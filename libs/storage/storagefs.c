@@ -211,7 +211,7 @@ array_t* __file_list(void* storage, const char* path) {
 
     DIR* dir = opendir(fullpath);
     if (dir == NULL) {
-        fprintf(stderr, "Error opening directory %s: %s\n", fullpath, strerror(errno));
+        log_error("Error opening directory %s: %s\n", fullpath, strerror(errno));
         return NULL;
     }
 
