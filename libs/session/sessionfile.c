@@ -85,6 +85,9 @@ int __destroy(const char* session_id) {
 }
 
 void __remove_expired(void) {
+    if (!storage_file_exist(appconfig()->sessionconfig.storage_name, __folder))
+        return;
+
     array_t* files = storage_file_list(appconfig()->sessionconfig.storage_name, __folder);
     if (files == NULL) return;
 
