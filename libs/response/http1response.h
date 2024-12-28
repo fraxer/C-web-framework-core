@@ -7,6 +7,12 @@
 #include "json.h"
 #include "response.h"
 
+typedef enum {
+    FILE_OK = 200,
+    FILE_FORBIDDEN = 403,
+    FILE_NOTFOUND = 404,
+} file_status_e;
+
 typedef struct http1response_head {
     size_t size;
     char* data;
@@ -78,5 +84,7 @@ void http1response_free_ranges(http1_ranges_t* ranges);
 int http1response_redirect_is_external(const char* url);
 const char* http1response_status_string(int status_code);
 int http1response_has_payload(http1response_t* response);
+file_status_e http1_get_file_full_path(server_t* server, char* file_full_path, size_t file_full_path_size, const char* path, size_t length);
+void http1_response_file(http1response_t* response, const char* file_full_path);
 
 #endif

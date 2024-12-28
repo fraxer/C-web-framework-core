@@ -29,8 +29,6 @@ websocketsresponse_t* websocketsresponse_create(connection_t*);
 
 void websocketsresponse_default_response(websocketsresponse_t*, const char*);
 
-int websocketsresponse_data_append(char*, size_t*, const char*, size_t);
-
 void websocketsresponse_pong(websocketsresponse_t*, const char*, size_t);
 
 void websocketsresponse_close(websocketsresponse_t*, const char*, size_t);

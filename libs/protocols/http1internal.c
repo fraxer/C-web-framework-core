@@ -377,12 +377,18 @@ void http1_handle(connection_t* connection) {
         return;
     }
 
-    if (http1_get_resource(connection) == 0) return;
-
-    if (!http1request_has_payload(request))
-        http1_get_file(connection);
+    char file_full_path[PATH_MAX];
+    const file_status_e status_code = http1_get_file_full_path(connection->server, file_full_path, PATH_MAX, request->path, request->path_length);
+    if (status_code == FILE_OK) {
+        if (!http1request_has_payload(request))
+            http1_response_file(response, file_full_path);
+        else
+            response->def(response, 400);
+    }
+    else if (http1_get_resource(connection) == 0)
+        return;
     else
-        response->def(response, 400);
+        response->def(response, status_code);
 
     connection->after_read_request(connection);
 }
@@ -404,7 +410,7 @@ int http1_get_resource(connection_t* connection) {
             return 0;
         }
 
-        int vector_size = route->params_count * 6;
+        int vector_size = route->params_count > 0 ? route->params_count * 6 : 20 * 6;
         int vector[vector_size];
 
         // find resource by template
@@ -423,6 +429,14 @@ int http1_get_resource(connection_t* connection) {
                 http1parser_append_query(request, query);
             }
 
+            if (route->handler[request->method] == NULL) return -1;
+
+            if (!http1_queue_handler_add(connection, route->handler[request->method]))
+                return -1;
+
+            return 0;
+        }
+        else if (matches_count == 1) {
             if (route->handler[request->method] == NULL) return -1;
 
             if (!http1_queue_handler_add(connection, route->handler[request->method]))

@@ -55,7 +55,6 @@ static jsondoc_t* __http1response_payload_json(http1response_t* response);
 static void __http1response_free(void* arg);
 static int __http1response_init_parser(http1response_t* response);
 static void __http1response_reset(http1response_t* response);
-static int __http1response_data_append(char* data, size_t* pos, const char* string, size_t length);
 
 void __http1response_view(http1response_t* response, jsondoc_t* document, const char* storage_name, const char* path_format, ...);
 
@@ -197,15 +196,6 @@ size_t __http1response_head_size(http1response_t* response) {
     return size;
 }
 
-int __http1response_data_append(char* data, size_t* pos, const char* string, size_t length) {
-    if (data == NULL) return 0;
-
-    memcpy(&data[*pos], string, length);
-    *pos += length;
-
-    return 1;
-}
-
 void __http1response_data(http1response_t* response, const char* data) {
     __http1response_datan(response, data, strlen(data));
 }
@@ -230,84 +220,69 @@ void __http1response_file(http1response_t* response, const char* path) {
 }
 
 void __http1response_filen(http1response_t* response, const char* path, size_t length) {
-    const char* root = response->connection->server->root;
-    size_t root_length = response->connection->server->root_length;
-    size_t fullpath_length = response->connection->server->root_length + length;
-
-    if (path[0] != '/') fullpath_length++;
-
-    char fullpath[fullpath_length + 1];
-
-    index_t* index = response->connection->server->index;
-
-    size_t indexpath_length = fullpath_length;
-
-    if (index != NULL) indexpath_length += index->length;
-
-    if (path[length - 1] != '/') indexpath_length++;
-
-    char indexpath[indexpath_length + 1];
-    char* resultpath = fullpath;
-
-    {
-        size_t pos = 0;
-
-        __http1response_data_append(fullpath, &pos, root, root_length);
-
-        if (path[0] != '/') __http1response_data_append(fullpath, &pos, "/", 1);
-
-        __http1response_data_append(fullpath, &pos, path, length);
-
-        fullpath[fullpath_length] = 0;
-
-        struct stat stat_obj;
-        if (stat(fullpath, &stat_obj) == -1 && errno == ENOENT) {
-            response->def(response, 404);
-            return;
-        }
-
-        if (S_ISDIR(stat_obj.st_mode)) {
-            if (index == NULL) {
-                response->def(response, 403);
-                return;
-            }
-
-            size_t index_pos = 0;
-
-            __http1response_data_append(indexpath, &index_pos, fullpath, fullpath_length);
-
-            if (fullpath[fullpath_length - 1] != '/') {
-                __http1response_data_append(indexpath, &index_pos, "/", 1);
-            }
-
-            __http1response_data_append(indexpath, &index_pos, index->value, index->length);
-
-            indexpath[indexpath_length] = 0;
-
-            if (stat(indexpath, &stat_obj) == -1 && errno == ENOENT) {
-                response->def(response, 404);
-                return;
-            }
-            if (!S_ISREG(stat_obj.st_mode)) {
-                response->def(response, 403);
-                return;
-            }
-
-            resultpath = indexpath;
-        }
-        else if (!S_ISREG(stat_obj.st_mode)) {
-            response->def(response, 404);
-            return;
-        }
+    char file_full_path[PATH_MAX];
+    const file_status_e status_code = http1_get_file_full_path(response->connection->server, file_full_path, PATH_MAX, path, length);
+    if (status_code != FILE_OK) {
+        response->def(response, status_code);
+        return;
     }
 
-    response->file_ = file_open(resultpath, O_RDONLY);
+    http1_response_file(response, file_full_path);
+}
+
+file_status_e http1_get_file_full_path(server_t* server, char* file_full_path, size_t file_full_path_size, const char* path, size_t length) {
+    size_t pos = 0;
+
+    if (!data_appendn(file_full_path, &pos, file_full_path_size, server->root, server->root_length))
+        return FILE_NOTFOUND;
+
+    if (path[0] != '/')
+        if (!data_appendn(file_full_path, &pos, file_full_path_size, "/", 1))
+            return FILE_NOTFOUND;
+
+    if (!data_appendn(file_full_path, &pos, file_full_path_size, path, length))
+        return FILE_NOTFOUND;
+
+    file_full_path[pos] = 0;
+
+    struct stat stat_obj;
+    if (stat(file_full_path, &stat_obj) == -1 && errno == ENOENT)
+        return FILE_NOTFOUND;
+
+    if (S_ISDIR(stat_obj.st_mode)) {
+        index_t* index = server->index;
+        if (index == NULL)
+            return FILE_FORBIDDEN;
+
+        if (file_full_path[pos - 1] != '/')
+            if (!data_appendn(file_full_path, &pos, file_full_path_size, "/", 1))
+                return FILE_NOTFOUND;
+
+        if (!data_appendn(file_full_path, &pos, file_full_path_size, index->value, index->length))
+            return FILE_NOTFOUND;
+
+        file_full_path[pos] = 0;
+
+        if (stat(file_full_path, &stat_obj) == -1 && errno == ENOENT)
+            return FILE_FORBIDDEN;
+
+        if (!S_ISREG(stat_obj.st_mode))
+            return FILE_FORBIDDEN;
+    }
+    else if (!S_ISREG(stat_obj.st_mode))
+        return FILE_NOTFOUND;
+
+    return FILE_OK;
+}
+
+void http1_response_file(http1response_t* response, const char* file_full_path) {
+    response->file_ = file_open(file_full_path, O_RDONLY);
     if (!response->file_.ok) {
         response->def(response, 404);
         return;
     }
 
-    const char* ext = file_extention(resultpath);
+    const char* ext = file_extention(file_full_path);
     const char* mimetype = __http1response_get_mimetype(ext);
     const char* connection = __http1response_keepalive_enabled(response) ? "keep-alive" : "close";
     response->headeru_add(response, "Connection", 10, connection, strlen(connection));
@@ -736,20 +711,20 @@ http1response_head_t http1response_create_head(http1response_t* response) {
     };
 
     size_t pos = 0;
-    if (!__http1response_data_append(head.data, &pos, "HTTP/1.1 ", 9)) return head;
-    if (!__http1response_data_append(head.data, &pos, http1response_status_string(response->status_code), __http1response_status_length(response->status_code))) return head;
+    if (!data_append(head.data, &pos, "HTTP/1.1 ", 9)) return head;
+    if (!data_append(head.data, &pos, http1response_status_string(response->status_code), __http1response_status_length(response->status_code))) return head;
 
     http1_header_t* header = response->header_;
     while (header) {
-        if (!__http1response_data_append(head.data, &pos, header->key, header->key_length)) return head;
-        if (!__http1response_data_append(head.data, &pos, ": ", 2)) return head;
-        if (!__http1response_data_append(head.data, &pos, header->value, header->value_length)) return head;
-        if (!__http1response_data_append(head.data, &pos, "\r\n", 2)) return head;
+        if (!data_append(head.data, &pos, header->key, header->key_length)) return head;
+        if (!data_append(head.data, &pos, ": ", 2)) return head;
+        if (!data_append(head.data, &pos, header->value, header->value_length)) return head;
+        if (!data_append(head.data, &pos, "\r\n", 2)) return head;
 
         header = header->next;
     }
 
-    if (!__http1response_data_append(head.data, &pos, "\r\n", 2)) return head;
+    if (!data_append(head.data, &pos, "\r\n", 2)) return head;
 
     return head;
 }

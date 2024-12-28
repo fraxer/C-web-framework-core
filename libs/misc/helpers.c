@@ -270,3 +270,24 @@ char __byte_to_hex(char code) {
     static char hex[] = "0123456789ABCDEF";
     return hex[code & 0x0F];
 }
+
+int data_append(char* data, size_t* pos, const char* string, size_t length) {
+    if (data == NULL) return 0;
+    if (string == NULL) return 0;
+
+    memcpy(&data[*pos], string, length);
+    *pos += length;
+
+    return 1;
+}
+
+int data_appendn(char* data, size_t* pos, size_t max, const char* string, size_t length) {
+    if (data == NULL) return 0;
+    if (string == NULL) return 0;
+    if (*pos + length >= max) return 0;
+
+    memcpy(&data[*pos], string, length);
+    *pos += length;
+
+    return 1;
+}

@@ -94,7 +94,7 @@ int websocketsrequest_get_resource(connection_t* connection) {
             return 1;
         }
 
-        int vector_size = route->params_count * 6;
+        int vector_size = route->params_count > 0 ? route->params_count * 6 : 20 * 6;
         int vector[vector_size];
 
         // find resource by template
@@ -119,6 +119,15 @@ int websocketsrequest_get_resource(connection_t* connection) {
             }
 
             if (route->handler[protocol->method] == NULL) return 0;
+
+            if (!websockets_queue_handler_add(connection, route->handler[protocol->method]))
+                return 0;
+
+            return 1;
+        }
+        else if (matches_count == 1) {
+            if (route->handler[protocol->method] == NULL)
+                return 0;
 
             if (!websockets_queue_handler_add(connection, route->handler[protocol->method]))
                 return 0;

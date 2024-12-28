@@ -6,8 +6,15 @@
 #include <sys/stat.h>
 
 #include "mimetype.h"
+#include "helpers.h"
 #include "websocketsrequest.h"
 #include "websocketsresponse.h"
+
+typedef enum {
+    FILE_OK = 0,
+    FILE_FORBIDDEN = 0,
+    FILE_NOTFOUND = 0,
+} file_status_e;
 
 void websocketsresponse_text(websocketsresponse_t*, const char*);
 void websocketsresponse_textn(websocketsresponse_t*, const char*, size_t);
@@ -22,6 +29,7 @@ size_t websocketsresponse_file_size(size_t);
 int websocketsresponse_prepare(websocketsresponse_t*, const char*, size_t);
 void websocketsresponse_reset(websocketsresponse_t*);
 int websocketsresponse_set_payload_length(char*, size_t*, size_t);
+file_status_e __get_file_full_path(server_t* server, char* file_full_path, size_t file_full_path_size, const char* path, size_t length);
 
 websocketsresponse_t* websocketsresponse_alloc() {
     return (websocketsresponse_t*)malloc(sizeof(websocketsresponse_t));
@@ -122,26 +130,17 @@ size_t websocketsresponse_file_size(size_t length) {
     return size;
 }
 
-int websocketsresponse_data_append(char* data, size_t* pos, const char* string, size_t length) {
-    memcpy(&data[*pos], string, length);
-
-    *pos += length;
-
-    return 0;
-}
-
 int websocketsresponse_prepare(websocketsresponse_t* response, const char* body, size_t length) {
-    char* data = (char*)malloc(response->body.size);
-
+    char* data = malloc(response->body.size);
     if (data == NULL) return -1;
 
     size_t pos = 0;
 
-    if (websocketsresponse_data_append(data, &pos, (const char*)&response->frame_code, 1) == -1) return -1;
+    if (!data_append(data, &pos, (const char*)&response->frame_code, 1)) return -1;
 
     if (websocketsresponse_set_payload_length(data, &pos, length) == -1) return -1;
 
-    if (body != NULL && websocketsresponse_data_append(data, &pos, body, length) == -1) return -1;
+    if (body != NULL && !data_append(data, &pos, body, length)) return -1;
 
     response->body.data = data;
 
@@ -216,41 +215,18 @@ int websocketsresponse_file(websocketsresponse_t* response, const char* path) {
 }
 
 int websocketsresponse_filen(websocketsresponse_t* response, const char* path, size_t length) {
-    {
-        const char* root = response->connection->server->root;
-        size_t root_length = response->connection->server->root_length;
-        size_t fullpath_length = response->connection->server->root_length + length;
-        size_t pos = 0;
-
-        if (path[0] != '/') fullpath_length++;
-
-        char fullpath[fullpath_length + 1];
-
-        websocketsresponse_data_append(fullpath, &pos, root, root_length);
-
-        if (path[0] != '/') websocketsresponse_data_append(fullpath, &pos, "/", 1);
-
-        websocketsresponse_data_append(fullpath, &pos, path, length);
-
-        fullpath[fullpath_length] = 0;
-
-        struct stat stat_obj;
-
-        stat(fullpath, &stat_obj);
-
-        if (S_ISDIR(stat_obj.st_mode)) {
-            websocketsresponse_default_response(response, "resource forbidden");
-            return -1;
-        }
-
-        if (!S_ISREG(stat_obj.st_mode)) {
-            websocketsresponse_default_response(response, "resource not found");
-            return -1;
-        }
-
-        response->file_.fd = open(fullpath, O_RDONLY);
+    char file_full_path[PATH_MAX];
+    const file_status_e status = __get_file_full_path(response->connection->server, file_full_path, PATH_MAX, path, length);
+    if (status == FILE_FORBIDDEN) {
+        websocketsresponse_default_response(response, "resource forbidden");
+        return -1;
+    }
+    else if (status == FILE_NOTFOUND) {
+        websocketsresponse_default_response(response, "resource not found");
+        return -1;
     }
 
+    response->file_.fd = open(file_full_path, O_RDONLY);
     if (response->file_.fd == -1) return -1;
 
     response->file_.size = (size_t)lseek(response->file_.fd, 0, SEEK_END);
@@ -258,14 +234,39 @@ int websocketsresponse_filen(websocketsresponse_t* response, const char* path, s
     lseek(response->file_.fd, 0, SEEK_SET);
 
     response->frame_code = 0x82;
-
     response->body.size = websocketsresponse_file_size(response->file_.size);
 
     if (websocketsresponse_prepare(response, NULL, response->file_.size) == -1) return -1;
 
-    // printf("body: %s, %ld\n", response->body.data, response->body.size);
-
     return 0;
+}
+
+file_status_e __get_file_full_path(server_t* server, char* file_full_path, size_t file_full_path_size, const char* path, size_t length) {
+    size_t pos = 0;
+
+    if (!data_appendn(file_full_path, &pos, file_full_path_size, server->root, server->root_length))
+        return FILE_NOTFOUND;
+
+    if (path[0] != '/')
+        if (!data_appendn(file_full_path, &pos, file_full_path_size, "/", 1))
+            return FILE_NOTFOUND;
+
+    if (!data_appendn(file_full_path, &pos, file_full_path_size, path, length))
+        return FILE_NOTFOUND;
+
+    file_full_path[pos] = 0;
+
+    struct stat stat_obj;
+    if (stat(file_full_path, &stat_obj) == -1 && errno == ENOENT)
+        return FILE_NOTFOUND;
+
+    if (S_ISDIR(stat_obj.st_mode))
+        return FILE_FORBIDDEN;
+
+    if (!S_ISREG(stat_obj.st_mode))
+        return FILE_NOTFOUND;
+
+    return FILE_OK;
 }
 
 void websocketsresponse_default_response(websocketsresponse_t* response, const char* text) {

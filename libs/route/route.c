@@ -11,6 +11,7 @@
 #define ROUTE_EMPTY_PARAM_NAME "Route error: Empty param name in \"%s\"\n"
 #define ROUTE_EMPTY_PARAM_EXPRESSION "Route error: Empty param expression in \"%s\"\n"
 #define ROUTE_PARAM_ONE_WORD "Route error: For param need one word in \"%s\"\n"
+#define ROUTE_REGEX_AND_PARAMS "Route error: Can't use named params with regex \"%s\"\n"
 
 typedef struct route_parser {
     int is_primitive;
@@ -18,6 +19,7 @@ typedef struct route_parser {
     unsigned short int dirty_pos;
     unsigned short int pos;
     const char* dirty_location;
+    char* path;
     char* location;
     route_param_t* first_param;
     route_param_t* last_param;
@@ -53,8 +55,8 @@ route_t* route_create(const char* dirty_location) {
 
     route->is_primitive = parser.is_primitive;
     route->params_count = parser.params_count;
-    route->path = parser.location;
-    route->path_length = strlen(parser.location);
+    route->path = parser.path;
+    route->path_length = strlen(parser.path);
     route->param = parser.first_param;
 
     result = 0;
@@ -107,11 +109,17 @@ int route_init_parser(route_parser_t* parser, const char* dirty_location) {
     parser->dirty_pos = 0;
     parser->pos = 0;
     parser->dirty_location = dirty_location;
-    parser->location = (char*)malloc(strlen(dirty_location) + 1);
+    parser->path = malloc(strlen(dirty_location) + 3); // +1 for ^, +1 for $, +1 for \0
+    parser->location = malloc(strlen(dirty_location) + 3); // +1 for ^, +1 for $, +1 for \0
     parser->first_param = NULL;
     parser->last_param = NULL;
 
+    if (parser->path == NULL) {
+        log_error(ROUTE_OUT_OF_MEMORY);
+        return -1;
+    }
     if (parser->location == NULL) {
+        free(parser->path);
         log_error(ROUTE_OUT_OF_MEMORY);
         return -1;
     }
@@ -121,6 +129,7 @@ int route_init_parser(route_parser_t* parser, const char* dirty_location) {
 
 int route_parse_location(route_parser_t* parser) {
     parser->is_primitive = 1;
+    int has_regex_symbols = 0;
 
     for (; parser->dirty_location[parser->dirty_pos] != 0; parser->dirty_pos++) {
         switch (parser->dirty_location[parser->dirty_pos]) {
@@ -150,6 +159,7 @@ int route_parse_location(route_parser_t* parser) {
         case '^':
         case '|':
         case '$':
+            has_regex_symbols = 1;
             route_insert_symbol(parser);
             parser->is_primitive = 0;
             break;
@@ -158,7 +168,28 @@ int route_parse_location(route_parser_t* parser) {
         }
     }
 
+    memcpy(parser->path, parser->location, parser->pos);
+    parser->path[parser->pos] = 0;
+
+    if (!parser->is_primitive && parser->first_param != NULL) {
+        memmove(parser->location + 1, parser->location, parser->pos);
+        parser->pos++;
+        parser->location[0] = '^';
+    }
+    else if (parser->is_primitive) {
+        memmove(parser->location + 1, parser->location, parser->pos);
+        parser->location[0] = '^';
+        parser->pos++;
+        parser->location[parser->pos] = '$';
+        parser->pos++;
+    }
+
     parser->location[parser->pos] = 0;
+
+    if (parser->first_param != NULL && has_regex_symbols) {
+        log_error(ROUTE_REGEX_AND_PARAMS, parser->dirty_location);
+        return -1;
+    }
 
     return 0;
 }
@@ -312,7 +343,8 @@ int route_fill_param(route_parser_t* parser) {
 }
 
 void route_parser_free(route_parser_t* parser) {
-    parser->location = NULL;
+    if (parser->location != NULL)
+        free(parser->location);
 }
 
 int route_set_http_handler(route_t* route, const char* method, void(*function)(void*)) {
