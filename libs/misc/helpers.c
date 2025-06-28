@@ -291,3 +291,21 @@ int data_appendn(char* data, size_t* pos, size_t max, const char* string, size_t
 
     return 1;
 }
+
+int is_path_traversal(const char* string, size_t length) {
+    char ch_1 = 0;
+    char ch_2 = 0;
+    char ch_3 = 0;
+    for (size_t i = 0; i <= length; i++) {
+        if (ch_1 == '/' && ch_2 == '.' && ch_3 == '.' && string[i] == '/')
+            return 1;
+        else if (ch_1 == '/' && ch_2 == '.' && ch_3 == '.' && string[i] == '\0')
+            return 1;
+
+        ch_1 = ch_2;
+        ch_2 = ch_3;
+        ch_3 = string[i];
+    }
+
+    return 0;
+}

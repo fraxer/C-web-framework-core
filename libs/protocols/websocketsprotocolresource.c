@@ -18,7 +18,6 @@ int websocketsparser_parse_method(websockets_protocol_resource_t*, char*, size_t
 int websocketsparser_parse_location(websockets_protocol_resource_t*, char*, size_t);
 int websocketsparser_append_uri(websockets_protocol_resource_t*, const char*, size_t);
 int websocketsparser_set_path(websockets_protocol_resource_t*, const char*, size_t);
-int websocketsparser_set_ext(websockets_protocol_resource_t*, const char*, size_t);
 int websocketsparser_set_query(websockets_protocol_resource_t*, const char*, size_t);
 
 websockets_protocol_t* websockets_protocol_resource_create() {
@@ -36,10 +35,8 @@ websockets_protocol_t* websockets_protocol_resource_create() {
     protocol->parser_stage = WSPROTRESOURCE_METHOD;
     protocol->uri_length = 0;
     protocol->path_length = 0;
-    protocol->ext_length = 0;
     protocol->uri = NULL;
     protocol->path = NULL;
-    protocol->ext = NULL;
     protocol->query_ = NULL;
     protocol->query = websocketsrequest_query;
 
@@ -55,16 +52,12 @@ void websockets_protocol_resource_reset(void* arg) {
     protocol->parser_stage = WSPROTRESOURCE_METHOD;
     protocol->uri_length = 0;
     protocol->path_length = 0;
-    protocol->ext_length = 0;
 
     if (protocol->uri) free((void*)protocol->uri);
     protocol->uri = NULL;
 
     if (protocol->path) free((void*)protocol->path);
     protocol->path = NULL;
-
-    if (protocol->ext) free((void*)protocol->ext);
-    protocol->ext = NULL;
 
     websocketsrequest_query_free(protocol->query_);
     protocol->query_ = NULL;
@@ -226,6 +219,11 @@ int websockets_protocol_resource_payload_parse(websocketsrequest_t* request, cha
             return 0;
 
         int r = write(request->protocol->payload.fd, &string[offset], length - offset);
+
+        if (r > 10) {
+            int i = 0;
+        }
+
         lseek(request->protocol->payload.fd, 0, SEEK_SET);
         if (r <= 0) return 0;
     }
@@ -289,45 +287,28 @@ int websocketsparser_parse_method(websockets_protocol_resource_t* protocol, char
 int websocketsparser_parse_location(websockets_protocol_resource_t* protocol, char* string, size_t length) {
     if (string[0] != '/') return 0;
 
-    size_t uri_point_end = 0;
     size_t path_point_end = 0;
-    size_t ext_point_start = 0;
+    for (size_t pos = 0; pos < length; pos++) {
+        switch (string[pos]) {
+        case '?':
+            path_point_end = pos;
 
-    for (size_t i = 0; i < length; i++) {
-        char c = string[i];
+            int result = websocketsparser_set_query(protocol, &string[pos + 1], length - (pos + 1));
+            if (result == 0)
+                goto next;
 
-        if (c == '?' && path_point_end == 0) {
-            path_point_end = i;
-
-            int result = websocketsparser_set_query(protocol, &string[i + 1], length - (i + 1));
-
-            if (result == 0) goto next;
-            if (result < 0) return result;
-        }
-
-        if (c == '.') {
-            ext_point_start = i + 1;
-
-            if (i + 1 < length && string[i] == '.' && string[i + 1] == '/') return 0;
-            if (i + 2 < length && string[i + 1] == '.' && string[i + 2] == '/') return 0;
-        }
-
-        if (c == ' ') {
-            uri_point_end = i;
-            break;
+            return result;
+        case '#':
+            path_point_end = pos;
+            goto next;
         }
     }
 
     next:
 
-    if (uri_point_end == 0) uri_point_end = length;
-    if (path_point_end == 0) path_point_end = uri_point_end;
-    if (ext_point_start == 0) ext_point_start = path_point_end;
+    if (path_point_end == 0) path_point_end = length;
 
-    if (websocketsparser_set_path(protocol, string, path_point_end) == -1) return 0;
-    if (websocketsparser_set_ext(protocol, &string[ext_point_start], path_point_end - ext_point_start) == -1) return 0;
-
-    return 1;
+    return websocketsparser_set_path(protocol, string, path_point_end);
 }
 
 int websocketsparser_append_uri(websockets_protocol_resource_t* protocol, const char* string, size_t length) {
@@ -347,29 +328,18 @@ int websocketsparser_append_uri(websockets_protocol_resource_t* protocol, const 
 }
 
 int websocketsparser_set_path(websockets_protocol_resource_t* protocol, const char* string, size_t length) {
-    if (string[0] != '/') return -1;
+    if (string[0] != '/') return 0;
 
-    protocol->path = (char*)malloc(length + 1);
-    if (protocol->path == NULL) return -1;
+    size_t decoded_length = length;
+    protocol->path = urldecodel(string, length, &decoded_length);
+    if (protocol->path == NULL) return 0;
 
-    memcpy(protocol->path, string, length);
+    protocol->path_length = decoded_length;
 
-    protocol->path[length] = 0;
-    protocol->path_length = length;
+    if (is_path_traversal(protocol->path, protocol->path_length))
+        return 0;
 
-    return 0;
-}
-
-int websocketsparser_set_ext(websockets_protocol_resource_t* protocol, const char* string, size_t length) {
-    protocol->ext = (char*)malloc(length + 1);
-    if (protocol->ext == NULL) return -1;
-
-    memcpy(protocol->ext, string, length);
-
-    protocol->ext[length] = 0;
-    protocol->ext_length = length;
-
-    return 0;
+    return 1;
 }
 
 int websocketsparser_set_query(websockets_protocol_resource_t* protocol, const char* string, size_t length) {
@@ -393,7 +363,7 @@ int websocketsparser_set_query(websockets_protocol_resource_t* protocol, const c
 
             stage = VALUE;
 
-            query->key = websockets_set_field(&string[point_start], pos - point_start);
+            query->key = urldecode(&string[point_start], pos - point_start);
 
             if (query->key == NULL) return -1;
 
@@ -402,7 +372,7 @@ int websocketsparser_set_query(websockets_protocol_resource_t* protocol, const c
         case '&':
             stage = KEY;
 
-            query->value = websockets_set_field(&string[point_start], pos - point_start);
+            query->value = urldecode(&string[point_start], pos - point_start);
 
             if (query->value == NULL) return -1;
 
@@ -421,11 +391,11 @@ int websocketsparser_set_query(websockets_protocol_resource_t* protocol, const c
             break;
         case '#':
             if (stage == KEY) {
-                query->key = websockets_set_field(&string[point_start], pos - point_start);
+                query->key = urldecode(&string[point_start], pos - point_start);
                 if (query->key == NULL) return -1;
             }
             else if (stage == VALUE) {
-                query->value = websockets_set_field(&string[point_start], pos - point_start);
+                query->value = urldecode(&string[point_start], pos - point_start);
                 if (query->value == NULL) return -1;
             }
 
@@ -434,14 +404,14 @@ int websocketsparser_set_query(websockets_protocol_resource_t* protocol, const c
     }
 
     if (stage == KEY) {
-        query->key = websockets_set_field(&string[point_start], pos - point_start);
+        query->key = urldecode(&string[point_start], pos - point_start);
         if (query->key == NULL) return -1;
 
         query->value = websockets_set_field("", 0);
         if (query->value == NULL) return -1;
     }
     else if (stage == VALUE) {
-        query->value = websockets_set_field(&string[point_start], pos - point_start);
+        query->value = urldecode(&string[point_start], pos - point_start);
         if (query->value == NULL) return -1;
     }
 

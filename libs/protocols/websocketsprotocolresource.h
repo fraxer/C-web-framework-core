@@ -17,11 +17,9 @@ typedef struct websockets_protocol_resource {
     websockets_protocol_resource_stage_e parser_stage;
     size_t uri_length;
     size_t path_length;
-    size_t ext_length;
 
     char* uri;
     char* path;
-    char* ext;
 
     websockets_query_t* query_;
 

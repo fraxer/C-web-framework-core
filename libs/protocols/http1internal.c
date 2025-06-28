@@ -508,16 +508,13 @@ int http1_get_redirect(connection_t* connection) {
         if (request->path) free((void*)request->path);
         request->path = NULL;
 
-        if (request->ext) free((void*)request->ext);
-        request->ext = NULL;
-
         if (http1response_redirect_is_external(new_uri)) {
             request->uri = new_uri;
             connection->keepalive_enabled = 0;
             return REDIRECT_FOUND;
         }
 
-        if (http1parser_set_uri(request, new_uri, strlen(new_uri)) == -1)
+        if (!http1parser_set_uri(request, new_uri, strlen(new_uri)))
             return REDIRECT_OUT_OF_MEMORY;
 
         redirect = connection->server->http.redirect;

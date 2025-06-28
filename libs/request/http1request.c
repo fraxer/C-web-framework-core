@@ -100,11 +100,8 @@ http1request_t* http1request_create(connection_t* connection) {
     request->content_encoding = CE_NONE;
     request->uri_length = 0;
     request->path_length = 0;
-    request->ext_length = 0;
     request->uri = NULL;
     request->path = NULL;
-    request->ext = NULL;
-    request->ext = NULL;
     request->query_ = NULL;
     request->last_query = NULL;
     request->header_ = NULL;
@@ -150,16 +147,12 @@ void http1request_reset(http1request_t* request) {
     request->version = HTTP1_VER_NONE;
     request->uri_length = 0;
     request->path_length = 0;
-    request->ext_length = 0;
 
     if (request->uri) free((void*)request->uri);
     request->uri = NULL;
 
     if (request->path) free((void*)request->path);
     request->path = NULL;
-
-    if (request->ext) free((void*)request->ext);
-    request->ext = NULL;
 
     http1request_payload_free(&request->payload_);
 

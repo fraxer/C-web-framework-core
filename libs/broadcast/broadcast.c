@@ -24,7 +24,7 @@ broadcast_list_t* __broadcast_create_list(const char* broadcast_name) {
 
     list->item = NULL;
     list->item_last = NULL;
-    list->locked = 0;
+    atomic_store(&list->locked, 1);
     list->next = NULL;
     list->name = malloc(strlen(broadcast_name) + 1);
     if (!list->name) goto failed;
@@ -61,7 +61,7 @@ broadcast_item_t* __broadcast_create_item(connection_t* connection, void* id, vo
     if (!item) return NULL;
 
     item->connection = connection;
-    item->locked = 0;
+    atomic_store(&item->locked, 0);
     item->next = NULL;
     item->response_handler = response_handler;
     item->id = id;
@@ -70,14 +70,10 @@ broadcast_item_t* __broadcast_create_item(connection_t* connection, void* id, vo
 }
 
 void __broadcast_free_item(broadcast_item_t* item) {
-    if (!item) return;
+    if (item == NULL) return;
 
-    item->connection = NULL;
-    item->locked = 0;
-    item->next = NULL;
-    item->response_handler = NULL;
-    item->id->free(item->id);
-    item->id = NULL;
+    if (item->id != NULL && item->id->free)
+        item->id->free(item->id);
 
     free(item);
 }
@@ -89,7 +85,6 @@ int __broadcast_lock(broadcast_t* broadcast) {
 
     do {
         expected = 0;
-        if (broadcast == NULL) return 0;
     } while (!atomic_compare_exchange_strong(&broadcast->locked, &expected, desired));
 
     return 1;
@@ -176,6 +171,7 @@ int __broadcast_list_contains(broadcast_list_t* list, connection_t* connection) 
 }
 
 void __broadcast_append_list(broadcast_t* broadcast, broadcast_list_t* list) {
+    if (broadcast == NULL || list == NULL) return;
     if (!__broadcast_lock(broadcast)) return;
 
     if (broadcast->list == NULL)
@@ -184,6 +180,7 @@ void __broadcast_append_list(broadcast_t* broadcast, broadcast_list_t* list) {
     broadcast_list_t* list_last = broadcast->list_last;
 
     __broadcast_lock_list(list_last);
+
     if (list_last)
         list_last->next = list;
 
@@ -194,13 +191,20 @@ void __broadcast_append_list(broadcast_t* broadcast, broadcast_list_t* list) {
 }
 
 void __broadcast_append_item(broadcast_list_t* list, broadcast_item_t* item) {
+    if (list == NULL || item == NULL) return;
+
     if (list->item == NULL)
         list->item = item;
+
+    broadcast_item_t* item_last = list->item_last;
+    __broadcast_lock_item(item_last);
 
     if (list->item_last)
         list->item_last->next = item;
 
     list->item_last = item;
+
+    __broadcast_unlock_item(item_last);
 }
 
 void __broadcast_queue_add(connection_t* connection, const char* payload, size_t size, void(*handle)(response_t* response, const char* payload, size_t size)) {
@@ -259,16 +263,15 @@ broadcast_t* broadcast_init() {
     broadcast_t* broadcast = malloc(sizeof * broadcast);
     if (!broadcast) return NULL;
 
-    broadcast->locked = 0;
+    atomic_store(&broadcast->locked, 0);
     broadcast->list = NULL;
     broadcast->list_last = NULL;
 
     return broadcast;
 }
 
-void broadcast_free(broadcast_t *broadcast) {
-    if (!broadcast) return;
-    if (!__broadcast_lock(broadcast)) return;
+void broadcast_free(broadcast_t* broadcast) {
+    if (broadcast == NULL) return;
 
     broadcast_list_t* list = broadcast->list;
     while (list) {
@@ -284,40 +287,39 @@ void broadcast_free(broadcast_t *broadcast) {
         list = next;
     }
 
-    broadcast->locked = 0;
-    broadcast->list = NULL;
-    broadcast->list_last = NULL;
-
     free(broadcast);
 }
 
 int broadcast_add(const char* broadcast_name, connection_t* connection, void* id, void(*response_handler)(response_t* response, const char* payload, size_t size)) {
-    broadcast_list_t* list = __broadcast_get_list(broadcast_name, connection->server->broadcast->list);
+    if (broadcast_name == NULL || connection == NULL || response_handler == NULL)
+        return 0;
+
+    broadcast_t* broadcast = connection->server->broadcast;
+
+    int result = 0;
+    broadcast_item_t* item = NULL;
+    broadcast_list_t* list = __broadcast_get_list(broadcast_name, broadcast->list);
     if (!list) {
-        list = __broadcast_create_list(broadcast_name);
-        if (!list) return 0;
+        list = __broadcast_create_list(broadcast_name); // already locked list
+        if (!list) goto failed;
 
-        __broadcast_lock_list(list);
-        __broadcast_append_list(connection->server->broadcast, list);
+        __broadcast_append_list(broadcast, list);
     }
+    else if (__broadcast_list_contains(list, connection))
+        goto failed;
 
-    if (__broadcast_list_contains(list, connection)) {
-        __broadcast_unlock_list(list);
-        return 0;
-    }
+    item = __broadcast_create_item(connection, id, response_handler);
+    if (!item) goto failed;
 
-    broadcast_item_t* item = __broadcast_create_item(connection, id, response_handler);
-    if (!item) {
-        __broadcast_unlock_list(list);
-        return 0;
-    }
-
-    __broadcast_lock_item(item);
     __broadcast_append_item(list, item);
-    __broadcast_unlock_item(item);
+
+    result = 1;
+
+    failed:
+
     __broadcast_unlock_list(list);
 
-    return 1;
+    return result;
 }
 
 void broadcast_remove(const char* broadcast_name, connection_t* connection) {
@@ -336,8 +338,6 @@ void broadcast_remove(const char* broadcast_name, connection_t* connection) {
                 return;
             }
 
-            __broadcast_unlock_list(list);
-
             while (item) {
                 broadcast_item_t* next_item = __broadcast_lock_item(item->next);
 
@@ -347,6 +347,7 @@ void broadcast_remove(const char* broadcast_name, connection_t* connection) {
                         list->item_last = item;
                     __broadcast_free_item(next_item);
                     __broadcast_unlock_item(item);
+                    __broadcast_unlock_list(list);
                     return;
                 }
 
@@ -365,11 +366,10 @@ void broadcast_remove(const char* broadcast_name, connection_t* connection) {
 }
 
 void broadcast_clear(connection_t* connection) {
-    if (connection->server == NULL) return;
-
     broadcast_list_t* list = __broadcast_lock_list(connection->server->broadcast->list);
     while (list) {
         broadcast_item_t* item = __broadcast_lock_item(list->item);
+        broadcast_list_t* next = NULL;
 
         if (item && item->connection == connection) {
             list->item = item->next;
@@ -377,7 +377,7 @@ void broadcast_clear(connection_t* connection) {
                 list->item_last = NULL;
 
             __broadcast_free_item(item);
-            continue;
+            goto next;
         }
 
         while (item) {
@@ -388,14 +388,16 @@ void broadcast_clear(connection_t* connection) {
                 if (next_item == list->item_last)
                     list->item_last = item;
                 __broadcast_free_item(next_item);
-                next_item = item->next;
+                next_item = __broadcast_lock_item(item->next);
             }
 
             __broadcast_unlock_item(item);
             item = next_item;
         }
 
-        broadcast_list_t* next = __broadcast_lock_list(list->next);
+        next:
+
+        next = __broadcast_lock_list(list->next);
         __broadcast_unlock_list(list);
         list = next;
     }
@@ -406,34 +408,28 @@ void broadcast_send_all(const char* broadcast_name, connection_t* connection, co
 }
 
 void broadcast_send(const char* broadcast_name, connection_t* connection, const char* payload, size_t size, void* id, int(*compare_handler)(void* st1, void* st2)) {
-    broadcast_list_t* list = __broadcast_lock_list(connection->server->broadcast->list);
-    while (list) {
-        if (strcmp(list->name, broadcast_name) == 0) {
-            broadcast_item_t* item = __broadcast_lock_item(list->item);
-            __broadcast_unlock_list(list);
-            while (item) {
-                if (connection != item->connection) {
-                    if (!connection->destroyed) {
-                        if (id && compare_handler && compare_handler(item->id, id))
-                            __broadcast_queue_add(item->connection, payload, size, item->response_handler);
-                        else if (!id && !compare_handler)
-                            __broadcast_queue_add(item->connection, payload, size, item->response_handler);
-                    }
-                }
+    broadcast_item_t* item = NULL;
+    broadcast_list_t* list = __broadcast_get_list(broadcast_name, connection->server->broadcast->list);
+    if (list == NULL) goto done;
 
-                broadcast_item_t* next_item = __broadcast_lock_item(item->next);
-                __broadcast_unlock_item(item);
-                item = next_item;
-            }
-
-            return;
+    item = __broadcast_lock_item(list->item);
+    while (item) {
+        if (connection != item->connection && !connection->destroyed) {
+            if (id && compare_handler && compare_handler(item->id, id))
+                __broadcast_queue_add(item->connection, payload, size, item->response_handler);
+            else if (!id && !compare_handler)
+                __broadcast_queue_add(item->connection, payload, size, item->response_handler);
         }
 
-        broadcast_list_t* next = __broadcast_lock_list(list->next);
-        __broadcast_unlock_list(list);
-        list = next;
+        broadcast_item_t* next_item = __broadcast_lock_item(item->next);
+        __broadcast_unlock_item(item);
+        item = next_item;
     }
 
-    if (id != NULL)
+    done:
+
+    if (id != NULL && ((broadcast_id_t*)id)->free)
         ((broadcast_id_t*)id)->free(id);
+
+    __broadcast_unlock_list(list);
 }

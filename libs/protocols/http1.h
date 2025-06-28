@@ -4,6 +4,7 @@
 #include "http1request.h"
 #include "http1response.h"
 #include "httpcontext.h"
+#include "query.h"
 #include "session.h"
 
 #endif

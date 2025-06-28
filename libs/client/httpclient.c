@@ -411,10 +411,6 @@ int __httpclient_handshake(httpclient_t* client) {
 int __httpclient_set_request_uri(httpclient_t* client) {
     http1request_t* request = (http1request_t*)client->request;
 
-    if (request->ext) free((void*)request->ext);
-    request->ext = httpclientparser_move_ext(client->parser);
-    request->ext_length = strlen(request->ext);
-
     if (request->uri) free((void*)request->uri);
     request->uri = httpclientparser_move_uri(client->parser);
     request->uri_length = strlen(request->uri);

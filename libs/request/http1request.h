@@ -23,11 +23,9 @@ typedef struct http1request {
 
     size_t uri_length;
     size_t path_length;
-    size_t ext_length;
 
     const char* uri;
     const char* path;
-    const char* ext;
 
     http1_query_t* query_;
     http1_query_t* last_query;
