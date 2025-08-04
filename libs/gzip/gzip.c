@@ -20,21 +20,21 @@ int gzip_free(gzip_t* gzip) {
     return 0;
 }
 
-int gzip_deflate_init(gzip_t* const gzip, const char* data, const size_t length) {
+int detect_overflow(gzip_t* gzip) {
+    return (gzip->stream.avail_out == 0 && 
+           (gzip->stream.avail_in > 0 || gzip->status_code == Z_OK));
+}
+
+int gzip_deflate_init(gzip_t* const gzip) {
     z_stream* const stream = &gzip->stream;
-    if (gzip->is_deflate_init == -1) {
-        gzip->is_deflate_init = 0;
+    gzip->is_deflate_init = 0;
 
-        stream->zalloc = Z_NULL;
-        stream->zfree = Z_NULL;
-        stream->opaque = Z_NULL;
+    stream->zalloc = Z_NULL;
+    stream->zfree = Z_NULL;
+    stream->opaque = Z_NULL;
 
-        if (deflateInit2(stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, MAX_WBITS + 16, MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY) != Z_OK)
-            return 0;
-    }
-
-    stream->avail_in = (uInt)length;
-    stream->next_in = (Bytef*)data;
+    if (deflateInit2(stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, MAX_WBITS + 16, MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY) != Z_OK)
+        return 0;
 
     return 1;
 }
@@ -47,6 +47,12 @@ size_t gzip_deflate(gzip_t* gzip, const char* compress_data, const size_t compre
     gzip->status_code = deflate(&gzip->stream, end ? Z_FINISH : Z_SYNC_FLUSH);
 
     return compress_length - gzip->stream.avail_out;
+}
+
+void gzip_set_in(gzip_t* gzip, const char* data, size_t length) {
+    z_stream* const stream = &gzip->stream;
+    stream->avail_in = (uInt)length;
+    stream->next_in = (Bytef*)data;
 }
 
 int gzip_deflate_free(gzip_t* gzip) {
