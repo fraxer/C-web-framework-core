@@ -4,8 +4,6 @@
 #include <stdlib.h>
 #include <sys/types.h>
 
-#define BUFO_SIZE 16384
-
 typedef struct bufo {
     unsigned is_proxy : 1;
     unsigned is_last : 1;
