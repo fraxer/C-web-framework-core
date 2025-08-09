@@ -519,6 +519,7 @@ void http1parser_try_set_range(http1requestparser_t* parser) {
 
     if (cmpstrn_lower(request->last_header->key, request->last_header->key_length, "range", 5)) {
         response->ranges = http1parser_parse_range((char*)request->last_header->value, request->last_header->value_length);
+        response->range = 1;
     }
 }
 

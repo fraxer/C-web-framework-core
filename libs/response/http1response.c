@@ -351,6 +351,7 @@ int __http1response_headern_add(http1response_t* response, const char* key, size
         else if (cmpstr_lower(header->key, "Content-Encoding") &&
             cmpstr_lower(header->value, "gzip")) {
             response->content_encoding = CE_GZIP;
+            response->gzip = 1;
         }
     }
 
@@ -701,10 +702,14 @@ int __http1response_alloc_body(http1response_t* response, const char* data, size
 }
 
 void __http1response_try_enable_gzip(http1response_t* response, const char* directive) {
+    if (response->range) return;
+
     env_gzip_str_t* item = env()->main.gzip;
     while (item != NULL) {
         if (cmpstr_lower(item->mimetype, directive)) {
             response->content_encoding = CE_GZIP;
+            response->gzip = 1;
+            response->chunked = 1;
             break;
         }
         item = item->next;
@@ -712,8 +717,12 @@ void __http1response_try_enable_gzip(http1response_t* response, const char* dire
 }
 
 void __http1response_try_enable_te(http1response_t* response, const char* directive) {
-    if (cmpstr_lower(directive, "chunked"))
-        response->transfer_encoding = TE_CHUNKED;
+    if (response->range) return;
+
+    if (!cmpstr_lower(directive, "chunked")) return;
+
+    response->transfer_encoding = TE_CHUNKED;
+    response->chunked = 1;
 }
 
 http1_ranges_t* http1response_init_ranges(void) {
