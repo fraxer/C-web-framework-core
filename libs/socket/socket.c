@@ -9,10 +9,10 @@
 #include "log.h"
 #include "socket.h"
 
-int __socket_open_listen(in_addr_t, unsigned short int);
-int __socket_set_options(int);
+static int __socket_set_options(int socket);
+static int __socket_open_listen(in_addr_t, unsigned short int);
 
-socket_t* socket_alloc() {
+socket_t* socket_alloc(void) {
     socket_t* socket = malloc(sizeof(socket_t));
     if (socket == NULL) return NULL;
 
@@ -47,11 +47,11 @@ socket_t* socket_listen_create(in_addr_t ip, unsigned short int port) {
     return result;
 }
 
-void socket_free(socket_t* socket, int closefd) {
+void socket_free(socket_t* socket, int close_sockets) {
     while (socket) {
         socket_t* next = socket->next;
 
-        if (closefd)
+        if (close_sockets)
             close(socket->fd);
 
         free(socket);
