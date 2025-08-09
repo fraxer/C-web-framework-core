@@ -23,13 +23,12 @@ typedef struct connection_queue_http1_data {
 } connection_queue_http1_data_t;
 
 void http1_read(connection_t*, char*, size_t);
-void http1_write(connection_t*, char*, size_t);
+void http1_write(connection_t*);
 ssize_t http1_read_internal(connection_t*, char*, size_t);
 ssize_t http1_write_internal(connection_t*, const char*, size_t);
 ssize_t http1_write_chunked(connection_t*, const char*, size_t, int);
 void http1_handle(connection_t*);
 void http1_client_handle(connection_t*);
-int http1_write_head(connection_t*);
 int http1_write_request_head(connection_t*);
 int http1_write_body(connection_t*, char*, size_t, size_t);
 int http1_get_resource(connection_t*);
@@ -37,11 +36,13 @@ void http1_get_file(connection_t*);
 int http1_get_redirect(connection_t*);
 int http1_apply_redirect(connection_t*);
 char* http1_get_fullpath(connection_t*);
-void http1_prepare_range(http1response_t*, ssize_t*, ssize_t*, size_t*, const size_t);
 int http1_queue_handler_add(connection_t*, void(*)(void*));
 void http1_queue_handler(void*);
 connection_queue_http1_data_t* http1_queue_data_create(connection_t* connection, void(*)(void*));
 void http1_queue_data_free(void* arg);
+
+int http_run_header_filters(http1response_t* response);
+int http_run_body_filters(http1response_t* response);
 
 
 void http1_wrap_read(connection_t* connection, char* buffer, size_t buffer_size) {
@@ -53,10 +54,13 @@ void http1_wrap_read(connection_t* connection, char* buffer, size_t buffer_size)
 }
 
 void http1_wrap_write(connection_t* connection, char* buffer, size_t buffer_size) {
+    (void)buffer;
+    (void)buffer_size;
+
     if (!connection_lock(connection))
         return;
 
-    http1_write(connection, buffer, buffer_size);
+    http1_write(connection);
     connection_unlock(connection);
 }
 
@@ -108,70 +112,12 @@ void http1_read(connection_t* connection, char* buffer, size_t buffer_size) {
     }
 }
 
-void http1_write(connection_t* connection, char* buffer, size_t buffer_size) {
+void http1_write(connection_t* connection) {
     http1response_t* response = (http1response_t*)connection->response;
 
-    if (http1_write_head(connection) == -1) goto write;
+    if (http_run_header_filters(response) == CWF_EVENT_AGAIN) return;
 
-    if (response->body.size == 0 && response->file_.size == 0) {
-        http1_write_body(connection, buffer, 0, 0);
-        goto write;
-    }
-
-    // body
-    if (response->body.pos < response->body.size) {
-        size_t payload_size = response->body.size - response->body.pos;
-        ssize_t end = 0;
-        ssize_t pos = response->body.pos;
-        if (response->ranges) {
-            http1_prepare_range(response, &pos, &end, &payload_size, response->body.size);
-        }
-
-        size_t size = payload_size > buffer_size ? buffer_size : payload_size;
-        buffer = &response->body.data[pos];
-
-        ssize_t writed = http1_write_body(connection, buffer, payload_size, size);
-        if (writed < 0) goto write;
-
-        if (response->ranges) {
-            response->ranges->pos += writed;
-            if (response->ranges->pos < end) return;
-        }
-        else {
-            response->body.pos += writed;
-            if (response->body.pos < response->body.size) return;
-        }
-    }
-
-    // file
-    if (response->file_.fd > 0 && response->file_pos < response->file_.size) {
-        size_t payload_size = response->file_.size - response->file_pos;
-        ssize_t end = 0;
-        ssize_t pos = response->file_pos;
-        if (response->ranges) {
-            http1_prepare_range(response, &pos, &end, &payload_size, response->file_.size);
-        }
-
-        size_t size = payload_size > buffer_size ? buffer_size : payload_size;
-        lseek(response->file_.fd, pos, SEEK_SET);
-
-        ssize_t readed = read(response->file_.fd, buffer, size);
-        if (readed < 0) goto write;
-
-        ssize_t writed = http1_write_body(connection, buffer, payload_size, readed);
-        if (writed < 0) goto write;
-
-        if (response->ranges) {
-            response->ranges->pos += writed;
-            if (response->ranges->pos < end) return;
-        }
-        else {
-            response->file_pos += writed;
-            if (response->file_pos < response->file_.size) return;
-        }
-    }
-
-    write:
+    if (http_run_body_filters(response) == CWF_EVENT_AGAIN) return;
 
     connection->after_write_request(connection);
 }
@@ -235,7 +181,7 @@ void http1_client_write(connection_t* connection, char* buffer, size_t buffer_si
     }
 
     // payload
-    while (request->payload_.file.fd > 0 && request->payload_.pos < request->payload_.file.size) {
+    while (request->payload_.file.fd > -1 && request->payload_.pos < request->payload_.file.size) {
         size_t payload_size = request->payload_.file.size - request->payload_.pos;
         ssize_t pos = request->payload_.pos;
         size_t size = payload_size > buffer_size ? buffer_size : payload_size;
@@ -288,22 +234,6 @@ ssize_t http1_write_chunked(connection_t* connection, const char* data, size_t l
     return writed;
 }
 
-int http1_write_head(connection_t* connection) {
-    http1response_t* response = (http1response_t*)connection->response;
-    if (response->head_writed) return 0;
-
-    http1response_head_t head = http1response_create_head(response);
-    if (head.data == NULL) return -1;
-
-    ssize_t writed = http1_write_internal(connection, head.data, head.size);
-
-    free(head.data);
-
-    response->head_writed = 1;
-    
-    return writed;
-}
-
 int http1_write_request_head(connection_t* connection) {
     http1request_t* request = (http1request_t*)connection->request;
 
@@ -328,10 +258,12 @@ int http1_write_body(connection_t* connection, char* buffer, size_t payload_size
             gzip_t* const gzip = &connection->gzip;
             char compress_buffer[GZIP_BUFFER];
 
-            if (!gzip_deflate_init(gzip, buffer, size)) {
+            if (!gzip_deflate_init(gzip)) {
                 log_error("gzip_deflate_init error\n");
                 return -1;
             }
+
+            gzip_set_in(gzip, buffer, size);
 
             const int gzip_end = (GZIP_BUFFER > payload_size && end) || end;
             do {
@@ -525,17 +457,6 @@ int http1_get_redirect(connection_t* connection) {
     return find_new_location ? REDIRECT_FOUND : REDIRECT_NOT_FOUND;
 }
 
-void http1_prepare_range(http1response_t* response, ssize_t* pos, ssize_t* end, size_t* payload_size, const size_t size) {
-    *end = response->ranges->end > (ssize_t)size ? (ssize_t)size : response->ranges->end;
-    if (response->ranges->end == -1) *end = size;
-
-    ssize_t start = response->ranges->start == -1 ? (ssize_t)size - *end : response->ranges->start;
-    if (response->ranges->pos < start) response->ranges->pos = start;
-
-    *pos = response->ranges->pos;
-    *payload_size = *end + 1 - response->ranges->pos;
-}
-
 int http1_queue_handler_add(connection_t* connection, void(*handle)(void*)) {
     connection_queue_item_t* item = connection_queue_item_create();
     if (item == NULL) return 0;
@@ -587,4 +508,54 @@ void http1_queue_data_free(void* arg) {
         data->ctx->free(data->ctx);
 
     free(data);
+}
+
+int http_run_header_filters(http1response_t* response) {
+    if (response->headers_sended)
+        return CWF_OK;
+
+    response->event_again = 0;
+    response->cur_filter = response->filter;
+
+    while (1) {
+        const int r = response->cur_filter->handler_header(response);
+        switch (r)
+        {
+        case CWF_ERROR: /* close connection */
+            return r;
+        case CWF_EVENT_AGAIN:
+            response->event_again = 1;
+            return r;
+        case CWF_OK:
+            response->headers_sended = 1;
+            return r;
+        }
+    }
+
+    return CWF_OK;
+}
+
+int http_run_body_filters(http1response_t* response) {
+    if (response->event_again)
+        response->event_again = 0;
+
+    while (1) {
+        response->cur_filter = response->filter;
+
+        int r = response->cur_filter->handler_body(response, NULL);
+        switch (r)
+        {
+        case CWF_OK:
+            return CWF_OK;
+        case CWF_ERROR: /* close connection */
+            return r;
+        case CWF_EVENT_AGAIN:
+            response->event_again = 1;
+            return r;
+        case CWF_DATA_AGAIN:
+            continue;
+        }
+    }
+
+    return CWF_OK;
 }
