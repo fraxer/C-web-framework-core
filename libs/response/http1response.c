@@ -34,8 +34,6 @@ static int __http1response_header_add(http1response_t* response, const char* key
 static int __http1response_headern_add(http1response_t* response, const char* key, size_t key_length, const char* value, size_t value_length);
 static int __http1response_headeru_add(http1response_t* response, const char* key, size_t key_length, const char* value, size_t value_length);
 static int __http1response_header_exist(http1response_t* response, const char* key);
-static size_t __http1response_status_length(int status_code);
-static size_t __http1response_head_size(http1response_t* response);
 static int __http1response_alloc_body(http1response_t* response, const char* data, size_t length);
 static int __http1response_header_add_content_length(http1response_t* response, size_t length);
 static const char* __http1response_get_mimetype(const char* extension);
@@ -62,6 +60,7 @@ void __http1response_free(void* arg) {
     http1response_t* response = arg;
 
     __http1response_reset(response);
+    filters_free(response->filter);
     http1responseparser_free(response->parser);
 
     free(response);
@@ -106,14 +105,18 @@ http1response_t* http1response_create(connection_t* connection) {
     response->transfer_encoding = TE_NONE;
     response->content_encoding = CE_NONE;
     response->content_length = 0;
-    response->body.data = NULL;
-    response->body.pos = 0;
-    response->body.size = 0;
     response->file_ = file_alloc();
     response->file_pos = 0;
     response->header_ = NULL;
     response->last_header = NULL;
     response->ranges = NULL;
+    response->filter = filters_create();
+    response->cur_filter = response->filter;
+    response->event_again = 0;
+    response->chunked = 0;
+    response->headers_sended = 0;
+    response->gzip = 0;
+    response->range = 0;
     response->connection = connection;
     response->data = __http1response_data;
     response->datan = __http1response_datan;
@@ -139,6 +142,8 @@ http1response_t* http1response_create(connection_t* connection) {
 
     __http1response_init_payload(response);
 
+    bufo_init(&response->body);
+
     if (!__http1response_init_parser(response)) {
         free(response);
         return NULL;
@@ -152,16 +157,21 @@ void __http1response_reset(http1response_t* response) {
     response->head_writed = 0;
     response->transfer_encoding = TE_NONE;
     response->content_encoding = CE_NONE;
-    response->body.pos = 0;
-    response->body.size = 0;
+    response->event_again = 0;
+    response->chunked = 0;
+    response->headers_sended = 0;
+    response->gzip = 0;
+    response->range = 0;
+
+    filters_reset(response->filter);
+    response->cur_filter = response->filter;
 
     __http1response_payload_free(&response->payload_);
 
     response->file_.close(&response->file_);
     response->file_pos = 0;
 
-    if (response->body.data) free(response->body.data);
-    response->body.data = NULL;
+    bufo_clear(&response->body);
 
     http1_headers_free(response->header_);
     response->header_ = NULL;
@@ -173,37 +183,14 @@ void __http1response_reset(http1response_t* response) {
     http1responseparser_reset(response->parser);
 }
 
-size_t __http1response_head_size(http1response_t* response) {
-    size_t size = 0;
-
-    size += 9; // "HTTP/X.X "
-
-    size += __http1response_status_length(response->status_code);
-
-    http1_header_t* header = response->header_;
-
-    while (header) {
-        size += header->key_length;
-        size += 2; // ": "
-        size += header->value_length;
-        size += 2; // "\r\n"
-
-        header = header->next;
-    }
-
-    size += 2; // "\r\n"
-
-    return size;
-}
-
 void __http1response_data(http1response_t* response, const char* data) {
     __http1response_datan(response, data, strlen(data));
 }
 
 void __http1response_datan(http1response_t* response, const char* data, size_t length) {
-    const char* connection = __http1response_keepalive_enabled(response) ? "keep-alive" : "close";
+    const char* keep_alive = __http1response_keepalive_enabled(response) ? "keep-alive" : "close";
     response->headeru_add(response, "Content-Type", 12, "text/html; charset=utf-8", 24);
-    response->headeru_add(response, "Connection", 10, connection, strlen(connection));
+    response->headeru_add(response, "Connection", 10, keep_alive, strlen(keep_alive));
     response->headeru_add(response, "Cache-Control", 13, "no-store, no-cache", 18);
 
     if (!__http1response_prepare_body(response, length)) {
@@ -374,7 +361,7 @@ int __http1response_headeru_add(http1response_t* response, const char* key, size
     if (!__http1response_header_exist(response, key))
         return __http1response_headern_add(response, key, key_length, value, value_length);
 
-    return 0;
+    return 1;
 }
 
 int __http1response_header_exist(http1response_t* response, const char* key) {
@@ -472,7 +459,7 @@ const char* http1response_status_string(int status_code) {
     return NULL;
 }
 
-size_t __http1response_status_length(int status_code) {
+size_t http1response_status_length(int status_code) {
     switch (status_code) {
     case 100: return 14;
     case 101: return 25;
@@ -556,7 +543,7 @@ void __http1response_default(http1response_t* response, int status_code) {
     const char* str2 = "</h1></body></html>";
     size_t str2_length = strlen(str2);
 
-    size_t status_code_length = __http1response_status_length(status_code) - 2;
+    size_t status_code_length = http1response_status_length(status_code) - 2;
     size_t data_length = str1_length + status_code_length + str2_length;
     size_t pos = 0;
 
@@ -704,37 +691,11 @@ void http1response_redirect(http1response_t* response, const char* path, int sta
         response->header_add(response, "Connection", "Close");
 }
 
-http1response_head_t http1response_create_head(http1response_t* response) {
-    http1response_head_t head = {
-        .size = __http1response_head_size(response),
-        .data = malloc(head.size)
-    };
-
-    size_t pos = 0;
-    if (!data_append(head.data, &pos, "HTTP/1.1 ", 9)) return head;
-    if (!data_append(head.data, &pos, http1response_status_string(response->status_code), __http1response_status_length(response->status_code))) return head;
-
-    http1_header_t* header = response->header_;
-    while (header) {
-        if (!data_append(head.data, &pos, header->key, header->key_length)) return head;
-        if (!data_append(head.data, &pos, ": ", 2)) return head;
-        if (!data_append(head.data, &pos, header->value, header->value_length)) return head;
-        if (!data_append(head.data, &pos, "\r\n", 2)) return head;
-
-        header = header->next;
-    }
-
-    if (!data_append(head.data, &pos, "\r\n", 2)) return head;
-
-    return head;
-}
-
 int __http1response_alloc_body(http1response_t* response, const char* data, size_t length) {
-    response->body.data = malloc(length);
-    if (response->body.data == NULL) return 0;
+    if (!bufo_alloc(&response->body, length)) return 0;
+    if (bufo_append(&response->body, data, length) <= 0) return 0;
 
-    memcpy(response->body.data, data, length);
-    response->body.size = length;
+    bufo_reset_pos(&response->body);
 
     return 1;
 }
@@ -779,48 +740,6 @@ void http1response_free_ranges(http1_ranges_t* ranges) {
 
 int __http1response_prepare_body(http1response_t* response, size_t length) {
     response->headeru_add(response, "Accept-Ranges", 13, "bytes", 5);
-
-    if (!response->ranges) {
-        if (response->content_encoding == CE_GZIP) {
-            if (!response->headeru_add(response, "Transfer-Encoding", 17, "chunked", 7)) return 0;
-            if (!response->headeru_add(response, "Content-Encoding", 16, "gzip", 4)) return 0;
-        }
-
-        if (response->transfer_encoding != TE_CHUNKED) {
-            if (!__http1response_header_exist(response, "Content-Length"))
-                if (!__http1response_header_add_content_length(response, length)) return 0;
-        }
-    }
-    // one range
-    else if (!response->ranges->next) {
-        if (response->ranges->start > (ssize_t)length) {
-            http1response_free_ranges(response->ranges);
-            response->ranges = NULL;
-            response->def(response, 416);
-            return 0;
-        }
-
-        response->status_code = 206;
-
-        ssize_t end = response->ranges->end > (ssize_t)length ? (ssize_t)length : response->ranges->end + 1;
-        if (response->ranges->end == -1) end = length;
-
-        ssize_t start = response->ranges->start;
-        if (response->ranges->start == -1) {
-            end = length;
-            start = (ssize_t)length - response->ranges->end;
-        }
-
-        char bytes[70] = {0};
-        int size = snprintf(bytes, sizeof(bytes), "bytes %ld-%ld/%ld", start, end - 1, length);
-
-        if (!response->headeru_add(response, "Content-Range", 13, bytes, size)) return 0;
-        if (!__http1response_header_add_content_length(response, end - start)) return 0;
-    }
-    // many ranges
-    else if (response->ranges->next) {
-        // TODO
-    }
 
     return 1;
 }
@@ -951,7 +870,7 @@ int http1response_has_payload(http1response_t* response) {
 }
 
 void __http1response_payload_free(http1_payload_t* payload) {
-    if (payload->file.fd <= 0) return;
+    if (payload->file.fd < 0) return;
 
     payload->file.close(&payload->file);
     unlink(payload->path);
