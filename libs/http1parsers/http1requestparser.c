@@ -242,7 +242,7 @@ int http1parser_parse_payload(http1requestparser_t* parser) {
     parser->pos_start = parser->pos;
     parser->pos = parser->bytes_readed;
 
-    if (request->payload_.file.fd <= 0) {
+    if (request->payload_.file.fd < 0) {
         request->payload_.path = create_tmppath(env()->main.tmp);
         if (request->payload_.path == NULL)
             return HTTP1PARSER_ERROR;
@@ -555,7 +555,7 @@ void http1parser_try_set_content_length(http1requestparser_t* parser) {
 
 http1_ranges_t* http1parser_parse_range(char* str, size_t length) {
     int result = -1;
-    int max = 2147483647;
+    long long int max = 9223372036854775807;
     long long int start_finded = 0;
     size_t start_position = 6;
     http1_ranges_t* ranges = NULL;

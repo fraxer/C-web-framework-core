@@ -8,8 +8,8 @@
 
 typedef struct file {
     int fd;
-    int ok;
-    int tmp;
+    unsigned ok;
+    unsigned tmp;
     size_t size;
     char name[NAME_MAX];
 

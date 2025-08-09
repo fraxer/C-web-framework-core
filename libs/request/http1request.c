@@ -227,7 +227,7 @@ const char* http1request_cookie(http1request_t* request, const char* key) {
 }
 
 void http1request_payload_free(http1_payload_t* payload) {
-    if (payload->file.fd <= 0) return;
+    if (payload->file.fd < 0) return;
 
     payload->file.close(&payload->file);
     unlink(payload->path);
@@ -458,7 +458,7 @@ void http1request_payload_parse_plain(http1request_t* request) {
 }
 
 void http1request_payload_parse(http1request_t* request) {
-    if (request->payload_.file.fd == 0) return;
+    if (request->payload_.file.fd < 0) return;
     if (request->payload_.part != NULL) return;
 
     http1_header_t* header = request->header_;
@@ -630,7 +630,7 @@ int http1request_append_urlencoded(http1request_t* request, const char* key, con
     if (payload->type != NONE && payload->type != URLENCODED)
         return 0;
 
-    if (file->fd <= 0) {
+    if (file->fd < 0) {
         if (!http1request_create_payload_file(&request->payload_))
             return 0;
 
@@ -719,7 +719,7 @@ int http1request_append_formdata_raw(http1request_t* request, const char* key, c
     if (payload->type != NONE && payload->type != MULTIPART)
         return 0;
 
-    if (file->fd <= 0) {
+    if (file->fd < 0) {
         if (!http1request_create_payload_file(payload))
             return 0;
         
@@ -799,7 +799,7 @@ int http1request_append_formdata_file_content(http1request_t* request, const cha
         return 0;
 
     int result = 0;
-    if (file->fd <= 0) {
+    if (file->fd < 0) {
         if (!http1request_create_payload_file(payload))
             goto failed;
 
@@ -865,7 +865,7 @@ int http1request_set_payload_raw(http1request_t* request, const char* value, con
     if (payload->type != NONE && payload->type != PLAIN)
         return 0;
 
-    if (file->fd <= 0) {
+    if (file->fd < 0) {
         if (!http1request_create_payload_file(payload))
             return 0;
     }
@@ -921,7 +921,7 @@ int http1request_set_payload_file_content(http1request_t* request, const file_co
         return 0;
 
     int result = 0;
-    if (file->fd <= 0) {
+    if (file->fd < 0) {
         if (!http1request_create_payload_file(payload))
             goto failed;
     }

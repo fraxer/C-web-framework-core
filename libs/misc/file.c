@@ -87,8 +87,9 @@ file_content_t file_content_create(const int fd, const char* filename, const off
 
 file_t file_alloc() {
     return (file_t){
-        .fd = 0,
+        .fd = -1,
         .ok = 0,
+        .tmp = 0,
         .size = 0,
         .name = {0},
 
@@ -121,7 +122,7 @@ char* __file_content(file_t* file) {
 
 int __file_set_content(file_t* file, const char* data, const size_t size) {
     if (file == NULL) return 0;
-    if (file->fd <= 0) return 0;
+    if (file->fd < 0) return 0;
 
     lseek(file->fd, 0, SEEK_SET);
     const int r = write(file->fd, data, size);
@@ -137,7 +138,7 @@ int __file_set_content(file_t* file, const char* data, const size_t size) {
 
 int __file_append_content(file_t* file, const char* data, const size_t size) {
     if (file == NULL) return 0;
-    if (file->fd <= 0) return 0;
+    if (file->fd < 0) return 0;
 
     lseek(file->fd, file->size, SEEK_SET);
     const int r = write(file->fd, data, size);
@@ -149,7 +150,7 @@ int __file_append_content(file_t* file, const char* data, const size_t size) {
 }
 
 int __file_close(file_t* file) {
-    if (file->fd == 0) return 1;
+    if (file->fd < 0) return 1;
 
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "/proc/self/fd/%d", file->fd);
@@ -171,7 +172,7 @@ int __file_close(file_t* file) {
 }
 
 int __file_truncate(file_t* file, const off_t offset) {
-    if (file->fd == 0) return 0;
+    if (file->fd < 0) return 0;
 
     const int status = ftruncate(file->fd, offset);
     if (status == 0) {
@@ -183,8 +184,9 @@ int __file_truncate(file_t* file, const off_t offset) {
 }
 
 void __file_reset(file_t* file) {
-    file->fd = 0;
+    file->fd = -1;
     file->ok = 0;
+    file->tmp = 0;
     file->size = 0;
     memset(file->name, 0, NAME_MAX);
 }

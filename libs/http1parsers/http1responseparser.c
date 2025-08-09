@@ -256,7 +256,7 @@ int __http1responseparser_parse_payload(http1responseparser_t* parser) {
     parser->pos_start = parser->pos;
     parser->pos = parser->bytes_readed;
 
-    if (response->payload_.file.fd <= 0) {
+    if (response->payload_.file.fd < 0) {
         response->payload_.path = create_tmppath(env()->main.tmp);
         if (response->payload_.path == NULL)
             return HTTP1PARSER_ERROR;
