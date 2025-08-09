@@ -126,11 +126,22 @@ char* http1_query_str(http1_query_t* query) {
     if (uri == NULL) return NULL;
 
     while (query != NULL) {
-        str_append(uri, query->key, strlen(query->key));
+        size_t key_length = 0;
+        char* key = urlencodel(query->key, strlen(query->key), &key_length);
+        if (key == NULL) return NULL;
+
+        size_t value_length = 0;
+        char* value = urlencodel(query->value, strlen(query->value), &value_length);
+        if (value == NULL) return NULL;
+
+        str_append(uri, key, key_length);
         str_appendc(uri, '=');
-        str_append(uri, query->value, strlen(query->value));
+        str_append(uri, value, value_length);
         if (query->next != NULL)
             str_appendc(uri, '&');
+
+        free(key);
+        free(value);
 
         query = query->next;
     }
