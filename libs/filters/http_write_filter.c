@@ -1,5 +1,7 @@
 #include <string.h>
 
+#define BUF_SIZE 16384
+
 #include "http_write_filter.h"
 #include "log.h"
 
@@ -113,7 +115,7 @@ void http_write_reset(void* arg) {
 
 int __wr(http1response_t* response, bufo_t* buf) {
     size_t readed = 0;
-    while ((readed = bufo_chunk_size(buf, BUFO_SIZE)) > 0) {
+    while ((readed = bufo_chunk_size(buf, BUF_SIZE)) > 0) {
         // log_error("%.*s", readed, bufo_data(buf));
         ssize_t writed = __write(response->connection, bufo_data(buf), readed);
         if (writed == -1) {

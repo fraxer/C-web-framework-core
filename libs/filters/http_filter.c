@@ -2,6 +2,7 @@
 #include "http_write_filter.h"
 #include "http_chunked_filter.h"
 #include "http_gzip_filter.h"
+#include "http_data_filter.h"
 #include "http_range_filter.h"
 #include "http_not_modified_filter.h"
 
@@ -9,11 +10,15 @@ http_filter_t* filters_create(void) {
     http_filter_t* filter_write = http_write_filter_create();
     http_filter_t* filter_chunked = http_chunked_filter_create();
     http_filter_t* filter_gzip = http_gzip_filter_create();
+    http_filter_t* filter_data = http_data_filter_create();
+    http_filter_t* filter_range = http_range_filter_create();
 
     filter_chunked->next = filter_write;
     filter_gzip->next = filter_chunked;
+    filter_data->next = filter_gzip;
+    filter_range->next = filter_data;
 
-    return filter_gzip;
+    return filter_range;
 }
 
 void filters_reset(http_filter_t* filter) {

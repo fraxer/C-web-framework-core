@@ -12,5 +12,8 @@ int http_not_modified_header(http1response_t* response) {
 }
 
 int http_not_modified_body(http1response_t* response, bufo_t* buf) {
+    (void)response;
+    (void)buf;
+
     return 0;
 }
