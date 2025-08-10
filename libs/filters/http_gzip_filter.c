@@ -73,7 +73,7 @@ int __header(http1response_t* response) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_gzip_t* module = cur_filter->module;
 
-    if (!response->gzip)
+    if (response->content_encoding == CE_NONE)
         return filter_next_handler_header(response);
 
     int r = 0;
@@ -84,7 +84,7 @@ int __header(http1response_t* response) {
     if (response->header(response, "Content-Encoding") == NULL)
         response->header_add(response, "Content-Encoding", "gzip");
 
-    response->chunked = 1;
+    response->transfer_encoding == TE_CHUNKED;
 
     if (!bufo_alloc(module->buf, BUF_SIZE))
         return CWF_ERROR;
@@ -109,7 +109,7 @@ int __body(http1response_t* response, bufo_t* parent_buf) {
     http_module_gzip_t* module = cur_filter->module;
     module->base.parent_buf = parent_buf;
 
-    if (!response->gzip)
+    if (response->content_encoding == CE_NONE)
         return filter_next_handler_body(response, parent_buf);
 
     int r = 0;

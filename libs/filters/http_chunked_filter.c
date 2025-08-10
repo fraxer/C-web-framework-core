@@ -76,7 +76,7 @@ int http_chunked_header(http1response_t* response) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_chunked_t* module = cur_filter->module;
 
-    if (!response->chunked)
+    if (response->transfer_encoding == TE_NONE)
         return filter_next_handler_header(response);
 
     int r = 0;
@@ -107,7 +107,7 @@ int http_chunked_body(http1response_t* response, bufo_t* parent_buf) {
     http_module_chunked_t* module = cur_filter->module;
     module->base.parent_buf = parent_buf;
 
-    if (!response->chunked)
+    if (response->transfer_encoding == TE_NONE)
         return filter_next_handler_body(response, parent_buf);
 
     int r = 0;

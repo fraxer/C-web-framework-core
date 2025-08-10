@@ -63,7 +63,7 @@ int __header(http1response_t* response) {
     if (module->base.cont)
         goto cont;
 
-    if (!response->range && !response->chunked) {
+    if (!response->range && response->transfer_encoding == TE_NONE) {
         size_t data_size = response->body.size;
         if (response->file_.fd > -1)
             data_size = response->file_.size;

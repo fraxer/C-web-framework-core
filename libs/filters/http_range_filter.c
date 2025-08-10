@@ -135,8 +135,8 @@ int __header(http1response_t* response) {
     if (module->base.cont)
         goto cont;
 
-    response->gzip = 0;
-    response->chunked = 0;
+    response->content_encoding = CE_NONE;
+    response->transfer_encoding = TE_NONE;
     response->range = 1;
 
     size_t data_size = response->body.size;

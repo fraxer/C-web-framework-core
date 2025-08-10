@@ -30,24 +30,20 @@ typedef struct http1response {
     http1_version_e version;
     http1_payload_t payload_;
 
-    int status_code;
-    int head_writed;
-    http1_trunsfer_encoding_t transfer_encoding;
-    http1_content_encoding_t content_encoding;
+    short status_code;
     size_t content_length;
 
     bufo_t body;
     file_t file_;
-    size_t file_pos;
     http1_header_t* header_;
     http1_header_t* last_header;
     http1_ranges_t* ranges;
     http_filter_t* filter;
     http_filter_t* cur_filter;
+    unsigned transfer_encoding : 3;
+    unsigned content_encoding : 2;
     unsigned event_again : 1;
-    unsigned chunked : 1;
     unsigned headers_sended : 1;
-    unsigned gzip : 1;
     unsigned range : 1;
 
     void* parser;

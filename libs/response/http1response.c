@@ -101,21 +101,17 @@ http1response_t* http1response_create(connection_t* connection) {
 
     response->status_code = 200;
     response->version = HTTP1_VER_NONE;
-    response->head_writed = 0;
     response->transfer_encoding = TE_NONE;
     response->content_encoding = CE_NONE;
     response->content_length = 0;
     response->file_ = file_alloc();
-    response->file_pos = 0;
     response->header_ = NULL;
     response->last_header = NULL;
     response->ranges = NULL;
     response->filter = filters_create();
     response->cur_filter = response->filter;
     response->event_again = 0;
-    response->chunked = 0;
     response->headers_sended = 0;
-    response->gzip = 0;
     response->range = 0;
     response->connection = connection;
     response->data = __http1response_data;
@@ -154,13 +150,10 @@ http1response_t* http1response_create(connection_t* connection) {
 
 void __http1response_reset(http1response_t* response) {
     response->status_code = 200;
-    response->head_writed = 0;
     response->transfer_encoding = TE_NONE;
     response->content_encoding = CE_NONE;
     response->event_again = 0;
-    response->chunked = 0;
     response->headers_sended = 0;
-    response->gzip = 0;
     response->range = 0;
 
     filters_reset(response->filter);
@@ -169,7 +162,6 @@ void __http1response_reset(http1response_t* response) {
     __http1response_payload_free(&response->payload_);
 
     response->file_.close(&response->file_);
-    response->file_pos = 0;
 
     bufo_clear(&response->body);
 
@@ -351,7 +343,6 @@ int __http1response_headern_add(http1response_t* response, const char* key, size
         else if (cmpstr_lower(header->key, "Content-Encoding") &&
             cmpstr_lower(header->value, "gzip")) {
             response->content_encoding = CE_GZIP;
-            response->gzip = 1;
         }
     }
 
@@ -708,8 +699,7 @@ void __http1response_try_enable_gzip(http1response_t* response, const char* dire
     while (item != NULL) {
         if (cmpstr_lower(item->mimetype, directive)) {
             response->content_encoding = CE_GZIP;
-            response->gzip = 1;
-            response->chunked = 1;
+            response->transfer_encoding = TE_CHUNKED;
             break;
         }
         item = item->next;
@@ -722,7 +712,6 @@ void __http1response_try_enable_te(http1response_t* response, const char* direct
     if (!cmpstr_lower(directive, "chunked")) return;
 
     response->transfer_encoding = TE_CHUNKED;
-    response->chunked = 1;
 }
 
 http1_ranges_t* http1response_init_ranges(void) {
@@ -731,7 +720,6 @@ http1_ranges_t* http1response_init_ranges(void) {
 
     range->start = -1;
     range->end = -1;
-    range->pos = 0;
     range->next = NULL;
 
     return range;

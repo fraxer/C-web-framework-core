@@ -45,7 +45,6 @@ typedef enum http1_trunsfer_encoding {
 typedef struct http1_ranges {
     ssize_t start;
     ssize_t end;
-    ssize_t pos;
     struct http1_ranges* next;
 } http1_ranges_t;
 
