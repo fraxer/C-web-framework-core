@@ -14,7 +14,6 @@ typedef struct gzip {
 int gzip_init(gzip_t* gzip);
 int gzip_free(gzip_t* gzip);
 
-int detect_overflow(gzip_t* gzip);
 int gzip_deflate_init(gzip_t* gzip);
 size_t gzip_deflate(gzip_t* gzip, const char* compress_data, const size_t compress_length, const int end);
 void gzip_set_in(gzip_t* gzip, const char* data, size_t length);

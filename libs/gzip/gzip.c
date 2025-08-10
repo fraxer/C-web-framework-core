@@ -20,11 +20,6 @@ int gzip_free(gzip_t* gzip) {
     return 0;
 }
 
-int detect_overflow(gzip_t* gzip) {
-    return (gzip->stream.avail_out == 0 && 
-           (gzip->stream.avail_in > 0 || gzip->status_code == Z_OK));
-}
-
 int gzip_deflate_init(gzip_t* const gzip) {
     z_stream* const stream = &gzip->stream;
     gzip->is_deflate_init = 0;
@@ -33,7 +28,7 @@ int gzip_deflate_init(gzip_t* const gzip) {
     stream->zfree = Z_NULL;
     stream->opaque = Z_NULL;
 
-    if (deflateInit2(stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, MAX_WBITS + 16, MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY) != Z_OK)
+    if (deflateInit2(stream, Z_BEST_SPEED, Z_DEFLATED, MAX_WBITS + 16, MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY) != Z_OK)
         return 0;
 
     return 1;
