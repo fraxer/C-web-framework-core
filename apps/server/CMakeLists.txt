@@ -6,4 +6,4 @@ FILE(GLOB_RECURSE SOURCES *.c)
 
 add_executable(${PROJECT_NAME} ${SOURCES})
 
-target_link_libraries(${PROJECT_NAME} PUBLIC moduleloader log signal pthread database)
+target_link_libraries(${PROJECT_NAME} PUBLIC moduleloader misc signal pthread database)
