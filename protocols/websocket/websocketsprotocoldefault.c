@@ -1,0 +1,81 @@
+#include <string.h>
+
+#include "websocketsserverhandlers.h"
+#include "websocketsprotocoldefault.h"
+#include "websocketsresponse.h"
+#include "websocketsparser.h"
+#include "appconfig.h"
+
+int websocketsrequest_get_default(connection_t* connection, websocketsrequest_t* request);
+void websockets_protocol_default_reset(void*);
+void websockets_protocol_default_free(void*);
+int websockets_protocol_default_payload_parse(websocketsparser_t* parser, char* data, size_t size);
+
+websockets_protocol_t* websockets_protocol_default_create(void) {
+    websockets_protocol_default_t* protocol = malloc(sizeof * protocol);
+    if (protocol == NULL) return NULL;
+
+    protocol->base.payload_parse = websockets_protocol_default_payload_parse;
+    protocol->base.get_resource = websocketsrequest_get_default;
+    protocol->base.reset = websockets_protocol_default_reset;
+    protocol->base.free = websockets_protocol_default_free;
+    protocol->payload = (char*(*)(websockets_protocol_default_t*))websocketsrequest_payload;
+    protocol->payload_file = (file_content_t(*)(websockets_protocol_default_t*))websocketsrequest_payload_file;
+    protocol->payload_json = (jsondoc_t*(*)(websockets_protocol_default_t*))websocketsrequest_payload_json;
+
+    websockets_protocol_init_payload((websockets_protocol_t*)protocol);
+
+    return (websockets_protocol_t*)protocol;
+}
+
+int websocketsrequest_get_default(connection_t* connection, websocketsrequest_t* request) {
+    connection_server_ctx_t* ctx = connection->ctx;
+
+    return websockets_deferred_handler(connection, request, websockets_queue_request_handler, ctx->server->websockets.default_handler, websockets_queue_data_request_create);
+}
+
+void websockets_protocol_default_reset(void* protocol) {
+    (void)protocol;
+}
+
+void websockets_protocol_default_free(void* protocol) {
+    websockets_protocol_default_reset(protocol);
+    free(protocol);
+}
+
+int websockets_protocol_default_payload_parse(websocketsparser_t* parser, char* string, size_t length) {
+    websocketsrequest_t* request = parser->request;
+
+    for (size_t i = 0; i < length; i++)
+        string[i] ^= parser->frame.mask[parser->payload_index++ % 4];
+
+    const char* tmp_dir = env()->main.tmp;
+    if (!websockets_create_tmpfile(request->protocol, tmp_dir))
+        return 0;
+
+    off_t payloadlength = lseek(request->protocol->payload.fd, 0, SEEK_END);
+    if (payloadlength + length > env()->main.client_max_body_size)
+        return 0;
+
+    int r = write(request->protocol->payload.fd, string, length);
+    lseek(request->protocol->payload.fd, 0, SEEK_SET);
+    if (r <= 0) return 0;
+    
+    return 1;
+}
+
+int set_websockets_default(connection_t* connection) {
+    connection->read = websockets_guard_read;
+    connection->write = websockets_guard_write;
+
+    connection_server_ctx_t* ctx = connection->ctx;
+
+    if (ctx->parser != NULL)
+        websocketsparser_free(ctx->parser);
+
+    ctx->parser = websocketsparser_create(connection, websockets_protocol_default_create);
+    if (ctx->parser == NULL)
+        return 0;
+
+    return 1;
+}
