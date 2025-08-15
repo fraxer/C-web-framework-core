@@ -10,12 +10,12 @@
 int __mpx_epoll_init();
 epoll_config_t* __mpx_epoll_config_init(int);
 void __mpx_epoll_free(void*);
-int __mpx_epoll_control_add(connection_t*, int);
-int __mpx_epoll_control_mod(connection_t*, int);
-int __mpx_epoll_control_del(connection_t*);
+int __mpx_epoll_control_add(connection_s_t*, int);
+int __mpx_epoll_control_mod(connection_s_t*, int);
+int __mpx_epoll_control_del(connection_s_t*);
 int __mpx_epoll_process_events(appconfig_t* appconfig, void* arg);
 int __mpx_epoll_convert_events(int);
-int __mpx_epoll_control(connection_t*, int, uint32_t);
+int __mpx_epoll_control(connection_s_t*, int, uint32_t);
 void __mpx_epoll_config_free(epoll_config_t*);
 
 mpxapi_epoll_t* mpx_epoll_init() {
@@ -91,18 +91,18 @@ void __mpx_epoll_free(void* arg) {
     free(api);
 }
 
-int __mpx_epoll_control_add(connection_t* connection, int events) {
+int __mpx_epoll_control_add(connection_s_t* connection, int events) {
     int result = __mpx_epoll_control(connection, EPOLL_CTL_ADD, __mpx_epoll_convert_events(events));
     if (result) connection->api->connection_count++;
 
     return result;
 }
 
-int __mpx_epoll_control_mod(connection_t* connection, int events) {
+int __mpx_epoll_control_mod(connection_s_t* connection, int events) {
     return __mpx_epoll_control(connection, EPOLL_CTL_MOD, __mpx_epoll_convert_events(events));
 }
 
-int __mpx_epoll_control_del(connection_t* connection) {
+int __mpx_epoll_control_del(connection_s_t* connection) {
     int result = __mpx_epoll_control(connection, EPOLL_CTL_DEL, 0);
     if (result) connection->api->connection_count--;
 
@@ -133,7 +133,7 @@ int __mpx_epoll_process_events(appconfig_t* appconfig, void* arg) {
 
     while (--n >= 0) {
         epoll_event_t* ev = &events[n];
-        connection_t* connection = ev->data.ptr;
+        connection_s_t* connection = ev->data.ptr;
 
         if (connection->destroyed || (ev->events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) || config_shutdown)
             connection->close(connection);
@@ -146,7 +146,7 @@ int __mpx_epoll_process_events(appconfig_t* appconfig, void* arg) {
     return 1;
 }
 
-int __mpx_epoll_control(connection_t* connection, int action, uint32_t flags) {
+int __mpx_epoll_control(connection_s_t* connection, int action, uint32_t flags) {
     mpxapi_epoll_t* api = (mpxapi_epoll_t*)connection->api;
     epoll_event_t event = {
         .data = {
@@ -158,8 +158,8 @@ int __mpx_epoll_control(connection_t* connection, int action, uint32_t flags) {
 
     if (action == EPOLL_CTL_DEL) pevent = NULL;
 
-    if (epoll_ctl(api->fd, action, connection->fd, pevent) == -1) {
-        log_error("Epoll error: Epoll_ctl failed %d %d\n", connection->fd, action);
+    if (epoll_ctl(api->fd, action, connection->base.fd, pevent) == -1) {
+        log_error("Epoll error: Epoll_ctl failed %d %d\n", connection->base.fd, action);
         return 0;
     }
 

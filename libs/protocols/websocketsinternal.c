@@ -68,6 +68,10 @@ void websockets_read(connection_t* connection, char* buffer, size_t buffer_size)
                 return;
             case WSPARSER_CONTINUE:
                 break;
+            case WSPARSER_HANDLE_AND_CONTINUE:
+                websockets_handle(connection, parser);
+                websocketsparser_prepare_remains(parser);
+                break;
             case WSPARSER_COMPLETE:
                 websockets_handle(connection, parser);
                 websocketsparser_reset(parser);

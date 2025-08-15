@@ -6,7 +6,7 @@
 #include "listener.h"
 
 static int __mpxserver_open_listener_sockets(mpxapi_t* api, server_t* server);
-static mpxlistener_t* __mpxserver_listener_create(connection_t* connection);
+static mpxlistener_t* __mpxserver_listener_create(connection_s_t* connection);
 static void __mpxserver_listener_append(mpxlistener_t*, mpxapi_t* api);
 static int __mpxserver_socket_exist(socket_t* socket, server_t* server);
 static void __mpxserver_close_listener_sockets(mpxapi_t* api);
@@ -55,8 +55,8 @@ void __mpxserver_listeners_connection_close(mpxlistener_t* listener) {
     }
 }
 
-int __mpxserver_connection_close(connection_t* connection) {
-    connection_lock(connection);
+int __mpxserver_connection_close(connection_s_t* connection) {
+    connection_s_lock(connection);
 
     if (!connection->destroyed) {
         if (!connection->api->control_del(connection))
@@ -64,25 +64,25 @@ int __mpxserver_connection_close(connection_t* connection) {
 
         connection->destroyed = 1;
 
-        shutdown(connection->fd, SHUT_RDWR);
+        shutdown(connection->base.fd, SHUT_RDWR);
     }
 
-    connection_unlock(connection);
+    connection_s_unlock(connection);
 
     return 1;
 }
 
-int __mpxserver_connection_destroy(connection_t* connection) {
-    connection_lock(connection);
+int __mpxserver_connection_destroy(connection_s_t* connection) {
+    connection_s_lock(connection);
 
-    if (connection->ssl != NULL) {
-        SSL_shutdown(connection->ssl);
-        SSL_clear(connection->ssl);
+    if (connection->base.ssl != NULL) {
+        SSL_shutdown(connection->base.ssl);
+        SSL_clear(connection->base.ssl);
     }
 
-    close(connection->fd);
+    close(connection->base.fd);
 
-    connection_dec(connection);
+    connection_s_dec(connection);
 
     return 1;
 }
@@ -106,7 +106,7 @@ int __mpxserver_open_listener_sockets(mpxapi_t* api, server_t* first_server) {
 
         last_socket = socket;
 
-        connection_t* connection = connection_alloc(socket->fd, api, server->ip, server->port);
+        connection_s_t* connection = connection_s_alloc(socket->fd, api, server->ip, server->port);
         if (connection == NULL) goto failed;
 
         connection->api = api;
@@ -136,7 +136,7 @@ int __mpxserver_open_listener_sockets(mpxapi_t* api, server_t* first_server) {
     return result;
 }
 
-mpxlistener_t* __mpxserver_listener_create(connection_t* connection) {
+mpxlistener_t* __mpxserver_listener_create(connection_s_t* connection) {
     mpxlistener_t* listener = malloc(sizeof * listener);
     if (listener == NULL) return NULL;
 

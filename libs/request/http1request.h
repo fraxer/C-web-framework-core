@@ -33,7 +33,7 @@ typedef struct http1request {
     http1_header_t* last_header;
     http1_cookie_t* cookie_;
 
-    connection_t* connection;
+    void* connection;
 
     const char*(*query)(struct http1request*, const char*);
 

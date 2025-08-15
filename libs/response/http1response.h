@@ -2,6 +2,7 @@
 #define __HTTP1RESPONSE__
 
 #include "connection.h"
+#include "server.h"
 #include "http1common.h"
 #include "array.h"
 #include "json.h"
@@ -47,7 +48,7 @@ typedef struct http1response {
     unsigned range : 1;
 
     void* parser;
-    connection_t* connection;
+    void* connection;
 
     void(*data)(struct http1response*, const char*);
     void(*datan)(struct http1response*, const char*, size_t);

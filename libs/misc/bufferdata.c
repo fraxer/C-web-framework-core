@@ -63,7 +63,6 @@ int bufferdata_move(bufferdata_t* buffer) {
 
     if (buffer->dbuffer_size <= dbuffer_length) {
         char* data = realloc(buffer->dynamic_buffer, dbuffer_length + 1);
-
         if (data == NULL) return 0;
 
         buffer->dbuffer_size = dbuffer_length + 1;
@@ -74,6 +73,28 @@ int bufferdata_move(bufferdata_t* buffer) {
 
     buffer->dynamic_buffer[dbuffer_length] = 0;
     buffer->offset_dbuffer = dbuffer_length;
+    buffer->offset_sbuffer = 0;
+
+    return 1;
+}
+
+int bufferdata_move_data_to_start(bufferdata_t* buffer, size_t offset, size_t size) {
+    char* buffer_data = buffer->static_buffer;
+    if (buffer->type == BUFFERDATA_DYNAMIC)
+        buffer_data = buffer->dynamic_buffer;
+
+    memmove(buffer_data, buffer_data + offset, size);
+
+    if (buffer->type == BUFFERDATA_DYNAMIC) {
+        char* data = realloc(buffer->dynamic_buffer, size + 1);
+        if (data == NULL) return 0;
+
+        buffer->dbuffer_size = size + 1;
+        buffer->dynamic_buffer = data;
+    }
+
+    buffer->dynamic_buffer[size] = 0;
+    buffer->offset_dbuffer = size;
     buffer->offset_sbuffer = 0;
 
     return 1;

@@ -14,13 +14,13 @@ static pthread_mutex_t connection_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void __connection_queue_append(connection_queue_item_t*);
 int __connection_queue_empty(cqueue_t*);
-connection_t* __connection_queue_pop();
+connection_s_t* __connection_queue_pop();
 void __connection_queue_item_free(connection_queue_item_t*);
 int __connection_queue_append_item(cqueue_t* queue, void* data);
 
 
 void __connection_queue_append(connection_queue_item_t* qitem) {
-    connection_inc(qitem->connection);
+    connection_s_inc(qitem->connection);
 
     __connection_queue_append_item(qitem->connection->queue, qitem);
     __connection_queue_append_item(queue, qitem->connection);
@@ -40,28 +40,28 @@ int __connection_queue_append_item(cqueue_t* queue, void* data) {
     return 1;
 }
 
-connection_t* __connection_queue_pop() {
+connection_s_t* __connection_queue_pop() {
     cqueue_lock(queue);
-    connection_t* connection = cqueue_pop(queue);
+    connection_s_t* connection = cqueue_pop(queue);
     cqueue_unlock(queue);
 
     // queue is empty
     if (connection == NULL)
         return NULL;
 
-    connection_lock(connection);
+    connection_s_lock(connection);
 
     if (connection->destroyed) {
-        if (connection_dec(connection) == CONNECTION_DEC_RESULT_DECREMENT)
-            connection_unlock(connection);
+        if (connection_s_dec(connection) == CONNECTION_DEC_RESULT_DECREMENT)
+            connection_s_unlock(connection);
 
         return NULL;
     }
 
-    if (!connection_trylockwrite(connection)) {
+    if (!connection_s_trylockwrite(connection)) {
         connection->queue_pop(connection);
         __connection_queue_append_item(queue, connection);
-        connection_unlock(connection);
+        connection_s_unlock(connection);
 
         return NULL;
     }
@@ -104,7 +104,7 @@ void connection_queue_guard_append(connection_queue_item_t* item) {
     pthread_mutex_unlock(&connection_queue_mutex);
 }
 
-connection_t* connection_queue_guard_pop() {
+connection_s_t* connection_queue_guard_pop() {
     struct timeval now;
     gettimeofday(&now, NULL);
     struct timespec timeToWait = {

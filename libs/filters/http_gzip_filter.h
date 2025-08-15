@@ -2,6 +2,7 @@
 #define __HTTP_GZIP_FILTER__
 
 #include "http1response.h"
+#include "gzip.h"
 
 typedef struct {
     http_module_t base;

@@ -25,7 +25,6 @@ void websocketsparser_init(websocketsparser_t* parser) {
     parser->stage = WSPARSER_FIRST_BYTE;
     parser->mask_index = 0;
     parser->bytes_readed = 0;
-    parser->pos_start = 0;
     parser->pos = 0;
     parser->payload_index = 0;
     parser->buffer = NULL;
@@ -64,13 +63,12 @@ void websocketsparser_set_bytes_readed(websocketsparser_t* parser, size_t bytes_
 }
 
 int websocketsparser_run(websocketsparser_t* parser) {
-    parser->pos_start = 0;
     parser->pos = 0;
 
     if (parser->stage == WSPARSER_PAYLOAD)
         return websocketsparser_parse_payload(parser);
 
-    for (parser->pos = parser->pos_start; parser->pos < parser->bytes_readed; parser->pos++) {
+    for (parser->pos = 0; parser->pos < parser->bytes_readed; parser->pos++) {
         char ch = parser->buffer[parser->pos];
 
         switch (parser->stage) {
@@ -166,7 +164,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
         case WSPARSER_CONTROL_PAYLOAD:
             {
                 parser->payload_saved_length++;
-                int end = parser->payload_saved_length == parser->frame.payload_length;
+                const int end = parser->payload_saved_length == parser->frame.payload_length;
 
                 ch = ch ^ parser->frame.mask[parser->payload_index++ % 4];
 
@@ -186,6 +184,16 @@ int websocketsparser_run(websocketsparser_t* parser) {
     }
 
     return WSPARSER_CONTINUE;
+}
+
+void websocketsparser_prepare_remains(websocketsparser_t* parser) {
+    parser->stage = WSPARSER_FIRST_BYTE;
+    parser->mask_index = 0;
+    parser->payload_index = 0;
+    parser->payload_saved_length = 0;
+
+    websockets_frame_init(&parser->frame);
+    bufferdata_move_data_to_start(&parser->buf, parser->pos, parser->bytes_readed - parser->pos);
 }
 
 int websocketsparser_parse_first_byte(websocketsparser_t* parser) {
@@ -269,15 +277,28 @@ int websocketsparser_parse_mask(websocketsparser_t* parser) {
 int websocketsparser_parse_payload(websocketsparser_t* parser) {
     websocketsrequest_t* request = (websocketsrequest_t*)parser->connection->request;
 
-    size_t pos_start = parser->pos;
-    size_t size = parser->bytes_readed - pos_start;
+    size_t size = parser->bytes_readed - parser->pos;
+    int has_data_for_next_request = 0;
+
+    if (size + parser->payload_saved_length > parser->frame.payload_length) {
+        printf("has_data_for_next_request: %ld > %ld\n", size + parser->payload_saved_length, parser->frame.payload_length);
+        size = parser->frame.payload_length - parser->payload_saved_length;
+        has_data_for_next_request = 1;
+
+    }
 
     parser->payload_saved_length += size;
 
-    if (!request->protocol->payload_parse(request, &parser->buffer[pos_start], size))
+    if (!request->protocol->payload_parse(request, &parser->buffer[parser->pos], size))
         return WSPARSER_ERROR;
 
-    int end_frame = parser->payload_saved_length >= parser->frame.payload_length;
+    if (has_data_for_next_request) {
+        parser->pos += size;
+
+        return WSPARSER_HANDLE_AND_CONTINUE;
+    }
+
+    const int end_frame = parser->payload_saved_length == parser->frame.payload_length;
 
     return end_frame ? WSPARSER_COMPLETE : WSPARSER_CONTINUE;
 }

@@ -1,7 +1,7 @@
 #ifndef __HTTP1TEPARSER__
 #define __HTTP1TEPARSER__
 
-#include "connection.h"
+#include "connection_c.h"
 #include "http1parsercommon.h"
 #include "http1response.h"
 #include "bufferdata.h"
@@ -28,7 +28,7 @@ typedef struct http1teparser {
     size_t chunk_size;
     size_t chunk_size_readed;
     char* buffer;
-    connection_t* connection;
+    connection_c_t* connection;
 } http1teparser_t;
 
 http1teparser_t* http1teparser_init();

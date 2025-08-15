@@ -14,8 +14,6 @@
 
 httpclient_t* __httpclient_create();
 int __httpclient_init_parser(httpclient_t*);
-int __httpclient_after_read(connection_t*);
-int __httpclient_after_write(connection_t*);
 int __httpclient_connection_close(connection_t*);
 void __httpclient_free(httpclient_t*);
 void __httpclient_set_method(httpclient_t*, route_methods_e);
@@ -101,16 +99,6 @@ int __httpclient_init_parser(httpclient_t* client) {
     httpclientparser_init(client->parser);
 
     return 1;
-}
-
-int __httpclient_after_read(connection_t* connection) {
-    (void)connection;
-    return 0;
-}
-
-int __httpclient_after_write(connection_t* connection) {
-    (void)connection;
-    return 0;
 }
 
 int __httpclient_connection_close(connection_t* connection) {
@@ -230,7 +218,7 @@ http1response_t* __httpclient_send(httpclient_t* client) {
 }
 
 int __httpclient_create_connection(httpclient_t* client) {
-    connection_t* connection = __httpclient_resolve(client->host, client->port);
+    connection_c_t* connection = __httpclient_resolve(client->host, client->port);
     if (connection == NULL)
         return 0;
 
@@ -240,8 +228,6 @@ int __httpclient_create_connection(httpclient_t* client) {
 
     connection->client = client;
     connection->ssl_ctx = client->ssl_ctx;
-    connection->after_read_request = __httpclient_after_read;
-    connection->after_write_request = __httpclient_after_write;
     connection->close = __httpclient_connection_close;
     connection->request = (request_t*)client->request;
     connection->response = (response_t*)client->response;
@@ -254,7 +240,7 @@ int __httpclient_create_connection(httpclient_t* client) {
     return 1;
 }
 
-connection_t* __httpclient_resolve(const char* host, const short port) {
+connection_c_t* __httpclient_resolve(const char* host, const short port) {
     if (host == NULL) {
         log_error("__httpclient_resolve: host is NULL\n");
         return NULL;
@@ -278,12 +264,12 @@ connection_t* __httpclient_resolve(const char* host, const short port) {
 
     int fd = -1;
     struct addrinfo* rp = NULL;
-    connection_t* connection = NULL;
+    connection_c_t* connection = NULL;
     for (rp = result; rp != NULL; rp = rp->ai_next) {
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd >= 0) {
             const in_addr_t ip = ((struct sockaddr_in*)rp->ai_addr)->sin_addr.s_addr;
-            connection = connection_client_create(fd, ip, port);
+            connection = connection_c_create(fd, ip, port);
             if (connection == NULL) {
                 close(fd);
                 fd = -1;

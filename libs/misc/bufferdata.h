@@ -27,6 +27,7 @@ size_t bufferdata_writed(bufferdata_t*);
 int bufferdata_push(bufferdata_t*, char);
 int bufferdata_complete(bufferdata_t*);
 int bufferdata_move(bufferdata_t*);
+int bufferdata_move_data_to_start(bufferdata_t*, size_t, size_t);
 
 char* bufferdata_get(bufferdata_t*);
 char* bufferdata_copy(bufferdata_t*);

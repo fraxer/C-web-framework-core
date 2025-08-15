@@ -42,7 +42,7 @@ void http1responseparser_init(http1responseparser_t* parser) {
     bufferdata_init(&parser->buf);
 }
 
-void http1responseparser_set_connection(http1responseparser_t* parser, connection_t* connection) {
+void http1responseparser_set_connection(http1responseparser_t* parser, connection_c_t* connection) {
     parser->connection = connection;
     parser->teparser->connection = connection;
 }
@@ -329,9 +329,9 @@ void __http1responseparser_try_set_keepalive(http1responseparser_t* parser) {
     if ((ssize_t)header->key_length != connection_key_length) return;
     if (!cmpstrn_lower(header->key, header->key_length, connection_key, connection_key_length)) return;
 
-    parser->connection->keepalive_enabled = 0;
+    parser->connection->base.keepalive_enabled = 0;
     if (cmpstrn_lower(header->value, header->value_length, connection_value, connection_value_length)) {
-        parser->connection->keepalive_enabled = 1;
+        parser->connection->base.keepalive_enabled = 1;
     }
 }
 

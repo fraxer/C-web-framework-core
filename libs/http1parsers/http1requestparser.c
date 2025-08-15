@@ -41,7 +41,7 @@ void http1parser_init(http1requestparser_t* parser) {
     bufferdata_init(&parser->buf);
 }
 
-void http1parser_set_connection(http1requestparser_t* parser, connection_t* connection) {
+void http1parser_set_connection(http1requestparser_t* parser, connection_s_t* connection) {
     parser->connection = connection;
 }
 
@@ -473,7 +473,7 @@ int http1parser_host_not_found(http1requestparser_t* parser) {
 
     server_t* server = parser->connection->server;
     while (server) {
-        if (server->ip == parser->connection->ip && server->port == parser->connection->port) {
+        if (server->ip == parser->connection->base.ip && server->port == parser->connection->base.port) {
             domain_t* server_domain = server->domain;
 
             while (server_domain) {
@@ -507,9 +507,9 @@ void http1parser_try_set_keepalive(http1requestparser_t* parser) {
     if ((ssize_t)header->key_length != connection_key_length) return;
     if (!cmpstrn_lower(header->key, header->key_length, connection_key, connection_key_length)) return;
 
-    parser->connection->keepalive_enabled = 0;
+    parser->connection->base.keepalive_enabled = 0;
     if (cmpstrn_lower(header->value, header->value_length, connection_value, connection_value_length)) {
-        parser->connection->keepalive_enabled = 1;
+        parser->connection->base.keepalive_enabled = 1;
     }
 }
 

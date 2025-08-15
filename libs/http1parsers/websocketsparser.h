@@ -13,7 +13,8 @@ enum websocketsparser_status {
     WSPARSER_OUT_OF_MEMORY,
     WSPARSER_BAD_REQUEST,
     WSPARSER_HOST_NOT_FOUND,
-    WSPARSER_PAYLOAD_LARGE
+    WSPARSER_PAYLOAD_LARGE,
+    WSPARSER_HANDLE_AND_CONTINUE
 };
 
 enum websocketsparser_opcode {
@@ -50,7 +51,6 @@ typedef struct websocketsparser {
     int mask_index;
 
     size_t bytes_readed;
-    size_t pos_start;
     size_t pos;
     ssize_t payload_index;
     size_t payload_saved_length;
@@ -72,5 +72,7 @@ void websocketsparser_free(websocketsparser_t*);
 void websocketsparser_set_bytes_readed(websocketsparser_t*, size_t);
 
 int websocketsparser_run(websocketsparser_t*);
+
+void websocketsparser_prepare_remains(websocketsparser_t*);
 
 #endif

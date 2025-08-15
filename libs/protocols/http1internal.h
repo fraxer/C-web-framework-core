@@ -1,12 +1,12 @@
 #ifndef __HTTP1INTERNAL__
 #define __HTTP1INTERNAL__
 
-#include "connection.h"
+#include "connection_s.h"
 
-void http1_wrap_read(connection_t*, char*, size_t);
-void http1_wrap_write(connection_t*, char*, size_t);
+void http1_wrap_read(connection_s_t*, char*, size_t);
+void http1_wrap_write(connection_s_t*, char*, size_t);
 
-void http1_client_read(connection_t*, char*, size_t);
-void http1_client_write(connection_t*, char*, size_t);
+void http1_client_read(connection_s_t*, char*, size_t);
+void http1_client_write(connection_s_t*, char*, size_t);
 
 #endif

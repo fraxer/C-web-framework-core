@@ -220,10 +220,6 @@ int websockets_protocol_resource_payload_parse(websocketsrequest_t* request, cha
 
         int r = write(request->protocol->payload.fd, &string[offset], length - offset);
 
-        if (r > 10) {
-            int i = 0;
-        }
-
         lseek(request->protocol->payload.fd, 0, SEEK_SET);
         if (r <= 0) return 0;
     }

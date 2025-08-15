@@ -84,7 +84,7 @@ int __header(http1response_t* response) {
     if (response->header(response, "Content-Encoding") == NULL)
         response->header_add(response, "Content-Encoding", "gzip");
 
-    response->transfer_encoding == TE_CHUNKED;
+    response->transfer_encoding = TE_CHUNKED;
 
     if (!bufo_alloc(module->buf, BUF_SIZE))
         return CWF_ERROR;

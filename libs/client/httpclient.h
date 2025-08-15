@@ -5,7 +5,7 @@
 #include <openssl/ssl.h>
 
 #include "route.h"
-#include "connection.h"
+#include "connection_c.h"
 #include "http1common.h"
 #include "http1request.h"
 #include "http1response.h"
@@ -26,7 +26,7 @@ typedef struct httpclient {
     int timeout;
     char* host;
     SSL_CTX* ssl_ctx;
-    connection_t* connection;
+    connection_c_t* connection;
     http1request_t* request;
     http1response_t* response;
     httpclientparser_t* parser;

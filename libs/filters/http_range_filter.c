@@ -112,7 +112,6 @@ int __get_range(http1response_t* response, http_module_range_t* module) {
 ssize_t __get_file_range(http1response_t* response, http_module_range_t* module, size_t offset, size_t capacity) {
     lseek(response->file_.fd, offset, SEEK_SET);
     const ssize_t r = read(response->file_.fd, module->buf->data, capacity);
-    lseek(response->file_.fd, 0, SEEK_SET);
 
     return r;
 }

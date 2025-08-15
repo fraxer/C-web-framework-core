@@ -1,7 +1,7 @@
 #ifndef __HTTP1REQUESTPARSER__
 #define __HTTP1REQUESTPARSER__
 
-#include "connection.h"
+#include "connection_s.h"
 #include "http1parsercommon.h"
 #include "http1request.h"
 #include "bufferdata.h"
@@ -30,12 +30,12 @@ typedef struct http1requestparser {
     size_t content_length;
     size_t content_saved_length;
     char* buffer;
-    connection_t* connection;
+    connection_s_t* connection;
 } http1requestparser_t;
 
 void http1parser_init(http1requestparser_t*);
 
-void http1parser_set_connection(http1requestparser_t*, connection_t*);
+void http1parser_set_connection(http1requestparser_t*, connection_s_t*);
 
 void http1parser_set_buffer(http1requestparser_t*, char*);
 

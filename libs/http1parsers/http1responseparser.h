@@ -1,7 +1,7 @@
 #ifndef __HTTP1RESPONSEPARSER__
 #define __HTTP1RESPONSEPARSER__
 
-#include "connection.h"
+#include "connection_c.h"
 #include "http1parsercommon.h"
 #include "http1teparser.h"
 #include "http1response.h"
@@ -30,13 +30,13 @@ typedef struct http1responseparser {
     size_t content_length;
     size_t content_saved_length;
     char* buffer;
-    connection_t* connection;
+    connection_c_t* connection;
     http1teparser_t* teparser;
 } http1responseparser_t;
 
 void http1responseparser_init(http1responseparser_t*);
 
-void http1responseparser_set_connection(http1responseparser_t*, connection_t*);
+void http1responseparser_set_connection(http1responseparser_t*, connection_c_t*);
 
 void http1responseparser_set_buffer(http1responseparser_t*, char*);
 
