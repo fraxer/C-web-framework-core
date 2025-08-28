@@ -1,8 +1,10 @@
+#include <errno.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/epoll.h>
 
 #include "log.h"
+#include "connection_s.h"
 #include "multiplexingepoll.h"
 
 #define EPOLL_MAX_EVENTS 16
@@ -18,7 +20,7 @@ int __mpx_epoll_convert_events(int);
 int __mpx_epoll_control(connection_s_t*, int, uint32_t);
 void __mpx_epoll_config_free(epoll_config_t*);
 
-mpxapi_epoll_t* mpx_epoll_init() {
+void* mpx_epoll_init() {
     mpxapi_epoll_t* result = NULL;
     mpxapi_epoll_t* api = malloc(sizeof * api);
     if (api == NULL) {
@@ -30,7 +32,6 @@ mpxapi_epoll_t* mpx_epoll_init() {
 
     api->base.connection_count = 0;
     api->base.config = __mpx_epoll_config_init(fd);
-    api->base.listeners = NULL;
     api->base.free = __mpx_epoll_free;
     api->base.control_add = __mpx_epoll_control_add;
     api->base.control_del = __mpx_epoll_control_del;
@@ -68,13 +69,6 @@ epoll_config_t* __mpx_epoll_config_init(int basefd) {
 
     iconfig->basefd = basefd;
     iconfig->timeout = 1000;
-    iconfig->buffer = malloc(sizeof(char) * env()->main.buffer_size);
-    iconfig->buffer_size = env()->main.buffer_size;
-
-    if (iconfig->buffer == NULL) {
-        free(iconfig);
-        return NULL;
-    }
 
     return iconfig;
 }
@@ -93,7 +87,7 @@ void __mpx_epoll_free(void* arg) {
 
 int __mpx_epoll_control_add(connection_s_t* connection, int events) {
     int result = __mpx_epoll_control(connection, EPOLL_CTL_ADD, __mpx_epoll_convert_events(events));
-    if (result) connection->api->connection_count++;
+    if (result) connection->listener->api->connection_count++;
 
     return result;
 }
@@ -104,7 +98,7 @@ int __mpx_epoll_control_mod(connection_s_t* connection, int events) {
 
 int __mpx_epoll_control_del(connection_s_t* connection) {
     int result = __mpx_epoll_control(connection, EPOLL_CTL_DEL, 0);
-    if (result) connection->api->connection_count--;
+    if (result) connection->listener->api->connection_count--;
 
     return result;
 }
@@ -135,19 +129,23 @@ int __mpx_epoll_process_events(appconfig_t* appconfig, void* arg) {
         epoll_event_t* ev = &events[n];
         connection_s_t* connection = ev->data.ptr;
 
-        if (connection->destroyed || (ev->events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) || config_shutdown)
-            connection->close(connection);
-        else if (ev->events & EPOLLIN)
-            connection->read(connection, apiconfig->buffer, apiconfig->buffer_size);
-        else if (ev->events & EPOLLOUT)
-            connection->write(connection, apiconfig->buffer, apiconfig->buffer_size);
+        if (connection->destroyed || (ev->events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) || config_shutdown) {
+            connection->base.close(connection);
+            continue;
+        }
+
+        if (ev->events & EPOLLIN)
+            connection->base.read(connection);
+
+        if (ev->events & EPOLLOUT)
+            connection->base.write(connection);
     }
 
     return 1;
 }
 
 int __mpx_epoll_control(connection_s_t* connection, int action, uint32_t flags) {
-    mpxapi_epoll_t* api = (mpxapi_epoll_t*)connection->api;
+    mpxapi_epoll_t* api = connection->listener->api;
     epoll_event_t event = {
         .data = {
             .ptr = connection
@@ -168,9 +166,6 @@ int __mpx_epoll_control(connection_s_t* connection, int action, uint32_t flags) 
 
 void __mpx_epoll_config_free(epoll_config_t* config) {
     if (config == NULL) return;
-
-    if (config->buffer != NULL)
-        free(config->buffer);
 
     free(config);
 }

@@ -26,7 +26,7 @@ typedef struct httpclient {
     int timeout;
     char* host;
     SSL_CTX* ssl_ctx;
-    connection_c_t* connection;
+    connection_t* connection;
     http1request_t* request;
     http1response_t* response;
     httpclientparser_t* parser;

@@ -5,43 +5,43 @@
 #include "openssl.h"
 #include "connection_c.h"
 
-connection_c_t* __connection_c_alloc(int fd, in_addr_t ip, unsigned short int port);
+connection_t* __connection_c_alloc(int fd, in_addr_t ip, unsigned short int port);
 
-connection_c_t* connection_c_create(const int fd, const in_addr_t ip, const short port) {
+connection_t* connection_c_create(const int fd, const in_addr_t ip, const short port) {
     return __connection_c_alloc(fd, ip, port);
 }
 
-connection_c_t* __connection_c_alloc(int fd, in_addr_t ip, unsigned short int port) {
-    connection_c_t* connection = malloc(sizeof * connection);
+connection_t* __connection_c_alloc(int fd, in_addr_t ip, unsigned short int port) {
+    connection_t* connection = malloc(sizeof * connection);
     if (connection == NULL) return NULL;
 
-    connection->base.fd = fd;
-    connection->base.keepalive_enabled = 0;
-    connection->base.ip = ip;
-    connection->base.port = port;
-    connection->base.ssl = NULL;
-    connection->base.ssl_ctx = NULL;
-    connection->client = NULL;
+    connection->fd = fd;
+    connection->keepalive = 0;
+    connection->ip = ip;
+    connection->port = port;
+    connection->ssl = NULL;
+    connection->ssl_ctx = NULL;
+    // connection->client = NULL;
     connection->request = NULL;
     connection->response = NULL;
 
-    if (!gzip_init(&connection->gzip)) {
-        free(connection);
-        return NULL;
-    }
+    // if (!gzip_init(&connection->gzip)) {
+    //     free(connection);
+    //     return NULL;
+    // }
 
     return connection;
 }
 
-void connection_free(connection_c_t* connection) {
+void connection_free(connection_t* connection) {
     if (connection == NULL) return;
 
-    gzip_free(&connection->gzip);
+    // gzip_free(&connection->gzip);
 
-    if (connection->base.ssl != NULL) {
-        SSL_free_buffers(connection->base.ssl);
-        SSL_free(connection->base.ssl);
-        connection->base.ssl = NULL;
+    if (connection->ssl != NULL) {
+        SSL_free_buffers(connection->ssl);
+        SSL_free(connection->ssl);
+        connection->ssl = NULL;
     }
 
     if (connection->request != NULL) {
@@ -57,10 +57,10 @@ void connection_free(connection_c_t* connection) {
     free(connection);
 }
 
-void connection_reset(connection_c_t* connection) {
+void connection_reset(connection_t* connection) {
     if (connection == NULL) return;
 
-    gzip_free(&connection->gzip);
+    // gzip_free(&connection->gzip);
 
     if (connection->request != NULL)
         connection->request->reset(connection->request);

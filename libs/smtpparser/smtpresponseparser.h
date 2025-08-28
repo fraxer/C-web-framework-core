@@ -1,7 +1,7 @@
 #ifndef __SMTPRESPONSEPARSER__
 #define __SMTPRESPONSEPARSER__
 
-#include "connection.h"
+#include "connection_c.h"
 #include "smtpresponse.h"
 #include "bufferdata.h"
 
@@ -25,11 +25,11 @@ typedef struct smtpresponseparser {
     size_t pos;
     size_t line_size;
     char* buffer;
-    connection_t* connection;
+    connection_c_t* connection;
 } smtpresponseparser_t;
 
 void smtpresponseparser_init(smtpresponseparser_t*);
-void smtpresponseparser_set_connection(smtpresponseparser_t*, connection_t*);
+void smtpresponseparser_set_connection(smtpresponseparser_t*, connection_c_t*);
 void smtpresponseparser_set_buffer(smtpresponseparser_t*, char*);
 void smtpresponseparser_free(smtpresponseparser_t*);
 void smtpresponseparser_reset(smtpresponseparser_t*);

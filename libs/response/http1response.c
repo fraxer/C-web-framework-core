@@ -200,7 +200,8 @@ void __http1response_file(http1response_t* response, const char* path) {
 
 void __http1response_filen(http1response_t* response, const char* path, size_t length) {
     char file_full_path[PATH_MAX];
-    const file_status_e status_code = http1_get_file_full_path(response->connection->server, file_full_path, PATH_MAX, path, length);
+    connection_s_t* connection = response->connection;
+    const file_status_e status_code = http1_get_file_full_path(connection->listener->server, file_full_path, PATH_MAX, path, length);
     if (status_code != FILE_OK) {
         response->def(response, status_code);
         return;
@@ -670,7 +671,8 @@ void __http1response_models(http1response_t* response, array_t* models, ...) {
 }
 
 int __http1response_keepalive_enabled(http1response_t* response) {
-    return response->connection->keepalive_enabled;
+    connection_t* connection = response->connection;
+    return connection->keepalive;
 }
 
 void http1response_redirect(http1response_t* response, const char* path, int status_code) {

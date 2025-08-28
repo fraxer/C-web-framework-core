@@ -1,7 +1,7 @@
 #ifndef __TLS__
 #define __TLS__
 
-#include "connection.h"
+#include "connection_s.h"
 #include "openssl.h"
 
 void tls_read(connection_t*, char*, size_t);

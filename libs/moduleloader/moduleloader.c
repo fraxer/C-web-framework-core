@@ -291,22 +291,6 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
     env->main.threads = json_int(token_threads);
 
 
-    const jsontok_t* token_buffer_size = json_object_get(token_main, "buffer_size");
-    if (token_buffer_size == NULL) {
-        log_error("module_loader_config_load: buffer_size not found\n");
-        return 0;
-    }
-    if (!json_is_int(token_buffer_size)) {
-        log_error("module_loader_config_load: buffer_size must be int\n");
-        return 0;
-    }
-    if (json_int(token_buffer_size) < 1) {
-        log_error("module_loader_config_load: buffer_size must be >= 1\n");
-        return 0;
-    }
-    env->main.buffer_size = json_int(token_buffer_size);
-
-
     const jsontok_t* token_client_max_body_size = json_object_get(token_main, "client_max_body_size");
     if (token_client_max_body_size == NULL) {
         log_error("module_loader_config_load: client_max_body_size not found\n");

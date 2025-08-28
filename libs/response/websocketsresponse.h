@@ -1,7 +1,7 @@
 #ifndef __WEBSOCKETSRESPONSE__
 #define __WEBSOCKETSRESPONSE__
 
-#include "connection.h"
+#include "connection_s.h"
 #include "websocketscommon.h"
 #include "response.h"
 
@@ -13,7 +13,7 @@ typedef struct websocketsresponse {
     websockets_body_t body;
     websockets_file_t file_;
 
-    connection_t* connection;
+    connection_s_t* connection;
 
     void(*text)(struct websocketsresponse*, const char*);
     void(*textn)(struct websocketsresponse*, const char*, size_t);
@@ -25,7 +25,7 @@ typedef struct websocketsresponse {
     int(*filen)(struct websocketsresponse*, const char*, size_t);
 } websocketsresponse_t;
 
-websocketsresponse_t* websocketsresponse_create(connection_t*);
+websocketsresponse_t* websocketsresponse_create(connection_s_t*);
 
 void websocketsresponse_default_response(websocketsresponse_t*, const char*);
 

@@ -23,7 +23,6 @@ typedef struct env_main {
     appconfig_reload_state_e reload;
     unsigned int workers;
     unsigned int threads;
-    unsigned int buffer_size;
     unsigned int client_max_body_size;
     char* tmp;
     env_gzip_str_t* gzip;

@@ -46,7 +46,7 @@ void websockets_read(connection_t* connection, char* buffer, size_t buffer_size)
         case -1:
             return;
         case 0:
-            connection->keepalive_enabled = 0;
+            connection->keepalive = 0;
             connection->after_read_request(connection);
             return;
         default:
@@ -148,7 +148,7 @@ void websockets_handle(connection_t* connection, websocketsparser_t* parser) {
     if (parser->frame.fin) {
         if (parser->frame.opcode == WSOPCODE_CLOSE) {
             websocketsresponse_close(response, bufferdata_get(&parser->buf), bufferdata_writed(&parser->buf));
-            connection->keepalive_enabled = 0;
+            connection->keepalive = 0;
             connection->after_read_request(connection);
             return;
         }

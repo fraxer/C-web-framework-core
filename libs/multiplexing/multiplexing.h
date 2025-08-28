@@ -4,7 +4,7 @@
 #include <stdatomic.h>
 
 #include "appconfig.h"
-#include "connection_s.h"
+#include "connection.h"
 
 enum mpxevents {
     MPXIN = 0x001,
@@ -15,28 +15,17 @@ enum mpxevents {
     MPXONESHOT = 0x020
 };
 
-typedef enum mpxtype {
-    MULTIPLEX_TYPE_EPOLL = 0
-} mpxtype_e;
-
-typedef struct mpxlistener {
-    connection_s_t* connection;
-    struct mpxlistener* next;
-} mpxlistener_t;
-
 typedef struct mpxapi {
     atomic_int connection_count;
     void* config;
-    mpxlistener_t* listeners;
     void(*free)(void*);
-    int(*control_add)(connection_s_t*, int);
-    int(*control_mod)(connection_s_t*, int);
-    int(*control_del)(connection_s_t*);
+    int(*control_add)(connection_t*, int);
+    int(*control_mod)(connection_t*, int);
+    int(*control_del)(connection_t*);
     int(*process_events)(appconfig_t* appconfig, void* arg);
 } mpxapi_t;
 
-mpxapi_t* mpx_create(mpxtype_e);
+mpxapi_t* mpx_create();
 void mpx_free(mpxapi_t*);
-void mpxlistener_free(mpxlistener_t*);
 
 #endif

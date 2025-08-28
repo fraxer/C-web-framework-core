@@ -2,7 +2,7 @@
 #define __WEBSOCKETSREQUEST__
 
 #include "route.h"
-#include "connection.h"
+#include "connection_s.h"
 #include "websocketscommon.h"
 #include "json.h"
 #include "request.h"

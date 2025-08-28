@@ -3,7 +3,7 @@
 
 #include <unistd.h>
 
-#include "connection.h"
+#include "connection_s.h"
 
 void websockets_wrap_read(connection_t*, char*, size_t);
 void websockets_wrap_write(connection_t*, char*, size_t);

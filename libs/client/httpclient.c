@@ -226,7 +226,7 @@ int __httpclient_create_connection(httpclient_t* client) {
     client->request->connection = connection;
     client->response->connection = connection;
 
-    connection->client = client;
+    // connection->client = client;
     connection->ssl_ctx = client->ssl_ctx;
     connection->close = __httpclient_connection_close;
     connection->request = (request_t*)client->request;

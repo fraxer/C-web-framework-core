@@ -69,6 +69,7 @@ typedef struct http1request {
 } http1request_t;
 
 http1request_t* http1request_create(connection_t*);
+void http1request_free(void* arg);
 char* http1request_payload(http1request_t*);
 char* http1request_payloadf(http1request_t*, const char*);
 file_content_t http1request_payload_file(http1request_t*);

@@ -26,7 +26,7 @@ void* thread_handler(void* arg) {
             continue;
 
         connection_queue_item_t* item = cqueue_pop(connection->queue);
-        item->handle(item);
+        item->run(item);
         item->free(item);
         if (connection_dec(connection) == CONNECTION_DEC_RESULT_DECREMENT)
             connection_unlock(connection);

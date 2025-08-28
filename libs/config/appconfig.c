@@ -167,7 +167,6 @@ void __appconfig_env_init(env_t* env) {
     env->main.reload = APPCONFIG_RELOAD_SOFT;
     env->main.client_max_body_size = 0;
     env->main.gzip = NULL;
-    env->main.buffer_size = 0;
     env->main.threads = 0;
     env->main.workers = 0;
     env->main.tmp = NULL;
@@ -181,7 +180,6 @@ void __appconfig_env_free(env_t* env) {
     if (env == NULL) return;
 
     env->main.client_max_body_size = 0;
-    env->main.buffer_size = 0;
     env->main.threads = 0;
     env->main.workers = 0;
 

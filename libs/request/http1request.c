@@ -86,8 +86,6 @@ void http1request_free(void* arg) {
     http1parser_free(request->parser);
 
     free(request);
-
-    request = NULL;
 }
 
 http1request_t* http1request_create(connection_t* connection) {
@@ -398,7 +396,7 @@ void http1request_payload_parse_multipart(http1request_t* request, const char* h
     multipartparser_t mparser;
     multipartparser_init(&mparser, request->payload_.file.fd, boundary);
 
-    size_t buffer_size = env()->main.buffer_size;
+    size_t buffer_size = 16384;
     char* buffer = malloc(buffer_size);
     if (buffer == NULL) {
         free(boundary);
@@ -424,7 +422,7 @@ void http1request_payload_parse_multipart(http1request_t* request, const char* h
 }
 
 void http1request_payload_parse_urlencoded(http1request_t* request) {
-    size_t buffer_size = env()->main.buffer_size;
+    size_t buffer_size = 16384;
     char* buffer = malloc(buffer_size);
     if (buffer == NULL) return;
 

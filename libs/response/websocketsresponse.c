@@ -45,7 +45,7 @@ void websocketsresponse_free(void* arg) {
     response = NULL;
 }
 
-websocketsresponse_t* websocketsresponse_create(connection_t* connection) {
+websocketsresponse_t* websocketsresponse_create(connection_s_t* connection) {
     websocketsresponse_t* response = websocketsresponse_alloc();
 
     if (response == NULL) return NULL;
@@ -202,7 +202,8 @@ void websocketsresponse_data(websocketsresponse_t* response, const char* data) {
 }
 
 void websocketsresponse_datan(websocketsresponse_t* response, const char* data, size_t length) {
-    if (((websocketsrequest_t*)response->connection->request)->type == WEBSOCKETS_TEXT) {
+    connection_s_t* connection = response->connection;
+    if (((websocketsrequest_t*)connection->request)->type == WEBSOCKETS_TEXT) {
         websocketsresponse_textn(response, data, length);
         return;
     }
@@ -216,7 +217,8 @@ int websocketsresponse_file(websocketsresponse_t* response, const char* path) {
 
 int websocketsresponse_filen(websocketsresponse_t* response, const char* path, size_t length) {
     char file_full_path[PATH_MAX];
-    const file_status_e status = __get_file_full_path(response->connection->server, file_full_path, PATH_MAX, path, length);
+    connection_s_t* connection = response->connection;
+    const file_status_e status = __get_file_full_path(connection->listener->server, file_full_path, PATH_MAX, path, length);
     if (status == FILE_FORBIDDEN) {
         websocketsresponse_default_response(response, "resource forbidden");
         return -1;

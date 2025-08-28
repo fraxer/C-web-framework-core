@@ -18,8 +18,7 @@
 
 typedef struct connection_queue_http1_data {
     connection_queue_item_data_t base;
-    httpctx_t* ctx;
-    void(*handler)(void*);
+    http1request_t* request;
 } connection_queue_http1_data_t;
 
 void http1_read(connection_t*, char*, size_t);
@@ -27,19 +26,20 @@ void http1_write(connection_t*);
 ssize_t http1_read_internal(connection_t*, char*, size_t);
 ssize_t http1_write_internal(connection_t*, const char*, size_t);
 ssize_t http1_write_chunked(connection_t*, const char*, size_t, int);
-void http1_handle(connection_t*);
+void http1_handle(connection_t* connection, http1request_t* request);
 void http1_client_handle(connection_t*);
 int http1_write_request_head(connection_t*);
 int http1_write_body(connection_t*, char*, size_t, size_t);
-int http1_get_resource(connection_t*);
+int http1_get_resource(connection_t* connection, http1request_t* request);
 void http1_get_file(connection_t*);
 int http1_get_redirect(connection_t*);
 int http1_apply_redirect(connection_t*);
 char* http1_get_fullpath(connection_t*);
-int http1_queue_handler_add(connection_t*, void(*)(void*));
+int http1_queue_handler_add(connection_t* connection, http1request_t* request, void(*handle)(void*));
 void http1_queue_handler(void*);
-connection_queue_http1_data_t* http1_queue_data_create(connection_t* connection, void(*)(void*));
+void* http1_queue_data_create(http1request_t* request);
 void http1_queue_data_free(void* arg);
+
 
 int http_run_header_filters(http1response_t* response);
 int http_run_body_filters(http1response_t* response);
@@ -77,7 +77,7 @@ void http1_read(connection_t* connection, char* buffer, size_t buffer_size) {
         case -1:
             return;
         case 0:
-            connection->keepalive_enabled = 0;
+            connection->keepalive = 0;
             connection->after_read_request(connection);
             return;
         default:
@@ -104,8 +104,8 @@ void http1_read(connection_t* connection, char* buffer, size_t buffer_size) {
             case HTTP1PARSER_CONTINUE:
                 break;
             case HTTP1PARSER_COMPLETE:
+                http1_handle(connection, parser->request);
                 http1parser_reset(parser);
-                http1_handle(connection);
                 return;
             }
         }
@@ -135,7 +135,7 @@ void http1_client_read(connection_t* connection, char* buffer, size_t buffer_siz
             connection->after_read_request(connection);
             return;
         case 0:
-            connection->keepalive_enabled = 0;
+            connection->keepalive = 0;
             connection->after_read_request(connection);
             return;
         default:
@@ -294,8 +294,8 @@ int http1_write_body(connection_t* connection, char* buffer, size_t payload_size
     return writed;
 }
 
-void http1_handle(connection_t* connection) {
-    http1request_t* request = (http1request_t*)connection->request;
+void http1_handle(connection_t* connection, http1request_t* request) {
+    // http1request_t* request = (http1request_t*)connection->request;
     http1response_t* response = (http1response_t*)connection->response;
 
     if (request->method == ROUTE_NONE) {
@@ -317,7 +317,7 @@ void http1_handle(connection_t* connection) {
         else
             response->def(response, 400);
     }
-    else if (http1_get_resource(connection) == 0)
+    else if (http1_get_resource(connection, request) == 0)
         return;
     else
         response->def(response, status_code);
@@ -329,14 +329,12 @@ void http1_client_handle(connection_t* connection) {
     connection->after_read_request(connection);
 }
 
-int http1_get_resource(connection_t* connection) {
-    http1request_t* request = (http1request_t*)connection->request;
-
+int http1_get_resource(connection_t* connection, http1request_t* request) {
     for (route_t* route = connection->server->http.route; route; route = route->next) {
         if (route->is_primitive && route_compare_primitive(route, request->path, request->path_length)) {
             if (route->handler[request->method] == NULL) return -1;
 
-            if (!http1_queue_handler_add(connection, route->handler[request->method]))
+            if (!http1_queue_handler_add(connection, request, route->handler[request->method]))
                 return -1;
 
             return 0;
@@ -363,7 +361,7 @@ int http1_get_resource(connection_t* connection) {
 
             if (route->handler[request->method] == NULL) return -1;
 
-            if (!http1_queue_handler_add(connection, route->handler[request->method]))
+            if (!http1_queue_handler_add(connection, request, route->handler[request->method]))
                 return -1;
 
             return 0;
@@ -371,7 +369,7 @@ int http1_get_resource(connection_t* connection) {
         else if (matches_count == 1) {
             if (route->handler[request->method] == NULL) return -1;
 
-            if (!http1_queue_handler_add(connection, route->handler[request->method]))
+            if (!http1_queue_handler_add(connection, request, route->handler[request->method]))
                 return -1;
 
             return 0;
@@ -442,7 +440,7 @@ int http1_get_redirect(connection_t* connection) {
 
         if (http1response_redirect_is_external(new_uri)) {
             request->uri = new_uri;
-            connection->keepalive_enabled = 0;
+            connection->keepalive = 0;
             return REDIRECT_FOUND;
         }
 
@@ -457,44 +455,31 @@ int http1_get_redirect(connection_t* connection) {
     return find_new_location ? REDIRECT_FOUND : REDIRECT_NOT_FOUND;
 }
 
-int http1_queue_handler_add(connection_t* connection, void(*handle)(void*)) {
+int http1_queue_handler_add(connection_t* connection, http1request_t* request, void(*handle)(void*)) {
     connection_queue_item_t* item = connection_queue_item_create();
     if (item == NULL) return 0;
 
-    item->handle = http1_queue_handler;
+    item->run = http1_queue_handler;
+    item->handle = handle;
     item->connection = connection;
-    item->data = (connection_queue_item_data_t*)http1_queue_data_create(connection, handle);
+    item->data = http1_queue_data_create(request);
 
     if (item->data == NULL) {
         item->free(item);
         return 0;
     }
 
-    connection->queue_append(item);
+    connection_queue_append(item);
 
     return 1;
 }
 
-void http1_queue_handler(void* arg) {
-    connection_queue_item_t* item = arg;
-    connection_queue_http1_data_t* data = (connection_queue_http1_data_t*)item->data;
-
-    if (run_middlewares(item->connection->server->http.middleware, data->ctx))
-        data->handler(data->ctx);
-
-    item->connection->queue_pop(item->connection);
-}
-
-connection_queue_http1_data_t* http1_queue_data_create(connection_t* connection, void(*handle)(void*)) {
+void* http1_queue_data_create(http1request_t* request) {
     connection_queue_http1_data_t* data = malloc(sizeof * data);
     if (data == NULL) return NULL;
 
-    httpctx_t* ctx = httpctx_create(connection->request, connection->response);
-    if (ctx == NULL) return NULL;
-
     data->base.free = http1_queue_data_free;
-    data->ctx = ctx;
-    data->handler = handle;
+    data->request = request;
 
     return data;
 }
@@ -504,10 +489,26 @@ void http1_queue_data_free(void* arg) {
 
     connection_queue_http1_data_t* data = arg;
 
-    if (data->ctx != NULL)
-        data->ctx->free(data->ctx);
+    if (data->request != NULL)
+        http1request_free(data->request);
 
     free(data);
+}
+
+void http1_queue_handler(void* arg) {
+    connection_queue_item_t* item = arg;
+    connection_queue_http1_data_t* data = (connection_queue_http1_data_t*)item->data;
+
+    // create ctx
+    httpctx_t* ctx = httpctx_create(data->request, item->connection->response);
+    if (ctx == NULL) return; // close connection
+
+    if (run_middlewares(item->connection->listener->server->http.middleware, ctx))
+        item->handle(ctx);
+
+    httpctx_free(ctx);
+
+    connection_queue_pop(item->connection);
 }
 
 int http_run_header_filters(http1response_t* response) {

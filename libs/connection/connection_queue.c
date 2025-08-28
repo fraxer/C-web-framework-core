@@ -14,7 +14,7 @@ static pthread_mutex_t connection_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void __connection_queue_append(connection_queue_item_t*);
 int __connection_queue_empty(cqueue_t*);
-connection_s_t* __connection_queue_pop();
+connection_t* __connection_queue_pop();
 void __connection_queue_item_free(connection_queue_item_t*);
 int __connection_queue_append_item(cqueue_t* queue, void* data);
 
@@ -22,7 +22,9 @@ int __connection_queue_append_item(cqueue_t* queue, void* data);
 void __connection_queue_append(connection_queue_item_t* qitem) {
     connection_s_inc(qitem->connection);
 
-    __connection_queue_append_item(qitem->connection->queue, qitem);
+    connection_server_ctx_t* ctx = qitem->connection->ctx;
+
+    __connection_queue_append_item(ctx->queue, qitem);
     __connection_queue_append_item(queue, qitem->connection);
 }
 
@@ -40,9 +42,10 @@ int __connection_queue_append_item(cqueue_t* queue, void* data) {
     return 1;
 }
 
-connection_s_t* __connection_queue_pop() {
+connection_t* __connection_queue_pop() {
     cqueue_lock(queue);
-    connection_s_t* connection = cqueue_pop(queue);
+    connection_t* connection = cqueue_pop(queue);
+    connection_server_ctx_t* ctx = connection->ctx;
     cqueue_unlock(queue);
 
     // queue is empty
@@ -51,15 +54,15 @@ connection_s_t* __connection_queue_pop() {
 
     connection_s_lock(connection);
 
-    if (connection->destroyed) {
+    if (ctx->destroyed) {
         if (connection_s_dec(connection) == CONNECTION_DEC_RESULT_DECREMENT)
             connection_s_unlock(connection);
 
         return NULL;
     }
 
-    if (!connection_s_trylockwrite(connection)) {
-        connection->queue_pop(connection);
+    if (!connection_trylockwrite(connection)) {
+        connection_queue_pop(connection);
         __connection_queue_append_item(queue, connection);
         connection_s_unlock(connection);
 
@@ -104,7 +107,17 @@ void connection_queue_guard_append(connection_queue_item_t* item) {
     pthread_mutex_unlock(&connection_queue_mutex);
 }
 
-connection_s_t* connection_queue_guard_pop() {
+void connection_queue_guard_append2(connection_t* connection) {
+    pthread_mutex_lock(&connection_queue_mutex);
+
+    connection_s_inc(connection);
+    __connection_queue_append_item(queue, connection);
+
+    pthread_cond_signal(&connection_queue_cond);
+    pthread_mutex_unlock(&connection_queue_mutex);
+}
+
+connection_t* connection_queue_guard_pop() {
     struct timeval now;
     gettimeofday(&now, NULL);
     struct timespec timeToWait = {
@@ -132,6 +145,7 @@ connection_queue_item_t* connection_queue_item_create() {
     if (item == NULL) return NULL;
 
     item->free = __connection_queue_item_free;
+    item->run = NULL;
     item->handle = NULL;
     item->connection = NULL;
     item->data = NULL;

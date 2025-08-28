@@ -5,7 +5,7 @@
 #include <stdatomic.h>
 
 #include "connection_queue.h"
-#include "connection.h"
+#include "connection_s.h"
 
 typedef struct broadcast_id {
     void(*free)(void*);

@@ -30,12 +30,12 @@ typedef struct http1requestparser {
     size_t content_length;
     size_t content_saved_length;
     char* buffer;
-    connection_s_t* connection;
+    connection_t* connection;
 } http1requestparser_t;
 
 void http1parser_init(http1requestparser_t*);
 
-void http1parser_set_connection(http1requestparser_t*, connection_s_t*);
+void http1parser_set_connection(http1requestparser_t*, connection_t*);
 
 void http1parser_set_buffer(http1requestparser_t*, char*);
 

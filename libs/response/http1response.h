@@ -1,7 +1,7 @@
 #ifndef __HTTP1RESPONSE__
 #define __HTTP1RESPONSE__
 
-#include "connection.h"
+#include "connection_s.h"
 #include "server.h"
 #include "http1common.h"
 #include "array.h"

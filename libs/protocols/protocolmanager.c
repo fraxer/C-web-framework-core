@@ -1,5 +1,4 @@
 #include "connection.h"
-#include "connection_s.h"
 #include "http1request.h"
 #include "http1response.h"
 #include "websocketsrequest.h"
@@ -10,7 +9,7 @@
 
 #include "protocolmanager.h"
 
-void protmgr_set_tls(connection_s_t* connection) {
+void protmgr_set_tls(connection_t* connection) {
     connection->read = tls_read;
     connection->write = tls_write;
 }

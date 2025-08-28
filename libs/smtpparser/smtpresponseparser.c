@@ -26,7 +26,7 @@ void smtpresponseparser_init(smtpresponseparser_t* parser) {
     bufferdata_init(&parser->buf);
 }
 
-void smtpresponseparser_set_connection(smtpresponseparser_t* parser, connection_t* connection) {
+void smtpresponseparser_set_connection(smtpresponseparser_t* parser, connection_c_t* connection) {
     parser->connection = connection;
 }
 

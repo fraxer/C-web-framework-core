@@ -20,7 +20,7 @@ void smtp_client_read(connection_t* connection, char* buffer, size_t buffer_size
             connection->after_read_request(connection);
             return;
         case 0:
-            connection->keepalive_enabled = 0;
+            connection->keepalive = 0;
             connection->after_read_request(connection);
             return;
         default:
