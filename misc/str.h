@@ -2,19 +2,30 @@
 #define __STR__
 
 #include <stdlib.h>
+#include <stdint.h>
 
-#define STR_BUFFER_SIZE 4096
+// Small String Optimization (SSO) buffer size
+// Optimized for typical JSON strings (keys and short values)
+#define STR_SSO_SIZE 32
 
 typedef struct {
-    char* buffer;
-    size_t size;
-    size_t capacity;
+    // SSO buffer - used for small strings (< 24 bytes)
+    char sso_buffer[STR_SSO_SIZE];
+
+    // Dynamic buffer - used for large strings (>= 24 bytes)
+    char* dynamic_buffer;
+
+    size_t size;         // Current string size (without null terminator)
+    size_t capacity;     // Capacity of dynamic buffer (0 if using SSO)
+    uint8_t is_dynamic;  // 0 = using sso_buffer, 1 = using dynamic_buffer
+    int init_capacity;   // Initial capacity for dynamic allocation
 } str_t;
 
 str_t* str_create(const char* string, const size_t size);
-str_t* str_create_empty(void);
-int str_init(str_t* str);
+str_t* str_create_empty(int init_capacity);
+int str_init(str_t* str, int init_capacity);
 int str_reset(str_t* str);
+int str_reserve(str_t* str, size_t capacity);
 void str_clear(str_t* str);
 void str_free(str_t* str);
 

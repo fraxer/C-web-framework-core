@@ -85,7 +85,7 @@ http1response_t* http1response_create(connection_t* connection);
 void http1response_free(void* arg);
 void http1response_redirect(http1response_t* response, const char* path, int status_code);
 http1_ranges_t* http1response_init_ranges(void);
-void http1response_free_ranges(http1_ranges_t* ranges);
+void http1_ranges_free(http1_ranges_t* ranges);
 int http1response_redirect_is_external(const char* url);
 const char* http1response_status_string(int status_code);
 int http1response_has_payload(http1response_t* response);

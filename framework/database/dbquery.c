@@ -247,7 +247,7 @@ str_t* __build_query(dbconnection_t* connection, const char* query, array_t* par
     const size_t query_size = strlen(query);
     int param_start = -1;
     char param_name[MAX_PARAM_NAME] = {0};
-    str_t* result_query = str_create_empty();
+    str_t* result_query = str_create_empty(512);
     if (result_query == NULL) return NULL;
 
     typedef struct {

@@ -23,6 +23,7 @@ typedef struct http1request {
     http1_header_t* header_;
     http1_header_t* last_header;
     http1_cookie_t* cookie_;
+    http1_ranges_t* ranges;
 
     connection_t* connection;
 

@@ -80,21 +80,15 @@ int __get_range(http1response_t* response, http_module_range_t* module) {
     const ssize_t source_end = response->ranges->end;
 
     size_t start = (size_t)source_start;
-    size_t end = (size_t)source_end;
-    if (source_start == -1) {
-        end = data_size - 1;
+    if (source_start == -1)
         start = data_size - (size_t)source_end;
-    }
-    else if (source_end == -1) {
-        end = data_size - 1;
-    }
 
     const size_t range_offset = start + module->range_pos;
     const size_t target_offset = range_offset < data_size ? range_offset : data_size;
 
-    const size_t range = end - range_offset;
-    const size_t add = source_end == -1 ? 0 : 1;
-    const size_t capacity = range + add < module->buf->capacity ? range + add : module->buf->capacity;
+    // Calculate remaining bytes to read
+    const size_t remaining = module->range_size - module->range_pos;
+    const size_t capacity = remaining < module->buf->capacity ? remaining : module->buf->capacity;
 
     const ssize_t r = is_file ? __get_file_range(response, module, target_offset, capacity)
                              : __get_data_range(response, module, target_offset, capacity);
@@ -167,8 +161,6 @@ int __header(http1response_t* response) {
 
     char bytes[70] = {0};
     int size = snprintf(bytes, sizeof(bytes), "bytes %zu-%zu/%zu", start, end - 1, data_size);
-
-    printf("Content-Range: %s, %ld\n", bytes, module->range_size);
 
     if (!response->headeru_add(response, "Content-Range", 13, bytes, size)) return CWF_ERROR;
     if (!response->header_add_content_length(response, end - start)) return CWF_ERROR;

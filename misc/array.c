@@ -221,7 +221,7 @@ str_t* array_item_to_string(array_t* array, size_t index) {
 
     avalue_t* element = &array->elements[index];
 
-    str_t* string = str_create_empty();
+    str_t* string = str_create_empty(256);
     if (string == NULL) return NULL;
 
     if (element->type == ARRAY_STRING) {

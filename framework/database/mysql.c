@@ -280,7 +280,7 @@ str_t* __escape_internal(void* connection, str_t* str, char quote) {
         return NULL;
     }
 
-    str_t* string = str_create_empty();
+    str_t* string = str_create_empty(256);
     if (string == NULL) {
         free(escaped);
         return NULL;
@@ -488,10 +488,10 @@ char* __compile_insert(void* connection, const char* table, array_t* params) {
 
     char* buffer = NULL;
 
-    str_t* fields = str_create_empty();
+    str_t* fields = str_create_empty(256);
     if (fields == NULL) return NULL;
 
-    str_t* values = str_create_empty();
+    str_t* values = str_create_empty(256);
     if (values == NULL) goto failed;
 
     for (size_t i = 0; i < array_size(params); i++) {
@@ -540,10 +540,10 @@ char* __compile_select(void* connection, const char* table, array_t* columns, ar
 
     char* buffer = NULL;
 
-    str_t* columns_str = str_create_empty();
+    str_t* columns_str = str_create_empty(256);
     if (columns_str == NULL) return 0;
 
-    str_t* where_str = str_create_empty();
+    str_t* where_str = str_create_empty(256);
     if (where_str == NULL) goto failed;
 
     for (size_t i = 0; i < array_size(columns); i++) {
@@ -601,10 +601,10 @@ char* __compile_update(void* connection, const char* table, array_t* set, array_
 
     char* buffer = NULL;
 
-    str_t* set_str = str_create_empty();
+    str_t* set_str = str_create_empty(256);
     if (set_str == NULL) return 0;
 
-    str_t* where_str = str_create_empty();
+    str_t* where_str = str_create_empty(256);
     if (where_str == NULL) goto failed;
 
     if (where == NULL || array_size(where) == 0)
@@ -674,7 +674,7 @@ char* __compile_delete(void* connection, const char* table, array_t* where) {
 
     char* buffer = NULL;
 
-    str_t* where_str = str_create_empty();
+    str_t* where_str = str_create_empty(256);
     if (where_str == NULL) goto failed;
 
     if (where == NULL || array_size(where) == 0)

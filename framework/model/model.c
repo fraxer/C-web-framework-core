@@ -43,12 +43,12 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
     dbinstance_t* dbinst = dbinstance(dbid);
     if (dbinst == NULL) return 0;
 
-    str_t* fields = str_create_empty();
+    str_t* fields = str_create_empty(256);
     if (fields == NULL) return 0;
 
     dbconnection_t* conn = dbinst->connection;
 
-    str_t* where_params = str_create_empty();
+    str_t* where_params = str_create_empty(256);
     if (where_params == NULL) goto failed;
 
     for (int i = 0; i < model->fields_count(model); i++) {
@@ -177,10 +177,10 @@ int model_update(const char* dbid, void* arg) {
 
     mfield_t* first_field = model->first_field(model);
     const char** unique_fields = model->primary_key(model);
-    str_t* set_params = str_create_empty();
+    str_t* set_params = str_create_empty(256);
     if (set_params == NULL) return 0;
 
-    str_t* where_params = str_create_empty();
+    str_t* where_params = str_create_empty(256);
     if (where_params == NULL) goto failed;
 
     for (int i = 0, iter_set = 0, iter_where = 0; i < model->fields_count(model); i++) {
@@ -289,7 +289,7 @@ int model_delete(const char* dbid, void* arg) {
 
     mfield_t* vfield = model->first_field(arg);
     const char** vunique = model->primary_key(arg);
-    str_t* where_params = str_create_empty();
+    str_t* where_params = str_create_empty(256);
     if (where_params == NULL) return 0;
 
     for (int i = 0, iter_where = 0; i < model->fields_count(model); i++) {
@@ -868,7 +868,7 @@ int __model_set_binary(mfield_t* field, const char* value, const size_t size) {
 
     if (!field->dirty) {
         if (field->oldvalue._string == NULL)
-            field->oldvalue._string = str_create_empty();
+            field->oldvalue._string = str_create_empty(256);
 
         if (field->oldvalue._string == NULL)
             return 0;
@@ -1624,7 +1624,7 @@ str_t* model_array_to_str(mfield_t* field) {
     if (field->type != MODEL_ARRAY) return NULL;
 
     array_t* array = field->value._array;
-    str_t* string = str_create_empty();
+    str_t* string = str_create_empty(256);
     if (string == NULL) return NULL;
 
     str_appendc(string, '[');

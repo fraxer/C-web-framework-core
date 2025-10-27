@@ -533,13 +533,9 @@ void __try_set_keepalive(http1requestparser_t* parser) {
 
 void __try_set_range(http1requestparser_t* parser) {
     http1request_t* request = parser->request;
-    connection_server_ctx_t* ctx = parser->connection->ctx;
-    http1response_t* response = ctx->response;
 
-    if (cmpstrn_lower(request->last_header->key, request->last_header->key_length, "range", 5)) {
-        response->ranges = http1parser_parse_range((char*)request->last_header->value, request->last_header->value_length);
-        response->range = 1;
-    }
+    if (cmpstrn_lower(request->last_header->key, request->last_header->key_length, "range", 5))
+        request->ranges = http1parser_parse_range((char*)request->last_header->value, request->last_header->value_length);
 }
 
 void __try_set_cookie(http1request_t* request) {
@@ -662,7 +658,7 @@ http1_ranges_t* http1parser_parse_range(char* str, size_t length) {
     failed:
 
     if (result == -1) {
-        http1response_free_ranges(ranges);
+        http1_ranges_free(ranges);
         return NULL;
     }
 

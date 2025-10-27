@@ -271,7 +271,7 @@ str_t* __escape_identifier(void* connection, str_t* str) {
 
 str_t* __escape_string(void* connection, str_t* str) {
     (void)connection;
-    str_t* quoted_str = str_create_empty();
+    str_t* quoted_str = str_create_empty(256);
     if (quoted_str == NULL) return NULL;
 
     str_appendc(quoted_str, '"');
