@@ -168,7 +168,7 @@ void __http1response_reset(http1response_t* response) {
     response->header_ = NULL;
     response->last_header = NULL;
 
-    http1response_free_ranges(response->ranges);
+    http1_ranges_free(response->ranges);
     response->ranges = NULL;
 
     http1responseparser_reset(response->parser);
@@ -730,16 +730,6 @@ http1_ranges_t* http1response_init_ranges(void) {
     range->next = NULL;
 
     return range;
-}
-
-void http1response_free_ranges(http1_ranges_t* ranges) {
-    while (ranges) {
-        http1_ranges_t* next = ranges->next;
-
-        free(ranges);
-
-        ranges = next;
-    }
 }
 
 int __http1response_prepare_body(http1response_t* response, size_t length) {

@@ -122,7 +122,7 @@ void http1_queries_free(http1_query_t* query) {
 char* http1_query_str(http1_query_t* query) {
     if (query == NULL) return NULL;
 
-    str_t* uri = str_create_empty();
+    str_t* uri = str_create_empty(256);
     if (uri == NULL) return NULL;
 
     while (query != NULL) {
@@ -246,5 +246,13 @@ void http1_cookie_free(http1_cookie_t* cookie) {
         if (cookie) free(cookie);
 
         cookie = next;
+    }
+}
+
+void http1_ranges_free(http1_ranges_t* ranges) {
+    while (ranges != NULL) {
+        http1_ranges_t* next = ranges->next;
+        free(ranges);
+        ranges = next;
     }
 }

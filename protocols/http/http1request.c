@@ -93,6 +93,7 @@ http1request_t* http1request_create(connection_t* connection) {
     request->header_ = NULL;
     request->last_header = NULL;
     request->cookie_ = NULL;
+    request->ranges = NULL;
     request->connection = connection;
     request->query = http1request_query;
     request->header = http1request_header;
@@ -146,6 +147,9 @@ void http1request_reset(http1request_t* request) {
 
     http1_cookie_free(request->cookie_);
     request->cookie_ = NULL;
+
+    http1_ranges_free(request->ranges);
+    request->ranges = NULL;
 }
 
 const char* http1request_query(http1request_t* request, const char* key) {

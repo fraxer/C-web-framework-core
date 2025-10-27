@@ -101,4 +101,6 @@ void http1_payloadfield_free(http1_payloadfield_t*);
 http1_cookie_t* http1_cookie_create();
 void http1_cookie_free(http1_cookie_t*);
 
+void http1_ranges_free(http1_ranges_t* ranges);
+
 #endif

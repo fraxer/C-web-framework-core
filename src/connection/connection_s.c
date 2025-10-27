@@ -141,7 +141,6 @@ int connection_after_write(connection_t* connection) {
 
     cqueue_lock(ctx->broadcast_queue);
     const int broadcast_empty = cqueue_empty(ctx->broadcast_queue);
-
     cqueue_unlock(ctx->broadcast_queue);
 
     if (!cqueue_empty(ctx->queue) || !broadcast_empty) {

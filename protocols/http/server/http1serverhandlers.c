@@ -18,7 +18,7 @@ struct middleware_item;
 
 typedef int(*deferred_handler)(http1response_t* response);
 typedef void(*queue_handler)(void*);
-typedef void*(*queue_data_create)(connection_t* connection, void* component);
+typedef void*(*queue_data_create)(connection_t* connection, http1request_t* request, http1response_t* response);
 
 int run_middlewares(struct middleware_item* middleware_item, void* ctx);
 
@@ -26,24 +26,25 @@ static int __tls_read(connection_t* connection);
 static int __tls_write(connection_t* connection);
 static int __read(connection_t* connection);
 static int __write(connection_t* connection);
-static int __deferred_handler(connection_t* connection, void* component, queue_handler runner, queue_handler handle, queue_data_create data_create);
+static int __deferred_handler(connection_t* connection, http1request_t* request, http1response_t* response, queue_handler runner, queue_handler handle, queue_data_create data_create);
 static int __handle(connection_t* connection, http1request_t* request, deferred_handler handler);
-static int __handler_added_to_queue(http1request_t* request);
+static int __handler_added_to_queue(http1request_t* request, http1response_t* response);
 static int __get_redirect(connection_t* connection, http1request_t* request);
-static int __apply_redirect(http1request_t* request, deferred_handler handler);
+static int __apply_redirect(http1request_t* request, http1response_t* response, deferred_handler handler);
 static void __queue_request_handler(void* arg);
 static void __queue_response_handler(void* arg);
-static void* __queue_data_request_create(connection_t* connection, void* component);
+static void* __queue_data_request_create(connection_t* connection, http1request_t* request, http1response_t* response);
 static void __queue_data_request_free(void* arg);
 static int __run_header_filters(http1response_t* response);
 static int __run_body_filters(http1response_t* response);
 static int __handshake(connection_t* connection);
 static int __set_servername(connection_t* connection);
-static void* __queue_data_response_create(connection_t* connection, void* component);
+static void* __queue_data_response_create(connection_t* connection, http1request_t* request, http1response_t* response);
 static void __queue_data_response_free(void* arg);
 static int __post_reponse_default(connection_t* connection, int status_code);
 static int __post_response(http1response_t* response);
 static int __post_deffered_response(http1response_t* response);
+static void __move_headers(http1request_t* request, http1response_t* response);
 
 int __tls_read(connection_t* connection) {
     return __handshake(connection);
@@ -183,14 +184,14 @@ int __write(connection_t* connection) {
     return connection_after_write(connection);
  }
 
-int __deferred_handler(connection_t* connection, void* component, queue_handler runner, queue_handler handle, queue_data_create data_create) {
+int __deferred_handler(connection_t* connection, http1request_t* request, http1response_t* response, queue_handler runner, queue_handler handle, queue_data_create data_create) {
     connection_queue_item_t* item = connection_queue_item_create();
     if (item == NULL) return 0;
 
     item->run = runner;
     item->handle = handle;
     item->connection = connection;
-    item->data = data_create(connection, component);
+    item->data = data_create(connection, request, response);
 
     if (item->data == NULL) {
         item->free(item);
@@ -213,7 +214,12 @@ int __deferred_handler(connection_t* connection, void* component, queue_handler 
 }
 
 int __handle(connection_t* connection, http1request_t* request, deferred_handler handler) {
-    switch (__apply_redirect(request, handler)) {
+    http1response_t* response = http1response_create(connection);
+    if (response == NULL) return 0;
+
+    __move_headers(request, response);
+
+    switch (__apply_redirect(request, response, handler)) {
     case -1:
     {
         http1request_free(request);
@@ -229,16 +235,13 @@ int __handle(connection_t* connection, http1request_t* request, deferred_handler
         break;
     }
 
-    if (__handler_added_to_queue(request))
+    if (__handler_added_to_queue(request, response))
         return 1;
 
     connection_server_ctx_t* ctx = connection->ctx;
     char file_full_path[PATH_MAX];
     const file_status_e file_status = http1_get_file_full_path(ctx->server, file_full_path, PATH_MAX, request->path, request->path_length);
     http1request_free(request);
-
-    http1response_t* response = http1response_create(connection);
-    if (response == NULL) return 0;
 
     if (file_status == FILE_OK)
         http1_response_file(response, file_full_path);
@@ -250,7 +253,7 @@ int __handle(connection_t* connection, http1request_t* request, deferred_handler
     return handler(response);
 }
 
-int __handler_added_to_queue(http1request_t* request) {
+int __handler_added_to_queue(http1request_t* request, http1response_t* response) {
     connection_t* connection = request->connection;
     connection_server_ctx_t* ctx = connection->ctx;
 
@@ -258,7 +261,7 @@ int __handler_added_to_queue(http1request_t* request) {
         if (route->is_primitive && route_compare_primitive(route, request->path, request->path_length)) {
             if (route->handler[request->method] == NULL) return 0;
 
-            return __deferred_handler(connection, request, __queue_request_handler, route->handler[request->method], __queue_data_request_create);
+            return __deferred_handler(connection, request, response, __queue_request_handler, route->handler[request->method], __queue_data_request_create);
         }
 
         int vector_size = route->params_count > 0 ? route->params_count * 6 : 20 * 6;
@@ -282,40 +285,34 @@ int __handler_added_to_queue(http1request_t* request) {
 
             if (route->handler[request->method] == NULL) return 0;
 
-            return __deferred_handler(connection, request, __queue_request_handler, route->handler[request->method], __queue_data_request_create);
+            return __deferred_handler(connection, request, response,  __queue_request_handler, route->handler[request->method], __queue_data_request_create);
         }
         else if (matches_count == 1) {
             if (route->handler[request->method] == NULL) return 0;
 
-            return __deferred_handler(connection, request, __queue_request_handler, route->handler[request->method], __queue_data_request_create);
+            return __deferred_handler(connection, request, response,  __queue_request_handler, route->handler[request->method], __queue_data_request_create);
         }
     }
 
     return 0;
 }
 
-int __apply_redirect(http1request_t* request, deferred_handler handler) {
+int __apply_redirect(http1request_t* request, http1response_t* response, deferred_handler handler) {
     connection_t* connection = request->connection;
     
     switch (__get_redirect(connection, request)) {
     case REDIRECT_OUT_OF_MEMORY:
     {
-        http1response_t* response = http1response_create(connection);
-        if (response == NULL) return -1;
         http1response_default(response, 500);
         return handler(response);
     }
     case REDIRECT_LOOP_CYCLE:
     {
-        http1response_t* response = http1response_create(connection);
-        if (response == NULL) return -1;
         http1response_default(response, 508);
         return handler(response);
     }
     case REDIRECT_FOUND:
     {
-        http1response_t* response = http1response_create(connection);
-        if (response == NULL) return -1;
         http1response_redirect(response, request->uri, 301);
         return handler(response);
     }
@@ -374,25 +371,24 @@ int __get_redirect(connection_t* connection, http1request_t* request) {
     return find_new_location ? REDIRECT_FOUND : REDIRECT_NOT_FOUND;
 }
 
-void* __queue_data_request_create(connection_t* connection, void* component) {
+void* __queue_data_request_create(connection_t* connection, http1request_t* request, http1response_t* response) {
     connection_queue_http1_data_t* data = malloc(sizeof * data);
     if (data == NULL) return NULL;
 
     data->base.free = __queue_data_request_free;
-    data->request = component;
+    data->request = request;
     data->connection = connection;
-    data->response = NULL;
+    data->response = response;
 
     return data;
 }
 
-void* __queue_data_response_create(connection_t* connection, void* component) {
-    http1response_t* response = component;
+void* __queue_data_response_create(connection_t* connection, http1request_t* request, http1response_t* response) {
     connection_queue_http1_data_t* data = malloc(sizeof * data);
     if (data == NULL) return NULL;
 
     data->base.free = __queue_data_response_free;
-    data->request = NULL;
+    data->request = request;
     data->connection = connection;
     data->response = response;
 
@@ -423,15 +419,7 @@ void __queue_request_handler(void* arg) {
     connection_queue_http1_data_t* data = (connection_queue_http1_data_t*)item->data;
     connection_server_ctx_t* conn_ctx = item->connection->ctx;
 
-    http1response_t* response = http1response_create(item->connection);
-    if (response == NULL) {
-        // TODO: close connection, return error
-        atomic_store(&conn_ctx->destroyed, 1);
-        connection_after_read(item->connection);
-        return;
-    }
-
-    conn_ctx->response = response;
+    conn_ctx->response = data->response;
 
     httpctx_t ctx;
     httpctx_init(&ctx, data->request, conn_ctx->response);
@@ -628,11 +616,16 @@ int __post_response(http1response_t* response) {
         return connection_after_read(connection);
     }
 
-    return __deferred_handler(connection, response, __queue_response_handler, NULL, __queue_data_response_create);
+    return __deferred_handler(connection, NULL, response, __queue_response_handler, NULL, __queue_data_response_create);
 }
 
 int __post_deffered_response(http1response_t* response) {
     connection_t* connection = response->connection;
 
-    return __deferred_handler(connection, response, __queue_response_handler, NULL, __queue_data_response_create);
+    return __deferred_handler(connection, NULL, response, __queue_response_handler, NULL, __queue_data_response_create);
+}
+
+void __move_headers(http1request_t* request, http1response_t* response) {
+    response->ranges = request->ranges;
+    request->ranges = NULL;
 }
