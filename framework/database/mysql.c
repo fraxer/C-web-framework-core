@@ -307,7 +307,7 @@ db_t* my_load(const char* database_id, const json_token_t* token_array) {
     enum required_fields { R_HOST_ID = 0, R_PORT, R_IP, R_DBNAME, R_USER, R_PASSWORD, R_FIELDS_COUNT };
     char* field_names[FIELDS_COUNT] = {"host_id", "port", "ip", "dbname", "user", "password"};
 
-    for (json_it_t it_array = json_create_empty_it(token_array); !json_end_it(&it_array); json_next_it(&it_array)) {
+    for (json_it_t it_array = json_init_it(token_array); !json_end_it(&it_array); json_next_it(&it_array)) {
         json_token_t* token_object = json_it_value(&it_array);
         int lresult = 0;
         int finded_fields[FIELDS_COUNT] = {0};
@@ -317,7 +317,7 @@ db_t* my_load(const char* database_id, const json_token_t* token_array) {
             goto failed;
         }
 
-        for (json_it_t it_object = json_create_empty_it(token_object); !json_end_it(&it_object); json_next_it(&it_object)) {
+        for (json_it_t it_object = json_init_it(token_object); !json_end_it(&it_object); json_next_it(&it_object)) {
             const char* key = json_it_key(&it_object);
             json_token_t* token_value = json_it_value(&it_object);
 
