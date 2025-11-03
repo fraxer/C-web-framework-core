@@ -427,7 +427,7 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
             const json_token_t* token = __view_get_loop_value(copy_tags, document, child);
             if (token != NULL) {
                 if (token->type == JSON_OBJECT || token->type == JSON_ARRAY) {
-                    for (json_it_t it = json_create_empty_it(token); !json_end_it(&it); it = json_next_it(&it)) {
+                    for (json_it_t it = json_init_it(token); !json_end_it(&it); it = json_next_it(&it)) {
                         if (token->type == JSON_OBJECT)
                             sprintf(tag_for->key_value, "%s", (char*)json_it_key(&it));
                         else

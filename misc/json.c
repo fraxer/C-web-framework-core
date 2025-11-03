@@ -1928,7 +1928,7 @@ void json_token_set_array(json_token_t* token, json_token_t* token_array) {
 // Функции для работы с итератором
 // ============================================================================
 
-json_it_t json_create_empty_it(const json_token_t* token) {
+json_it_t json_init_it(const json_token_t* token) {
     json_it_t it = {
         .ok = 0,
         .index = 0,

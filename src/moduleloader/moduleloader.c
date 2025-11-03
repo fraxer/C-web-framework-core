@@ -338,7 +338,7 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     }
 
     env_gzip_str_t* last_gzip_item = NULL;
-    for (json_it_t it = json_create_empty_it(token_gzip); !json_end_it(&it); it = json_next_it(&it)) {
+    for (json_it_t it = json_init_it(token_gzip); !json_end_it(&it); it = json_next_it(&it)) {
         const json_token_t* token_mimetype = json_it_value(&it);
         if (!json_is_string(token_mimetype)) {
             log_error("module_loader_config_load: gzip must be array of strings\n");
@@ -519,7 +519,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
     server_t* first_server = NULL;
     server_t* last_server = NULL;
     routeloader_lib_t* first_lib = NULL;
-    for (json_it_t it_servers = json_create_empty_it(token_servers); !json_end_it(&it_servers); json_next_it(&it_servers)) {
+    for (json_it_t it_servers = json_init_it(token_servers); !json_end_it(&it_servers); json_next_it(&it_servers)) {
         enum required_fields { R_DOMAINS = 0, R_IP, R_PORT, R_ROOT, R_FIELDS_COUNT };
         char* str_required_fields[R_FIELDS_COUNT] = {"domains", "ip", "port", "root"};
         enum fields { DOMAINS = 0, IP, PORT, ROOT, INDEX, HTTP, WEBSOCKETS, DATABASE, OPENSSL, FIELDS_COUNT };
@@ -552,7 +552,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             goto failed;
         }
 
-        for (json_it_t it_server = json_create_empty_it(token_server); !json_end_it(&it_server); json_next_it(&it_server)) {
+        for (json_it_t it_server = json_init_it(token_server); !json_end_it(&it_server); json_next_it(&it_server)) {
             const char* key = json_it_key(&it_server);
             const json_token_t* token_value = json_it_value(&it_server);
 
@@ -749,7 +749,7 @@ domain_t* __module_loader_domains_load(const json_token_t* token_array) {
     domain_t* first_domain = NULL;
     domain_t* last_domain = NULL;
 
-    for (json_it_t it = json_create_empty_it(token_array); !json_end_it(&it); json_next_it(&it)) {
+    for (json_it_t it = json_init_it(token_array); !json_end_it(&it); json_next_it(&it)) {
         json_token_t* token_domain = json_it_value(&it);
         if (!json_is_string(token_domain)) {
             log_error("__module_loader_domains_load: domain must be string\n");
@@ -795,7 +795,7 @@ int __module_loader_databases_load(appconfig_t* config, const json_token_t* toke
     }
 
     int result = 0;
-    for (json_it_t it = json_create_empty_it(token_databases); !json_end_it(&it); json_next_it(&it)) {
+    for (json_it_t it = json_init_it(token_databases); !json_end_it(&it); json_next_it(&it)) {
         json_token_t* token_array = json_it_value(&it);
         if (!json_is_array(token_array)) {
             log_error("__module_loader_databases_load: database driver must be array\n");
@@ -848,7 +848,7 @@ int __module_loader_storages_load(appconfig_t* config, const json_token_t* token
 
     int result = 0;
     storage_t* last_storage = NULL;
-    for (json_it_t it = json_create_empty_it(token_storages); !json_end_it(&it); json_next_it(&it)) {
+    for (json_it_t it = json_init_it(token_storages); !json_end_it(&it); json_next_it(&it)) {
         json_token_t* token_object = json_it_value(&it);
         if (!json_is_object(token_object)) {
             log_error("__module_loader_storages_load: storage must be object\n");
@@ -915,7 +915,7 @@ int __module_loader_mimetype_load(appconfig_t* config, const json_token_t* token
     size_t table_type_size = json_object_size(token_mimetypes);
     size_t table_ext_size = 0;
 
-    for (json_it_t it = json_create_empty_it(token_mimetypes); !json_end_it(&it); json_next_it(&it)) {
+    for (json_it_t it = json_init_it(token_mimetypes); !json_end_it(&it); json_next_it(&it)) {
         const json_token_t* token_array = json_it_value(&it);
         if (!json_is_array(token_array)) {
             log_error("__module_loader_mimetype_load: mimetype item must be array\n");
@@ -931,7 +931,7 @@ int __module_loader_mimetype_load(appconfig_t* config, const json_token_t* token
         goto failed;
     }
 
-    for (json_it_t it_object = json_create_empty_it(token_mimetypes); !json_end_it(&it_object); json_next_it(&it_object)) {
+    for (json_it_t it_object = json_init_it(token_mimetypes); !json_end_it(&it_object); json_next_it(&it_object)) {
         const char* mimetype = json_it_key(&it_object);
         const json_token_t* token_array = json_it_value(&it_object);
         if (!json_is_array(token_array)) {
@@ -943,7 +943,7 @@ int __module_loader_mimetype_load(appconfig_t* config, const json_token_t* token
             goto failed;
         }
 
-        for (json_it_t it_array = json_create_empty_it(token_array); !json_end_it(&it_array); json_next_it(&it_array)) {
+        for (json_it_t it_array = json_init_it(token_array); !json_end_it(&it_array); json_next_it(&it_array)) {
             const int* index = json_it_key(&it_array);
             const json_token_t* token_value = json_it_value(&it_array);
             if (!json_is_string(token_value)) {
@@ -1094,7 +1094,7 @@ int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_t
     }
     if (json_object_size(token_object) == 0) return 1;
 
-    for (json_it_t it = json_create_empty_it(token_object); !json_end_it(&it); json_next_it(&it)) {
+    for (json_it_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
         const char* route_path = json_it_key(&it);
         if (strlen(route_path) == 0) {
             log_error("__module_loader_http_routes_load: route path is empty\n");
@@ -1142,7 +1142,7 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
         log_error("__module_loader_set_http_route: http.route item must be object\n");
         return 0;
     }
-    for (json_it_t it = json_create_empty_it(token_object); !json_end_it(&it); json_next_it(&it)) {
+    for (json_it_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
         const char* method = json_it_key(&it);
         json_token_t* token_array = json_it_value(&it);
         if (!json_is_array(token_array)) {
@@ -1229,7 +1229,7 @@ int __module_loader_http_redirects_load(const json_token_t* token_object, redire
     }
     if (json_object_size(token_object) == 0) return 1;
 
-    for (json_it_t it = json_create_empty_it(token_object); !json_end_it(&it); json_next_it(&it)) {
+    for (json_it_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
         json_token_t* token_value = json_it_value(&it);
         if (token_value == NULL) {
             log_error("__module_loader_http_redirects_load: http.redirects item.value is empty\n");
@@ -1290,7 +1290,7 @@ int __module_loader_middlewares_load(const json_token_t* token_array, middleware
     }
     if (json_array_size(token_array) == 0) return 1;
 
-    for (json_it_t it = json_create_empty_it(token_array); !json_end_it(&it); json_next_it(&it)) {
+    for (json_it_t it = json_init_it(token_array); !json_end_it(&it); json_next_it(&it)) {
         json_token_t* token_value = json_it_value(&it);
         if (!json_is_string(token_value)) {
             log_error("__module_loader_middlewares_load: http.middlewares item.value must be string\n");
@@ -1402,7 +1402,7 @@ int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const 
     }
     if (json_object_size(token_object) == 0) return 1;
 
-    for (json_it_t it = json_create_empty_it(token_object); !json_end_it(&it); json_next_it(&it)) {
+    for (json_it_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
         const char* route_path = json_it_key(&it);
         if (strlen(route_path) == 0) {
             log_error("__module_loader_websockets_routes_load: websockets.route path is empty\n");
@@ -1450,7 +1450,7 @@ int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloa
         log_error("__module_loader_set_websockets_route: websockets.route item must be object\n");
         return 0;
     }
-    for (json_it_t it = json_create_empty_it(token_object); !json_end_it(&it); json_next_it(&it)) {
+    for (json_it_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
         const char* method = json_it_key(&it);
         if (strlen(method) == 0) {
             log_error("__module_loader_set_websockets_route: websockets.route item.key is empty\n");
@@ -1705,7 +1705,7 @@ openssl_t* __module_loader_tls_load(const json_token_t* token_object) {
     enum fields { FULLCHAIN = 0, PRIVATE, CIPHERS, FIELDS_COUNT };
     char* finded_fields_str[FIELDS_COUNT] = {"fullchain", "private", "ciphers"};
     int finded_fields[FIELDS_COUNT] = {0};
-    for (json_it_t it = json_create_empty_it(token_object); !json_end_it(&it); json_next_it(&it)) {
+    for (json_it_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
         const char* key = json_it_key(&it);
         if (strlen(key) == 0) {
             log_error("__module_loader_tls_load: tls key is empty\n");

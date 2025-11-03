@@ -1350,7 +1350,7 @@ int model_set_array_from_str(mfield_t* field, const char* value) {
         return 0;
     }
 
-    for (json_it_t it_array = json_create_empty_it(token_array); !json_end_it(&it_array); json_next_it(&it_array)) {
+    for (json_it_t it_array = json_init_it(token_array); !json_end_it(&it_array); json_next_it(&it_array)) {
         json_token_t* token_value = json_it_value(&it_array);
         if (json_is_string(token_value)) {
             array_push_back(array, array_create_string(json_string(token_value)));

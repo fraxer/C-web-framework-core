@@ -174,7 +174,7 @@ void json_token_set_array(json_token_t* token, json_token_t* token_array);
 /**
  * Инициализация итератора для массива и объекта
  */
-json_it_t json_create_empty_it(const json_token_t* token);
+json_it_t json_init_it(const json_token_t* token);
 int json_end_it(const json_it_t* iterator);
 const void* json_it_key(const json_it_t* iterator);
 json_token_t* json_it_value(const json_it_t* iterator);
