@@ -24,7 +24,7 @@ static void __http1response_datan(http1response_t* response, const char* data, s
 static void __http1response_file(http1response_t* response, const char* path);
 static void __http1response_filen(http1response_t* response, const char* path, size_t length);
 static void __http1response_filef(http1response_t*, const char*, const char*, ...);
-static void __http1response_json(http1response_t* response, jsondoc_t* document);
+static void __http1response_json(http1response_t* response, json_doc_t* document);
 static void __http1response_model(http1response_t* response, void* model, ...);
 static void __http1response_models(http1response_t* response, array_t* models, ...);
 
@@ -47,13 +47,13 @@ static void __http1response_init_payload(http1response_t* response);
 static void __http1response_payload_parse_plain(http1response_t* response);
 static char* __http1response_payload(http1response_t* response);
 static file_content_t __http1response_payload_file(http1response_t* response);
-static jsondoc_t* __http1response_payload_json(http1response_t* response);
+static json_doc_t* __http1response_payload_json(http1response_t* response);
 
 
 static int __http1response_init_parser(http1response_t* response);
 static void __http1response_reset(http1response_t* response);
 
-void __http1response_view(http1response_t* response, jsondoc_t* document, const char* storage_name, const char* path_format, ...);
+void __http1response_view(http1response_t* response, json_doc_t* document, const char* storage_name, const char* path_format, ...);
 
 void http1response_free(void* arg) {
     http1response_t* response = arg;
@@ -74,7 +74,7 @@ int __http1response_init_parser(http1response_t* response) {
     return 1;
 }
 
-void __http1response_view(http1response_t* response, jsondoc_t* document, const char* storage_name, const char* path_format, ...)
+void __http1response_view(http1response_t* response, json_doc_t* document, const char* storage_name, const char* path_format, ...)
 {
     char path[PATH_MAX];
 
@@ -557,7 +557,7 @@ void http1response_default(http1response_t* response, int status_code) {
     response->datan(response, data, data_length);
 }
 
-void __http1response_json(http1response_t* response, jsondoc_t* document) {
+void __http1response_json(http1response_t* response, json_doc_t* document) {
     const char* connection = __http1response_keepalive_enabled(response) ? "keep-alive" : "close";
     response->headeru_add(response, "Content-Type", 12, "application/json", 16);
     response->headeru_add(response, "Connection", 10, connection, strlen(connection));
@@ -598,13 +598,13 @@ void __http1response_model(http1response_t* response, void* model, ...) {
 
     va_end(va_args);
 
-    jsondoc_t* doc = json_init();
+    json_doc_t* doc = json_create_empty();
     if (!doc) {
         response->def(response, 500);
         return;
     }
 
-    jsontok_t* object = model_json_create_object(model, display_fields, doc);
+    json_token_t* object = model_json_create_object(model, display_fields, doc);
     if (object == NULL) {
         json_free(doc);
         response->def(response, 500);
@@ -644,7 +644,7 @@ void __http1response_models(http1response_t* response, array_t* models, ...) {
 
     va_end(va_args);
 
-    jsondoc_t* doc = json_init();
+    json_doc_t* doc = json_create_empty();
     if (!doc) {
         response->def(response, 500);
         return;
@@ -652,7 +652,7 @@ void __http1response_models(http1response_t* response, array_t* models, ...) {
 
     for (size_t i = 0; i < array_size(models); i++) {
         void* model = array_get(models, i);
-        jsontok_t* object = model_json_create_object(model, display_fields, doc);
+        json_token_t* object = model_json_create_object(model, display_fields, doc);
         if (object == NULL) {
             json_free(doc);
             response->def(response, 500);
@@ -956,15 +956,11 @@ file_content_t __http1response_payload_file(http1response_t* response) {
     return file_content;
 }
 
-jsondoc_t* __http1response_payload_json(http1response_t* response) {
+json_doc_t* __http1response_payload_json(http1response_t* response) {
     char* payload = __http1response_payload(response);
     if (payload == NULL) return NULL;
 
-    jsondoc_t* document = json_init();
-    if (document == NULL) goto failed;
-    if (!json_parse(document, payload)) goto failed;
-
-    failed:
+    json_doc_t* document = json_parse(payload);
 
     free(payload);
 

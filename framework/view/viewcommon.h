@@ -63,7 +63,7 @@ typedef struct view_loop {
     char key_name[VIEWPARSER_VARIABLE_ITEM_NAME_SIZE];
     char key_value[VIEWPARSER_VARIABLE_ITEM_NAME_SIZE];
 
-    jsontok_t* token;
+    json_token_t* token;
 } view_loop_t;
 
 typedef struct view_include {

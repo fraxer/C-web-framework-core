@@ -19,6 +19,6 @@ typedef struct postgresqlconnection {
     PGconn* connection;
 } postgresqlconnection_t;
 
-db_t* postgresql_load(const char* database_id, const jsontok_t* token_array);
+db_t* postgresql_load(const char* database_id, const json_token_t* token_array);
 
 #endif

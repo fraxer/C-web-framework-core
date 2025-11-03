@@ -35,7 +35,7 @@ websockets_protocol_t* websockets_protocol_resource_create(void) {
     protocol->base.free = websockets_protocol_resource_free;
     protocol->payload = (char*(*)(websockets_protocol_resource_t*))websocketsrequest_payload;
     protocol->payload_file = (file_content_t(*)(websockets_protocol_resource_t*))websocketsrequest_payload_file;
-    protocol->payload_json = (jsondoc_t*(*)(websockets_protocol_resource_t*))websocketsrequest_payload_json;
+    protocol->payload_json = (json_doc_t*(*)(websockets_protocol_resource_t*))websocketsrequest_payload_json;
     protocol->method = ROUTE_NONE;
     protocol->parser_stage = WSPROTRESOURCE_METHOD;
     protocol->uri_length = 0;

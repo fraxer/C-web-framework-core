@@ -41,9 +41,9 @@ typedef struct http1response {
 
     void(*data)(struct http1response*, const char*);
     void(*datan)(struct http1response*, const char*, size_t);
-    void(*view)(struct http1response*, jsondoc_t* document, const char* storage_name, const char* path_format, ...);
+    void(*view)(struct http1response*, json_doc_t* document, const char* storage_name, const char* path_format, ...);
     void(*def)(struct http1response*, int);
-    void(*json)(struct http1response*, jsondoc_t* document);
+    void(*json)(struct http1response*, json_doc_t* document);
     void(*model)(struct http1response*, void* model, ...);
     void(*models)(struct http1response*, array_t* models, ...);
 
@@ -62,7 +62,7 @@ typedef struct http1response {
 
     char*(*payload)(struct http1response*);
     file_content_t(*payload_file)(struct http1response*);
-    jsondoc_t*(*payload_json)(struct http1response*);
+    json_doc_t*(*payload_json)(struct http1response*);
     
     size_t content_length;
 

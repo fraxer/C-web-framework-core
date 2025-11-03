@@ -35,7 +35,7 @@ typedef enum state {
     JSON_STATE_CLOSE_CONTAINER      // Закрыть контейнер
 } state_t;
 
-static _Thread_local json2_manager_t* manager = NULL;
+static _Thread_local json_manager_t* manager = NULL;
 static _Thread_local short free_blocks_counter = 0;
 
 static const char escape_table[256] = {
@@ -44,16 +44,16 @@ static const char escape_table[256] = {
     ['\\'] = '\\', ['/'] = '/'
 };
 
-static json2_token_t* __parse_value(json2_parser_t* parser);
-static json2_token_t* __parse_object(json2_parser_t* parser);
-static json2_token_t* __parse_array(json2_parser_t* parser);
-static json2_token_t* __parse_string(json2_parser_t* parser);
-static json2_token_t* __parse_number(json2_parser_t* parser);
-static json2_token_t* __parse_null(json2_parser_t* parser);
-static json2_token_t* __parse_true(json2_parser_t* parser);
-static json2_token_t* __parse_false(json2_parser_t* parser);
-static void __set_child_or_sibling(json2_token_t* token_src, json2_token_t* token_dst);
-static void __init_token(json2_token_t* token, memory_block_t* block, json2_token_type_t type);
+static json_token_t* __parse_value(json_parser_t* parser);
+static json_token_t* __parse_object(json_parser_t* parser);
+static json_token_t* __parse_array(json_parser_t* parser);
+static json_token_t* __parse_string(json_parser_t* parser);
+static json_token_t* __parse_number(json_parser_t* parser);
+static json_token_t* __parse_null(json_parser_t* parser);
+static json_token_t* __parse_true(json_parser_t* parser);
+static json_token_t* __parse_false(json_parser_t* parser);
+static void __set_child_or_sibling(json_token_t* token_src, json_token_t* token_dst);
+static void __init_token(json_token_t* token, memory_block_t* block, json_token_type_t type);
 
 // ============================================================================
 // Функции для работы с блоками памяти (free-list)
@@ -61,7 +61,7 @@ static void __init_token(json2_token_t* token, memory_block_t* block, json2_toke
 
 // Используем первые 8 байт каждого свободного токена для хранения указателя на следующий
 typedef union {
-    json2_token_t token;
+    json_token_t token;
     void* next_free;  // Указатель на следующий свободный слот
 } free_slot_t;
 
@@ -125,7 +125,7 @@ int memory_block_alloc_slot(memory_block_t* block, size_t* slot_index) {
     return 1;
 }
 
-void memory_block_free_slot(memory_block_t* block, json2_token_t* token) {
+void memory_block_free_slot(memory_block_t* block, json_token_t* token) {
     if (block == NULL || token == NULL)
         return;
 
@@ -152,16 +152,16 @@ int memory_block_is_full(memory_block_t* block) {
 // Функции для работы с менеджером токенов
 // ============================================================================
 
-json2_manager_t* json2_manager_create(void) {
+json_manager_t* json_manager_create(void) {
     manager = malloc(sizeof * manager);
     if (manager == NULL) return NULL;
 
-    json2_manager_init(manager);
+    json_manager_init(manager);
 
     return manager;
 }
 
-void json2_manager_init(json2_manager_t* manager) {
+void json_manager_init(json_manager_t* manager) {
     if (manager == NULL)
         return;
 
@@ -169,15 +169,15 @@ void json2_manager_init(json2_manager_t* manager) {
     manager->current_block = NULL;  // Инициализируем кэш
 }
 
-void json2_manager_free(json2_manager_t* manager) {
+void json_manager_free(json_manager_t* manager) {
     if (manager == NULL)
         return;
 
-    json2_manager_destroy(manager);
+    json_manager_destroy(manager);
     free(manager);
 }
 
-void json2_manager_destroy(json2_manager_t* manager) {
+void json_manager_destroy(json_manager_t* manager) {
     if (manager == NULL)
         return;
 
@@ -189,10 +189,10 @@ void json2_manager_destroy(json2_manager_t* manager) {
         current = next;
     }
 
-    memset(manager, 0, sizeof(json2_manager_t));
+    memset(manager, 0, sizeof(json_manager_t));
 }
 
-size_t json2_manager_destroy_empty_blocks(void) {
+size_t json_manager_destroy_empty_blocks(void) {
     if (manager == NULL) return 0;
 
     free_blocks_counter++;
@@ -240,13 +240,13 @@ size_t json2_manager_destroy_empty_blocks(void) {
 // Функции для работы с парсером
 // ============================================================================
 
-static inline void skip_ws(json2_parser_t* parser) {
+static inline void skip_ws(json_parser_t* parser) {
     while (*parser->ptr == ' ' || *parser->ptr == '\t' || *parser->ptr == '\n' || *parser->ptr == '\r') {
         parser->ptr++;
     }
 }
 
-json2_token_t* __parse_value(json2_parser_t* parser) {
+json_token_t* __parse_value(json_parser_t* parser) {
     skip_ws(parser);
 
     // Проверка на конец строки
@@ -277,8 +277,8 @@ json2_token_t* __parse_value(json2_parser_t* parser) {
     }
 }
 
-json2_token_t* __parse_object(json2_parser_t* parser) {
-    json2_token_t* token = json2_token_alloc(JSON2_OBJECT);
+json_token_t* __parse_object(json_parser_t* parser) {
+    json_token_t* token = json_token_alloc(JSON_OBJECT);
     if (token == NULL) {
         parser->error = "Out of memory";
         return NULL;
@@ -301,9 +301,9 @@ json2_token_t* __parse_object(json2_parser_t* parser) {
     while (1) {
         skip_ws(parser);
 
-        json2_token_t* key = __parse_string(parser);
+        json_token_t* key = __parse_string(parser);
         if (parser->error) {
-            json2_token_free(key);
+            json_token_free(key);
             return token;
         }
 
@@ -318,9 +318,9 @@ json2_token_t* __parse_object(json2_parser_t* parser) {
 
         parser->ptr++;
 
-        json2_token_t* val = __parse_value(parser);
+        json_token_t* val = __parse_value(parser);
         if (parser->error) {
-            json2_token_free(val);
+            json_token_free(val);
             return token;
         }
 
@@ -344,8 +344,8 @@ json2_token_t* __parse_object(json2_parser_t* parser) {
     return token;
 }
 
-json2_token_t* __parse_array(json2_parser_t* parser) {
-    json2_token_t* token = json2_token_alloc(JSON2_ARRAY);
+json_token_t* __parse_array(json_parser_t* parser) {
+    json_token_t* token = json_token_alloc(JSON_ARRAY);
     if (token == NULL) {
         parser->error = "Out of memory";
         return NULL;
@@ -365,9 +365,9 @@ json2_token_t* __parse_array(json2_parser_t* parser) {
     }
 
     while (1) {
-        json2_token_t* val = __parse_value(parser);
+        json_token_t* val = __parse_value(parser);
         if (parser->error) {
-            json2_token_free(val);
+            json_token_free(val);
             return token;
         }
 
@@ -391,8 +391,8 @@ json2_token_t* __parse_array(json2_parser_t* parser) {
     return token;
 }
 
-json2_token_t* __parse_null(json2_parser_t* parser) {
-    json2_token_t* token = json2_token_alloc(JSON2_NULL);
+json_token_t* __parse_null(json_parser_t* parser) {
+    json_token_t* token = json_token_alloc(JSON_NULL);
     if (token == NULL) return NULL;
 
     const char* expected = "null";
@@ -409,8 +409,8 @@ json2_token_t* __parse_null(json2_parser_t* parser) {
     return token;
 }
 
-json2_token_t* __parse_true(json2_parser_t* parser) {
-    json2_token_t* token = json2_token_alloc(JSON2_BOOL);
+json_token_t* __parse_true(json_parser_t* parser) {
+    json_token_t* token = json_token_alloc(JSON_BOOL);
     if (token == NULL) return NULL;
 
     const char* expected = "true";
@@ -429,8 +429,8 @@ json2_token_t* __parse_true(json2_parser_t* parser) {
     return token;
 }
 
-json2_token_t* __parse_false(json2_parser_t* parser) {
-    json2_token_t* token = json2_token_alloc(JSON2_BOOL);
+json_token_t* __parse_false(json_parser_t* parser) {
+    json_token_t* token = json_token_alloc(JSON_BOOL);
     if (token == NULL) return NULL;
 
     const char* expected = "false";
@@ -449,8 +449,8 @@ json2_token_t* __parse_false(json2_parser_t* parser) {
     return token;
 }
 
-json2_token_t* __parse_number(json2_parser_t* parser) {
-    json2_token_t* token = json2_token_alloc(JSON2_NUMBER);
+json_token_t* __parse_number(json_parser_t* parser) {
+    json_token_t* token = json_token_alloc(JSON_NUMBER);
     if (token == NULL) return NULL;
 
     const char* start = parser->ptr;
@@ -468,8 +468,8 @@ json2_token_t* __parse_number(json2_parser_t* parser) {
     return token;
 }
 
-json2_token_t* __parse_string(json2_parser_t* parser) {
-    json2_token_t* token = json2_token_alloc(JSON2_STRING);
+json_token_t* __parse_string(json_parser_t* parser) {
+    json_token_t* token = json_token_alloc(JSON_STRING);
     if (token == NULL) return NULL;
 
     int result = 0;
@@ -838,7 +838,7 @@ json2_token_t* __parse_string(json2_parser_t* parser) {
     return token;
 }
 
-void __set_child_or_sibling(json2_token_t* token_src, json2_token_t* token_dst) {
+void __set_child_or_sibling(json_token_t* token_src, json_token_t* token_dst) {
     if (!token_src->child)
         token_src->child = token_dst;
     else
@@ -849,11 +849,11 @@ void __set_child_or_sibling(json2_token_t* token_src, json2_token_t* token_dst) 
     // Устанавливаем parent для token_dst
     token_dst->parent = token_src;
 
-    if (token_src->type == JSON2_OBJECT || token_src->type == JSON2_ARRAY)
+    if (token_src->type == JSON_OBJECT || token_src->type == JSON_ARRAY)
         token_src->size++;
 }
 
-void __init_token(json2_token_t* token, memory_block_t* block, json2_token_type_t type) {
+void __init_token(json_token_t* token, memory_block_t* block, json_token_type_t type) {
     token->block = block;
     token->child = NULL;
     token->sibling = NULL;
@@ -863,7 +863,7 @@ void __init_token(json2_token_t* token, memory_block_t* block, json2_token_type_
     token->type = type;
 
     // Initialize union based on type
-    if (type == JSON2_STRING) {
+    if (type == JSON_STRING) {
         // Initialize embedded str_t structure
         str_init(&token->value._string, 0);
     } else {
@@ -876,16 +876,16 @@ void __init_token(json2_token_t* token, memory_block_t* block, json2_token_type_
 // Функции для работы с json
 // ============================================================================
 
-json2_doc_t* json2_parse(const char* json_str) {
+json_doc_t* json_parse(const char* json_str) {
     // Инициализация глобального менеджера при первом использовании
     if (manager == NULL) {
-        manager = json2_manager_create();
+        manager = json_manager_create();
         if (manager == NULL) {
             return NULL;
         }
     }
 
-    json2_doc_t* doc = malloc(sizeof * doc);
+    json_doc_t* doc = malloc(sizeof * doc);
     if (doc == NULL) return NULL;
 
     doc->root = NULL;
@@ -894,7 +894,7 @@ json2_doc_t* json2_parse(const char* json_str) {
 
     const size_t json_size = strlen(json_str);
 
-    json2_parser_t parser = {
+    json_parser_t parser = {
         .json = json_str,
         .ptr = json_str,
         .end = json_str + json_size,
@@ -903,8 +903,8 @@ json2_doc_t* json2_parse(const char* json_str) {
         .json_size = json_size
     };
 
-    json2_token_t* toksuper = NULL;   // Текущий родительский токен
-    json2_token_t* last_token = NULL; // Последний добавленный токен
+    json_token_t* toksuper = NULL;   // Текущий родительский токен
+    json_token_t* last_token = NULL; // Последний добавленный токен
     size_t pos = 0;
 
     // Основной цикл парсинга - проходим по каждому символу
@@ -916,20 +916,20 @@ json2_doc_t* json2_parse(const char* json_str) {
             case '{':
             case '[': {
                 // Создаем токен для объекта или массива
-                json2_token_t* token = json2_token_alloc(
-                    c == '{' ? JSON2_OBJECT : JSON2_ARRAY
+                json_token_t* token = json_token_alloc(
+                    c == '{' ? JSON_OBJECT : JSON_ARRAY
                 );
                 if (!token) {
                     parser.error = "Out of memory";
-                    goto error_exit;
+                    goto failed;
                 }
 
                 // Добавляем токен к родителю
                 if (toksuper) {
                     // В строгом режиме объект/массив не может быть ключом
-                    if (toksuper->type == JSON2_OBJECT) {
+                    if (toksuper->type == JSON_OBJECT) {
                         parser.error = "Object/array cannot be a key";
-                        goto error_exit;
+                        goto failed;
                     }
 
                     token->parent = toksuper;
@@ -951,16 +951,16 @@ json2_doc_t* json2_parse(const char* json_str) {
 
             case '}':
             case ']': {
-                json2_token_type_t expected_type = (c == '}' ? JSON2_OBJECT : JSON2_ARRAY);
+                json_token_type_t expected_type = (c == '}' ? JSON_OBJECT : JSON_ARRAY);
 
                 // Проверяем текущий родитель
                 if (!toksuper) {
                     parser.error = "Unexpected closing bracket";
-                    goto error_exit;
+                    goto failed;
                 }
 
                 // Поднимаемся по цепочке родителей, пока не найдём нужный контейнер
-                json2_token_t* container = toksuper;
+                json_token_t* container = toksuper;
                 while (container && container->type != expected_type) {
                     // Если в объекте, то toksuper может указывать на ключ
                     // Нужно подняться к родительскому объекту
@@ -973,7 +973,7 @@ json2_doc_t* json2_parse(const char* json_str) {
 
                 if (!container || container->type != expected_type) {
                     parser.error = "Mismatched brackets";
-                    goto error_exit;
+                    goto failed;
                 }
 
                 // Закрываем найденный контейнер и поднимаемся к его родителю
@@ -982,26 +982,14 @@ json2_doc_t* json2_parse(const char* json_str) {
             }
 
             case '"': {
-                // Парсим строку
-                // json2_token_t* token = json2_token_alloc(JSON2_STRING);
-                // if (!token) {
-                //     parser.error = "Out of memory";
-                //     goto error_exit;
-                // }
-
                 // Используем существующую функцию парсинга строк
                 parser.ptr = json_str + pos;
-                json2_token_t* token = __parse_string(&parser);
+                json_token_t* token = __parse_string(&parser);
 
                 if (parser.error) {
-                    json2_token_free(token);
-                    goto error_exit;
+                    json_token_free(token);
+                    goto failed;
                 }
-
-                // Копируем распарсенную строку в наш токен
-                // token->value._string = parsed_string->value._string;
-                // parsed_string->value._string = NULL;  // Забираем владение строкой
-                // json2_token_free(parsed_string);
 
                 // Обновляем позицию в цикле
                 pos = parser.ptr - json_str - 1;  // -1 потому что цикл добавит +1
@@ -1041,8 +1029,8 @@ json2_doc_t* json2_parse(const char* json_str) {
                 // Запятая разделяет элементы
                 // Поднимаемся к родителю, если мы не в массиве/объекте
                 if (toksuper &&
-                    toksuper->type != JSON2_ARRAY &&
-                    toksuper->type != JSON2_OBJECT) {
+                    toksuper->type != JSON_ARRAY &&
+                    toksuper->type != JSON_OBJECT) {
                     toksuper = toksuper->parent;
                 }
                 break;
@@ -1055,18 +1043,12 @@ json2_doc_t* json2_parse(const char* json_str) {
             case 'f':
             case 'n': {
                 // Примитив не может быть ключом объекта
-                if (toksuper && toksuper->type == JSON2_OBJECT) {
+                if (toksuper && toksuper->type == JSON_OBJECT) {
                     parser.error = "Primitive cannot be a key";
-                    goto error_exit;
+                    goto failed;
                 }
 
-                json2_token_t* token = NULL;
-                // json2_token_t* token = json2_token_alloc(prim_type);
-                // if (!token) {
-                //     parser.error = "Out of memory";
-                //     goto error_exit;
-                // }
-
+                json_token_t* token = NULL;
                 // Парсим примитив
                 parser.ptr = json_str + pos;
 
@@ -1075,34 +1057,24 @@ json2_doc_t* json2_parse(const char* json_str) {
                         __parse_true(&parser) : __parse_false(&parser);
 
                     if (parser.error) {
-                        json2_token_free(token);
-                        goto error_exit;
+                        json_token_free(token);
+                        goto failed;
                     }
-
-                    // token->value._int = parsed->value._int;
-                    // json2_token_free(parsed);
                 } else if (c == 'n') {
                     token = __parse_null(&parser);
-                    // json2_token_t* parsed = __parse_null(&parser);
 
                     if (parser.error) {
-                        json2_token_free(token);
-                        goto error_exit;
+                        json_token_free(token);
+                        goto failed;
                     }
-
-                    // json2_token_free(parsed);
                 } else {
                     // Число
                     token = __parse_number(&parser);
-                    // json2_token_t* parsed = __parse_number(&parser);
 
                     if (parser.error) {
-                        json2_token_free(token);
-                        goto error_exit;
+                        json_token_free(token);
+                        goto failed;
                     }
-
-                    // token->value._double = parsed->value._double;
-                    // json2_token_free(parsed);
                 }
 
                 // Обновляем позицию в цикле
@@ -1126,38 +1098,42 @@ json2_doc_t* json2_parse(const char* json_str) {
 
             default:
                 parser.error = "Unexpected character";
-                goto error_exit;
+                goto failed;
         }
     }
 
     // Проверяем, что все контейнеры закрыты
     if (toksuper != NULL) {
         parser.error = "Unclosed object or array";
-        goto error_exit;
+        goto failed;
     }
 
     return doc;
 
-error_exit:
+    failed:
+
     if (parser.error) {
         log_error("JSON Error: %s\n    %.*s\n    ^\n",
                  parser.error,
                  min(15, parser.end - parser.ptr),
                  parser.ptr);
     }
-    return doc;
+
+    json_free(doc);
+
+    return NULL;
 }
 
-json2_doc_t* json2_create_empty(void) {
+json_doc_t* json_create_empty(void) {
     // Инициализация глобального менеджера при первом использовании
     if (manager == NULL) {
-        manager = json2_manager_create();
+        manager = json_manager_create();
         if (manager == NULL) {
             return NULL;
         }
     }
 
-    json2_doc_t* doc = malloc(sizeof * doc);
+    json_doc_t* doc = malloc(sizeof * doc);
     if (doc == NULL) return NULL;
 
     doc->root = NULL;
@@ -1167,10 +1143,10 @@ json2_doc_t* json2_create_empty(void) {
     return doc;
 }
 
-json2_token_t* json2_token_alloc(json2_token_type_t type) {
+json_token_t* json_token_alloc(json_token_type_t type) {
     // Инициализация глобального менеджера при первом использовании
     if (manager == NULL) {
-        manager = json2_manager_create();
+        manager = json_manager_create();
         if (manager == NULL) {
             return NULL;
         }
@@ -1178,7 +1154,7 @@ json2_token_t* json2_token_alloc(json2_token_type_t type) {
 
     memory_block_t* block = NULL;
     size_t slot_index = 0;
-    json2_token_t* token = NULL;
+    json_token_t* token = NULL;
 
     // 1. ОПТИМИЗАЦИЯ: Сначала пробуем кэшированный блок - O(1) в 99% случаев!
     if (manager->current_block && !memory_block_is_full(manager->current_block)) {
@@ -1201,7 +1177,7 @@ json2_token_t* json2_token_alloc(json2_token_type_t type) {
     }
 
     // 3. Не нашли свободный слот - создаём новый блок
-    block = memory_block_create(sizeof(json2_token_t), TOKENS_PER_BLOCK);
+    block = memory_block_create(sizeof(json_token_t), TOKENS_PER_BLOCK);
     if (block == NULL) return NULL;
 
     // Добавляем блок в начало списка
@@ -1216,18 +1192,18 @@ json2_token_t* json2_token_alloc(json2_token_type_t type) {
     found_slot:
 
     // Инициализируем токен
-    token = (json2_token_t*)block->memory + slot_index;
+    token = (json_token_t*)block->memory + slot_index;
     __init_token(token, block, type);
 
     return token;
 }
 
-void json2_token_free(json2_token_t* token) {
+void json_token_free(json_token_t* token) {
     if (!manager || !token || !token->block)
         return;
 
     // Очистить содержимое токена
-    if (token->type == JSON2_STRING)
+    if (token->type == JSON_STRING)
         str_clear(&token->value._string);
 
     // Освобождаем слот в блоке
@@ -1237,20 +1213,20 @@ void json2_token_free(json2_token_t* token) {
     if (!memory_block_is_full(token->block))
         manager->current_block = token->block;
 
-    json2_manager_destroy_empty_blocks();
+    json_manager_destroy_empty_blocks();
 }
 
 // Рекурсивная функция для освобождения дерева токенов
-static void __free_token_tree(json2_token_t* token) {
+static void __free_token_tree(json_token_t* token) {
     if (token == NULL) return;
 
     // Сохраняем ссылки на child и sibling перед обнулением
-    json2_token_t* child = token->child;
-    json2_token_t* sibling = token->sibling;
+    json_token_t* child = token->child;
+    json_token_t* sibling = token->sibling;
     memory_block_t* block = token->block;
 
     // Освобождаем значение токена (если это строка)
-    if (token->type == JSON2_STRING) {
+    if (token->type == JSON_STRING) {
         str_clear(&token->value._string);
     }
 
@@ -1276,7 +1252,7 @@ static void __free_token_tree(json2_token_t* token) {
     __free_token_tree(sibling);
 }
 
-void json2_free(json2_doc_t* document) {
+void json_clear(json_doc_t* document) {
     if (document == NULL) return;
 
     // Освобождаем дерево токенов
@@ -1285,24 +1261,28 @@ void json2_free(json2_doc_t* document) {
 
     // Освобождаем буфер stringify
     str_clear(&document->stringify);
+}
 
-    // Освобождаем сам документ
+void json_free(json_doc_t* document) {
+    if (document == NULL) return;
+
+    json_clear(document);
     free(document);
 }
 
-json2_token_t* json2_root(const json2_doc_t* document) {
+json_token_t* json_root(const json_doc_t* document) {
     if (document == NULL) return NULL;
 
     return document->root;
 }
 
-int json2_bool(const json2_token_t* token) {
+int json_bool(const json_token_t* token) {
     if (token == NULL) return 0;
 
     return token->value._int;
 }
 
-int json2_int(const json2_token_t* token, int* ok) {
+int json_int(const json_token_t* token, int* ok) {
     // Проверка на NULL
     if (token == NULL) {
         if (ok) *ok = 0;
@@ -1310,7 +1290,7 @@ int json2_int(const json2_token_t* token, int* ok) {
     }
 
     // Проверка типа токена
-    if (token->type != JSON2_NUMBER) {
+    if (token->type != JSON_NUMBER) {
         if (ok) *ok = 0;
         return 0;
     }
@@ -1349,22 +1329,17 @@ int json2_int(const json2_token_t* token, int* ok) {
     return (int)val;
 }
 
-double json2_double(const json2_token_t* token, int* ok) {
-    if (token == NULL) {
-        if (ok) *ok = 0;
+double json_double(const json_token_t* token) {
+    if (token == NULL)
         return 0.0;
-    }
 
-    if (token->type != JSON2_NUMBER) {
-        if (ok) *ok = 0;
+    if (token->type != JSON_NUMBER)
         return 0.0;
-    }
 
-    if (ok) *ok = 1;
     return token->value._double;
 }
 
-long long json2_llong(const json2_token_t* token, int* ok) {
+long long json_llong(const json_token_t* token, int* ok) {
     // Проверка на NULL
     if (token == NULL) {
         if (ok) *ok = 0;
@@ -1372,7 +1347,7 @@ long long json2_llong(const json2_token_t* token, int* ok) {
     }
 
     // Проверка типа токена
-    if (token->type != JSON2_NUMBER) {
+    if (token->type != JSON_NUMBER) {
         if (ok) *ok = 0;
         return 0;
     }
@@ -1411,13 +1386,19 @@ long long json2_llong(const json2_token_t* token, int* ok) {
     return (long long)val;
 }
 
-const char* json2_string(const json2_token_t* token) {
+const char* json_string(const json_token_t* token) {
     if (token == NULL) return NULL;
 
     return str_get((str_t*)&token->value._string);
 }
 
-unsigned int json2_uint(const json2_token_t* token, int* ok) {
+size_t json_string_size(const json_token_t* token) {
+    if (token == NULL) return 0;
+
+    return str_size(&token->value._string);
+}
+
+unsigned int json_uint(const json_token_t* token, int* ok) {
     // Проверка на NULL
     if (token == NULL) {
         if (ok) *ok = 0;
@@ -1425,7 +1406,7 @@ unsigned int json2_uint(const json2_token_t* token, int* ok) {
     }
 
     // Проверка типа токена
-    if (token->type != JSON2_NUMBER) {
+    if (token->type != JSON_NUMBER) {
         if (ok) *ok = 0;
         return 0;
     }
@@ -1464,44 +1445,44 @@ unsigned int json2_uint(const json2_token_t* token, int* ok) {
     return (unsigned int)val;
 }
 
-int json2_is_bool(const json2_token_t* token) {
+int json_is_bool(const json_token_t* token) {
     if (token == NULL) return 0;
 
-    return token->type == JSON2_BOOL;
+    return token->type == JSON_BOOL;
 }
 
-int json2_is_null(const json2_token_t* token) {
+int json_is_null(const json_token_t* token) {
     if (token == NULL) return 0;
 
-    return token->type == JSON2_NULL;
+    return token->type == JSON_NULL;
 }
 
-int json2_is_string(const json2_token_t* token) {
+int json_is_string(const json_token_t* token) {
     if (token == NULL) return 0;
 
-    return token->type == JSON2_STRING;
+    return token->type == JSON_STRING;
 }
 
-int json2_is_number(const json2_token_t* token) {
+int json_is_number(const json_token_t* token) {
     if (token == NULL) return 0;
 
-    return token->type == JSON2_NUMBER;
+    return token->type == JSON_NUMBER;
 }
 
-int json2_is_object(const json2_token_t* token) {
+int json_is_object(const json_token_t* token) {
     if (token == NULL) return 0;
 
-    return token->type == JSON2_OBJECT;
+    return token->type == JSON_OBJECT;
 }
 
-int json2_is_array(const json2_token_t* token) {
+int json_is_array(const json_token_t* token) {
     if (token == NULL) return 0;
 
-    return token->type == JSON2_ARRAY;
+    return token->type == JSON_ARRAY;
 }
 
-json2_token_t* json2_create_bool(int value) {
-    json2_token_t* token = json2_token_alloc(JSON2_BOOL);
+json_token_t* json_create_bool(int value) {
+    json_token_t* token = json_token_alloc(JSON_BOOL);
     if (token == NULL) return NULL;
 
     token->value._int = value ? 1 : 0;
@@ -1509,8 +1490,8 @@ json2_token_t* json2_create_bool(int value) {
     return token;
 }
 
-json2_token_t* json2_create_null(void) {
-    json2_token_t* token = json2_token_alloc(JSON2_NULL);
+json_token_t* json_create_null(void) {
+    json_token_t* token = json_token_alloc(JSON_NULL);
     if (token == NULL) return NULL;
 
     token->value._int = 0;
@@ -1518,10 +1499,10 @@ json2_token_t* json2_create_null(void) {
     return token;
 }
 
-json2_token_t* json2_create_string(const char* value) {
+json_token_t* json_create_string(const char* value) {
     if (value == NULL) return NULL;
 
-    json2_token_t* token = json2_token_alloc(JSON2_STRING);
+    json_token_t* token = json_token_alloc(JSON_STRING);
     if (token == NULL) return NULL;
 
     // Инициализируем str_t структуру
@@ -1531,15 +1512,15 @@ json2_token_t* json2_create_string(const char* value) {
     size_t len = strlen(value);
     if (str_assign(&token->value._string, value, len) == 0) {
         // str_assign вернул 0 - ошибка
-        json2_token_free(token);
+        json_token_free(token);
         return NULL;
     }
 
     return token;
 }
 
-json2_token_t* json2_create_number(double value) {
-    json2_token_t* token = json2_token_alloc(JSON2_NUMBER);
+json_token_t* json_create_number(double value) {
+    json_token_t* token = json_token_alloc(JSON_NUMBER);
     if (token == NULL) return NULL;
 
     token->value._double = value;
@@ -1547,21 +1528,51 @@ json2_token_t* json2_create_number(double value) {
     return token;
 }
 
-json2_token_t* json2_create_object(void) {
-    return json2_token_alloc(JSON2_OBJECT);
+json_token_t* json_create_object(void) {
+    return json_token_alloc(JSON_OBJECT);
 }
 
-json2_token_t* json2_create_array(void) {
-    return json2_token_alloc(JSON2_ARRAY);
+json_token_t* json_create_array(void) {
+    return json_token_alloc(JSON_ARRAY);
 }
 
-int json2_array_prepend(json2_token_t* token_array, json2_token_t* token_append) {
+json_doc_t* json_root_create_object(void) {
+    json_doc_t* doc = json_create_empty();
+    if (doc == NULL) return NULL;
+
+    json_token_t* token = json_create_array();
+    if (token == NULL) {
+        json_free(doc);
+        return NULL;
+    }
+
+    doc->root = token;
+
+    return doc;
+}
+
+json_doc_t* json_root_create_array(void) {
+    json_doc_t* doc = json_create_empty();
+    if (doc == NULL) return NULL;
+
+    json_token_t* token = json_create_object();
+    if (token == NULL) {
+        json_free(doc);
+        return NULL;
+    }
+
+    doc->root = token;
+
+    return doc;
+}
+
+int json_array_prepend(json_token_t* token_array, json_token_t* token_append) {
     if (token_array == NULL || token_append == NULL) return 0;
 
-    return json2_array_append_to(token_array, 0, token_append);
+    return json_array_append_to(token_array, 0, token_append);
 }
 
-int json2_array_append(json2_token_t* token_array, json2_token_t* token_append) {
+int json_array_append(json_token_t* token_array, json_token_t* token_append) {
     if (token_array == NULL || token_append == NULL) return 0;
 
     __set_child_or_sibling(token_array, token_append);
@@ -1569,10 +1580,10 @@ int json2_array_append(json2_token_t* token_array, json2_token_t* token_append) 
     return 1;
 }
 
-int json2_array_append_to(json2_token_t* token_array, int index, json2_token_t* token_append) {
+int json_array_append_to(json_token_t* token_array, int index, json_token_t* token_append) {
     if (token_array == NULL || token_append == NULL) return 0;
 
-    json2_token_t* token = token_array->child;
+    json_token_t* token = token_array->child;
     if (token == NULL) {
         token_array->child = token_append;
         token_array->last_sibling = token_append;
@@ -1580,7 +1591,7 @@ int json2_array_append_to(json2_token_t* token_array, int index, json2_token_t* 
         return 1;
     }
 
-    json2_token_t* token_prev = NULL;
+    json_token_t* token_prev = NULL;
     int find_index = 0;
     int i = 0;
     while (token) {
@@ -1609,16 +1620,16 @@ int json2_array_append_to(json2_token_t* token_array, int index, json2_token_t* 
     return 1;
 }
 
-int json2_array_erase(json2_token_t* token_array, int index, int count) {
+int json_array_erase(json_token_t* token_array, int index, int count) {
     if (token_array == NULL) return 0;
 
-    json2_token_t* token = token_array->child;
+    json_token_t* token = token_array->child;
     if (token == NULL) return 1;
     if (count == 0) return 0;
     if (index < 0 || index >= (int)token_array->size) return 0;
 
-    json2_token_t* token_prev = NULL;
-    json2_token_t* token_start = NULL;
+    json_token_t* token_prev = NULL;
+    json_token_t* token_start = NULL;
     int find_index = 0;
     int i = 0;
     while (token) {
@@ -1648,7 +1659,7 @@ int json2_array_erase(json2_token_t* token_array, int index, int count) {
     return 1;
 }
 
-int json2_array_clear(json2_token_t* token_array) {
+int json_array_clear(json_token_t* token_array) {
     if (token_array == NULL) return 0;
 
     token_array->child = NULL;
@@ -1657,16 +1668,16 @@ int json2_array_clear(json2_token_t* token_array) {
     return 1;
 }
 
-int json2_array_size(const json2_token_t* token_array) {
+int json_array_size(const json_token_t* token_array) {
     if (token_array == NULL) return 0;
 
     return token_array->size;
 }
 
-json2_token_t* json2_array_get(const json2_token_t* token_array, int index) {
+json_token_t* json_array_get(const json_token_t* token_array, int index) {
     if (token_array == NULL) return NULL;
 
-    json2_token_t* token = token_array->child;
+    json_token_t* token = token_array->child;
     if (token == NULL) return NULL;
 
     int i = 0;
@@ -1680,10 +1691,10 @@ json2_token_t* json2_array_get(const json2_token_t* token_array, int index) {
     return NULL;
 }
 
-int json2_object_set(json2_token_t* token_object, const char* key, json2_token_t* token) {
+int json_object_set(json_token_t* token_object, const char* key, json_token_t* token) {
     if (token_object == NULL || key == NULL || token == NULL) return 0;
 
-    json2_token_t* token_key = json2_create_string(key);
+    json_token_t* token_key = json_create_string(key);
     if (token_key == NULL) return 0;
 
     __set_child_or_sibling(token_key, token);
@@ -1692,14 +1703,14 @@ int json2_object_set(json2_token_t* token_object, const char* key, json2_token_t
     return 1;
 }
 
-json2_token_t* json2_object_get(const json2_token_t* token_object, const char* key) {
+json_token_t* json_object_get(const json_token_t* token_object, const char* key) {
     if (token_object == NULL || key == NULL) return NULL;
 
-    json2_token_t* token = token_object->child;
+    json_token_t* token = token_object->child;
     if (token == NULL) return NULL;
 
     while (token) {
-        const char* token_key = json2_string(token);
+        const char* token_key = json_string(token);
         if (token_key && strcmp(token_key, key) == 0) {
             return token->child;
         }
@@ -1710,15 +1721,15 @@ json2_token_t* json2_object_get(const json2_token_t* token_object, const char* k
     return NULL;
 }
 
-int json2_object_remove(json2_token_t* token_object, const char* key) {
+int json_object_remove(json_token_t* token_object, const char* key) {
     if (token_object == NULL || key == NULL) return 0;
 
-    json2_token_t* token_prev = NULL;
-    json2_token_t* token = token_object->child;
+    json_token_t* token_prev = NULL;
+    json_token_t* token = token_object->child;
     if (token == NULL) return 0;
 
     while (token) {
-        const char* token_key = json2_string(token);
+        const char* token_key = json_string(token);
         if (token_key && strcmp(token_key, key) == 0) {
             if (token_prev)
                 token_prev->sibling = token->sibling;
@@ -1736,13 +1747,13 @@ int json2_object_remove(json2_token_t* token_object, const char* key) {
     return 0;
 }
 
-int json2_object_size(const json2_token_t* token_object) {
+int json_object_size(const json_token_t* token_object) {
     if (token_object == NULL) return 0;
 
     return token_object->size;
 }
 
-int json2_object_clear(json2_token_t* token_object) {
+int json_object_clear(json_token_t* token_object) {
     if (token_object == NULL) return 0;
 
     token_object->child = NULL;
@@ -1755,11 +1766,11 @@ int json2_object_clear(json2_token_t* token_object) {
 // Функции для изменения значения токена
 // ============================================================================
 
-void json2_token_set_bool(json2_token_t* token, int value) {
+void json_token_set_bool(json_token_t* token, int value) {
     if (token == NULL) return;
 
     // Очищаем старое значение если это была строка
-    if (token->type == JSON2_STRING) {
+    if (token->type == JSON_STRING) {
         str_clear(&token->value._string);
     }
 
@@ -1767,16 +1778,16 @@ void json2_token_set_bool(json2_token_t* token, int value) {
     token->sibling = NULL;
     token->last_sibling = NULL;
     token->parent = NULL;
-    token->type = JSON2_BOOL;
+    token->type = JSON_BOOL;
     token->size = 0;
     token->value._int = value ? 1 : 0;
 }
 
-void json2_token_set_null(json2_token_t* token) {
+void json_token_set_null(json_token_t* token) {
     if (token == NULL) return;
 
     // Очищаем старое значение если это была строка
-    if (token->type == JSON2_STRING) {
+    if (token->type == JSON_STRING) {
         str_clear(&token->value._string);
     }
 
@@ -1784,16 +1795,16 @@ void json2_token_set_null(json2_token_t* token) {
     token->sibling = NULL;
     token->last_sibling = NULL;
     token->parent = NULL;
-    token->type = JSON2_NULL;
+    token->type = JSON_NULL;
     token->size = 0;
     token->value._int = 0;
 }
 
-void json2_token_set_string(json2_token_t* token, const char* value) {
+void json_token_set_string(json_token_t* token, const char* value) {
     if (token == NULL || value == NULL) return;
 
     // Очищаем старое значение если это была строка
-    if (token->type == JSON2_STRING) {
+    if (token->type == JSON_STRING) {
         str_clear(&token->value._string);
     } else {
         // Обнуляем union для безопасности
@@ -1804,7 +1815,7 @@ void json2_token_set_string(json2_token_t* token, const char* value) {
     token->sibling = NULL;
     token->last_sibling = NULL;
     token->parent = NULL;
-    token->type = JSON2_STRING;
+    token->type = JSON_STRING;
     token->size = 0;
 
     // Инициализируем строку
@@ -1813,11 +1824,11 @@ void json2_token_set_string(json2_token_t* token, const char* value) {
     str_assign(&token->value._string, value, len);
 }
 
-void json2_token_set_llong(json2_token_t* token, long long value) {
+void json_token_set_llong(json_token_t* token, long long value) {
     if (token == NULL) return;
 
     // Очищаем старое значение если это была строка
-    if (token->type == JSON2_STRING) {
+    if (token->type == JSON_STRING) {
         str_clear(&token->value._string);
     }
 
@@ -1825,16 +1836,16 @@ void json2_token_set_llong(json2_token_t* token, long long value) {
     token->sibling = NULL;
     token->last_sibling = NULL;
     token->parent = NULL;
-    token->type = JSON2_NUMBER;
+    token->type = JSON_NUMBER;
     token->size = 0;
     token->value._double = (double)value;
 }
 
-void json2_token_set_int(json2_token_t* token, int value) {
+void json_token_set_int(json_token_t* token, int value) {
     if (token == NULL) return;
 
     // Очищаем старое значение если это была строка
-    if (token->type == JSON2_STRING) {
+    if (token->type == JSON_STRING) {
         str_clear(&token->value._string);
     }
 
@@ -1842,16 +1853,16 @@ void json2_token_set_int(json2_token_t* token, int value) {
     token->sibling = NULL;
     token->last_sibling = NULL;
     token->parent = NULL;
-    token->type = JSON2_NUMBER;
+    token->type = JSON_NUMBER;
     token->size = 0;
     token->value._double = (double)value;
 }
 
-void json2_token_set_uint(json2_token_t* token, unsigned int value) {
+void json_token_set_uint(json_token_t* token, unsigned int value) {
     if (token == NULL) return;
 
     // Очищаем старое значение если это была строка
-    if (token->type == JSON2_STRING) {
+    if (token->type == JSON_STRING) {
         str_clear(&token->value._string);
     }
 
@@ -1859,16 +1870,16 @@ void json2_token_set_uint(json2_token_t* token, unsigned int value) {
     token->sibling = NULL;
     token->last_sibling = NULL;
     token->parent = NULL;
-    token->type = JSON2_NUMBER;
+    token->type = JSON_NUMBER;
     token->size = 0;
     token->value._double = (double)value;
 }
 
-void json2_token_set_double(json2_token_t* token, double value) {
+void json_token_set_double(json_token_t* token, double value) {
     if (token == NULL) return;
 
     // Очищаем старое значение если это была строка
-    if (token->type == JSON2_STRING) {
+    if (token->type == JSON_STRING) {
         str_clear(&token->value._string);
     }
 
@@ -1876,39 +1887,39 @@ void json2_token_set_double(json2_token_t* token, double value) {
     token->sibling = NULL;
     token->last_sibling = NULL;
     token->parent = NULL;
-    token->type = JSON2_NUMBER;
+    token->type = JSON_NUMBER;
     token->size = 0;
     token->value._double = value;
 }
 
-void json2_token_set_object(json2_token_t* token, json2_token_t* token_object) {
+void json_token_set_object(json_token_t* token, json_token_t* token_object) {
     if (token == NULL || token_object == NULL) return;
 
     // Очищаем старое значение если это была строка
-    if (token->type == JSON2_STRING) {
+    if (token->type == JSON_STRING) {
         str_clear(&token->value._string);
     }
 
     token->child = token_object->child;
     token->last_sibling = token_object->last_sibling;
     token->parent = NULL;
-    token->type = JSON2_OBJECT;
+    token->type = JSON_OBJECT;
     token->size = token_object->size;
     token->value._int = 0;
 }
 
-void json2_token_set_array(json2_token_t* token, json2_token_t* token_array) {
+void json_token_set_array(json_token_t* token, json_token_t* token_array) {
     if (token == NULL || token_array == NULL) return;
 
     // Очищаем старое значение если это была строка
-    if (token->type == JSON2_STRING) {
+    if (token->type == JSON_STRING) {
         str_clear(&token->value._string);
     }
 
     token->child = token_array->child;
     token->last_sibling = token_array->last_sibling;
     token->parent = NULL;
-    token->type = JSON2_ARRAY;
+    token->type = JSON_ARRAY;
     token->size = token_array->size;
     token->value._int = 0;
 }
@@ -1917,11 +1928,11 @@ void json2_token_set_array(json2_token_t* token, json2_token_t* token_array) {
 // Функции для работы с итератором
 // ============================================================================
 
-json2_it_t json2_init_it(const json2_token_t* token) {
-    json2_it_t it = {
+json_it_t json_create_empty_it(const json_token_t* token) {
+    json_it_t it = {
         .ok = 0,
         .index = 0,
-        .type = JSON2_NULL,
+        .type = JSON_NULL,
         .key = NULL,
         .value = NULL,
         .parent = NULL
@@ -1933,14 +1944,14 @@ json2_it_t json2_init_it(const json2_token_t* token) {
     it.index = 0;
     it.type = token->type;
     it.key = token->child;
-    it.parent = (json2_token_t*)token;
+    it.parent = (json_token_t*)token;
 
-    if (token->type == JSON2_OBJECT) {
+    if (token->type == JSON_OBJECT) {
         if (token->child) {
             it.value = token->child->child;
         }
     }
-    else if (token->type == JSON2_ARRAY) {
+    else if (token->type == JSON_ARRAY) {
         it.value = token->child;
     }
     else {
@@ -1950,59 +1961,59 @@ json2_it_t json2_init_it(const json2_token_t* token) {
     return it;
 }
 
-int json2_end_it(const json2_it_t* iterator) {
+int json_end_it(const json_it_t* iterator) {
     if (iterator == NULL) return 1;
     if (iterator->parent == NULL) return 1;
 
     return iterator->index == (int)iterator->parent->size;
 }
 
-const void* json2_it_key(const json2_it_t* iterator) {
+const void* json_it_key(const json_it_t* iterator) {
     if (iterator == NULL)
         return NULL;
 
-    if (iterator->type == JSON2_OBJECT)
-        return json2_string(iterator->key);
-    else if (iterator->type == JSON2_ARRAY)
+    if (iterator->type == JSON_OBJECT)
+        return json_string(iterator->key);
+    else if (iterator->type == JSON_ARRAY)
         return &iterator->index;
 
     return NULL;
 }
 
-json2_token_t* json2_it_value(const json2_it_t* iterator) {
+json_token_t* json_it_value(const json_it_t* iterator) {
     if (iterator == NULL) return NULL;
 
     return iterator->value;
 }
 
-json2_it_t json2_next_it(json2_it_t* iterator) {
-    if (iterator == NULL) return (json2_it_t){0};
+json_it_t json_next_it(json_it_t* iterator) {
+    if (iterator == NULL) return (json_it_t){0};
 
     iterator->index++;
 
-    if (json2_end_it(iterator)) return *iterator;
+    if (json_end_it(iterator)) return *iterator;
 
     iterator->key = iterator->key->sibling;
 
-    if (iterator->type == JSON2_OBJECT)
+    if (iterator->type == JSON_OBJECT)
         iterator->value = iterator->key->child;
-    else if (iterator->type == JSON2_ARRAY)
+    else if (iterator->type == JSON_ARRAY)
         iterator->value = iterator->key;
 
     return *iterator;
 }
 
-void json2_it_erase(json2_it_t* iterator) {
+void json_it_erase(json_it_t* iterator) {
     if (iterator == NULL) return;
 
-    if (iterator->type == JSON2_OBJECT) {
-        const char* key = json2_string(iterator->key);
+    if (iterator->type == JSON_OBJECT) {
+        const char* key = json_string(iterator->key);
         if (key) {
-            json2_object_remove(iterator->parent, key);
+            json_object_remove(iterator->parent, key);
         }
     }
-    else if (iterator->type == JSON2_ARRAY) {
-        json2_array_erase(iterator->parent, iterator->index, 1);
+    else if (iterator->type == JSON_ARRAY) {
+        json_array_erase(iterator->parent, iterator->index, 1);
     }
 
     iterator->index--;
@@ -2116,7 +2127,7 @@ static int __unicode_encode_escape(uint32_t codepoint, str_t* dest) {
 // Параметр encode_unicode:
 //   0 = сохранять UTF-8 как есть (только обязательные escape-последовательности)
 //   1 = кодировать все не-ASCII символы в \uXXXX последовательности
-static int __json2_process_string_escapes(const char* source_str, size_t source_length, str_t* dest, int encode_unicode) {
+static int __json_process_string_escapes(const char* source_str, size_t source_length, str_t* dest, int encode_unicode) {
     size_t i = 0;
 
     while (i < source_length) {
@@ -2202,38 +2213,38 @@ static int __json2_process_string_escapes(const char* source_str, size_t source_
 }
 
 // Вспомогательная функция для вставки обработанной строки
-static int __json2_stringify_insert_processed(json2_doc_t* document, const char* string, size_t length) {
+static int __json_stringify_insert_processed(json_doc_t* document, const char* string, size_t length) {
     // Используем режим из документа:
     //   0 = UTF-8 mode (сохранять UTF-8 как есть) - компактнее
     //   1 = ASCII-only mode (кодировать все не-ASCII в \uXXXX) - для совместимости
-    return __json2_process_string_escapes(string, length, &document->stringify, document->ascii_mode);
+    return __json_process_string_escapes(string, length, &document->stringify, document->ascii_mode);
 }
 
 // Вспомогательная функция для вставки строки без обработки
-static int __json2_stringify_insert(json2_doc_t* document, const char* string, size_t length) {
+static int __json_stringify_insert(json_doc_t* document, const char* string, size_t length) {
     return str_append(&document->stringify, string, length);
 }
 
-static int __json2_stringify_token(json2_doc_t* document) {
+static int __json_stringify_token(json_doc_t* document) {
     if (document == NULL) return 0;
 
-    json2_token_t* token = document->root;
+    json_token_t* token = document->root;
     if (token == NULL) return 0;
 
     state_t state = JSON_STATE_PROCESS_PRIMITIVE;
-    if (token->type == JSON2_OBJECT)
+    if (token->type == JSON_OBJECT)
         state = JSON_STATE_OPEN_OBJECT;
-    else if (token->type == JSON2_ARRAY)
+    else if (token->type == JSON_ARRAY)
         state = JSON_STATE_OPEN_ARRAY;
 
     while (token != NULL) {
         switch (state) {
         case JSON_STATE_OPEN_OBJECT:
             {
-                if (!__json2_stringify_insert(document, "{", 1)) return 0;
+                if (!__json_stringify_insert(document, "{", 1)) return 0;
 
                 if (token->child == NULL) {
-                    if (!__json2_stringify_insert(document, "}", 1)) return 0;
+                    if (!__json_stringify_insert(document, "}", 1)) return 0;
                 }
                 else {
                     token = token->child;
@@ -2248,16 +2259,16 @@ static int __json2_stringify_token(json2_doc_t* document) {
                     break;
                 } else {
                     // Если parent - массив, добавляем запятую перед следующим элементом
-                    if (token->parent && token->parent->type == JSON2_ARRAY) {
-                        if (!__json2_stringify_insert(document, ",", 1)) return 0;
+                    if (token->parent && token->parent->type == JSON_ARRAY) {
+                        if (!__json_stringify_insert(document, ",", 1)) return 0;
                     }
 
                     token = token->sibling;
 
                     state = JSON_STATE_PROCESS_PRIMITIVE;
-                    if (token->type == JSON2_OBJECT)
+                    if (token->type == JSON_OBJECT)
                         state = JSON_STATE_OPEN_OBJECT;
-                    else if (token->type == JSON2_ARRAY)
+                    else if (token->type == JSON_ARRAY)
                         state = JSON_STATE_OPEN_ARRAY;
 
                     break;
@@ -2266,37 +2277,37 @@ static int __json2_stringify_token(json2_doc_t* document) {
             break;
         case JSON_STATE_PROCESS_OBJECT_KEY:
             {
-                json2_token_t* key = token;
+                json_token_t* key = token;
 
                 // Валидация ключа
-                if (key->type != JSON2_STRING) return 0;  // Ключ должен быть строкой
+                if (key->type != JSON_STRING) return 0;  // Ключ должен быть строкой
                 if (key->child == NULL) return 0;         // У ключа должно быть значение
 
                 // Записываем ключ
-                if (!__json2_stringify_insert(document, "\"", 1)) return 0;
-                const char* key_str = json2_string(key);
+                if (!__json_stringify_insert(document, "\"", 1)) return 0;
+                const char* key_str = json_string(key);
                 if (key_str == NULL) return 0;
 
                 const size_t key_len = str_size(&key->value._string);
-                if (!__json2_stringify_insert_processed(document, key_str, key_len)) return 0;
-                if (!__json2_stringify_insert(document, "\":", 2)) return 0;
+                if (!__json_stringify_insert_processed(document, key_str, key_len)) return 0;
+                if (!__json_stringify_insert(document, "\":", 2)) return 0;
 
                 // Переключаемся на запись значения
                 token = key->child;
 
                 state = JSON_STATE_PROCESS_PRIMITIVE;
-                if (token->type == JSON2_OBJECT)
+                if (token->type == JSON_OBJECT)
                     state = JSON_STATE_OPEN_OBJECT;
-                else if (token->type == JSON2_ARRAY)
+                else if (token->type == JSON_ARRAY)
                     state = JSON_STATE_OPEN_ARRAY;
             }
             break;
         case JSON_STATE_OPEN_ARRAY:
             {
-                if (!__json2_stringify_insert(document, "[", 1)) return 0;
+                if (!__json_stringify_insert(document, "[", 1)) return 0;
 
                 if (token->child == NULL) {
-                    if (!__json2_stringify_insert(document, "]", 1)) return 0;
+                    if (!__json_stringify_insert(document, "]", 1)) return 0;
                 }
                 else {
                     // Переходим к первому элементу
@@ -2304,9 +2315,9 @@ static int __json2_stringify_token(json2_doc_t* document) {
 
                     // Определяем состояние для первого элемента
                     state = JSON_STATE_PROCESS_PRIMITIVE;
-                    if (token->type == JSON2_OBJECT)
+                    if (token->type == JSON_OBJECT)
                         state = JSON_STATE_OPEN_OBJECT;
-                    else if (token->type == JSON2_ARRAY)
+                    else if (token->type == JSON_ARRAY)
                         state = JSON_STATE_OPEN_ARRAY;
                     break;
                 }
@@ -2318,53 +2329,53 @@ static int __json2_stringify_token(json2_doc_t* document) {
                     break;
                 } else {
                     // Если parent - массив, добавляем запятую перед следующим элементом
-                    if (token->parent && token->parent->type == JSON2_ARRAY) {
-                        if (!__json2_stringify_insert(document, ",", 1)) return 0;
+                    if (token->parent && token->parent->type == JSON_ARRAY) {
+                        if (!__json_stringify_insert(document, ",", 1)) return 0;
                     }
 
                     token = token->sibling;
                 }
 
                 state = JSON_STATE_PROCESS_PRIMITIVE;
-                if (token->type == JSON2_OBJECT)
+                if (token->type == JSON_OBJECT)
                     state = JSON_STATE_OPEN_OBJECT;
-                else if (token->type == JSON2_ARRAY)
+                else if (token->type == JSON_ARRAY)
                     state = JSON_STATE_OPEN_ARRAY;
             }
             break;
         case JSON_STATE_PROCESS_PRIMITIVE:
             {
                 switch (token->type) {
-                case JSON2_STRING:
+                case JSON_STRING:
                     {
-                        const char* value = json2_string(token);
+                        const char* value = json_string(token);
 
-                        if (!__json2_stringify_insert(document, "\"", 1)) return 0;
+                        if (!__json_stringify_insert(document, "\"", 1)) return 0;
                         if (value) {
                             // Вычисляем size только если value != NULL
                             size_t size = str_size(&token->value._string);
-                            if (!__json2_stringify_insert_processed(document, value, size)) return 0;
+                            if (!__json_stringify_insert_processed(document, value, size)) return 0;
                         }
-                        if (!__json2_stringify_insert(document, "\"", 1)) return 0;
+                        if (!__json_stringify_insert(document, "\"", 1)) return 0;
                     }
                     break;
 
-                case JSON2_BOOL:
+                case JSON_BOOL:
                     {
                         const char* value = token->value._int ? "true" : "false";
                         int size = token->value._int ? 4 : 5;
 
-                        if (!__json2_stringify_insert(document, value, size)) return 0;
+                        if (!__json_stringify_insert(document, value, size)) return 0;
                     }
                     break;
 
-                case JSON2_NULL:
+                case JSON_NULL:
                     {
-                        if (!__json2_stringify_insert(document, "null", 4)) return 0;
+                        if (!__json_stringify_insert(document, "null", 4)) return 0;
                     }
                     break;
 
-                case JSON2_NUMBER:
+                case JSON_NUMBER:
                     {
                         size_t buffer_size = 64;
                         char buffer[buffer_size];
@@ -2400,7 +2411,7 @@ static int __json2_stringify_token(json2_doc_t* document) {
 
                         size_t size = (size_t)written;
 
-                        if (!__json2_stringify_insert(document, buffer, size)) return 0;
+                        if (!__json_stringify_insert(document, buffer, size)) return 0;
                     }
                     break;
                 default:
@@ -2414,16 +2425,16 @@ static int __json2_stringify_token(json2_doc_t* document) {
                 } else {
                     token = token->sibling;
 
-                    if (token->parent && token->parent->type == JSON2_ARRAY)
-                        if (!__json2_stringify_insert(document, ",", 1)) return 0;
+                    if (token->parent && token->parent->type == JSON_ARRAY)
+                        if (!__json_stringify_insert(document, ",", 1)) return 0;
 
-                    if (token->parent && token->parent->type == JSON2_STRING && token->parent->sibling != NULL) {
-                        if (!__json2_stringify_insert(document, ",", 1)) return 0;
+                    if (token->parent && token->parent->type == JSON_STRING && token->parent->sibling != NULL) {
+                        if (!__json_stringify_insert(document, ",", 1)) return 0;
 
                         state = JSON_STATE_PROCESS_PRIMITIVE;
-                        if (token->parent->type == JSON2_OBJECT)
+                        if (token->parent->type == JSON_OBJECT)
                             state = JSON_STATE_OPEN_OBJECT;
-                        else if (token->parent->type == JSON2_ARRAY)
+                        else if (token->parent->type == JSON_ARRAY)
                             state = JSON_STATE_OPEN_ARRAY;
 
 
@@ -2431,9 +2442,9 @@ static int __json2_stringify_token(json2_doc_t* document) {
                     }
 
                     state = JSON_STATE_PROCESS_PRIMITIVE;
-                    if (token->type == JSON2_OBJECT)
+                    if (token->type == JSON_OBJECT)
                         state = JSON_STATE_OPEN_OBJECT;
-                    else if (token->type == JSON2_ARRAY)
+                    else if (token->type == JSON_ARRAY)
                         state = JSON_STATE_OPEN_ARRAY;
 
                     break;
@@ -2443,8 +2454,8 @@ static int __json2_stringify_token(json2_doc_t* document) {
         case JSON_STATE_CLOSE_CONTAINER:
             {
                 // Если parent - ключ объекта, добавляем запятую если есть следующий ключ
-                if (token && token->type == JSON2_STRING && token->sibling != NULL) {
-                    if (!__json2_stringify_insert(document, ",", 1)) return 0;
+                if (token && token->type == JSON_STRING && token->sibling != NULL) {
+                    if (!__json_stringify_insert(document, ",", 1)) return 0;
 
                     token = token->sibling;
                     state = JSON_STATE_PROCESS_OBJECT_KEY;
@@ -2453,31 +2464,31 @@ static int __json2_stringify_token(json2_doc_t* document) {
 
                 // Закрываем контейнеры, поднимаясь вверх
                 while (token != NULL) {
-                    if (token->type == JSON2_OBJECT) {
-                        if (!__json2_stringify_insert(document, "}", 1)) return 0;
-                    } else if (token->type == JSON2_ARRAY) {
-                        if (!__json2_stringify_insert(document, "]", 1)) return 0;
+                    if (token->type == JSON_OBJECT) {
+                        if (!__json_stringify_insert(document, "}", 1)) return 0;
+                    } else if (token->type == JSON_ARRAY) {
+                        if (!__json_stringify_insert(document, "]", 1)) return 0;
                     }
 
                     if (token->sibling != NULL) {
                         // Добавляем запятую если:
                         // 1. parent - массив (элементы массива разделяются запятыми), ИЛИ
                         // 2. текущий токен - ключ объекта (пары ключ-значение разделяются запятыми)
-                        if ((token->parent && token->parent->type == JSON2_ARRAY) ||
-                            (token->type == JSON2_STRING)) {
-                            if (!__json2_stringify_insert(document, ",", 1)) return 0;
+                        if ((token->parent && token->parent->type == JSON_ARRAY) ||
+                            (token->type == JSON_STRING)) {
+                            if (!__json_stringify_insert(document, ",", 1)) return 0;
                         }
 
                         token = token->sibling;
 
                         // Если следующий токен - ключ объекта, переходим к обработке ключа
-                        if (token->type == JSON2_STRING) {
+                        if (token->type == JSON_STRING) {
                             state = JSON_STATE_PROCESS_OBJECT_KEY;
                         } else {
                             state = JSON_STATE_PROCESS_PRIMITIVE;
-                            if (token->type == JSON2_OBJECT)
+                            if (token->type == JSON_OBJECT)
                                 state = JSON_STATE_OPEN_OBJECT;
-                            else if (token->type == JSON2_ARRAY)
+                            else if (token->type == JSON_ARRAY)
                                 state = JSON_STATE_OPEN_ARRAY;
                         }
                         break;
@@ -2496,13 +2507,13 @@ static int __json2_stringify_token(json2_doc_t* document) {
     return 1;
 }
 
-const char* json2_stringify(json2_doc_t* document) {
+const char* json_stringify(json_doc_t* document) {
     if (document == NULL) return NULL;
     if (document->root == NULL) return NULL;
 
     str_reset(&document->stringify);
 
-    if (!__json2_stringify_token(document)) {
+    if (!__json_stringify_token(document)) {
         str_clear(&document->stringify);
         return NULL;
     }
@@ -2510,17 +2521,17 @@ const char* json2_stringify(json2_doc_t* document) {
     return str_get(&document->stringify);
 }
 
-size_t json2_stringify_size(json2_doc_t* document) {
+size_t json_stringify_size(json_doc_t* document) {
     if (document == NULL) return 0;
 
     return str_size(&document->stringify);
 }
 
-char* json2_stringify_detach(json2_doc_t* document) {
+char* json_stringify_detach(json_doc_t* document) {
     if (document == NULL) return NULL;
 
     // Сначала вызываем stringify для генерации строки
-    const char* result = json2_stringify(document);
+    const char* result = json_stringify(document);
     if (result == NULL) return NULL;
 
     // Копируем строку
@@ -2532,17 +2543,17 @@ char* json2_stringify_detach(json2_doc_t* document) {
     return detached;
 }
 
-int json2_copy(json2_doc_t* from, json2_doc_t* to) {
+int json_copy(json_doc_t* from, json_doc_t* to) {
     if (from == NULL || to == NULL) return 0;
 
-    char* data = json2_stringify_detach(from);
+    char* data = json_stringify_detach(from);
     if (data == NULL) return 0;
 
-    json2_doc_t* parsed = json2_parse(data);
+    json_doc_t* parsed = json_parse(data);
     free(data);
 
     if (parsed == NULL || parsed->root == NULL) {
-        if (parsed) json2_free(parsed);
+        if (parsed) json_free(parsed);
         return 0;
     }
 
@@ -2551,7 +2562,7 @@ int json2_copy(json2_doc_t* from, json2_doc_t* to) {
     parsed->root = NULL;
 
     // Освобождаем временный документ
-    json2_free(parsed);
+    json_free(parsed);
 
     return 1;
 }

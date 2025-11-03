@@ -29,7 +29,7 @@ int str_reserve(str_t* str, size_t capacity);
 void str_clear(str_t* str);
 void str_free(str_t* str);
 
-size_t str_size(str_t* str);
+size_t str_size(const str_t* str);
 int str_insertc(str_t* str, char ch, size_t pos);
 int str_prependc(str_t* str, char ch);
 int str_appendc(str_t* str, char ch);

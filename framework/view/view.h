@@ -3,6 +3,6 @@
 
 #include "viewcommon.h"
 
-char* render(jsondoc_t* document, const char* storage_name, const char* path_format, ...);
+char* render(json_doc_t* document, const char* storage_name, const char* path_format, ...);
 
 #endif

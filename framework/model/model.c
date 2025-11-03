@@ -416,7 +416,7 @@ int model_execute(const char* dbid, const char* format, array_t* params) {
     return res;
 }
 
-jsontok_t* model_to_json(void* arg, jsondoc_t* document, ...) {
+json_token_t* model_to_json(void* arg, json_doc_t* document, ...) {
     va_list va_args;
     va_start(va_args, 0);
 
@@ -437,10 +437,10 @@ char* model_stringify(void* arg, ...) {
 
     va_end(va_args);
 
-    jsondoc_t* doc = json_init();
+    json_doc_t* doc = json_create_empty();
     if (!doc) return NULL;
 
-    jsontok_t* object = model_json_create_object(arg, display_fields, doc);
+    json_token_t* object = model_json_create_object(arg, display_fields, doc);
     if (object == NULL) {
         json_free(doc);
         return NULL;
@@ -456,10 +456,10 @@ char* model_stringify(void* arg, ...) {
 char* model_list_stringify(array_t* array) {
     if (array == NULL) return NULL;
 
-    jsondoc_t* doc = json_init();
+    json_doc_t* doc = json_create_empty();
     if (!doc) return NULL;
 
-    jsontok_t* json_array = json_create_array(doc);
+    json_token_t* json_array = json_create_array();
     char* data = NULL;
 
     for (size_t i = 0; i < array_size(array); i++) {
@@ -585,7 +585,7 @@ tm_t* model_timetz(mfield_t* field) {
     return field->value._tm;
 }
 
-jsondoc_t* model_json(mfield_t* field) {
+json_doc_t* model_json(mfield_t* field) {
     if (field == NULL) return NULL;
     if (field->type != MODEL_JSON) return NULL;
 
@@ -797,7 +797,7 @@ int model_set_timetz(mfield_t* field, tm_t* value) {
     return __model_set_date(field, value);
 }
 
-int model_set_json(mfield_t* field, jsondoc_t* value) {
+int model_set_json(mfield_t* field, json_doc_t* value) {
     if (field == NULL) return 0;
     if (field->type != MODEL_JSON) return 0;
 
@@ -809,7 +809,7 @@ int model_set_json(mfield_t* field, jsondoc_t* value) {
 
     json_free(field->value._jsondoc);
 
-    jsondoc_t* document = json_init();
+    json_doc_t* document = json_create_empty();
     if (document == NULL) return 0;
 
     if (!json_copy(value, document)) {
@@ -1280,7 +1280,7 @@ int model_set_json_from_str(mfield_t* field, const char* value) {
     if (field == NULL) return 0;
     if (field->type != MODEL_JSON) return 0;
 
-    jsondoc_t* document = json_create(value);
+    json_doc_t* document = json_parse(value);
     if (document == NULL) return 0;
 
     field->value._jsondoc = document;
@@ -1331,10 +1331,10 @@ int model_set_enum_from_str(mfield_t* field, const char* value, size_t size) {
 }
 
 int model_set_array_from_str(mfield_t* field, const char* value) {
-    jsondoc_t* document = json_create(value);
+    json_doc_t* document = json_parse(value);
     if (document == NULL) return 0;
 
-    const jsontok_t* token_array = json_root(document);
+    const json_token_t* token_array = json_root(document);
     if (token_array == NULL) {
         json_free(document);
         return 0;
@@ -1350,11 +1350,11 @@ int model_set_array_from_str(mfield_t* field, const char* value) {
         return 0;
     }
 
-    for (jsonit_t it_array = json_init_it(token_array); !json_end_it(&it_array); json_next_it(&it_array)) {
-        jsontok_t* token_value = json_it_value(&it_array);
+    for (json_it_t it_array = json_create_empty_it(token_array); !json_end_it(&it_array); json_next_it(&it_array)) {
+        json_token_t* token_value = json_it_value(&it_array);
         if (json_is_string(token_value)) {
             array_push_back(array, array_create_string(json_string(token_value)));
-        } else if (json_is_int(token_value)) {
+        } else if (json_is_number(token_value)) {
             array_push_back(array, array_create_double(json_double(token_value)));
         } else if (json_is_bool(token_value)) {
             array_push_back(array, array_create_double(json_bool(token_value)));
@@ -1681,14 +1681,14 @@ void model_params_free(void* params, const size_t size) {
     free(params);
 }
 
-jsontok_t* model_json_create_object(void* arg, char** display_fields, jsondoc_t* doc) {
+json_token_t* model_json_create_object(void* arg, char** display_fields, json_doc_t* doc) {
     if (arg == NULL) return NULL;
     if (doc == NULL) return NULL;
 
     model_t* model = arg;
 
     int result = 0;
-    jsontok_t* object = json_create_object(doc);
+    json_token_t* object = json_create_object();
     if (object == NULL) return NULL;
 
     for (int i = 0; i < model->fields_count(model); i++) {
@@ -1697,68 +1697,68 @@ jsontok_t* model_json_create_object(void* arg, char** display_fields, jsondoc_t*
         if (!__model_allow_field_in_json(field->name, display_fields))
             continue;
 
-        jsontok_t* token_value = NULL;
+        json_token_t* token_value = NULL;
 
         switch (field->type) {
         case MODEL_BOOL:
-            token_value = json_create_bool(doc, model_bool(field));
+            token_value = json_create_bool(model_bool(field));
             break;
         case MODEL_SMALLINT:
-            token_value = json_create_int(doc, model_smallint(field));
+            token_value = json_create_number(model_smallint(field));
             break;
         case MODEL_INT:
-            token_value = json_create_int(doc, model_int(field));
+            token_value = json_create_number(model_int(field));
             break;
         case MODEL_BIGINT:
-            token_value = json_create_int(doc, model_bigint(field));
+            token_value = json_create_number(model_bigint(field));
             break;
         case MODEL_FLOAT:
-            token_value = json_create_double(doc, model_float(field));
+            token_value = json_create_number(model_float(field));
             break;
         case MODEL_DOUBLE:
-            token_value = json_create_double(doc, model_double(field));
+            token_value = json_create_number(model_double(field));
             break;
         case MODEL_DECIMAL:
-            token_value = json_create_double(doc, model_decimal(field));
+            token_value = json_create_number(model_decimal(field));
             break;
         case MODEL_MONEY:
-            token_value = json_create_double(doc, model_double(field));
+            token_value = json_create_number(model_double(field));
             break;
         case MODEL_DATE:
-            token_value = json_create_string(doc, str_get(model_date_to_str(field)));
+            token_value = json_create_string(str_get(model_date_to_str(field)));
             break;
         case MODEL_TIME:
-            token_value = json_create_string(doc, str_get(model_time_to_str(field)));
+            token_value = json_create_string(str_get(model_time_to_str(field)));
             break;
         case MODEL_TIMETZ:
-            token_value = json_create_string(doc, str_get(model_timetz_to_str(field)));
+            token_value = json_create_string(str_get(model_timetz_to_str(field)));
             break;
         case MODEL_TIMESTAMP:
-            token_value = json_create_string(doc, str_get(model_timestamp_to_str(field)));
+            token_value = json_create_string(str_get(model_timestamp_to_str(field)));
             break;
         case MODEL_TIMESTAMPTZ:
-            token_value = json_create_string(doc, str_get(model_timestamptz_to_str(field)));
+            token_value = json_create_string(str_get(model_timestamptz_to_str(field)));
             break;
         case MODEL_JSON:
-            token_value = json_create_string(doc, str_get(model_json_to_str(field)));
+            token_value = json_create_string(str_get(model_json_to_str(field)));
             break;
         case MODEL_BINARY:
-            token_value = json_create_string(doc, str_get(model_binary(field)));
+            token_value = json_create_string(str_get(model_binary(field)));
             break;
         case MODEL_VARCHAR:
-            token_value = json_create_string(doc, str_get(model_varchar(field)));
+            token_value = json_create_string(str_get(model_varchar(field)));
             break;
         case MODEL_CHAR:
-            token_value = json_create_string(doc, str_get(model_char(field)));
+            token_value = json_create_string(str_get(model_char(field)));
             break;
         case MODEL_TEXT:
-            token_value = json_create_string(doc, str_get(model_text(field)));
+            token_value = json_create_string(str_get(model_text(field)));
             break;
         case MODEL_ENUM:
-            token_value = json_create_string(doc, str_get(model_enum(field)));
+            token_value = json_create_string(str_get(model_enum(field)));
             break;
         case MODEL_ARRAY:
-            token_value = json_create_string(doc, str_get(model_array_to_str(field)));
+            token_value = json_create_string(str_get(model_array_to_str(field)));
             break;
         }
 

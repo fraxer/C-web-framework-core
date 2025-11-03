@@ -128,15 +128,11 @@ file_content_t websocketsrequest_payload_file(websockets_protocol_t* protocol) {
     return file_content;
 }
 
-jsondoc_t* websocketsrequest_payload_json(websockets_protocol_t* protocol) {
+json_doc_t* websocketsrequest_payload_json(websockets_protocol_t* protocol) {
     char* payload = websocketsrequest_payload(protocol);
     if (payload == NULL) return NULL;
 
-    jsondoc_t* document = json_init();
-    if (document == NULL) goto failed;
-    if (!json_parse(document, payload)) goto failed;
-
-    failed:
+    json_doc_t* document = json_parse(payload);
 
     free(payload);
 

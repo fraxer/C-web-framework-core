@@ -471,7 +471,7 @@ int mg_migration_create(mgconfig_t* config) {
 }
 
 int main(int argc, char* argv[]) {
-    jsondoc_t* document = NULL;
+    json_doc_t* document = NULL;
     mgconfig_t config = mg_args_parse(argc, argv);
     if (!config.ok) goto failed;
 

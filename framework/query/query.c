@@ -287,7 +287,7 @@ long double query_param_ldouble(http1request_t* request, const char* param_name,
     return strtold(value, NULL);
 }
 
-jsondoc_t* query_param_array(http1request_t* request, const char* param_name, int* ok) {
+json_doc_t* query_param_array(http1request_t* request, const char* param_name, int* ok) {
     const char* value = __prepare_and_get_value(request, param_name, &ok);
     if (value == NULL)
         return NULL;
@@ -295,16 +295,11 @@ jsondoc_t* query_param_array(http1request_t* request, const char* param_name, in
     if (value == NULL || *value == '\0')
         return NULL;
 
-    jsondoc_t* document = json_init();
+    json_doc_t* document = json_parse(value);
     if (document == NULL)
         return NULL;
 
-    if (!json_parse(document, value)) {
-        json_free(document);
-        return NULL;
-    }
-
-    jsontok_t* array = json_root(document);
+    json_token_t* array = json_root(document);
     if (!json_is_array(array)) {
         json_free(document);
         return NULL;
@@ -315,7 +310,7 @@ jsondoc_t* query_param_array(http1request_t* request, const char* param_name, in
     return document;
 }
 
-jsondoc_t* query_param_object(http1request_t* request, const char* param_name, int* ok) {
+json_doc_t* query_param_object(http1request_t* request, const char* param_name, int* ok) {
     const char* value = __prepare_and_get_value(request, param_name, &ok);
     if (value == NULL)
         return NULL;
@@ -323,16 +318,11 @@ jsondoc_t* query_param_object(http1request_t* request, const char* param_name, i
     if (value == NULL || *value == '\0')
         return NULL;
 
-    jsondoc_t* document = json_init();
+    json_doc_t* document = json_parse(value);
     if (document == NULL)
         return NULL;
 
-    if (!json_parse(document, value)) {
-        json_free(document);
-        return NULL;
-    }
-
-    jsontok_t* object = json_root(document);
+    json_token_t* object = json_root(document);
     if (!json_is_object(object)) {
         json_free(document);
         return NULL;
