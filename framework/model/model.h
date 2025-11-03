@@ -714,7 +714,7 @@ void* model_one(const char* dbid, void*(create_instance)(void), const char* form
 array_t* model_list(const char* dbid, void*(create_instance)(void), const char* format, array_t* params);
 int model_execute(const char* dbid, const char* format, array_t* params);
 
-json_token_t* model_to_json(void* arg, json_doc_t* document, ...);
+json_token_t* model_to_json(void* arg, ...);
 char* model_stringify(void* arg, ...);
 char* model_list_stringify(array_t* array);
 void model_free(void* arg);
@@ -829,6 +829,6 @@ void model_param_clear(void* field);
 void model_params_clear(void* params, const size_t size);
 void model_params_free(void* params, const size_t size);
 
-json_token_t* model_json_create_object(void* arg, char** display_fields, json_doc_t* doc);
+json_token_t* model_json_create_object(void* arg, char** display_fields);
 
 #endif

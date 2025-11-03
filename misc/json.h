@@ -100,6 +100,8 @@ void json_token_free(json_token_t* token);
 json_doc_t* json_parse(const char* string);
 json_doc_t* json_create_empty(void);
 
+void json_set_root(json_doc_t* document, json_token_t* token);
+
 // Освобождение памяти JSON документа
 void json_clear(json_doc_t* document);
 void json_free(json_doc_t* document);
