@@ -1,201 +1,188 @@
-#ifndef __JSON__
-#define __JSON__
+#ifndef __JSON2__
+#define __JSON2__
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "str.h"
 
-#define JSON_ERROR_BUFFER_SIZE 256
+// Количество токенов в одном блоке памяти
+#define TOKENS_PER_BLOCK 4096
+
+typedef struct memory_block {
+    void* memory;                    // Указатель на память
+    void* free_list;                 // Односвязный список свободных слотов
+    size_t capacity;                 // Общее количество слотов
+    size_t used_count;               // Количество используемых слотов
+    struct memory_block* next;       // Следующий блок в списке
+} memory_block_t;
+
+typedef struct {
+    memory_block_t* token_blocks;    // Цепочка списоков блоков для токенов
+    memory_block_t* current_block;   // Кэш последнего блока с свободными слотами (оптимизация)
+} json2_manager_t;
 
 typedef enum {
-    JSON_UNDEFINED = 0,
-    JSON_OBJECT,
-    JSON_ARRAY,
-    JSON_STRING,
-    JSON_BOOL,
-    JSON_NULL,
-    JSON_LLONG,
-    JSON_INT,
-    JSON_UINT,
-    JSON_DOUBLE
-} jsontype_t;
+    JSON2_OBJECT = 0,
+    JSON2_ARRAY,
+    JSON2_STRING,
+    JSON2_BOOL,
+    JSON2_NULL,
+    JSON2_NUMBER
+} json2_token_type_t;
 
 typedef union {
     int _int;
-    unsigned int _uint;
-    long long _llong;
     double _double;
-    char *string;
-} jsonv_u;
+    str_t _string;
+} json2_value_u;
 
-struct jsondoc;
-
-/**
- * JSON token description.
- */
-typedef struct jsontok {
-    jsonv_u value;
-    struct jsontok *child;
-    struct jsontok *sibling;
-    struct jsontok *last_sibling;
-    struct jsondoc *doc;
-    jsontype_t type;
-    int start;
-    int end;
-    int size;
-    int parent;
-} jsontok_t;
-
-/**
- * JSON parser. Contains an array of token blocks available. Also stores
- * the string being parsed now and current position in that string.
- */
-typedef struct {
-    size_t string_len;
-    const char *string;
-    char *string_internal;
-    struct jsondoc *doc;
-    int toksuper; /* superior token node, e.g. parent object or array */
-    unsigned int dirty_pos; /* offset in the JSON string */
-    unsigned int pos;
-} jsonparser_t;
+typedef struct json2_token {
+    memory_block_t* block;           // Блок, в котором находится токен
+    struct json2_token* child;       // Используется для типа JSON_OBJECT или JSON_ARRAY
+    struct json2_token* sibling;
+    struct json2_token* last_sibling;
+    struct json2_token* parent;      // Родительский токен (для iter2 алгоритма)
+    size_t size;                     // Количество элементов в массиве или ключей у объекта
+    json2_value_u value;             // Значение простого типа
+    json2_token_type_t type;         // Тип токена
+} json2_token_t;
 
 typedef struct {
-    str_t string;
-    int detached;
-} jsonstr_t;
-
-/**
- * JSON document
- */
-typedef struct jsondoc {
-    jsonparser_t parser;
-    jsonstr_t stringify;
-    jsontok_t **tokens; // array of pointers on the tokens
-    int ok;
-    unsigned int toknext; // next token to allocate
-    unsigned int tokens_count;
-    char error[JSON_ERROR_BUFFER_SIZE];
-} jsondoc_t;
+    json2_token_t* root;
+    str_t stringify;
+    int ascii_mode;                  // 0 = UTF-8 mode (default), 1 = ASCII-only mode (encode all non-ASCII as \uXXXX)
+} json2_doc_t;
 
 typedef struct {
-    jsontok_t* key;
-    jsontok_t* value;
-    jsontok_t* parent;
-    jsontype_t type;
+    const char* json;                // указатель на начало JSON-строки
+    const char* ptr;                 // указатель на текущую позицию (изначально равен json)
+    const char* end;                 // указатель на конец буфера (json + strlen(json)) для защиты от buffer overread
+    json2_doc_t* doc;                // указатель на документ
+    char* error;                     // NULL или сообщение об ошибке
+    size_t json_size;                // размер JSON-строки
+} json2_parser_t;
+
+typedef struct {
+    json2_token_t* key;
+    json2_token_t* value;
+    json2_token_t* parent;
+    json2_token_type_t type;
     int ok;
     int index;
-} jsonit_t;
+} json2_it_t;
+
+// Вспомогательные функции для работы с блоками
+memory_block_t* memory_block_create(size_t element_size, size_t capacity);
+void memory_block_destroy(memory_block_t* block);
+int memory_block_alloc_slot(memory_block_t* block, size_t* slot_index);
+void memory_block_free_slot(memory_block_t* block, json2_token_t* token);
+int memory_block_is_empty(memory_block_t* block);
+int memory_block_is_full(memory_block_t* block);
+
+
+json2_manager_t* json2_manager_create(void);
+// Инициализация менеджера токенов
+void json2_manager_init(json2_manager_t* manager);
+void json2_manager_free(json2_manager_t* manager);
+// Освобождение менеджера токенов
+void json2_manager_destroy(json2_manager_t* manager);
+// Освобождение пустых блоков
+size_t json2_manager_destroy_empty_blocks(void);
+
+
+// Выделение токена
+json2_token_t* json2_token_alloc(json2_token_type_t type);
+// Освобождение токена
+void json2_token_free(json2_token_t* token);
+
+// Парсинг JSON
+json2_doc_t* json2_parse(const char* string);
+json2_doc_t* json2_create_empty(void);
+
+// Освобождение памяти JSON документа
+void json2_free(json2_doc_t* document);
 
 /**
- * Create JSON document over an array of tokens
+ * Получение значения токена
  */
-jsondoc_t* json_init();
-jsondoc_t* json_create(const char*);
+json2_token_t* json2_root(const json2_doc_t* document);
+int json2_bool(const json2_token_t* token);
+int json2_int(const json2_token_t* token, int* ok);
+double json2_double(const json2_token_t* token, int* ok);
+long long json2_llong(const json2_token_t* token, int* ok);
+const char* json2_string(const json2_token_t* token);
+unsigned int json2_uint(const json2_token_t* token, int* ok);
 
 /**
- * Run JSON parser.
- * It parses a JSON data string into and array of tokens, each describing
- * a single JSON object.
+ * Проверка типа
  */
-int json_parse(jsondoc_t*, const char*);
+int json2_is_bool(const json2_token_t* token);
+int json2_is_null(const json2_token_t* token);
+int json2_is_string(const json2_token_t* token);
+int json2_is_number(const json2_token_t* token);
+int json2_is_object(const json2_token_t* token);
+int json2_is_array(const json2_token_t* token);
 
 /**
- * Free internal memory
+ * Создание токена
  */
-void json_clear(jsondoc_t*);
-void json_free(jsondoc_t*);
-void json_token_reset(jsontok_t*);
-
-jsontok_t* json_root(const jsondoc_t*);
-int json_ok(const jsondoc_t*);
-const char* json_error(const jsondoc_t*);
-
-/**
- * Get values
- */
-int json_bool(const jsontok_t*);
-int json_int(const jsontok_t*);
-double json_double(const jsontok_t*);
-long long json_llong(const jsontok_t*);
-const char *json_string(const jsontok_t*);
-unsigned int json_uint(const jsontok_t*);
+json2_token_t* json2_create_bool(int value);
+json2_token_t* json2_create_null(void);
+json2_token_t* json2_create_string(const char* value);
+json2_token_t* json2_create_number(double value);
+json2_token_t* json2_create_object(void);
+json2_token_t* json2_create_array(void);
 
 /**
- * Check value type in token
+ * Работа с массивами
  */
-int json_is_bool(const jsontok_t*);
-int json_is_null(const jsontok_t*);
-int json_is_string(const jsontok_t*);
-int json_is_llong(const jsontok_t*);
-int json_is_int(const jsontok_t*);
-int json_is_uint(const jsontok_t*);
-int json_is_double(const jsontok_t*);
-int json_is_object(const jsontok_t*);
-int json_is_array(const jsontok_t*);
+int json2_array_prepend(json2_token_t* token_array, json2_token_t* token_append);
+int json2_array_append(json2_token_t* token_array, json2_token_t* token_append);
+int json2_array_append_to(json2_token_t* token_array, int index, json2_token_t* token_append);
+int json2_array_erase(json2_token_t* token_array, int index, int count);
+int json2_array_clear(json2_token_t* token_array);
+int json2_array_size(const json2_token_t* token_array);
+json2_token_t* json2_array_get(const json2_token_t* token_array, int index);
 
 /**
- * Create token with same type
+ * Работа с объектами
  */
-jsontok_t* json_create_bool(jsondoc_t*, int);
-jsontok_t* json_create_null(jsondoc_t*);
-jsontok_t* json_create_string(jsondoc_t*, const char *);
-jsontok_t* json_create_llong(jsondoc_t*, long long);
-jsontok_t* json_create_int(jsondoc_t*, int);
-jsontok_t* json_create_uint(jsondoc_t*, unsigned int);
-jsontok_t* json_create_double(jsondoc_t*, double);
-jsontok_t* json_create_object(jsondoc_t*);
-jsontok_t* json_create_array(jsondoc_t*);
+int json2_object_set(json2_token_t* token_object, const char* key, json2_token_t* token);
+json2_token_t* json2_object_get(const json2_token_t* token_object, const char* key);
+int json2_object_remove(json2_token_t* token_object, const char* key);
+int json2_object_size(const json2_token_t* token_object);
+int json2_object_clear(json2_token_t* token_object);
 
 /**
- * Actions on array
+ * Изменить значение токена с типом
  */
-int json_array_prepend(jsontok_t*, jsontok_t*);
-int json_array_append(jsontok_t*, jsontok_t*);
-int json_array_append_to(jsontok_t*, int, jsontok_t*);
-int json_array_erase(jsontok_t*, int, int);
-int json_array_clear(jsontok_t*);
-int json_array_size(const jsontok_t*);
-jsontok_t* json_array_get(const jsontok_t*, int);
+void json2_token_set_bool(json2_token_t* token, int value);
+void json2_token_set_null(json2_token_t* token);
+void json2_token_set_string(json2_token_t* token, const char* value);
+void json2_token_set_llong(json2_token_t* token, long long value);
+void json2_token_set_int(json2_token_t* token, int value);
+void json2_token_set_uint(json2_token_t* token, unsigned int value);
+void json2_token_set_double(json2_token_t* token, double value);
+void json2_token_set_object(json2_token_t* token, json2_token_t* token_object);
+void json2_token_set_array(json2_token_t* token, json2_token_t* token_array);
 
 /**
- * Actions on object
+ * Инициализация итератора для массива и объекта
  */
-int json_object_set(jsontok_t*, const char *, jsontok_t*);
-jsontok_t* json_object_get(const jsontok_t*, const char *);
-int json_object_remove(jsontok_t*, const char *);
-int json_object_size(const jsontok_t*);
-int json_object_clear(jsontok_t*);
+json2_it_t json2_init_it(const json2_token_t* token);
+int json2_end_it(const json2_it_t* iterator);
+const void* json2_it_key(const json2_it_t* iterator);
+json2_token_t* json2_it_value(const json2_it_t* iterator);
+json2_it_t json2_next_it(json2_it_t* iterator);
+void json2_it_erase(json2_it_t* iterator);
 
 /**
- * Change value of a token with type
+ * Преобразовать JSON-документ с токенами в строку
  */
-void json_token_set_bool(jsontok_t*, int);
-void json_token_set_null(jsontok_t*);
-void json_token_set_string(jsontok_t*, const char *);
-void json_token_set_llong(jsontok_t*, long long);
-void json_token_set_int(jsontok_t*, int);
-void json_token_set_uint(jsontok_t*, unsigned int);
-void json_token_set_double(jsontok_t*, double);
-void json_token_set_object(jsontok_t*, jsontok_t*);
-void json_token_set_array(jsontok_t*, jsontok_t*);
-
-/**
- * Init iterator for array and object
- */
-jsonit_t json_init_it(const jsontok_t*);
-int json_end_it(const jsonit_t*);
-const void* json_it_key(const jsonit_t*);
-jsontok_t* json_it_value(const jsonit_t*);
-jsonit_t json_next_it(jsonit_t*);
-void json_it_erase(jsonit_t*);
-
-/**
- * Convert json document with tokens to string
- */
-const char* json_stringify(jsondoc_t*);
-size_t json_stringify_size(jsondoc_t*);
-char* json_stringify_detach(jsondoc_t*);
-int json_copy(jsondoc_t*, jsondoc_t*);
+const char* json2_stringify(json2_doc_t* document);
+size_t json2_stringify_size(json2_doc_t* document);
+char* json2_stringify_detach(json2_doc_t* document);
+int json2_copy(json2_doc_t* from, json2_doc_t* to);
 
 #endif
