@@ -1143,6 +1143,12 @@ json_doc_t* json_create_empty(void) {
     return doc;
 }
 
+void json_set_root(json_doc_t* document, json_token_t* token) {
+    if (document == NULL || token == NULL) return;
+
+    document->root = token;
+}
+
 json_token_t* json_token_alloc(json_token_type_t type) {
     // Инициализация глобального менеджера при первом использовании
     if (manager == NULL) {

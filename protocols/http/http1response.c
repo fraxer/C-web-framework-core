@@ -604,12 +604,14 @@ void __http1response_model(http1response_t* response, void* model, ...) {
         return;
     }
 
-    json_token_t* object = model_json_create_object(model, display_fields, doc);
+    json_token_t* object = model_json_create_object(model, display_fields);
     if (object == NULL) {
         json_free(doc);
         response->def(response, 500);
         return;
     }
+
+    json_set_root(doc, object);
 
     const char* data = json_stringify(doc);
     const size_t length = json_stringify_size(doc);
@@ -644,20 +646,23 @@ void __http1response_models(http1response_t* response, array_t* models, ...) {
 
     va_end(va_args);
 
-    json_doc_t* doc = json_create_empty();
+    json_doc_t* doc = json_root_create_array();
     if (!doc) {
         response->def(response, 500);
         return;
     }
 
+    json_token_t* json_array = json_root(doc);
     for (size_t i = 0; i < array_size(models); i++) {
         void* model = array_get(models, i);
-        json_token_t* object = model_json_create_object(model, display_fields, doc);
+        json_token_t* object = model_json_create_object(model, display_fields);
         if (object == NULL) {
             json_free(doc);
             response->def(response, 500);
             return;
         }
+
+        json_array_append(json_array, object);
     }
 
     const char* data = json_stringify(doc);

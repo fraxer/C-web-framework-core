@@ -416,7 +416,7 @@ int model_execute(const char* dbid, const char* format, array_t* params) {
     return res;
 }
 
-json_token_t* model_to_json(void* arg, json_doc_t* document, ...) {
+json_token_t* model_to_json(void* arg, ...) {
     va_list va_args;
     va_start(va_args, 0);
 
@@ -424,7 +424,7 @@ json_token_t* model_to_json(void* arg, json_doc_t* document, ...) {
 
     va_end(va_args);
 
-    return model_json_create_object(arg, display_fields, document);
+    return model_json_create_object(arg, display_fields);
 }
 
 char* model_stringify(void* arg, ...) {
@@ -440,11 +440,13 @@ char* model_stringify(void* arg, ...) {
     json_doc_t* doc = json_create_empty();
     if (!doc) return NULL;
 
-    json_token_t* object = model_json_create_object(arg, display_fields, doc);
+    json_token_t* object = model_json_create_object(arg, display_fields);
     if (object == NULL) {
         json_free(doc);
         return NULL;
     }
+
+    json_set_root(doc, object);
 
     char* data = json_stringify_detach(doc);
 
@@ -456,10 +458,10 @@ char* model_stringify(void* arg, ...) {
 char* model_list_stringify(array_t* array) {
     if (array == NULL) return NULL;
 
-    json_doc_t* doc = json_create_empty();
+    json_doc_t* doc = json_root_create_array();
     if (!doc) return NULL;
 
-    json_token_t* json_array = json_create_array();
+    json_token_t* json_array = json_root(doc);
     char* data = NULL;
 
     for (size_t i = 0; i < array_size(array); i++) {
@@ -469,7 +471,7 @@ char* model_list_stringify(array_t* array) {
         model_t* model = item->_pointer;
         if (model == NULL) goto failed;
 
-        json_array_append(json_array, model_to_json(model, doc));
+        json_array_append(json_array, model_to_json(model));
     }
 
     data = json_stringify_detach(doc);
@@ -1335,10 +1337,6 @@ int model_set_array_from_str(mfield_t* field, const char* value) {
     if (document == NULL) return 0;
 
     const json_token_t* token_array = json_root(document);
-    if (token_array == NULL) {
-        json_free(document);
-        return 0;
-    }
     if (!json_is_array(token_array)) {
         json_free(document);
         return 0;
@@ -1681,9 +1679,8 @@ void model_params_free(void* params, const size_t size) {
     free(params);
 }
 
-json_token_t* model_json_create_object(void* arg, char** display_fields, json_doc_t* doc) {
+json_token_t* model_json_create_object(void* arg, char** display_fields) {
     if (arg == NULL) return NULL;
-    if (doc == NULL) return NULL;
 
     model_t* model = arg;
 
