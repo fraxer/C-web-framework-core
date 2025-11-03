@@ -12,7 +12,7 @@ unsigned long query_param_ulong(http1request_t* request, const char* param_name,
 float query_param_float(http1request_t* request, const char* param_name, int* ok);
 double query_param_double(http1request_t* request, const char* param_name, int* ok);
 long double query_param_ldouble(http1request_t* request, const char* param_name, int* ok);
-jsondoc_t* query_param_array(http1request_t* request, const char* param_name, int* ok);
-jsondoc_t* query_param_object(http1request_t* request, const char* param_name, int* ok);
+json_doc_t* query_param_array(http1request_t* request, const char* param_name, int* ok);
+json_doc_t* query_param_object(http1request_t* request, const char* param_name, int* ok);
 
 #endif

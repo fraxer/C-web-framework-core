@@ -41,20 +41,20 @@ typedef struct http1request {
     char*(*payloadf)(struct http1request*, const char*);
     file_content_t(*payload_file)(struct http1request*);
     file_content_t(*payload_filef)(struct http1request*, const char*);
-    jsondoc_t*(*payload_json)(struct http1request*);
-    jsondoc_t*(*payload_jsonf)(struct http1request*, const char*);
+    json_doc_t*(*payload_json)(struct http1request*);
+    json_doc_t*(*payload_jsonf)(struct http1request*, const char*);
 
     int(*append_urlencoded)(struct http1request*, const char*, const char*);
     int(*append_formdata_raw)(struct http1request*, const char*, const char*, const char*);
     int(*append_formdata_text)(struct http1request*, const char*, const char*);
-    int(*append_formdata_json)(struct http1request*, const char*, jsondoc_t*);
+    int(*append_formdata_json)(struct http1request*, const char*, json_doc_t*);
     int(*append_formdata_filepath)(struct http1request*, const char*, const char*);
     int(*append_formdata_file)(struct http1request*, const char*, file_t*);
     int(*append_formdata_file_content)(struct http1request*, const char*, file_content_t*);
 
     int(*set_payload_raw)(struct http1request*, const char*, const size_t, const char*);
     int(*set_payload_text)(struct http1request*, const char*);
-    int(*set_payload_json)(struct http1request*, jsondoc_t*);
+    int(*set_payload_json)(struct http1request*, json_doc_t*);
     int(*set_payload_filepath)(struct http1request*, const char*);
     int(*set_payload_file)(struct http1request*, const file_t*);
     int(*set_payload_file_content)(struct http1request*, const file_content_t*);
@@ -75,8 +75,8 @@ char* http1request_payload(http1request_t*);
 char* http1request_payloadf(http1request_t*, const char*);
 file_content_t http1request_payload_file(http1request_t*);
 file_content_t http1request_payload_filef(http1request_t*, const char*);
-jsondoc_t* http1request_payload_json(http1request_t*);
-jsondoc_t* http1request_payload_jsonf(http1request_t*, const char*);
+json_doc_t* http1request_payload_json(http1request_t*);
+json_doc_t* http1request_payload_jsonf(http1request_t*, const char*);
 int http1request_allow_payload(http1request_t*);
 int http1parser_set_uri(http1request_t*, const char*, size_t);
 void http1parser_append_query(http1request_t*, http1_query_t*);

@@ -37,7 +37,7 @@ void websocketsrequest_free(void* arg);
 
 char* websocketsrequest_payload(websockets_protocol_t*);
 file_content_t websocketsrequest_payload_file(websockets_protocol_t*);
-jsondoc_t* websocketsrequest_payload_json(websockets_protocol_t*);
+json_doc_t* websocketsrequest_payload_json(websockets_protocol_t*);
 
 void websockets_protocol_init_payload(websockets_protocol_t*);
 int websockets_create_tmpfile(websockets_protocol_t*, const char*);

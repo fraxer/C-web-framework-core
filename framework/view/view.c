@@ -9,12 +9,12 @@
 #include "viewstore.h"
 #include "view.h"
 
-static char* __view_render(jsondoc_t* document, const char* storage_name, const char* path);
-static char* __view_make_content(view_t* view, jsondoc_t* document);
-static int __view_get_condition_value(view_copy_tags_t* copy_tags, jsondoc_t* document, view_tag_t* tag);
-static const char* __view_get_tag_value(view_copy_tags_t* copy_tags, jsondoc_t* document, view_tag_t* tag);
-static const jsontok_t* __view_get_loop_value(view_copy_tags_t* copy_tags, jsondoc_t* document, view_tag_t* tag);
-static void __view_build_content_recursive(view_t* view, jsondoc_t* document, view_copy_tags_t* copy_tags, view_tag_t* tag);
+static char* __view_render(json_doc_t* document, const char* storage_name, const char* path);
+static char* __view_make_content(view_t* view, json_doc_t* document);
+static int __view_get_condition_value(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag);
+static const char* __view_get_tag_value(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag);
+static const json_token_t* __view_get_loop_value(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag);
+static void __view_build_content_recursive(view_t* view, json_doc_t* document, view_copy_tags_t* copy_tags, view_tag_t* tag);
 static void __view_copy_loop_tags_init(view_copy_tags_t* copy_tags);
 static void __view_copy_loop_tags_free(view_copy_tags_t* copy_tags);
 static view_loop_t* __view_copy_loop_tag_add(view_copy_tags_t* copy_tags, view_tag_t* tag);
@@ -29,7 +29,7 @@ static view_loop_t* __view_copy_loop_tag_get(view_copy_tags_t* copy_tags, view_t
  * @param ... The arguments to format the path.
  * @return The rendered content of the view.
  */
-char* render(jsondoc_t* document, const char* storage_name, const char* path_format, ...) {
+char* render(json_doc_t* document, const char* storage_name, const char* path_format, ...) {
     char path[PATH_MAX];
 
     va_list args;
@@ -48,7 +48,7 @@ char* render(jsondoc_t* document, const char* storage_name, const char* path_for
  * @param path The path of the view.
  * @return The rendered content of the view, or NULL if an error occurred.
  */
-char* __view_render(jsondoc_t* document, const char* storage_name, const char* path) {
+char* __view_render(json_doc_t* document, const char* storage_name, const char* path) {
     viewstore_t* viewstore = appconfig()->viewstore;
     viewstore_lock(viewstore);
     view_t* view = viewstore_get_view(viewstore, path);
@@ -84,7 +84,7 @@ char* __view_render(jsondoc_t* document, const char* storage_name, const char* p
  * @param document The JSON document to render.
  * @return The rendered content of the view, or NULL if an error occurred.
  */
-char* __view_make_content(view_t* view, jsondoc_t* document) {
+char* __view_make_content(view_t* view, json_doc_t* document) {
     view_copy_tags_t copy_tags;
     __view_copy_loop_tags_init(&copy_tags);
 
@@ -116,10 +116,10 @@ char* __view_make_content(view_t* view, jsondoc_t* document) {
  * @param tag The condition tag.
  * @return The value of the condition tag, or 0 if an error occurred.
  */
-int __view_get_condition_value(view_copy_tags_t* copy_tags, jsondoc_t* document, view_tag_t* tag) {
+int __view_get_condition_value(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag) {
     view_variable_item_t* item = tag->item;
     view_loop_t* tag_for = __view_copy_loop_tag_get(copy_tags, tag->data_parent);
-    const jsontok_t* json_token = json_root(document);
+    const json_token_t* json_token = json_root(document);
     if (tag_for != NULL) {
         view_loop_t* tag_parent = tag_for;
 
@@ -138,7 +138,7 @@ int __view_get_condition_value(view_copy_tags_t* copy_tags, jsondoc_t* document,
     }
 
     while (item) {
-        const jsontok_t* token = NULL;
+        const json_token_t* token = NULL;
         if (json_token->type == JSON_STRING)
             token = json_token;
         else if (json_token->type == JSON_OBJECT)
@@ -182,10 +182,10 @@ int __view_get_condition_value(view_copy_tags_t* copy_tags, jsondoc_t* document,
  * @param tag The tag.
  * @return The value of the tag as a string, or NULL if an error occurred.
  */
-const char* __view_get_tag_value(view_copy_tags_t* copy_tags, jsondoc_t* document, view_tag_t* tag) {
+const char* __view_get_tag_value(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag) {
     view_variable_item_t* item = tag->item;
     view_loop_t* tag_for = __view_copy_loop_tag_get(copy_tags, tag->data_parent);
-    const jsontok_t* json_token = json_root(document);
+    const json_token_t* json_token = json_root(document);
     if (tag_for != NULL) {
         view_loop_t* tag_parent = tag_for;
 
@@ -207,7 +207,7 @@ const char* __view_get_tag_value(view_copy_tags_t* copy_tags, jsondoc_t* documen
     }
 
     while (item) {
-        const jsontok_t* token = NULL;
+        const json_token_t* token = NULL;
         if (json_token->type == JSON_STRING)
             token = json_token;
         else if (json_token->type == JSON_OBJECT)
@@ -251,10 +251,10 @@ const char* __view_get_tag_value(view_copy_tags_t* copy_tags, jsondoc_t* documen
  * @param tag The loop tag.
  * @return The value of the loop tag as a json token, or NULL if an error occurred.
  */
-const jsontok_t* __view_get_loop_value(view_copy_tags_t* copy_tags, jsondoc_t* document, view_tag_t* tag) {
+const json_token_t* __view_get_loop_value(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag) {
     view_variable_item_t* item = tag->item;
     view_loop_t* tag_for = __view_copy_loop_tag_get(copy_tags, tag->data_parent);
-    const jsontok_t* json_token = json_root(document);
+    const json_token_t* json_token = json_root(document);
     if (tag_for != NULL) {
         view_loop_t* tag_parent = tag_for;
 
@@ -273,7 +273,7 @@ const jsontok_t* __view_get_loop_value(view_copy_tags_t* copy_tags, jsondoc_t* d
     }
 
     while (item) {
-        const jsontok_t* token = NULL;
+        const json_token_t* token = NULL;
         if (json_token->type == JSON_ARRAY)
             token = json_token;
         else
@@ -321,7 +321,7 @@ const jsontok_t* __view_get_loop_value(view_copy_tags_t* copy_tags, jsondoc_t* d
  * @param tag The tag to start building content from.
  * @return None.
  */
-void __view_build_content_recursive(view_t* view, jsondoc_t* document, view_copy_tags_t* copy_tags, view_tag_t* tag) {
+void __view_build_content_recursive(view_t* view, json_doc_t* document, view_copy_tags_t* copy_tags, view_tag_t* tag) {
     view_tag_t* child = tag;
     while (child) {
         switch (child->type) {
@@ -424,10 +424,10 @@ void __view_build_content_recursive(view_t* view, jsondoc_t* document, view_copy
             for (size_t i = child->parent_text_offset; i < child->parent_text_offset + child->parent_text_size && i < size; i++)
                 bufferdata_push(&copy_tags->buf, content[i]);
 
-            const jsontok_t* token = __view_get_loop_value(copy_tags, document, child);
+            const json_token_t* token = __view_get_loop_value(copy_tags, document, child);
             if (token != NULL) {
                 if (token->type == JSON_OBJECT || token->type == JSON_ARRAY) {
-                    for (jsonit_t it = json_init_it(token); !json_end_it(&it); it = json_next_it(&it)) {
+                    for (json_it_t it = json_create_empty_it(token); !json_end_it(&it); it = json_next_it(&it)) {
                         if (token->type == JSON_OBJECT)
                             sprintf(tag_for->key_value, "%s", (char*)json_it_key(&it));
                         else

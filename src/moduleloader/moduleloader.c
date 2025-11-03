@@ -41,28 +41,28 @@
 
 static atomic_bool __module_loader_wait_signal = ATOMIC_VAR_INIT(0);
 
-static int __module_loader_init_modules(appconfig_t* config, jsondoc_t* document);
-static int __module_loader_servers_load(appconfig_t* config, const jsontok_t* servers);
-static domain_t* __module_loader_domains_load(const jsontok_t* token_array);
-static int __module_loader_databases_load(appconfig_t* config, const jsontok_t* databases);
-static int __module_loader_storages_load(appconfig_t* config, const jsontok_t* storages);
-static int __module_loader_mimetype_load(appconfig_t* config, const jsontok_t* mimetypes);
+static int __module_loader_init_modules(appconfig_t* config, json_doc_t* document);
+static int __module_loader_servers_load(appconfig_t* config, const json_token_t* servers);
+static domain_t* __module_loader_domains_load(const json_token_t* token_array);
+static int __module_loader_databases_load(appconfig_t* config, const json_token_t* databases);
+static int __module_loader_storages_load(appconfig_t* config, const json_token_t* storages);
+static int __module_loader_mimetype_load(appconfig_t* config, const json_token_t* mimetypes);
 static int __module_loader_viewstore_load(appconfig_t* config);
-static int __module_loader_sessionconfig_load(appconfig_t* config, const jsontok_t* sessionconfig);
+static int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* sessionconfig);
 
-static int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const jsontok_t* token_object, route_t** route);
-static int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const jsontok_t* token_object);
+static int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route);
+static int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object);
 static void __module_loader_pass_memory_sharedlib(routeloader_lib_t*, const char*);
-static int __module_loader_http_redirects_load(const jsontok_t* token_object, redirect_t** redirect);
-static int __module_loader_middlewares_load(const jsontok_t* token_object, middleware_item_t** middleware_item);
-static void __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t** first_lib, const jsontok_t* token_array);
-static int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const jsontok_t* token_object, route_t** route);
-static int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const jsontok_t* token_object);
-static openssl_t* __module_loader_tls_load(const jsontok_t* token_object);
+static int __module_loader_http_redirects_load(const json_token_t* token_object, redirect_t** redirect);
+static int __module_loader_middlewares_load(const json_token_t* token_object, middleware_item_t** middleware_item);
+static void __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t** first_lib, const json_token_t* token_array);
+static int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route);
+static int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object);
+static openssl_t* __module_loader_tls_load(const json_token_t* token_object);
 static int __module_loader_check_unique_domainport(server_t* first_server);
-static void* __module_loader_storage_fs_load(const jsontok_t* token_object, const char* storage_name);
-static void* __module_loader_storage_s3_load(const jsontok_t* token_object, const char* storage_name);
-static const char* __module_loader_storage_field(const char* storage_name, const jsontok_t* token_object, const char* key);
+static void* __module_loader_storage_fs_load(const json_token_t* token_object, const char* storage_name);
+static void* __module_loader_storage_s3_load(const json_token_t* token_object, const char* storage_name);
+static const char* __module_loader_storage_field(const char* storage_name, const json_token_t* token_object, const char* key);
 static int __module_loader_thread_workers_load(void);
 static int __module_loader_thread_handlers_load(void);
 static void __module_loader_on_shutdown_cb(void);
@@ -72,7 +72,7 @@ int module_loader_init(appconfig_t* config) {
 
     appconfig_set_after_run_threads_cb(module_loader_signal_unlock);
 
-    jsondoc_t* document = NULL;
+    json_doc_t* document = NULL;
     if (!module_loader_load_json_config(config->path, &document))
         goto failed;
     if (!__module_loader_init_modules(config, document))
@@ -90,7 +90,7 @@ int module_loader_init(appconfig_t* config) {
 int module_loader_config_correct(const char* path) {
     int result = 0;
     appconfig_t* config = NULL;
-    jsondoc_t* document = NULL;
+    json_doc_t* document = NULL;
     if (!module_loader_load_json_config(path, &document))
         goto failed;
 
@@ -109,7 +109,7 @@ int module_loader_config_correct(const char* path) {
     return result;
 }
 
-int module_loader_load_json_config(const char* path, jsondoc_t** document) {
+int module_loader_load_json_config(const char* path, json_doc_t** document) {
     if (path == NULL) return 0;
 
     file_t file = file_open(path, O_RDONLY);
@@ -129,17 +129,9 @@ int module_loader_load_json_config(const char* path, jsondoc_t** document) {
 
     int result = 0;
 
-    *document = json_init();
+    *document = json_parse(data);
     if (*document == NULL) {
-        log_error("module_loader_load_json_config: json_init error\n");
-        goto failed;
-    }
-    if (!json_parse(*document, data)) {
         log_error("module_loader_load_json_config: json_parse error\n");
-        goto failed;
-    }
-    if (!(*document)->ok) {
-        log_error("module_loader_load_json_config: json document invalid\n");
         goto failed;
     }
     if (!json_is_object(json_root(*document))) {
@@ -156,7 +148,7 @@ int module_loader_load_json_config(const char* path, jsondoc_t** document) {
     return result;
 }
 
-int __module_loader_init_modules(appconfig_t* config, jsondoc_t* document) {
+int __module_loader_init_modules(appconfig_t* config, json_doc_t* document) {
     int result = 0;
 
     if (!connection_queue_init()) {
@@ -180,11 +172,11 @@ int __module_loader_init_modules(appconfig_t* config, jsondoc_t* document) {
     return result;
 }
 
-int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
+int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     env_t* env = &config->env;
-    const jsontok_t* root = json_root(document);
+    const json_token_t* root = json_root(document);
 
-    const jsontok_t* token_migrations = json_object_get(root, "migrations");
+    const json_token_t* token_migrations = json_object_get(root, "migrations");
     if (token_migrations == NULL) {
         env->migrations.source_directory = malloc(sizeof(char) * 1);
         if (env->migrations.source_directory == NULL) {
@@ -200,7 +192,7 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
             return 0;
         }
 
-        const jsontok_t* token_source_directory = json_object_get(token_migrations, "source_directory");
+        const json_token_t* token_source_directory = json_object_get(token_migrations, "source_directory");
         if (token_source_directory == NULL) {
             env->migrations.source_directory = malloc(sizeof(char) * 1);
             if (env->migrations.source_directory == NULL) {
@@ -216,7 +208,7 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
                 return 0;
             }
 
-            env->migrations.source_directory = malloc(sizeof(char) * (token_source_directory->size + 1));
+            env->migrations.source_directory = malloc(sizeof(char) * (json_string_size(token_source_directory) + 1));
             if (env->migrations.source_directory == NULL) {
                 log_error("module_loader_config_load: memory alloc error\n");
                 return 0;
@@ -227,7 +219,7 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
     }
 
 
-    const jsontok_t* token_main = json_object_get(root, "main");
+    const json_token_t* token_main = json_object_get(root, "main");
     if (token_main == NULL) {
         log_error("module_loader_config_load: main not found\n");
         return 0;
@@ -238,7 +230,7 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
     }
 
 
-    const jsontok_t* token_reload = json_object_get(token_main, "reload");
+    const json_token_t* token_reload = json_object_get(token_main, "reload");
     if (token_reload == NULL) {
         log_error("module_loader_config_load: reload not found\n");
         return 0;
@@ -259,55 +251,61 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
     }
 
 
-    const jsontok_t* token_workers = json_object_get(token_main, "workers");
+    const json_token_t* token_workers = json_object_get(token_main, "workers");
     if (token_workers == NULL) {
         log_error("module_loader_config_load: workers not found\n");
         return 0;
     }
-    if (!json_is_int(token_workers)) {
+    if (!json_is_number(token_workers)) {
         log_error("module_loader_config_load: workers must be int\n");
         return 0;
     }
-    if (json_int(token_workers) < 1) {
+    int ok = 0;
+    int workers_count = json_int(token_workers, &ok);
+    if (!ok || workers_count < 1) {
         log_error("module_loader_config_load: workers must be >= 1\n");
         return 0;
     }
-    env->main.workers = json_int(token_workers);
+    env->main.workers = workers_count;
 
 
-    const jsontok_t* token_threads = json_object_get(token_main, "threads");
+    const json_token_t* token_threads = json_object_get(token_main, "threads");
     if (token_threads == NULL) {
         log_error("module_loader_config_load: threads not found\n");
         return 0;
     }
-    if (!json_is_int(token_threads)) {
+    if (!json_is_number(token_threads)) {
         log_error("module_loader_config_load: threads must be int\n");
         return 0;
     }
-    if (json_int(token_threads) < 1) {
+    ok = 0;
+    int threads_count = json_int(token_threads, &ok);
+    if (!ok || threads_count < 1) {
         log_error("module_loader_config_load: threads must be >= 1\n");
         return 0;
     }
-    env->main.threads = json_int(token_threads);
+    env->main.threads = threads_count;
 
 
-    const jsontok_t* token_client_max_body_size = json_object_get(token_main, "client_max_body_size");
+    const json_token_t* token_client_max_body_size = json_object_get(token_main, "client_max_body_size");
     if (token_client_max_body_size == NULL) {
         log_error("module_loader_config_load: client_max_body_size not found\n");
         return 0;
     }
-    if (!json_is_int(token_client_max_body_size)) {
+    if (!json_is_number(token_client_max_body_size)) {
         log_error("module_loader_config_load: client_max_body_size must be int\n");
         return 0;
     }
-    if (json_int(token_client_max_body_size) < 1) {
+    ok = 0;
+    unsigned int client_max_body_size = json_int(token_client_max_body_size, &ok);
+    if (!ok || client_max_body_size < 1) {
         log_error("module_loader_config_load: client_max_body_size must be >= 1\n");
         return 0;
     }
-    env->main.client_max_body_size = json_int(token_client_max_body_size);
+    env->main.client_max_body_size = client_max_body_size;
 
 
-    const jsontok_t* token_tmp = json_object_get(token_main, "tmp");
+    const json_token_t* token_tmp = json_object_get(token_main, "tmp");
     if (token_tmp == NULL) {
         log_error("module_loader_config_load: tmp not found\n");
         return 0;
@@ -316,20 +314,20 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
         log_error("module_loader_config_load: tmp must be string\n");
         return 0;
     }
-    env->main.tmp = malloc(sizeof(char) * (token_tmp->size + 1));
+    env->main.tmp = malloc(sizeof(char) * (json_string_size(token_tmp) + 1));
     if (env->main.tmp == NULL) {
         log_error("module_loader_config_load: memory alloc error for tmp\n");
         return 0;
     }
     strcpy(env->main.tmp, json_string(token_tmp));
-    const size_t tmp_length = token_tmp->size;
+    const size_t tmp_length = json_string_size(token_tmp);
     if (env->main.tmp[tmp_length - 1] == '/') {
         log_error("module_loader_config_load: remove last slash from main.tmp\n");
         return 0;
     }
 
 
-    const jsontok_t* token_gzip = json_object_get(token_main, "gzip");
+    const json_token_t* token_gzip = json_object_get(token_main, "gzip");
     if (token_gzip == NULL) {
         log_error("module_loader_config_load: gzip not found\n");
         return 0;
@@ -340,13 +338,13 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
     }
 
     env_gzip_str_t* last_gzip_item = NULL;
-    for (jsonit_t it = json_init_it(token_gzip); !json_end_it(&it); it = json_next_it(&it)) {
-        const jsontok_t* token_mimetype = json_it_value(&it);
+    for (json_it_t it = json_create_empty_it(token_gzip); !json_end_it(&it); it = json_next_it(&it)) {
+        const json_token_t* token_mimetype = json_it_value(&it);
         if (!json_is_string(token_mimetype)) {
             log_error("module_loader_config_load: gzip must be array of strings\n");
             return 0;
         }
-        if (token_mimetype->size == 0) {
+        if (json_string_size(token_mimetype) == 0) {
             log_error("module_loader_config_load: gzip item must be not empty\n");
             return 0;
         }
@@ -357,7 +355,7 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
             return 0;
         }
         str->next = NULL;
-        str->mimetype = malloc(sizeof(char) * (token_mimetype->size + 1));
+        str->mimetype = malloc(sizeof(char) * (json_string_size(token_mimetype) + 1));
         if (str->mimetype == NULL) {
             log_error("module_loader_config_load: memory alloc error for gzip item value\n");
             free(str);
@@ -389,7 +387,7 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
         return 0;
 
 
-    const jsontok_t* token_mail = json_object_get(root, "mail");
+    const json_token_t* token_mail = json_object_get(root, "mail");
     if (token_mail == NULL) {
         env->mail.dkim_private = malloc(sizeof(char) * 1);
         if (env->mail.dkim_private == NULL) {
@@ -415,7 +413,7 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
         strcpy(env->mail.host, "");
     }
     else {
-        const jsontok_t* token_dkim_private = json_object_get(token_mail, "dkim_private");
+        const json_token_t* token_dkim_private = json_object_get(token_mail, "dkim_private");
         if (token_dkim_private == NULL) {
             env->mail.dkim_private = malloc(sizeof(char) * 1);
             if (env->mail.dkim_private == NULL) {
@@ -429,7 +427,7 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
                 log_error("module_loader_config_load: mail.dkim_private must be string\n");
                 return 0;
             }
-            if (token_dkim_private->size == 0) {
+            if (json_string_size(token_dkim_private) == 0) {
                 log_error("module_loader_config_load: mail.dkim_private must be not empty\n");
                 return 0;
             }
@@ -449,7 +447,7 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
             }
         }
 
-        const jsontok_t* token_dkim_selector = json_object_get(token_mail, "dkim_selector");
+        const json_token_t* token_dkim_selector = json_object_get(token_mail, "dkim_selector");
         if (token_dkim_selector == NULL) {
             env->mail.dkim_selector = malloc(sizeof(char) * 1);
             if (env->mail.dkim_selector == NULL) {
@@ -463,12 +461,12 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
                 log_error("module_loader_config_load: mail.dkim_selector must be string\n");
                 return 0;
             }
-            if (token_dkim_selector->size == 0) {
+            if (json_string_size(token_dkim_selector) == 0) {
                 log_error("module_loader_config_load: mail.dkim_selector must be not empty\n");
                 return 0;
             }
 
-            env->mail.dkim_selector = malloc(sizeof(char) * (token_dkim_selector->size + 1));
+            env->mail.dkim_selector = malloc(sizeof(char) * (json_string_size(token_dkim_selector) + 1));
             if (env->mail.dkim_selector == NULL) {
                 log_error("module_loader_config_load: memory alloc error mail.dkim_selector\n");
                 return 0;
@@ -476,7 +474,7 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
             strcpy(env->mail.dkim_selector, json_string(token_dkim_selector));
         }
 
-        const jsontok_t* token_host = json_object_get(token_mail, "host");
+        const json_token_t* token_host = json_object_get(token_mail, "host");
         if (token_host == NULL) {
             env->mail.host = malloc(sizeof(char) * 1);
             if (env->mail.host == NULL) {
@@ -490,12 +488,12 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
                 log_error("module_loader_config_load: mail.host must be string\n");
                 return 0;
             }
-            if (token_host->size == 0) {
+            if (json_string_size(token_host) == 0) {
                 log_error("module_loader_config_load: mail.host must be not empty\n");
                 return 0;
             }
 
-            env->mail.host = malloc(sizeof(char) * (token_host->size + 1));
+            env->mail.host = malloc(sizeof(char) * (json_string_size(token_host) + 1));
             if (env->mail.host == NULL) {
                 log_error("module_loader_config_load: memory alloc error mail.host\n");
                 return 0;
@@ -507,7 +505,7 @@ int module_loader_config_load(appconfig_t* config, jsondoc_t* document) {
     return 1;
 }
 
-int __module_loader_servers_load(appconfig_t* config, const jsontok_t* token_servers) {
+int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_servers) {
     if (token_servers == NULL) {
         log_error("__module_loader_servers_load: servers not found\n");
         return 0;
@@ -521,7 +519,7 @@ int __module_loader_servers_load(appconfig_t* config, const jsontok_t* token_ser
     server_t* first_server = NULL;
     server_t* last_server = NULL;
     routeloader_lib_t* first_lib = NULL;
-    for (jsonit_t it_servers = json_init_it(token_servers); !json_end_it(&it_servers); json_next_it(&it_servers)) {
+    for (json_it_t it_servers = json_create_empty_it(token_servers); !json_end_it(&it_servers); json_next_it(&it_servers)) {
         enum required_fields { R_DOMAINS = 0, R_IP, R_PORT, R_ROOT, R_FIELDS_COUNT };
         char* str_required_fields[R_FIELDS_COUNT] = {"domains", "ip", "port", "root"};
         enum fields { DOMAINS = 0, IP, PORT, ROOT, INDEX, HTTP, WEBSOCKETS, DATABASE, OPENSSL, FIELDS_COUNT };
@@ -548,15 +546,15 @@ int __module_loader_servers_load(appconfig_t* config, const jsontok_t* token_ser
             goto failed;
         }
 
-        const jsontok_t* token_server = json_it_value(&it_servers);
+        const json_token_t* token_server = json_it_value(&it_servers);
         if (!json_is_object(token_server)) {
             log_error("__module_loader_servers_load: server must be object\n");
             goto failed;
         }
 
-        for (jsonit_t it_server = json_init_it(token_server); !json_end_it(&it_server); json_next_it(&it_server)) {
+        for (json_it_t it_server = json_create_empty_it(token_server); !json_end_it(&it_server); json_next_it(&it_server)) {
             const char* key = json_it_key(&it_server);
-            const jsontok_t* token_value = json_it_value(&it_server);
+            const json_token_t* token_value = json_it_value(&it_server);
 
             if (strcmp(key, "domains") == 0) {
                 finded_fields[DOMAINS] = 1;
@@ -585,12 +583,17 @@ int __module_loader_servers_load(appconfig_t* config, const jsontok_t* token_ser
             else if (strcmp(key, "port") == 0) {
                 finded_fields[PORT] = 1;
 
-                if (!json_is_int(token_value)) {
+                if (!json_is_number(token_value)) {
                     log_error("__module_loader_servers_load: port must be integer\n");
                     goto failed;
                 }
 
-                server->port = json_int(token_value);
+                int ok = 0;
+                server->port = json_int(token_value, &ok);
+                if (!ok) {
+                    log_error("__module_loader_servers_load: port must be integer\n");
+                    goto failed;
+                }
             }
             else if (strcmp(key, "root") == 0) {
                 finded_fields[ROOT] = 1;
@@ -601,7 +604,7 @@ int __module_loader_servers_load(appconfig_t* config, const jsontok_t* token_ser
                 }
 
                 const char* value = json_string(token_value);
-                size_t value_length = token_value->size;
+                size_t value_length = json_string_size(token_value);
 
                 if (value[value_length - 1] == '/')
                     value_length--;
@@ -741,13 +744,13 @@ int __module_loader_servers_load(appconfig_t* config, const jsontok_t* token_ser
     return result;
 }
 
-domain_t* __module_loader_domains_load(const jsontok_t* token_array) {
+domain_t* __module_loader_domains_load(const json_token_t* token_array) {
     domain_t* result = NULL;
     domain_t* first_domain = NULL;
     domain_t* last_domain = NULL;
 
-    for (jsonit_t it = json_init_it(token_array); !json_end_it(&it); json_next_it(&it)) {
-        jsontok_t* token_domain = json_it_value(&it);
+    for (json_it_t it = json_create_empty_it(token_array); !json_end_it(&it); json_next_it(&it)) {
+        json_token_t* token_domain = json_it_value(&it);
         if (!json_is_string(token_domain)) {
             log_error("__module_loader_domains_load: domain must be string\n");
             goto failed;
@@ -778,7 +781,7 @@ domain_t* __module_loader_domains_load(const jsontok_t* token_array) {
     return result;
 }
 
-int __module_loader_databases_load(appconfig_t* config, const jsontok_t* token_databases) {
+int __module_loader_databases_load(appconfig_t* config, const json_token_t* token_databases) {
     if (token_databases == NULL) return 1;
     if (!json_is_object(token_databases)) {
         log_error("__module_loader_databases_load: databases must be object\n");
@@ -792,8 +795,8 @@ int __module_loader_databases_load(appconfig_t* config, const jsontok_t* token_d
     }
 
     int result = 0;
-    for (jsonit_t it = json_init_it(token_databases); !json_end_it(&it); json_next_it(&it)) {
-        jsontok_t* token_array = json_it_value(&it);
+    for (json_it_t it = json_create_empty_it(token_databases); !json_end_it(&it); json_next_it(&it)) {
+        json_token_t* token_array = json_it_value(&it);
         if (!json_is_array(token_array)) {
             log_error("__module_loader_databases_load: database driver must be array\n");
             goto failed;
@@ -836,7 +839,7 @@ int __module_loader_databases_load(appconfig_t* config, const jsontok_t* token_d
     return result;
 }
 
-int __module_loader_storages_load(appconfig_t* config, const jsontok_t* token_storages) {
+int __module_loader_storages_load(appconfig_t* config, const json_token_t* token_storages) {
     if (token_storages == NULL) return 1;
     if (!json_is_object(token_storages)) {
         log_error("__module_loader_storages_load: storages must be object\n");
@@ -845,8 +848,8 @@ int __module_loader_storages_load(appconfig_t* config, const jsontok_t* token_st
 
     int result = 0;
     storage_t* last_storage = NULL;
-    for (jsonit_t it = json_init_it(token_storages); !json_end_it(&it); json_next_it(&it)) {
-        jsontok_t* token_object = json_it_value(&it);
+    for (json_it_t it = json_create_empty_it(token_storages); !json_end_it(&it); json_next_it(&it)) {
+        json_token_t* token_object = json_it_value(&it);
         if (!json_is_object(token_object)) {
             log_error("__module_loader_storages_load: storage must be object\n");
             goto failed;
@@ -858,7 +861,7 @@ int __module_loader_storages_load(appconfig_t* config, const jsontok_t* token_st
             goto failed;
         }
 
-        jsontok_t* token_storage_type = json_object_get(token_object, "type");
+        json_token_t* token_storage_type = json_object_get(token_object, "type");
         if (!json_is_string(token_storage_type)) {
             log_error("Field type must be string in storage %s\n", storage_name);
             goto failed;
@@ -894,7 +897,7 @@ int __module_loader_storages_load(appconfig_t* config, const jsontok_t* token_st
     return result;
 }
 
-int __module_loader_mimetype_load(appconfig_t* config, const jsontok_t* token_mimetypes) {
+int __module_loader_mimetype_load(appconfig_t* config, const json_token_t* token_mimetypes) {
     if (token_mimetypes == NULL) {
         log_error("__module_loader_mimetype_load: mimetypes not found\n");
         return 0;
@@ -912,8 +915,8 @@ int __module_loader_mimetype_load(appconfig_t* config, const jsontok_t* token_mi
     size_t table_type_size = json_object_size(token_mimetypes);
     size_t table_ext_size = 0;
 
-    for (jsonit_t it = json_init_it(token_mimetypes); !json_end_it(&it); json_next_it(&it)) {
-        const jsontok_t* token_array = json_it_value(&it);
+    for (json_it_t it = json_create_empty_it(token_mimetypes); !json_end_it(&it); json_next_it(&it)) {
+        const json_token_t* token_array = json_it_value(&it);
         if (!json_is_array(token_array)) {
             log_error("__module_loader_mimetype_load: mimetype item must be array\n");
             return 0;
@@ -928,9 +931,9 @@ int __module_loader_mimetype_load(appconfig_t* config, const jsontok_t* token_mi
         goto failed;
     }
 
-    for (jsonit_t it_object = json_init_it(token_mimetypes); !json_end_it(&it_object); json_next_it(&it_object)) {
+    for (json_it_t it_object = json_create_empty_it(token_mimetypes); !json_end_it(&it_object); json_next_it(&it_object)) {
         const char* mimetype = json_it_key(&it_object);
-        const jsontok_t* token_array = json_it_value(&it_object);
+        const json_token_t* token_array = json_it_value(&it_object);
         if (!json_is_array(token_array)) {
             log_error("__module_loader_mimetype_load: mimetype item must be array\n");
             goto failed;
@@ -940,14 +943,14 @@ int __module_loader_mimetype_load(appconfig_t* config, const jsontok_t* token_mi
             goto failed;
         }
 
-        for (jsonit_t it_array = json_init_it(token_array); !json_end_it(&it_array); json_next_it(&it_array)) {
+        for (json_it_t it_array = json_create_empty_it(token_array); !json_end_it(&it_array); json_next_it(&it_array)) {
             const int* index = json_it_key(&it_array);
-            const jsontok_t* token_value = json_it_value(&it_array);
+            const json_token_t* token_value = json_it_value(&it_array);
             if (!json_is_string(token_value)) {
                 log_error("__module_loader_mimetype_load: mimetype item.value must be string\n");
                 goto failed;
             }
-            if (token_value->size == 0) {
+            if (json_string_size(token_value) == 0) {
                 log_error("__module_loader_mimetype_load: mimetype item.value must be not empty\n");
                 goto failed;
             }
@@ -984,7 +987,7 @@ int __module_loader_viewstore_load(appconfig_t* config) {
     return 1;
 }
 
-int __module_loader_sessionconfig_load(appconfig_t* config, const jsontok_t* token_sessions) {
+int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* token_sessions) {
     if (token_sessions == NULL) return 1;
     if (!json_is_object(token_sessions)) {
         log_error("__module_loader_sessionconfig_load: sessions must be object\n");
@@ -992,7 +995,7 @@ int __module_loader_sessionconfig_load(appconfig_t* config, const jsontok_t* tok
     }
 
     int result = 0;
-    jsontok_t* token_driver = json_object_get(token_sessions, "driver");
+    json_token_t* token_driver = json_object_get(token_sessions, "driver");
     if (!json_is_string(token_driver)) {
         log_error("__module_loader_sessionconfig_load: field driver must be string in sessions section\n");
         goto failed;
@@ -1008,7 +1011,7 @@ int __module_loader_sessionconfig_load(appconfig_t* config, const jsontok_t* tok
             goto failed;
         }
 
-        jsontok_t* token_storage_name = json_object_get(token_sessions, "storage_name");
+        json_token_t* token_storage_name = json_object_get(token_sessions, "storage_name");
         if (!json_is_string(token_storage_name)) {
             log_error("__module_loader_sessionconfig_load: field storage_name must be string in sessions section\n");
             goto failed;
@@ -1031,7 +1034,7 @@ int __module_loader_sessionconfig_load(appconfig_t* config, const jsontok_t* tok
             goto failed;
         }
 
-        jsontok_t* token_host_id = json_object_get(token_sessions, "host_id");
+        json_token_t* token_host_id = json_object_get(token_sessions, "host_id");
         if (!json_is_string(token_host_id)) {
             log_error("__module_loader_sessionconfig_load: field host_id must be string in sessions section\n");
             goto failed;
@@ -1050,21 +1053,23 @@ int __module_loader_sessionconfig_load(appconfig_t* config, const jsontok_t* tok
         goto failed;
     }
 
-    jsontok_t* token_lifetime = json_object_get(token_sessions, "lifetime");
+    json_token_t* token_lifetime = json_object_get(token_sessions, "lifetime");
     if (token_lifetime == NULL) {
         log_error("__module_loader_sessionconfig_load: field lifetime not found in sessions section\n");
         goto failed;
     }
-    if (!json_is_int(token_lifetime)) {
+    if (!json_is_number(token_lifetime)) {
         log_error("__module_loader_sessionconfig_load: field lifetime must be int in sessions section\n");
         goto failed;
     }
-    if (json_int(token_lifetime) <= 0) {
+    int ok = 0;
+    int lifetime = json_int(token_lifetime, &ok);
+    if (!ok || lifetime <= 0) {
         log_error("__module_loader_sessionconfig_load: field lifetime must be positive in sessions section\n");
         goto failed;
     }
 
-    config->sessionconfig.lifetime = json_int(token_lifetime);
+    config->sessionconfig.lifetime = lifetime;
 
     result = 1;
 
@@ -1076,7 +1081,7 @@ int __module_loader_sessionconfig_load(appconfig_t* config, const jsontok_t* tok
     return result;
 }
 
-int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const jsontok_t* token_object, route_t** route) {
+int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route) {
     int result = 0;
     route_t* first_route = NULL;
     route_t* last_route = NULL;
@@ -1089,7 +1094,7 @@ int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const jsonto
     }
     if (json_object_size(token_object) == 0) return 1;
 
-    for (jsonit_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
+    for (json_it_t it = json_create_empty_it(token_object); !json_end_it(&it); json_next_it(&it)) {
         const char* route_path = json_it_key(&it);
         if (strlen(route_path) == 0) {
             log_error("__module_loader_http_routes_load: route path is empty\n");
@@ -1128,7 +1133,7 @@ int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const jsonto
     return result;
 }
 
-int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const jsontok_t* token_object) {
+int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object) {
     if (token_object == NULL) {
         log_error("__module_loader_set_http_route: http.route item is empty\n");
         return 0;
@@ -1137,9 +1142,9 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
         log_error("__module_loader_set_http_route: http.route item must be object\n");
         return 0;
     }
-    for (jsonit_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
+    for (json_it_t it = json_create_empty_it(token_object); !json_end_it(&it); json_next_it(&it)) {
         const char* method = json_it_key(&it);
-        jsontok_t* token_array = json_it_value(&it);
+        json_token_t* token_array = json_it_value(&it);
         if (!json_is_array(token_array)) {
             log_error("__module_loader_set_http_route: http.route item.value must be array\n");
             return 0;
@@ -1149,21 +1154,21 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
             return 0;
         }
 
-        const jsontok_t* token_string0 = json_array_get(token_array, 0);
+        const json_token_t* token_string0 = json_array_get(token_array, 0);
         if (!json_is_string(token_string0)) {
             log_error("__module_loader_set_http_route: http.route item.value[0] must be string\n");
             return 0;
         }
-        if (token_string0->size == 0) {
+        if (json_string_size(token_string0) == 0) {
             log_error("__module_loader_set_http_route: http.route item.value[0] must be not empty string\n");
             return 0;
         }
-        const jsontok_t* token_string1 = json_array_get(token_array, 1);
+        const json_token_t* token_string1 = json_array_get(token_array, 1);
         if (!json_is_string(token_string1)) {
             log_error("__module_loader_set_http_route: http.route item.value[1] must be string\n");
             return 0;
         }
-        if (token_string1->size == 0) {
+        if (json_string_size(token_string1) == 0) {
             log_error("__module_loader_set_http_route: http.route item.value[1] must be not empty string\n");
             return 0;
         }
@@ -1212,7 +1217,7 @@ void __module_loader_pass_memory_sharedlib(routeloader_lib_t* first_lib, const c
         function(appconfig());
 }
 
-int __module_loader_http_redirects_load(const jsontok_t* token_object, redirect_t** redirect) {
+int __module_loader_http_redirects_load(const json_token_t* token_object, redirect_t** redirect) {
     int result = 0;
     redirect_t* first_redirect = NULL;
     redirect_t* last_redirect = NULL;
@@ -1224,8 +1229,8 @@ int __module_loader_http_redirects_load(const jsontok_t* token_object, redirect_
     }
     if (json_object_size(token_object) == 0) return 1;
 
-    for (jsonit_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
-        jsontok_t* token_value = json_it_value(&it);
+    for (json_it_t it = json_create_empty_it(token_object); !json_end_it(&it); json_next_it(&it)) {
+        json_token_t* token_value = json_it_value(&it);
         if (token_value == NULL) {
             log_error("__module_loader_http_redirects_load: http.redirects item.value is empty\n");
             goto failed;
@@ -1234,7 +1239,7 @@ int __module_loader_http_redirects_load(const jsontok_t* token_object, redirect_
             log_error("__module_loader_http_redirects_load: http.redirects item.value must be string\n");
             goto failed;
         }
-        if (token_value->size == 0) {
+        if (json_string_size(token_value) == 0) {
             log_error("__module_loader_http_redirects_load: http.redirects item.value is empty\n");
             goto failed;
         }
@@ -1273,7 +1278,7 @@ int __module_loader_http_redirects_load(const jsontok_t* token_object, redirect_
     return result;
 }
 
-int __module_loader_middlewares_load(const jsontok_t* token_array, middleware_item_t** middleware_item) {
+int __module_loader_middlewares_load(const json_token_t* token_array, middleware_item_t** middleware_item) {
     int result = 0;
     middleware_item_t* first_middleware = NULL;
     middleware_item_t* last_middleware = NULL;
@@ -1285,13 +1290,13 @@ int __module_loader_middlewares_load(const jsontok_t* token_array, middleware_it
     }
     if (json_array_size(token_array) == 0) return 1;
 
-    for (jsonit_t it = json_init_it(token_array); !json_end_it(&it); json_next_it(&it)) {
-        jsontok_t* token_value = json_it_value(&it);
+    for (json_it_t it = json_create_empty_it(token_array); !json_end_it(&it); json_next_it(&it)) {
+        json_token_t* token_value = json_it_value(&it);
         if (!json_is_string(token_value)) {
             log_error("__module_loader_middlewares_load: http.middlewares item.value must be string\n");
             goto failed;
         }
-        if (token_value->size == 0) {
+        if (json_string_size(token_value) == 0) {
             log_error("__module_loader_middlewares_load: http.middlewares item.value is empty\n");
             goto failed;
         }
@@ -1330,7 +1335,7 @@ int __module_loader_middlewares_load(const jsontok_t* token_array, middleware_it
     return result;
 }
 
-void __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t** first_lib, const jsontok_t* token_array) {
+void __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t** first_lib, const json_token_t* token_array) {
     *fn = (void(*)(void*))websockets_default_handler;
 
     if (token_array == NULL) return;
@@ -1343,21 +1348,21 @@ void __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_
         return;
     }
 
-    const jsontok_t* token_string0 = json_array_get(token_array, 0);
+    const json_token_t* token_string0 = json_array_get(token_array, 0);
     if (!json_is_string(token_string0)) {
         log_error("__module_loader_websockets_default_load: websockets.default item.value[0] must be string\n");
         return;
     }
-    if (token_string0->size == 0) {
+    if (json_string_size(token_string0) == 0) {
         log_error("__module_loader_websockets_default_load: websockets.default item.value[0] must be not empty string\n");
         return;
     }
-    const jsontok_t* token_string1 = json_array_get(token_array, 1);
+    const json_token_t* token_string1 = json_array_get(token_array, 1);
     if (!json_is_string(token_string1)) {
         log_error("__module_loader_websockets_default_load: websockets.default item.value[1] must be string\n");
         return;
     }
-    if (token_string1->size == 0) {
+    if (json_string_size(token_string1) == 0) {
         log_error("__module_loader_websockets_default_load: websockets.default item.value[1] must be not empty string\n");
         return;
     }
@@ -1384,7 +1389,7 @@ void __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_
     *(void**)(&(*fn)) = routeloader_get_handler(*first_lib, lib_file, lib_handler);
 }
 
-int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const jsontok_t* token_object, route_t** route) {
+int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route) {
     int result = 0;
     route_t* first_route = NULL;
     route_t* last_route = NULL;
@@ -1395,9 +1400,9 @@ int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const 
         log_error("__module_loader_websockets_routes_load: websockets.routes must be object\n");
         goto failed;
     }
-    if (token_object->size == 0) return 1;
+    if (json_object_size(token_object) == 0) return 1;
 
-    for (jsonit_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
+    for (json_it_t it = json_create_empty_it(token_object); !json_end_it(&it); json_next_it(&it)) {
         const char* route_path = json_it_key(&it);
         if (strlen(route_path) == 0) {
             log_error("__module_loader_websockets_routes_load: websockets.route path is empty\n");
@@ -1436,7 +1441,7 @@ int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const 
     return result;
 }
 
-int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const jsontok_t* token_object) {
+int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object) {
     if (token_object == NULL) {
         log_error("__module_loader_set_websockets_route: websockets.route item is empty\n");
         return 0;
@@ -1445,14 +1450,14 @@ int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloa
         log_error("__module_loader_set_websockets_route: websockets.route item must be object\n");
         return 0;
     }
-    for (jsonit_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
+    for (json_it_t it = json_create_empty_it(token_object); !json_end_it(&it); json_next_it(&it)) {
         const char* method = json_it_key(&it);
         if (strlen(method) == 0) {
             log_error("__module_loader_set_websockets_route: websockets.route item.key is empty\n");
             return 0;
         }
 
-        jsontok_t* token_array = json_it_value(&it);
+        json_token_t* token_array = json_it_value(&it);
         if (!json_is_array(token_array)) {
             log_error("__module_loader_set_websockets_route: websockets.route item.value must be array\n");
             return 0;
@@ -1462,21 +1467,21 @@ int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloa
             return 0;
         }
 
-        const jsontok_t* token_string0 = json_array_get(token_array, 0);
+        const json_token_t* token_string0 = json_array_get(token_array, 0);
         if (!json_is_string(token_string0)) {
             log_error("__module_loader_set_websockets_route: websockets.route item.value[0] must be string\n");
             return 0;
         }
-        if (token_string0->size == 0) {
+        if (json_string_size(token_string0) == 0) {
             log_error("__module_loader_set_websockets_route: websockets.route item.value[0] must be not empty string\n");
             return 0;
         }
-        const jsontok_t* token_string1 = json_array_get(token_array, 1);
+        const json_token_t* token_string1 = json_array_get(token_array, 1);
         if (!json_is_string(token_string1)) {
             log_error("__module_loader_set_websockets_route: websockets.route item.value[1] must be string\n");
             return 0;
         }
-        if (token_string1->size == 0) {
+        if (json_string_size(token_string1) == 0) {
             log_error("__module_loader_set_websockets_route: websockets.route item.value[1] must be not empty string\n");
             return 0;
         }
@@ -1577,7 +1582,7 @@ void module_loader_wakeup_all_threads(void) {
     thread_handlers_wakeup();
 }
 
-void* __module_loader_storage_fs_load(const jsontok_t* token_object, const char* storage_name) {
+void* __module_loader_storage_fs_load(const json_token_t* token_object, const char* storage_name) {
     void* result = NULL;
 
     const char* root = __module_loader_storage_field(storage_name, token_object, "root");
@@ -1612,7 +1617,7 @@ void* __module_loader_storage_fs_load(const jsontok_t* token_object, const char*
     return result;
 }
 
-void* __module_loader_storage_s3_load(const jsontok_t* token_object, const char* storage_name) {
+void* __module_loader_storage_s3_load(const json_token_t* token_object, const char* storage_name) {
     void* result = NULL;
 
     const char* access_id = __module_loader_storage_field(storage_name, token_object, "access_id");
@@ -1664,15 +1669,15 @@ void* __module_loader_storage_s3_load(const jsontok_t* token_object, const char*
     return result;
 }
 
-const char* __module_loader_storage_field(const char* storage_name, const jsontok_t* token_object, const char* key) {
-    jsontok_t* token_value = json_object_get(token_object, key);
+const char* __module_loader_storage_field(const char* storage_name, const json_token_t* token_object, const char* key) {
+    json_token_t* token_value = json_object_get(token_object, key);
     if (!json_is_string(token_value)) {
         log_error("__module_loader_storage_field: field %s must be string in storage %s\n", key, storage_name);
         return NULL;
     }
 
     const char* value = json_string(token_value);
-    if (token_value->size == 0) {
+    if (json_string_size(token_value) == 0) {
         log_error("__module_loader_storage_field: field %s is empty in storage %s\n", key, storage_name);
         return NULL;
     }
@@ -1680,7 +1685,7 @@ const char* __module_loader_storage_field(const char* storage_name, const jsonto
     return value;
 }
 
-openssl_t* __module_loader_tls_load(const jsontok_t* token_object) {
+openssl_t* __module_loader_tls_load(const json_token_t* token_object) {
     if (token_object == NULL) {
         log_error("__module_loader_tls_load: openssl not found\n");
         return NULL;
@@ -1700,14 +1705,14 @@ openssl_t* __module_loader_tls_load(const jsontok_t* token_object) {
     enum fields { FULLCHAIN = 0, PRIVATE, CIPHERS, FIELDS_COUNT };
     char* finded_fields_str[FIELDS_COUNT] = {"fullchain", "private", "ciphers"};
     int finded_fields[FIELDS_COUNT] = {0};
-    for (jsonit_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
+    for (json_it_t it = json_create_empty_it(token_object); !json_end_it(&it); json_next_it(&it)) {
         const char* key = json_it_key(&it);
         if (strlen(key) == 0) {
             log_error("__module_loader_tls_load: tls key is empty\n");
             goto failed;
         }
 
-        const jsontok_t* token_value = json_it_value(&it);
+        const json_token_t* token_value = json_it_value(&it);
         if (token_value == NULL) {
             log_error("__module_loader_tls_load: tls value is empty\n");
             goto failed;
@@ -1718,14 +1723,14 @@ openssl_t* __module_loader_tls_load(const jsontok_t* token_object) {
                 log_error("__module_loader_tls_load: field fullchain must be string type\n");
                 goto failed;
             }
-            if (token_value->size == 0) {
+            if (json_string_size(token_value) == 0) {
                 log_error("__module_loader_tls_load: field fullchain is empty\n");
                 goto failed;
             }
 
             finded_fields[FULLCHAIN] = 1;
 
-            openssl->fullchain = malloc(token_value->size + 1);
+            openssl->fullchain = malloc(json_string_size(token_value) + 1);
             if (openssl->fullchain == NULL) {
                 log_error("__module_loader_tls_load: failed to allocate memory for fullchain\n");
                 goto failed;
@@ -1738,14 +1743,14 @@ openssl_t* __module_loader_tls_load(const jsontok_t* token_object) {
                 log_error("Openssl field private must be string type\n");
                 goto failed;
             }
-            if (token_value->size == 0) {
+            if (json_string_size(token_value) == 0) {
                 log_error("__module_loader_tls_load: field private is empty\n");
                 goto failed;
             }
 
             finded_fields[PRIVATE] = 1;
 
-            openssl->private = malloc(token_value->size + 1);
+            openssl->private = malloc(json_string_size(token_value) + 1);
             if (openssl->private == NULL) {
                 log_error("__module_loader_tls_load: failed to allocate memory for private\n");
                 goto failed;
@@ -1758,14 +1763,14 @@ openssl_t* __module_loader_tls_load(const jsontok_t* token_object) {
                 log_error("Openssl field ciphers must be string type\n");
                 goto failed;
             }
-            if (token_value->size == 0) {
+            if (json_string_size(token_value) == 0) {
                 log_error("__module_loader_tls_load: field ciphers is empty\n");
                 goto failed;
             }
 
             finded_fields[CIPHERS] = 1;
 
-            openssl->ciphers = malloc(token_value->size + 1);
+            openssl->ciphers = malloc(json_string_size(token_value) + 1);
             if (openssl->ciphers == NULL) {
                 log_error("__module_loader_tls_load: failed to allocate memory for ciphers\n");
                 goto failed;

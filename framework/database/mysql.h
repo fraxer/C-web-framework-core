@@ -18,6 +18,6 @@ typedef struct myconnection {
     MYSQL* connection;
 } myconnection_t;
 
-db_t* my_load(const char* database_id, const jsontok_t* token_array);
+db_t* my_load(const char* database_id, const json_token_t* token_array);
 
 #endif

@@ -18,6 +18,6 @@ typedef struct redisconnection {
     redisContext* connection;
 } redisconnection_t;
 
-db_t* redis_load(const char* database_id, const jsontok_t* token_array);
+db_t* redis_load(const char* database_id, const json_token_t* token_array);
 
 #endif

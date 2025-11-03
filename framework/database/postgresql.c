@@ -297,7 +297,7 @@ str_t* __escape_internal(void* connection, str_t* str, char*(fn)(PGconn* conn, c
     return string;
 }
 
-db_t* postgresql_load(const char* database_id, const jsontok_t* token_array) {
+db_t* postgresql_load(const char* database_id, const json_token_t* token_array) {
     db_t* result = NULL;
     db_t* database = db_create(database_id);
     if (database == NULL) {
@@ -309,8 +309,8 @@ db_t* postgresql_load(const char* database_id, const jsontok_t* token_array) {
     enum reqired_fields { R_HOST_ID = 0, R_PORT, R_IP, R_DBNAME, R_USER, R_PASSWORD, R_CONNECTION_TIMEOUT, R_FIELDS_COUNT };
     char* field_names[FIELDS_COUNT] = {"host_id", "port", "ip", "dbname", "user", "password", "connection_timeout"};
 
-    for (jsonit_t it_array = json_init_it(token_array); !json_end_it(&it_array); json_next_it(&it_array)) {
-        jsontok_t* token_object = json_it_value(&it_array);
+    for (json_it_t it_array = json_create_empty_it(token_array); !json_end_it(&it_array); json_next_it(&it_array)) {
+        json_token_t* token_object = json_it_value(&it_array);
         int lresult = 0;
         int finded_fields[FIELDS_COUNT] = {0};
         postgresqlhost_t* host = __host_create();
@@ -319,9 +319,9 @@ db_t* postgresql_load(const char* database_id, const jsontok_t* token_array) {
             goto failed;
         }
 
-        for (jsonit_t it_object = json_init_it(token_object); !json_end_it(&it_object); json_next_it(&it_object)) {
+        for (json_it_t it_object = json_create_empty_it(token_object); !json_end_it(&it_object); json_next_it(&it_object)) {
             const char* key = json_it_key(&it_object);
-            jsontok_t* token_value = json_it_value(&it_object);
+            json_token_t* token_value = json_it_value(&it_object);
 
             if (strcmp(key, "host_id") == 0) {
                 if (finded_fields[HOST_ID]) {
@@ -337,7 +337,7 @@ db_t* postgresql_load(const char* database_id, const jsontok_t* token_array) {
 
                 if (host->base.id != NULL) free(host->base.id);
 
-                host->base.id = malloc(token_value->size + 1);
+                host->base.id = malloc(json_string_size(token_value) + 1);
                 if (host->base.id == NULL) {
                     log_error("postgresql_load: alloc memory for %s failed\n", key);
                     goto host_failed;
@@ -350,14 +350,19 @@ db_t* postgresql_load(const char* database_id, const jsontok_t* token_array) {
                     log_error("postgresql_load: field %s must be unique\n", key);
                     goto host_failed;
                 }
-                if (!json_is_int(token_value)) {
+                if (!json_is_number(token_value)) {
                     log_error("postgresql_load: field %s must be int\n", key);
                     goto host_failed;
                 }
 
                 finded_fields[PORT] = 1;
 
-                host->base.port = json_int(token_value);
+                int ok = 0;
+                host->base.port = json_int(token_value, &ok);
+                if (!ok) {
+                    log_error("postgresql_load: field %s must be int\n", key);
+                    goto host_failed;
+                }
             }
             else if (strcmp(key, "ip") == 0) {
                 if (finded_fields[IP]) {
@@ -373,7 +378,7 @@ db_t* postgresql_load(const char* database_id, const jsontok_t* token_array) {
 
                 if (host->base.ip != NULL) free(host->base.ip);
 
-                host->base.ip = malloc(token_value->size + 1);
+                host->base.ip = malloc(json_string_size(token_value) + 1);
                 if (host->base.ip == NULL) {
                     log_error("postgresql_load: alloc memory for %s failed\n", key);
                     goto host_failed;
@@ -395,7 +400,7 @@ db_t* postgresql_load(const char* database_id, const jsontok_t* token_array) {
 
                 if (host->dbname != NULL) free(host->dbname);
 
-                host->dbname = malloc(token_value->size + 1);
+                host->dbname = malloc(json_string_size(token_value) + 1);
                 if (host->dbname == NULL) {
                     log_error("postgresql_load: alloc memory for %s failed\n", key);
                     goto host_failed;
@@ -417,7 +422,7 @@ db_t* postgresql_load(const char* database_id, const jsontok_t* token_array) {
 
                 if (host->user != NULL) free(host->user);
 
-                host->user = malloc(token_value->size + 1);
+                host->user = malloc(json_string_size(token_value) + 1);
                 if (host->user == NULL) {
                     log_error("postgresql_load: alloc memory for %s failed\n", key);
                     goto host_failed;
@@ -439,7 +444,7 @@ db_t* postgresql_load(const char* database_id, const jsontok_t* token_array) {
 
                 if (host->password != NULL) free(host->password);
 
-                host->password = malloc(token_value->size + 1);
+                host->password = malloc(json_string_size(token_value) + 1);
                 if (host->password == NULL) {
                     log_error("postgresql_load: alloc memory for %s failed\n", key);
                     goto host_failed;
@@ -452,14 +457,19 @@ db_t* postgresql_load(const char* database_id, const jsontok_t* token_array) {
                     log_error("postgresql_load: field %s must be unique\n", key);
                     goto host_failed;
                 }
-                if (!json_is_int(token_value)) {
+                if (!json_is_number(token_value)) {
                     log_error("postgresql_load: field %s must be int\n", key);
                     goto host_failed;
                 }
 
                 finded_fields[CONNECTION_TIMEOUT] = 1;
 
-                host->connection_timeout = json_int(token_value);
+                int ok = 0;
+                host->connection_timeout = json_int(token_value, &ok);
+                if (!ok) {
+                    log_error("postgresql_load: field %s must be int\n", key);
+                    goto host_failed;
+                }
             }
             else {
                 log_error("postgresql_load: unknown field: %s\n", key);

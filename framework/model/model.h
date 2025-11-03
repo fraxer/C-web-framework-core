@@ -678,7 +678,7 @@ typedef struct {
         double _double;
         long double _ldouble;
         tm_t* _tm;
-        jsondoc_t* _jsondoc;
+        json_doc_t* _jsondoc;
         enums_t* _enum;
         array_t* _array;
     };
@@ -714,7 +714,7 @@ void* model_one(const char* dbid, void*(create_instance)(void), const char* form
 array_t* model_list(const char* dbid, void*(create_instance)(void), const char* format, array_t* params);
 int model_execute(const char* dbid, const char* format, array_t* params);
 
-jsontok_t* model_to_json(void* arg, jsondoc_t* document, ...);
+json_token_t* model_to_json(void* arg, json_doc_t* document, ...);
 char* model_stringify(void* arg, ...);
 char* model_list_stringify(array_t* array);
 void model_free(void* arg);
@@ -737,7 +737,7 @@ tm_t* model_date(mfield_t* field);
 tm_t* model_time(mfield_t* field);
 tm_t* model_timetz(mfield_t* field);
 
-jsondoc_t* model_json(mfield_t* field);
+json_doc_t* model_json(mfield_t* field);
 
 str_t* model_binary(mfield_t* field);
 str_t* model_varchar(mfield_t* field);
@@ -765,7 +765,7 @@ int model_set_date(mfield_t* field, tm_t* value);
 int model_set_time(mfield_t* field, tm_t* value);
 int model_set_timetz(mfield_t* field, tm_t* value);
 
-int model_set_json(mfield_t* field, jsondoc_t* value);
+int model_set_json(mfield_t* field, json_doc_t* value);
 
 int model_set_binary(mfield_t* field, const char* value, const size_t size);
 int model_set_varchar(mfield_t* field, const char* value);
@@ -829,6 +829,6 @@ void model_param_clear(void* field);
 void model_params_clear(void* params, const size_t size);
 void model_params_free(void* params, const size_t size);
 
-jsontok_t* model_json_create_object(void* arg, char** display_fields, jsondoc_t* doc);
+json_token_t* model_json_create_object(void* arg, char** display_fields, json_doc_t* doc);
 
 #endif

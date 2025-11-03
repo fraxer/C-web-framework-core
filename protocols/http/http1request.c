@@ -37,13 +37,13 @@ http1_payloadpart_t* http1request_urlencoded_part(http1request_t*, const char*);
 int http1request_append_urlencoded(http1request_t*, const char*, const char*);
 int http1request_append_formdata_raw(http1request_t*, const char*, const char*, const char*);
 int http1request_append_formdata_text(http1request_t*, const char*, const char*);
-int http1request_append_formdata_json(http1request_t*, const char*, jsondoc_t*);
+int http1request_append_formdata_json(http1request_t*, const char*, json_doc_t*);
 int http1request_append_formdata_filepath(http1request_t*, const char*, const char*);
 int http1request_append_formdata_file(http1request_t*, const char*, file_t*);
 int http1request_append_formdata_file_content(http1request_t*, const char*, file_content_t*);
 int http1request_set_payload_raw(http1request_t*, const char*, const size_t, const char*);
 int http1request_set_payload_text(http1request_t*, const char*);
-int http1request_set_payload_json(http1request_t*, jsondoc_t*);
+int http1request_set_payload_json(http1request_t*, json_doc_t*);
 int http1request_set_payload_filepath(http1request_t*, const char*);
 int http1request_set_payload_file(http1request_t*, const file_t*);
 int http1request_set_payload_file_content(http1request_t*, const file_content_t*);
@@ -324,19 +324,15 @@ file_content_t http1request_payload_filef(http1request_t* request, const char* f
     return file_content;
 }
 
-jsondoc_t* http1request_payload_json(http1request_t* request) {
+json_doc_t* http1request_payload_json(http1request_t* request) {
     return http1request_payload_jsonf(request, NULL);
 }
 
-jsondoc_t* http1request_payload_jsonf(http1request_t* request, const char* field) {
+json_doc_t* http1request_payload_jsonf(http1request_t* request, const char* field) {
     char* payload = http1request_payloadf(request, field);
     if (payload == NULL) return NULL;
 
-    jsondoc_t* document = json_init();
-    if (document == NULL) goto failed;
-    if (!json_parse(document, payload)) goto failed;
-
-    failed:
+    json_doc_t* document = json_parse(payload);
 
     free(payload);
 
@@ -749,7 +745,7 @@ int http1request_append_formdata_text(http1request_t* request, const char* key, 
     return http1request_append_formdata_raw(request, key, value, "text/plain");
 }
 
-int http1request_append_formdata_json(http1request_t* request, const char* key, jsondoc_t* document) {
+int http1request_append_formdata_json(http1request_t* request, const char* key, json_doc_t* document) {
     return http1request_append_formdata_raw(request, key, json_stringify(document), "application/json");
 }
 
@@ -871,7 +867,7 @@ int http1request_set_payload_text(http1request_t* request, const char* value) {
     return http1request_set_payload_raw(request, value, strlen(value), "text/plain");
 }
 
-int http1request_set_payload_json(http1request_t* request, jsondoc_t* document) {
+int http1request_set_payload_json(http1request_t* request, json_doc_t* document) {
     return http1request_set_payload_raw(request, json_stringify(document), json_stringify_size(document), "application/json");
 }
 
