@@ -1,4 +1,6 @@
 #include <string.h>
+#include <stdarg.h>
+#include <stdio.h>
 
 #include "str.h"
 
@@ -8,7 +10,11 @@ static int __str_switch_to_dynamic(str_t* str, size_t required_size);
 static inline char* __str_get_buffer(str_t* str);
 static inline size_t __str_get_capacity(str_t* str);
 
-str_t* str_create(const char* string, const size_t size) {
+str_t* str_create(const char* string) {
+    return str_createn(string, strlen(string));
+}
+
+str_t* str_createn(const char* string, const size_t size) {
     str_t* data = str_create_empty(size);
     if (data == NULL) return NULL;
 
@@ -211,6 +217,44 @@ int str_append(str_t* str, const char* string, size_t size) {
     return str_insert(str, string, size, str->size);
 }
 
+int str_appendf(str_t* str, const char* format, ...) {
+    if (str == NULL || format == NULL) return 0;
+
+    va_list args, args_copy;
+    va_start(args, format);
+
+    // Make a copy of args for the second vsnprintf call
+    va_copy(args_copy, args);
+
+    // First call to determine required size
+    int needed_size = vsnprintf(NULL, 0, format, args);
+    va_end(args);
+
+    if (needed_size < 0) {
+        va_end(args_copy);
+        return 0;
+    }
+
+    // Allocate temporary buffer
+    char* buffer = malloc(needed_size + 1);
+    if (buffer == NULL) {
+        va_end(args_copy);
+        return 0;
+    }
+
+    // Format the string
+    vsnprintf(buffer, needed_size + 1, format, args_copy);
+    va_end(args_copy);
+
+    // Append to str
+    int result = str_append(str, buffer, needed_size);
+
+    // Free temporary buffer
+    free(buffer);
+
+    return result;
+}
+
 int str_assign(str_t* str, const char* string, size_t size) {
     if (str == NULL) return 0;
 
@@ -244,6 +288,17 @@ int str_move(str_t* srcstr, str_t* dststr) {
     dststr->init_capacity = srcstr->init_capacity;
 
     return str_init(srcstr, srcstr->init_capacity);
+}
+
+int str_cmp(str_t* srcstr, str_t* dststr) {
+    return str_cmpc(srcstr, str_get(dststr));
+}
+
+int str_cmpc(str_t* srcstr, const char* dststr) {
+    if (srcstr == NULL || dststr == NULL)
+        return 0;
+
+    return strcmp(str_get(srcstr), dststr);
 }
 
 char* str_get(str_t* str) {

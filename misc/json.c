@@ -877,6 +877,8 @@ void __init_token(json_token_t* token, memory_block_t* block, json_token_type_t 
 // ============================================================================
 
 json_doc_t* json_parse(const char* json_str) {
+    if (json_str == NULL) return NULL;
+
     // Инициализация глобального менеджера при первом использовании
     if (manager == NULL) {
         manager = json_manager_create();

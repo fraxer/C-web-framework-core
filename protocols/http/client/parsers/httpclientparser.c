@@ -319,7 +319,7 @@ int __httpclientparser_set_uri(httpclientparser_t* parser) {
     if (!__httpclientparser_set_path(parser, string, path_point_end))
         return 0;
 
-    str_t* uri = str_create(parser->path, path_point_end);
+    str_t* uri = str_createn(parser->path, path_point_end);
     if (uri == NULL) return 0;
 
     http1_query_t* query = parser->query;

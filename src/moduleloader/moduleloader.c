@@ -27,6 +27,7 @@
 #include "broadcast.h"
 #include "connection_queue.h"
 #include "middlewarelist.h"
+#include "prepare_statements.h"
 #ifdef MySQL_FOUND
     #include "mysql.h"
 #endif
@@ -49,6 +50,7 @@ static int __module_loader_storages_load(appconfig_t* config, const json_token_t
 static int __module_loader_mimetype_load(appconfig_t* config, const json_token_t* mimetypes);
 static int __module_loader_viewstore_load(appconfig_t* config);
 static int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* sessionconfig);
+static int __module_loader_prepared_queries_load(appconfig_t* config);
 
 static int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route);
 static int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object);
@@ -384,6 +386,8 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     if (!__module_loader_viewstore_load(config))
         return 0;
     if (!__module_loader_sessionconfig_load(config, json_object_get(root, "sessions")))
+        return 0;
+    if (!__module_loader_prepared_queries_load(config))
         return 0;
 
 
@@ -1079,6 +1083,19 @@ int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* 
         sessionconfig_clear(&config->sessionconfig);
 
     return result;
+}
+
+int __module_loader_prepared_queries_load(appconfig_t* config) {
+    for (int i = 0; i < pstmt_count(); i++) {
+        prepare_stmt_t* stmt = (pstmt_list()[i])();
+        if (stmt == NULL) {
+            log_error("__module_loader_prepared_queries_load: can't create prepared statement\n");
+            return 0;
+        }
+        array_push_back(config->prepared_queries, array_create_pointer(stmt, array_nocopy, pstmt_free));
+    }
+
+    return 1;
 }
 
 int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route) {

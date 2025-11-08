@@ -4,31 +4,66 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
 
 #include "log.h"
 #include "array.h"
 #include "str.h"
 #include "model.h"
 #include "dbresult.h"
+#include "dbquery.h"
 #include "mysql.h"
+
+// Помощник функция для очистки bind_result (используется при ошибках)
+// Определяем макрос для очистки
+#define CLEANUP_BIND_RESULT() \
+    for (int col = 0; col < cols; col++) { \
+        if (bind_result[col].buffer) free(bind_result[col].buffer); \
+        if (bind_result[col].length) free(bind_result[col].length); \
+        if (bind_result[col].is_null) free(bind_result[col].is_null); \
+        if (bind_result[col].error) free(bind_result[col].error); \
+    } \
+    free(bind_result); \
+
+typedef struct {
+    array_t* param_order;
+} my_sql_processor_data_t;
+
+typedef struct {
+    MYSQL_STMT* stmt;
+    array_t* param_order;
+    MYSQL_BIND* write_binds;
+    bool* null_indicators;  // Массив индикаторов NULL для каждого параметра
+} mysql_prepared_stmt_t;
 
 static myhost_t* __host_create(void);
 static void __host_free(void*);
 static void* __connection_create(void* host);
 static void __connection_free(void* connection);
 static dbresult_t* __query(void* connection, const char* sql);
+static dbresult_t* __process_result(void* connection, dbresult_t* result);
+static dbresult_t* __process_prepared_result(void* connection, MYSQL_STMT* stmt, dbresult_t* result);
 static MYSQL* __connect(void* host);
 static int __is_active(void* connection);
 static int __reconnect(void* host, void* connection);
-static char* __compile_table_exist(const char* table);
-static char* __compile_table_migration_create(const char* table);
-static str_t* __escape_identifier(void* connection, str_t* str);
-static str_t* __escape_string(void* connection, str_t* str);
-static str_t* __escape_internal(void* connection, str_t* str, char quote);
+static char* __compile_table_exist(dbconnection_t* connection, const char* table);
+static char* __compile_table_migration_create(dbconnection_t* connection, const char* table);
+static str_t* __escape_identifier(void* connection, const char* str);
+static str_t* __escape_string(void* connection, const char* str);
+static str_t* __escape_internal(void* connection, const char* str, char quote);
+static int __build_query_processor(void* connection, char parameter_type, const char* param_name, mfield_t* field, str_t* result_sql, void* user_data);
+static str_t* __build_query(void* connection, str_t* sql, array_t* params, array_t* param_order);
+static void __prepared_stmt_free(void* data);
+static int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params);
+static dbresult_t* __execute_prepared(void* connection, const char* stmt_name, array_t* params);
+static int __deallocate(void* connection, str_t* stmt_name);
 static char* __compile_insert(void* connection, const char* table, array_t* params);
 static char* __compile_select(void* connection, const char* table, array_t* columns, array_t* where);
 static char* __compile_update(void* connection, const char* table, array_t* set, array_t* where);
 static char* __compile_delete(void* connection, const char* table, array_t* where);
+static enum_field_types __convert_model_type_to_mysql(mtype_e model_type);
+static int __bind_field_value(MYSQL_BIND* bind, mfield_t* field, bool* is_null_indicator);
+
 
 myhost_t* __host_create(void) {
     myhost_t* host = malloc(sizeof * host);
@@ -74,12 +109,16 @@ void* __connection_create(void* host) {
     if (connection == NULL) return NULL;
 
     connection->base.thread_id = gettid();
+    connection->base.prepare_statements = map_create_ex(map_compare_string, map_copy_string, free, NULL, __prepared_stmt_free);
     connection->base.free = __connection_free;
     connection->base.query = __query;
     connection->base.escape_identifier = __escape_identifier;
     connection->base.escape_string = __escape_string;
     connection->base.is_active = __is_active;
     connection->base.reconnect = __reconnect;
+    connection->base.prepare = __prepare;
+    connection->base.execute_prepared = __execute_prepared;
+    connection->base.deallocate = __deallocate;
     connection->connection = __connect(host);
 
     if (connection->connection == NULL) {
@@ -90,32 +129,56 @@ void* __connection_create(void* host) {
     return connection;
 }
 
-char* __compile_table_exist(const char* table) {
+char* __compile_table_exist(dbconnection_t* connection, const char* table) {
+    str_t* quoted_table = connection->escape_string(connection, table);
+    if (quoted_table == NULL)
+        return NULL;
+
     char tmp[512] = {0};
 
-    sprintf(
-        &tmp[0],
-        "SHOW TABLES LIKE '%s'",
-        table
+    ssize_t written = snprintf(
+        tmp,
+        sizeof(tmp),
+        "SHOW TABLES LIKE %s",
+        str_get(quoted_table)
     );
 
-    return strdup(&tmp[0]);
+    str_free(quoted_table);
+
+    if (written < 0 || written >= (ssize_t)sizeof(tmp)) {
+        log_error("__compile_table_exist: buffer overflow prevented\n");
+        return NULL;
+    }
+
+    return strdup(tmp);
 }
 
-char* __compile_table_migration_create(const char* table) {
+char* __compile_table_migration_create(dbconnection_t* connection, const char* table) {
+    str_t* quoted_table = connection->escape_identifier(connection, table);
+    if (quoted_table == NULL)
+        return NULL;
+
     char tmp[512] = {0};
 
-    sprintf(
-        &tmp[0],
+    ssize_t written = snprintf(
+        tmp,
+        sizeof(tmp),
         "CREATE TABLE %s "
         "("
             "version     varchar(180)  NOT NULL PRIMARY KEY,"
             "apply_time  integer       NOT NULL DEFAULT 0"
         ")",
-        table
+        str_get(quoted_table)
     );
 
-    return strdup(&tmp[0]);
+    str_free(quoted_table);
+
+    if (written < 0 || written >= (ssize_t)sizeof(tmp)) {
+        log_error("__compile_table_migration_create: buffer overflow prevented\n");
+        return NULL;
+    }
+
+    return strdup(tmp);
 }
 
 void __connection_free(void* connection) {
@@ -137,6 +200,12 @@ dbresult_t* __query(void* connection, const char* sql) {
         log_error("Mysql error: %s\n", mysql_error(myconnection->connection));
         return result;
     }
+
+    return __process_result(myconnection, result);
+}
+
+dbresult_t* __process_result(void* connection, dbresult_t* result) {
+    myconnection_t* myconnection = connection;
 
     result->ok = 1;
 
@@ -208,18 +277,234 @@ dbresult_t* __query(void* connection, const char* sql) {
     return result;
 }
 
+dbresult_t* __process_prepared_result(void* connection, MYSQL_STMT* stmt, dbresult_t* result) {
+    myconnection_t* myconnection = connection;
+
+    result->ok = 1;
+    dbresultquery_t* query_last = NULL;
+
+    do {
+        // Получаем метаданные результата
+        MYSQL_RES* res = mysql_stmt_result_metadata(stmt);
+        if (res == NULL && mysql_stmt_field_count(stmt) > 0) {
+            log_error("__process_prepared_result: mysql_stmt_result_metadata failed: %s\n", mysql_stmt_error(stmt));
+            return result;
+        }
+
+        if (res != NULL) {
+            int cols = mysql_num_fields(res);
+
+            // Сохраняем результаты в буфер statement'а
+            if (mysql_stmt_store_result(stmt)) {
+                log_error("__process_prepared_result: mysql_stmt_store_result failed: %s\n", mysql_stmt_error(stmt));
+                mysql_free_result(res);
+                return result;
+            }
+
+            unsigned long num_rows = mysql_stmt_num_rows(stmt);
+
+            // Создаём query с правильным количеством строк
+            dbresultquery_t* query = dbresult_query_create(num_rows, cols);
+            if (query == NULL) {
+                log_error("__process_prepared_result: Out of memory\n");
+                mysql_free_result(res);
+                result->ok = 0;
+                return result;
+            }
+
+            // ДОБАВЛЯЕМ QUERY В RESULT СРАЗУ ПОСЛЕ СОЗДАНИЯ
+            // чтобы гарантировать что она не будет потеряна при ошибках
+            if (query_last != NULL)
+                query_last->next = query;
+
+            query_last = query;
+
+            if (result->query == NULL) {
+                result->query = query;
+                result->current = query;
+            }
+
+            // Вставляем информацию о полях
+            MYSQL_FIELD* fields = mysql_fetch_fields(res);
+            MYSQL_BIND* bind_result = calloc(cols, sizeof(MYSQL_BIND));
+            if (bind_result == NULL) {
+                log_error("__process_prepared_result: memory allocation failed for bind_result\n");
+                mysql_free_result(res);
+                result->ok = 0;
+                return result;
+            }
+
+            // Инициализируем буферы для каждого столбца на основе max_length
+            int alloc_failed = 0;
+            for (int col = 0; col < cols; col++) {
+                MYSQL_FIELD field = fields[col];
+
+                dbresult_query_field_insert(query, field.name, col);
+
+                // Вычисляем размер буфера
+                // ВАЖНО: field.max_length всегда 0 для prepared statements, используем field.length
+                // field.length — это максимальная длина по схеме таблицы
+                // Защита от integer overflow: проверяем ПЕРЕД добавлением 1
+                unsigned long buffer_length;
+                const unsigned long MAX_FIELD_SIZE = 1024 * 1024 * 100;  // 100 MB на поле
+
+                if (field.length >= MAX_FIELD_SIZE) {
+                    buffer_length = MAX_FIELD_SIZE;
+                    log_error("Field '%s' has excessive length %lu, limiting to 100MB\n", field.name, field.length);
+                } else if (field.length > 0) {
+                    // Безопасно добавляем 1 для null-терминатора
+                    buffer_length = field.length + 1;
+                } else {
+                    buffer_length = 4096;
+                }
+
+                char* buffer = malloc(buffer_length);
+                if (buffer == NULL) {
+                    alloc_failed = 1;
+                    break;
+                }
+
+                unsigned long* length = malloc(sizeof(unsigned long));
+                if (length == NULL) {
+                    alloc_failed = 1;
+                    free(buffer);
+                    break;
+                }
+
+                bool* is_null = malloc(sizeof(bool));
+                if (is_null == NULL) {
+                    alloc_failed = 1;
+                    free(buffer);
+                    free(length);
+                    break;
+                }
+
+                // Добавляем поле error для детекции усечения
+                bool* error = malloc(sizeof(bool));
+                if (error == NULL) {
+                    alloc_failed = 1;
+                    free(buffer);
+                    free(length);
+                    free(is_null);
+                    break;
+                }
+
+                *length = 0;
+                *is_null = 0;
+                *error = 0;  // Инициализируем флаг ошибки
+
+                bind_result[col].buffer_type = MYSQL_TYPE_STRING;
+                bind_result[col].buffer = buffer;
+                bind_result[col].buffer_length = buffer_length;
+                bind_result[col].length = length;
+                bind_result[col].is_null = is_null;
+                bind_result[col].error = error;  // Устанавливаем указатель на флаг ошибки
+            }
+
+            mysql_free_result(res);
+
+            if (alloc_failed) {
+                // Освобождаем ВСЕ уже выделенные буферы перед выходом
+                CLEANUP_BIND_RESULT();
+                result->ok = 0;
+                return result;
+            }
+
+            // Привязываем буферы к результатам
+            if (mysql_stmt_bind_result(stmt, bind_result)) {
+                log_error("__process_prepared_result: mysql_stmt_bind_result failed: %s\n", mysql_stmt_error(stmt));
+                CLEANUP_BIND_RESULT();
+                result->ok = 0;
+                return result;
+            }
+
+            // Получаем строки
+            int row = 0;
+            int fetch_status;
+            while ((fetch_status = mysql_stmt_fetch(stmt)) == 0) {
+                for (int col = 0; col < cols; col++) {
+                    // ИСПРАВЛЕНИЕ: Используем указатель вместо копии структуры
+                    // Это избегает ненужного копирования и потенциальных race conditions
+                    MYSQL_BIND* bind = &bind_result[col];
+
+                    if (*bind->is_null) {
+                        dbresult_query_value_insert(query, NULL, 0, row, col);
+                    } else {
+                        // ИСПРАВЛЕНИЕ: Улучшена логика проверки buffer overread
+                        // Всегда используем минимум из двух значений для безопасности
+                        unsigned long safe_length;
+
+                        if (*bind->error) {
+                            // Данные были усечены
+                            log_error("Data truncated in column %d at row %d. Buffer size: %lu, Actual data length: %lu\n",
+                                    col, row, bind->buffer_length, *bind->length);
+                            result->ok = 0;
+
+                            // При усечении: берем меньшее значение, но не больше buffer_length
+                            safe_length = (*bind->length < bind->buffer_length)
+                                ? *bind->length
+                                : bind->buffer_length;
+                        } else {
+                            // Нет усечения, но проверяем на переполнение буфера
+                            // *bind->length должно быть <= buffer_length, но проверяем для безопасности
+                            if (*bind->length > bind->buffer_length) {
+                                log_error("Buffer overread detected in column %d at row %d: length %lu > buffer_length %lu\n",
+                                        col, row, *bind->length, bind->buffer_length);
+                                safe_length = bind->buffer_length;
+                                result->ok = 0;
+                            } else {
+                                safe_length = *bind->length;
+                            }
+                        }
+
+                        // Дополнительная проверка: исключаем null-терминатор из длины
+                        if (safe_length > 0 && bind->buffer_type == MYSQL_TYPE_STRING) {
+                            safe_length = (safe_length > bind->buffer_length) ? bind->buffer_length : safe_length;
+                        }
+
+                        dbresult_query_value_insert(query, bind->buffer, safe_length, row, col);
+                    }
+                }
+                row++;
+            }
+
+            // Проверяем результат fetch
+            if (fetch_status != MYSQL_NO_DATA) {
+                log_error("__process_prepared_result: mysql_stmt_fetch error: %s\n", mysql_stmt_error(stmt));
+                result->ok = 0;
+            }
+
+            // Освобождаем буферы ПОСЛЕ обработки всех строк
+            CLEANUP_BIND_RESULT();
+            mysql_stmt_free_result(stmt);
+        }
+        else if (mysql_stmt_field_count(stmt) != 0) {
+            log_error("__process_prepared_result: error getting result: %s\n", mysql_stmt_error(stmt));
+            result->ok = 0;
+            break;
+        }
+
+        // Пытаемся получить следующий результат на уровне соединения
+        int status = mysql_stmt_next_result(stmt);
+        if (status > 0) {
+            log_error("__process_prepared_result: mysql_stmt_next_result error: %s\n", mysql_stmt_error(stmt));
+            result->ok = 0;
+        } else if (status < 0) {
+            // status == -1 означает нет больше результатов
+            break;
+        }
+        // status == 0 означает есть еще результаты
+
+    } while (1);
+
+    return result;
+}
+
 MYSQL* __connect(void* arg) {
     myhost_t* host = arg;
 
     MYSQL* connection = mysql_init(NULL);
     if (connection == NULL) return NULL;
-
-    int reconnect = 0;
-    if (mysql_options(connection, MYSQL_OPT_RECONNECT, &reconnect)) {
-        log_error("Failed to set reconnect option\n");
-        mysql_close(connection);
-        return NULL;
-    }
 
     connection = mysql_real_connect(
         connection,
@@ -260,21 +545,23 @@ int __reconnect(void* host, void* connection) {
     return 1;
 }
 
-str_t* __escape_identifier(void* connection, str_t* str) {
-    return __escape_internal(connection, str, '"');
+str_t* __escape_identifier(void* connection, const char* str) {
+    return __escape_internal(connection, str, '`');
 }
 
-str_t* __escape_string(void* connection, str_t* str) {
+str_t* __escape_string(void* connection, const char* str) {
     return __escape_internal(connection, str, '\'');
 }
 
-str_t* __escape_internal(void* connection, str_t* str, char quote) {
+str_t* __escape_internal(void* connection, const char* str, char quote) {
     myconnection_t* conn = connection;
 
-    char* escaped = malloc(str_size(str) * 2 + 1);
+    const size_t str_len = strlen(str);
+
+    char* escaped = malloc(str_len * 2 + 1);
     if (escaped == NULL) return NULL;
 
-    unsigned long len = mysql_real_escape_string(conn->connection, escaped, str_get(str), str_size(str));
+    unsigned long len = mysql_real_escape_string(conn->connection, escaped, str, str_len);
     if (len == (unsigned long)-1) {
         free(escaped);
         return NULL;
@@ -485,6 +772,268 @@ db_t* my_load(const char* database_id, const json_token_t* token_array) {
     return result;
 }
 
+int __build_query_processor(void* connection, char parameter_type, const char* param_name, mfield_t* field, str_t* result_sql, void* user_data) {
+    my_sql_processor_data_t* data = user_data;
+    array_t* param_order = data->param_order;
+
+    if (parameter_type == '@') {
+        str_t* field_value = model_field_to_string(field);
+        if (field_value == NULL) return 0;
+
+        if (!process_value(connection, parameter_type, result_sql, field_value)) {
+            log_error("__build_query_processor: process_value failed\n");
+            return 0;
+        }
+    }
+    else if (parameter_type == ':') {
+        // Replace :param with ?
+        str_appendc(result_sql, '?');
+        array_push_back_str(param_order, param_name);
+    }
+    else {
+        log_error("__build_query_processor: unknown parameter type: %c\n", parameter_type);
+        return 0;
+    }
+
+    return 1;
+}
+
+str_t* __build_query(void* connection, str_t* sql, array_t* params, array_t* param_order) {
+    const char* query = str_get(sql);
+    const size_t query_size = str_size(sql);
+
+    // Prepare data for callback
+    my_sql_processor_data_t processor_data = {
+        .param_order = param_order,
+    };
+
+    return parse_sql_parameters(connection, query, query_size, params, __build_query_processor, &processor_data);
+}
+
+void __prepared_stmt_free(void* data) {
+    if (data == NULL) return;
+
+    mysql_prepared_stmt_t* stmt_data = data;
+
+    if (stmt_data->stmt != NULL)
+        mysql_stmt_close(stmt_data->stmt);
+
+    if (stmt_data->param_order != NULL)
+        array_free(stmt_data->param_order);
+
+    if (stmt_data->write_binds != NULL)
+        free(stmt_data->write_binds);
+
+    if (stmt_data->null_indicators != NULL)
+        free(stmt_data->null_indicators);
+
+    free(stmt_data);
+}
+
+int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params) {
+    myconnection_t* myconnection = connection;
+
+    // Массив с упорядоченными параметрами
+    array_t* param_order = array_create();
+    if (param_order == NULL)
+        return 0;
+
+    // Обрабатываем SQL-строку (заменяем :param на ?)
+    str_t* processed_sql = __build_query(connection, sql, params, param_order);
+    if (processed_sql == NULL) {
+        array_free(param_order);
+        return 0;
+    }
+
+    // Инициализируем prepared statement
+    MYSQL_STMT* stmt = mysql_stmt_init(myconnection->connection);
+    if (stmt == NULL) {
+        log_error("mysql_stmt_init failed: out of memory\n");
+        str_free(processed_sql);
+        array_free(param_order);
+        return 0;
+    }
+
+    // Подготавливаем statement
+    if (mysql_stmt_prepare(stmt, str_get(processed_sql), str_size(processed_sql))) {
+        log_error("mysql_stmt_prepare error: %s\nSQL: %s\n", mysql_stmt_error(stmt), str_get(processed_sql));
+        str_free(processed_sql);
+        array_free(param_order);
+        mysql_stmt_close(stmt);
+        return 0;
+    }
+
+    str_free(processed_sql);
+
+    // Создаём структуру для хранения statement
+    mysql_prepared_stmt_t* stmt_data = malloc(sizeof * stmt_data);
+    if (stmt_data == NULL) {
+        log_error("__prepare: memory allocation failed for stmt_data\n");
+        array_free(param_order);
+        mysql_stmt_close(stmt);
+        return 0;
+    }
+
+    stmt_data->stmt = stmt;
+    stmt_data->param_order = param_order;
+
+    // Предвыделяем write_binds и lengths для переиспользования в execute_prepared
+    const int n_params = array_size(param_order);
+    if (n_params > 0) {
+        stmt_data->write_binds = calloc(n_params, sizeof(MYSQL_BIND));
+        if (stmt_data->write_binds == NULL) {
+            log_error("__prepare: memory allocation failed for write_binds\n");
+            array_free(param_order);
+            mysql_stmt_close(stmt);
+            free(stmt_data);
+            return 0;
+        }
+
+        stmt_data->null_indicators = calloc(n_params, sizeof(bool));
+        if (stmt_data->null_indicators == NULL) {
+            log_error("__prepare: memory allocation failed for null_indicators\n");
+            array_free(param_order);
+            mysql_stmt_close(stmt);
+            free(stmt_data->write_binds);
+            free(stmt_data);
+            return 0;
+        }
+
+        // Инициализируем структуры MYSQL_BIND один раз
+        for (int i = 0; i < n_params; i++) {
+            int finded = 0;
+            const char* param_name = array_get(param_order, i);
+            if (param_name == NULL) {
+                log_error("__prepare: param_name is NULL at index %d\n", i);
+                array_free(param_order);
+                mysql_stmt_close(stmt);
+                free(stmt_data->write_binds);
+                free(stmt_data->null_indicators);
+                free(stmt_data);
+                return 0;
+            }
+
+            for (size_t j = 0; j < array_size(params); j++) {
+                mfield_t* field = array_get(params, j);
+                if (field == NULL || field->name == NULL)
+                    continue;
+
+                if (strcmp(param_name, field->name) == 0) {
+                    stmt_data->write_binds[i].buffer_type = __convert_model_type_to_mysql(field->type);
+                    finded = 1;
+                    break;
+                }
+            }
+
+            if (!finded) {
+                log_error("__prepare: param %s not found in params\n", param_name);
+                array_free(param_order);
+                mysql_stmt_close(stmt);
+                free(stmt_data->write_binds);
+                free(stmt_data->null_indicators);
+                free(stmt_data);
+                return 0;
+            }
+        }
+    } else {
+        stmt_data->write_binds = NULL;
+        stmt_data->null_indicators = NULL;
+    }
+
+    // Сохраняем statement с функцией освобождения
+    const int r = map_insert_or_assign(myconnection->base.prepare_statements, str_get(stmt_name), stmt_data);
+    if (r == -1) {
+        __prepared_stmt_free(stmt_data);
+        return 0;
+    }
+
+    return 1;
+}
+
+dbresult_t* __execute_prepared(void* connection, const char* stmt_name, array_t* params) {
+    myconnection_t* myconnection = connection;
+
+    dbresult_t* result = dbresult_create();
+    if (result == NULL) return NULL;
+
+    // Получаем подготовленный statement
+    mysql_prepared_stmt_t* stmt_data = map_find(myconnection->base.prepare_statements, stmt_name);
+    if (stmt_data == NULL) {
+        log_error("__execute_prepared: prepared statement %s not found\n", stmt_name);
+        return result;
+    }
+
+    array_t* param_order = stmt_data->param_order;
+    MYSQL_STMT* stmt = stmt_data->stmt;
+    MYSQL_BIND* write_binds = stmt_data->write_binds;
+    bool* null_indicators = stmt_data->null_indicators;
+
+    const int n_params = array_size(param_order);
+
+    // Инициализируем массив null_indicators перед выполнением
+    if (null_indicators != NULL)
+        for (int i = 0; i < n_params; i++)
+            null_indicators[i] = false;
+
+    // Заполняем параметры (привязка выполнена в __prepare)
+    if (n_params > 0) {
+        for (int i = 0; i < n_params; i++) {
+            int finded = 0;
+            const char* param_name = array_get_string(param_order, i);
+            if (param_name == NULL) {
+                log_error("__execute_prepared: param_order_str is NULL\n");
+                return result;
+            }
+
+            // Ищем параметр в массиве params
+            for (size_t j = 0; j < array_size(params); j++) {
+                mfield_t* field = array_get(params, j);
+
+                // Проверка на NULL для field и field->name
+                if (field != NULL && field->name != NULL && strcmp(param_name, field->name) == 0) {
+                    if (!__bind_field_value(&write_binds[i], field, &null_indicators[i])) {
+                        log_error("__execute_prepared: failed to bind field %s\n", param_name);
+                        return result;
+                    }
+
+                    finded = 1;
+                    break;
+                }
+            }
+
+            if (!finded) {
+                log_error("__execute_prepared: param %s not found in params array\n", param_name);
+                return result;
+            }
+        }
+
+        if (mysql_stmt_bind_param(stmt, stmt_data->write_binds)) {
+            log_error("__prepare: mysql_stmt_bind_param failed: %s\n", mysql_stmt_error(stmt));
+            return result;
+        }
+    }
+
+    // Выполняем statement
+    if (mysql_stmt_execute(stmt)) {
+        log_error("__execute_prepared: mysql_stmt_execute failed: %s\n", mysql_stmt_error(stmt));
+        return result;
+    }
+
+    return __process_prepared_result(myconnection, stmt, result);
+}
+
+int __deallocate(void* connection, str_t* stmt_name) {
+    myconnection_t* myconnection = connection;
+
+    // Удаляем из map - функция __prepared_stmt_free будет вызвана автоматически
+    // и освободит stmt и param_order
+    const int result = map_erase(myconnection->base.prepare_statements, str_get(stmt_name));
+    if (result == 0)
+        return 0;
+
+    return 1;
+}
+
 char* __compile_insert(void* connection, const char* table, array_t* params) {
     if (connection == NULL) return NULL;
     if (table == NULL) return NULL;
@@ -512,7 +1061,7 @@ char* __compile_insert(void* connection, const char* table, array_t* params) {
         str_t* value = model_field_to_string(field);
         if (value == NULL) goto failed;
 
-        str_t* quoted_str = __escape_string(connection, value);
+        str_t* quoted_str = __escape_string(connection, str_get(value));
         if (quoted_str == NULL) goto failed;
 
         str_append(values, str_get(quoted_str), str_size(quoted_str));
@@ -572,7 +1121,7 @@ char* __compile_select(void* connection, const char* table, array_t* columns, ar
         str_t* value = model_field_to_string(field);
         if (value == NULL) goto failed;
 
-        str_t* quoted_str = __escape_string(connection, value);
+        str_t* quoted_str = __escape_string(connection, str_get(value));
         if (quoted_str == NULL) goto failed;
 
         str_append(where_str, str_get(quoted_str), str_size(quoted_str));
@@ -627,7 +1176,7 @@ char* __compile_update(void* connection, const char* table, array_t* set, array_
         str_t* value = model_field_to_string(field);
         if (value == NULL) goto failed;
 
-        str_t* quoted_str = __escape_string(connection, value);
+        str_t* quoted_str = __escape_string(connection, str_get(value));
         if (quoted_str == NULL) goto failed;
 
         str_append(set_str, str_get(quoted_str), str_size(quoted_str));
@@ -646,7 +1195,7 @@ char* __compile_update(void* connection, const char* table, array_t* set, array_
         str_t* value = model_field_to_string(field);
         if (value == NULL) goto failed;
 
-        str_t* quoted_str = __escape_string(connection, value);
+        str_t* quoted_str = __escape_string(connection, str_get(value));
         if (quoted_str == NULL) goto failed;
 
         str_append(where_str, str_get(quoted_str), str_size(quoted_str));
@@ -697,7 +1246,7 @@ char* __compile_delete(void* connection, const char* table, array_t* where) {
         str_t* value = model_field_to_string(field);
         if (value == NULL) goto failed;
 
-        str_t* quoted_str = __escape_string(connection, value);
+        str_t* quoted_str = __escape_string(connection, str_get(value));
         if (quoted_str == NULL) goto failed;
 
         str_append(where_str, str_get(quoted_str), str_size(quoted_str));
@@ -720,4 +1269,194 @@ char* __compile_delete(void* connection, const char* table, array_t* where) {
     str_free(where_str);
 
     return buffer;
+}
+
+enum_field_types __convert_model_type_to_mysql(mtype_e model_type) {
+    switch (model_type) {
+        // Логические и целые типы
+        case MODEL_BOOL:
+            return MYSQL_TYPE_TINY;        // TINYINT
+        case MODEL_SMALLINT:
+            return MYSQL_TYPE_SHORT;       // SMALLINT
+        case MODEL_INT:
+            return MYSQL_TYPE_LONG;        // INT
+        case MODEL_BIGINT:
+            return MYSQL_TYPE_LONGLONG;    // BIGINT
+
+        // Вещественные типы
+        case MODEL_FLOAT:
+            return MYSQL_TYPE_FLOAT;       // FLOAT
+        case MODEL_DOUBLE:
+            return MYSQL_TYPE_DOUBLE;      // DOUBLE
+        case MODEL_DECIMAL:
+            return MYSQL_TYPE_NEWDECIMAL;  // DECIMAL
+        case MODEL_MONEY:
+            return MYSQL_TYPE_NEWDECIMAL;  // DECIMAL
+
+        // Типы даты и времени
+        case MODEL_DATE:
+            return MYSQL_TYPE_DATE;        // DATE
+        case MODEL_TIME:
+            return MYSQL_TYPE_TIME;        // TIME
+        case MODEL_TIMETZ:
+            return MYSQL_TYPE_TIME;        // TIME (без поддержки часового пояса в MySQL)
+        case MODEL_TIMESTAMP:
+            return MYSQL_TYPE_TIMESTAMP;   // TIMESTAMP
+        case MODEL_TIMESTAMPTZ:
+            return MYSQL_TYPE_DATETIME;    // DATETIME (без поддержки часового пояса)
+
+        // Типы данных JSON
+        case MODEL_JSON:
+            return MYSQL_TYPE_JSON;        // JSON
+
+        // Строковые типы
+        case MODEL_BINARY:
+            return MYSQL_TYPE_BLOB;        // BLOB (для бинарных данных)
+        case MODEL_VARCHAR:
+            return MYSQL_TYPE_VARCHAR;     // VARCHAR
+        case MODEL_CHAR:
+            return MYSQL_TYPE_STRING;      // CHAR
+        case MODEL_TEXT:
+            return MYSQL_TYPE_STRING;      // LONGBLOB/TEXT
+        case MODEL_ENUM:
+            return MYSQL_TYPE_STRING;      // VARCHAR (enum хранится как строка)
+        case MODEL_ARRAY:
+            return MYSQL_TYPE_JSON;        // JSON (массив как JSON)
+
+        default:
+            return MYSQL_TYPE_STRING;      // Значение по умолчанию
+    }
+}
+
+int __bind_field_value(MYSQL_BIND* bind, mfield_t* field, bool* is_null_indicator) {
+    if (bind == NULL || field == NULL || is_null_indicator == NULL) return 0;
+
+    // Инициализируем NULL индикатор для этого параметра
+    *is_null_indicator = false;
+
+    switch (field->type) {
+        case MODEL_BOOL:
+        case MODEL_SMALLINT: {
+            bind->buffer = &field->value._short;
+            bind->buffer_length = sizeof(short);
+            break;
+        }
+        case MODEL_INT: {
+            bind->buffer = &field->value._int;
+            bind->buffer_length = sizeof(int);
+            break;
+        }
+        case MODEL_BIGINT: {
+            bind->buffer = &field->value._bigint;
+            bind->buffer_length = sizeof(long long);
+            break;
+        }
+        case MODEL_FLOAT: {
+            bind->buffer = &field->value._float;
+            bind->buffer_length = sizeof(float);
+            break;
+        }
+        case MODEL_DOUBLE:
+        case MODEL_MONEY: {
+            bind->buffer = &field->value._double;
+            bind->buffer_length = sizeof(double);
+            break;
+        }
+        case MODEL_DECIMAL: {
+            bind->buffer = &field->value._ldouble;
+            bind->buffer_length = sizeof(long double);
+            break;
+        }
+        case MODEL_DATE:
+        case MODEL_TIME:
+        case MODEL_TIMETZ:
+        case MODEL_TIMESTAMP:
+        case MODEL_TIMESTAMPTZ: {
+            // Преобразуем дату/время в строку
+            str_t* str_value = model_field_to_string(field);
+            if (str_value == NULL) {
+                bind->buffer = NULL;
+                bind->buffer_length = 0;
+                bind->is_null = is_null_indicator;
+                *is_null_indicator = true;
+            } else {
+                char* str = str_get(str_value);
+                // Дополнительная проверка на NULL после str_get
+                if (str == NULL) {
+                    bind->buffer = NULL;
+                    bind->buffer_length = 0;
+                    bind->is_null = is_null_indicator;
+                    *is_null_indicator = true;
+                } else {
+                    const size_t len = str_size(str_value);
+                    bind->buffer = str;
+                    bind->buffer_length = len;
+                    bind->is_null = is_null_indicator;
+                }
+                // Примечание: str_value должна оставаться в памяти во время выполнения запроса
+                // В этом случае нужно управлять жизненным циклом отдельно
+            }
+            break;
+        }
+        case MODEL_JSON:
+        case MODEL_ARRAY: {
+            // JSON и ARRAY преобразуем в строку
+            str_t* str_value = model_field_to_string(field);
+            if (str_value == NULL) {
+                bind->buffer = NULL;
+                bind->buffer_length = 0;
+                bind->is_null = is_null_indicator;
+                *is_null_indicator = true;
+            } else {
+                char* str = str_get(str_value);
+                // Дополнительная проверка на NULL после str_get
+                if (str == NULL) {
+                    bind->buffer = NULL;
+                    bind->buffer_length = 0;
+                    bind->is_null = is_null_indicator;
+                    *is_null_indicator = true;
+                } else {
+                    const size_t len = str_size(str_value);
+                    bind->buffer = str;
+                    bind->buffer_length = len;
+                    bind->is_null = is_null_indicator;
+                }
+            }
+            break;
+        }
+        case MODEL_BINARY:
+        case MODEL_VARCHAR:
+        case MODEL_CHAR:
+        case MODEL_TEXT:
+        case MODEL_ENUM: {
+            // Строковые типы
+            // Проверка на NULL для field->value._string перед использованием
+            if (field->value._string == NULL) {
+                bind->buffer = NULL;
+                bind->buffer_length = 0;
+                bind->is_null = is_null_indicator;
+                *is_null_indicator = true;
+            } else {
+                char* str = str_get(field->value._string);
+                if (str != NULL) {
+                    const size_t len = str_size(field->value._string);
+                    bind->buffer = str;
+                    bind->buffer_length = len;
+                    bind->is_null = is_null_indicator;
+                } else {
+                    bind->buffer = NULL;
+                    bind->buffer_length = 0;
+                    bind->is_null = is_null_indicator;
+                    *is_null_indicator = true;
+                }
+            }
+            break;
+        }
+        default: {
+            log_error("__bind_field_value: unknown field type: %d\n", field->type);
+            return 0;
+        }
+    }
+
+    return 1;
 }

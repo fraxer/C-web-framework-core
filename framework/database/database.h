@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 
 #include "array.h"
+#include "map.h"
 #include "json.h"
 
 typedef enum transaction_level {
@@ -37,19 +38,39 @@ typedef struct dbresult {
     dbresultquery_t* current;
 } dbresult_t;
 
+typedef struct {
+    str_t value;
+    int type;
+} prepare_statement_param_t;
+
+typedef struct prepare_statement {
+    void(*free)(void*);
+    str_t name;
+    str_t query;
+    array_t* params; // prepare_statement_param_t[]
+    void* data;
+} prepare_statement_t;
+
 typedef struct dbconnection {
-    pid_t thread_id;
     void(*free)(void*);
     dbresult_t*(*query)(void* connection, const char* sql);
-    str_t*(*escape_identifier)(void* connection, str_t* string);
-    str_t*(*escape_string)(void* connection, str_t* string);
+    str_t*(*escape_identifier)(void* connection, const char* string);
+    str_t*(*escape_string)(void* connection, const char* string);
     int(*is_active)(void* connection);
     int(*reconnect)(void* host, void* connection);
+
+    // Функции для prepared statements
+    int(*prepare)(void* connection, str_t* stmt_name, str_t* sql, array_t* params);
+    dbresult_t*(*execute_prepared)(void* connection, const char* stmt_name, array_t* params);
+    int(*deallocate)(void* connection, str_t* stmt_name);
+
+    pid_t thread_id;
+    map_t* prepare_statements;
 } dbconnection_t;
 
 typedef struct dbgrammar {
-    char*(*compile_table_exist)(const char* table);
-    char*(*compile_table_migration_create)(const char* table);
+    char*(*compile_table_exist)(dbconnection_t* connection, const char* table);
+    char*(*compile_table_migration_create)(dbconnection_t* connection, const char* table);
     char*(*compile_insert)(void* connection, const char* table, array_t* params);
     char*(*compile_select)(void* connection, const char* table, array_t* columns, array_t* where);
     char*(*compile_update)(void* connection, const char* table, array_t* set, array_t* where);

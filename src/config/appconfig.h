@@ -58,6 +58,7 @@ typedef struct appconfig {
     storage_t* storages;
     viewstore_t* viewstore;
     server_chain_t* server_chain;
+    array_t* prepared_queries; // prepare_stmt_t
 } appconfig_t;
 
 int appconfig_init(int argc, char* argv[]);

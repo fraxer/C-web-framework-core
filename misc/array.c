@@ -9,19 +9,44 @@
 void __array_resize(array_t* array, size_t new_capacity);
 void __array_free_value(avalue_t* value);
 
+int array_init(array_t* array) {
+    if (array == NULL)
+        return 0;
+
+    array->elements = malloc(INITIAL_CAPACITY * sizeof(avalue_t));
+    if (array->elements == NULL) {
+        array->size = 0;
+        array->capacity = 0;
+        return 0;
+    }
+
+    array->size = 0;
+    array->capacity = INITIAL_CAPACITY;
+    return 1;
+}
+
+void array_destroy(array_t* array) {
+    if (array == NULL)
+        return;
+
+    for (size_t i = 0; i < array->size; i++)
+        __array_free_value(&array->elements[i]);
+
+    free(array->elements);
+    array->elements = NULL;
+    array->size = 0;
+    array->capacity = 0;
+}
+
 array_t* array_create(void) {
     array_t* array = malloc(sizeof * array);
     if (array == NULL)
         return NULL;
 
-    array->elements = malloc(INITIAL_CAPACITY * sizeof(avalue_t));
-    if (array->elements == NULL) {
+    if (!array_init(array)) {
         free(array);
         return NULL;
     }
-
-    array->size = 0;
-    array->capacity = INITIAL_CAPACITY;
 
     return array;
 }
@@ -87,12 +112,11 @@ void array_clear(array_t* array) {
     array->size = 0;
 }
 
-void array_free(array_t* array) {
-    if (array == NULL) return;
+void array_free(void* arg) {
+    if (arg == NULL) return;
 
-    array_clear(array);
-    free(array->elements);
-    free(array);
+    array_destroy(arg);
+    free(arg);
 }
 
 void array_insert(array_t* array, size_t index, avalue_t value) {

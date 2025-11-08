@@ -113,14 +113,23 @@ int __file_content_put(void* storage, const file_content_t* file_content, const 
         unlink(fullpath);
         return 0;
     }
-    if (file_content->size < target_file.size)
-        ftruncate(target_file.fd, file_content->size);
+
+    int result = 1;
+    if (file_content->size < target_file.size) {
+        const int r = ftruncate(target_file.fd, file_content->size);
+        if (r == -1) {
+            log_error("Storage %s write file %s error: %s\n", s->base.name, file_content->filename, strerror(errno));
+            target_file.close(&target_file);
+            unlink(fullpath);
+            result = 0;
+        }
+    }
 
     lseek(file_content->fd, 0, SEEK_SET);
 
     target_file.close(&target_file);
 
-    return 1;
+    return result;
 }
 
 int __file_data_put(void* storage, const char* data, const size_t data_size, const char* path) {

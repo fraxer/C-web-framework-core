@@ -23,8 +23,8 @@ int redis_selectdb(redisContext*, const int);
 static redisContext* __connect(void* host);
 static int __is_active(void* connection);
 static int __reconnect(void* host, void* connection);
-static str_t* __escape_identifier(void* connection, str_t* str);
-static str_t* __escape_string(void* connection, str_t* str);
+static str_t* __escape_identifier(void* connection, const char* str);
+static str_t* __escape_string(void* connection, const char* str);
 static char* __compile_insert(void* connection, const char* table, array_t* params);
 static char* __compile_select(void* connection, const char* table, array_t* columns, array_t* where);
 static char* __compile_update(void* connection, const char* table, array_t* set, array_t* where);
@@ -265,18 +265,19 @@ int __reconnect(void* host, void* connection) {
     return 1;
 }
 
-str_t* __escape_identifier(void* connection, str_t* str) {
+str_t* __escape_identifier(void* connection, const char* str) {
     return __escape_string(connection, str);
 }
 
-str_t* __escape_string(void* connection, str_t* str) {
+str_t* __escape_string(void* connection, const char* str) {
     (void)connection;
     str_t* quoted_str = str_create_empty(256);
     if (quoted_str == NULL) return NULL;
 
     str_appendc(quoted_str, '"');
-    for (size_t i = 0; i < str_size(str); i++) {
-        char ch = str_get(str)[i];
+    const size_t str_len = strlen(str);
+    for (size_t i = 0; i < str_len; i++) {
+        char ch = str[i];
         if (ch == '"' || ch == '\\' || ch == '\'')
             str_appendc(quoted_str, '\\');
 

@@ -7,6 +7,9 @@
 
 #include "db.h"
 #include "log.h"
+#include "array.h"
+#include "appconfig.h"
+#include "prepare_statements.h"
 #include "model.h"
 
 static void __model_value_clear(mvalue_t* value, mtype_e type);
@@ -59,12 +62,10 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
         if (i > 0)
             str_appendc(fields, ',');
 
-        str_t* field_name = str_create(field->name, strlen(field->name));
-        str_t* escaped_value = conn->escape_identifier(conn, field_name);
+        str_t* escaped_value = conn->escape_identifier(conn, field->name);
         if (escaped_value == NULL) goto failed;
 
         str_append(fields, str_get(escaped_value), str_size(escaped_value));
-        str_free(field_name);
         str_free(escaped_value);
     }
 
@@ -80,14 +81,14 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
         str_t* value = model_field_to_string(param);
         if (value == NULL) goto failed;
 
-        str_t* escaped_value = conn->escape_string(conn, value);
+        str_t* escaped_value = conn->escape_string(conn, str_get(value));
         if (escaped_value == NULL) goto failed;
 
         str_append(where_params, str_get(escaped_value), str_size(escaped_value));
         str_free(escaped_value);
     }
 
-    dbresult_t* result = dbqueryf(dbinst,
+    dbresult_t* result = dbqueryf(dbid,
         "SELECT "
             "%s "
         "FROM "
@@ -143,11 +144,7 @@ int model_create(const char* dbid, void* arg) {
         array_push_back(arr, array_create_pointer(field, array_nocopy, array_nofree));
     }
 
-    dbresult_t* result = NULL;
-    dbinstance_t* dbinst = dbinstance(dbid);
-    if (dbinst == NULL) goto failed;
-
-    result = dbinsert(dbinst, model->table(model), arr);
+    dbresult_t* result = dbinsert(dbid, model->table(model), arr);
     if (!dbresult_ok(result)) {
         // log_error("model_create: Error insert model %s\n", dbinst->error);
         goto failed;
@@ -158,7 +155,6 @@ int model_create(const char* dbid, void* arg) {
     failed:
 
     array_free(arr);
-    dbinstance_free(dbinst);
     dbresult_free(result);
 
     return res;
@@ -206,7 +202,7 @@ int model_update(const char* dbid, void* arg) {
             str_append(where_params, field->name, strlen(field->name));
             str_appendc(where_params, '=');
 
-            str_t* escaped_fieldstr = conn->escape_string(conn, fieldstr);
+            str_t* escaped_fieldstr = conn->escape_string(conn, str_get(fieldstr));
             if (escaped_fieldstr == NULL) goto failed;
 
             str_append(where_params, str_get(escaped_fieldstr), str_size(escaped_fieldstr));
@@ -230,7 +226,7 @@ int model_update(const char* dbid, void* arg) {
         str_append(set_params, field->name, strlen(field->name));
         str_appendc(set_params, '=');
 
-        str_t* escaped_fieldstr = conn->escape_string(conn, fieldstr);
+        str_t* escaped_fieldstr = conn->escape_string(conn, str_get(fieldstr));
         if (escaped_fieldstr == NULL) goto failed;
 
         str_append(set_params, str_get(escaped_fieldstr), str_size(escaped_fieldstr));
@@ -239,7 +235,7 @@ int model_update(const char* dbid, void* arg) {
         iter_set++;
     }
 
-    dbresult_t* result = dbqueryf(dbinst,
+    dbresult_t* result = dbqueryf(dbid,
         "UPDATE "
             "%s "
         "SET "
@@ -309,7 +305,7 @@ int model_delete(const char* dbid, void* arg) {
             str_append(where_params, field->name, strlen(field->name));
             str_appendc(where_params, '=');
 
-            str_t* escaped_fieldstr = conn->escape_string(conn, fieldstr);
+            str_t* escaped_fieldstr = conn->escape_string(conn, str_get(fieldstr));
             if (escaped_fieldstr == NULL) goto failed;
 
             str_append(where_params, str_get(escaped_fieldstr), str_size(escaped_fieldstr));
@@ -321,7 +317,7 @@ int model_delete(const char* dbid, void* arg) {
         }
     }
 
-    dbresult_t* result = dbqueryf(dbinst,
+    dbresult_t* result = dbqueryf(dbid,
         "DELETE FROM "
             "%s "
         "WHERE "
@@ -346,14 +342,8 @@ int model_delete(const char* dbid, void* arg) {
 }
 
 void* model_one(const char* dbid, void*(create_instance)(void), const char* format, array_t* params) {
-    dbinstance_t* dbinst = dbinstance(dbid);
-    if (dbinst == NULL) return NULL;
-
-    modelview_t* model = NULL;
-
-    dbresult_t* result = dbquery(dbinst, format, params);
-    dbinstance_free(dbinst);
-
+    void* model = NULL;
+    dbresult_t* result = dbquery(dbid, format, params);
     if (!dbresult_ok(result))
         goto failed;
 
@@ -361,8 +351,6 @@ void* model_one(const char* dbid, void*(create_instance)(void), const char* form
         goto failed;
 
     model = __modelview_fill(create_instance, result);
-    if (model == NULL)
-        goto failed;
 
     failed:
 
@@ -372,14 +360,8 @@ void* model_one(const char* dbid, void*(create_instance)(void), const char* form
 }
 
 array_t* model_list(const char* dbid, void*(create_instance)(void), const char* format, array_t* params) {
-    dbinstance_t* dbinst = dbinstance(dbid);
-    if (dbinst == NULL) return NULL;
-
     array_t* array = NULL;
-
-    dbresult_t* result = dbquery(dbinst, format, params);
-    dbinstance_free(dbinst);
-
+    dbresult_t* result = dbquery(dbid, format, params);
     if (!dbresult_ok(result))
         goto failed;
 
@@ -395,47 +377,48 @@ array_t* model_list(const char* dbid, void*(create_instance)(void), const char* 
     return array;
 }
 
-int model_execute(const char* dbid, const char* format, array_t* params) {
-    int res = 0;
-
-    dbinstance_t* dbinst = dbinstance(dbid);
-    if (dbinst == NULL) return 0;
-
-    dbresult_t* result = dbquery(dbinst, format, params);
-    dbinstance_free(dbinst);
-
+void* model_prepared_one(const char* dbid, void*(create_instance)(void), const char* stat_name, array_t* params) {
+    void* model = NULL;
+    dbresult_t* result = dbprepared_query(dbid, stat_name, params);
     if (!dbresult_ok(result))
         goto failed;
 
-    res = 1;
+    if (dbresult_query_rows(result) == 0)
+        goto failed;
+
+    model = __modelview_fill(create_instance, result);
 
     failed:
 
     dbresult_free(result);
 
-    return res;
+    return model;
 }
 
-json_token_t* model_to_json(void* arg, ...) {
-    va_list va_args;
-    va_start(va_args, 0);
+array_t* model_prepared_list(const char* dbid, void*(create_instance)(void), const char* stat_name, array_t* params) {
+    array_t* array = NULL;
+    dbresult_t* result = dbprepared_query(dbid, stat_name, params);
+    if (!dbresult_ok(result))
+        goto failed;
 
-    char** display_fields = va_arg(va_args, char**);
+    if (dbresult_query_rows(result) == 0)
+        goto failed;
 
-    va_end(va_args);
+    array = __modelview_fill_array(create_instance, result);
 
+    failed:
+
+    dbresult_free(result);
+
+    return array;
+}
+
+json_token_t* model_to_json(void* arg, char** display_fields) {
     return model_json_create_object(arg, display_fields);
 }
 
-char* model_stringify(void* arg, ...) {
+char* model_stringify(void* arg, char** display_fields) {
     if (arg == NULL) return NULL;
-
-    va_list va_args;
-    va_start(va_args, 0);
-
-    char** display_fields = va_arg(va_args, char**);
-
-    va_end(va_args);
 
     json_doc_t* doc = json_create_empty();
     if (!doc) return NULL;
@@ -471,7 +454,7 @@ char* model_list_stringify(array_t* array) {
         model_t* model = item->_pointer;
         if (model == NULL) goto failed;
 
-        json_array_append(json_array, model_to_json(model));
+        json_array_append(json_array, model_to_json(model, NULL));
     }
 
     data = json_stringify_detach(doc);
@@ -1380,7 +1363,7 @@ str_t* model_bool_to_str(mfield_t* field) {
     if (size < 0) return NULL;
 
     if (field->value._string == NULL)
-        field->value._string = str_create(str, size);
+        field->value._string = str_createn(str, size);
     else
         str_assign(field->value._string, str, size);
 
@@ -1396,7 +1379,7 @@ str_t* model_smallint_to_str(mfield_t* field) {
     if (size < 0) return NULL;
 
     if (field->value._string == NULL)
-        field->value._string = str_create(str, size);
+        field->value._string = str_createn(str, size);
     else
         str_assign(field->value._string, str, size);
 
@@ -1412,7 +1395,7 @@ str_t* model_int_to_str(mfield_t* field) {
     if (size < 0) return NULL;
 
     if (field->value._string == NULL)
-        field->value._string = str_create(str, size);
+        field->value._string = str_createn(str, size);
     else
         str_assign(field->value._string, str, size);
 
@@ -1428,7 +1411,7 @@ str_t* model_bigint_to_str(mfield_t* field) {
     if (size < 0) return NULL;
 
     if (field->value._string == NULL)
-        field->value._string = str_create(str, size);
+        field->value._string = str_createn(str, size);
     else
         str_assign(field->value._string, str, size);
 
@@ -1444,7 +1427,7 @@ str_t* model_float_to_str(mfield_t* field) {
     if (size < 0) return NULL;
 
     if (field->value._string == NULL)
-        field->value._string = str_create(str, size);
+        field->value._string = str_createn(str, size);
     else
         str_assign(field->value._string, str, size);
 
@@ -1460,7 +1443,7 @@ str_t* model_double_to_str(mfield_t* field) {
     if (size < 0) return NULL;
 
     if (field->value._string == NULL)
-        field->value._string = str_create(str, size);
+        field->value._string = str_createn(str, size);
     else
         str_assign(field->value._string, str, size);
 
@@ -1476,7 +1459,7 @@ str_t* model_decimal_to_str(mfield_t* field) {
     if (size < 0) return NULL;
 
     if (field->value._string == NULL)
-        field->value._string = str_create(str, size);
+        field->value._string = str_createn(str, size);
     else
         str_assign(field->value._string, str, size);
 
@@ -1492,7 +1475,7 @@ str_t* model_money_to_str(mfield_t* field) {
     if (size < 0) return NULL;
 
     if (field->value._string == NULL)
-        field->value._string = str_create(str, size);
+        field->value._string = str_createn(str, size);
     else
         str_assign(field->value._string, str, size);
 
@@ -1525,7 +1508,7 @@ str_t* model_timestamp_to_str(mfield_t* field) {
         return NULL;
 
     if (field->value._string == NULL)
-        field->value._string = str_create(value, size);
+        field->value._string = str_createn(value, size);
     else
         str_assign(field->value._string, value, size);
 
@@ -1542,7 +1525,7 @@ str_t* model_timestamptz_to_str(mfield_t* field) {
         return NULL;
 
     if (field->value._string == NULL)
-        field->value._string = str_create(value, size);
+        field->value._string = str_createn(value, size);
     else
         str_assign(field->value._string, value, size);
 
@@ -1559,7 +1542,7 @@ str_t* model_date_to_str(mfield_t* field) {
         return NULL;
 
     if (field->value._string == NULL)
-        field->value._string = str_create(value, size);
+        field->value._string = str_createn(value, size);
     else
         str_assign(field->value._string, value, size);
 
@@ -1576,7 +1559,7 @@ str_t* model_time_to_str(mfield_t* field) {
         return NULL;
 
     if (field->value._string == NULL)
-        field->value._string = str_create(value, size);
+        field->value._string = str_createn(value, size);
     else
         str_assign(field->value._string, value, size);
 
@@ -1593,7 +1576,7 @@ str_t* model_timetz_to_str(mfield_t* field) {
         return NULL;
 
     if (field->value._string == NULL)
-        field->value._string = str_create(value, size);
+        field->value._string = str_createn(value, size);
     else
         str_assign(field->value._string, value, size);
 
@@ -1608,7 +1591,7 @@ str_t* model_json_to_str(mfield_t* field) {
     if (data == NULL) return NULL;
 
     if (field->value._string == NULL)
-        field->value._string = str_create(data, strlen(data));
+        field->value._string = str_createn(data, strlen(data));
     else
         str_assign(field->value._string, data, strlen(data));
 
@@ -1664,6 +1647,11 @@ void model_param_clear(void* field) {
 
     __model_value_free(&_field->value, _field->type);
     __model_value_free(&_field->oldvalue, _field->type);
+}
+
+void model_param_free(void* field) {
+    model_param_clear(field);
+    free(field);
 }
 
 void model_params_clear(void* params, const size_t size) {
