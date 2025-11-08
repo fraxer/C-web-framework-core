@@ -21,7 +21,8 @@ typedef struct {
     int init_capacity;   // Initial capacity for dynamic allocation
 } str_t;
 
-str_t* str_create(const char* string, const size_t size);
+str_t* str_create(const char* string);
+str_t* str_createn(const char* string, const size_t size);
 str_t* str_create_empty(int init_capacity);
 int str_init(str_t* str, int init_capacity);
 int str_reset(str_t* str);
@@ -36,8 +37,11 @@ int str_appendc(str_t* str, char ch);
 int str_insert(str_t* str, const char* string, size_t size, size_t pos);
 int str_prepend(str_t* str, const char* string, size_t size);
 int str_append(str_t* str, const char* string, size_t size);
+int str_appendf(str_t* str, const char* format, ...);
 int str_assign(str_t* str, const char* string, size_t size);
 int str_move(str_t* srcstr, str_t* dststr);
+int str_cmp(str_t* srcstr, str_t* dststr);
+int str_cmpc(str_t* srcstr, const char* dststr);
 
 char* str_get(str_t* str);
 char* str_copy(str_t* str);

@@ -39,14 +39,9 @@ char* __create(const char* data) {
 }
 
 char* __get(const char* session_id) {
-    dbinstance_t* dbinst = dbinstance(appconfig()->sessionconfig.host_id);
-    if (dbinst == NULL) return NULL;
-
-    dbresult_t* result = dbqueryf(dbinst, "GET %s", session_id);
-
-    dbinstance_free(dbinst);
     char* data = NULL;
 
+    dbresult_t* result = dbqueryf(appconfig()->sessionconfig.host_id, "GET %s", session_id);
     if (!dbresult_ok(result))
         goto failed;
 
@@ -65,15 +60,10 @@ char* __get(const char* session_id) {
 }
 
 int __update(const char* session_id, const char* data) {
-    dbinstance_t* dbinst = dbinstance(appconfig()->sessionconfig.host_id);
-    if (dbinst == NULL) return 0;
-
-    dbresult_t* result = dbqueryf(dbinst, "SET %s %s EX %d", session_id, data, appconfig()->sessionconfig.lifetime);
-
-    dbinstance_free(dbinst);
     int res = 0;
     const db_table_cell_t* field = NULL;
 
+    dbresult_t* result = dbqueryf(appconfig()->sessionconfig.host_id, "SET %s %s EX %d", session_id, data, appconfig()->sessionconfig.lifetime);
     if (!dbresult_ok(result))
         goto failed;
 
@@ -93,12 +83,7 @@ int __update(const char* session_id, const char* data) {
 }
 
 int __destroy(const char* session_id) {
-    dbinstance_t* dbinst = dbinstance(appconfig()->sessionconfig.host_id);
-    if (dbinst == NULL) return 0;
-
-    dbresult_t* result = dbqueryf(dbinst, "DEL %s", session_id);
-
-    dbinstance_free(dbinst);
+    dbresult_t* result = dbqueryf(appconfig()->sessionconfig.host_id, "DEL %s", session_id);
     dbresult_free(result);
 
     return 1;

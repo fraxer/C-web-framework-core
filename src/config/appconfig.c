@@ -55,6 +55,13 @@ appconfig_t* appconfig_create(const char* path) {
         return NULL;
     }
 
+    config->prepared_queries = array_create();
+    if (config->prepared_queries == NULL) {
+        free(config->path);
+        free(config);
+        return NULL;
+    }
+
     return config;
 }
 
@@ -96,6 +103,9 @@ void appconfig_clear(appconfig_t* config) {
     config->server_chain = NULL;
 
     sessionconfig_clear(&config->sessionconfig);
+
+    array_free(config->prepared_queries);
+    config->prepared_queries = NULL;
 }
 
 void appconfig_free(appconfig_t* config) {

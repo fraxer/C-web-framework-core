@@ -42,13 +42,15 @@ typedef struct {
     size_t capacity;
 } array_t;
 
+int array_init(array_t* array);
+void array_destroy(array_t* array);
 array_t* array_create(void);
 array_t* array_create_from_ints(int* ints, size_t count);
 array_t* array_create_from_doubles(double* doubles, size_t count);
 array_t* array_create_from_strings(char** strings, size_t count);
 array_t* array_copy(array_t* array);
 void array_clear(array_t* array);
-void array_free(array_t* array);
+void array_free(void* arg);
 void array_insert(array_t* array, size_t index, avalue_t value);
 void array_push_front(array_t* array, avalue_t value);
 void array_push_back(array_t* array, avalue_t value);
