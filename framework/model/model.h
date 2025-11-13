@@ -14,90 +14,26 @@
 
 typedef struct tm tm_t;
 
-tm_t* tm_create(tm_t* time);
-
-#define mnparams(TYPE, FIELD, NAME, VALUE) \
-    field->type = TYPE;\
-    strcpy(field->name, #NAME);\
-    field->dirty = 0;\
-    field->value.FIELD = VALUE;\
-    field->value._string = NULL;\
-    field->oldvalue._short = 0;\
-    field->oldvalue._string = NULL;
-
-#define mdparams(TYPE, NAME, VALUE) \
-    field->type = TYPE;\
-    strcpy(field->name, #NAME);\
-    field->dirty = 0;\
-    field->value._tm = tm_create(VALUE);\
-    field->value._string = NULL;\
-    field->oldvalue._tm = NULL;\
-    field->oldvalue._string = NULL;
-
-#define msparams(TYPE, NAME, VALUE) \
-    field->type = TYPE;\
-    strcpy(field->name, #NAME);\
-    field->dirty = 0;\
-    field->value._short = 0;\
-    field->value._string = str_createn(VALUE, strlen(VALUE != NULL ? VALUE : ""));\
-    field->oldvalue._short = 0;\
-    field->oldvalue._string = NULL;
-
-#define mparam_bool(NAME, VALUE) { mnparams(MODEL_BOOL, _short, NAME, VALUE) }
-#define mparam_smallint(NAME, VALUE) { mnparams(MODEL_SMALLINT, _short, NAME, VALUE) }
-#define mparam_int(NAME, VALUE) { mnparams(MODEL_INT, _int, NAME, VALUE) }
-#define mparam_bigint(NAME, VALUE) { mnparams(MODEL_BIGINT, _bigint, NAME, VALUE) }
-#define mparam_float(NAME, VALUE) { mnparams(MODEL_FLOAT, _float, NAME, VALUE) }
-#define mparam_double(NAME, VALUE) { mnparams(MODEL_DOUBLE, _double, NAME, VALUE) }
-#define mparam_decimal(NAME, VALUE) { mnparams(MODEL_DECIMAL, _ldouble, NAME, VALUE) }
-#define mparam_money(NAME, VALUE) { mnparams(MODEL_MONEY, _double, NAME, VALUE) }
-#define mparam_date(NAME, VALUE) { mdparams(MODEL_DATE, NAME, VALUE) }
-#define mparam_time(NAME, VALUE) { mdparams(MODEL_TIME, NAME, VALUE) }
-#define mparam_timetz(NAME, VALUE) { mdparams(MODEL_TIMETZ, NAME, VALUE) }
-#define mparam_timestamp(NAME, VALUE) { mdparams(MODEL_TIMESTAMP, NAME, VALUE) }
-#define mparam_timestamptz(NAME, VALUE) { mdparams(MODEL_TIMESTAMPTZ, NAME, VALUE) }
-#define mparam_json(NAME, VALUE) \
-    field->type = MODEL_JSON;\
-    strcpy(field->name, #NAME);\
-    field->dirty = 0;\
-    field->value._jsondoc = json_parse(VALUE);\
-    field->value._string = NULL;\
-    field->oldvalue._jsondoc = NULL;\
-    field->oldvalue._string = NULL;
-
-#define mparam_binary(NAME, VALUE) { msparams(MODEL_BINARY, NAME, VALUE) }
-#define mparam_varchar(NAME, VALUE) { msparams(MODEL_VARCHAR, NAME, VALUE) }
-#define mparam_char(NAME, VALUE) { msparams(MODEL_CHAR, NAME, VALUE) }
-#define mparam_text(NAME, VALUE) { msparams(MODEL_TEXT, NAME, VALUE) }
-#define mparam_enum(NAME, VALUE, ...) \
-    field->type = MODEL_ENUM;\
-    strcpy(field->name, #NAME);\
-    field->dirty = 0;\
-    field->value._enum = enums_create(args_str(__VA_ARGS__));\
-    field->value._string = str_createn(VALUE, strlen(VALUE != NULL ? VALUE : ""));\
-    field->oldvalue._enum = NULL;\
-    field->oldvalue._string = NULL;
-
-#define mparam_array(NAME, VALUE) \
-    field->type = MODEL_ARRAY;\
-    strcpy(field->name, #NAME);\
-    field->dirty = 0;\
-    field->value._array = VALUE;\
-    field->value._string = NULL;\
-    field->oldvalue._array = NULL;\
-    field->oldvalue._string = NULL;
-
-
-
-
-
-
-
-
-
-
-
-
+#define mparam_bool(NAME, VALUE) field_create_bool(#NAME, VALUE)
+#define mparam_smallint(NAME, VALUE) field_create_smallint(#NAME, VALUE)
+#define mparam_int(NAME, VALUE) field_create_int(#NAME, VALUE)
+#define mparam_bigint(NAME, VALUE) field_create_bigint(#NAME, VALUE)
+#define mparam_float(NAME, VALUE) field_create_float(#NAME, VALUE)
+#define mparam_double(NAME, VALUE) field_create_double(#NAME, VALUE)
+#define mparam_decimal(NAME, VALUE) field_create_decimal(#NAME, VALUE)
+#define mparam_money(NAME, VALUE) field_create_double(#NAME, VALUE)
+#define mparam_date(NAME, VALUE) field_create_date(#NAME, VALUE)
+#define mparam_time(NAME, VALUE) field_create_time(#NAME, VALUE)
+#define mparam_timetz(NAME, VALUE) field_create_timetz(#NAME, VALUE)
+#define mparam_timestamp(NAME, VALUE) field_create_timestamp(#NAME, VALUE)
+#define mparam_timestamptz(NAME, VALUE) field_create_timestamptz(#NAME, VALUE)
+#define mparam_json(NAME, VALUE) field_create_json(#NAME, VALUE)
+#define mparam_binary(NAME, VALUE) field_create_binary(#NAME, VALUE)
+#define mparam_varchar(NAME, VALUE) field_create_varchar(#NAME, VALUE)
+#define mparam_char(NAME, VALUE) field_create_char(#NAME, VALUE)
+#define mparam_text(NAME, VALUE) field_create_text(#NAME, VALUE)
+#define mparam_enum(NAME, VALUE, ...) field_create_enum(#NAME, VALUE, args_str(VALUE, __VA_ARGS__))
+#define mparam_array(NAME, VALUE) field_create_array(#NAME, VALUE)
 
 
 #define mnfields(TYPE, FIELD, NAME, VALUE) \
@@ -113,9 +49,9 @@ tm_t* tm_create(tm_t* time);
     .type = TYPE,\
     .name = #NAME,\
     .dirty = 0,\
-    .value._tm = tm_create(VALUE),\
+    .value._tm = VALUE,\
     .value._string = NULL,\
-    .oldvalue._tm = NULL,\
+    .oldvalue._tm = (tm_t){0},\
     .oldvalue._string = NULL
 
 #define msfields(TYPE, NAME, VALUE) \
@@ -123,34 +59,9 @@ tm_t* tm_create(tm_t* time);
     .name = #NAME,\
     .dirty = 0,\
     .value._short = 0,\
-    .value._string = str_createn(VALUE, strlen(VALUE != NULL ? VALUE : "")),\
+    .value._string = str_create(VALUE),\
     .oldvalue._short = 0,\
     .oldvalue._string = NULL
-
-// #define mparam_bool(NAME, VALUE) { mnfields(MODEL_BOOL, _short, NAME, VALUE) }
-// #define mparam_smallint(NAME, VALUE) { mnfields(MODEL_SMALLINT, _short, NAME, VALUE) }
-// #define mparam_int(NAME, VALUE) { mnfields(MODEL_INT, _int, NAME, VALUE) }
-// #define mparam_bigint(NAME, VALUE) { mnfields(MODEL_BIGINT, _bigint, NAME, VALUE) }
-// #define mparam_float(NAME, VALUE) { mnfields(MODEL_FLOAT, _float, NAME, VALUE) }
-// #define mparam_double(NAME, VALUE) { mnfields(MODEL_DOUBLE, _double, NAME, VALUE) }
-// #define mparam_decimal(NAME, VALUE) { mnfields(MODEL_DECIMAL, _ldouble, NAME, VALUE) }
-// #define mparam_money(NAME, VALUE) { mnfields(MODEL_MONEY, _double, NAME, VALUE) }
-// #define mparam_date(NAME, VALUE) { mdfields(MODEL_DATE, NAME, VALUE) }
-// #define mparam_time(NAME, VALUE) { mdfields(MODEL_TIME, NAME, VALUE) }
-// #define mparam_timetz(NAME, VALUE) { mdfields(MODEL_TIMETZ, NAME, VALUE) }
-// #define mparam_timestamp(NAME, VALUE) { mdfields(MODEL_TIMESTAMP, NAME, VALUE) }
-// #define mparam_timestamptz(NAME, VALUE) { mdfields(MODEL_TIMESTAMPTZ, NAME, VALUE) }
-    
-
-// #define mparam_binary(NAME, VALUE) { msfields(MODEL_BINARY, NAME, VALUE) }
-// #define mparam_varchar(NAME, VALUE) { msfields(MODEL_VARCHAR, NAME, VALUE) }
-// #define mparam_char(NAME, VALUE) { msfields(MODEL_CHAR, NAME, VALUE) }
-// #define mparam_text(NAME, VALUE) { msfields(MODEL_TEXT, NAME, VALUE) }
-    
-
-
-
-
 
 #define mfield_bool(NAME, VALUE) .NAME = { mnfields(MODEL_BOOL, _short, NAME, VALUE) }
 #define mfield_smallint(NAME, VALUE) .NAME = { mnfields(MODEL_SMALLINT, _short, NAME, VALUE) }
@@ -169,7 +80,7 @@ tm_t* tm_create(tm_t* time);
         .type = MODEL_JSON,\
         .name = #NAME,\
         .dirty = 0,\
-        .value._jsondoc = json_create(VALUE),\
+        .value._jsondoc = VALUE,\
         .value._string = NULL,\
         .oldvalue._jsondoc = NULL,\
         .oldvalue._string = NULL\
@@ -183,7 +94,7 @@ tm_t* tm_create(tm_t* time);
         .name = #NAME,\
         .dirty = 0,\
         .value._enum = enums_create(args_str(__VA_ARGS__)),\
-        .value._string = str_create(VALUE, strlen(VALUE != NULL ? VALUE : "")),\
+        .value._string = str_create(VALUE),\
         .oldvalue._enum = NULL,\
         .oldvalue._string = NULL\
     }
@@ -211,7 +122,7 @@ tm_t* tm_create(tm_t* time);
 #define mfield_def_varchar(NAME) mparam_varchar(NAME, 0)
 #define mfield_def_char(NAME) mparam_char(NAME, 0)
 #define mfield_def_text(NAME) mparam_text(NAME, 0)
-#define mfield_def_enum(NAME) mparam_enum(NAME, 0)
+#define mfield_def_enum(NAME, VALUE, ...) mparam_enum(NAME, VALUE, __VA_ARGS__)
 #define mfield_def_array(NAME, VALUE) mparam_array(NAME, VALUE)
 
 
@@ -222,117 +133,115 @@ tm_t* tm_create(tm_t* time);
 
 
 
-#define asd(ARRAY, NAME) { \
-        mfield_t* field = malloc(sizeof * field); \
-        NAME \
-        array_push_back(ARRAY, array_create_pointer(field, NULL, model_param_free)); \
-    }
+#define MDL_ARRAY_APPEND(ARRAY, NAME) array_push_back(ARRAY, array_create_pointer(NAME, NULL, model_param_free));
 
-#define MDL_VA_NARGS_REVERSE_(_441,_440,_439,_438,_437,_436,_435,_434,_433,_432,_431,_430,_429,_428,_427,_426,_425,_424,_423,_422,_421,_420,_419,_418,_417,_416,_415,_414,_413,_412,_411,_410,_409,_408,_407,_406,_405,_404,_403,_402,_401,_400,_399,_398,_397,_396,_395,_394,_393,_392,_391,_390,_389,_388,_387,_386,_385,_384,_383,_382,_381,_380,_379,_378,_377,_376,_375,_374,_373,_372,_371,_370,_369,_368,_367,_366,_365,_364,_363,_362,_361,_360,_359,_358,_357,_356,_355,_354,_353,_352,_351,_350,_349,_348,_347,_346,_345,_344,_343,_342,_341,_340,_339,_338,_337,_336,_335,_334,_333,_332,_331,_330,_329,_328,_327,_326,_325,_324,_323,_322,_321,_320,_319,_318,_317,_316,_315,_314,_313,_312,_311,_310,_309,_308,_307,_306,_305,_304,_303,_302,_301,_300,_299,_298,_297,_296,_295,_294,_293,_292,_291,_290,_289,_288,_287,_286,_285,_284,_283,_282,_281,_280,_279,_278,_277,_276,_275,_274,_273,_272,_271,_270,_269,_268,_267,_266,_265,_264,_263,_262,_261,_260,_259,_258,_257,_256,_255,_254,_253,_252,_251,_250,_249,_248,_247,_246,_245,_244,_243,_242,_241,_240,_239,_238,_237,_236,_235,_234,_233,_232,_231,_230,_229,_228,_227,_226,_225,_224,_223,_222,_221,_220,_219,_218,_217,_216,_215,_214,_213,_212,_211,_210,_209,_208,_207,_206,_205,_204,_203,_202,_201,_200,_199,_198,_197,_196,_195,_194,_193,_192,_191,_190,_189,_188,_187,_186,_185,_184,_183,_182,_181,_180,_179,_178,_177,_176,_175,_174,_173,_172,_171,_170,_169,_168,_167,_166,_165,_164,_163,_162,_161,_160,_159,_158,_157,_156,_155,_154,_153,_152,_151,_150,_149,_148,_147,_146,_145,_144,_143,_142,_141,_140,_139,_138,_137,_136,_135,_134,_133,_132,_131,_130,_129,_128,_127,_126,_125,_124,_123,_122,_121,_120,_119,_118,_117,_116,_115,_114,_113,_112,_111,_110,_109,_108,_107,_106,_105,_104,_103,_102,_101,_100,_99,_98,_97,_96,_95,_94,_93,_92,_91,_90,_89,_88,_87,_86,_85,_84,_83,_82,_81,_80,_79,_78,_77,_76,_75,_74,_73,_72,_71,_70,_69,_68,_67,_66,_65,_64,_63,_62,_61,_60,_59,_58,_57,_56,_55,_54,_53,_52,_51,_50,_49,_48,_47,_46,_45,_44,_43,_42,_41,_40,_39,_38,_37,_36,_35,_34,_33,_32,_31,_30,_29,_28,_27,_26,_25,_24,_23,_22,_21,_20,_19,_18,_17,_16,_15,_14,_13,_12,_11,_10,_9,_8,_7,_6,_5,_4,_3,_2,_1,N,...) N
-#define MDL_VA_NARGS(...) MDL_VA_NARGS_REVERSE_(__VA_ARGS__, 441,440,439,438,437,436,435,434,433,432,431,430,429,428,427,426,425,424,423,422,421,420,419,418,417,416,415,414,413,412,411,410,409,408,407,406,405,404,403,402,401,400,399,398,397,396,395,394,393,392,391,390,389,388,387,386,385,384,383,382,381,380,379,378,377,376,375,374,373,372,371,370,369,368,367,366,365,364,363,362,361,360,359,358,357,356,355,354,353,352,351,350,349,348,347,346,345,344,343,342,341,340,339,338,337,336,335,334,333,332,331,330,329,328,327,326,325,324,323,322,321,320,319,318,317,316,315,314,313,312,311,310,309,308,307,306,305,304,303,302,301,300,299,298,297,296,295,294,293,292,291,290,289,288,287,286,285,284,283,282,281,280,279,278,277,276,275,274,273,272,271,270,269,268,267,266,265,264,263,262,261,260,259,258,257,256,255,254,253,252,251,250,249,248,247,246,245,244,243,242,241,240,239,238,237,236,235,234,233,232,231,230,229,228,227,226,225,224,223,222,221,220,219,218,217,216,215,214,213,212,211,210,209,208,207,206,205,204,203,202,201,200,199,198,197,196,195,194,193,192,191,190,189,188,187,186,185,184,183,182,181,180,179,178,177,176,175,174,173,172,171,170,169,168,167,166,165,164,163,162,161,160,159,158,157,156,155,154,153,152,151,150,149,148,147,146,145,144,143,142,141,140,139,138,137,136,135,134,133,132,131,130,129,128,127,126,125,124,123,122,121,120,119,118,117,116,115,114,113,112,111,110,109,108,107,106,105,104,103,102,101,100,99,98,97,96,95,94,93,92,91,90,89,88,87,86,85,84,83,82,81,80,79,78,77,76,75,74,73,72,71,70,69,68,67,66,65,64,63,62,61,60,59,58,57,56,55,54,53,52,51,50,49,48,47,46,45,44,43,42,41,40,39,38,37,36,35,34,33,32,31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0)
+#define MDL_VA_NARGS_REVERSE_(_101,_100,_99,_98,_97,_96,_95,_94,_93,_92,_91,_90,_89,_88,_87,_86,_85,_84,_83,_82,_81,_80,_79,_78,_77,_76,_75,_74,_73,_72,_71,_70,_69,_68,_67,_66,_65,_64,_63,_62,_61,_60,_59,_58,_57,_56,_55,_54,_53,_52,_51,_50,_49,_48,_47,_46,_45,_44,_43,_42,_41,_40,_39,_38,_37,_36,_35,_34,_33,_32,_31,_30,_29,_28,_27,_26,_25,_24,_23,_22,_21,_20,_19,_18,_17,_16,_15,_14,_13,_12,_11,_10,_9,_8,_7,_6,_5,_4,_3,_2,_1,N,...) N
+#define MDL_VA_NARGS(...) MDL_VA_NARGS_REVERSE_(__VA_ARGS__, 101,100,99,98,97,96,95,94,93,92,91,90,89,88,87,86,85,84,83,82,81,80,79,78,77,76,75,74,73,72,71,70,69,68,67,66,65,64,63,62,61,60,59,58,57,56,55,54,53,52,51,50,49,48,47,46,45,44,43,42,41,40,39,38,37,36,35,34,33,32,31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0)
 
 #define MDL_ITEM_CONCAT(A, B) A##B
 #define MDL_ITEM(ARRAY, N, ...) MDL_ITEM_CONCAT(MDL_ITEM_, N)(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_1(ARRAY, FIELD) asd(ARRAY, FIELD)
-#define MDL_ITEM_2(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_1(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_3(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_2(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_4(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_3(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_5(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_4(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_6(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_5(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_7(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_6(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_8(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_7(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_9(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_8(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_10(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_9(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_11(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_10(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_12(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_11(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_13(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_12(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_14(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_13(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_15(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_14(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_16(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_15(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_17(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_16(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_18(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_17(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_19(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_18(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_20(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_19(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_21(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_20(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_22(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_21(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_23(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_22(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_24(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_23(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_25(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_24(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_26(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_25(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_27(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_26(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_28(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_27(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_29(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_28(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_30(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_29(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_31(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_30(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_32(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_31(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_33(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_32(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_34(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_33(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_35(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_34(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_36(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_35(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_37(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_36(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_38(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_37(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_39(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_38(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_40(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_39(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_41(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_40(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_42(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_41(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_43(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_42(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_44(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_43(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_45(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_44(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_46(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_45(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_47(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_46(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_48(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_47(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_49(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_48(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_50(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_49(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_51(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_50(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_52(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_51(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_53(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_52(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_54(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_53(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_55(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_54(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_56(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_55(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_57(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_56(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_58(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_57(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_59(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_58(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_60(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_59(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_61(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_60(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_62(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_61(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_63(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_62(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_64(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_63(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_65(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_64(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_66(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_65(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_67(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_66(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_68(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_67(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_69(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_68(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_70(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_69(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_71(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_70(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_72(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_71(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_73(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_72(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_74(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_73(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_75(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_74(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_76(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_75(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_77(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_76(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_78(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_77(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_79(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_78(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_80(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_79(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_81(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_80(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_82(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_81(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_83(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_82(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_84(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_83(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_85(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_84(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_86(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_85(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_87(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_86(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_88(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_87(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_89(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_88(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_90(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_89(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_91(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_90(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_92(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_91(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_93(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_92(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_94(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_93(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_95(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_94(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_96(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_95(ARRAY, __VA_ARGS__)
-#define MDL_ITEM_97(ARRAY, NAME, ...) asd(ARRAY, NAME) MDL_ITEM_96(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_1(ARRAY, FIELD) MDL_ARRAY_APPEND(ARRAY, FIELD)
+#define MDL_ITEM_2(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_1(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_3(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_2(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_4(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_3(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_5(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_4(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_6(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_5(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_7(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_6(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_8(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_7(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_9(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_8(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_10(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_9(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_11(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_10(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_12(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_11(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_13(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_12(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_14(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_13(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_15(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_14(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_16(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_15(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_17(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_16(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_18(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_17(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_19(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_18(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_20(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_19(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_21(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_20(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_22(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_21(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_23(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_22(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_24(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_23(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_25(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_24(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_26(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_25(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_27(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_26(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_28(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_27(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_29(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_28(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_30(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_29(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_31(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_30(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_32(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_31(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_33(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_32(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_34(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_33(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_35(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_34(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_36(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_35(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_37(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_36(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_38(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_37(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_39(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_38(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_40(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_39(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_41(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_40(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_42(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_41(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_43(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_42(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_44(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_43(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_45(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_44(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_46(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_45(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_47(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_46(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_48(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_47(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_49(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_48(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_50(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_49(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_51(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_50(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_52(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_51(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_53(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_52(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_54(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_53(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_55(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_54(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_56(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_55(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_57(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_56(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_58(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_57(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_59(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_58(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_60(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_59(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_61(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_60(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_62(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_61(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_63(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_62(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_64(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_63(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_65(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_64(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_66(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_65(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_67(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_66(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_68(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_67(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_69(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_68(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_70(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_69(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_71(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_70(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_72(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_71(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_73(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_72(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_74(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_73(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_75(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_74(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_76(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_75(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_77(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_76(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_78(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_77(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_79(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_78(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_80(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_79(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_81(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_80(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_82(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_81(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_83(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_82(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_84(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_83(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_85(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_84(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_86(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_85(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_87(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_86(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_88(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_87(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_89(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_88(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_90(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_89(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_91(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_90(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_92(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_91(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_93(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_92(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_94(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_93(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_95(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_94(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_96(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_95(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_97(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_96(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_98(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_97(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_99(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_98(ARRAY, __VA_ARGS__)
+#define MDL_ITEM_100(ARRAY, NAME, ...) MDL_ARRAY_APPEND(ARRAY, NAME) MDL_ITEM_99(ARRAY, __VA_ARGS__)
 
 #define mparams_fill_array(ARRAY, ...) MDL_ITEM(ARRAY, MDL_VA_NARGS(__VA_ARGS__), __VA_ARGS__)
-#define mparams_create_array(ARRAY, ...) array_t* ARRAY = array_create();mparams_fill_array(ARRAY, __VA_ARGS__)
 
 #define MDL_NSEQ() 64,MW_NSEQ()
 #define display_fields(...) (char*[NARG_(__VA_ARGS__,MDL_NSEQ())]){__VA_ARGS__, NULL}
@@ -372,7 +281,7 @@ typedef struct {
         float _float;
         double _double;
         long double _ldouble;
-        tm_t* _tm;
+        tm_t _tm;
         json_doc_t* _jsondoc;
         enums_t* _enum;
         array_t* _array;
@@ -401,6 +310,32 @@ typedef struct modelview {
     int(*fields_count)(void* arg);
 } modelview_t;
 
+// Specialized field creation functions
+void* field_create_bool(const char* field_name, short value);
+void* field_create_smallint(const char* field_name, short value);
+void* field_create_int(const char* field_name, int value);
+void* field_create_bigint(const char* field_name, long long value);
+void* field_create_float(const char* field_name, float value);
+void* field_create_double(const char* field_name, double value);
+void* field_create_decimal(const char* field_name, long double value);
+void* field_create_money(const char* field_name, double value);
+
+void* field_create_date(const char* field_name, tm_t* value);
+void* field_create_time(const char* field_name, tm_t* value);
+void* field_create_timetz(const char* field_name, tm_t* value);
+void* field_create_timestamp(const char* field_name, tm_t* value);
+void* field_create_timestamptz(const char* field_name, tm_t* value);
+
+void* field_create_json(const char* field_name, json_doc_t* value);
+
+void* field_create_binary(const char* field_name, const char* value);
+void* field_create_varchar(const char* field_name, const char* value);
+void* field_create_char(const char* field_name, const char* value);
+void* field_create_text(const char* field_name, const char* value);
+
+void* field_create_enum(const char* field_name, const char* default_value, char** values, int count);
+void* field_create_array(const char* field_name, array_t* value);
+
 void* model_get(const char* dbid, void*(create_instance)(void), array_t* params);
 int model_create(const char* dbid, void* arg);
 int model_update(const char* dbid, void* arg);
@@ -427,11 +362,11 @@ double model_double(mfield_t* field);
 long double model_decimal(mfield_t* field);
 double model_money(mfield_t* field);
 
-tm_t* model_timestamp(mfield_t* field);
-tm_t* model_timestamptz(mfield_t* field);
-tm_t* model_date(mfield_t* field);
-tm_t* model_time(mfield_t* field);
-tm_t* model_timetz(mfield_t* field);
+tm_t model_timestamp(mfield_t* field);
+tm_t model_timestamptz(mfield_t* field);
+tm_t model_date(mfield_t* field);
+tm_t model_time(mfield_t* field);
+tm_t model_timetz(mfield_t* field);
 
 json_doc_t* model_json(mfield_t* field);
 
