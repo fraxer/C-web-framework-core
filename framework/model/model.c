@@ -23,16 +23,353 @@ static int __model_allow_field_in_json(const char* field_name, char** display_fi
 static mfield_t __model_tmpfield_create(mfield_t* source_field);
 static int __model_field_is_primary_and_not_dirty(model_t* model, mfield_t* field);
 
-tm_t* tm_create(tm_t* time) {
-    tm_t* tm = malloc(sizeof * tm);
-    if (tm == NULL) return NULL;
+// Numeric types
+void* field_create_bool(const char* field_name, short value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
 
-    if (time == NULL)
-        memset(tm, 0, sizeof * tm);
+    field->type = MODEL_BOOL;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    field->value._short = value;
+    field->value._string = NULL;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+void* field_create_smallint(const char* field_name, short value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_SMALLINT;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    field->value._short = value;
+    field->value._string = NULL;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+void* field_create_int(const char* field_name, int value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_INT;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    field->value._int = value;
+    field->value._string = NULL;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+void* field_create_bigint(const char* field_name, long long value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_BIGINT;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    field->value._bigint = value;
+    field->value._string = NULL;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+void* field_create_float(const char* field_name, float value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_FLOAT;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    field->value._float = value;
+    field->value._string = NULL;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+void* field_create_double(const char* field_name, double value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_DOUBLE;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    field->value._double = value;
+    field->value._string = NULL;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+void* field_create_decimal(const char* field_name, long double value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_DECIMAL;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    field->value._ldouble = value;
+    field->value._string = NULL;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+void* field_create_money(const char* field_name, double value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_MONEY;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    field->value._double = value;
+    field->value._string = NULL;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+// Date/Time types
+void* field_create_date(const char* field_name, tm_t* value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_DATE;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    if (value == NULL)
+        memset(&field->value._tm, 0, sizeof(tm_t));
     else
-        memcpy(tm, time, sizeof * tm);
+        memcpy(&field->value._tm, value, sizeof(tm_t));
+    field->value._string = NULL;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
 
-    return tm;
+    return field;
+}
+
+void* field_create_time(const char* field_name, tm_t* value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_TIME;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    if (value == NULL)
+        memset(&field->value._tm, 0, sizeof(tm_t));
+    else
+        memcpy(&field->value._tm, value, sizeof(tm_t));
+    field->value._string = NULL;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+void* field_create_timetz(const char* field_name, tm_t* value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_TIMETZ;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    if (value == NULL)
+        memset(&field->value._tm, 0, sizeof(tm_t));
+    else
+        memcpy(&field->value._tm, value, sizeof(tm_t));
+    field->value._string = NULL;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+void* field_create_timestamp(const char* field_name, tm_t* value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_TIMESTAMP;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    if (value == NULL)
+        memset(&field->value._tm, 0, sizeof(tm_t));
+    else
+        memcpy(&field->value._tm, value, sizeof(tm_t));
+    field->value._string = NULL;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+void* field_create_timestamptz(const char* field_name, tm_t* value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_TIMESTAMPTZ;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    if (value == NULL)
+        memset(&field->value._tm, 0, sizeof(tm_t));
+    else
+        memcpy(&field->value._tm, value, sizeof(tm_t));
+    field->value._string = NULL;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+// JSON
+void* field_create_json(const char* field_name, json_doc_t* value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_JSON;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    field->value._jsondoc = value;
+    field->value._string = NULL;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+// String types
+void* field_create_binary(const char* field_name, const char* value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_BINARY;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    field->value._string = str_create(value != NULL ? value : "");
+    if (field->value._string == NULL) {
+        free(field);
+        return NULL;
+    }
+    field->value._short = 0;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+void* field_create_varchar(const char* field_name, const char* value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_VARCHAR;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    field->value._string = str_create(value != NULL ? value : "");
+    if (field->value._string == NULL) {
+        free(field);
+        return NULL;
+    }
+    field->value._short = 0;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+void* field_create_char(const char* field_name, const char* value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_CHAR;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    field->value._string = str_create(value != NULL ? value : "");
+    if (field->value._string == NULL) {
+        free(field);
+        return NULL;
+    }
+    field->value._short = 0;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+void* field_create_text(const char* field_name, const char* value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_TEXT;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    field->value._string = str_create(value != NULL ? value : "");
+    if (field->value._string == NULL) {
+        free(field);
+        return NULL;
+    }
+    field->value._short = 0;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+// Enum
+void* field_create_enum(const char* field_name, const char* default_value, char** values, int count) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    // Create enums structure
+    enums_t* enums = enums_create(values, count);
+    if (enums == NULL) {
+        free(field);
+        return NULL;
+    }
+
+    field->type = MODEL_ENUM;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    field->value._enum = enums;
+    field->value._string = str_create(default_value != NULL ? default_value : "");
+    if (field->value._string == NULL) {
+        enums_free(enums);
+        free(field);
+        return NULL;
+    }
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
+}
+
+// Array
+void* field_create_array(const char* field_name, array_t* value) {
+    mfield_t* field = malloc(sizeof * field);
+    if (field == NULL) return NULL;
+
+    field->type = MODEL_ARRAY;
+    strcpy(field->name, field_name);
+    field->dirty = 0;
+    field->value._array = value;
+    field->value._string = NULL;
+    field->oldvalue._short = 0;
+    field->oldvalue._string = NULL;
+
+    return field;
 }
 
 void* model_get(const char* dbid, void*(create_instance)(void), array_t* params) {
@@ -535,37 +872,37 @@ double model_money(mfield_t* field) {
     return field->value._double;
 }
 
-tm_t* model_timestamp(mfield_t* field) {
-    if (field == NULL) return NULL;
-    if (field->type != MODEL_TIMESTAMP) return NULL;
+tm_t model_timestamp(mfield_t* field) {
+    if (field == NULL) return (tm_t){0};
+    if (field->type != MODEL_TIMESTAMP) return (tm_t){0};
 
     return field->value._tm;
 }
 
-tm_t* model_timestamptz(mfield_t* field) {
-    if (field == NULL) return NULL;
-    if (field->type != MODEL_TIMESTAMPTZ) return NULL;
+tm_t model_timestamptz(mfield_t* field) {
+    if (field == NULL) return(tm_t){0};
+    if (field->type != MODEL_TIMESTAMPTZ) return (tm_t){0};
 
     return field->value._tm;
 }
 
-tm_t* model_date(mfield_t* field) {
-    if (field == NULL) return NULL;
-    if (field->type != MODEL_DATE) return NULL;
+tm_t model_date(mfield_t* field) {
+    if (field == NULL) return (tm_t){0};
+    if (field->type != MODEL_DATE) return (tm_t){0};
 
     return field->value._tm;
 }
 
-tm_t* model_time(mfield_t* field) {
-    if (field == NULL) return NULL;
-    if (field->type != MODEL_TIME) return NULL;
+tm_t model_time(mfield_t* field) {
+    if (field == NULL) return (tm_t){0};
+    if (field->type != MODEL_TIME) return (tm_t){0};
 
     return field->value._tm;
 }
 
-tm_t* model_timetz(mfield_t* field) {
-    if (field == NULL) return NULL;
-    if (field->type != MODEL_TIMETZ) return NULL;
+tm_t model_timetz(mfield_t* field) {
+    if (field == NULL) return (tm_t){0};
+    if (field->type != MODEL_TIMETZ) return (tm_t){0};
 
     return field->value._tm;
 }
@@ -874,14 +1211,11 @@ int __model_set_date(mfield_t* field, tm_t* value) {
 
     if (!field->dirty) {
         field->oldvalue._tm = field->value._tm;
-        field->value._tm = NULL;
+        field->value._tm = (tm_t){0};
         field->dirty = 1;
     }
 
-    if (field->value._tm != NULL)
-        free(field->value._tm);
-
-    field->value._tm = tm_create(value);
+    memcpy(&field->value._tm, value, sizeof(tm_t));
 
     str_clear(field->value._string);
 
@@ -957,8 +1291,7 @@ void __model_value_clear(mvalue_t* value, mtype_e type) {
     case MODEL_TIMETZ:
     case MODEL_TIMESTAMP:
     case MODEL_TIMESTAMPTZ:
-        if (value->_tm != NULL)
-            memset(value->_tm, 0, sizeof * value->_tm);
+        memset(&value->_tm, 0, sizeof(tm_t));
         break;
 
     case MODEL_JSON:
@@ -995,8 +1328,7 @@ void __model_value_free(mvalue_t* value, mtype_e type) {
     case MODEL_TIMETZ:
     case MODEL_TIMESTAMP:
     case MODEL_TIMESTAMPTZ:
-        if (value->_tm != NULL)
-            free(value->_tm);
+        memset(&value->_tm, 0, sizeof(tm_t));
         break;
 
     case MODEL_JSON:
@@ -1008,6 +1340,7 @@ void __model_value_free(mvalue_t* value, mtype_e type) {
         break;
 
     case MODEL_ARRAY:
+        array_free(value->_array);
         break;
 
     default:
@@ -1205,60 +1538,60 @@ int model_set_timestamp_from_str(mfield_t* field, const char* value) {
     if (field == NULL) return 0;
     if (field->type != MODEL_TIMESTAMP) return 0;
 
-    memset(field->value._tm, 0, sizeof(tm_t));
+    memset(&field->value._tm, 0, sizeof(tm_t));
 
-    if (strlen(value) > 0 && strptime(value, "%Y-%m-%d %H:%M:%S", field->value._tm) == NULL)
+    if (strlen(value) > 0 && strptime(value, "%Y-%m-%d %H:%M:%S", &field->value._tm) == NULL)
         return 0;
 
-    return model_set_timestamp(field, field->value._tm);
+    return model_set_timestamp(field, &field->value._tm);
 }
 
 int model_set_timestamptz_from_str(mfield_t* field, const char* value) {
     if (field == NULL) return 0;
     if (field->type != MODEL_TIMESTAMPTZ) return 0;
 
-    memset(field->value._tm, 0, sizeof(tm_t));
+    memset(&field->value._tm, 0, sizeof(tm_t));
 
-    if (strlen(value) > 0 && strptime(value, "%Y-%m-%d %H:%M:%S%z", field->value._tm) == NULL)
+    if (strlen(value) > 0 && strptime(value, "%Y-%m-%d %H:%M:%S%z", &field->value._tm) == NULL)
         return 0;
 
-    return model_set_timestamptz(field, field->value._tm);
+    return model_set_timestamptz(field, &field->value._tm);
 }
 
 int model_set_date_from_str(mfield_t* field, const char* value) {
     if (field == NULL) return 0;
     if (field->type != MODEL_DATE) return 0;
 
-    memset(field->value._tm, 0, sizeof(tm_t));
+    memset(&field->value._tm, 0, sizeof(tm_t));
 
-    if (strlen(value) > 0 && strptime(value, "%Y-%m-%d %H:%M:%S", field->value._tm) == NULL)
+    if (strlen(value) > 0 && strptime(value, "%Y-%m-%d %H:%M:%S", &field->value._tm) == NULL)
         return 0;
 
-    return model_set_date(field, field->value._tm);
+    return model_set_date(field, &field->value._tm);
 }
 
 int model_set_time_from_str(mfield_t* field, const char* value) {
     if (field == NULL) return 0;
     if (field->type != MODEL_TIME) return 0;
 
-    memset(field->value._tm, 0, sizeof(tm_t));
+    memset(&field->value._tm, 0, sizeof(tm_t));
 
-    if (strlen(value) > 0 && strptime(value, "%H:%M:%S", field->value._tm) == NULL)
+    if (strlen(value) > 0 && strptime(value, "%H:%M:%S", &field->value._tm) == NULL)
         return 0;
 
-    return model_set_time(field, field->value._tm);
+    return model_set_time(field, &field->value._tm);
 }
 
 int model_set_timetz_from_str(mfield_t* field, const char* value) {
     if (field == NULL) return 0;
     if (field->type != MODEL_TIMETZ) return 0;
 
-    memset(field->value._tm, 0, sizeof(tm_t));
+    memset(&field->value._tm, 0, sizeof(tm_t));
 
-    if (strlen(value) > 0 && strptime(value, "%H:%M:%S%z", field->value._tm) == NULL)
+    if (strlen(value) > 0 && strptime(value, "%H:%M:%S%z", &field->value._tm) == NULL)
         return 0;
 
-    return model_set_timetz(field, field->value._tm);
+    return model_set_timetz(field, &field->value._tm);
 }
 
 int model_set_json_from_str(mfield_t* field, const char* value) {
@@ -1489,10 +1822,10 @@ str_t* model_timestamp_to_str(mfield_t* field) {
     char value[64] = {0};
 
     tm_t tm = {0};
-    memcpy(&tm, field->value._tm, sizeof(tm));
+    memcpy(&tm, &field->value._tm, sizeof(tm_t));
     size_t size = 0;
 
-    if (field->value._tm->tm_year == 0) {
+    if (field->value._tm.tm_year == 0) {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
 
@@ -1520,7 +1853,7 @@ str_t* model_timestamptz_to_str(mfield_t* field) {
     if (field->type != MODEL_TIMESTAMPTZ) return NULL;
 
     char value[32] = {0};
-    const size_t size = strftime(value, sizeof(value), "%Y-%m-%d %H:%M:%S%z", field->value._tm);
+    const size_t size = strftime(value, sizeof(value), "%Y-%m-%d %H:%M:%S%z", &field->value._tm);
     if (size == 0)
         return NULL;
 
@@ -1537,7 +1870,7 @@ str_t* model_date_to_str(mfield_t* field) {
     if (field->type != MODEL_DATE) return NULL;
 
     char value[32] = {0};
-    const size_t size = strftime(value, sizeof(value), "%Y-%m-%d %H:%M:%S", field->value._tm);
+    const size_t size = strftime(value, sizeof(value), "%Y-%m-%d %H:%M:%S", &field->value._tm);
     if (size == 0)
         return NULL;
 
@@ -1554,7 +1887,7 @@ str_t* model_time_to_str(mfield_t* field) {
     if (field->type != MODEL_TIME) return NULL;
 
     char value[10] = {0};
-    const size_t size = strftime(value, sizeof(value), "%H:%M:%S", field->value._tm);
+    const size_t size = strftime(value, sizeof(value), "%H:%M:%S", &field->value._tm);
     if (size == 0)
         return NULL;
 
@@ -1571,7 +1904,7 @@ str_t* model_timetz_to_str(mfield_t* field) {
     if (field->type != MODEL_TIMETZ) return NULL;
 
     char value[20] = {0};
-    const size_t size = strftime(value, sizeof(value), "%H:%M:%S%z", field->value._tm);
+    const size_t size = strftime(value, sizeof(value), "%H:%M:%S%z", &field->value._tm);
     if (size == 0)
         return NULL;
 

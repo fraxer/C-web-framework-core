@@ -184,7 +184,11 @@ int mg_migration_table_create(dbinstance_t* dbinst) {
 }
 
 int mg_migration_exist(dbinstance_t* dbinst, const char* filename) {
-    mparams_create_array(params,
+    array_t* params = array_create();
+    if (params == NULL)
+        return 0;
+
+    mparams_fill_array(params,
         mparam_text(version, filename)
     )
     array_t* column_arr = array_create_strings("1");
@@ -207,7 +211,11 @@ int mg_migration_exist(dbinstance_t* dbinst, const char* filename) {
 }
 
 int mg_migration_commit(dbinstance_t* dbinst, const char* filename) {
-    mparams_create_array(params,
+    array_t* params = array_create();
+    if (params == NULL)
+        return 0;
+
+    mparams_fill_array(params,
         mparam_text(version, filename),
         mparam_bigint(apply_time, time(0))
     )
@@ -227,7 +235,11 @@ int mg_migration_commit(dbinstance_t* dbinst, const char* filename) {
 }
 
 int mg_migration_rollback(dbinstance_t* dbinst, const char* filename) {
-    mparams_create_array(params,
+    array_t* params = array_create();
+    if (params == NULL)
+        return 0;
+
+    mparams_fill_array(params,
         mparam_text(version, filename)
     )
     dbresult_t* result = dbdelete(dbinst, "migration", params);

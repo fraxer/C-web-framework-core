@@ -11,6 +11,8 @@ static inline char* __str_get_buffer(str_t* str);
 static inline size_t __str_get_capacity(str_t* str);
 
 str_t* str_create(const char* string) {
+    if (string == NULL) return str_create_empty(0);
+
     return str_createn(string, strlen(string));
 }
 
