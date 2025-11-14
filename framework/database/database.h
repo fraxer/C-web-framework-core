@@ -62,7 +62,6 @@ typedef struct dbconnection {
     // Функции для prepared statements
     int(*prepare)(void* connection, str_t* stmt_name, str_t* sql, array_t* params);
     dbresult_t*(*execute_prepared)(void* connection, const char* stmt_name, array_t* params);
-    int(*deallocate)(void* connection, str_t* stmt_name);
 
     pid_t thread_id;
     map_t* prepare_statements;

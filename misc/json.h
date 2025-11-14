@@ -84,7 +84,7 @@ int memory_block_is_full(memory_block_t* block);
 json_manager_t* json_manager_create(void);
 // Инициализация менеджера токенов
 void json_manager_init(json_manager_t* manager);
-void json_manager_free(json_manager_t* manager);
+void json_manager_free(void);
 // Освобождение менеджера токенов
 void json_manager_destroy(json_manager_t* manager);
 // Освобождение пустых блоков

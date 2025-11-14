@@ -74,12 +74,15 @@ void* __connection_create(void* host) {
     if (connection == NULL) return NULL;
 
     connection->base.thread_id = gettid();
+    connection->base.prepare_statements = NULL;
     connection->base.free = __connection_free;
     connection->base.query = __query;
     connection->base.escape_identifier = __escape_identifier;
     connection->base.escape_string = __escape_string;
     connection->base.is_active = __is_active;
     connection->base.reconnect = __reconnect;
+    connection->base.prepare = NULL;
+    connection->base.execute_prepared = NULL;
     connection->connection = __connect(host);
 
     if (connection->connection == NULL) {

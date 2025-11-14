@@ -2,6 +2,7 @@
 #define __POSTGRESQL__
 
 #include <postgresql/libpq-fe.h>
+#include <postgresql/pg_config.h>
 
 #include "json.h"
 #include "database.h"

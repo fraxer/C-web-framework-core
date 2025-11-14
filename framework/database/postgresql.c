@@ -20,6 +20,12 @@ typedef struct {
     int* param_index;
 } pg_sql_processor_data_t;
 
+typedef struct {
+    void* connection;
+    array_t* param_order;
+    str_t* stmt_name;
+} pg_prepared_stmt_t;
+
 static postgresqlhost_t* __host_create(void);
 static void __host_free(void*);
 static void* __connection_create(void* host);
@@ -36,9 +42,9 @@ static str_t* __escape_string(void* connection, const char* str);
 static str_t* __escape_internal(void* connection, const char* str, char*(fn)(PGconn* conn, const char* str, size_t len));
 static int __build_query_processor(void* connection, char parameter_type, const char* param_name, mfield_t* field, str_t* result_sql, void* user_data);
 static str_t* __build_query(void* connection, str_t* sql, array_t* params, array_t* param_order);
+static void __prepared_stmt_free(void* data);
 static int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params);
 static dbresult_t* __execute_prepared(void* connection, const char* stmt_name, array_t* params);
-static int __deallocate(void* connection, str_t* stmt_name);
 static char* __compile_insert(void* connection, const char* table, array_t* params);
 static char* __compile_select(void* connection, const char* table, array_t* columns, array_t* where);
 static char* __compile_update(void* connection, const char* table, array_t* set, array_t* where);
@@ -89,7 +95,7 @@ void* __connection_create(void* host) {
     if (connection == NULL) return NULL;
 
     connection->base.thread_id = gettid();
-    connection->base.prepare_statements = map_create_ex(map_compare_string, map_copy_string, free, NULL, array_free);
+    connection->base.prepare_statements = map_create_ex(map_compare_string, map_copy_string, free, NULL, __prepared_stmt_free);
     connection->base.free = __connection_free;
     connection->base.query = __query;
     connection->base.escape_identifier = __escape_identifier;
@@ -98,7 +104,6 @@ void* __connection_create(void* host) {
     connection->base.reconnect = __reconnect;
     connection->base.prepare = __prepare;
     connection->base.execute_prepared = __execute_prepared;
-    connection->base.deallocate = __deallocate;
     connection->connection = __connect(host);
 
     if (connection->connection == NULL) {
@@ -171,6 +176,9 @@ void __connection_free(void* connection) {
     if (connection == NULL) return;
 
     postgresqlconnection_t* conn = connection;
+
+    if (conn->base.prepare_statements != NULL)
+        map_free(conn->base.prepare_statements);
 
     PQfinish(conn->connection);
     free(conn);
@@ -388,6 +396,37 @@ str_t* __build_query(void* connection, str_t* sql, array_t* params, array_t* par
     return parse_sql_parameters(connection, query, query_size, params, __build_query_processor, &processor_data);
 }
 
+void __prepared_stmt_free(void* data) {
+    if (data == NULL) return;
+
+    pg_prepared_stmt_t* stmt_data = data;
+
+    if (stmt_data->connection != NULL && stmt_data->stmt_name != NULL) {
+        postgresqlconnection_t* pgconnection = stmt_data->connection;
+
+        #ifdef PG_MAJORVERSION_NUM
+            #if PG_MAJORVERSION_NUM > 16
+                PQsendClosePrepared(pgconnection, str_get(stmt_data->stmt_name));
+            #else
+                str_t str;
+                str_init(&str, 64);
+                str_appendf(&str, "DEALLOCATE %s", str_get(stmt_data->stmt_name));
+
+                PQclear(PQexec(pgconnection->connection, str_get(&str)));
+                str_clear(&str);
+            #endif
+        #endif
+    }
+
+    if (stmt_data->param_order != NULL)
+        array_free(stmt_data->param_order);
+
+    if (stmt_data->stmt_name != NULL)
+        str_free(stmt_data->stmt_name);
+
+    free(stmt_data);
+}
+
 int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params) {
     postgresqlconnection_t* pgconnection = connection;
 
@@ -412,22 +451,40 @@ int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params) {
         return 0;
     }
 
+    pg_prepared_stmt_t* stmt_data = malloc(sizeof * stmt_data);
+    if (stmt_data == NULL) {
+        log_error("__prepare: memory allocation failed for stmt_data\n");
+        str_free(processed_sql);
+        array_free(param_order);
+        return 0;
+    }
+
+    stmt_data->connection = connection;
+    stmt_data->param_order = param_order;
+    stmt_data->stmt_name = str_createn(str_get(stmt_name), str_size(stmt_name));
+    if (stmt_data->stmt_name == NULL) {
+        log_error("__prepare: memory allocation failed for stmt_name\n");
+        str_free(processed_sql);
+        __prepared_stmt_free(stmt_data);
+        return 0;
+    }
+
     ExecStatusType status = PQresultStatus(res);
     PQclear(res);
 
     if (status != PGRES_COMMAND_OK) {
         log_error("PQprepare error: %s\nSQL: %s\n", PQerrorMessage(pgconnection->connection), str_get(processed_sql));
         str_free(processed_sql);
-        array_free(param_order);
+        __prepared_stmt_free(stmt_data);
         return 0;
     }
 
     str_free(processed_sql);
 
     // Сохраняем порядок параметров в prepare_statements. Даже пустой.
-    const int r = map_insert_or_assign(pgconnection->base.prepare_statements, str_get(stmt_name), param_order);
+    const int r = map_insert_or_assign(pgconnection->base.prepare_statements, str_get(stmt_name), stmt_data);
     if (r == -1) {
-        array_free(param_order);
+        __prepared_stmt_free(stmt_data);
         return 0;
     }
 
@@ -442,7 +499,13 @@ dbresult_t* __execute_prepared(void* connection, const char* stmt_name, array_t*
     if (result == NULL) return NULL;
 
     // Получаем порядок параметров из prepare_statements
-    array_t* param_order = map_find(pgconnection->base.prepare_statements, stmt_name);
+    pg_prepared_stmt_t* stmt_data = map_find(pgconnection->base.prepare_statements, stmt_name);
+    if (stmt_data == NULL) {
+        log_error("__execute_prepared: prepared statement %s not found\n", stmt_name);
+        return result;
+    }
+
+    array_t* param_order = stmt_data->param_order;
     // Определяем количество параметров
     const int n_params = array_size(param_order);
     // Подготавливаем массивы параметров
@@ -475,6 +538,10 @@ dbresult_t* __execute_prepared(void* connection, const char* stmt_name, array_t*
 
                 if (field != NULL && strcmp(param_order_str, field->name) == 0) {
                     str_t* str = model_field_to_string(field);
+                    if (str == NULL) {
+                        log_error("__execute_prepared: model_field_to_string failed\n");
+                        goto failed;
+                    }
                     param_values[i] = str_get(str);
                     if (param_values[i] == NULL) {
                         log_error("__execute_prepared: memory allocation failed for param_strings\n");
@@ -509,41 +576,12 @@ dbresult_t* __execute_prepared(void* connection, const char* stmt_name, array_t*
     if (param_values != NULL) free(param_values);
     if (param_lengths != NULL) free(param_lengths);
 
-    if (!res)
+    if (!res) {
+        result->ok = 0;
         return result;
+    }
 
     return __process_result(pgconnection, result);
-}
-
-int __deallocate(void* connection, str_t* stmt_name) {
-    postgresqlconnection_t* pgconnection = connection;
-
-    str_t str;
-    str_init(&str, 64);
-    str_appendf(&str, "DEALLOCATE %s", str_get(stmt_name));
-
-    PGresult* res = PQexec(pgconnection->connection, str_get(&str));
-
-    str_clear(&str);
-
-    if (res == NULL) {
-        log_error("DEALLOCATE failed: out of memory\n");
-        return 0;
-    }
-
-    ExecStatusType status = PQresultStatus(res);
-    PQclear(res);
-
-    if (status != PGRES_COMMAND_OK) {
-        log_error("DEALLOCATE error: %s\n", PQerrorMessage(pgconnection->connection));
-        return 0;
-    }
-
-    const int result = map_erase(pgconnection->base.prepare_statements, str_get(stmt_name));
-    if (result == 0)
-        return 0;
-
-    return 1;
 }
 
 db_t* postgresql_load(const char* database_id, const json_token_t* token_array) {

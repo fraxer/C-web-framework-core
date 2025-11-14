@@ -29,8 +29,7 @@
 typedef enum mgactions {
     NONE = 0,
     CREATE,
-    UP,
-    DOWN
+    UP
 } mgactions_e;
 
 // migrate postgresql.p1 s1 create create_users_table config.json
@@ -38,10 +37,6 @@ typedef enum mgactions {
 // migrate postgresql.p1 s1 up config.json
 // migrate postgresql.p1 s1 up 2 config.json
 // migrate postgresql.p1 s1 up all config.json
-
-// migrate postgresql.p1 s1 down config.json
-// migrate postgresql.p1 s1 down 3 config.json
-// migrate postgresql.p1 s1 down all config.json
 
 typedef struct mgconfig {
     int ok;
@@ -81,7 +76,7 @@ int mg_parse_action_create(mgconfig_t* config, int argc, char* argv[]) {
     return 0;
 }
 
-int mg_parse_action_up_down(mgconfig_t* config, int pos, int argc, char* argv[]) {
+int mg_parse_action_up(mgconfig_t* config, int pos, int argc, char* argv[]) {
     if (strspn(argv[pos], "0123456789") == strlen(argv[pos])) {
         config->count_migrations = atoi(argv[pos]);
         pos++;
@@ -99,7 +94,6 @@ int mg_parse_action_up_down(mgconfig_t* config, int pos, int argc, char* argv[])
 
     printf("Error: command incorrect\n");
     printf("Example: migrate <db driver> <server id> up [number, all] <config path>\n");
-    printf("Example: migrate <db driver> <server id> down [number, all] <config path>\n");
 
     return -1;
 }
@@ -132,11 +126,7 @@ mgconfig_t mg_args_parse(int argc, char* argv[]) {
     }
     else if (strcmp(argv[pos], "up") == 0) {
         config.action = UP;
-        if (mg_parse_action_up_down(&config, ++pos, argc, argv) == -1) return config;
-    }
-    else if (strcmp(argv[pos], "down") == 0) {
-        config.action = DOWN;
-        if (mg_parse_action_up_down(&config, ++pos, argc, argv) == -1) return config;
+        if (mg_parse_action_up(&config, ++pos, argc, argv) == -1) return config;
     }
     else {
         printf("Error: command incorrect\n");
@@ -154,8 +144,8 @@ int mg_sort_desc(const struct dirent **a, const struct dirent **b) {
     return strcoll((*b)->d_name, (*a)->d_name);
 }
 
-int mg_migration_table_exist(dbinstance_t* dbinst) {
-    dbresult_t* result = dbtable_exist(dbinst, "migration");
+int mg_migration_table_exist(const char* dbid) {
+    dbresult_t* result = dbtable_exist(dbid, "migration");
 
     if (!dbresult_ok(result)) {
         printf("%s\n", "query error");
@@ -170,8 +160,8 @@ int mg_migration_table_exist(dbinstance_t* dbinst) {
     return rows > 0;
 }
 
-int mg_migration_table_create(dbinstance_t* dbinst) {
-    dbresult_t* result = dbtable_migration_create(dbinst, "migration");
+int mg_migration_table_create(const char* dbid) {
+    dbresult_t* result = dbtable_migration_create(dbid, "migration");
 
     if (!dbresult_ok(result)) {
         printf("%s\n", "query error");
@@ -183,7 +173,7 @@ int mg_migration_table_create(dbinstance_t* dbinst) {
     return 1;
 }
 
-int mg_migration_exist(dbinstance_t* dbinst, const char* filename) {
+int mg_migration_exist(const char* dbid, const char* filename) {
     array_t* params = array_create();
     if (params == NULL)
         return 0;
@@ -193,7 +183,7 @@ int mg_migration_exist(dbinstance_t* dbinst, const char* filename) {
     )
     array_t* column_arr = array_create_strings("1");
 
-    dbresult_t* result = dbselect(dbinst, "migration", column_arr, params);
+    dbresult_t* result = dbselect(dbid, "migration", column_arr, params);
     array_free(column_arr);
     array_free(params);
 
@@ -210,7 +200,7 @@ int mg_migration_exist(dbinstance_t* dbinst, const char* filename) {
     return rows > 0;
 }
 
-int mg_migration_commit(dbinstance_t* dbinst, const char* filename) {
+int mg_migration_commit(const char* dbid, const char* filename) {
     array_t* params = array_create();
     if (params == NULL)
         return 0;
@@ -220,7 +210,7 @@ int mg_migration_commit(dbinstance_t* dbinst, const char* filename) {
         mparam_bigint(apply_time, time(0))
     )
 
-    dbresult_t* result = dbinsert(dbinst, "migration", params);
+    dbresult_t* result = dbinsert(dbid, "migration", params);
     array_free(params);
 
     if (!dbresult_ok(result)) {
@@ -232,33 +222,6 @@ int mg_migration_commit(dbinstance_t* dbinst, const char* filename) {
     dbresult_free(result);
 
     return 1;
-}
-
-int mg_migration_rollback(dbinstance_t* dbinst, const char* filename) {
-    array_t* params = array_create();
-    if (params == NULL)
-        return 0;
-
-    mparams_fill_array(params,
-        mparam_text(version, filename)
-    )
-    dbresult_t* result = dbdelete(dbinst, "migration", params);
-    array_free(params);
-
-    if (!dbresult_ok(result)) {
-        printf("%s\n", "query error");
-        dbresult_free(result);
-        return 0;
-    }
-
-    dbresult_free(result);
-
-    return 1;
-}
-
-int mg_default_up_down(dbinstance_t* instance) {
-    (void)instance;
-    return 0;
 }
 
 int mg_migrate_run(mgconfig_t* config, const char* filename, const char* path) {
@@ -270,39 +233,30 @@ int mg_migrate_run(mgconfig_t* config, const char* filename, const char* path) {
         return result;
     }
 
-    int(*function_up)(dbinstance_t*) = NULL;
-    int(*function_down)(dbinstance_t*) = NULL;
+    int make_increment = 0;
+    const char* dbid = config->database_driver;
+    int(*function_up)(const char*) = NULL;
 
     *(void**)(&function_up) = dlsym(dlpointer, "up");
-    if (function_up == NULL)
-        function_up = mg_default_up_down;
-
-    *(void**)(&function_down) = dlsym(dlpointer, "down");
-    if (function_down == NULL)
-        function_down = mg_default_up_down;
-
-    dbinstance_t* dbinst = dbinstance(config->database_driver);
-    if (dbinst == NULL) {
-        printf("Error: not found database in %s\n", path);
+    if (function_up == NULL) {
+        printf("Error: not found function up in %s\n", path);
         goto failed;
     }
 
-    int make_increment = 0;
-    if (!mg_migration_table_exist(dbinst))
-        if (!mg_migration_table_create(dbinst))
+    
+    if (dbid == NULL) {
+        printf("Error: not found database in %s\n", path);
+        goto failed;
+    }
+    
+    if (!mg_migration_table_exist(dbid))
+        if (!mg_migration_table_create(dbid))
             goto failed;
 
     if (config->action == UP) {
-        if (!mg_migration_exist(dbinst, filename) && function_up(dbinst)) {
-            mg_migration_commit(dbinst, filename);
+        if (!mg_migration_exist(dbid, filename) && function_up(dbid)) {
+            mg_migration_commit(dbid, filename);
             printf("success up %s in %s\n", path, config->database_driver);
-            make_increment = 1;
-        }
-    }
-    else if (config->action == DOWN) {
-        if (mg_migration_exist(dbinst, filename) && function_down(dbinst)) {
-            mg_migration_rollback(dbinst, filename);
-            printf("success down %s in %s\n", path, config->database_driver);
             make_increment = 1;
         }
     }
@@ -313,7 +267,6 @@ int mg_migrate_run(mgconfig_t* config, const char* filename, const char* path) {
 
     failed:
 
-    dbinstance_free(dbinst);
     dlclose(dlpointer);
 
     return result;
@@ -437,18 +390,8 @@ int mg_create_template(const char* source_directory, mgconfig_t* config) {
         "#include \"dbqueryf.h\"\n"
         "#include \"dbresult.h\"\n\n"
 
-        "int up(dbinstance_t* dbinst) {\n"
-        "    dbresult_t* result = dbqueryf(dbinst, \"\");\n\n"
-
-        "    int res = dbresult_ok(result);\n\n"
-
-        "    dbresult_free(result);\n\n"
-
-        "    return res;\n"
-        "}\n\n"
-
-        "int down(dbinstance_t* dbinst) {\n"
-        "    dbresult_t* result = dbqueryf(dbinst, \"\");\n\n"
+        "int up(const char* dbid) {\n"
+        "    dbresult_t* result = dbqueryf(dbid, \"\");\n\n"
 
         "    int res = dbresult_ok(result);\n\n"
 

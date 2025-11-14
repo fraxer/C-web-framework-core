@@ -4,6 +4,7 @@
 #include <stdlib.h>
 
 #include "log.h"
+#include "json.h"
 #include "threadhandler.h"
 #include "connection_queue.h"
 
@@ -47,6 +48,8 @@ void* thread_handler(void* arg) {
     }
 
     appconfg_threads_decrement(appconfig);
+
+    json_manager_free();
 
     pthread_exit(NULL);
 }

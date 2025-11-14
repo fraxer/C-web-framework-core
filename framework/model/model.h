@@ -12,7 +12,7 @@
 #include "enums.h"
 #include "macros.h"
 
-typedef struct tm tm_t;
+
 
 #define mparam_bool(NAME, VALUE) field_create_bool(#NAME, VALUE)
 #define mparam_smallint(NAME, VALUE) field_create_smallint(#NAME, VALUE)
@@ -245,6 +245,8 @@ typedef struct tm tm_t;
 
 #define MDL_NSEQ() 64,MW_NSEQ()
 #define display_fields(...) (char*[NARG_(__VA_ARGS__,MDL_NSEQ())]){__VA_ARGS__, NULL}
+
+typedef struct tm tm_t;
 
 typedef enum {
     MODEL_BOOL = 0,
