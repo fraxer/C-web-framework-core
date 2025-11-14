@@ -169,12 +169,13 @@ void json_manager_init(json_manager_t* manager) {
     manager->current_block = NULL;  // Инициализируем кэш
 }
 
-void json_manager_free(json_manager_t* manager) {
+void json_manager_free(void) {
     if (manager == NULL)
         return;
 
     json_manager_destroy(manager);
     free(manager);
+    manager = NULL;
 }
 
 void json_manager_destroy(json_manager_t* manager) {

@@ -205,8 +205,11 @@ dbresult_t* dbprepared_query(const char* dbid, const char* stmt_name, array_t* p
 
     dbinstance_free(dbinst);
 
-    void* param_order = map_find(connection->prepare_statements, stmt_name);
-    if (param_order == NULL) {
+    if (connection->prepare_statements == NULL)
+        return NULL;
+
+    void* stmt = map_find(connection->prepare_statements, stmt_name);
+    if (stmt == NULL) {
         array_t* prepared_queries = appconfig()->prepared_queries;
         for (size_t i = 0; i < array_size(prepared_queries); i++) {
             prepare_stmt_t* stmt = array_get(prepared_queries, i);

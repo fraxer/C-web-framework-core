@@ -4,6 +4,7 @@
 #include <stdlib.h>
 
 #include "log.h"
+#include "json.h"
 #include "multiplexingserver.h"
 #include "threadworker.h"
 
@@ -23,6 +24,8 @@ void* thread_worker(void* arg) {
     }
 
     appconfg_threads_decrement(appconfig);
+
+    json_manager_free();
 
     pthread_exit(NULL);
 }

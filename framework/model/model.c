@@ -63,7 +63,7 @@ void* field_create_int(const char* field_name, int value) {
     field->dirty = 0;
     field->value._int = value;
     field->value._string = NULL;
-    field->oldvalue._short = 0;
+    field->oldvalue._int = 0;
     field->oldvalue._string = NULL;
 
     return field;
@@ -78,7 +78,7 @@ void* field_create_bigint(const char* field_name, long long value) {
     field->dirty = 0;
     field->value._bigint = value;
     field->value._string = NULL;
-    field->oldvalue._short = 0;
+    field->oldvalue._bigint = 0;
     field->oldvalue._string = NULL;
 
     return field;
@@ -93,7 +93,7 @@ void* field_create_float(const char* field_name, float value) {
     field->dirty = 0;
     field->value._float = value;
     field->value._string = NULL;
-    field->oldvalue._short = 0;
+    field->oldvalue._float = 0;
     field->oldvalue._string = NULL;
 
     return field;
@@ -108,7 +108,7 @@ void* field_create_double(const char* field_name, double value) {
     field->dirty = 0;
     field->value._double = value;
     field->value._string = NULL;
-    field->oldvalue._short = 0;
+    field->oldvalue._double = 0;
     field->oldvalue._string = NULL;
 
     return field;
@@ -123,7 +123,7 @@ void* field_create_decimal(const char* field_name, long double value) {
     field->dirty = 0;
     field->value._ldouble = value;
     field->value._string = NULL;
-    field->oldvalue._short = 0;
+    field->oldvalue._ldouble = 0;
     field->oldvalue._string = NULL;
 
     return field;
@@ -138,7 +138,7 @@ void* field_create_money(const char* field_name, double value) {
     field->dirty = 0;
     field->value._double = value;
     field->value._string = NULL;
-    field->oldvalue._short = 0;
+    field->oldvalue._double = 0;
     field->oldvalue._string = NULL;
 
     return field;
@@ -157,7 +157,7 @@ void* field_create_date(const char* field_name, tm_t* value) {
     else
         memcpy(&field->value._tm, value, sizeof(tm_t));
     field->value._string = NULL;
-    field->oldvalue._short = 0;
+    field->oldvalue._tm = (tm_t){0};
     field->oldvalue._string = NULL;
 
     return field;
@@ -175,7 +175,7 @@ void* field_create_time(const char* field_name, tm_t* value) {
     else
         memcpy(&field->value._tm, value, sizeof(tm_t));
     field->value._string = NULL;
-    field->oldvalue._short = 0;
+    field->oldvalue._tm = (tm_t){0};
     field->oldvalue._string = NULL;
 
     return field;
@@ -193,7 +193,7 @@ void* field_create_timetz(const char* field_name, tm_t* value) {
     else
         memcpy(&field->value._tm, value, sizeof(tm_t));
     field->value._string = NULL;
-    field->oldvalue._short = 0;
+    field->oldvalue._tm = (tm_t){0};
     field->oldvalue._string = NULL;
 
     return field;
@@ -211,7 +211,7 @@ void* field_create_timestamp(const char* field_name, tm_t* value) {
     else
         memcpy(&field->value._tm, value, sizeof(tm_t));
     field->value._string = NULL;
-    field->oldvalue._short = 0;
+    field->oldvalue._tm = (tm_t){0};
     field->oldvalue._string = NULL;
 
     return field;
@@ -229,7 +229,7 @@ void* field_create_timestamptz(const char* field_name, tm_t* value) {
     else
         memcpy(&field->value._tm, value, sizeof(tm_t));
     field->value._string = NULL;
-    field->oldvalue._short = 0;
+    field->oldvalue._tm = (tm_t){0};
     field->oldvalue._string = NULL;
 
     return field;
@@ -245,7 +245,7 @@ void* field_create_json(const char* field_name, json_doc_t* value) {
     field->dirty = 0;
     field->value._jsondoc = value;
     field->value._string = NULL;
-    field->oldvalue._short = 0;
+    field->oldvalue._jsondoc = NULL;
     field->oldvalue._string = NULL;
 
     return field;
@@ -350,7 +350,7 @@ void* field_create_enum(const char* field_name, const char* default_value, char*
         free(field);
         return NULL;
     }
-    field->oldvalue._short = 0;
+    field->oldvalue._enum = NULL;
     field->oldvalue._string = NULL;
 
     return field;
@@ -366,7 +366,7 @@ void* field_create_array(const char* field_name, array_t* value) {
     field->dirty = 0;
     field->value._array = value;
     field->value._string = NULL;
-    field->oldvalue._short = 0;
+    field->oldvalue._array = NULL;
     field->oldvalue._string = NULL;
 
     return field;
@@ -378,16 +378,23 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
     model_t* model = create_instance();
     if (model == NULL) return NULL;
 
-    void* res = NULL;
-
     dbinstance_t* dbinst = dbinstance(dbid);
-    if (dbinst == NULL) return 0;
+    if (dbinst == NULL) {
+        model_free(model);
+        return NULL;
+    }
 
     str_t* fields = str_create_empty(256);
-    if (fields == NULL) return 0;
+    if (fields == NULL) {
+        dbinstance_free(dbinst);
+        model_free(model);
+        return NULL;
+    }
 
     dbconnection_t* conn = dbinst->connection;
+    dbinstance_free(dbinst);
 
+    void* res = NULL;
     str_t* where_params = str_create_empty(256);
     if (where_params == NULL) goto failed;
 
@@ -453,7 +460,6 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
 
     failed:
 
-    dbinstance_free(dbinst);
     str_free(fields);
     str_free(where_params);
     dbresult_free(result);
@@ -507,6 +513,7 @@ int model_update(const char* dbid, void* arg) {
     if (dbinst == NULL) return 0;
 
     dbconnection_t* conn = dbinst->connection;
+    dbinstance_free(dbinst);
 
     mfield_t* first_field = model->first_field(model);
     const char** unique_fields = model->primary_key(model);
@@ -598,7 +605,6 @@ int model_update(const char* dbid, void* arg) {
 
     failed:
 
-    dbinstance_free(dbinst);
     str_free(set_params);
     str_free(where_params);
     dbresult_free(result);
@@ -619,6 +625,7 @@ int model_delete(const char* dbid, void* arg) {
     if (dbinst == NULL) return 0;
 
     dbconnection_t* conn = dbinst->connection;
+    dbinstance_free(dbinst);
 
     mfield_t* vfield = model->first_field(arg);
     const char** vunique = model->primary_key(arg);
@@ -671,7 +678,6 @@ int model_delete(const char* dbid, void* arg) {
 
     failed:
 
-    dbinstance_free(dbinst);
     str_free(where_params);
     dbresult_free(result);
 

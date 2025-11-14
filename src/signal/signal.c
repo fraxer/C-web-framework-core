@@ -58,6 +58,7 @@ void print_stack_trace(void) {
 void signal_before_ctrl_c(__attribute__((unused))int s) {
     signal_flush_streams();
     log_error("[signal_before_ctrl_c] Сигнал CTRL + C\n");
+    exit(0);
 }
 
 void signal_before_undefined_instruction(__attribute__((unused))int s) {
@@ -79,11 +80,13 @@ void signal_before_segmentation_fault(__attribute__((unused))int s) {
 void signal_before_terminate(__attribute__((unused))int s) {
     signal_flush_streams();
     log_error("[signal_before_terminate] Запрос на прекращение работы\n");
+    exit(0);
 }
 
 void signal_before_abort(__attribute__((unused))int s) {
     signal_flush_streams();
     log_error("[signal_before_abort] Аварийное завершение\n");
+    exit(1);
 }
 
 int __signal_is_inet_socket(int fd) {

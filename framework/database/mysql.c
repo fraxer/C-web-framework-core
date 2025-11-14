@@ -56,7 +56,6 @@ static str_t* __build_query(void* connection, str_t* sql, array_t* params, array
 static void __prepared_stmt_free(void* data);
 static int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params);
 static dbresult_t* __execute_prepared(void* connection, const char* stmt_name, array_t* params);
-static int __deallocate(void* connection, str_t* stmt_name);
 static char* __compile_insert(void* connection, const char* table, array_t* params);
 static char* __compile_select(void* connection, const char* table, array_t* columns, array_t* where);
 static char* __compile_update(void* connection, const char* table, array_t* set, array_t* where);
@@ -118,7 +117,6 @@ void* __connection_create(void* host) {
     connection->base.reconnect = __reconnect;
     connection->base.prepare = __prepare;
     connection->base.execute_prepared = __execute_prepared;
-    connection->base.deallocate = __deallocate;
     connection->connection = __connect(host);
 
     if (connection->connection == NULL) {
@@ -185,6 +183,9 @@ void __connection_free(void* connection) {
     if (connection == NULL) return;
 
     myconnection_t* conn = connection;
+
+    if (conn->base.prepare_statements != NULL)
+        map_free(conn->base.prepare_statements);
 
     mysql_close(conn->connection);
     free(conn);
@@ -278,7 +279,7 @@ dbresult_t* __process_result(void* connection, dbresult_t* result) {
 }
 
 dbresult_t* __process_prepared_result(void* connection, MYSQL_STMT* stmt, dbresult_t* result) {
-    myconnection_t* myconnection = connection;
+    (void)connection;
 
     result->ok = 1;
     dbresultquery_t* query_last = NULL;
@@ -833,20 +834,26 @@ void __prepared_stmt_free(void* data) {
 int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params) {
     myconnection_t* myconnection = connection;
 
+    // Инициализируем переменные для гарантированной очистки
+    array_t* param_order = NULL;
+    str_t* processed_sql = NULL;
+    MYSQL_STMT* stmt = NULL;
+    mysql_prepared_stmt_t* stmt_data = NULL;
+
     // Массив с упорядоченными параметрами
-    array_t* param_order = array_create();
+    param_order = array_create();
     if (param_order == NULL)
         return 0;
 
     // Обрабатываем SQL-строку (заменяем :param на ?)
-    str_t* processed_sql = __build_query(connection, sql, params, param_order);
+    processed_sql = __build_query(connection, sql, params, param_order);
     if (processed_sql == NULL) {
         array_free(param_order);
         return 0;
     }
 
     // Инициализируем prepared statement
-    MYSQL_STMT* stmt = mysql_stmt_init(myconnection->connection);
+    stmt = mysql_stmt_init(myconnection->connection);
     if (stmt == NULL) {
         log_error("mysql_stmt_init failed: out of memory\n");
         str_free(processed_sql);
@@ -866,7 +873,7 @@ int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params) {
     str_free(processed_sql);
 
     // Создаём структуру для хранения statement
-    mysql_prepared_stmt_t* stmt_data = malloc(sizeof * stmt_data);
+    stmt_data = malloc(sizeof * stmt_data);
     if (stmt_data == NULL) {
         log_error("__prepare: memory allocation failed for stmt_data\n");
         array_free(param_order);
@@ -876,6 +883,8 @@ int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params) {
 
     stmt_data->stmt = stmt;
     stmt_data->param_order = param_order;
+    stmt_data->write_binds = NULL;
+    stmt_data->null_indicators = NULL;
 
     // Предвыделяем write_binds и lengths для переиспользования в execute_prepared
     const int n_params = array_size(param_order);
@@ -883,20 +892,13 @@ int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params) {
         stmt_data->write_binds = calloc(n_params, sizeof(MYSQL_BIND));
         if (stmt_data->write_binds == NULL) {
             log_error("__prepare: memory allocation failed for write_binds\n");
-            array_free(param_order);
-            mysql_stmt_close(stmt);
-            free(stmt_data);
-            return 0;
+            goto cleanup_error;
         }
 
         stmt_data->null_indicators = calloc(n_params, sizeof(bool));
         if (stmt_data->null_indicators == NULL) {
             log_error("__prepare: memory allocation failed for null_indicators\n");
-            array_free(param_order);
-            mysql_stmt_close(stmt);
-            free(stmt_data->write_binds);
-            free(stmt_data);
-            return 0;
+            goto cleanup_error;
         }
 
         // Инициализируем структуры MYSQL_BIND один раз
@@ -905,17 +907,12 @@ int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params) {
             const char* param_name = array_get(param_order, i);
             if (param_name == NULL) {
                 log_error("__prepare: param_name is NULL at index %d\n", i);
-                array_free(param_order);
-                mysql_stmt_close(stmt);
-                free(stmt_data->write_binds);
-                free(stmt_data->null_indicators);
-                free(stmt_data);
-                return 0;
+                goto cleanup_error;
             }
 
             for (size_t j = 0; j < array_size(params); j++) {
                 mfield_t* field = array_get(params, j);
-                if (field == NULL || field->name == NULL)
+                if (field == NULL)
                     continue;
 
                 if (strcmp(param_name, field->name) == 0) {
@@ -927,12 +924,7 @@ int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params) {
 
             if (!finded) {
                 log_error("__prepare: param %s not found in params\n", param_name);
-                array_free(param_order);
-                mysql_stmt_close(stmt);
-                free(stmt_data->write_binds);
-                free(stmt_data->null_indicators);
-                free(stmt_data);
-                return 0;
+                goto cleanup_error;
             }
         }
     } else {
@@ -948,6 +940,11 @@ int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params) {
     }
 
     return 1;
+
+    cleanup_error:
+
+    __prepared_stmt_free(stmt_data);
+    return 0;
 }
 
 dbresult_t* __execute_prepared(void* connection, const char* stmt_name, array_t* params) {
@@ -990,7 +987,7 @@ dbresult_t* __execute_prepared(void* connection, const char* stmt_name, array_t*
                 mfield_t* field = array_get(params, j);
 
                 // Проверка на NULL для field и field->name
-                if (field != NULL && field->name != NULL && strcmp(param_name, field->name) == 0) {
+                if (field != NULL && strcmp(param_name, field->name) == 0) {
                     if (!__bind_field_value(&write_binds[i], field, &null_indicators[i])) {
                         log_error("__execute_prepared: failed to bind field %s\n", param_name);
                         return result;
@@ -1020,18 +1017,6 @@ dbresult_t* __execute_prepared(void* connection, const char* stmt_name, array_t*
     }
 
     return __process_prepared_result(myconnection, stmt, result);
-}
-
-int __deallocate(void* connection, str_t* stmt_name) {
-    myconnection_t* myconnection = connection;
-
-    // Удаляем из map - функция __prepared_stmt_free будет вызвана автоматически
-    // и освободит stmt и param_order
-    const int result = map_erase(myconnection->base.prepare_statements, str_get(stmt_name));
-    if (result == 0)
-        return 0;
-
-    return 1;
 }
 
 char* __compile_insert(void* connection, const char* table, array_t* params) {
