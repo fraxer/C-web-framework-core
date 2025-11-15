@@ -11,7 +11,7 @@
 #include "dbquery.h"
 #include "model.h"
 #include "dbresult.h"
-#include "prepare_statements.h"
+#include "statement_registry.h"
 
 /**
  * SQL parser state for tracking strings, comments, and context

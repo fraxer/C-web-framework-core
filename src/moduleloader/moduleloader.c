@@ -26,8 +26,8 @@
 #include "threadworker.h"
 #include "broadcast.h"
 #include "connection_queue.h"
-#include "middlewarelist.h"
-#include "prepare_statements.h"
+#include "statement_registry.h"
+#include "middleware_registry.h"
 #ifdef MySQL_FOUND
     #include "mysql.h"
 #endif
@@ -73,6 +73,16 @@ int module_loader_init(appconfig_t* config) {
     int result = 0;
 
     appconfig_set_after_run_threads_cb(module_loader_signal_unlock);
+
+    if (!prepare_statements_init()) {
+        log_error("module_loader_init: failed to initialize prepared statements\n");
+        goto failed;
+    }
+
+    if (!middlewares_init()) {
+        log_error("module_loader_init: failed to initialize middlewares\n");
+        goto failed;
+    }
 
     json_doc_t* document = NULL;
     if (!module_loader_load_json_config(config->path, &document))
@@ -961,10 +971,10 @@ int __module_loader_mimetype_load(appconfig_t* config, const json_token_t* token
 
             const char* extension = json_string(token_value);
             if (*index == 0)
-                if (!mimetype_add(mimetype_get_table_type(config->mimetype), mimetype, extension))
+                if (!mimetype_add(config->mimetype, MIMETYPE_TABLE_TYPE, mimetype, extension))
                     goto failed;
 
-            if (!mimetype_add(mimetype_get_table_ext(config->mimetype), extension, mimetype))
+            if (!mimetype_add(config->mimetype, MIMETYPE_TABLE_EXT, extension, mimetype))
                 goto failed;
         }
     }
@@ -1573,6 +1583,8 @@ void module_loader_create_config_and_init(void) {
         return;
     }
 
+    pstmt_registry_clear();
+    middleware_registry_clear();
     appconfig_set(newconfig);
     module_loader_init(newconfig);
 }
