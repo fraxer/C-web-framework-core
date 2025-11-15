@@ -1685,7 +1685,13 @@ void* __module_loader_storage_s3_load(const json_token_t* token_object, const ch
         goto failed;
     }
 
-    storages3_t* storage = storage_create_s3(storage_name, access_id, access_secret, protocol, host, port, bucket);
+    const char* region = __module_loader_storage_field(storage_name, token_object, "region");
+    if (region == NULL) {
+        log_error("__module_loader_storage_s3_load: storage %s has empty region\n");
+        goto failed;
+    }
+
+    storages3_t* storage = storage_create_s3(storage_name, access_id, access_secret, protocol, host, port, bucket, region);
     if (storage == NULL) {
         log_error("__module_loader_storage_s3_load: failed to create storage %s\n", storage_name);
         goto failed;

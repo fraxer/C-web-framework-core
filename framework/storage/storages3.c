@@ -11,6 +11,7 @@
 #include "mimetype.h"
 #include "storages3.h"
 #include "httpclient.h"
+#include "str.h"
 
 static const char* EMPTY_PAYLOAD_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
@@ -32,7 +33,7 @@ static int __file_sha256(const int fd, unsigned char* hash);
 static int __data_sha256(const char* data, const size_t data_size, unsigned char* hash);
 static array_t* __parse_file_list_payload(const char* payload);
 
-storages3_t* storage_create_s3(const char* storage_name, const char* access_id, const char* access_secret, const char* protocol, const char* host, const char* port, const char* bucket) {
+storages3_t* storage_create_s3(const char* storage_name, const char* access_id, const char* access_secret, const char* protocol, const char* host, const char* port, const char* bucket, const char* region) {
     storages3_t* storage = malloc(sizeof * storage);
     if (storage == NULL)
         return NULL;
@@ -40,12 +41,17 @@ storages3_t* storage_create_s3(const char* storage_name, const char* access_id, 
     storage->base.type = STORAGE_TYPE_S3;
     storage->base.next = NULL;
     strcpy(storage->base.name, storage_name);
-    strcpy(storage->access_id, access_id);
-    strcpy(storage->access_secret, access_secret);
-    strcpy(storage->protocol, protocol);
-    strcpy(storage->host, host);
-    strcpy(storage->port, port);
-    strcpy(storage->bucket, bucket);
+
+    if (!str_assign(&storage->access_id, access_id, strlen(access_id)) ||
+        !str_assign(&storage->access_secret, access_secret, strlen(access_secret)) ||
+        !str_assign(&storage->protocol, protocol, strlen(protocol)) ||
+        !str_assign(&storage->host, host, strlen(host)) ||
+        !str_assign(&storage->port, port, strlen(port)) ||
+        !str_assign(&storage->bucket, bucket, strlen(bucket)) ||
+        !str_assign(&storage->region, region, strlen(region))) {
+        __free(storage);
+        return NULL;
+    }
 
     storage->base.free = __free;
     storage->base.file_get = __file_get;
@@ -60,7 +66,17 @@ storages3_t* storage_create_s3(const char* storage_name, const char* access_id, 
 }
 
 void __free(void* storage) {
-    free(storage);
+    storages3_t* s = storage;
+    if (s == NULL) return;
+
+    str_clear(&s->access_id);
+    str_clear(&s->access_secret);
+    str_clear(&s->protocol);
+    str_clear(&s->host);
+    str_clear(&s->port);
+    str_clear(&s->bucket);
+    str_clear(&s->region);
+    free(s);
 }
 
 file_t __file_get(void* storage, const char* path) {
@@ -443,11 +459,11 @@ char* __create_uri(storages3_t* storage, const char* path_format, ...) {
     vsnprintf(path, sizeof(path), path_format, args);
     va_end(args);
 
-    size_t uri_length = strlen(storage->bucket) + strlen(path) + 2;
+    size_t uri_length = str_size(&storage->bucket) + strlen(path) + 2;
     char* uri = malloc(uri_length + 1);
     if (uri == NULL) return NULL;
 
-    snprintf(uri, uri_length + 1, "/%s/%s", storage->bucket, path);
+    snprintf(uri, uri_length + 1, "/%s/%s", str_get(&storage->bucket), path);
     storage_merge_slash(uri);
 
     return uri;
@@ -456,27 +472,52 @@ char* __create_uri(storages3_t* storage, const char* path_format, ...) {
 char* __create_url(storages3_t* storage, const char* uri) {
     char port[8];
     memset(port, 0, 8);
-    if (storage->port[0] != 0)
-        snprintf(port, sizeof(port), ":%s", storage->port);
+    if (str_size(&storage->port) > 0)
+        snprintf(port, sizeof(port), ":%s", str_get(&storage->port));
 
-    const size_t url_length = strlen(storage->protocol) + strlen(storage->host) + strlen(port) + strlen(uri) + 3;
+    const size_t url_length = str_size(&storage->protocol) + str_size(&storage->host) + strlen(port) + strlen(uri) + 3;
     char* url = malloc(url_length + 1);
     if (url == NULL) return NULL;
 
-    snprintf(url, url_length + 1, "%s://%s%s%s", storage->protocol, storage->host, port, uri);
+    snprintf(url, url_length + 1, "%s://%s%s%s", str_get(&storage->protocol), str_get(&storage->host), port, uri);
 
     return url;
 }
 
 int __host_str(storages3_t* storage, char* string) {
-    if (strlen(storage->host) + strlen(storage->port) > NAME_MAX - 2)
+    if (storage == NULL || string == NULL)
         return 0;
 
-    strcpy(string, storage->host);
+    size_t host_len = str_size(&storage->host);
+    size_t port_len = str_size(&storage->port);
 
-    if (storage->port[0] != 0 && strcmp(storage->port, "443") != 0 && strcmp(storage->port, "80") != 0) {
-        strcat(string, ":");
-        strcat(string, storage->port);
+    if (host_len + port_len > NAME_MAX - 2)
+        return 0;
+
+    const char* host_str = str_get(&storage->host);
+    const char* port_str = str_get(&storage->port);
+
+    if (host_str == NULL)
+        return 0;
+
+    strncpy(string, host_str, host_len);
+    string[host_len] = '\0';
+
+    if (port_len > 0 && strcmp(port_str, "443") != 0 && strcmp(port_str, "80") != 0) {
+        size_t current_len = host_len;
+        size_t remaining = NAME_MAX - current_len - 1;
+
+        if (remaining < 2)  // Место для ":" + null terminator
+            return 0;
+
+        strncat(string, ":", remaining);
+        current_len = strlen(string);
+        remaining = NAME_MAX - current_len - 1;
+
+        if (remaining < port_len)  // Место для port
+            return 0;
+
+        strncat(string, port_str, remaining);
     }
 
     return 1;
@@ -551,7 +592,7 @@ void calculate_signature(const unsigned char* signing_key,const char* string_to_
 char* __create_authtoken(storages3_t* storage, httpclient_t* client, const char* method, const char* date, const char* payload_hash) {
     char short_date[64];
     __create_short_date(short_date, sizeof(short_date));
-    const char *region = "us-east-1";
+    const char *region = str_get(&storage->region);
     const char *service = "s3";
 
     char host[NAME_MAX] = {0};
@@ -601,7 +642,7 @@ char* __create_authtoken(storages3_t* storage, httpclient_t* client, const char*
 
     unsigned char signing_key[SHA256_DIGEST_LENGTH];
     calculate_signing_key(
-        storage->access_secret,
+        str_get(&storage->access_secret),
         short_date,
         region,
         service,
@@ -618,13 +659,13 @@ char* __create_authtoken(storages3_t* storage, httpclient_t* client, const char*
     char* authorization_header = malloc(512);
     if (authorization_header == NULL) return NULL;
 
-    snprintf(authorization_header, 512, 
-        "AWS4-HMAC-SHA256 Credential=%s/%s/%s/%s/aws4_request,SignedHeaders=%s,Signature=%s", 
-        storage->access_id, 
+    snprintf(authorization_header, 512,
+        "AWS4-HMAC-SHA256 Credential=%s/%s/%s/%s/aws4_request,SignedHeaders=%s,Signature=%s",
+        str_get(&storage->access_id),
         short_date,
         region,
         service,
-        signed_headers, 
+        signed_headers,
         signature
     );
 
