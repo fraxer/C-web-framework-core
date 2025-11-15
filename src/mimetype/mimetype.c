@@ -24,11 +24,7 @@ static map_t* __mimetype_create_extensions_set(void) {
     );
 }
 
-mimetype_t* mimetype_create(size_t table_type_size, size_t table_ext_size) {
-    // Note: size parameters are ignored as map_t dynamically manages size
-    (void)table_type_size;
-    (void)table_ext_size;
-
+mimetype_t* mimetype_create(void) {
     mimetype_t* mimetype = malloc(sizeof(mimetype_t));
     if (mimetype == NULL) {
         log_error("mimetype_create: failed to allocate mimetype structure\n");

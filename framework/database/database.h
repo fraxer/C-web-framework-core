@@ -38,19 +38,6 @@ typedef struct dbresult {
     dbresultquery_t* current;
 } dbresult_t;
 
-typedef struct {
-    str_t value;
-    int type;
-} prepare_statement_param_t;
-
-typedef struct prepare_statement {
-    void(*free)(void*);
-    str_t name;
-    str_t query;
-    array_t* params; // prepare_statement_param_t[]
-    void* data;
-} prepare_statement_t;
-
 typedef struct dbconnection {
     void(*free)(void*);
     dbresult_t*(*query)(void* connection, const char* sql);

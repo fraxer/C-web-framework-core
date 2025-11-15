@@ -926,20 +926,8 @@ int __module_loader_mimetype_load(appconfig_t* config, const json_token_t* token
     }
 
     int result = 0;
-    size_t table_type_size = json_object_size(token_mimetypes);
-    size_t table_ext_size = 0;
 
-    for (json_it_t it = json_init_it(token_mimetypes); !json_end_it(&it); json_next_it(&it)) {
-        const json_token_t* token_array = json_it_value(&it);
-        if (!json_is_array(token_array)) {
-            log_error("__module_loader_mimetype_load: mimetype item must be array\n");
-            return 0;
-        }
-
-        table_ext_size += json_array_size(token_array);
-    }
-
-    config->mimetype = mimetype_create(table_type_size, table_ext_size);
+    config->mimetype = mimetype_create();
     if (config->mimetype == NULL) {
         log_error("__module_loader_mimetype_load: can't alloc mimetype memory, %d\n", errno);
         goto failed;
