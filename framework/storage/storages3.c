@@ -34,9 +34,18 @@ static int __data_sha256(const char* data, const size_t data_size, unsigned char
 static array_t* __parse_file_list_payload(const char* payload);
 
 storages3_t* storage_create_s3(const char* storage_name, const char* access_id, const char* access_secret, const char* protocol, const char* host, const char* port, const char* bucket, const char* region) {
-    storages3_t* storage = malloc(sizeof * storage);
+    storages3_t* storage = calloc(1, sizeof * storage);
     if (storage == NULL)
         return NULL;
+
+    // Initialize all str_t fields
+    str_init(&storage->access_id, 0);
+    str_init(&storage->access_secret, 0);
+    str_init(&storage->protocol, 0);
+    str_init(&storage->host, 0);
+    str_init(&storage->port, 0);
+    str_init(&storage->bucket, 0);
+    str_init(&storage->region, 0);
 
     storage->base.type = STORAGE_TYPE_S3;
     storage->base.next = NULL;
