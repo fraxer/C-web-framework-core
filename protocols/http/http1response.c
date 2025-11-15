@@ -179,8 +179,14 @@ void __http1response_data(http1response_t* response, const char* data) {
 }
 
 void __http1response_datan(http1response_t* response, const char* data, size_t length) {
-    if (!__http1response_alloc_body(response, data, length))
-        response->def(response, 500);
+    connection_t* connection = response->connection;
+    connection_server_ctx_t* ctx = connection->ctx;
+
+    if (!__http1response_alloc_body(response, data, length)) {
+        connection->keepalive = 0;
+        ctx->destroyed = 1;
+        return;
+    }
 
     const char* keep_alive = __http1response_keepalive_enabled(response) ? "keep-alive" : "close";
     response->headeru_add(response, "Content-Type", 12, "text/html; charset=utf-8", 24);
@@ -188,8 +194,8 @@ void __http1response_datan(http1response_t* response, const char* data, size_t l
     response->headeru_add(response, "Cache-Control", 13, "no-store, no-cache", 18);
 
     if (!__http1response_prepare_body(response, length)) {
-        response->def(response, 500);
-        return;
+        connection->keepalive = 0;
+        ctx->destroyed = 1;
     }
 }
 
