@@ -61,7 +61,7 @@ view_t* viewstore_add_view(viewstore_t* viewstore, view_tag_t* tag, const char* 
 view_t* viewstore_get_view(viewstore_t* viewstore, const char* path) {
     view_t* view = viewstore->view;
     while (view != NULL) {
-        if (cmpstr(view->path, path))
+        if (strcmp(view->path, path) == 0)
             return view;
 
         view = view->next;

@@ -63,26 +63,15 @@ int helpers_base_mkdir(const char* base_path, const char* path) {
     return 1;
 }
 
-int cmpstr(const char* a, const char* b) {
-    size_t a_length = strlen(a);
-    size_t b_length = strlen(b);
-
-    for (size_t i = 0, j = 0; i < a_length && j < b_length; i++, j++)
-        if (a[i] != b[j]) return 0;
-
-    return 1;
-}
-
 int cmpstr_lower(const char* a, const char* b) {
-    size_t a_length = strlen(a);
-    size_t b_length = strlen(b);
-
-    return cmpstrn_lower(a, a_length, b, b_length);
+    return cmpstrn_lower(a, strlen(a), b, strlen(b));
 }
 
 int cmpstrn_lower(const char *a, size_t a_length, const char *b, size_t b_length) {
-    for (size_t i = 0, j = 0; i < a_length && j < b_length; i++, j++)
-        if (tolower(a[i]) != tolower(b[j])) return 0;
+    if (a_length != b_length) return 0;
+
+    for (size_t i = 0; i < a_length; i++)
+        if (tolower(a[i]) != tolower(b[i])) return 0;
 
     return 1;
 }
