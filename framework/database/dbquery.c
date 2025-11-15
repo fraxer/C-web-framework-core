@@ -262,8 +262,18 @@ dbresult_t* dbtable_migration_create(const char* dbid, const char* table) {
 }
 
 dbresult_t* dbbegin(const char* dbid, transaction_level_e level) {
-    (void)level;
-    return dbqueryf(dbid, "level");
+    dbinstance_t* instance = dbinstance(dbid);
+    if (instance == NULL) return NULL;
+
+    dbconnection_t* connection = instance->connection;
+    dbinstance_free(instance);
+
+    if (connection->begin == NULL) {
+        log_error("dbbegin: begin function not implemented for this database\n");
+        return NULL;
+    }
+
+    return connection->begin(connection, level);
 }
 
 dbresult_t* dbcommit(const char* dbid) {
