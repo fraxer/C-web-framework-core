@@ -11,6 +11,8 @@
 #include "http1response.h"
 #include "httpclientparser.h"
 
+#define BUF_SIZE 16384
+
 typedef enum client_redirect {
     CLIENTREDIRECT_NONE = 0,
     CLIENTREDIRECT_EXIST,
@@ -36,6 +38,9 @@ typedef struct httpclient {
     int(*set_url)(struct httpclient*, const char*);
     void(*set_timeout)(struct httpclient*, int);
     void(*free)(struct httpclient*);
+
+    char* buffer;
+    size_t buffer_size;
 } httpclient_t;
 
 httpclient_t* httpclient_init(route_methods_e method, const char* url, int timeout);

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <string.h>
+#include <stdlib.h>
 #include <sys/types.h>
 #include <netinet/tcp.h>
 #include <netdb.h>
@@ -88,6 +89,12 @@ httpclient_t* __httpclient_create() {
     client->set_method = __httpclient_set_method;
     client->set_url = __httpclient_set_url;
     client->free = __httpclient_free;
+    client->buffer_size = BUF_SIZE;
+    client->buffer = malloc(sizeof(char) * client->buffer_size);
+    if (client->buffer == NULL) {
+        free(client);
+        return NULL;
+    }
 
     return client;
 }
@@ -136,6 +143,11 @@ void __httpclient_free(httpclient_t* client) {
     if (client->host != NULL) {
         free(client->host);
         client->host = NULL;
+    }
+
+    if (client->buffer != NULL) {
+        free(client->buffer);
+        client->buffer = NULL;
     }
 
     free(client);
@@ -223,6 +235,8 @@ int __httpclient_create_connection(httpclient_t* client) {
         return 0;
 
     client->connection = connection;
+    client->connection->buffer = client->buffer;
+    client->connection->buffer_size = client->buffer_size;
     client->request->connection = connection;
     client->response->connection = connection;
 
@@ -452,15 +466,8 @@ int __httpclient_try_set_content_length(httpclient_t* client) {
 }
 
 int __httpclient_send_recv_data(httpclient_t* client) {
-    char* buffer = malloc(sizeof(char) * HTTPCLIENT_BUFSIZ);
-    if (buffer == NULL) return 0;
-
-    // TODO: перенести инициализацию буфера в инициализацию клиента
-
     client->connection->write(client->connection);
     client->connection->read(client->connection);
-
-    free(buffer);
 
     return 1;
 }

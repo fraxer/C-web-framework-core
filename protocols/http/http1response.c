@@ -697,7 +697,7 @@ void http1response_redirect(http1response_t* response, const char* path, int sta
 
 int __http1response_alloc_body(http1response_t* response, const char* data, size_t length) {
     if (!bufo_alloc(&response->body, length)) return 0;
-    if (bufo_append(&response->body, data, length) <= 0) return 0;
+    if (bufo_append(&response->body, data, length) < 0) return 0;
 
     bufo_reset_pos(&response->body);
 

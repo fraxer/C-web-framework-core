@@ -33,6 +33,7 @@ http1teparser_t* http1teparser_init() {
     parser->connection = NULL;
 
     bufferdata_init(&parser->buf);
+    gzip_init(&parser->gzip);
 
     return parser;
 }
@@ -159,13 +160,16 @@ int __read_chunk(http1teparser_t* parser) {
             if (gzip_inflate_has_error(gzip))
                 return 0;
 
-            if (writed > 0)
-                response->payload_.file.append_content(&response->payload_.file, buffer, writed);
+            if (writed > 0) {
+                if (!response->payload_.file.append_content(&response->payload_.file, buffer, writed))
+                    return 0;
+            }
         } while (gzip_want_continue(gzip));
 
-        if (gzip_is_end(gzip))
+        if (gzip_is_end(gzip)) {
             if (!gzip_inflate_free(gzip))
                 return 0;
+        }
     }
     else {
         if (!response->payload_.file.append_content(&response->payload_.file, &parser->buffer[parser->pos], temp_chunk_size))

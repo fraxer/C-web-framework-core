@@ -40,6 +40,7 @@ void http1responseparser_init(http1responseparser_t* parser) {
     if (parser->teparser == NULL) return;
 
     bufferdata_init(&parser->buf);
+    gzip_init(&parser->gzip);
 }
 
 void http1responseparser_set_connection(http1responseparser_t* parser, connection_t* connection) {
@@ -289,6 +290,7 @@ int __http1responseparser_parse_payload(http1responseparser_t* parser) {
         if (response->content_encoding == CE_GZIP) {
             gzip_t* gzip = &parser->gzip;
             char buffer[GZIP_BUFFER];
+            size_t decompressed_total = 0;
 
             if (!gzip_inflate_init(gzip, &parser->buffer[parser->pos_start], string_len))
                 return HTTP1PARSER_ERROR;
@@ -298,20 +300,25 @@ int __http1responseparser_parse_payload(http1responseparser_t* parser) {
                 if (gzip_inflate_has_error(gzip))
                     return HTTP1PARSER_ERROR;
 
-                if (writed > 0)
+                if (writed > 0) {
                     response->payload_.file.append_content(&response->payload_.file, buffer, writed);
+                    decompressed_total += writed;
+                }
             } while (gzip_want_continue(gzip));
 
             if (gzip_is_end(gzip))
                 if (!gzip_inflate_free(gzip))
                     return HTTP1PARSER_ERROR;
+
+            parser->content_saved_length += decompressed_total;
         }
         else {
             if (!response->payload_.file.append_content(&response->payload_.file, &parser->buffer[parser->pos_start], string_len))
                 return HTTP1PARSER_ERROR;
+
+            parser->content_saved_length += string_len;
         }
 
-        parser->content_saved_length += string_len;
         if (parser->content_saved_length >= parser->content_length)
             return HTTP1RESPONSEPARSER_COMPLETE;
     }
