@@ -127,26 +127,83 @@ int send_mail(mail_payload_t* payload) {
     if (!mail_is_real(payload->to)) return 0;
 
     mail_t* mail = mail_create();
-    if (!mail->connected(mail)) {
-        if (!mail->connect(mail, payload->to))
-            return 0;
+    if (mail == NULL) return 0;
 
-        mail->read_banner(mail);
-        mail->send_hello(mail);
-        mail->start_tls(mail);
+    int result = 0;  // Assume failure
+
+    // Check connection
+    if (!mail->connected(mail)) {
+        if (!mail->connect(mail, payload->to)) {
+            log_error("[send_mail] Failed to connect\n");
+            goto cleanup;
+        }
+
+        // Check banner read
+        if (!mail->read_banner(mail)) {
+            log_error("[send_mail] Failed to read banner\n");
+            goto cleanup;
+        }
+
+        // Check EHLO
+        if (!mail->send_hello(mail)) {
+            log_error("[send_mail] Failed to send EHLO\n");
+            goto cleanup;
+        }
+
+        // Check STARTTLS
+        if (!mail->start_tls(mail)) {
+            log_error("[send_mail] Failed to start TLS\n");
+            goto cleanup;
+        }
     }
 
-    mail->set_from(mail, payload->from, payload->from_name);
-    mail->set_to(mail, payload->to);
-    mail->set_subject(mail, payload->subject);
-    mail->set_body(mail, payload->body);
+    // Set sender
+    if (!mail->set_from(mail, payload->from, payload->from_name)) {
+        log_error("[send_mail] Failed to set FROM\n");
+        goto cleanup;
+    }
 
-    mail->send_mail(mail);
-    mail->send_reset(mail);
-    mail->send_quit(mail);
+    // Set recipient
+    if (!mail->set_to(mail, payload->to)) {
+        log_error("[send_mail] Failed to set TO\n");
+        goto cleanup;
+    }
+
+    // Set subject
+    if (!mail->set_subject(mail, payload->subject)) {
+        log_error("[send_mail] Failed to set subject\n");
+        goto cleanup;
+    }
+
+    // Set body
+    if (!mail->set_body(mail, payload->body)) {
+        log_error("[send_mail] Failed to set body\n");
+        goto cleanup;
+    }
+
+    // Send mail (MAIL FROM, RCPT TO, DATA, content)
+    if (!mail->send_mail(mail)) {
+        log_error("[send_mail] Failed to send mail\n");
+        goto cleanup;
+    }
+
+    // Send RSET to reset connection
+    if (!mail->send_reset(mail)) {
+        log_error("[send_mail] Failed to send RSET\n");
+        goto cleanup;
+    }
+
+    // Send QUIT to close connection
+    if (!mail->send_quit(mail)) {
+        log_error("[send_mail] Failed to send QUIT\n");
+        goto cleanup;
+    }
+
+    result = 1;  // Success
+
+cleanup:
     mail->free(mail);
-
-    return 1;
+    return result;
 }
 
 void send_mail_async(mail_payload_t* payload) {
@@ -190,6 +247,9 @@ int __mail_connect(mail_t* instance, const char* email) {
         return 0;
     }
 
+    instance->connection->buffer = instance->buffer;
+    instance->connection->buffer_size = instance->buffer_size;
+
     instance->request_data = smtprequest_data_create(instance->connection);
     if (instance->request_data == NULL)
         return 0;
@@ -215,7 +275,7 @@ int __mail_connect(mail_t* instance, const char* email) {
         return 0;
     }
 
-    log_info("Mail domain: %s", punycode_domain);
+    log_info("Mail domain: %s\n", punycode_domain);
 
     mail_mx_record_t mx_records[MAIL_RECORDS_SIZE];
     memset(mx_records, 0, sizeof(mail_mx_record_t) * MAIL_RECORDS_SIZE);
@@ -305,7 +365,13 @@ void __mail_connection_free(connection_t* connection) {
 int __mail_read_banner(mail_t* instance) {
     if (!__mail_can_interact(instance)) return 0;
 
-    instance->connection->read(instance->connection);
+    // Check read return value
+    int read_result = instance->connection->read(instance->connection);
+    if (!read_result) {
+        log_error("[__mail_read_banner] Read failed\n");
+        instance->reseted = 1;
+        return 0;
+    }
 
     connection_client_ctx_t* ctx = instance->connection->ctx;
     smtpresponse_t* response = ctx->response;
@@ -553,8 +619,21 @@ int __mail_send_content(mail_t* instance) {
     if (!__mail_can_interact(instance)) return 0;
     if (instance->data_size == 0) return 0;
 
-    instance->connection->write(instance->connection);
-    instance->connection->read(instance->connection);
+    // Check write return value
+    int write_result = instance->connection->write(instance->connection);
+    if (!write_result) {
+        log_error("[__mail_send_content] Write failed\n");
+        instance->reseted = 1;
+        return 0;
+    }
+
+    // Check read return value
+    int read_result = instance->connection->read(instance->connection);
+    if (!read_result) {
+        log_error("[__mail_send_content] Read failed\n");
+        instance->reseted = 1;
+        return 0;
+    }
 
     connection_client_ctx_t* ctx = instance->connection->ctx;
     smtpresponse_t* response = ctx->response;
@@ -780,13 +859,37 @@ int __mail_send_command(mail_t* instance, const char* format, ...) {
     size_t size = vsnprintf(instance->request->command, sizeof(instance->request->command), format, args);
     va_end(args);
 
+    // Check for buffer truncation
+    if (size >= sizeof(instance->request->command)) {
+        log_error("[__mail_send_command] Command truncated\n");
+        instance->reseted = 1;
+        return 0;
+    }
+
     if (size <= 2) return 0;
-    if (instance->request->command[size - 2] != '\r' && instance->request->command[size - 1] != '\n') return 0;
 
-    log_info("%s\n", instance->request->command);
+    // Fix CRLF validation: should use OR (||) not AND (&&)
+    if (instance->request->command[size - 2] != '\r' || instance->request->command[size - 1] != '\n') {
+        log_error("[__mail_send_command] Invalid CRLF termination\n");
+        instance->reseted = 1;
+        return 0;
+    }
 
-    instance->connection->write(instance->connection);
-    instance->connection->read(instance->connection);
+    // Check write return value
+    int write_result = instance->connection->write(instance->connection);
+    if (!write_result) {
+        log_error("[__mail_send_command] Write failed\n");
+        instance->reseted = 1;
+        return 0;
+    }
+
+    // Check read return value
+    int read_result = instance->connection->read(instance->connection);
+    if (!read_result) {
+        log_error("[__mail_send_command] Read failed\n");
+        instance->reseted = 1;
+        return 0;
+    }
 
     return 1;
 }
@@ -844,12 +947,22 @@ int __mail_alloc_ssl(connection_t* connection) {
 }
 
 int __mail_handshake(connection_t* connection) {
+    if (connection == NULL) return 0;
+
     set_smtp_client_tls(connection);
-    connection->write(connection);
+
+    // Check write return value during TLS handshake
+    int write_result = connection->write(connection);
+    if (!write_result) {
+        log_error("[__mail_handshake] Write failed during TLS handshake\n");
+        return 0;
+    }
 
     connection_client_ctx_t* ctx = connection->ctx;
-    if (ctx->request == NULL || connection->fd == 0)
+    if (ctx->request == NULL || connection->fd == 0) {
+        log_error("[__mail_handshake] Invalid context or disconnected\n");
         return 0;
+    }
 
     return 1;
 }
