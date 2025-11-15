@@ -35,6 +35,7 @@ static dbresult_t* __process_result(void* connection, dbresult_t* result);
 static PGconn* __connect(void* host);
 static int __is_active(void* connection);
 static int __reconnect(void* host, void* connection);
+static dbresult_t* __begin(void* connection, transaction_level_e level);
 static char* __compile_table_exist(dbconnection_t* connection, const char* table);
 static char* __compile_table_migration_create(dbconnection_t* connection, const char* table);
 static str_t* __escape_identifier(void* connection, const char* str);
@@ -104,6 +105,7 @@ void* __connection_create(void* host) {
     connection->base.reconnect = __reconnect;
     connection->base.prepare = __prepare;
     connection->base.execute_prepared = __execute_prepared;
+    connection->base.begin = __begin;
     connection->connection = __connect(host);
 
     if (connection->connection == NULL) {
@@ -324,6 +326,42 @@ int __reconnect(void* host, void* connection) {
     }
 
     return 1;
+}
+
+const char* __postgresql_isolation_level_to_string(transaction_level_e level) {
+    switch (level) {
+        case READ_UNCOMMITTED:
+            // PostgreSQL treats READ_UNCOMMITTED as READ_COMMITTED
+            return "READ COMMITTED";
+        case READ_COMMITTED:
+            return "READ COMMITTED";
+        case REPEATABLE_READ:
+            return "REPEATABLE READ";
+        case SERIALIZABLE:
+            return "SERIALIZABLE";
+        default:
+            return "READ COMMITTED";
+    }
+}
+
+dbresult_t* __begin(void* connection, transaction_level_e level) {
+    postgresqlconnection_t* pgconnection = connection;
+    if (pgconnection == NULL) return NULL;
+
+    const char* level_str = __postgresql_isolation_level_to_string(level);
+
+    str_t query;
+    str_init(&query, 64);
+    if (!str_appendf(&query, "BEGIN ISOLATION LEVEL %s", level_str)) {
+        str_clear(&query);
+        return NULL;
+    }
+
+    dbresult_t* result = __query(connection, str_get(&query));
+
+    str_clear(&query);
+
+    return result;
 }
 
 str_t* __escape_identifier(void* connection, const char* str) {

@@ -13,7 +13,7 @@ dbresult_t* dbquery(const char* dbid, const char* format, array_t* params);
 dbresult_t* dbprepared_query(const char* dbid, const char* stmt_name, array_t* params);
 dbresult_t* dbtable_exist(const char* dbid, const char* table);
 dbresult_t* dbtable_migration_create(const char* dbid, const char* table);
-dbresult_t* dbbegin(const char* dbid, transaction_level_e);
+dbresult_t* dbbegin(const char* dbid, transaction_level_e level);
 dbresult_t* dbcommit(const char* dbid);
 dbresult_t* dbrollback(const char* dbid);
 dbresult_t* dbinsert(const char* dbid, const char* table, array_t* params);

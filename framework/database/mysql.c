@@ -46,6 +46,7 @@ static dbresult_t* __process_prepared_result(void* connection, MYSQL_STMT* stmt,
 static MYSQL* __connect(void* host);
 static int __is_active(void* connection);
 static int __reconnect(void* host, void* connection);
+static dbresult_t* __begin(void* connection, transaction_level_e level);
 static char* __compile_table_exist(dbconnection_t* connection, const char* table);
 static char* __compile_table_migration_create(dbconnection_t* connection, const char* table);
 static str_t* __escape_identifier(void* connection, const char* str);
@@ -117,6 +118,7 @@ void* __connection_create(void* host) {
     connection->base.reconnect = __reconnect;
     connection->base.prepare = __prepare;
     connection->base.execute_prepared = __execute_prepared;
+    connection->base.begin = __begin;
     connection->connection = __connect(host);
 
     if (connection->connection == NULL) {
@@ -544,6 +546,45 @@ int __reconnect(void* host, void* connection) {
     }
 
     return 1;
+}
+
+const char* __mysql_isolation_level_to_string(transaction_level_e level) {
+    switch (level) {
+        case READ_UNCOMMITTED:
+            return "READ UNCOMMITTED";
+        case READ_COMMITTED:
+            return "READ COMMITTED";
+        case REPEATABLE_READ:
+            return "REPEATABLE READ";
+        case SERIALIZABLE:
+            return "SERIALIZABLE";
+        default:
+            return "READ COMMITTED";
+    }
+}
+
+dbresult_t* __begin(void* connection, transaction_level_e level) {
+    myconnection_t* myconnection = connection;
+    if (myconnection == NULL) return NULL;
+
+    const char* level_str = __mysql_isolation_level_to_string(level);
+
+    str_t query;
+    str_init(&query, 64);
+    if (!str_appendf(&query, "SET TRANSACTION ISOLATION LEVEL %s", level_str)) {
+        str_clear(&query);
+        return NULL;
+    }
+
+    dbresult_t* result = __query(connection, str_get(&query));
+    str_clear(&query);
+
+    if (!dbresult_ok(result))
+        return result;
+
+    dbresult_free(result);
+
+    return __query(connection, "START TRANSACTION");
 }
 
 str_t* __escape_identifier(void* connection, const char* str) {
