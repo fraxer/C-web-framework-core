@@ -42,6 +42,8 @@ connection_client_ctx_t *__ctx_create(void) {
     ctx->request = NULL;
     ctx->response = NULL;
 
+    gzip_init(&ctx->gzip);
+
     return ctx;
 }
 
