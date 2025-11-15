@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
+#include <float.h>
 #include <math.h>
 
 #include "log.h"
@@ -457,7 +458,7 @@ json_token_t* __parse_number(json_parser_t* parser) {
     const char* start = parser->ptr;
     char* end = NULL;
 
-    token->value._double = strtod(start, &end);
+    token->value._ldouble = strtold(start, &end);
 
     if (end == start) {
         parser->error = "Invalid number";
@@ -1292,45 +1293,33 @@ int json_bool(const json_token_t* token) {
 }
 
 int json_int(const json_token_t* token, int* ok) {
+    if (ok) *ok = 0;
+
     // Проверка на NULL
-    if (token == NULL) {
-        if (ok) *ok = 0;
+    if (token == NULL)
         return 0;
-    }
 
     // Проверка типа токена
-    if (token->type != JSON_NUMBER) {
-        if (ok) *ok = 0;
+    if (token->type != JSON_NUMBER)
         return 0;
-    }
 
-    double val = token->value._double;
+    long double val = token->value._ldouble;
 
     // Проверка на NaN (Not a Number)
-    if (isnan(val)) {
-        if (ok) *ok = 0;
+    if (isnan(val))
         return 0;
-    }
 
     // Проверка на бесконечность
-    if (isinf(val)) {
-        if (ok) *ok = 0;
-        // Если +бесконечность, возвращаем максимальное значение
-        // Если -бесконечность, возвращаем минимальное значение
+    if (isinf(val))
         return (val > 0) ? INT_MAX : INT_MIN;
-    }
 
     // Проверка на переполнение int (сверху)
-    if (val > (double)INT_MAX) {
-        if (ok) *ok = 0;
+    if (val > (long double)INT_MAX)
         return INT_MAX;
-    }
 
     // Проверка на переполнение int (снизу)
-    if (val < (double)INT_MIN) {
-        if (ok) *ok = 0;
+    if (val < (long double)INT_MIN)
         return INT_MIN;
-    }
 
     // Успешная конвертация
     if (ok) *ok = 1;
@@ -1338,56 +1327,93 @@ int json_int(const json_token_t* token, int* ok) {
     return (int)val;
 }
 
-double json_double(const json_token_t* token) {
+double json_double(const json_token_t* token, int* ok) {
+    if (ok) *ok = 0;
+
+    // Проверка на NULL
     if (token == NULL)
         return 0.0;
 
+    // Проверка типа токена
     if (token->type != JSON_NUMBER)
         return 0.0;
 
-    return token->value._double;
+    // Получаем значение с типом long double
+    long double value = token->value._ldouble;
+
+    // Проверка на NaN (Not a Number)
+    if (isnan(value))
+        return 0.0;
+
+    // Проверка на бесконечность - это ошибка для преобразования
+    if (isinf(value))
+        return (value > 0) ? INFINITY : -INFINITY;
+
+    // Проверка на переполнение при преобразовании к double
+    if (value > (long double)DBL_MAX)
+        return DBL_MAX;
+
+    if (value < (long double)-DBL_MAX)
+        return -DBL_MAX;
+
+    // Успешная конвертация
+    if (ok) *ok = 1;
+    // Безопасное преобразование к double
+    return (double)value;
+}
+
+long double json_ldouble(const json_token_t* token) {
+    // Проверка на NULL
+    if (token == NULL)
+        return 0.0L;
+
+    // Проверка типа токена
+    if (token->type != JSON_NUMBER)
+        return 0.0L;
+
+    // Получаем значение
+    long double value = token->value._ldouble;
+
+    // Проверка на NaN (Not a Number)
+    if (isnan(value))
+        return 0.0L;
+
+    // Проверка на бесконечность - сохраняем знак
+    if (isinf(value))
+        return (value > 0) ? INFINITY : -INFINITY;
+
+    // Возвращаем значение
+    return value;
 }
 
 long long json_llong(const json_token_t* token, int* ok) {
+    if (ok) *ok = 0;
+
     // Проверка на NULL
-    if (token == NULL) {
-        if (ok) *ok = 0;
+    if (token == NULL)
         return 0;
-    }
 
     // Проверка типа токена
-    if (token->type != JSON_NUMBER) {
-        if (ok) *ok = 0;
+    if (token->type != JSON_NUMBER)
         return 0;
-    }
 
-    double val = token->value._double;
+    long double val = token->value._ldouble;
 
     // Проверка на NaN (Not a Number)
-    if (isnan(val)) {
-        if (ok) *ok = 0;
+    if (isnan(val))
         return 0;
-    }
 
     // Проверка на бесконечность
-    if (isinf(val)) {
-        if (ok) *ok = 0;
-        // Если +бесконечность, возвращаем максимальное значение
-        // Если -бесконечность, возвращаем минимальное значение
+    if (isinf(val))
         return (val > 0) ? LLONG_MAX : LLONG_MIN;
-    }
 
     // Проверка на переполнение long long (сверху)
-    if (val > (double)LLONG_MAX) {
-        if (ok) *ok = 0;
+    if (val > (long double)LLONG_MAX)
         return LLONG_MAX;
-    }
 
     // Проверка на переполнение long long (снизу)
-    if (val < (double)LLONG_MIN) {
-        if (ok) *ok = 0;
+    if (val < (long double)LLONG_MIN)
         return LLONG_MIN;
-    }
 
     // Успешная конвертация
     if (ok) *ok = 1;
@@ -1408,45 +1434,33 @@ size_t json_string_size(const json_token_t* token) {
 }
 
 unsigned int json_uint(const json_token_t* token, int* ok) {
+    if (ok) *ok = 0;
+
     // Проверка на NULL
-    if (token == NULL) {
-        if (ok) *ok = 0;
+    if (token == NULL)
         return 0;
-    }
 
     // Проверка типа токена
-    if (token->type != JSON_NUMBER) {
-        if (ok) *ok = 0;
+    if (token->type != JSON_NUMBER)
         return 0;
-    }
 
-    double val = token->value._double;
+    long double val = token->value._ldouble;
 
     // Проверка на NaN (Not a Number)
-    if (isnan(val)) {
-        if (ok) *ok = 0;
+    if (isnan(val))
         return 0;
-    }
 
     // Проверка на бесконечность
-    if (isinf(val)) {
-        if (ok) *ok = 0;
-        // Если +бесконечность, возвращаем максимальное значение
-        // Если -бесконечность, возвращаем 0
+    if (isinf(val))
         return (val > 0) ? UINT_MAX : 0;
-    }
 
     // Проверка на отрицательные значения
-    if (val < 0) {
-        if (ok) *ok = 0;
+    if (val < 0)
         return 0;
-    }
 
     // Проверка на переполнение unsigned int
-    if (val > (double)UINT_MAX) {
-        if (ok) *ok = 0;
+    if (val > (long double)UINT_MAX)
         return UINT_MAX;
-    }
 
     // Успешная конвертация
     if (ok) *ok = 1;
@@ -1528,11 +1542,11 @@ json_token_t* json_create_string(const char* value) {
     return token;
 }
 
-json_token_t* json_create_number(double value) {
+json_token_t* json_create_number(long double value) {
     json_token_t* token = json_token_alloc(JSON_NUMBER);
     if (token == NULL) return NULL;
 
-    token->value._double = value;
+    token->value._ldouble = value;
 
     return token;
 }
@@ -1847,7 +1861,7 @@ void json_token_set_llong(json_token_t* token, long long value) {
     token->parent = NULL;
     token->type = JSON_NUMBER;
     token->size = 0;
-    token->value._double = (double)value;
+    token->value._ldouble = (long double)value;
 }
 
 void json_token_set_int(json_token_t* token, int value) {
@@ -1864,7 +1878,7 @@ void json_token_set_int(json_token_t* token, int value) {
     token->parent = NULL;
     token->type = JSON_NUMBER;
     token->size = 0;
-    token->value._double = (double)value;
+    token->value._ldouble = (long double)value;
 }
 
 void json_token_set_uint(json_token_t* token, unsigned int value) {
@@ -1881,7 +1895,7 @@ void json_token_set_uint(json_token_t* token, unsigned int value) {
     token->parent = NULL;
     token->type = JSON_NUMBER;
     token->size = 0;
-    token->value._double = (double)value;
+    token->value._ldouble = (long double)value;
 }
 
 void json_token_set_double(json_token_t* token, double value) {
@@ -1898,7 +1912,24 @@ void json_token_set_double(json_token_t* token, double value) {
     token->parent = NULL;
     token->type = JSON_NUMBER;
     token->size = 0;
-    token->value._double = value;
+    token->value._ldouble = (long double)value;
+}
+
+void json_token_set_ldouble(json_token_t* token, long double value) {
+    if (token == NULL) return;
+
+    // Очищаем старое значение если это была строка
+    if (token->type == JSON_STRING) {
+        str_clear(&token->value._string);
+    }
+
+    token->child = NULL;
+    token->sibling = NULL;
+    token->last_sibling = NULL;
+    token->parent = NULL;
+    token->type = JSON_NUMBER;
+    token->size = 0;
+    token->value._ldouble = value;
 }
 
 void json_token_set_object(json_token_t* token, json_token_t* token_object) {
@@ -2386,20 +2417,20 @@ static int __json_stringify_token(json_doc_t* document) {
 
                 case JSON_NUMBER:
                     {
-                        size_t buffer_size = 64;
+                        const size_t buffer_size = 512;
                         char buffer[buffer_size];
 
                         // Проверяем, является ли число целым
-                        double value = token->value._double;
+                        long double value = token->value._ldouble;
 
                         // Улучшенная проверка на целое число с учетом диапазона long long
                         int is_integer = 0;
                         if (!isinf(value) && !isnan(value)) {
                             // Проверяем, что число в диапазоне long long и является целым
-                            if (value >= (double)LLONG_MIN && value <= (double)LLONG_MAX) {
+                            if (value >= (long double)LLONG_MIN && value <= (long double)LLONG_MAX) {
                                 long long int_value = (long long)value;
                                 // Проверяем, что после конвертации значение не изменилось
-                                if (value == (double)int_value) {
+                                if (value == (long double)int_value) {
                                     is_integer = 1;
                                 }
                             }
@@ -2409,10 +2440,10 @@ static int __json_stringify_token(json_doc_t* document) {
                         int written;
                         if (is_integer) {
                             // Целое число
-                            written = snprintf(buffer, sizeof(buffer), "%.0f", value);
+                            written = snprintf(buffer, sizeof(buffer), "%.0Lf", value);
                         } else {
-                            // Пункт 7: Дробное число с полной точностью (17 значащих цифр для double)
-                            written = snprintf(buffer, sizeof(buffer), "%.17g", value);
+                            // Пункт 7: Дробное число с полной точностью (17 значащих цифр для long double)
+                            written = snprintf(buffer, sizeof(buffer), "%.17Lg", value);
                         }
 
                         // Пункт 4: Проверка на переполнение буфера и ошибки snprintf

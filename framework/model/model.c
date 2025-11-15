@@ -1675,11 +1675,11 @@ int model_set_array_from_str(mfield_t* field, const char* value) {
         if (json_is_string(token_value)) {
             array_push_back(array, array_create_string(json_string(token_value)));
         } else if (json_is_number(token_value)) {
-            array_push_back(array, array_create_double(json_double(token_value)));
+            array_push_back(array, array_create_ldouble(json_ldouble(token_value)));
         } else if (json_is_bool(token_value)) {
-            array_push_back(array, array_create_double(json_bool(token_value)));
+            array_push_back(array, array_create_ldouble(json_bool(token_value)));
         } else if (json_is_null(token_value)) {
-            array_push_back(array, array_create_double(0));
+            array_push_back(array, array_create_ldouble(0));
         }
         else {
             json_free(document);

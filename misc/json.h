@@ -33,7 +33,7 @@ typedef enum {
 
 typedef union {
     int _int;
-    double _double;
+    long double _ldouble;
     str_t _string;
 } json_value_u;
 
@@ -112,7 +112,8 @@ void json_free(json_doc_t* document);
 json_token_t* json_root(const json_doc_t* document);
 int json_bool(const json_token_t* token);
 int json_int(const json_token_t* token, int* ok);
-double json_double(const json_token_t* token);
+double json_double(const json_token_t* token, int* ok);
+long double json_ldouble(const json_token_t* token);
 long long json_llong(const json_token_t* token, int* ok);
 const char* json_string(const json_token_t* token);
 size_t json_string_size(const json_token_t* token);
@@ -134,7 +135,7 @@ int json_is_array(const json_token_t* token);
 json_token_t* json_create_bool(int value);
 json_token_t* json_create_null(void);
 json_token_t* json_create_string(const char* value);
-json_token_t* json_create_number(double value);
+json_token_t* json_create_number(long double value);
 json_token_t* json_create_object(void);
 json_token_t* json_create_array(void);
 json_doc_t* json_root_create_object(void);
@@ -170,6 +171,7 @@ void json_token_set_llong(json_token_t* token, long long value);
 void json_token_set_int(json_token_t* token, int value);
 void json_token_set_uint(json_token_t* token, unsigned int value);
 void json_token_set_double(json_token_t* token, double value);
+void json_token_set_ldouble(json_token_t* token, long double value);
 void json_token_set_object(json_token_t* token, json_token_t* token_object);
 void json_token_set_array(json_token_t* token, json_token_t* token_array);
 
