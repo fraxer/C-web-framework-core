@@ -92,11 +92,13 @@ array_t* array_copy(array_t* array) {
 
         if (element->type == ARRAY_INT)
             array_push_back(copy_array, array_create_int(element->_int));
-        if (element->type == ARRAY_DOUBLE)
+        else if (element->type == ARRAY_DOUBLE)
             array_push_back(copy_array, array_create_double(element->_double));
-        if (element->type == ARRAY_STRING)
+        else if (element->type == ARRAY_LONGDOUBLE)
+            array_push_back(copy_array, array_create_ldouble(element->_ldouble));
+        else if (element->type == ARRAY_STRING)
             array_push_back(copy_array, array_create_stringn(element->_string, element->_length));
-        if (element->type == ARRAY_POINTER)
+        else if (element->type == ARRAY_POINTER)
             array_push_back(copy_array, array_create_pointer(element->_copy(element->_pointer), element->_copy, element->_free));
     }
 
@@ -206,9 +208,11 @@ void* array_get(array_t* array, size_t index) {
 
     if (element->type == ARRAY_INT)
         return &element->_int;
-    if (element->type == ARRAY_DOUBLE)
+    else if (element->type == ARRAY_DOUBLE)
         return &element->_double;
-    if (element->type == ARRAY_STRING)
+    else if (element->type == ARRAY_LONGDOUBLE)
+        return &element->_ldouble;
+    else if (element->type == ARRAY_STRING)
         return element->_string;
 
     return element->_pointer;
@@ -226,6 +230,13 @@ double array_get_double(array_t* array, size_t index) {
     if (value == NULL) return 0.0;
 
     return *(double*)value;
+}
+
+long double array_get_ldouble(array_t* array, size_t index) {
+    void* value = array_get(array, index);
+    if (value == NULL) return 0.0;
+
+    return *(long double*)value;
 }
 
 const char* array_get_string(array_t* array, size_t index) {
@@ -259,7 +270,17 @@ str_t* array_item_to_string(array_t* array, size_t index) {
     }
     else if (element->type == ARRAY_DOUBLE) {
         char str[375] = {0};
-        int size = snprintf(str, sizeof(str), "%.12f", array_get_double(array, index));
+        const int size = snprintf(str, sizeof(str), "%.12f", array_get_double(array, index));
+        if (size < 0) {
+            str_free(string);
+            return NULL;
+        }
+
+        str_append(string, str, size);
+    }
+    else if (element->type == ARRAY_LONGDOUBLE) {
+        char str[512] = {0};
+        const int size = snprintf(str, sizeof(str), "%.17Lg", array_get_ldouble(array, index));
         if (size < 0) {
             str_free(string);
             return NULL;
@@ -269,7 +290,7 @@ str_t* array_item_to_string(array_t* array, size_t index) {
     }
     else if (element->type == ARRAY_INT) {
         char str[12] = {0};
-        int size = snprintf(str, sizeof(str), "%d", array_get_int(array, index));
+        const int size = snprintf(str, sizeof(str), "%d", array_get_int(array, index));
         if (size < 0) {
             str_free(string);
             return NULL;
@@ -299,6 +320,17 @@ avalue_t array_create_int(int value) {
 avalue_t array_create_double(double value) {
     avalue_t v = {
         .type = ARRAY_DOUBLE,
+        ._double = value,
+        ._length = 0,
+        ._string = NULL
+    };
+
+    return v;
+}
+
+avalue_t array_create_ldouble(long double value) {
+    avalue_t v = {
+        .type = ARRAY_LONGDOUBLE,
         ._double = value,
         ._length = 0,
         ._string = NULL
