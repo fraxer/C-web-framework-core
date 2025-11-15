@@ -4,34 +4,65 @@
 #include "log.h"
 #include "mimetype.h"
 
-typedef struct _ENTRY {
-    unsigned int used;
-    ENTRY entry;
-} _ENTRY;
+// Helper function to free a nested map (for table_type values)
+static void __mimetype_free_extensions_map(void* extensions_map) {
+    if (extensions_map != NULL) {
+        map_free((map_t*)extensions_map);
+    }
+}
 
-static void __mimetype_table_clear(hsearch_data_t* table);
+// Helper function to create a new extensions set (inner map)
+static map_t* __mimetype_create_extensions_set(void) {
+    // Create a map to act as a set of extensions
+    // key = extension (string), value = extension (string) - used as a set
+    return map_create_ex(
+        map_compare_string,
+        map_copy_string,
+        free,
+        map_copy_string,
+        free
+    );
+}
 
 mimetype_t* mimetype_create(size_t table_type_size, size_t table_ext_size) {
-    table_type_size = (table_type_size + 1) * 1.5;
-    table_ext_size = (table_ext_size + 1) * 1.5;
+    // Note: size parameters are ignored as map_t dynamically manages size
+    (void)table_type_size;
+    (void)table_ext_size;
 
-    mimetype_t* mimetype = malloc(sizeof * mimetype);
-    if (mimetype == NULL) return NULL;
+    mimetype_t* mimetype = malloc(sizeof(mimetype_t));
+    if (mimetype == NULL) {
+        log_error("mimetype_create: failed to allocate mimetype structure\n");
+        return NULL;
+    }
 
-    mimetype->table_type.filled = 0;
-    mimetype->table_type.size = 0;
-    mimetype->table_type.table = NULL;
-    mimetype->table_ext.filled = 0;
-    mimetype->table_ext.size = 0;
-    mimetype->table_ext.table = NULL;
+    // Create map for extension -> mimetype lookups (simple string -> string)
+    mimetype->table_ext = map_create_ex(
+        map_compare_string,
+        map_copy_string,
+        free,
+        map_copy_string,
+        free
+    );
 
-    if (hcreate_r(table_type_size, &mimetype->table_type) == 0) {
+    if (mimetype->table_ext == NULL) {
+        log_error("mimetype_create: failed to create table_ext\n");
         free(mimetype);
         return NULL;
     }
 
-    if (hcreate_r(table_ext_size, &mimetype->table_ext) == 0) {
-        hdestroy_r(&mimetype->table_type);
+    // Create map for mimetype -> extensions set (string -> map_t*)
+    // Note: values are map_t* pointers, we don't copy them, just store pointers
+    mimetype->table_type = map_create_ex(
+        map_compare_string,
+        map_copy_string,               // copy key (mimetype)
+        free,                          // free key
+        NULL,                          // don't copy value (map_t*)
+        __mimetype_free_extensions_map // free value (map_t*)
+    );
+
+    if (mimetype->table_type == NULL) {
+        log_error("mimetype_create: failed to create table_type\n");
+        map_free(mimetype->table_ext);
         free(mimetype);
         return NULL;
     }
@@ -42,112 +73,90 @@ mimetype_t* mimetype_create(size_t table_type_size, size_t table_ext_size) {
 void mimetype_destroy(mimetype_t* mimetype) {
     if (mimetype == NULL) return;
 
-    __mimetype_table_clear(&mimetype->table_ext);
-    __mimetype_table_clear(&mimetype->table_type);
+    // map_free will automatically free all keys and values using the registered free functions
+    if (mimetype->table_ext != NULL) {
+        map_free(mimetype->table_ext);
+    }
 
-    hdestroy_r(&mimetype->table_ext);
-    hdestroy_r(&mimetype->table_type);
+    if (mimetype->table_type != NULL) {
+        map_free(mimetype->table_type);
+    }
 
     free(mimetype);
 }
 
-void __mimetype_table_clear(hsearch_data_t* table) {
-    if (table == NULL) return;
+int mimetype_add(mimetype_t* mimetype, mimetype_table_type_t table_type, const char* key, const char* value) {
+    if (mimetype == NULL) {
+        log_error("mimetype_add: mimetype is NULL\n");
+        return 0;
+    }
 
-    for (size_t i = 0; i < table->size; i++) {
-        _ENTRY* e = &table->table[i];
-        if (e->used != 0) {
-            if (e->entry.key != NULL) free(e->entry.key);
-            if (e->entry.data != NULL) free(e->entry.data);
+    if (key == NULL || value == NULL) {
+        log_error("mimetype_add: key or value is NULL\n");
+        return 0;
+    }
+
+    if (table_type == MIMETYPE_TABLE_TYPE) {
+        // Adding to table_type: mimetype -> extensions
+        // key = mimetype, value = extension
+
+        // Find or create the extensions set for this mimetype
+        map_t* extensions_set = (map_t*)map_find(mimetype->table_type, key);
+
+        if (extensions_set == NULL) {
+            // Create new extensions set for this mimetype
+            extensions_set = __mimetype_create_extensions_set();
+            if (extensions_set == NULL) {
+                log_error("mimetype_add: failed to create extensions set for '%s'\n", key);
+                return 0;
+            }
+
+            // Insert the new set into table_type
+            if (map_insert(mimetype->table_type, key, extensions_set) == 0) {
+                log_error("mimetype_add: failed to insert mimetype '%s'\n", key);
+                map_free(extensions_set);
+                return 0;
+            }
         }
-    }
-}
 
-hsearch_data_t* mimetype_get_table_ext(mimetype_t* mimetype) {
-    return &mimetype->table_ext;
-}
+        // Add extension to the set (duplicates are OK, map_insert will ignore them)
+        map_insert(extensions_set, value, (void*)value);
 
-hsearch_data_t* mimetype_get_table_type(mimetype_t* mimetype) {
-    return &mimetype->table_type;
-}
+    } else if (table_type == MIMETYPE_TABLE_EXT) {
+        // Adding to table_ext: extension -> mimetype
+        // key = extension, value = mimetype
 
-int mimetype_add(hsearch_data_t* table, const char* key, const char* value) {
-    int result = 0;
-    if (table == NULL) return 0;
+        // Keep first value for duplicate keys
+        map_insert(mimetype->table_ext, key, (void*)value);
 
-    ENTRY item = {
-        .key = NULL,
-        .data = NULL
-    };
-    item.key = malloc(sizeof(char) * (strlen(key) + 1));
-    if (item.key == NULL) {
-        log_error("mimetype_add: can't alloc memory for key failed\n");
-        goto failed;
+    } else {
+        log_error("mimetype_add: invalid table_type %d\n", table_type);
+        return 0;
     }
 
-    strcpy(item.key, key);
-
-    item.data = malloc(sizeof(char) * (strlen(value) + 1));
-    if (item.data == NULL) {
-        log_error("mimetype_add: can't alloc memory for value failed\n");
-        goto failed;
-    }
-
-    strcpy(item.data, value);
-
-    ENTRY* res = NULL;
-    if (hsearch_r(item, ENTER, &res, table) == 0) goto failed;
-
-    result = 1;
-
-    failed:
-
-    if (result == 0) {
-        if (item.key != NULL) free(item.key);
-        if (item.data != NULL) free(item.data);
-    }
-
-    return result;
+    return 1;
 }
 
 const char* mimetype_find_ext(mimetype_t* mimetype, const char* key) {
     if (mimetype == NULL) return NULL;
     if (key == NULL) return NULL;
 
-    const char* result = NULL;
+    // Find in table_type (mimetype -> extensions set)
+    map_t* extensions_set = (map_t*)map_find(mimetype->table_type, key);
+    if (extensions_set == NULL) return NULL;
 
-    ENTRY item = {
-        .key = (char*)key,
-        .data = NULL
-    };
-    ENTRY* res = NULL;
+    // Return the first extension from the set
+    map_iterator_t it = map_begin(extensions_set);
+    if (!map_iterator_valid(it)) return NULL;
 
-    if (hsearch_r(item, FIND, &res, &mimetype->table_type) == 0) goto failed;
-
-    result = res->data;
-
-    failed:
-
-    return result;
+    return (const char*)map_iterator_key(it);
 }
 
 const char* mimetype_find_type(mimetype_t* mimetype, const char* key) {
     if (mimetype == NULL) return NULL;
     if (key == NULL) return NULL;
 
-    const char* result = NULL;
-
-    ENTRY item = {
-        .key = (char*)key,
-        .data = NULL
-    };
-    ENTRY* res = NULL;
-
-    if (hsearch_r(item, FIND, &res, &mimetype->table_ext) == 0) goto failed;
-
-    result = res->data;
-
-    failed:
-
+    // Find in table_ext (extension -> mimetype)
+    const char* result = (const char*)map_find(mimetype->table_ext, key);
     return result;
 }

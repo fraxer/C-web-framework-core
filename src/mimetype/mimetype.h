@@ -1,24 +1,22 @@
-#ifndef __USE_GNU
-#define __USE_GNU
-#endif
-
 #ifndef __MIMETYPE__
 #define __MIMETYPE__
 
-#include <search.h>
+#include <stdlib.h>
+#include "map.h"
 
-typedef struct hsearch_data hsearch_data_t;
+typedef enum {
+    MIMETYPE_TABLE_TYPE = 0,  // mimetype -> extension mapping
+    MIMETYPE_TABLE_EXT = 1    // extension -> mimetype mapping
+} mimetype_table_type_t;
 
 typedef struct {
-    hsearch_data_t table_ext;
-    hsearch_data_t table_type;
+    map_t* table_ext;   // extension -> mimetype (string -> string)
+    map_t* table_type;  // mimetype -> set of extensions (string -> map_t*)
 } mimetype_t;
 
 mimetype_t* mimetype_create(size_t table_type_size, size_t table_ext_size);
 void mimetype_destroy(mimetype_t* mimetype);
-hsearch_data_t* mimetype_get_table_ext(mimetype_t* mimetype);
-hsearch_data_t* mimetype_get_table_type(mimetype_t* mimetype);
-int mimetype_add(hsearch_data_t* table, const char* key, const char* value);
+int mimetype_add(mimetype_t* mimetype, mimetype_table_type_t table_type, const char* key, const char* value);
 const char* mimetype_find_ext(mimetype_t* mimetype, const char* key);
 const char* mimetype_find_type(mimetype_t* mimetype, const char* key);
 
