@@ -12,8 +12,8 @@ queryparser_result_t queryparser_parse(
     size_t start_pos,
     void* context,
     queryparser_append_fn append_fn,
-    http1_query_t** out_first_query,
-    http1_query_t** out_last_query
+    query_t** out_first_query,
+    query_t** out_last_query
 ) {
     size_t pos = start_pos;
     size_t point_start = start_pos;
@@ -21,7 +21,7 @@ queryparser_result_t queryparser_parse(
     enum { KEY, VALUE } stage = KEY;
 
     // Create first query node
-    http1_query_t* query = query_create(NULL, 0, NULL, 0);
+    query_t* query = query_create(NULL, 0, NULL, 0);
     if (query == NULL) return QUERYPARSER_ERROR;
 
     *out_first_query = query;
@@ -53,7 +53,7 @@ queryparser_result_t queryparser_parse(
             if (query->value == NULL) return QUERYPARSER_ERROR;
 
             // Create new query node
-            http1_query_t* query_new = query_create(NULL, 0, NULL, 0);
+            query_t* query_new = query_create(NULL, 0, NULL, 0);
             if (query_new == NULL) return QUERYPARSER_ERROR;
 
             // Link to list
@@ -100,8 +100,8 @@ queryparser_result_t queryparser_parse(
     return QUERYPARSER_OK;
 }
 
-http1_query_t* query_create(const char* key, size_t key_length, const char* value, size_t value_length) {
-    http1_query_t* query = malloc(sizeof * query);
+query_t* query_create(const char* key, size_t key_length, const char* value, size_t value_length) {
+    query_t* query = malloc(sizeof * query);
 
     if (query == NULL) return NULL;
 
@@ -118,21 +118,21 @@ http1_query_t* query_create(const char* key, size_t key_length, const char* valu
     return query;
 }
 
-void query_free(http1_query_t* query) {
+void query_free(query_t* query) {
     free((void*)query->key);
     free((void*)query->value);
     free(query);
 }
 
-void queries_free(http1_query_t* query) {
+void queries_free(query_t* query) {
     while (query != NULL) {
-        http1_query_t* next = query->next;
+        query_t* next = query->next;
         query_free(query);
         query = next;
     }
 }
 
-char* query_stringify(http1_query_t* query) {
+char* query_stringify(query_t* query) {
     if (query == NULL) return NULL;
 
     str_t* uri = str_create_empty(256);

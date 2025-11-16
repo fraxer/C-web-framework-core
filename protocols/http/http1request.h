@@ -19,8 +19,8 @@ typedef struct http1request {
     const char* uri;
     const char* path;
 
-    http1_query_t* query_;
-    http1_query_t* last_query;
+    query_t* query_;
+    query_t* last_query;
     http1_header_t* header_;
     http1_header_t* last_header;
     http1_cookie_t* cookie_;
@@ -80,7 +80,7 @@ json_doc_t* http1request_payload_json(http1request_t*);
 json_doc_t* http1request_payload_jsonf(http1request_t*, const char*);
 int http1request_allow_payload(http1request_t*);
 int http1parser_set_uri(http1request_t*, const char*, size_t);
-void http1parser_append_query(http1request_t*, http1_query_t*);
+void http1parser_append_query(http1request_t*, query_t*);
 http1request_head_t http1request_create_head(http1request_t*);
 
 #endif

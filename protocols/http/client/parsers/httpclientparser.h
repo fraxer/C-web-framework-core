@@ -36,8 +36,8 @@ typedef struct httpclientparser {
     char* uri;
     char* path;
     char* buffer;
-    http1_query_t* query;
-    http1_query_t* last_query;
+    query_t* query;
+    query_t* last_query;
 } httpclientparser_t;
 
 void httpclientparser_init(httpclientparser_t* parser);
@@ -50,7 +50,7 @@ char* httpclientparser_move_host(httpclientparser_t* parser);
 short int httpclientparser_move_port(httpclientparser_t* parser);
 char* httpclientparser_move_uri(httpclientparser_t* parser);
 char* httpclientparser_move_path(httpclientparser_t* parser);
-http1_query_t* httpclientparser_move_query(httpclientparser_t* parser);
-http1_query_t* httpclientparser_move_last_query(httpclientparser_t* parser);
+query_t* httpclientparser_move_query(httpclientparser_t* parser);
+query_t* httpclientparser_move_last_query(httpclientparser_t* parser);
 
 #endif

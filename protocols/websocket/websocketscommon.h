@@ -19,9 +19,6 @@ typedef enum websockets_datatype {
     WEBSOCKETS_PONG = 0x8A
 } websockets_datatype_e;
 
-// Use http1_query_t as websockets_query_t - they are structurally identical
-typedef http1_query_t websockets_query_t;
-
 typedef struct websockets_body {
     size_t size;
     size_t pos;

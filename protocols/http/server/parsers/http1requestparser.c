@@ -386,14 +386,14 @@ int __set_path(http1request_t* request, const char* string, size_t length) {
     return HTTP1PARSER_CONTINUE;
 }
 
-static void __http1parser_append_query_callback(void* context, http1_query_t* query) {
+static void __http1parser_append_query_callback(void* context, query_t* query) {
     http1request_t* request = (http1request_t*)context;
     http1parser_append_query(request, query);
 }
 
 int __set_query(http1request_t* request, const char* string, size_t length, size_t pos) {
-    http1_query_t* first_query = NULL;
-    http1_query_t* last_query = NULL;
+    query_t* first_query = NULL;
+    query_t* last_query = NULL;
 
     queryparser_result_t result = queryparser_parse(
         string,
@@ -415,7 +415,7 @@ int __set_query(http1request_t* request, const char* string, size_t length, size
     return HTTP1PARSER_CONTINUE;
 }
 
-void http1parser_append_query(http1request_t* request, http1_query_t* query) {
+void http1parser_append_query(http1request_t* request, query_t* query) {
     if (request->query_ == NULL)
         request->query_ = query;
 
