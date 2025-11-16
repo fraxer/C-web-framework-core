@@ -3,7 +3,7 @@
 
 #include <stddef.h>
 
-#include "http1common.h"
+#include "queryparser.h"
 #include "bufferdata.h"
 
 typedef enum httpclientparser_stage {

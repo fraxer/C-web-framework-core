@@ -425,7 +425,7 @@ int __http1responseparser_set_header_value(http1response_t* response, http1respo
     char* string = bufferdata_get(&parser->buf);
     size_t length = bufferdata_writed(&parser->buf);
 
-    response->last_header->value = http1_set_field(string, length);
+    response->last_header->value = copy_cstringn(string, length);
     response->last_header->value_length = length;
 
     if (response->last_header->value == NULL)

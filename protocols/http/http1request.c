@@ -137,7 +137,7 @@ void http1request_reset(http1request_t* request) {
 
     http1request_payload_free(&request->payload_);
 
-    http1_queries_free(request->query_);
+    queries_free(request->query_);
     request->query_ = NULL;
     request->last_query = NULL;
 

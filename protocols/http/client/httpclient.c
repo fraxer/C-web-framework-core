@@ -422,7 +422,7 @@ int __httpclient_set_request_uri(httpclient_t* client) {
     request->path = httpclientparser_move_path(client->parser);
     request->path_length = strlen(request->path);
 
-    http1_queries_free(request->query_);
+    queries_free(request->query_);
     request->query_ = httpclientparser_move_query(client->parser);
     request->last_query = httpclientparser_move_last_query(client->parser);
     request->method = client->method;

@@ -5,6 +5,7 @@
 #include "http1common.h"
 #include "httpclient.h"
 #include "httpclientparser.h"
+#include "queryparser.h"
 
 void __httpclientparser_flush(httpclientparser_t* parser);
 int __httpclientparser_set_query(httpclientparser_t* parser, const char* string, size_t length, size_t pos);
@@ -242,7 +243,7 @@ void __httpclientparser_flush(httpclientparser_t* parser) {
     if (parser->path) free(parser->path);
     parser->path = NULL;
 
-    http1_queries_free(parser->query);
+    queries_free(parser->query);
     parser->query = NULL;
     parser->last_query = NULL;
 }
@@ -325,7 +326,7 @@ int __httpclientparser_set_uri(httpclientparser_t* parser) {
     http1_query_t* query = parser->query;
     if (query != NULL) str_appendc(uri, '?');
 
-    char* query_str = http1_query_str(parser->query);
+    char* query_str = query_stringify(parser->query);
     if (query_str != NULL) {
         str_append(uri, query_str, strlen(query_str));
         free(query_str);
@@ -337,68 +338,31 @@ int __httpclientparser_set_uri(httpclientparser_t* parser) {
     return 1;
 }
 
+static void __httpclientparser_append_query_callback(void* context, http1_query_t* query) {
+    httpclientparser_t* parser = (httpclientparser_t*)context;
+    __httpclientparser_append_query(parser, query);
+}
+
 int __httpclientparser_set_query(httpclientparser_t* parser, const char* string, size_t length, size_t pos) {
-    size_t point_start = pos + 1;
-    enum { KEY, VALUE } stage = KEY;
+    http1_query_t* first_query = NULL;
+    http1_query_t* last_query = NULL;
 
-    http1_query_t* query = http1_query_create(NULL, 0, NULL, 0);
-    if (query == NULL) return 0;
+    queryparser_result_t result = queryparser_parse(
+        string,
+        length,
+        pos + 1,  // Start after '?'
+        parser,
+        __httpclientparser_append_query_callback,
+        &first_query,
+        &last_query
+    );
 
-    parser->query = query;
-    parser->last_query = query;
-
-    for (++pos; pos < length; pos++) {
-        switch (string[pos]) {
-        case '=':
-            if (string[pos - 1] == '=') continue;
-
-            stage = VALUE;
-
-            query->key = urldecode(&string[point_start], pos - point_start);
-            if (query->key == NULL) return 0;
-
-            point_start = pos + 1;
-            break;
-        case '&':
-            stage = KEY;
-
-            query->value = urldecode(&string[point_start], pos - point_start);
-            if (query->value == NULL) return 0;
-
-            http1_query_t* query_new = http1_query_create(NULL, 0, NULL, 0);
-            if (query_new == NULL) return 0;
-
-            __httpclientparser_append_query(parser, query_new);
-
-            query = query_new;
-
-            point_start = pos + 1;
-            break;
-        case '#':
-            if (stage == KEY) {
-                query->key = urldecode(&string[point_start], pos - point_start);
-                if (query->key == NULL) return 0;
-            }
-            else if (stage == VALUE) {
-                query->value = urldecode(&string[point_start], pos - point_start);
-                if (query->value == NULL) return 0;
-            }
-
-            return 1;
-        }
+    if (result != QUERYPARSER_OK) {
+        return 0;
     }
 
-    if (stage == KEY) {
-        query->key = urldecode(&string[point_start], pos - point_start);
-        if (query->key == NULL) return 0;
-
-        query->value = http1_set_field("", 1);
-        if (query->value == NULL) return 0;
-    }
-    else if (stage == VALUE) {
-        query->value = urldecode(&string[point_start], pos - point_start);
-        if (query->value == NULL) return 0;
-    }
+    parser->query = first_query;
+    parser->last_query = last_query;
 
     return 1;
 }

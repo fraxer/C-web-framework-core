@@ -284,3 +284,15 @@ int is_path_traversal(const char* string, size_t length) {
 
     return 0;
 }
+
+char* copy_cstringn(const char* string, size_t length) {
+    char* value = malloc(length + 1);
+    if (value == NULL) return value;
+
+    if (string != NULL) {
+        memcpy(value, string, length);
+        value[length] = 0;
+    }
+
+    return value;
+}

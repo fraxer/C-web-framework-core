@@ -7,7 +7,6 @@
 #include "http1common.h"
 
 http1_header_t* http1_header_alloc();
-http1_query_t* http1_query_alloc();
 http1_cookie_t* http1_cookie_alloc();
 
 
@@ -27,10 +26,10 @@ http1_header_t* http1_header_create(const char* key, size_t key_length, const ch
     header->next = NULL;
 
     if (key_length)
-        header->key = http1_set_field(key, key_length);
+        header->key = copy_cstringn(key, key_length);
 
     if (value_length)
-        header->value = http1_set_field(value, value_length);
+        header->value = copy_cstringn(value, value_length);
 
     return header;
 }
@@ -81,87 +80,6 @@ http1_header_t* http1_header_delete(http1_header_t* header, const char* key) {
     }
 
     return first_header;
-}
-
-http1_query_t* http1_query_alloc() {
-    return malloc(sizeof(http1_query_t));
-}
-
-http1_query_t* http1_query_create(const char* key, size_t key_length, const char* value, size_t value_length) {
-    http1_query_t* query = http1_query_alloc();
-
-    if (query == NULL) return NULL;
-
-    query->key = NULL;
-    query->value = NULL;
-    query->next = NULL;
-
-    if (key && key_length)
-        query->key = http1_set_field(key, key_length);
-
-    if (value && value_length)
-        query->value = http1_set_field(value, value_length);
-
-    return query;
-}
-
-void http1_query_free(http1_query_t* query) {
-    free((void*)query->key);
-    free((void*)query->value);
-    free(query);
-}
-
-void http1_queries_free(http1_query_t* query) {
-    while (query != NULL) {
-        http1_query_t* next = query->next;
-        http1_query_free(query);
-        query = next;
-    }
-}
-
-char* http1_query_str(http1_query_t* query) {
-    if (query == NULL) return NULL;
-
-    str_t* uri = str_create_empty(256);
-    if (uri == NULL) return NULL;
-
-    while (query != NULL) {
-        size_t key_length = 0;
-        char* key = urlencodel(query->key, strlen(query->key), &key_length);
-        if (key == NULL) return NULL;
-
-        size_t value_length = 0;
-        char* value = urlencodel(query->value, strlen(query->value), &value_length);
-        if (value == NULL) return NULL;
-
-        str_append(uri, key, key_length);
-        str_appendc(uri, '=');
-        str_append(uri, value, value_length);
-        if (query->next != NULL)
-            str_appendc(uri, '&');
-
-        free(key);
-        free(value);
-
-        query = query->next;
-    }
-
-    char* string = str_copy(uri);
-    str_free(uri);
-
-    return string;
-}
-
-char* http1_set_field(const char* string, size_t length) {
-    char* value = malloc(length + 1);
-    if (value == NULL) return value;
-
-    if (string != NULL) {
-        memcpy(value, string, length);
-        value[length] = 0;
-    }
-
-    return value;
 }
 
 http1_payloadpart_t* http1_payloadpart_create() {
