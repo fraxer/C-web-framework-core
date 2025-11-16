@@ -8,7 +8,7 @@
 #include "query.h"
 
 const char* __value(http1request_t* request, const char* param_name) {
-    http1_query_t* query = request->query_;
+    query_t* query = request->query_;
 
     while (query) {
         if (strcmp(param_name, query->key) == 0)

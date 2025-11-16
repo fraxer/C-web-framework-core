@@ -42,7 +42,7 @@ int http1parser_run(http1requestparser_t* parser);
 void http1parser_set_bytes_readed(http1requestparser_t*, int);
 void http1parser_prepare_continue(http1requestparser_t* parser);
 int http1parser_set_uri(http1request_t*, const char*, size_t);
-void http1parser_append_query(http1request_t*, http1_query_t*);
+void http1parser_append_query(http1request_t*, query_t*);
 http1_ranges_t* http1parser_parse_range(char*, size_t);
 
 #endif

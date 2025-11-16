@@ -21,7 +21,7 @@ typedef struct websockets_protocol_resource {
     char* uri;
     char* path;
 
-    websockets_query_t* query_;
+    query_t* query_;
 
     char*(*payload)(struct websockets_protocol_resource*);
     file_content_t(*payload_file)(struct websockets_protocol_resource*);

@@ -155,7 +155,7 @@ void http1request_reset(http1request_t* request) {
 const char* http1request_query(http1request_t* request, const char* key) {
     if (key == NULL) return NULL;
 
-    http1_query_t* query = request->query_;
+    query_t* query = request->query_;
 
     while (query) {
         if (strcmp(key, query->key) == 0)

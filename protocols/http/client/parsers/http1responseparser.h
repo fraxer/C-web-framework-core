@@ -44,6 +44,6 @@ void http1responseparser_free(http1responseparser_t*);
 void http1responseparser_reset(http1responseparser_t*);
 int http1responseparser_run(http1responseparser_t*);
 void http1responseparser_set_bytes_readed(http1responseparser_t*, int);
-void http1responseparser_append_query(http1response_t*, http1_query_t*);
+void http1responseparser_append_query(http1response_t*, query_t*);
 
 #endif

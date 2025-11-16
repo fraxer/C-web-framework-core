@@ -9,7 +9,7 @@
 
 void __httpclientparser_flush(httpclientparser_t* parser);
 int __httpclientparser_set_query(httpclientparser_t* parser, const char* string, size_t length, size_t pos);
-void __httpclientparser_append_query(httpclientparser_t* parser, http1_query_t* query);
+void __httpclientparser_append_query(httpclientparser_t* parser, query_t* query);
 int __httpclientparser_set_path(httpclientparser_t* parser, const char* string, size_t length);
 int __httpclientparser_set_protocol(httpclientparser_t* parser);
 int __httpclientparser_set_host(httpclientparser_t* parser);
@@ -62,15 +62,15 @@ char* httpclientparser_move_path(httpclientparser_t* parser) {
     return path;
 }
 
-http1_query_t* httpclientparser_move_query(httpclientparser_t* parser) {
-    http1_query_t* query = parser->query;
+query_t* httpclientparser_move_query(httpclientparser_t* parser) {
+    query_t* query = parser->query;
     parser->query = NULL;
 
     return query;
 }
 
-http1_query_t* httpclientparser_move_last_query(httpclientparser_t* parser) {
-    http1_query_t* last_query = parser->last_query;
+query_t* httpclientparser_move_last_query(httpclientparser_t* parser) {
+    query_t* last_query = parser->last_query;
     parser->last_query = NULL;
 
     return last_query;
@@ -323,7 +323,7 @@ int __httpclientparser_set_uri(httpclientparser_t* parser) {
     str_t* uri = str_createn(parser->path, path_point_end);
     if (uri == NULL) return 0;
 
-    http1_query_t* query = parser->query;
+    query_t* query = parser->query;
     if (query != NULL) str_appendc(uri, '?');
 
     char* query_str = query_stringify(parser->query);
@@ -338,14 +338,14 @@ int __httpclientparser_set_uri(httpclientparser_t* parser) {
     return 1;
 }
 
-static void __httpclientparser_append_query_callback(void* context, http1_query_t* query) {
+static void __httpclientparser_append_query_callback(void* context, query_t* query) {
     httpclientparser_t* parser = (httpclientparser_t*)context;
     __httpclientparser_append_query(parser, query);
 }
 
 int __httpclientparser_set_query(httpclientparser_t* parser, const char* string, size_t length, size_t pos) {
-    http1_query_t* first_query = NULL;
-    http1_query_t* last_query = NULL;
+    query_t* first_query = NULL;
+    query_t* last_query = NULL;
 
     queryparser_result_t result = queryparser_parse(
         string,
@@ -367,7 +367,7 @@ int __httpclientparser_set_query(httpclientparser_t* parser, const char* string,
     return 1;
 }
 
-void __httpclientparser_append_query(httpclientparser_t* parser, http1_query_t* query) {
+void __httpclientparser_append_query(httpclientparser_t* parser, query_t* query) {
     if (parser->query == NULL)
         parser->query = query;
 

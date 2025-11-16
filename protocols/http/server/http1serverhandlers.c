@@ -276,7 +276,7 @@ int __handler_added_to_queue(http1request_t* request, http1response_t* response)
             for (route_param_t* param = route->param; param; param = param->next, i++) {
                 size_t substring_length = vector[i * 2 + 1] - vector[i * 2];
 
-                http1_query_t* query = query_create(param->string, param->string_len, &request->path[vector[i * 2]], substring_length);
+                query_t* query = query_create(param->string, param->string_len, &request->path[vector[i * 2]], substring_length);
 
                 if (query == NULL || query->key == NULL || query->value == NULL) return 0;
 
