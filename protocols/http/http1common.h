@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "file.h"
+#include "helpers.h"
 
 typedef struct http1_header {
     char* key;
@@ -18,12 +19,6 @@ typedef enum http1_version {
     HTTP1_VER_1_0,
     HTTP1_VER_1_1
 } http1_version_e;
-
-typedef struct http1_query {
-    const char* key;
-    const char* value;
-    struct http1_query* next;
-} http1_query_t;
 
 typedef struct http1_body {
     size_t size;
@@ -85,13 +80,6 @@ http1_header_t* http1_header_create(const char*, size_t, const char*, size_t);
 void http1_header_free(http1_header_t*);
 void http1_headers_free(http1_header_t*);
 http1_header_t* http1_header_delete(http1_header_t*, const char*);
-
-http1_query_t* http1_query_create(const char*, size_t, const char*, size_t);
-void http1_query_free(http1_query_t*);
-void http1_queries_free(http1_query_t*);
-char* http1_query_str(http1_query_t*);
-
-char* http1_set_field(const char*, size_t);
 
 http1_payloadpart_t* http1_payloadpart_create();
 void http1_payloadpart_free(http1_payloadpart_t*);

@@ -4,6 +4,7 @@
 #include "route.h"
 #include "connection.h"
 #include "http1common.h"
+#include "queryparser.h"
 #include "json.h"
 #include "request.h"
 

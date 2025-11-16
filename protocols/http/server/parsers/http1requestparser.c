@@ -11,6 +11,7 @@
 #include "http1common.h"
 #include "http1requestparser.h"
 #include "helpers.h"
+#include "queryparser.h"
 
 static int __parse_payload(http1requestparser_t* parser);
 static int __set_method(http1request_t* request, bufferdata_t* buf);
@@ -385,70 +386,31 @@ int __set_path(http1request_t* request, const char* string, size_t length) {
     return HTTP1PARSER_CONTINUE;
 }
 
+static void __http1parser_append_query_callback(void* context, http1_query_t* query) {
+    http1request_t* request = (http1request_t*)context;
+    http1parser_append_query(request, query);
+}
+
 int __set_query(http1request_t* request, const char* string, size_t length, size_t pos) {
-    size_t point_start = pos + 1;
+    http1_query_t* first_query = NULL;
+    http1_query_t* last_query = NULL;
 
-    enum { KEY, VALUE } stage = KEY;
+    queryparser_result_t result = queryparser_parse(
+        string,
+        length,
+        pos + 1,  // Start after '?'
+        request,
+        __http1parser_append_query_callback,
+        &first_query,
+        &last_query
+    );
 
-    http1_query_t* query = http1_query_create(NULL, 0, NULL, 0);
-
-    if (query == NULL) return HTTP1PARSER_OUT_OF_MEMORY;
-
-    request->query_ = query;
-    request->last_query = query;
-
-    for (++pos; pos < length; pos++) {
-        switch (string[pos]) {
-        case '=':
-            if (string[pos - 1] == '=') continue;
-
-            stage = VALUE;
-
-            query->key = urldecode(&string[point_start], pos - point_start);
-            if (query->key == NULL) return HTTP1PARSER_OUT_OF_MEMORY;
-
-            point_start = pos + 1;
-            break;
-        case '&':
-            stage = KEY;
-
-            query->value = urldecode(&string[point_start], pos - point_start);
-            if (query->value == NULL) return HTTP1PARSER_OUT_OF_MEMORY;
-
-            http1_query_t* query_new = http1_query_create(NULL, 0, NULL, 0);
-            if (query_new == NULL) return HTTP1PARSER_OUT_OF_MEMORY;
-
-            http1parser_append_query(request, query_new);
-
-            query = query_new;
-
-            point_start = pos + 1;
-            break;
-        case '#':
-            if (stage == KEY) {
-                query->key = urldecode(&string[point_start], pos - point_start);
-                if (query->key == NULL) return HTTP1PARSER_OUT_OF_MEMORY;
-            }
-            else if (stage == VALUE) {
-                query->value = urldecode(&string[point_start], pos - point_start);
-                if (query->value == NULL) return HTTP1PARSER_OUT_OF_MEMORY;
-            }
-
-            return HTTP1PARSER_CONTINUE;
-        }
+    if (result != QUERYPARSER_OK) {
+        return HTTP1PARSER_OUT_OF_MEMORY;
     }
 
-    if (stage == KEY) {
-        query->key = urldecode(&string[point_start], pos - point_start);
-        if (query->key == NULL) return HTTP1PARSER_OUT_OF_MEMORY;
-
-        query->value = http1_set_field("", 1);
-        if (query->value == NULL) return HTTP1PARSER_OUT_OF_MEMORY;
-    }
-    else if (stage == VALUE) {
-        query->value = urldecode(&string[point_start], pos - point_start);
-        if (query->value == NULL) return HTTP1PARSER_OUT_OF_MEMORY;
-    }
+    request->query_ = first_query;
+    request->last_query = last_query;
 
     return HTTP1PARSER_CONTINUE;
 }
@@ -693,7 +655,7 @@ int __set_header_value(http1request_t* request, http1requestparser_t* parser) {
     char* string = bufferdata_get(&parser->buf);
     size_t length = bufferdata_writed(&parser->buf);
 
-    request->last_header->value = http1_set_field(string, length);
+    request->last_header->value = copy_cstringn(string, length);
     request->last_header->value_length = length;
 
     if (request->last_header->value == NULL)

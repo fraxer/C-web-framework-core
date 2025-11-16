@@ -165,11 +165,11 @@ int multipartparser_create_part(multipartparser_t* parser) {
                 http1_payloadfield_t* f = http1_payloadfield_create();
 
                 f->key_length = hfield->key_size;
-                f->key = http1_set_field(hfield->key, hfield->key_size);
+                f->key = copy_cstringn(hfield->key, hfield->key_size);
                 if (f->key == NULL) return 0;
 
                 f->value_length = hfield->value_size;
-                f->value = http1_set_field(&header->value[hfield->value_offset], hfield->value_size);
+                f->value = copy_cstringn(&header->value[hfield->value_offset], hfield->value_size);
                 if (f->value == NULL) return 0;
 
                 hfield = hfield->next;

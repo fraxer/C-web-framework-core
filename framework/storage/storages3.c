@@ -618,7 +618,7 @@ char* __create_authtoken(storages3_t* storage, httpclient_t* client, const char*
     const char *signed_headers = "host;x-amz-content-sha256;x-amz-date";
     httpclientparser_t* parser = client->parser;
 
-    char* query_str = http1_query_str(parser->query);
+    char* query_str = query_stringify(parser->query);
 
     char canonical_request[1024];
     snprintf(canonical_request, 1024, 

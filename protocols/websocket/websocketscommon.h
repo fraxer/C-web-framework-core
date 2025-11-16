@@ -5,6 +5,7 @@
 #include <sys/types.h>
 
 #include "connection_queue.h"
+#include "queryparser.h"
 
 struct websocketsrequest;
 
@@ -18,11 +19,8 @@ typedef enum websockets_datatype {
     WEBSOCKETS_PONG = 0x8A
 } websockets_datatype_e;
 
-typedef struct websockets_query {
-    const char* key;
-    const char* value;
-    struct websockets_query* next;
-} websockets_query_t;
+// Use http1_query_t as websockets_query_t - they are structurally identical
+typedef http1_query_t websockets_query_t;
 
 typedef struct websockets_body {
     size_t size;

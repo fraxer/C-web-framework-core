@@ -5,6 +5,7 @@
 #include "http1parsercommon.h"
 #include "http1teparser.h"
 #include "http1response.h"
+#include "queryparser.h"
 #include "bufferdata.h"
 #include "gzip.h"
 

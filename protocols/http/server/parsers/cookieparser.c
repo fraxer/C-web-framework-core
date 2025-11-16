@@ -23,7 +23,7 @@ void cookieparser_parse(cookieparser_t* parser, char* buffer, size_t buffer_size
         switch (stage) {
         case KEY:
             if (ch == '=') {
-                cookie->key = http1_set_field(&buffer[parser->offset], parser->size);
+                cookie->key = copy_cstringn(&buffer[parser->offset], parser->size);
                 cookie->key_length = parser->size;
 
                 parser->offset = parser->payload_offset + 1;
@@ -36,7 +36,7 @@ void cookieparser_parse(cookieparser_t* parser, char* buffer, size_t buffer_size
             break;
         case VALUE:
             if (ch == ';' || ch == '\0') {
-                cookie->value = http1_set_field(&buffer[parser->offset], parser->size);
+                cookie->value = copy_cstringn(&buffer[parser->offset], parser->size);
                 cookie->value_length = parser->size;
 
                 parser->offset = parser->payload_offset + 1;

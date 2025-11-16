@@ -5,6 +5,7 @@
 #include "websocketsprotocolresource.h"
 #include "websocketsresponse.h"
 #include "websocketsparser.h"
+#include "queryparser.h"
 
 static const size_t method_max_length = 6;
 
@@ -20,10 +21,7 @@ int websocketsparser_parse_method(websockets_protocol_resource_t*, char*, size_t
 int websocketsparser_parse_location(websockets_protocol_resource_t*, char*, size_t);
 int websocketsparser_append_uri(websockets_protocol_resource_t*, const char*, size_t);
 int websocketsparser_set_path(websockets_protocol_resource_t*, const char*, size_t);
-int websocketsparser_set_query(websockets_protocol_resource_t*, const char*, size_t);
-websockets_query_t* websockets_query_create(const char*, size_t, const char*, size_t);
-void websockets_query_free(websockets_query_t*);
-const char* websockets_set_field(const char*, size_t);
+int websocketsparser_set_query(websockets_protocol_resource_t*, const char*, size_t, size_t);
 
 websockets_protocol_t* websockets_protocol_resource_create(void) {
     websockets_protocol_resource_t* protocol = malloc(sizeof * protocol);
@@ -107,7 +105,7 @@ int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t
             for (route_param_t* param = route->param; param; param = param->next, i++) {
                 size_t substring_length = vector[i * 2 + 1] - vector[i * 2];
 
-                websockets_query_t* query = websockets_query_create(param->string, param->string_len, &protocol->path[vector[i * 2]], substring_length);
+                websockets_query_t* query = query_create(param->string, param->string_len, &protocol->path[vector[i * 2]], substring_length);
 
                 if (query == NULL || query->key == NULL || query->value == NULL) return 0;
 
@@ -265,7 +263,7 @@ void websocketsrequest_query_free(websockets_query_t* query) {
     while (query != NULL) {
         websockets_query_t* next = query->next;
 
-        websockets_query_free(query);
+        query_free(query);
 
         query = next;
     }
@@ -295,7 +293,7 @@ int websocketsparser_parse_location(websockets_protocol_resource_t* protocol, ch
         case '?':
             path_point_end = pos;
 
-            int result = websocketsparser_set_query(protocol, &string[pos + 1], length - (pos + 1));
+            int result = websocketsparser_set_query(protocol, string, length, pos);
             if (result == 0)
                 goto next;
 
@@ -344,78 +342,24 @@ int websocketsparser_set_path(websockets_protocol_resource_t* protocol, const ch
     return 1;
 }
 
-int websocketsparser_set_query(websockets_protocol_resource_t* protocol, const char* string, size_t length) {
-    size_t pos = 0;
-    size_t point_start = 0;
+int websocketsparser_set_query(websockets_protocol_resource_t* protocol, const char* string, size_t length, size_t pos) {
+    websockets_query_t* first_query = NULL;
+    websockets_query_t* last_query = NULL;
 
-    enum { KEY, VALUE } stage = KEY;
+    queryparser_result_t result = queryparser_parse(
+        string,
+        length,
+        pos + 1,  // Start after '?'
+        NULL,
+        NULL,  // No append callback needed for WebSockets
+        &first_query,
+        &last_query
+    );
 
-    websockets_query_t* query = websockets_query_create(NULL, 0, NULL, 0);
+    if (result != QUERYPARSER_OK)
+        return -1;
 
-    if (query == NULL) return -1;
-
-    protocol->query_ = query;
-
-    websockets_query_t* last_query = query;
-
-    for (; pos < length; pos++) {
-        switch (string[pos]) {
-        case '=':
-            if (string[pos - 1] == '=') continue;
-
-            stage = VALUE;
-
-            query->key = urldecode(&string[point_start], pos - point_start);
-
-            if (query->key == NULL) return -1;
-
-            point_start = pos + 1;
-            break;
-        case '&':
-            stage = KEY;
-
-            query->value = urldecode(&string[point_start], pos - point_start);
-
-            if (query->value == NULL) return -1;
-
-            websockets_query_t* query_new = websockets_query_create(NULL, 0, NULL, 0);
-
-            if (query_new == NULL) return -1;
-
-            if (last_query)
-                last_query->next = query_new;
-
-            last_query = query_new;
-
-            query = query_new;
-
-            point_start = pos + 1;
-            break;
-        case '#':
-            if (stage == KEY) {
-                query->key = urldecode(&string[point_start], pos - point_start);
-                if (query->key == NULL) return -1;
-            }
-            else if (stage == VALUE) {
-                query->value = urldecode(&string[point_start], pos - point_start);
-                if (query->value == NULL) return -1;
-            }
-
-            return 0;
-        }
-    }
-
-    if (stage == KEY) {
-        query->key = urldecode(&string[point_start], pos - point_start);
-        if (query->key == NULL) return -1;
-
-        query->value = websockets_set_field("", 0);
-        if (query->value == NULL) return -1;
-    }
-    else if (stage == VALUE) {
-        query->value = urldecode(&string[point_start], pos - point_start);
-        if (query->value == NULL) return -1;
-    }
+    protocol->query_ = first_query;
 
     return 0;
 }
@@ -432,41 +376,6 @@ int websocketsrequest_has_payload(websockets_protocol_resource_t* protocol) {
     return 0;
 }
 
-websockets_query_t* websockets_query_alloc() {
-    return malloc(sizeof(websockets_query_t));
-}
-
-websockets_query_t* websockets_query_create(const char* key, size_t key_length, const char* value, size_t value_length) {
-    websockets_query_t* query = websockets_query_alloc();
-
-    if (query == NULL) return NULL;
-
-    query->key = websockets_set_field(key, key_length);
-    query->value = websockets_set_field(value, value_length);
-    query->next = NULL;
-
-    return query;
-}
-
-void websockets_query_free(websockets_query_t* query) {
-    free((void*)query->key);
-    free((void*)query->value);
-    free(query);
-}
-
-const char* websockets_set_field(const char* string, size_t length) {
-    if (string == NULL) return NULL;
-
-    char* value = (char*)malloc(length + 1);
-
-    if (value == NULL) return value;
-
-    strncpy(value, string, length);
-
-    value[length] = 0;
-
-    return value;
-}
 
 int set_websockets_resource(connection_t* connection) {
     connection->read = websockets_guard_read;
