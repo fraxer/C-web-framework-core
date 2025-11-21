@@ -4,20 +4,20 @@
 #include <stdlib.h>
 #include <stddef.h>
 
-#include "http1common.h"
+#include "httpcommon.h"
 
 typedef struct cookieparser {
     size_t payload_offset;
     size_t offset;
     size_t size;
-    http1_cookie_t* cookie;
-    http1_cookie_t* last_cookie;
+    http_cookie_t* cookie;
+    http_cookie_t* last_cookie;
 } cookieparser_t;
 
 void cookieparser_init(cookieparser_t*);
 
 void cookieparser_parse(cookieparser_t*, char*, size_t);
 
-http1_cookie_t* cookieparser_cookie(cookieparser_t*);
+http_cookie_t* cookieparser_cookie(cookieparser_t*);
 
 #endif

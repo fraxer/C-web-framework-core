@@ -3,42 +3,42 @@
 #include <stdlib.h>
 #include <ctype.h>
 
-#include "http1response.h"
+#include "httpresponse.h"
 #include "cookieparser.h"
 #include "domain.h"
 #include "log.h"
 #include "appconfig.h"
-#include "http1common.h"
-#include "http1requestparser.h"
+#include "httpcommon.h"
+#include "httprequestparser.h"
 #include "helpers.h"
 #include "queryparser.h"
 
-static int __parse_payload(http1requestparser_t* parser);
-static int __set_method(http1request_t* request, bufferdata_t* buf);
-static int __set_protocol(http1request_t* request, bufferdata_t* buf);
-static int __set_header_key(http1request_t* request, bufferdata_t* buf);
-static int __set_header_value(http1request_t* request, http1requestparser_t* parser);
-static int __set_path(http1request_t* request, const char* string, size_t length);
-static int __set_query(http1request_t* request, const char* string, size_t length, size_t pos);
-static int __try_set_server(http1requestparser_t* parser, http1_header_t* header);
-static void __try_set_keepalive(http1requestparser_t* parser);
-static void __try_set_range(http1requestparser_t* parser);
-static void __try_set_cookie(http1request_t* request);
-static void __flush(http1requestparser_t* parser);
-static int __header_is_host(http1_header_t* header);
-static int __header_is_content_length(http1_header_t* header);
+static int __parse_payload(httprequestparser_t* parser);
+static int __set_method(httprequest_t* request, bufferdata_t* buf);
+static int __set_protocol(httprequest_t* request, bufferdata_t* buf);
+static int __set_header_key(httprequest_t* request, bufferdata_t* buf);
+static int __set_header_value(httprequest_t* request, httprequestparser_t* parser);
+static int __set_path(httprequest_t* request, const char* string, size_t length);
+static int __set_query(httprequest_t* request, const char* string, size_t length, size_t pos);
+static int __try_set_server(httprequestparser_t* parser, http_header_t* header);
+static void __try_set_keepalive(httprequestparser_t* parser);
+static void __try_set_range(httprequestparser_t* parser);
+static void __try_set_cookie(httprequest_t* request);
+static void __flush(httprequestparser_t* parser);
+static int __header_is_host(http_header_t* header);
+static int __header_is_content_length(http_header_t* header);
 
-http1requestparser_t* http1parser_create(connection_t* connection) {
-    http1requestparser_t* parser = malloc(sizeof * parser);
+httprequestparser_t* httpparser_create(connection_t* connection) {
+    httprequestparser_t* parser = malloc(sizeof * parser);
     if (parser == NULL) return NULL;
 
-    http1parser_init(parser, connection);
+    httpparser_init(parser, connection);
 
     return parser;
 }
 
-void http1parser_init(http1requestparser_t* parser, connection_t* connection) {
-    parser->base.free = http1parser_free;
+void httpparser_init(httprequestparser_t* parser, connection_t* connection) {
+    parser->base.free = httpparser_free;
     parser->stage = HTTP1REQUESTPARSER_METHOD;
     parser->host_found = connection->ssl != NULL;
     parser->bytes_readed = 0;
@@ -53,24 +53,24 @@ void http1parser_init(http1requestparser_t* parser, connection_t* connection) {
     bufferdata_init(&parser->buf);
 }
 
-void http1parser_free(void* arg) {
-    http1requestparser_t* parser = arg;
+void httpparser_free(void* arg) {
+    httprequestparser_t* parser = arg;
 
     __flush(parser);
     free(parser);
 }
 
-void http1parser_reset(http1requestparser_t* parser) {
+void httpparser_reset(httprequestparser_t* parser) {
     __flush(parser);
-    http1parser_init(parser, parser->connection);
+    httpparser_init(parser, parser->connection);
 }
 
-void __flush(http1requestparser_t* parser) {
+void __flush(httprequestparser_t* parser) {
     if (parser->buf.dynamic_buffer) free(parser->buf.dynamic_buffer);
     parser->buf.dynamic_buffer = NULL;
 }
 
-int http1parser_run(http1requestparser_t* parser) {
+int httpparser_run(httprequestparser_t* parser) {
     if (parser->stage == HTTP1REQUESTPARSER_PAYLOAD)
         return __parse_payload(parser);
 
@@ -81,7 +81,7 @@ int http1parser_run(http1requestparser_t* parser) {
         {
         case HTTP1REQUESTPARSER_METHOD:
             if (parser->request == NULL)
-                parser->request = http1request_create(parser->connection);
+                parser->request = httprequest_create(parser->connection);
 
             if (ch == ' ') {
                 parser->stage = HTTP1REQUESTPARSER_URI;
@@ -111,14 +111,14 @@ int http1parser_run(http1requestparser_t* parser) {
                 if (uri == NULL)
                     return HTTP1PARSER_OUT_OF_MEMORY;
 
-                int result = http1parser_set_uri(parser->request, uri, length);
+                int result = httpparser_set_uri(parser->request, uri, length);
                 if (result != HTTP1PARSER_CONTINUE)
                     return result;
 
                 bufferdata_reset(&parser->buf);
                 break;
             }
-            else if (http1parser_is_ctl(ch)) {
+            else if (httpparser_is_ctl(ch)) {
                 return HTTP1PARSER_BAD_REQUEST;
             }
             else {
@@ -171,7 +171,7 @@ int http1parser_run(http1requestparser_t* parser) {
 
                 break;
             }
-            else if (http1parser_is_ctl(ch)) {
+            else if (httpparser_is_ctl(ch)) {
                 return HTTP1PARSER_BAD_REQUEST;
             }
             else {
@@ -198,7 +198,7 @@ int http1parser_run(http1requestparser_t* parser) {
 
                 break;
             }
-            else if (http1parser_is_ctl(ch)) {
+            else if (httpparser_is_ctl(ch)) {
                 return HTTP1PARSER_BAD_REQUEST;
             }
             else
@@ -240,11 +240,11 @@ int http1parser_run(http1requestparser_t* parser) {
     return HTTP1PARSER_CONTINUE;
 }
 
-void http1parser_set_bytes_readed(http1requestparser_t* parser, int readed) {
+void httpparser_set_bytes_readed(httprequestparser_t* parser, int readed) {
     parser->bytes_readed = readed;
 }
 
-void http1parser_prepare_continue(http1requestparser_t* parser) {
+void httpparser_prepare_continue(httprequestparser_t* parser) {
     bufferdata_clear(&parser->buf);
 
     parser->stage = HTTP1REQUESTPARSER_METHOD;
@@ -255,10 +255,10 @@ void http1parser_prepare_continue(http1requestparser_t* parser) {
     parser->host_found = 0;
 }
 
-int __parse_payload(http1requestparser_t* parser) {
-    http1request_t* request = parser->request;
+int __parse_payload(httprequestparser_t* parser) {
+    httprequest_t* request = parser->request;
 
-    if (!http1request_allow_payload(request))
+    if (!httprequest_allow_payload(request))
         return HTTP1PARSER_BAD_REQUEST;
 
     size_t string_len = parser->bytes_readed - parser->pos;
@@ -300,7 +300,7 @@ int __parse_payload(http1requestparser_t* parser) {
     return HTTP1PARSER_CONTINUE;
 }
 
-int __set_method(http1request_t* request, bufferdata_t* buf) {
+int __set_method(httprequest_t* request, bufferdata_t* buf) {
     char* s = bufferdata_get(buf);
     size_t l = bufferdata_writed(buf);
 
@@ -324,7 +324,7 @@ int __set_method(http1request_t* request, bufferdata_t* buf) {
     return 1;
 }
 
-int http1parser_set_uri(http1request_t* request, const char* string, size_t length) {
+int httpparser_set_uri(httprequest_t* request, const char* string, size_t length) {
     if (string[0] != '/')
         return HTTP1PARSER_BAD_REQUEST;
 
@@ -355,7 +355,7 @@ int http1parser_set_uri(http1request_t* request, const char* string, size_t leng
     return __set_path(request, string, path_point_end);
 }
 
-int __set_protocol(http1request_t* request, bufferdata_t* buf) {
+int __set_protocol(httprequest_t* request, bufferdata_t* buf) {
     char* s = bufferdata_get(buf);
 
     if (s[0] == 'H' && s[1] == 'T' && s[2] == 'T' && s[3] == 'P' && s[4] == '/'  && s[5] == '1' && s[6] == '.' && s[7] == '1') {
@@ -372,7 +372,7 @@ int __set_protocol(http1request_t* request, bufferdata_t* buf) {
     return HTTP1PARSER_BAD_REQUEST;
 }
 
-int __set_path(http1request_t* request, const char* string, size_t length) {
+int __set_path(httprequest_t* request, const char* string, size_t length) {
     size_t decoded_length = 0;
     char* path = urldecodel(string, length, &decoded_length);
     if (path == NULL) return HTTP1PARSER_OUT_OF_MEMORY;
@@ -386,12 +386,12 @@ int __set_path(http1request_t* request, const char* string, size_t length) {
     return HTTP1PARSER_CONTINUE;
 }
 
-static void __http1parser_append_query_callback(void* context, query_t* query) {
-    http1request_t* request = (http1request_t*)context;
-    http1parser_append_query(request, query);
+static void __httpparser_append_query_callback(void* context, query_t* query) {
+    httprequest_t* request = (httprequest_t*)context;
+    httpparser_append_query(request, query);
 }
 
-int __set_query(http1request_t* request, const char* string, size_t length, size_t pos) {
+int __set_query(httprequest_t* request, const char* string, size_t length, size_t pos) {
     query_t* first_query = NULL;
     query_t* last_query = NULL;
 
@@ -400,7 +400,7 @@ int __set_query(http1request_t* request, const char* string, size_t length, size
         length,
         pos + 1,  // Start after '?'
         request,
-        __http1parser_append_query_callback,
+        __httpparser_append_query_callback,
         &first_query,
         &last_query
     );
@@ -415,7 +415,7 @@ int __set_query(http1request_t* request, const char* string, size_t length, size
     return HTTP1PARSER_CONTINUE;
 }
 
-void http1parser_append_query(http1request_t* request, query_t* query) {
+void httpparser_append_query(httprequest_t* request, query_t* query) {
     if (request->query_ == NULL)
         request->query_ = query;
 
@@ -425,7 +425,7 @@ void http1parser_append_query(http1request_t* request, query_t* query) {
     request->last_query = query;
 }
 
-int __try_set_server(http1requestparser_t* parser, http1_header_t* header) {
+int __try_set_server(httprequestparser_t* parser, http_header_t* header) {
     if (parser->host_found) return HTTP1PARSER_CONTINUE;
     
     if (!__header_is_host(header)) return HTTP1PARSER_CONTINUE;
@@ -478,9 +478,9 @@ int __try_set_server(http1requestparser_t* parser, http1_header_t* header) {
     return HTTP1PARSER_HOST_NOT_FOUND;
 }
 
-void __try_set_keepalive(http1requestparser_t* parser) {
-    http1request_t* request = parser->request;
-    http1_header_t* header = request->last_header;
+void __try_set_keepalive(httprequestparser_t* parser) {
+    httprequest_t* request = parser->request;
+    http_header_t* header = request->last_header;
 
     const char* connection_key = "connection";
     const size_t connection_key_length = 10;
@@ -493,15 +493,15 @@ void __try_set_keepalive(http1requestparser_t* parser) {
     parser->connection->keepalive = cmpstrn_lower(header->value, header->value_length, connection_value, connection_value_length);
 }
 
-void __try_set_range(http1requestparser_t* parser) {
-    http1request_t* request = parser->request;
+void __try_set_range(httprequestparser_t* parser) {
+    httprequest_t* request = parser->request;
 
     if (cmpstrn_lower(request->last_header->key, request->last_header->key_length, "range", 5))
-        request->ranges = http1parser_parse_range((char*)request->last_header->value, request->last_header->value_length);
+        request->ranges = httpparser_parse_range((char*)request->last_header->value, request->last_header->value_length);
 }
 
-void __try_set_cookie(http1request_t* request) {
-    http1_header_t* header = request->last_header;
+void __try_set_cookie(httprequest_t* request) {
+    http_header_t* header = request->last_header;
 
     const char* key = "cookie";
     const size_t key_length = 6;
@@ -516,13 +516,13 @@ void __try_set_cookie(http1request_t* request) {
     request->cookie_ = cookieparser_cookie(&cparser);
 }
 
-http1_ranges_t* http1parser_parse_range(char* str, size_t length) {
+http_ranges_t* httpparser_parse_range(char* str, size_t length) {
     int result = -1;
     long long int max = 9223372036854775807;
     long long int start_finded = 0;
     size_t start_position = 6;
-    http1_ranges_t* ranges = NULL;
-    http1_ranges_t* last_range = NULL;
+    http_ranges_t* ranges = NULL;
+    http_ranges_t* last_range = NULL;
 
     if (!(str[0] == 'b' && str[1] == 'y' && str[2] == 't' && str[3] == 'e' && str[4] == 's' && str[5] == '=')) return NULL;
 
@@ -554,7 +554,7 @@ http1_ranges_t* http1parser_parse_range(char* str, size_t length) {
                 }
             }
 
-            http1_ranges_t* range = http1response_init_ranges();
+            http_ranges_t* range = httpresponse_init_ranges();
             if (range == NULL) goto failed;
 
             if (ranges == NULL) ranges = range;
@@ -620,17 +620,17 @@ http1_ranges_t* http1parser_parse_range(char* str, size_t length) {
     failed:
 
     if (result == -1) {
-        http1_ranges_free(ranges);
+        http_ranges_free(ranges);
         return NULL;
     }
 
     return ranges;
 }
 
-int __set_header_key(http1request_t* request, bufferdata_t* buf) {
+int __set_header_key(httprequest_t* request, bufferdata_t* buf) {
     char* string = bufferdata_get(buf);
     size_t length = bufferdata_writed(buf);
-    http1_header_t* header = http1_header_create(string, length, NULL, 0);
+    http_header_t* header = http_header_create(string, length, NULL, 0);
 
     if (header == NULL) {
         log_error("HTTP error: can't alloc header memory\n");
@@ -651,7 +651,7 @@ int __set_header_key(http1request_t* request, bufferdata_t* buf) {
     return HTTP1PARSER_CONTINUE;
 }
 
-int __set_header_value(http1request_t* request, http1requestparser_t* parser) {
+int __set_header_value(httprequest_t* request, httprequestparser_t* parser) {
     char* string = bufferdata_get(&parser->buf);
     size_t length = bufferdata_writed(&parser->buf);
 
@@ -675,10 +675,10 @@ int __set_header_value(http1request_t* request, http1requestparser_t* parser) {
     return HTTP1PARSER_CONTINUE;
 }
 
-int __header_is_host(http1_header_t* header) {
+int __header_is_host(http_header_t* header) {
     return cmpstrn_lower(header->key, header->key_length, "host", 4);
 }
 
-int __header_is_content_length(http1_header_t* header) {
+int __header_is_content_length(http_header_t* header) {
     return cmpstrn_lower(header->key, header->key_length, "content-length", 14);
 }

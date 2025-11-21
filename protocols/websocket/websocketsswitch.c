@@ -1,11 +1,11 @@
 #include "websocketsswitch.h"
 
 void switch_to_websockets(httpctx_t* ctx) {
-    const http1_header_t* connection  = ctx->request->headern(ctx->request, "Connection", 10);
-    const http1_header_t* upgrade     = ctx->request->headern(ctx->request, "Upgrade", 7);
-    const http1_header_t* ws_version  = ctx->request->headern(ctx->request, "Sec-WebSocket-Version", 21);
-    const http1_header_t* ws_key      = ctx->request->headern(ctx->request, "Sec-WebSocket-Key", 17);
-    const http1_header_t* ws_protocol = ctx->request->headern(ctx->request, "Sec-WebSocket-Protocol", 22);
+    const http_header_t* connection  = ctx->request->headern(ctx->request, "Connection", 10);
+    const http_header_t* upgrade     = ctx->request->headern(ctx->request, "Upgrade", 7);
+    const http_header_t* ws_version  = ctx->request->headern(ctx->request, "Sec-WebSocket-Version", 21);
+    const http_header_t* ws_key      = ctx->request->headern(ctx->request, "Sec-WebSocket-Key", 17);
+    const http_header_t* ws_protocol = ctx->request->headern(ctx->request, "Sec-WebSocket-Protocol", 22);
 
     if (connection == NULL || upgrade == NULL || ws_version == NULL || ws_key == NULL) {
         ctx->response->data(ctx->response, "error connect to web socket");

@@ -11,10 +11,10 @@ typedef enum {
     QUERYPARSER_ERROR = -1
 } queryparser_result_t;
 
-typedef struct http1_query {
+typedef struct http_query {
     const char* key;
     const char* value;
-    struct http1_query* next;
+    struct http_query* next;
 } query_t;
 
 /**

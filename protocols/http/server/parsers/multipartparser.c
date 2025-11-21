@@ -146,14 +146,14 @@ void multipartparser_parse(multipartparser_t* parser, char* buffer, size_t buffe
     }
 }
 
-http1_payloadpart_t* multipartparser_part(multipartparser_t* parser) {
+http_payloadpart_t* multipartparser_part(multipartparser_t* parser) {
     return parser->part;
 }
 
 int multipartparser_create_part(multipartparser_t* parser) {
-    http1_header_t* header = parser->header;
-    http1_payloadfield_t* field = NULL;
-    http1_payloadfield_t* last_field = NULL;
+    http_header_t* header = parser->header;
+    http_payloadfield_t* field = NULL;
+    http_payloadfield_t* last_field = NULL;
     while (header) {
         if (strcmp(header->key, "Content-Disposition") == 0) {
             formdataparser_t fdparser;
@@ -162,7 +162,7 @@ int multipartparser_create_part(multipartparser_t* parser) {
 
             formdatafield_t* hfield = formdataparser_fields(&fdparser);
             while (hfield) {
-                http1_payloadfield_t* f = http1_payloadfield_create();
+                http_payloadfield_t* f = http_payloadfield_create();
 
                 f->key_length = hfield->key_size;
                 f->key = copy_cstringn(hfield->key, hfield->key_size);
@@ -187,7 +187,7 @@ int multipartparser_create_part(multipartparser_t* parser) {
         header = header->next;
     }
 
-    http1_payloadpart_t* part = http1_payloadpart_create();
+    http_payloadpart_t* part = http_payloadpart_create();
     if (part == NULL) return 0;
 
     part->offset = parser->offset;
@@ -210,7 +210,7 @@ int multipartparser_create_part(multipartparser_t* parser) {
 int multipartparser_create_header(multipartparser_t* parser) {
     parser->stage = HEADER_KEY;
 
-    http1_header_t* header = http1_header_create(NULL, parser->header_key_size, NULL, parser->header_value_size);
+    http_header_t* header = http_header_create(NULL, parser->header_key_size, NULL, parser->header_value_size);
     if (header == NULL) return 0;
 
     if (!multipartparser_write_header(parser->payload_fd, header->key, parser->header_key_offset, parser->header_key_size))

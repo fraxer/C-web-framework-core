@@ -109,7 +109,7 @@ file_t __file_get(void* storage, const char* path) {
     if (client == NULL)
         goto failed;
 
-    http1request_t* req = client->request;
+    httprequest_t* req = client->request;
 
     char amz_date[64];
     __create_amz_date(amz_date, sizeof(amz_date));
@@ -120,7 +120,7 @@ file_t __file_get(void* storage, const char* path) {
     req->header_add(req, "x-amz-content-sha256", EMPTY_PAYLOAD_HASH);
     req->header_add(req, "x-amz-date", amz_date);
 
-    http1response_t* res = client->send(client);
+    httpresponse_t* res = client->send(client);
     if (!res)
         goto failed;
     if (res->status_code != 200)
@@ -185,7 +185,7 @@ int __file_content_put(void* storage, const file_content_t* file_content, const 
     if (client == NULL)
         goto failed;
 
-    http1request_t* req = client->request;
+    httprequest_t* req = client->request;
 
     unsigned char file_content_hash[SHA256_DIGEST_LENGTH];
     char payload_hash[SHA256_DIGEST_LENGTH * 2 + 1];
@@ -215,7 +215,7 @@ int __file_content_put(void* storage, const file_content_t* file_content, const 
 
     req->set_payload_file_content(req, file_content);
 
-    http1response_t* res = client->send(client);
+    httpresponse_t* res = client->send(client);
     if (!res)
         goto failed;
     if (res->status_code >= 300)
@@ -260,7 +260,7 @@ int __file_data_put(void* storage, const char* data, const size_t data_size, con
     if (client == NULL)
         goto failed;
 
-    http1request_t* req = client->request;
+    httprequest_t* req = client->request;
 
     unsigned char content_hash[SHA256_DIGEST_LENGTH];
     char payload_hash[SHA256_DIGEST_LENGTH * 2 + 1];
@@ -290,7 +290,7 @@ int __file_data_put(void* storage, const char* data, const size_t data_size, con
 
     req->set_payload_raw(req, data, data_size, mimetype);
 
-    http1response_t* res = client->send(client);
+    httpresponse_t* res = client->send(client);
     if (!res)
         goto failed;
     if (res->status_code >= 300)
@@ -329,7 +329,7 @@ int __file_remove(void* storage, const char* path) {
     if (client == NULL)
         goto failed;
 
-    http1request_t* req = client->request;
+    httprequest_t* req = client->request;
 
     char amz_date[64];
     __create_amz_date(amz_date, sizeof(amz_date));
@@ -340,7 +340,7 @@ int __file_remove(void* storage, const char* path) {
     req->header_add(req, "x-amz-content-sha256", EMPTY_PAYLOAD_HASH);
     req->header_add(req, "x-amz-date", amz_date);
 
-    http1response_t* res = client->send(client);
+    httpresponse_t* res = client->send(client);
     if (!res)
         goto failed;
     if (res->status_code != 200)
@@ -379,7 +379,7 @@ int __file_exist(void* storage, const char* path) {
     if (client == NULL)
         goto failed;
 
-    http1request_t* req = client->request;
+    httprequest_t* req = client->request;
 
     char amz_date[64];
     __create_amz_date(amz_date, sizeof(amz_date));
@@ -390,7 +390,7 @@ int __file_exist(void* storage, const char* path) {
     req->header_add(req, "x-amz-content-sha256", EMPTY_PAYLOAD_HASH);
     req->header_add(req, "x-amz-date", amz_date);
 
-    http1response_t* res = client->send(client);
+    httpresponse_t* res = client->send(client);
     if (!res)
         goto failed;
     if (res->status_code != 200)
@@ -429,7 +429,7 @@ array_t* __file_list(void* storage, const char* path) {
     client = httpclient_init(ROUTE_GET, url, timeout);
     if (client == NULL) goto failed;
 
-    http1request_t* req = client->request;
+    httprequest_t* req = client->request;
 
     char amz_date[64];
     __create_amz_date(amz_date, sizeof(amz_date));
@@ -440,7 +440,7 @@ array_t* __file_list(void* storage, const char* path) {
     req->header_add(req, "x-amz-content-sha256", EMPTY_PAYLOAD_HASH);
     req->header_add(req, "x-amz-date", amz_date);
 
-    http1response_t* res = client->send(client);
+    httpresponse_t* res = client->send(client);
     if (!res)
         goto failed;
     if (res->status_code != 200)

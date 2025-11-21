@@ -7,7 +7,7 @@
 #include "log.h"
 #include "query.h"
 
-const char* __value(http1request_t* request, const char* param_name) {
+const char* __value(httprequest_t* request, const char* param_name) {
     query_t* query = request->query_;
 
     while (query) {
@@ -20,7 +20,7 @@ const char* __value(http1request_t* request, const char* param_name) {
     return NULL;
 }
 
-const char* __prepare_and_get_value(http1request_t* request, const char* param_name, int** ok) {
+const char* __prepare_and_get_value(httprequest_t* request, const char* param_name, int** ok) {
     if (ok == NULL)
         return NULL;
 
@@ -91,12 +91,12 @@ int __is_long(const char* str) {
     char* endptr = NULL;
     errno = 0;
 
-    long val = strtol(str, &endptr, 10);
+    strtol(str, &endptr, 10);
 
     if (*endptr != '\0')
         return 0;
 
-    if (errno == ERANGE || val > LONG_MAX || val < LONG_MIN)
+    if (errno == ERANGE)
         return 0;
 
     return 1;
@@ -112,12 +112,12 @@ int __is_ulong(const char* str) {
     char* endptr = NULL;
     errno = 0;
 
-    unsigned long val = strtoul(str, &endptr, 10);
+    strtoul(str, &endptr, 10);
 
     if (*endptr != '\0')
         return 0;
 
-    if (errno == ERANGE || val > ULONG_MAX)
+    if (errno == ERANGE)
         return 0;
 
     return 1;
@@ -151,7 +151,7 @@ int __is_double(const char* str) {
     char* endptr = NULL;
     errno = 0;
 
-    float val = strtod(str, &endptr);
+    double val = strtod(str, &endptr);
 
     if (*endptr != '\0')
         return 0;
@@ -186,17 +186,17 @@ int __is_long_double(const char* str) {
     return 1;
 }
 
-const char* query_param_char(http1request_t* request, const char* param_name, int* ok) {
+const char* query_param_char(httprequest_t* request, const char* param_name, int* ok) {
     const char* value = __prepare_and_get_value(request, param_name, &ok);
     if (value == NULL)
-        return 0;
+        return NULL;
 
     *ok = 1;
 
     return value;
 }
 
-int query_param_int(http1request_t* request, const char* param_name, int* ok) {
+int query_param_int(httprequest_t* request, const char* param_name, int* ok) {
     const char* value = __prepare_and_get_value(request, param_name, &ok);
     if (value == NULL)
         return 0;
@@ -209,7 +209,7 @@ int query_param_int(http1request_t* request, const char* param_name, int* ok) {
     return atoi(value);
 }
 
-unsigned int query_param_uint(http1request_t* request, const char* param_name, int* ok) {
+unsigned int query_param_uint(httprequest_t* request, const char* param_name, int* ok) {
     const char* value = __prepare_and_get_value(request, param_name, &ok);
     if (value == NULL)
         return 0;
@@ -222,7 +222,7 @@ unsigned int query_param_uint(http1request_t* request, const char* param_name, i
     return strtoul(value, NULL, 10);
 }
 
-long query_param_long(http1request_t* request, const char* param_name, int* ok) {
+long query_param_long(httprequest_t* request, const char* param_name, int* ok) {
     const char* value = __prepare_and_get_value(request, param_name, &ok);
     if (value == NULL)
         return 0;
@@ -235,7 +235,7 @@ long query_param_long(http1request_t* request, const char* param_name, int* ok) 
     return strtol(value, NULL, 10);
 }
 
-unsigned long query_param_ulong(http1request_t* request, const char* param_name, int* ok) {
+unsigned long query_param_ulong(httprequest_t* request, const char* param_name, int* ok) {
     const char* value = __prepare_and_get_value(request, param_name, &ok);
     if (value == NULL)
         return 0;
@@ -245,10 +245,10 @@ unsigned long query_param_ulong(http1request_t* request, const char* param_name,
 
     *ok = 1;
 
-    return strtol(value, NULL, 10);
+    return strtoul(value, NULL, 10);
 }
 
-float query_param_float(http1request_t* request, const char* param_name, int* ok) {
+float query_param_float(httprequest_t* request, const char* param_name, int* ok) {
     const char* value = __prepare_and_get_value(request, param_name, &ok);
     if (value == NULL)
         return 0;
@@ -261,7 +261,7 @@ float query_param_float(http1request_t* request, const char* param_name, int* ok
     return strtof(value, NULL);
 }
 
-double query_param_double(http1request_t* request, const char* param_name, int* ok) {
+double query_param_double(httprequest_t* request, const char* param_name, int* ok) {
     const char* value = __prepare_and_get_value(request, param_name, &ok);
     if (value == NULL)
         return 0;
@@ -274,7 +274,7 @@ double query_param_double(http1request_t* request, const char* param_name, int* 
     return strtod(value, NULL);
 }
 
-long double query_param_ldouble(http1request_t* request, const char* param_name, int* ok) {
+long double query_param_ldouble(httprequest_t* request, const char* param_name, int* ok) {
     const char* value = __prepare_and_get_value(request, param_name, &ok);
     if (value == NULL)
         return 0;
@@ -287,7 +287,7 @@ long double query_param_ldouble(http1request_t* request, const char* param_name,
     return strtold(value, NULL);
 }
 
-json_doc_t* query_param_array(http1request_t* request, const char* param_name, int* ok) {
+json_doc_t* query_param_array(httprequest_t* request, const char* param_name, int* ok) {
     const char* value = __prepare_and_get_value(request, param_name, &ok);
     if (value == NULL)
         return NULL;
@@ -310,7 +310,7 @@ json_doc_t* query_param_array(http1request_t* request, const char* param_name, i
     return document;
 }
 
-json_doc_t* query_param_object(http1request_t* request, const char* param_name, int* ok) {
+json_doc_t* query_param_object(httprequest_t* request, const char* param_name, int* ok) {
     const char* value = __prepare_and_get_value(request, param_name, &ok);
     if (value == NULL)
         return NULL;

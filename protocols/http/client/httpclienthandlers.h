@@ -4,8 +4,8 @@
 #include "connection_c.h"
 
 void set_client_tls(connection_t* connection);
-void set_client_http1(connection_t* connection);
-int http1_client_read(connection_t* connection);
-int http1_client_write(connection_t* connection);
+void set_client_http(connection_t* connection);
+int http_client_read(connection_t* connection);
+int http_client_write(connection_t* connection);
 
 #endif

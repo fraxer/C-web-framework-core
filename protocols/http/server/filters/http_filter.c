@@ -42,12 +42,12 @@ void filters_free(http_filter_t* filter) {
     }
 }
 
-int filter_next_handler_header(struct http1response* response) {
+int filter_next_handler_header(struct httpresponse* response) {
     response->cur_filter = response->cur_filter->next;
     return response->cur_filter->handler_header(response);
 }
 
-int filter_next_handler_body(struct http1response* response, bufo_t* buf) {
+int filter_next_handler_body(struct httpresponse* response, bufo_t* buf) {
     response->cur_filter = response->cur_filter->next;
     return response->cur_filter->handler_body(response, buf);
 }

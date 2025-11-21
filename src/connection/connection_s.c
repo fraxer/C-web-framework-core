@@ -8,7 +8,7 @@
 #include "multiplexing.h"
 
 void broadcast_clear(connection_t*);
-void http1parser_free(void*);
+void httpparser_free(void*);
 
 static connection_server_ctx_t* __ctx_create(listener_t* listener);
 static void __ctx_reset(void* arg);

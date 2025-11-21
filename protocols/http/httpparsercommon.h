@@ -1,7 +1,7 @@
 #ifndef __HTTP1PARSERCOMMON__
 #define __HTTP1PARSERCOMMON__
 
-enum http1parser_status {
+enum httpparser_status {
     HTTP1PARSER_ERROR = 0,
     HTTP1PARSER_CONTINUE,
     HTTP1PARSER_HANDLE_AND_CONTINUE,
@@ -12,6 +12,6 @@ enum http1parser_status {
     HTTP1PARSER_COMPLETE
 };
 
-int http1parser_is_ctl(int);
+int httpparser_is_ctl(int);
 
 #endif

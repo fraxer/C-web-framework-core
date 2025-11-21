@@ -1,4 +1,4 @@
-#include "http1teparser.h"
+#include "httpteparser.h"
 #include "helpers.h"
 
 static const long __hextable[] = { 
@@ -15,12 +15,12 @@ static const long __hextable[] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
 };
 
-static int __set_chunk_size(http1teparser_t* parser);
+static int __set_chunk_size(httpteparser_t* parser);
 static ssize_t __hex_to_dec(const char* data, size_t size);
-static int __read_chunk(http1teparser_t* parser);
+static int __read_chunk(httpteparser_t* parser);
 
-http1teparser_t* http1teparser_init() {
-    http1teparser_t* parser = malloc(sizeof * parser);
+httpteparser_t* httpteparser_init() {
+    httpteparser_t* parser = malloc(sizeof * parser);
     if (parser == NULL) return NULL;
 
     parser->stage = HTTP1TEPARSER_CHUNKSIZE;
@@ -38,19 +38,19 @@ http1teparser_t* http1teparser_init() {
     return parser;
 }
 
-void http1teparser_free(http1teparser_t* parser) {
+void httpteparser_free(httpteparser_t* parser) {
     if (parser->buf.dynamic_buffer) free(parser->buf.dynamic_buffer);
     parser->buf.dynamic_buffer = NULL;
 
     free(parser);
 }
 
-void http1teparser_set_buffer(http1teparser_t* parser, char* buffer, size_t buffer_size) {
+void httpteparser_set_buffer(httpteparser_t* parser, char* buffer, size_t buffer_size) {
     parser->buffer = buffer;
     parser->bytes_readed = buffer_size;
 }
 
-int http1teparser_run(http1teparser_t* parser) {
+int httpteparser_run(httpteparser_t* parser) {
     parser->pos_start = 0;
     parser->pos = 0;
 
@@ -116,7 +116,7 @@ int http1teparser_run(http1teparser_t* parser) {
     return HTTP1TEPARSER_CONTINUE;
 }
 
-int __set_chunk_size(http1teparser_t* parser) {
+int __set_chunk_size(httpteparser_t* parser) {
     char* string = bufferdata_get(&parser->buf);
     size_t length = bufferdata_writed(&parser->buf);
 
@@ -140,13 +140,13 @@ ssize_t __hex_to_dec(const char* data, size_t size) {
     return ret; 
 }
 
-int __read_chunk(http1teparser_t* parser) {
+int __read_chunk(httpteparser_t* parser) {
     size_t temp_chunk_size = parser->chunk_size - parser->chunk_size_readed > parser->bytes_readed - parser->pos
         ? parser->bytes_readed - parser->pos
         : parser->chunk_size - parser->chunk_size_readed;
 
     connection_client_ctx_t* ctx = parser->connection->ctx;
-    http1response_t* response = ctx->response;
+    httpresponse_t* response = ctx->response;
 
     if (response->content_encoding == CE_GZIP) {
         gzip_t* const gzip = &parser->gzip;

@@ -14,14 +14,14 @@ ssize_t __write(connection_t* connection, const char* data, size_t size) {
         send(connection->fd, data, size, MSG_NOSIGNAL);
 }
 
-size_t __head_size(http1response_t* response) {
+size_t __head_size(httpresponse_t* response) {
     size_t size = 0;
 
     size += 9; // "HTTP/X.X "
 
-    size += http1response_status_length(response->status_code);
+    size += httpresponse_status_length(response->status_code);
 
-    http1_header_t* header = response->header_;
+    http_header_t* header = response->header_;
 
     while (header) {
         size += header->key_length;
@@ -37,13 +37,13 @@ size_t __head_size(http1response_t* response) {
     return size;
 }
 
-int __build_head(http1response_t* response, bufo_t* buf) {
+int __build_head(httpresponse_t* response, bufo_t* buf) {
     if (!bufo_alloc(buf, __head_size(response))) return 0;
 
     if (!bufo_append(buf, "HTTP/1.1 ", 9)) return 0;
-    if (!bufo_append(buf, http1response_status_string(response->status_code), http1response_status_length(response->status_code))) return 0;
+    if (!bufo_append(buf, httpresponse_status_string(response->status_code), httpresponse_status_length(response->status_code))) return 0;
 
-    http1_header_t* header = response->header_;
+    http_header_t* header = response->header_;
     while (header) {
         if (!bufo_append(buf, header->key, header->key_length)) return 0;
         if (!bufo_append(buf, ": ", 2)) return 0;
@@ -112,7 +112,7 @@ void http_write_reset(void* arg) {
     bufo_clear(module->buf);
 }
 
-int __wr(http1response_t* response, bufo_t* buf) {
+int __wr(httpresponse_t* response, bufo_t* buf) {
     size_t readed = 0;
     while ((readed = bufo_chunk_size(buf, BUF_SIZE)) > 0) {
         // log_error("%.*s", readed, bufo_data(buf));
@@ -134,7 +134,7 @@ int __wr(http1response_t* response, bufo_t* buf) {
     return CWF_OK;
 }
 
-int http_write_header(http1response_t* response) {
+int http_write_header(httpresponse_t* response) {
     http_module_write_t* module = response->cur_filter->module;
     bufo_t* buf = module->buf;
 
@@ -147,7 +147,7 @@ int http_write_header(http1response_t* response) {
     return __wr(response, buf);
 }
 
-int http_write_body(http1response_t* response, bufo_t* parent_buf) {
+int http_write_body(httpresponse_t* response, bufo_t* parent_buf) {
     http_module_write_t* module = response->cur_filter->module;
     module->base.parent_buf = parent_buf;
 

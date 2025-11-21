@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <string.h>
 
-#include "http1common.h"
+#include "httpcommon.h"
 
 typedef enum multipartstage {
     BODY = 0,
@@ -37,10 +37,10 @@ typedef struct multipartparser {
     size_t offset;
     size_t size;
     multipartstage_e stage;
-    http1_payloadpart_t* part;
-    http1_payloadpart_t* last_part;
-    http1_header_t* header;
-    http1_header_t* last_header;
+    http_payloadpart_t* part;
+    http_payloadpart_t* last_part;
+    http_header_t* header;
+    http_header_t* last_header;
     int payload_fd;
 } multipartparser_t;
 
@@ -48,6 +48,6 @@ void multipartparser_init(multipartparser_t*, int, const char*);
 
 void multipartparser_parse(multipartparser_t*, char*, size_t);
 
-http1_payloadpart_t* multipartparser_part(multipartparser_t*);
+http_payloadpart_t* multipartparser_part(multipartparser_t*);
 
 #endif

@@ -1,7 +1,7 @@
 #ifndef __HTTP_NOT_MODIFIED_FILTER__
 #define __HTTP_NOT_MODIFIED_FILTER__
 
-#include "http1response.h"
+#include "httpresponse.h"
 
 typedef struct {
     char* key;
@@ -10,7 +10,7 @@ typedef struct {
     size_t value_length;
 } http_not_modified_filter_t;
 
-int http_not_modified_header(http1response_t* response);
-int http_not_modified_body(http1response_t* response, bufo_t* buf);
+int http_not_modified_header(httpresponse_t* response);
+int http_not_modified_body(httpresponse_t* response, bufo_t* buf);
 
 #endif

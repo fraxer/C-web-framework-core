@@ -161,7 +161,7 @@ config.json                       # Конфигурация приложени�
 ### HTTP обработчик
 
 ```c
-#include "http1.h"
+#include "http.h"
 
 void my_handler(httpctx_t* ctx) {
     // Получение query параметра
