@@ -14,6 +14,7 @@ typedef struct connection_queue_websockets_data {
     websocketsrequest_t* request;
     websocketsresponse_t* response;
     connection_t* connection;
+    ratelimiter_t* ratelimiter;
 } connection_queue_websockets_data_t;
 
 static int __read(connection_t* connection);
@@ -22,7 +23,7 @@ static int __handle(websocketsparser_t* parser, deferred_handler handler);
 
 static void __queue_data_request_free(void* arg);
 static void __queue_response_handler(void* arg);
-static void* __queue_data_response_create(connection_t* connection, void* component);
+static void* __queue_data_response_create(connection_t* connection, void* component, ratelimiter_t* ratelimiter);
 static void __queue_data_response_free(void* arg);
 static int __post_reponse_default(connection_t* connection, const char* status_text);
 static int __post_response(websocketsresponse_t* response);
@@ -201,6 +202,13 @@ void websockets_queue_request_handler(void* arg) {
 
     conn_ctx->response = response;
 
+    if (!ratelimiter_allow(data->ratelimiter, item->connection->ip, 1)) {
+        websocketsresponse_t* response = conn_ctx->response;
+        websocketsresponse_default(response, "Too Many Requests");
+        connection_after_read(item->connection);
+        return;
+    }
+
     // TODO: wsctx_t in stack
     wsctx_t* ctx = wsctx_create(data->request, conn_ctx->response);
     if (ctx == NULL) return; // close connection
@@ -213,7 +221,7 @@ void websockets_queue_request_handler(void* arg) {
     connection_after_read(item->connection);
 }
 
-void* websockets_queue_data_request_create(connection_t* connection, void* component) {
+void* websockets_queue_data_request_create(connection_t* connection, void* component, ratelimiter_t* ratelimiter) {
     connection_queue_websockets_data_t* data = malloc(sizeof * data);
     if (data == NULL) return NULL;
 
@@ -221,6 +229,7 @@ void* websockets_queue_data_request_create(connection_t* connection, void* compo
     data->request = component;
     data->connection = connection;
     data->response = NULL;
+    data->ratelimiter = ratelimiter;
 
     return data;
 }
@@ -255,23 +264,23 @@ int __post_response(websocketsresponse_t* response) {
         return connection_after_read(connection);
     }
 
-    return websockets_deferred_handler(connection, response, __queue_response_handler, NULL, __queue_data_response_create);
+    return websockets_deferred_handler(connection, response, __queue_response_handler, NULL, __queue_data_response_create, NULL);
 }
 
 int __post_deffered_response(websocketsresponse_t* response) {
     connection_t* connection = response->connection;
 
-    return websockets_deferred_handler(connection, response, __queue_response_handler, NULL, __queue_data_response_create);
+    return websockets_deferred_handler(connection, response, __queue_response_handler, NULL, __queue_data_response_create, NULL);
 }
 
-int websockets_deferred_handler(connection_t* connection, void* component, queue_handler runner, queue_handler handle, queue_data_create data_create) {
+int websockets_deferred_handler(connection_t* connection, void* component, queue_handler runner, queue_handler handle, queue_data_create data_create, ratelimiter_t* ratelimiter) {
     connection_queue_item_t* item = connection_queue_item_create();
     if (item == NULL) return 0;
 
     item->run = runner;
     item->handle = handle;
     item->connection = connection;
-    item->data = data_create(connection, component);
+    item->data = data_create(connection, component, ratelimiter);
 
     if (item->data == NULL) {
         item->free(item);
@@ -303,7 +312,9 @@ void __queue_response_handler(void* arg) {
     connection_after_read(item->connection);
 }
 
-void* __queue_data_response_create(connection_t* connection, void* component) {
+void* __queue_data_response_create(connection_t* connection, void* component, ratelimiter_t* ratelimiter) {
+    (void)ratelimiter;
+
     websocketsresponse_t* response = component;
     connection_queue_websockets_data_t* data = malloc(sizeof * data);
     if (data == NULL) return NULL;
@@ -312,6 +323,7 @@ void* __queue_data_response_create(connection_t* connection, void* component) {
     data->request = NULL;
     data->connection = connection;
     data->response = response;
+    data->ratelimiter = NULL;
 
     return data;
 }

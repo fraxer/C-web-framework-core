@@ -9,7 +9,6 @@
 void broadcast_free(struct broadcast* broadcast);
 void middlewares_free(struct middleware_item* middleware_item);
 
-
 server_t* server_create() {
     server_t* server = malloc(sizeof * server);
     if (server == NULL) return NULL;
@@ -24,11 +23,14 @@ server_t* server_create() {
     server->http.route = NULL;
     server->http.redirect = NULL;
     server->http.middleware = NULL;
+    server->http.ratelimiter = NULL;
     server->websockets.default_handler = NULL;
     server->websockets.route = NULL;
     server->websockets.middleware = NULL;
+    server->websockets.ratelimiter = NULL;
     server->openssl = NULL;
     server->broadcast = NULL;
+    server->ratelimits_config = NULL;
     server->next = NULL;
 
     return server;
@@ -61,17 +63,26 @@ void servers_free(server_t* server) {
         if (server->http.route) routes_free(server->http.route);
         server->http.route = NULL;
 
+        if (server->http.ratelimiter) ratelimiter_free(server->http.ratelimiter);
+        server->http.ratelimiter = NULL;
+
         if (server->websockets.route) routes_free(server->websockets.route);
         server->websockets.route = NULL;
 
         if (server->websockets.middleware) middlewares_free(server->websockets.middleware);
         server->websockets.middleware = NULL;
 
+        if (server->websockets.ratelimiter) ratelimiter_free(server->websockets.ratelimiter);
+        server->websockets.ratelimiter = NULL;
+
         if (server->openssl) openssl_free(server->openssl);
         server->openssl = NULL;
 
         if (server->broadcast) broadcast_free(server->broadcast);
         server->broadcast = NULL;
+
+        if (server->ratelimits_config) map_free(server->ratelimits_config);
+        server->ratelimits_config = NULL;
 
         server->next = NULL;
 

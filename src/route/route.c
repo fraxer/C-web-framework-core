@@ -342,7 +342,7 @@ void route_parser_free(route_parser_t* parser) {
         free(parser->location);
 }
 
-int route_set_http_handler(route_t* route, const char* method, void(*function)(void*)) {
+int route_set_http_handler(route_t* route, const char* method, void(*function)(void*), ratelimiter_t* ratelimiter) {
     int m = ROUTE_NONE;
 
     if (method[0] == 'G' && method[1] == 'E' && method[2] == 'T') {
@@ -372,11 +372,12 @@ int route_set_http_handler(route_t* route, const char* method, void(*function)(v
     if (route->handler[m]) return 1;
 
     route->handler[m] = function;
+    route->ratelimiter = ratelimiter;
 
     return 1;
 }
 
-int route_set_websockets_handler(route_t* route, const char* method, void(*function)(void*)) {
+int route_set_websockets_handler(route_t* route, const char* method, void(*function)(void*), ratelimiter_t* ratelimiter) {
     int m = ROUTE_NONE;
 
     if (method[0] == 'G' && method[1] == 'E' && method[2] == 'T') {
@@ -397,6 +398,7 @@ int route_set_websockets_handler(route_t* route, const char* method, void(*funct
     if (route->handler[m]) return 1;
 
     route->handler[m] = function;
+    route->ratelimiter = ratelimiter;
 
     return 1;
 }
@@ -419,6 +421,7 @@ void routes_free(route_t* route) {
             pcre_free(route->location);
 
         free(route->path);
+        ratelimiter_free(route->ratelimiter);
         free(route);
 
         route = route_next;
@@ -428,9 +431,8 @@ void routes_free(route_t* route) {
 int route_compare_primitive(route_t* route, const char* path, size_t length) {
     if (route->path_length != length) return 0;
 
-    for (size_t i = 0, j = 0; i < route->path_length && j < length; i++, j++) {
-        if (route->path[i] != path[j]) return 0;
-    }
+    for (size_t i = 0; i < length; i++)
+        if (route->path[i] != path[i]) return 0;
 
     return 1;
 }

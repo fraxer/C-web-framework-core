@@ -10,6 +10,7 @@
 #include "file.h"
 #include "database.h"
 #include "json.h"
+#include "map.h"
 #include "redirect.h"
 #include "route.h"
 #include "routeloader.h"
@@ -52,14 +53,14 @@ static int __module_loader_viewstore_load(appconfig_t* config);
 static int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* sessionconfig);
 static int __module_loader_prepared_queries_load(appconfig_t* config);
 
-static int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route);
-static int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object);
+static int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config);
+static int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config);
 static void __module_loader_pass_memory_sharedlib(routeloader_lib_t*, const char*);
 static int __module_loader_http_redirects_load(const json_token_t* token_object, redirect_t** redirect);
 static int __module_loader_middlewares_load(const json_token_t* token_object, middleware_item_t** middleware_item);
 static void __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t** first_lib, const json_token_t* token_array);
-static int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route);
-static int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object);
+static int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config);
+static int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config);
 static openssl_t* __module_loader_tls_load(const json_token_t* token_object);
 static int __module_loader_check_unique_domainport(server_t* first_server);
 static void* __module_loader_storage_fs_load(const json_token_t* token_object, const char* storage_name);
@@ -68,6 +69,10 @@ static const char* __module_loader_storage_field(const char* storage_name, const
 static int __module_loader_thread_workers_load(void);
 static int __module_loader_thread_handlers_load(void);
 static void __module_loader_on_shutdown_cb(void);
+static map_t* __module_loader_ratelimits_configs_load(const json_token_t* token_object);
+static ratelimiter_config_t* __module_loader_ratelimits_config_load(const json_token_t* token_object);
+static int __module_loader_http_ratelimit_load(const json_token_t* token_string, ratelimiter_t** ratelimiter, map_t* ratelimits_config);
+static int __module_loader_websockets_ratelimit_load(const json_token_t* token_string, ratelimiter_t** ratelimiter, map_t* ratelimits_config);
 
 int module_loader_init(appconfig_t* config) {
     int result = 0;
@@ -536,7 +541,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
     for (json_it_t it_servers = json_init_it(token_servers); !json_end_it(&it_servers); json_next_it(&it_servers)) {
         enum required_fields { R_DOMAINS = 0, R_IP, R_PORT, R_ROOT, R_FIELDS_COUNT };
         char* str_required_fields[R_FIELDS_COUNT] = {"domains", "ip", "port", "root"};
-        enum fields { DOMAINS = 0, IP, PORT, ROOT, INDEX, HTTP, WEBSOCKETS, DATABASE, OPENSSL, FIELDS_COUNT };
+        enum fields { DOMAINS = 0, IP, PORT, ROOT, INDEX, RATELIMITS, HTTP, WEBSOCKETS, DATABASE, OPENSSL, FIELDS_COUNT };
 
         int finded_fields[FIELDS_COUNT] = {0};
 
@@ -566,148 +571,178 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             goto failed;
         }
 
-        for (json_it_t it_server = json_init_it(token_server); !json_end_it(&it_server); json_next_it(&it_server)) {
-            const char* key = json_it_key(&it_server);
-            const json_token_t* token_value = json_it_value(&it_server);
+        const json_token_t* token_domains = json_object_get(token_server, "domains");
+        if (token_domains != NULL) {
+            finded_fields[DOMAINS] = 1;
 
-            if (strcmp(key, "domains") == 0) {
-                finded_fields[DOMAINS] = 1;
-
-                if (!json_is_array(token_value)) {
-                    log_error("__module_loader_servers_load: domains must be array\n");
-                    goto failed;
-                }
-
-                server->domain = __module_loader_domains_load(token_value);
-                if (server->domain == NULL) {
-                    log_error("__module_loader_servers_load: can't load domains\n");
-                    goto failed;
-                }
+            if (!json_is_array(token_domains)) {
+                log_error("__module_loader_servers_load: domains must be array\n");
+                goto failed;
             }
-            else if (strcmp(key, "ip") == 0) {
-                finded_fields[IP] = 1;
-
-                if (!json_is_string(token_value)) {
-                    log_error("__module_loader_servers_load: ip must be string\n");
-                    goto failed;
-                }
-
-                server->ip = inet_addr(json_string(token_value));
+            server->domain = __module_loader_domains_load(token_domains);
+            if (server->domain == NULL) {
+                log_error("__module_loader_servers_load: can't load domains\n");
+                goto failed;
             }
-            else if (strcmp(key, "port") == 0) {
-                finded_fields[PORT] = 1;
+        }
 
-                if (!json_is_number(token_value)) {
-                    log_error("__module_loader_servers_load: port must be integer\n");
-                    goto failed;
-                }
+        const json_token_t* token_ip = json_object_get(token_server, "ip");
+        if (token_ip != NULL) {
+            finded_fields[IP] = 1;
 
-                int ok = 0;
-                server->port = json_int(token_value, &ok);
-                if (!ok) {
-                    log_error("__module_loader_servers_load: port must be integer\n");
-                    goto failed;
-                }
+            if (!json_is_string(token_ip)) {
+                log_error("__module_loader_servers_load: ip must be string\n");
+                goto failed;
             }
-            else if (strcmp(key, "root") == 0) {
-                finded_fields[ROOT] = 1;
+            server->ip = inet_addr(json_string(token_ip));
+        }
 
-                if (!json_is_string(token_value)) {
-                    log_error("__module_loader_servers_load: root path must be string\n");
-                    goto failed;
-                }
+        const json_token_t* token_port = json_object_get(token_server, "port");
+        if (token_port != NULL) {
+            finded_fields[PORT] = 1;
 
-                const char* value = json_string(token_value);
-                size_t value_length = json_string_size(token_value);
-
-                if (value[value_length - 1] == '/')
-                    value_length--;
-
-                server->root = malloc(value_length + 1);
-                if (server->root == NULL) {
-                    log_error("__module_loader_servers_load: can't alloc memory for root path\n");
-                    goto failed;
-                }
-
-                strncpy(server->root, value, value_length);
-
-                server->root[value_length] = 0;
-                server->root_length = value_length;
-
-                struct stat stat_obj;
-                stat(server->root, &stat_obj);
-                if (!S_ISDIR(stat_obj.st_mode)) {
-                    log_error("__module_loader_servers_load: root directory not found\n");
-                    goto failed;
-                }
+            if (!json_is_number(token_port)) {
+                log_error("__module_loader_servers_load: port must be number\n");
+                goto failed;
             }
-            else if (strcmp(key, "index") == 0) {
-                finded_fields[INDEX] = 1;
-
-                if (!json_is_string(token_value)) {
-                    log_error("__module_loader_servers_load: index file must be string\n");
-                    goto failed;
-                }
-
-                server->index = server_index_create(json_string(token_value));
-                if (server->index == NULL) {
-                    log_error("__module_loader_servers_load: can't alloc memory for index file\n");
-                    goto failed;
-                }
+            int ok = 0;
+            server->port = json_int(token_port, &ok);
+            if (!ok) {
+                log_error("__module_loader_servers_load: port must be integer\n");
+                goto failed;
             }
-            else if (strcmp(key, "http") == 0) {
-                finded_fields[HTTP] = 1;
+        }
 
-                if (!json_is_object(token_value)) {
-                    log_error("__module_loader_servers_load: http must be object\n");
-                    goto failed;
-                }
+        const json_token_t* token_root = json_object_get(token_server, "root");
+        if (token_root != NULL) {
+            finded_fields[ROOT] = 1;
 
-                if (!__module_loader_http_routes_load(&first_lib, json_object_get(token_value, "routes"), &server->http.route)) {
-                    log_error("__module_loader_servers_load: can't load routes\n");
-                    goto failed;
-                }
-                if (!__module_loader_http_redirects_load(json_object_get(token_value, "redirects"), &server->http.redirect)) {
-                    log_error("__module_loader_servers_load: can't load redirects\n");
-                    goto failed;
-                }
-                if (!__module_loader_middlewares_load(json_object_get(token_value, "middlewares"), &server->http.middleware)) {
-                    log_error("__module_loader_servers_load: can't load middlewares\n");
-                    goto failed;
-                }
+            if (!json_is_string(token_root)) {
+                log_error("__module_loader_servers_load: root must be string\n");
+                goto failed;
             }
-            else if (strcmp(key, "websockets") == 0) {
-                finded_fields[WEBSOCKETS] = 1;
+            const char* value = json_string(token_root);
+            size_t value_length = json_string_size(token_root);
 
-                if (!json_is_object(token_value)) {
-                    log_error("__module_loader_servers_load: websockets must be object\n");
-                    goto failed;
-                }
+            if (value[value_length - 1] == '/')
+                value_length--;
 
-                __module_loader_websockets_default_load(&server->websockets.default_handler, &first_lib, json_object_get(token_value, "default"));
-
-                if (!__module_loader_websockets_routes_load(&first_lib, json_object_get(token_value, "routes"), &server->websockets.route)) {
-                    log_error("__module_loader_servers_load: can't load routes\n");
-                    goto failed;
-                }
-                if (!__module_loader_middlewares_load(json_object_get(token_value, "middlewares"), &server->websockets.middleware)) {
-                    log_error("__module_loader_servers_load: can't load middlewares\n");
-                    goto failed;
-                }
+            server->root = malloc(value_length + 1);
+            if (server->root == NULL) {
+                log_error("__module_loader_servers_load: can't alloc memory for root path\n");
+                goto failed;
             }
-            else if (strcmp(key, "tls") == 0) {
-                finded_fields[OPENSSL] = 1;
 
-                if (!json_is_object(token_value)) {
-                    log_error("__module_loader_servers_load: tls must be object\n");
-                    goto failed;
-                }
+            strncpy(server->root, value, value_length);
 
-                server->openssl = __module_loader_tls_load(token_value);
-                if (server->openssl == NULL) {
-                    log_error("__module_loader_servers_load: can't load tls\n");
-                    goto failed;
-                }
+            server->root[value_length] = 0;
+            server->root_length = value_length;
+
+            struct stat stat_obj;
+            stat(server->root, &stat_obj);
+            if (!S_ISDIR(stat_obj.st_mode)) {
+                log_error("__module_loader_servers_load: root directory not found\n");
+                goto failed;
+            }
+        }
+
+        const json_token_t* token_index = json_object_get(token_server, "index");
+        if (token_index != NULL) {
+            finded_fields[INDEX] = 1;
+
+            if (!json_is_string(token_index)) {
+                log_error("__module_loader_servers_load: index must be string\n");
+                goto failed;
+            }
+
+            server->index = server_index_create(json_string(token_index));
+            if (server->index == NULL) {
+                log_error("__module_loader_servers_load: can't alloc memory for index file\n");
+                goto failed;
+            }
+        }
+
+        const json_token_t* token_ratelimits = json_object_get(token_server, "ratelimits");
+        if (token_ratelimits != NULL) {
+            finded_fields[RATELIMITS] = 1;
+
+            if (!json_is_object(token_ratelimits)) {
+                log_error("__module_loader_servers_load: ratelimits must be object\n");
+                goto failed;
+            }
+
+            server->ratelimits_config = __module_loader_ratelimits_configs_load(token_ratelimits);
+            if (server->ratelimits_config == NULL) {
+                log_error("__module_loader_servers_load: can't load ratelimits config\n");
+                goto failed;
+            }
+        }
+
+        const json_token_t* token_http = json_object_get(token_server, "http");
+        if (token_http != NULL) {
+            finded_fields[HTTP] = 1;
+
+            if (!json_is_object(token_http)) {
+                log_error("__module_loader_servers_load: http must be object\n");
+                goto failed;
+            }
+
+            if (!__module_loader_http_ratelimit_load(json_object_get(token_http, "ratelimit"), &server->http.ratelimiter, server->ratelimits_config)) {
+                log_error("__module_loader_servers_load: can't load routes\n");
+                goto failed;
+            }
+            if (!__module_loader_http_routes_load(&first_lib, json_object_get(token_http, "routes"), &server->http.route, server->ratelimits_config)) {
+                log_error("__module_loader_servers_load: can't load routes\n");
+                goto failed;
+            }
+            if (!__module_loader_http_redirects_load(json_object_get(token_http, "redirects"), &server->http.redirect)) {
+                log_error("__module_loader_servers_load: can't load redirects\n");
+                goto failed;
+            }
+            if (!__module_loader_middlewares_load(json_object_get(token_http, "middlewares"), &server->http.middleware)) {
+                log_error("__module_loader_servers_load: can't load middlewares\n");
+                goto failed;
+            }
+        }
+
+        const json_token_t* token_websockets = json_object_get(token_server, "websockets");
+        if (token_websockets != NULL) {
+            finded_fields[WEBSOCKETS] = 1;
+
+            if (!json_is_object(token_websockets)) {
+                log_error("__module_loader_servers_load: websockets must be object\n");
+                goto failed;
+            }
+
+            __module_loader_websockets_default_load(&server->websockets.default_handler, &first_lib, json_object_get(token_websockets, "default"));
+
+            if (!__module_loader_websockets_ratelimit_load(json_object_get(token_websockets, "ratelimit"), &server->websockets.ratelimiter, server->ratelimits_config)) {
+                log_error("__module_loader_servers_load: can't load routes\n");
+                goto failed;
+            }
+            if (!__module_loader_websockets_routes_load(&first_lib, json_object_get(token_websockets, "routes"), &server->websockets.route, server->ratelimits_config)) {
+                log_error("__module_loader_servers_load: can't load routes\n");
+                goto failed;
+            }
+            if (!__module_loader_middlewares_load(json_object_get(token_websockets, "middlewares"), &server->websockets.middleware)) {
+                log_error("__module_loader_servers_load: can't load middlewares\n");
+                goto failed;
+            }
+        }
+
+        const json_token_t* token_tls = json_object_get(token_server, "tls");
+        if (token_tls != NULL) {
+            finded_fields[OPENSSL] = 1;
+
+            if (!json_is_object(token_tls)) {
+                log_error("__module_loader_servers_load: database must be object\n");
+                goto failed;
+            }
+
+            server->openssl = __module_loader_tls_load(token_tls);
+            if (server->openssl == NULL) {
+                log_error("__module_loader_servers_load: can't load tls\n");
+                goto failed;
             }
         }
 
@@ -1096,7 +1131,7 @@ int __module_loader_prepared_queries_load(appconfig_t* config) {
     return 1;
 }
 
-int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route) {
+int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config) {
     int result = 0;
     route_t* first_route = NULL;
     route_t* last_route = NULL;
@@ -1130,7 +1165,7 @@ int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_t
 
         last_route = rt;
 
-        if (!__module_loader_set_http_route(first_lib, &last_lib, rt, json_it_value(&it))) {
+        if (!__module_loader_set_http_route(first_lib, &last_lib, rt, json_it_value(&it), ratelimiter_config)) {
             log_error("__module_loader_http_routes_load: failed to set http route\n");
             goto failed;
         }
@@ -1148,7 +1183,7 @@ int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_t
     return result;
 }
 
-int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object) {
+int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config) {
     if (token_object == NULL) {
         log_error("__module_loader_set_http_route: http.route item is empty\n");
         return 0;
@@ -1159,37 +1194,67 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
     }
     for (json_it_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
         const char* method = json_it_key(&it);
-        json_token_t* token_array = json_it_value(&it);
-        if (!json_is_array(token_array)) {
-            log_error("__module_loader_set_http_route: http.route item.value must be array\n");
-            return 0;
-        }
-        if (json_array_size(token_array) != 2) {
-            log_error("__module_loader_set_http_route: http.route item.value must be array with 2 elements\n");
+        if (strlen(method) == 0) {
+            log_error("__module_loader_set_http_route: http.route item.key must be not empty\n");
             return 0;
         }
 
-        const json_token_t* token_string0 = json_array_get(token_array, 0);
-        if (!json_is_string(token_string0)) {
-            log_error("__module_loader_set_http_route: http.route item.value[0] must be string\n");
+        json_token_t* token_object = json_it_value(&it);
+        if (!json_is_object(token_object)) {
+            log_error("__module_loader_set_http_route: http.route item.value must be object\n");
             return 0;
         }
-        if (json_string_size(token_string0) == 0) {
-            log_error("__module_loader_set_http_route: http.route item.value[0] must be not empty string\n");
-            return 0;
-        }
-        const json_token_t* token_string1 = json_array_get(token_array, 1);
-        if (!json_is_string(token_string1)) {
-            log_error("__module_loader_set_http_route: http.route item.value[1] must be string\n");
-            return 0;
-        }
-        if (json_string_size(token_string1) == 0) {
-            log_error("__module_loader_set_http_route: http.route item.value[1] must be not empty string\n");
+        if (json_object_size(token_object) < 2) {
+            log_error("__module_loader_set_http_route: http.route item.value must be object with at least 2 elements\n");
             return 0;
         }
 
-        const char* lib_file = json_string(token_string0);
-        const char* lib_handler = json_string(token_string1);
+        const json_token_t* token_file = json_object_get(token_object, "file");
+        if (!json_is_string(token_file)) {
+            log_error("__module_loader_set_http_route: http.route item.value.route must be string\n");
+            return 0;
+        }
+        if (json_string_size(token_file) == 0) {
+            log_error("__module_loader_set_http_route: http.route item.value.route must be not empty string\n");
+            return 0;
+        }
+        const json_token_t* token_function = json_object_get(token_object, "function");
+        if (!json_is_string(token_function)) {
+            log_error("__module_loader_set_http_route: http.route item.value.handler must be string\n");
+            return 0;
+        }
+        if (json_string_size(token_function) == 0) {
+            log_error("__module_loader_set_http_route: http.route item.value.handler must be not empty string\n");
+            return 0;
+        }
+        const json_token_t* token_ratelimit = json_object_get(token_object, "ratelimit");
+        ratelimiter_t* ratelimiter = NULL;
+        if (token_ratelimit != NULL) {
+            if (!json_is_string(token_ratelimit)) {
+                log_error("__module_loader_set_http_route: http.route item.value.handler must be string\n");
+                return 0;
+            }
+            if (json_string_size(token_ratelimit) == 0) {
+                log_error("__module_loader_set_http_route: http.route item.value.handler must be not empty string\n");
+                return 0;
+            }
+
+            const char* ratelimit_name = json_string(token_ratelimit);
+            ratelimiter_config_t* config = map_find(ratelimiter_config, ratelimit_name);
+            if (config == NULL) {
+                log_error("__module_loader_set_http_route: ratelimiter %s not found\n", ratelimit_name);
+                return 0;
+            }
+
+            ratelimiter = ratelimiter_init(config);
+            if (ratelimiter == NULL) {
+                log_error("__module_loader_set_http_route: failed to create ratelimiter %s\n", ratelimit_name);
+                return 0;
+            }
+        }
+
+        const char* lib_file = json_string(token_file);
+        const char* lib_handler = json_string(token_function);
         if (!routeloader_has_lib(*first_lib, lib_file)) {
             routeloader_lib_t* routeloader_lib = routeloader_load_lib(lib_file);
             if (routeloader_lib == NULL) {
@@ -1213,7 +1278,7 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
             return 0;
         }
 
-        if (!route_set_http_handler(route, method, function)) {
+        if (!route_set_http_handler(route, method, function, ratelimiter)) {
             log_error("__module_loader_set_http_route: failed to set http handler %s.%s\n", lib_file, lib_handler);
             return 0;
         }
@@ -1404,7 +1469,7 @@ void __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_
     *(void**)(&(*fn)) = routeloader_get_handler(*first_lib, lib_file, lib_handler);
 }
 
-int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route) {
+int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config) {
     int result = 0;
     route_t* first_route = NULL;
     route_t* last_route = NULL;
@@ -1438,7 +1503,7 @@ int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const 
 
         last_route = rt;
 
-        if (!__module_loader_set_websockets_route(first_lib, &last_lib, rt, json_it_value(&it))) {
+        if (!__module_loader_set_websockets_route(first_lib, &last_lib, rt, json_it_value(&it), ratelimiter_config)) {
             log_error("__module_loader_websockets_routes_load: failed to set websockets route\n");
             goto failed;
         }
@@ -1456,7 +1521,7 @@ int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const 
     return result;
 }
 
-int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object) {
+int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config) {
     if (token_object == NULL) {
         log_error("__module_loader_set_websockets_route: websockets.route item is empty\n");
         return 0;
@@ -1472,37 +1537,62 @@ int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloa
             return 0;
         }
 
-        json_token_t* token_array = json_it_value(&it);
-        if (!json_is_array(token_array)) {
-            log_error("__module_loader_set_websockets_route: websockets.route item.value must be array\n");
+        json_token_t* token_object = json_it_value(&it);
+        if (!json_is_object(token_object)) {
+            log_error("__module_loader_set_websockets_route: websockets.route item.value must be object\n");
             return 0;
         }
-        if (json_array_size(token_array) != 2) {
-            log_error("__module_loader_set_websockets_route: websockets.route item.value must be array with 2 elements\n");
-            return 0;
-        }
-
-        const json_token_t* token_string0 = json_array_get(token_array, 0);
-        if (!json_is_string(token_string0)) {
-            log_error("__module_loader_set_websockets_route: websockets.route item.value[0] must be string\n");
-            return 0;
-        }
-        if (json_string_size(token_string0) == 0) {
-            log_error("__module_loader_set_websockets_route: websockets.route item.value[0] must be not empty string\n");
-            return 0;
-        }
-        const json_token_t* token_string1 = json_array_get(token_array, 1);
-        if (!json_is_string(token_string1)) {
-            log_error("__module_loader_set_websockets_route: websockets.route item.value[1] must be string\n");
-            return 0;
-        }
-        if (json_string_size(token_string1) == 0) {
-            log_error("__module_loader_set_websockets_route: websockets.route item.value[1] must be not empty string\n");
+        if (json_object_size(token_object) < 2) {
+            log_error("__module_loader_set_websockets_route: websockets.route item.value must be object with at least 2 elements\n");
             return 0;
         }
 
-        const char* lib_file = json_string(token_string0);
-        const char* lib_handler = json_string(token_string1);
+        const json_token_t* token_file = json_object_get(token_object, "file");
+        if (!json_is_string(token_file)) {
+            log_error("__module_loader_set_websockets_route: websockets.route item.value.route must be string\n");
+            return 0;
+        }
+        if (json_string_size(token_file) == 0) {
+            log_error("__module_loader_set_websockets_route: websockets.route item.value.route must be not empty string\n");
+            return 0;
+        }
+        const json_token_t* token_function = json_object_get(token_object, "function");
+        if (!json_is_string(token_function)) {
+            log_error("__module_loader_set_websockets_route: websockets.route item.value.handler must be string\n");
+            return 0;
+        }
+        if (json_string_size(token_function) == 0) {
+            log_error("__module_loader_set_websockets_route: websockets.route item.value.handler must be not empty string\n");
+            return 0;
+        }
+        const json_token_t* token_ratelimit = json_object_get(token_object, "ratelimit");
+        ratelimiter_t* ratelimiter = NULL;
+        if (token_ratelimit != NULL) {
+            if (!json_is_string(token_ratelimit)) {
+                log_error("__module_loader_set_websockets_route: websockets.route item.value.handler must be string\n");
+                return 0;
+            }
+            if (json_string_size(token_ratelimit) == 0) {
+                log_error("__module_loader_set_websockets_route: websockets.route item.value.handler must be not empty string\n");
+                return 0;
+            }
+
+            const char* ratelimit_name = json_string(token_ratelimit);
+            ratelimiter_config_t* config = map_find(ratelimiter_config, ratelimit_name);
+            if (config == NULL) {
+                log_error("__module_loader_set_websockets_route: ratelimiter %s not found\n", ratelimit_name);
+                return 0;
+            }
+
+            ratelimiter = ratelimiter_init(config);
+            if (ratelimiter == NULL) {
+                log_error("__module_loader_set_websockets_route: failed to create ratelimiter %s\n", ratelimit_name);
+                return 0;
+            }
+        }
+
+        const char* lib_file = json_string(token_file);
+        const char* lib_handler = json_string(token_function);
         routeloader_lib_t* routeloader_lib = NULL;
         if (!routeloader_has_lib(*first_lib, lib_file)) {
             routeloader_lib = routeloader_load_lib(lib_file);
@@ -1528,7 +1618,7 @@ int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloa
             return 0;
         }
 
-        if (!route_set_websockets_handler(route, method, function)) {
+        if (!route_set_websockets_handler(route, method, function, ratelimiter)) {
             log_error("__module_loader_set_websockets_route: failed to set websockets handler\n");
             return 0;
         }
@@ -1581,6 +1671,168 @@ void __module_loader_on_shutdown_cb(void) {
     atomic_store(&appconfig()->shutdown, 1);
     module_loader_wakeup_all_threads();
     module_loader_signal_unlock();
+}
+
+map_t* __module_loader_ratelimits_configs_load(const json_token_t* token_object) {
+    if (!json_is_object(token_object)) {
+        log_error("__module_loader_ratelimits_config_load: ratelimits must be object\n");
+        return NULL;
+    }
+
+    map_t* map = map_create_ex(map_compare_string, map_copy_string, free, NULL, free);
+    if (map == NULL) {
+        log_error("__module_loader_ratelimits_config_load: can't create ratelimits map\n");
+        return NULL;
+    }
+
+    for (json_it_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
+        const char* key = json_it_key(&it);
+        json_token_t* token_object = json_it_value(&it);
+
+        if (!json_is_object(token_object)) {
+            log_error("__module_loader_ratelimits_config_load: ratelimits.%s must be object\n", key);
+            map_free(map);
+            return NULL;
+        }
+
+        ratelimiter_config_t* config = __module_loader_ratelimits_config_load(token_object);
+        if (config == NULL) {
+            map_free(map);
+            return NULL;
+        }
+
+        if (map_insert_or_assign(map, key, config) == -1) {
+            log_error("__module_loader_ratelimits_config_load: can't insert ratelimits.%s\n", key);
+            free(config);
+            map_free(map);
+            return NULL;
+        }
+    }
+
+    return map;
+}
+
+ratelimiter_config_t* __module_loader_ratelimits_config_load(const json_token_t* token_object) {
+    if (!json_is_object(token_object)) {
+        log_error("__module_loader_ratelimits_config_load: ratelimits must be object\n");
+        return NULL;
+    }
+
+    ratelimiter_config_t* config = malloc(sizeof * config);
+    if (config == NULL) {
+        log_error("__module_loader_ratelimits_config_load: can't allocate ratelimits config\n");
+        return NULL;
+    }
+
+    config->time_window_ns = 1000000000ULL; // 1 секунда
+    config->cleanup_interval_s = 60; // 5 минут
+
+    const json_token_t* token_burst = json_object_get(token_object, "burst");
+    if (!json_is_number(token_burst)) {
+        log_error("__module_loader_ratelimits_config_load: ratelimits.burst must be number\n");
+        free(config);
+        return NULL;
+    }
+
+    int ok = 0;
+    const int burst = json_int(token_burst, &ok);
+    if (!ok) {
+        log_error("__module_loader_ratelimits_config_load: ratelimits.burst must be integer\n");
+        free(config);
+        return NULL;
+    }
+
+    config->max_tokens = burst;
+
+    const json_token_t* token_rate = json_object_get(token_object, "rate");
+    if (!json_is_number(token_rate)) {
+        log_error("__module_loader_ratelimits_config_load: ratelimits.rate must be number\n");
+        free(config);
+        return NULL;
+    }
+
+    const int rate = json_int(token_rate, &ok);
+    if (!ok) {
+        log_error("__module_loader_ratelimits_config_load: ratelimits.rate must be integer\n");
+        free(config);
+        return NULL;
+    }
+
+    config->refill_rate = rate;
+
+    return config;
+}
+
+int __module_loader_http_ratelimit_load(const json_token_t* token_string, ratelimiter_t** ratelimiter, map_t* ratelimits_config) {
+    *ratelimiter = NULL;
+
+    if (token_string == NULL) return 1;
+
+    if (!json_is_string(token_string)) {
+        log_error("__module_loader_http_ratelimit_load: http.ratelimit must be string\n");
+        return 0;
+    }
+
+    if (json_string_size(token_string) == 0) {
+        log_error("__module_loader_http_ratelimit_load: http.ratelimit must be not empty string\n");
+        return 0;
+    }
+
+    if (ratelimits_config == NULL) {
+        log_error("__module_loader_http_ratelimit_load: ratelimits config not loaded\n");
+        return 0;
+    }
+
+    const char* ratelimit_name = json_string(token_string);
+    ratelimiter_config_t* config = map_find(ratelimits_config, ratelimit_name);
+    if (config == NULL) {
+        log_error("__module_loader_http_ratelimit_load: ratelimiter %s not found\n", ratelimit_name);
+        return 0;
+    }
+
+    *ratelimiter = ratelimiter_init(config);
+    if (*ratelimiter == NULL) {
+        log_error("__module_loader_http_ratelimit_load: failed to create ratelimiter %s\n", ratelimit_name);
+        return 0;
+    }
+
+    return 1;
+}
+
+int __module_loader_websockets_ratelimit_load(const json_token_t* token_string, ratelimiter_t** ratelimiter, map_t* ratelimits_config) {
+    *ratelimiter = NULL;
+
+    if (token_string == NULL) return 1;
+
+    if (!json_is_string(token_string)) {
+        log_error("__module_loader_websockets_ratelimit_load: websockets.ratelimit must be string\n");
+        return 0;
+    }
+
+    if (json_string_size(token_string) == 0) {
+        log_error("__module_loader_websockets_ratelimit_load: websockets.ratelimit must be not empty string\n");
+        return 0;
+    }
+
+    if (ratelimits_config == NULL) {
+        log_error("__module_loader_websockets_ratelimit_load: ratelimits config not loaded\n");
+        return 0;
+    }
+
+    const char* ratelimit_name = json_string(token_string);
+    ratelimiter_config_t* config = map_find(ratelimits_config, ratelimit_name);
+    if (config == NULL) {
+        log_error("__module_loader_websockets_ratelimit_load: ratelimiter %s not found\n", ratelimit_name);
+        return 0;
+    }
+
+    *ratelimiter = ratelimiter_init(config);
+    if (*ratelimiter == NULL) {
+        log_error("__module_loader_websockets_ratelimit_load: failed to create ratelimiter %s\n", ratelimit_name);
+        return 0;
+    }
+
+    return 1;
 }
 
 void module_loader_signal_lock(void) {

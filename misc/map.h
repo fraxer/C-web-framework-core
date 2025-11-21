@@ -61,7 +61,7 @@ void map_free(map_t* map);
 
 // Map operations
 int map_insert(map_t* map, const void* key, void* value);
-int map_insert_or_assign(map_t* map, void* key, void* value);
+int map_insert_or_assign(map_t* map, const void* key, void* value);
 void* map_find(map_t* map, const void* key);
 map_node_t* map_find_node(map_t* map, const void* key);
 int map_erase(map_t* map, const void* key);

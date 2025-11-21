@@ -22,6 +22,7 @@ int websocketsparser_parse_location(websockets_protocol_resource_t*, char*, size
 int websocketsparser_append_uri(websockets_protocol_resource_t*, const char*, size_t);
 int websocketsparser_set_path(websockets_protocol_resource_t*, const char*, size_t);
 int websocketsparser_set_query(websockets_protocol_resource_t*, const char*, size_t, size_t);
+static ratelimiter_t* __ratelimiter_find(server_websockets_t* websockets_config, route_t* route);
 
 websockets_protocol_t* websockets_protocol_resource_create(void) {
     websockets_protocol_resource_t* protocol = malloc(sizeof * protocol);
@@ -82,10 +83,12 @@ int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t
     connection_server_ctx_t* ctx = connection->ctx;
 
     for (route_t* route = ctx->server->websockets.route; route; route = route->next) {
+        ratelimiter_t* ratelimiter = __ratelimiter_find(&ctx->server->websockets, route);
+
         if (route->is_primitive && route_compare_primitive(route, protocol->path, protocol->path_length)) {
             if (route->handler[protocol->method] == NULL) return 0;
 
-            if (!websockets_deferred_handler(connection, request, websockets_queue_request_handler, route->handler[protocol->method], websockets_queue_data_request_create))
+            if (!websockets_deferred_handler(connection, request, websockets_queue_request_handler, route->handler[protocol->method], websockets_queue_data_request_create, ratelimiter))
                 return 0;
 
             return 1;
@@ -117,7 +120,7 @@ int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t
 
             if (route->handler[protocol->method] == NULL) return 0;
 
-            if (!websockets_deferred_handler(connection, request, websockets_queue_request_handler, route->handler[protocol->method], websockets_queue_data_request_create))
+            if (!websockets_deferred_handler(connection, request, websockets_queue_request_handler, route->handler[protocol->method], websockets_queue_data_request_create, ratelimiter))
                 return 0;
 
             return 1;
@@ -126,7 +129,7 @@ int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t
             if (route->handler[protocol->method] == NULL)
                 return 0;
 
-            if (!websockets_deferred_handler(connection, request, websockets_queue_request_handler, route->handler[protocol->method], websockets_queue_data_request_create))
+            if (!websockets_deferred_handler(connection, request, websockets_queue_request_handler, route->handler[protocol->method], websockets_queue_data_request_create, ratelimiter))
                 return 0;
 
             return 1;
@@ -391,4 +394,10 @@ int set_websockets_resource(connection_t* connection) {
         return 0;
 
     return 1;
+}
+
+ratelimiter_t* __ratelimiter_find(server_websockets_t* websockets_config, route_t* route) {
+    if (route->ratelimiter != NULL) return route->ratelimiter;
+
+    return websockets_config->ratelimiter;
 }

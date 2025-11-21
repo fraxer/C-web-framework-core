@@ -4,11 +4,13 @@
 #include <arpa/inet.h>
 #include <stdatomic.h>
 
+#include "map.h"
 #include "redirect.h"
 #include "route.h"
 #include "routeloader.h"
 #include "domain.h"
 #include "openssl.h"
+#include "ratelimiter.h"
 
 struct middleware_item;
 
@@ -19,12 +21,14 @@ typedef struct index {
 
 typedef struct server_http {
     route_t* route;
+    ratelimiter_t* ratelimiter;
     redirect_t* redirect;
     struct middleware_item* middleware;
 } server_http_t;
 
 typedef struct server_websockets {
     route_t* route;
+    ratelimiter_t* ratelimiter;
     void(*default_handler)(void*);
     struct middleware_item* middleware;
 } server_websockets_t;
@@ -42,6 +46,7 @@ typedef struct server {
     domain_t* domain;
     index_t* index;
     openssl_t* openssl;
+    map_t* ratelimits_config; // ratelimiter_config_t
     struct broadcast* broadcast;
     struct server* next;
 } server_t;
