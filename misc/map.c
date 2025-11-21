@@ -121,7 +121,7 @@ int map_insert(map_t* map, const void* key, void* value) {
 }
 
 // Insert or update a key-value pair
-int map_insert_or_assign(map_t* map, void* key, void* value) {
+int map_insert_or_assign(map_t* map, const void* key, void* value) {
     if (map == NULL)
         return -1;
 

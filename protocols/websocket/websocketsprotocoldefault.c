@@ -31,7 +31,9 @@ websockets_protocol_t* websockets_protocol_default_create(void) {
 int websocketsrequest_get_default(connection_t* connection, websocketsrequest_t* request) {
     connection_server_ctx_t* ctx = connection->ctx;
 
-    return websockets_deferred_handler(connection, request, websockets_queue_request_handler, ctx->server->websockets.default_handler, websockets_queue_data_request_create);
+    ratelimiter_t* ratelimiter = ctx->server->websockets.ratelimiter;
+
+    return websockets_deferred_handler(connection, request, websockets_queue_request_handler, ctx->server->websockets.default_handler, websockets_queue_data_request_create, ratelimiter);
 }
 
 void websockets_protocol_default_reset(void* protocol) {
