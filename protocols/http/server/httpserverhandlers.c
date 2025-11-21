@@ -1,25 +1,25 @@
-#include "http1serverhandlers.h"
+#include "httpserverhandlers.h"
 
 #include "httpcontext.h"
-#include "http1request.h"
-#include "http1response.h"
-#include "http1requestparser.h"
+#include "httprequest.h"
+#include "httpresponse.h"
+#include "httprequestparser.h"
 #include "log.h"
 #include "connection_queue.h"
 
 typedef struct {
     connection_queue_item_data_t base;
-    http1request_t* request;
-    http1response_t* response;
+    httprequest_t* request;
+    httpresponse_t* response;
     connection_t* connection;
     ratelimiter_t* ratelimiter;
-} connection_queue_http1_data_t;
+} connection_queue_http_data_t;
 
 struct middleware_item;
 
-typedef int(*deferred_handler)(http1response_t* response);
+typedef int(*deferred_handler)(httpresponse_t* response);
 typedef void(*queue_handler)(void*);
-typedef void*(*queue_data_create)(connection_t* connection, http1request_t* request, http1response_t* response, ratelimiter_t* ratelimiter);
+typedef void*(*queue_data_create)(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter);
 
 int run_middlewares(struct middleware_item* middleware_item, void* ctx);
 
@@ -27,25 +27,25 @@ static int __tls_read(connection_t* connection);
 static int __tls_write(connection_t* connection);
 static int __read(connection_t* connection);
 static int __write(connection_t* connection);
-static int __deferred_handler(connection_t* connection, http1request_t* request, http1response_t* response, queue_handler runner, queue_handler handle, queue_data_create data_create, ratelimiter_t* ratelimiter);
-static int __handle(connection_t* connection, http1request_t* request, deferred_handler handler);
-static int __handler_added_to_queue(http1request_t* request, http1response_t* response);
-static int __get_redirect(connection_t* connection, http1request_t* request);
-static int __apply_redirect(http1request_t* request, http1response_t* response, deferred_handler handler);
+static int __deferred_handler(connection_t* connection, httprequest_t* request, httpresponse_t* response, queue_handler runner, queue_handler handle, queue_data_create data_create, ratelimiter_t* ratelimiter);
+static int __handle(connection_t* connection, httprequest_t* request, deferred_handler handler);
+static int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response);
+static int __get_redirect(connection_t* connection, httprequest_t* request);
+static int __apply_redirect(httprequest_t* request, httpresponse_t* response, deferred_handler handler);
 static void __queue_request_handler(void* arg);
 static void __queue_response_handler(void* arg);
-static void* __queue_data_request_create(connection_t* connection, http1request_t* request, http1response_t* response, ratelimiter_t* ratelimiter);
+static void* __queue_data_request_create(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter);
 static void __queue_data_request_free(void* arg);
-static int __run_header_filters(http1response_t* response);
-static int __run_body_filters(http1response_t* response);
+static int __run_header_filters(httpresponse_t* response);
+static int __run_body_filters(httpresponse_t* response);
 static int __handshake(connection_t* connection);
 static int __set_servername(connection_t* connection);
-static void* __queue_data_response_create(connection_t* connection, http1request_t* request, http1response_t* response, ratelimiter_t* ratelimiter);
+static void* __queue_data_response_create(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter);
 static void __queue_data_response_free(void* arg);
 static int __post_reponse_default(connection_t* connection, int status_code);
-static int __post_response(http1response_t* response);
-static int __post_deffered_response(http1response_t* response);
-static void __move_headers(http1request_t* request, http1response_t* response);
+static int __post_response(httpresponse_t* response);
+static int __post_deffered_response(httpresponse_t* response);
+static void __move_headers(httprequest_t* request, httpresponse_t* response);
 static ratelimiter_t* __ratelimiter_find(server_http_t* http_config, route_t* route);
 
 int __tls_read(connection_t* connection) {
@@ -67,25 +67,25 @@ int set_tls(connection_t* connection) {
     return 1;
 }
 
-int set_http1(connection_t* connection) {
-    connection->read = http1_server_guard_read;
-    connection->write = http1_server_guard_write;
+int set_http(connection_t* connection) {
+    connection->read = http_server_guard_read;
+    connection->write = http_server_guard_write;
 
     connection_server_ctx_t* ctx = connection->ctx;
 
     if (ctx->parser != NULL) {
-        http1parser_free(ctx->parser);
+        httpparser_free(ctx->parser);
         ctx->parser = NULL;
     }
 
-    ctx->parser = http1parser_create(connection);
+    ctx->parser = httpparser_create(connection);
     if (ctx->parser == NULL)
         return 0;
 
     return 1;
 }
 
-int http1_server_guard_read(connection_t* connection) {
+int http_server_guard_read(connection_t* connection) {
     connection_s_lock(connection);
     const int r = __read(connection);
     connection_s_unlock(connection);
@@ -93,7 +93,7 @@ int http1_server_guard_read(connection_t* connection) {
     return r;
 }
 
-int http1_server_guard_write(connection_t* connection) {
+int http_server_guard_write(connection_t* connection) {
     connection_s_lock(connection);
     const int r = __write(connection);
     connection_s_unlock(connection);
@@ -103,7 +103,7 @@ int http1_server_guard_write(connection_t* connection) {
 
 int __read(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
-    http1requestparser_t* parser = ctx->parser;
+    httprequestparser_t* parser = ctx->parser;
 
     while (1) {
         int bytes_readed = 0;
@@ -123,12 +123,12 @@ int __read(connection_t* connection) {
             return 0;
         default:
         {
-            http1parser_set_bytes_readed(parser, bytes_readed);
+            httpparser_set_bytes_readed(parser, bytes_readed);
             parser->pos_start = 0;
             parser->pos = 0;
 
             while (1) {
-                switch (http1parser_run(parser)) {
+                switch (httpparser_run(parser)) {
                 case HTTP1PARSER_ERROR:
                 case HTTP1PARSER_OUT_OF_MEMORY:
                     return 0;
@@ -145,7 +145,7 @@ int __read(connection_t* connection) {
                     if (!__handle(connection, parser->request, __post_deffered_response))
                         return 0;
 
-                    http1parser_prepare_continue(parser);
+                    httpparser_prepare_continue(parser);
                     break;
                 }
                 case HTTP1PARSER_COMPLETE:
@@ -153,7 +153,7 @@ int __read(connection_t* connection) {
                     if (!__handle(connection, parser->request, __post_response))
                         return 0;
 
-                    http1parser_reset(parser);
+                    httpparser_reset(parser);
                     return 1;
                 }
                 default:
@@ -169,7 +169,7 @@ int __read(connection_t* connection) {
 
 int __write(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
-    http1response_t* response = ctx->response;
+    httpresponse_t* response = ctx->response;
 
     int r = __run_header_filters(response);
     if (r == CWF_EVENT_AGAIN)
@@ -186,7 +186,7 @@ int __write(connection_t* connection) {
     return connection_after_write(connection);
  }
 
-int __deferred_handler(connection_t* connection, http1request_t* request, http1response_t* response, queue_handler runner, queue_handler handle, queue_data_create data_create, ratelimiter_t* ratelimiter) {
+int __deferred_handler(connection_t* connection, httprequest_t* request, httpresponse_t* response, queue_handler runner, queue_handler handle, queue_data_create data_create, ratelimiter_t* ratelimiter) {
     connection_queue_item_t* item = connection_queue_item_create();
     if (item == NULL) return 0;
 
@@ -215,8 +215,8 @@ int __deferred_handler(connection_t* connection, http1request_t* request, http1r
     return 1;
 }
 
-int __handle(connection_t* connection, http1request_t* request, deferred_handler handler) {
-    http1response_t* response = http1response_create(connection);
+int __handle(connection_t* connection, httprequest_t* request, deferred_handler handler) {
+    httpresponse_t* response = httpresponse_create(connection);
     if (response == NULL) return 0;
 
     __move_headers(request, response);
@@ -224,12 +224,12 @@ int __handle(connection_t* connection, http1request_t* request, deferred_handler
     switch (__apply_redirect(request, response, handler)) {
     case -1:
     {
-        http1request_free(request);
+        httprequest_free(request);
         return 0;
     }
     case 1:
     {
-        http1request_free(request);
+        httprequest_free(request);
         return 1;
     }
     case 0:
@@ -242,26 +242,26 @@ int __handle(connection_t* connection, http1request_t* request, deferred_handler
 
     connection_server_ctx_t* ctx = connection->ctx;
     char file_full_path[PATH_MAX];
-    const file_status_e file_status = http1_get_file_full_path(ctx->server, file_full_path, PATH_MAX, request->path, request->path_length);
-    http1request_free(request);
+    const file_status_e file_status = http_get_file_full_path(ctx->server, file_full_path, PATH_MAX, request->path, request->path_length);
+    httprequest_free(request);
 
     if (file_status == FILE_OK) {
         if (!ratelimiter_allow(ctx->server->http.ratelimiter, connection->ip, 1)) {
-            http1response_default(response, 429);
+            httpresponse_default(response, 429);
             response->header_add(response, "Retry-After", "1");
         }
         else
-            http1_response_file(response, file_full_path);
+            http_response_file(response, file_full_path);
     }
     else if (file_status == FILE_FORBIDDEN)
-        http1response_default(response, 403);
+        httpresponse_default(response, 403);
     else
-        http1response_default(response, 404);
+        httpresponse_default(response, 404);
 
     return handler(response);
 }
 
-int __handler_added_to_queue(http1request_t* request, http1response_t* response) {
+int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
     connection_t* connection = request->connection;
     connection_server_ctx_t* ctx = connection->ctx;
 
@@ -290,7 +290,7 @@ int __handler_added_to_queue(http1request_t* request, http1response_t* response)
 
                 if (query == NULL || query->key == NULL || query->value == NULL) return 0;
 
-                http1parser_append_query(request, query);
+                httpparser_append_query(request, query);
             }
 
             if (route->handler[request->method] == NULL) return 0;
@@ -307,23 +307,23 @@ int __handler_added_to_queue(http1request_t* request, http1response_t* response)
     return 0;
 }
 
-int __apply_redirect(http1request_t* request, http1response_t* response, deferred_handler handler) {
+int __apply_redirect(httprequest_t* request, httpresponse_t* response, deferred_handler handler) {
     connection_t* connection = request->connection;
     
     switch (__get_redirect(connection, request)) {
     case REDIRECT_OUT_OF_MEMORY:
     {
-        http1response_default(response, 500);
+        httpresponse_default(response, 500);
         return handler(response);
     }
     case REDIRECT_LOOP_CYCLE:
     {
-        http1response_default(response, 508);
+        httpresponse_default(response, 508);
         return handler(response);
     }
     case REDIRECT_FOUND:
     {
-        http1response_redirect(response, request->uri, 301);
+        httpresponse_redirect(response, request->uri, 301);
         return handler(response);
     }
     case REDIRECT_NOT_FOUND:
@@ -334,7 +334,7 @@ int __apply_redirect(http1request_t* request, http1response_t* response, deferre
     return 0;
 }
 
-int __get_redirect(connection_t* connection, http1request_t* request) {
+int __get_redirect(connection_t* connection, httprequest_t* request) {
     int loop_cycle = 1;
     int find_new_location = 0;
 
@@ -364,13 +364,13 @@ int __get_redirect(connection_t* connection, http1request_t* request) {
         if (request->path) free((void*)request->path);
         request->path = NULL;
 
-        if (http1response_redirect_is_external(new_uri)) {
+        if (httpresponse_redirect_is_external(new_uri)) {
             request->uri = new_uri;
             connection->keepalive = 0;
             return REDIRECT_FOUND;
         }
 
-        if (!http1parser_set_uri(request, new_uri, strlen(new_uri)))
+        if (!httpparser_set_uri(request, new_uri, strlen(new_uri)))
             return REDIRECT_OUT_OF_MEMORY;
 
         redirect = ctx->server->http.redirect;
@@ -381,8 +381,8 @@ int __get_redirect(connection_t* connection, http1request_t* request) {
     return find_new_location ? REDIRECT_FOUND : REDIRECT_NOT_FOUND;
 }
 
-void* __queue_data_request_create(connection_t* connection, http1request_t* request, http1response_t* response, ratelimiter_t* ratelimiter) {
-    connection_queue_http1_data_t* data = malloc(sizeof * data);
+void* __queue_data_request_create(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter) {
+    connection_queue_http_data_t* data = malloc(sizeof * data);
     if (data == NULL) return NULL;
 
     data->base.free = __queue_data_request_free;
@@ -394,10 +394,10 @@ void* __queue_data_request_create(connection_t* connection, http1request_t* requ
     return data;
 }
 
-void* __queue_data_response_create(connection_t* connection, http1request_t* request, http1response_t* response, ratelimiter_t* ratelimiter) {
+void* __queue_data_response_create(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter) {
     (void)ratelimiter;
 
-    connection_queue_http1_data_t* data = malloc(sizeof * data);
+    connection_queue_http_data_t* data = malloc(sizeof * data);
     if (data == NULL) return NULL;
 
     data->base.free = __queue_data_response_free;
@@ -412,10 +412,10 @@ void* __queue_data_response_create(connection_t* connection, http1request_t* req
 void __queue_data_request_free(void* arg) {
     if (arg == NULL) return;
 
-    connection_queue_http1_data_t* data = arg;
+    connection_queue_http_data_t* data = arg;
 
     if (data->request != NULL)
-        http1request_free(data->request);
+        httprequest_free(data->request);
 
     free(data);
 }
@@ -423,21 +423,21 @@ void __queue_data_request_free(void* arg) {
 void __queue_data_response_free(void* arg) {
     if (arg == NULL) return;
 
-    connection_queue_http1_data_t* data = arg;
+    connection_queue_http_data_t* data = arg;
 
     free(data);
 }
 
 void __queue_request_handler(void* arg) {
     connection_queue_item_t* item = arg;
-    connection_queue_http1_data_t* data = (connection_queue_http1_data_t*)item->data;
+    connection_queue_http_data_t* data = (connection_queue_http_data_t*)item->data;
     connection_server_ctx_t* conn_ctx = item->connection->ctx;
 
     conn_ctx->response = data->response;
 
     if (!ratelimiter_allow(data->ratelimiter, item->connection->ip, 1)) {
-        http1response_t* response = conn_ctx->response;
-        http1response_default(response, 429);
+        httpresponse_t* response = conn_ctx->response;
+        httpresponse_default(response, 429);
         response->header_add(response, "Retry-After", "1");
         connection_after_read(item->connection);
         return;
@@ -456,7 +456,7 @@ void __queue_request_handler(void* arg) {
 
 void __queue_response_handler(void* arg) {
     connection_queue_item_t* item = arg;
-    connection_queue_http1_data_t* data = (connection_queue_http1_data_t*)item->data;
+    connection_queue_http_data_t* data = (connection_queue_http_data_t*)item->data;
     connection_server_ctx_t* conn_ctx = item->connection->ctx;
 
     conn_ctx->response = data->response;
@@ -464,7 +464,7 @@ void __queue_response_handler(void* arg) {
     connection_after_read(item->connection);
 }
 
-int __run_header_filters(http1response_t* response) {
+int __run_header_filters(httpresponse_t* response) {
     if (response->headers_sended)
         return CWF_OK;
 
@@ -489,7 +489,7 @@ int __run_header_filters(http1response_t* response) {
     return CWF_OK;
 }
 
-int __run_body_filters(http1response_t* response) {
+int __run_body_filters(httpresponse_t* response) {
     if (response->event_again)
         response->event_again = 0;
 
@@ -539,7 +539,7 @@ int __handshake(connection_t* connection) {
             if (!__set_servername(connection))
                 return 0;
 
-        if (!set_http1(connection))
+        if (!set_http(connection))
             return 0;
 
         return 1;
@@ -620,15 +620,15 @@ int __set_servername(connection_t* connection) {
 }
 
 int __post_reponse_default(connection_t* connection, int status_code) {
-    http1response_t* response = http1response_create(connection);
+    httpresponse_t* response = httpresponse_create(connection);
     if (response == NULL) return 0;
 
-    http1response_default(response, status_code);
+    httpresponse_default(response, status_code);
 
     return __post_response(response);
 }
 
-int __post_response(http1response_t* response) {
+int __post_response(httpresponse_t* response) {
     connection_t* connection = response->connection;
     connection_server_ctx_t* ctx = connection->ctx;
 
@@ -641,13 +641,13 @@ int __post_response(http1response_t* response) {
     return __deferred_handler(connection, NULL, response, __queue_response_handler, NULL, __queue_data_response_create, NULL);
 }
 
-int __post_deffered_response(http1response_t* response) {
+int __post_deffered_response(httpresponse_t* response) {
     connection_t* connection = response->connection;
 
     return __deferred_handler(connection, NULL, response, __queue_response_handler, NULL, __queue_data_response_create, NULL);
 }
 
-void __move_headers(http1request_t* request, http1response_t* response) {
+void __move_headers(httprequest_t* request, httpresponse_t* response) {
     response->ranges = request->ranges;
     request->ranges = NULL;
 }

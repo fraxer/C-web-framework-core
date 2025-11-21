@@ -5,11 +5,11 @@
 static http_module_data_t* __create(void);
 static void __free(void* arg);
 static void __reset(void* arg);
-static int __header(http1response_t* response);
-static int __body(http1response_t* response, bufo_t* parent_buf);
-static bufo_t* body_next_chunk_data(http1response_t* response, bufo_t* proxy_body_buf, int** ok);
-static bufo_t* file_next_chunk_data(http1response_t* response, int** ok);
-static bufo_t* next_chunk_data(http1response_t* response, bufo_t* proxy_body_buf, int* ok);
+static int __header(httpresponse_t* response);
+static int __body(httpresponse_t* response, bufo_t* parent_buf);
+static bufo_t* body_next_chunk_data(httpresponse_t* response, bufo_t* proxy_body_buf, int** ok);
+static bufo_t* file_next_chunk_data(httpresponse_t* response, int** ok);
+static bufo_t* next_chunk_data(httpresponse_t* response, bufo_t* proxy_body_buf, int* ok);
 
 http_filter_t* http_data_filter_create(void) {
     http_filter_t* filter = malloc(sizeof * filter);
@@ -69,7 +69,7 @@ void __reset(void* arg) {
     module->proxy_body_buf->is_proxy = 1;
 }
 
-int __header(http1response_t* response) {
+int __header(httpresponse_t* response) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_data_t* module = cur_filter->module;
     int r = 0;
@@ -98,7 +98,7 @@ int __header(http1response_t* response) {
     return r;
 }
 
-int __body(http1response_t* response, bufo_t* parent_buf) {
+int __body(httpresponse_t* response, bufo_t* parent_buf) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_data_t* module = cur_filter->module;
     module->base.parent_buf = parent_buf;
@@ -140,7 +140,7 @@ int __body(http1response_t* response, bufo_t* parent_buf) {
     return CWF_ERROR;
 }
 
-bufo_t* body_next_chunk_data(http1response_t* response, bufo_t* proxy_body_buf, int** ok) {
+bufo_t* body_next_chunk_data(httpresponse_t* response, bufo_t* proxy_body_buf, int** ok) {
     **ok = 1;
 
     proxy_body_buf->data = response->body.data + response->body.pos;
@@ -160,7 +160,7 @@ bufo_t* body_next_chunk_data(http1response_t* response, bufo_t* proxy_body_buf, 
     return proxy_body_buf;
 }
 
-bufo_t* file_next_chunk_data(http1response_t* response, int** ok) {
+bufo_t* file_next_chunk_data(httpresponse_t* response, int** ok) {
     **ok = 0;
 
     if (!bufo_alloc(&response->body, BUF_SIZE)) return NULL;
@@ -184,7 +184,7 @@ bufo_t* file_next_chunk_data(http1response_t* response, int** ok) {
     return &response->body;
 }
 
-bufo_t* next_chunk_data(http1response_t* response, bufo_t* proxy_body_buf, int* ok) {
+bufo_t* next_chunk_data(httpresponse_t* response, bufo_t* proxy_body_buf, int* ok) {
     if (response->file_.fd > -1)
         return file_next_chunk_data(response, &ok);
 

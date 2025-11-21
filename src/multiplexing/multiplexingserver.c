@@ -4,7 +4,7 @@
 #include "multiplexing.h"
 #include "multiplexingserver.h"
 #include "server.h"
-#include "http1serverhandlers.h"
+#include "httpserverhandlers.h"
 
 static int BUFFER_SIZE = 16384;
 
@@ -207,7 +207,7 @@ int __set_protocol(connection_t* connection) {
     if (ctx->server->openssl)
         r = set_tls(connection);
     else
-        r = set_http1(connection);
+        r = set_http(connection);
 
     if (!r) {
         connection_free(connection);

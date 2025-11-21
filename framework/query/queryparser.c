@@ -1,7 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "http1common.h"
+#include "httpcommon.h"
 #include "helpers.h"
 #include "str.h"
 #include "queryparser.h"

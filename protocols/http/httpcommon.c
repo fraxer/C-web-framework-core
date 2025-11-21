@@ -4,18 +4,18 @@
 
 #include "str.h"
 #include "helpers.h"
-#include "http1common.h"
+#include "httpcommon.h"
 
-http1_header_t* http1_header_alloc();
-http1_cookie_t* http1_cookie_alloc();
+http_header_t* http_header_alloc();
+http_cookie_t* http_cookie_alloc();
 
 
-http1_header_t* http1_header_alloc() {
-    return malloc(sizeof(http1_header_t));
+http_header_t* http_header_alloc() {
+    return malloc(sizeof(http_header_t));
 }
 
-http1_header_t* http1_header_create(const char* key, size_t key_length, const char* value, size_t value_length) {
-    http1_header_t* header = http1_header_alloc();
+http_header_t* http_header_create(const char* key, size_t key_length, const char* value, size_t value_length) {
+    http_header_t* header = http_header_alloc();
 
     if (header == NULL) return NULL;
 
@@ -34,7 +34,7 @@ http1_header_t* http1_header_create(const char* key, size_t key_length, const ch
     return header;
 }
 
-void http1_header_free(http1_header_t* header) {
+void http_header_free(http_header_t* header) {
     if (header->key)
         free((void*)header->key);
 
@@ -44,34 +44,34 @@ void http1_header_free(http1_header_t* header) {
     free(header);
 }
 
-void http1_headers_free(http1_header_t* header) {
+void http_headers_free(http_header_t* header) {
     while (header) {
-        http1_header_t* next = header->next;
-        http1_header_free(header);
+        http_header_t* next = header->next;
+        http_header_free(header);
         header = next;
     }
 }
 
-http1_header_t* http1_header_delete(http1_header_t* header, const char* key) {
+http_header_t* http_header_delete(http_header_t* header, const char* key) {
     if (header == NULL) return NULL;
 
     if (cmpstrn_lower(header->key, header->key_length, key, strlen(key))) {
-        http1_header_t* next = header->next;
-        http1_header_free(header);
+        http_header_t* next = header->next;
+        http_header_free(header);
         return next;
     }
 
-    http1_header_t* first_header = header;
-    http1_header_t* prev_header = header;
+    http_header_t* first_header = header;
+    http_header_t* prev_header = header;
 
     header = header->next;
 
     while (header) {
-        http1_header_t* next = header->next;
+        http_header_t* next = header->next;
 
         if (cmpstrn_lower(header->key, header->key_length, key, strlen(key))) {
             prev_header->next = next;
-            http1_header_free(header);
+            http_header_free(header);
             break;
         }
 
@@ -82,8 +82,8 @@ http1_header_t* http1_header_delete(http1_header_t* header, const char* key) {
     return first_header;
 }
 
-http1_payloadpart_t* http1_payloadpart_create() {
-    http1_payloadpart_t* part = malloc(sizeof * part);
+http_payloadpart_t* http_payloadpart_create() {
+    http_payloadpart_t* part = malloc(sizeof * part);
     if (part == NULL) return NULL;
 
     part->field = NULL;
@@ -95,16 +95,16 @@ http1_payloadpart_t* http1_payloadpart_create() {
     return part;
 }
 
-void http1_payloadpart_free(http1_payloadpart_t* part) {
+void http_payloadpart_free(http_payloadpart_t* part) {
     while (part) {
-        http1_payloadpart_t* next = part->next;
+        http_payloadpart_t* next = part->next;
 
-        http1_payloadfield_free(part->field);
+        http_payloadfield_free(part->field);
 
-        http1_header_t* header = part->header;
+        http_header_t* header = part->header;
         while (header) {
-            http1_header_t* next = header->next;
-            http1_header_free(header);
+            http_header_t* next = header->next;
+            http_header_free(header);
             header = next;
         }
 
@@ -114,8 +114,8 @@ void http1_payloadpart_free(http1_payloadpart_t* part) {
     }
 }
 
-http1_payloadfield_t* http1_payloadfield_create() {
-    http1_payloadfield_t* field = malloc(sizeof * field);
+http_payloadfield_t* http_payloadfield_create() {
+    http_payloadfield_t* field = malloc(sizeof * field);
     if (field == NULL) return NULL;
     field->key = NULL;
     field->key_length = 0;
@@ -125,9 +125,9 @@ http1_payloadfield_t* http1_payloadfield_create() {
     return field;
 }
 
-void http1_payloadfield_free(http1_payloadfield_t* field) {
+void http_payloadfield_free(http_payloadfield_t* field) {
     while (field) {
-        http1_payloadfield_t* next = field->next;
+        http_payloadfield_t* next = field->next;
 
         if (field->key) free(field->key);
         if (field->value) free(field->value);
@@ -137,12 +137,12 @@ void http1_payloadfield_free(http1_payloadfield_t* field) {
     }
 }
 
-http1_cookie_t* http1_cookie_alloc() {
-    return malloc(sizeof(http1_cookie_t));
+http_cookie_t* http_cookie_alloc() {
+    return malloc(sizeof(http_cookie_t));
 }
 
-http1_cookie_t* http1_cookie_create() {
-    http1_cookie_t* cookie = http1_cookie_alloc();
+http_cookie_t* http_cookie_create() {
+    http_cookie_t* cookie = http_cookie_alloc();
 
     if (cookie == NULL) return NULL;
 
@@ -155,9 +155,9 @@ http1_cookie_t* http1_cookie_create() {
     return cookie;
 }
 
-void http1_cookie_free(http1_cookie_t* cookie) {
+void http_cookie_free(http_cookie_t* cookie) {
     while (cookie) {
-        http1_cookie_t* next = cookie->next;
+        http_cookie_t* next = cookie->next;
 
         if (cookie->key) free(cookie->key);
         if (cookie->value) free(cookie->value);
@@ -167,9 +167,9 @@ void http1_cookie_free(http1_cookie_t* cookie) {
     }
 }
 
-void http1_ranges_free(http1_ranges_t* ranges) {
+void http_ranges_free(http_ranges_t* ranges) {
     while (ranges != NULL) {
-        http1_ranges_t* next = ranges->next;
+        http_ranges_t* next = ranges->next;
         free(ranges);
         ranges = next;
     }

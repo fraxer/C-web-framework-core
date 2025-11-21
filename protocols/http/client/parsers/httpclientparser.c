@@ -2,7 +2,7 @@
 #include <string.h>
 
 #include "helpers.h"
-#include "http1common.h"
+#include "httpcommon.h"
 #include "httpclient.h"
 #include "httpclientparser.h"
 #include "queryparser.h"

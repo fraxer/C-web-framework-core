@@ -72,7 +72,7 @@ void http_chunked_reset(void* arg) {
     bufo_flush(module->buf);
 }
 
-int http_chunked_header(http1response_t* response) {
+int http_chunked_header(httpresponse_t* response) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_chunked_t* module = cur_filter->module;
 
@@ -102,7 +102,7 @@ int http_chunked_header(http1response_t* response) {
     return r;
 }
 
-int http_chunked_body(http1response_t* response, bufo_t* parent_buf) {
+int http_chunked_body(httpresponse_t* response, bufo_t* parent_buf) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_chunked_t* module = cur_filter->module;
     module->base.parent_buf = parent_buf;

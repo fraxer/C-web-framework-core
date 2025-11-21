@@ -1,7 +1,7 @@
 #ifndef __HTTP_DATA_FILTER__
 #define __HTTP_DATA_FILTER__
 
-#include "http1response.h"
+#include "httpresponse.h"
 
 typedef struct {
     http_module_t base;

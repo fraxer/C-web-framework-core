@@ -3,30 +3,30 @@
 #include <fcntl.h>
 #include <stdlib.h>
 
-#include "http1request.h"
-#include "http1response.h"
+#include "httprequest.h"
+#include "httpresponse.h"
 #include "cookieparser.h"
 #include "domain.h"
 #include "log.h"
 #include "appconfig.h"
-#include "http1common.h"
-#include "http1responseparser.h"
+#include "httpcommon.h"
+#include "httpresponseparser.h"
 #include "helpers.h"
 
-int __http1responseparser_set_protocol(http1response_t*, http1responseparser_t*);
-int __http1responseparser_set_statuscode(http1response_t*, http1responseparser_t*);
-int __http1responseparser_set_header_key(http1response_t*, http1responseparser_t*);
-int __http1responseparser_set_header_value(http1response_t*, http1responseparser_t*);
-int __http1responseparser_parse_payload(http1responseparser_t*);
-void __try_set_keepalive(http1responseparser_t*);
-void __try_set_content_length(http1responseparser_t*);
-void __try_set_transfer_encoding(http1responseparser_t*);
-void __try_set_content_encoding(http1responseparser_t*);
-void __http1responseparser_flush(http1responseparser_t*);
-int __transfer_decoding(http1response_t*, const char*, size_t);
+int __httpresponseparser_set_protocol(httpresponse_t*, httpresponseparser_t*);
+int __httpresponseparser_set_statuscode(httpresponse_t*, httpresponseparser_t*);
+int __httpresponseparser_set_header_key(httpresponse_t*, httpresponseparser_t*);
+int __httpresponseparser_set_header_value(httpresponse_t*, httpresponseparser_t*);
+int __httpresponseparser_parse_payload(httpresponseparser_t*);
+void __try_set_keepalive(httpresponseparser_t*);
+void __try_set_content_length(httpresponseparser_t*);
+void __try_set_transfer_encoding(httpresponseparser_t*);
+void __try_set_content_encoding(httpresponseparser_t*);
+void __httpresponseparser_flush(httpresponseparser_t*);
+int __transfer_decoding(httpresponse_t*, const char*, size_t);
 
 
-void http1responseparser_init(http1responseparser_t* parser) {
+void httpresponseparser_init(httpresponseparser_t* parser) {
     parser->stage = HTTP1RESPONSEPARSER_PROTOCOL;
     parser->bytes_readed = 0;
     parser->pos_start = 0;
@@ -36,48 +36,48 @@ void http1responseparser_init(http1responseparser_t* parser) {
     parser->content_length = 0;
     parser->content_saved_length = 0;
 
-    parser->teparser = http1teparser_init();
+    parser->teparser = httpteparser_init();
     if (parser->teparser == NULL) return;
 
     bufferdata_init(&parser->buf);
     gzip_init(&parser->gzip);
 }
 
-void http1responseparser_set_connection(http1responseparser_t* parser, connection_t* connection) {
+void httpresponseparser_set_connection(httpresponseparser_t* parser, connection_t* connection) {
     parser->connection = connection;
     parser->teparser->connection = connection;
 }
 
-void http1responseparser_set_buffer(http1responseparser_t* parser, char* buffer) {
+void httpresponseparser_set_buffer(httpresponseparser_t* parser, char* buffer) {
     parser->buffer = buffer;
 }
 
-void http1responseparser_free(http1responseparser_t* parser) {
-    __http1responseparser_flush(parser);
+void httpresponseparser_free(httpresponseparser_t* parser) {
+    __httpresponseparser_flush(parser);
     free(parser);
 }
 
-void http1responseparser_reset(http1responseparser_t* parser) {
-    __http1responseparser_flush(parser);
-    http1responseparser_init(parser);
+void httpresponseparser_reset(httpresponseparser_t* parser) {
+    __httpresponseparser_flush(parser);
+    httpresponseparser_init(parser);
 }
 
-void __http1responseparser_flush(http1responseparser_t* parser) {
+void __httpresponseparser_flush(httpresponseparser_t* parser) {
     if (parser->buf.dynamic_buffer) free(parser->buf.dynamic_buffer);
     parser->buf.dynamic_buffer = NULL;
 
-    http1teparser_free(parser->teparser);
+    httpteparser_free(parser->teparser);
 }
 
-int http1responseparser_run(http1responseparser_t* parser) {
+int httpresponseparser_run(httpresponseparser_t* parser) {
     connection_client_ctx_t* ctx = parser->connection->ctx;
-    http1response_t* response = ctx->response;
-    http1request_t* request = ctx->request;
+    httpresponse_t* response = ctx->response;
+    httprequest_t* request = ctx->request;
     parser->pos_start = 0;
     parser->pos = 0;
 
     if (parser->stage == HTTP1RESPONSEPARSER_PAYLOAD)
-        return __http1responseparser_parse_payload(parser);
+        return __httpresponseparser_parse_payload(parser);
 
     for (parser->pos = parser->pos_start; parser->pos < parser->bytes_readed; parser->pos++) {
         char ch = parser->buffer[parser->pos];
@@ -89,7 +89,7 @@ int http1responseparser_run(http1responseparser_t* parser) {
                 parser->stage = HTTP1RESPONSEPARSER_STATUS_CODE;
 
                 bufferdata_complete(&parser->buf);
-                if (!__http1responseparser_set_protocol(response, parser))
+                if (!__httpresponseparser_set_protocol(response, parser))
                     return HTTP1PARSER_BAD_REQUEST;
 
                 bufferdata_reset(&parser->buf);
@@ -107,13 +107,13 @@ int http1responseparser_run(http1responseparser_t* parser) {
                 parser->stage = HTTP1RESPONSEPARSER_STATUS_TEXT;
 
                 bufferdata_complete(&parser->buf);
-                if (!__http1responseparser_set_statuscode(response, parser))
+                if (!__httpresponseparser_set_statuscode(response, parser))
                     return HTTP1PARSER_BAD_REQUEST;
 
                 bufferdata_reset(&parser->buf);
                 break;
             }
-            else if (http1parser_is_ctl(ch)) {
+            else if (httpparser_is_ctl(ch)) {
                 return HTTP1PARSER_BAD_REQUEST;
             }
             else {
@@ -153,14 +153,14 @@ int http1responseparser_run(http1responseparser_t* parser) {
                 parser->stage = HTTP1RESPONSEPARSER_HEADER_SPACE;
 
                 bufferdata_complete(&parser->buf);
-                if (!__http1responseparser_set_header_key(response, parser))
+                if (!__httpresponseparser_set_header_key(response, parser))
                     return HTTP1PARSER_BAD_REQUEST;
 
                 bufferdata_reset(&parser->buf);
 
                 break;
             }
-            else if (http1parser_is_ctl(ch)) {
+            else if (httpparser_is_ctl(ch)) {
                 return HTTP1PARSER_BAD_REQUEST;
             }
             else {
@@ -179,14 +179,14 @@ int http1responseparser_run(http1responseparser_t* parser) {
                 parser->stage = HTTP1RESPONSEPARSER_NEWLINE2;
 
                 bufferdata_complete(&parser->buf);
-                if (!__http1responseparser_set_header_value(response, parser))
+                if (!__httpresponseparser_set_header_value(response, parser))
                     return HTTP1PARSER_BAD_REQUEST;
 
                 bufferdata_reset(&parser->buf);
 
                 break;
             }
-            else if (http1parser_is_ctl(ch))
+            else if (httpparser_is_ctl(ch))
                 return HTTP1PARSER_BAD_REQUEST;
             else
             {
@@ -214,7 +214,7 @@ int http1responseparser_run(http1responseparser_t* parser) {
             else
                 return HTTP1PARSER_BAD_REQUEST;
         case HTTP1RESPONSEPARSER_PAYLOAD:
-            return __http1responseparser_parse_payload(parser);
+            return __httpresponseparser_parse_payload(parser);
         default:
             return HTTP1PARSER_BAD_REQUEST;
         }
@@ -223,11 +223,11 @@ int http1responseparser_run(http1responseparser_t* parser) {
     return HTTP1PARSER_CONTINUE;
 }
 
-void http1responseparser_set_bytes_readed(http1responseparser_t* parser, int readed) {
+void httpresponseparser_set_bytes_readed(httpresponseparser_t* parser, int readed) {
     parser->bytes_readed = readed;
 }
 
-int __http1responseparser_set_protocol(http1response_t* response, http1responseparser_t* parser) {
+int __httpresponseparser_set_protocol(httpresponse_t* response, httpresponseparser_t* parser) {
     char* s = bufferdata_get(&parser->buf);
 
     if (s[0] == 'H' && s[1] == 'T' && s[2] == 'T' && s[3] == 'P' && s[4] == '/'  && s[5] == '1' && s[6] == '.' && s[7] == '1') {
@@ -238,7 +238,7 @@ int __http1responseparser_set_protocol(http1response_t* response, http1responsep
     return 0;
 }
 
-int __http1responseparser_set_statuscode(http1response_t* response, http1responseparser_t* parser) {
+int __httpresponseparser_set_statuscode(httpresponse_t* response, httpresponseparser_t* parser) {
     char* string = bufferdata_get(&parser->buf);
     int status_code = atoi(string);
     if (status_code == 0)
@@ -249,11 +249,11 @@ int __http1responseparser_set_statuscode(http1response_t* response, http1respons
     return 1;
 }
 
-int __http1responseparser_parse_payload(http1responseparser_t* parser) {
+int __httpresponseparser_parse_payload(httpresponseparser_t* parser) {
     connection_client_ctx_t* ctx = parser->connection->ctx;
-    http1response_t* response = ctx->response;
+    httpresponse_t* response = ctx->response;
 
-    if (!http1response_has_payload(response))
+    if (!httpresponse_has_payload(response))
         return HTTP1PARSER_BAD_REQUEST;
 
     parser->pos_start = parser->pos;
@@ -326,10 +326,10 @@ int __http1responseparser_parse_payload(http1responseparser_t* parser) {
     return HTTP1PARSER_CONTINUE;
 }
 
-void __try_set_keepalive(http1responseparser_t* parser) {
+void __try_set_keepalive(httpresponseparser_t* parser) {
     connection_client_ctx_t* ctx = parser->connection->ctx;
-    http1response_t* response = ctx->response;
-    http1_header_t* header = response->last_header;
+    httpresponse_t* response = ctx->response;
+    http_header_t* header = response->last_header;
 
     const char* connection_key = "connection";
     const size_t connection_key_length = 10;
@@ -342,10 +342,10 @@ void __try_set_keepalive(http1responseparser_t* parser) {
     parser->connection->keepalive = cmpstrn_lower(header->value, header->value_length, connection_value, connection_value_length);
 }
 
-void __try_set_content_length(http1responseparser_t* parser) {
+void __try_set_content_length(httpresponseparser_t* parser) {
     connection_client_ctx_t* ctx = parser->connection->ctx;
-    http1response_t* response = ctx->response;
-    http1_header_t* header = response->last_header;
+    httpresponse_t* response = ctx->response;
+    http_header_t* header = response->last_header;
 
     const char* key = "content-length";
     const size_t key_length = 14;
@@ -357,10 +357,10 @@ void __try_set_content_length(http1responseparser_t* parser) {
     response->content_length = parser->content_length;
 }
 
-void __try_set_transfer_encoding(http1responseparser_t* parser) {
+void __try_set_transfer_encoding(httpresponseparser_t* parser) {
     connection_client_ctx_t* ctx = parser->connection->ctx;
-    http1response_t* response = ctx->response;
-    http1_header_t* header = response->last_header;
+    httpresponse_t* response = ctx->response;
+    http_header_t* header = response->last_header;
 
     const char* key = "transfer-encoding";
     const size_t key_length = 17;
@@ -380,10 +380,10 @@ void __try_set_transfer_encoding(http1responseparser_t* parser) {
         response->transfer_encoding = TE_GZIP;
 }
 
-void __try_set_content_encoding(http1responseparser_t* parser) {
+void __try_set_content_encoding(httpresponseparser_t* parser) {
     connection_client_ctx_t* ctx = parser->connection->ctx;
-    http1response_t* response = ctx->response;
-    http1_header_t* header = response->last_header;
+    httpresponse_t* response = ctx->response;
+    http_header_t* header = response->last_header;
 
     const char* key = "content-encoding";
     const size_t key_length = 16;
@@ -397,10 +397,10 @@ void __try_set_content_encoding(http1responseparser_t* parser) {
         response->content_encoding = CE_GZIP;
 }
 
-int __http1responseparser_set_header_key(http1response_t* response, http1responseparser_t* parser) {
+int __httpresponseparser_set_header_key(httpresponse_t* response, httpresponseparser_t* parser) {
     char* string = bufferdata_get(&parser->buf);
     size_t length = bufferdata_writed(&parser->buf);
-    http1_header_t* header = http1_header_create(string, length, NULL, 0);
+    http_header_t* header = http_header_create(string, length, NULL, 0);
 
     if (header == NULL) {
         log_error("HTTP error: can't alloc header memory\n");
@@ -421,7 +421,7 @@ int __http1responseparser_set_header_key(http1response_t* response, http1respons
     return 1;
 }
 
-int __http1responseparser_set_header_value(http1response_t* response, http1responseparser_t* parser) {
+int __httpresponseparser_set_header_value(httpresponse_t* response, httpresponseparser_t* parser) {
     char* string = bufferdata_get(&parser->buf);
     size_t length = bufferdata_writed(&parser->buf);
 
@@ -439,9 +439,9 @@ int __http1responseparser_set_header_value(http1response_t* response, http1respo
     return HTTP1PARSER_CONTINUE;
 }
 
-int __transfer_decoding(http1response_t* response, const char* data, size_t size) {
-    http1teparser_t* parser = ((http1responseparser_t*)response->parser)->teparser;
-    http1teparser_set_buffer(parser, (char*)data, size);
+int __transfer_decoding(httpresponse_t* response, const char* data, size_t size) {
+    httpteparser_t* parser = ((httpresponseparser_t*)response->parser)->teparser;
+    httpteparser_set_buffer(parser, (char*)data, size);
 
-    return http1teparser_run(parser);
+    return httpteparser_run(parser);
 }

@@ -5,8 +5,8 @@
 static http_module_gzip_t* __create(void);
 static void __free(void* arg);
 static void __reset(void* arg);
-static int __header(http1response_t* response);
-static int __body(http1response_t* response, bufo_t* parent_buf);
+static int __header(httpresponse_t* response);
+static int __body(httpresponse_t* response, bufo_t* parent_buf);
 static int __process(http_module_gzip_t* module, bufo_t* buf);
 
 http_filter_t* http_gzip_filter_create(void) {
@@ -69,7 +69,7 @@ void __reset(void* arg) {
     gzip_free(&module->gzip);
 }
 
-int __header(http1response_t* response) {
+int __header(httpresponse_t* response) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_gzip_t* module = cur_filter->module;
 
@@ -108,7 +108,7 @@ int __header(http1response_t* response) {
     return r;
 }
 
-int __body(http1response_t* response, bufo_t* parent_buf) {
+int __body(httpresponse_t* response, bufo_t* parent_buf) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_gzip_t* module = cur_filter->module;
     module->base.parent_buf = parent_buf;

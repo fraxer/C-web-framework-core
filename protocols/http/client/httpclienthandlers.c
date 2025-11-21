@@ -1,8 +1,8 @@
-#include "http1clienthandlers.h"
+#include "httpclienthandlers.h"
 
 #include "log.h"
-#include "http1request.h"
-#include "http1responseparser.h"
+#include "httprequest.h"
+#include "httpresponseparser.h"
 
 static int __tls_read(connection_t* connection);
 static int __tls_write(connection_t* connection);
@@ -25,17 +25,17 @@ void set_client_tls(connection_t* connection) {
     connection->write = __tls_write;
 }
 
-void set_client_http1(connection_t* connection) {
-    connection->read = http1_client_read;
-    connection->write = http1_client_write;
+void set_client_http(connection_t* connection) {
+    connection->read = http_client_read;
+    connection->write = http_client_write;
 }
 
-int http1_client_read(connection_t* connection) {
+int http_client_read(connection_t* connection) {
     connection_client_ctx_t* ctx = connection->ctx;
-    http1response_t* response = ctx->response;
-    http1responseparser_t* parser = response->parser;
-    http1responseparser_set_connection(parser, connection);
-    http1responseparser_set_buffer(parser, connection->buffer);
+    httpresponse_t* response = ctx->response;
+    httpresponseparser_t* parser = response->parser;
+    httpresponseparser_set_connection(parser, connection);
+    httpresponseparser_set_buffer(parser, connection->buffer);
 
     while (1) {
         int bytes_readed = connection_data_read(connection);
@@ -47,9 +47,9 @@ int http1_client_read(connection_t* connection) {
             connection->keepalive = 0;
             return 1;
         default:
-            http1responseparser_set_bytes_readed(parser, bytes_readed);
+            httpresponseparser_set_bytes_readed(parser, bytes_readed);
 
-            switch (http1responseparser_run(parser)) {
+            switch (httpresponseparser_run(parser)) {
             case HTTP1PARSER_ERROR:
             case HTTP1PARSER_OUT_OF_MEMORY:
                 return 0;
@@ -65,7 +65,7 @@ int http1_client_read(connection_t* connection) {
             case HTTP1PARSER_CONTINUE:
                 break;
             case HTTP1RESPONSEPARSER_COMPLETE:
-                http1responseparser_reset(parser);
+                httpresponseparser_reset(parser);
                 return 1;
             }
         }
@@ -74,9 +74,9 @@ int http1_client_read(connection_t* connection) {
     return 0;
 }
 
-int http1_client_write(connection_t* connection) {
+int http_client_write(connection_t* connection) {
     connection_client_ctx_t* ctx = connection->ctx;
-    http1request_t* request = ctx->request;
+    httprequest_t* request = ctx->request;
 
     if (__write_request_head(connection) == -1) return 0;
 
@@ -127,9 +127,9 @@ ssize_t __write_chunked(connection_t* connection, const char* data, size_t lengt
 
 int __write_request_head(connection_t* connection) {
     connection_client_ctx_t* ctx = connection->ctx;
-    http1request_t* request = ctx->request;
+    httprequest_t* request = ctx->request;
 
-    http1request_head_t head = http1request_create_head(request);
+    httprequest_head_t head = httprequest_create_head(request);
     if (head.data == NULL) return -1;
 
     ssize_t writed = connection_data_write(connection, head.data, head.size);
@@ -141,7 +141,7 @@ int __write_request_head(connection_t* connection) {
 
 int __write_body(connection_t* connection, char* buffer, size_t payload_size, size_t size) {
     connection_client_ctx_t* ctx = connection->ctx;
-    http1response_t* response = ctx->response;
+    httpresponse_t* response = ctx->response;
     ssize_t writed = -1;
 
     if (response->transfer_encoding == TE_CHUNKED) {
@@ -190,7 +190,7 @@ int __write_body(connection_t* connection, char* buffer, size_t payload_size, si
 int __handshake(connection_t* connection) {
     int result = SSL_do_handshake(connection->ssl);
     if (result == 1) {
-        set_client_http1(connection);
+        set_client_http(connection);
         return 1;
     }
 

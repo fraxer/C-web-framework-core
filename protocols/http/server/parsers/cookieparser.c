@@ -11,7 +11,7 @@ void cookieparser_init(cookieparser_t* parser) {
 void cookieparser_parse(cookieparser_t* parser, char* buffer, size_t buffer_size) {
     enum { KEY, VALUE, SPACE } stage = KEY;
 
-    http1_cookie_t* cookie = http1_cookie_create();
+    http_cookie_t* cookie = http_cookie_create();
     if (cookie == NULL) return;
 
     parser->cookie = cookie;
@@ -46,7 +46,7 @@ void cookieparser_parse(cookieparser_t* parser, char* buffer, size_t buffer_size
 
                 if (ch == '\0') return;
 
-                http1_cookie_t* cookie_new = http1_cookie_create();
+                http_cookie_t* cookie_new = http_cookie_create();
 
                 if (cookie_new == NULL) return;
 
@@ -74,6 +74,6 @@ void cookieparser_parse(cookieparser_t* parser, char* buffer, size_t buffer_size
     }
 }
 
-http1_cookie_t* cookieparser_cookie(cookieparser_t* parser) {
+http_cookie_t* cookieparser_cookie(cookieparser_t* parser) {
     return parser->cookie;
 }

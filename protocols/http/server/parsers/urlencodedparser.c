@@ -59,7 +59,7 @@ void urlencodedparser_parse(urlencodedparser_t* parser, char* buffer, size_t buf
 }
 
 int urlencodedparser_add_part(urlencodedparser_t* parser) {
-    http1_payloadpart_t* part = http1_payloadpart_create();
+    http_payloadpart_t* part = http_payloadpart_create();
     if (!part) return -1;
 
     if (!parser->part) {
@@ -81,8 +81,8 @@ int urlencodedparser_add_part(urlencodedparser_t* parser) {
 }
 
 int urlencodedparser_set_field(urlencodedparser_t* parser) {
-    http1_payloadpart_t* part = parser->last_part;
-    part->field = http1_payloadfield_create();
+    http_payloadpart_t* part = parser->last_part;
+    part->field = http_payloadfield_create();
     part->field->value = malloc(part->size + 1);
     if (!part->field->value) return -1;
 
@@ -100,6 +100,6 @@ int urlencodedparser_set_field(urlencodedparser_t* parser) {
     return 0;
 }
 
-http1_payloadpart_t* urlencodedparser_part(urlencodedparser_t* parser) {
+http_payloadpart_t* urlencodedparser_part(urlencodedparser_t* parser) {
     return parser->part;
 }

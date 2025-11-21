@@ -3,8 +3,8 @@
 
 #include <string.h>
 
-#include "http1response.h"
-#include "http1request.h"
+#include "httpresponse.h"
+#include "httprequest.h"
 #include "httpcontext.h"
 #include "websocketsprotocoldefault.h"
 #include "websocketsprotocolresource.h"

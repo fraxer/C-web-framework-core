@@ -1,7 +1,7 @@
 #ifndef __HTTP_GZIP_FILTER__
 #define __HTTP_GZIP_FILTER__
 
-#include "http1response.h"
+#include "httpresponse.h"
 #include "gzip.h"
 
 typedef struct {

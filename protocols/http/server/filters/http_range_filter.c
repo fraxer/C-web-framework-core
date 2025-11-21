@@ -7,11 +7,11 @@
 static http_module_range_t* __create(void);
 static void __free(void* arg);
 static void __reset(void* arg);
-static int __get_range(http1response_t* response, http_module_range_t* module);
-static ssize_t __get_file_range(http1response_t* response, http_module_range_t* module, size_t offset, size_t capacity);
-static ssize_t __get_data_range(http1response_t* response, http_module_range_t* module, size_t offset, size_t capacity);
-static int __header(http1response_t* response);
-static int __body(http1response_t* response, bufo_t* parent_buf);
+static int __get_range(httpresponse_t* response, http_module_range_t* module);
+static ssize_t __get_file_range(httpresponse_t* response, http_module_range_t* module, size_t offset, size_t capacity);
+static ssize_t __get_data_range(httpresponse_t* response, http_module_range_t* module, size_t offset, size_t capacity);
+static int __header(httpresponse_t* response);
+static int __body(httpresponse_t* response, bufo_t* parent_buf);
 
 http_filter_t* http_range_filter_create(void) {
     http_filter_t* filter = malloc(sizeof * filter);
@@ -70,7 +70,7 @@ void __reset(void* arg) {
     bufo_flush(module->buf);
 }
 
-int __get_range(http1response_t* response, http_module_range_t* module) {
+int __get_range(httpresponse_t* response, http_module_range_t* module) {
     const int is_file = response->file_.fd > -1;
     size_t data_size = response->body.size;
     if (is_file)
@@ -106,20 +106,20 @@ int __get_range(http1response_t* response, http_module_range_t* module) {
     return 1;
 }
 
-ssize_t __get_file_range(http1response_t* response, http_module_range_t* module, size_t offset, size_t capacity) {
+ssize_t __get_file_range(httpresponse_t* response, http_module_range_t* module, size_t offset, size_t capacity) {
     lseek(response->file_.fd, offset, SEEK_SET);
     const ssize_t r = read(response->file_.fd, module->buf->data, capacity);
 
     return r;
 }
 
-ssize_t __get_data_range(http1response_t* response, http_module_range_t* module, size_t offset, size_t capacity) {
+ssize_t __get_data_range(httpresponse_t* response, http_module_range_t* module, size_t offset, size_t capacity) {
     memcpy(module->buf->data, response->body.data + offset, capacity);
 
     return capacity;
 }
 
-int __header(http1response_t* response) {
+int __header(httpresponse_t* response) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_range_t* module = cur_filter->module;
 
@@ -180,7 +180,7 @@ int __header(http1response_t* response) {
     return r;
 }
 
-int __body(http1response_t* response, bufo_t* parent_buf) {
+int __body(httpresponse_t* response, bufo_t* parent_buf) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_range_t* module = cur_filter->module;
     module->base.parent_buf = parent_buf;

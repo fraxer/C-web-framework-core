@@ -7,7 +7,7 @@
 #include <sys/socket.h>
 
 #include "log.h"
-#include "http1clienthandlers.h"
+#include "httpclienthandlers.h"
 #include "httpclientparser.h"
 #include "httpclient.h"
 
@@ -19,7 +19,7 @@ int __httpclient_connection_close(connection_t*);
 void __httpclient_free(httpclient_t*);
 void __httpclient_set_method(httpclient_t*, route_methods_e);
 int __httpclient_set_url(httpclient_t*, const char*);
-http1response_t* __httpclient_send(httpclient_t*);
+httpresponse_t* __httpclient_send(httpclient_t*);
 int __httpclient_create_connection(httpclient_t*);
 connection_t* __httpclient_resolve(const char*, const short);
 int __httpclient_establish_connection(httpclient_t*);
@@ -51,10 +51,10 @@ httpclient_t* httpclient_init(route_methods_e method, const char* url, int timeo
 
     if (!client->set_url(client, url)) goto failed;
 
-    client->request = http1request_create(client->connection);
+    client->request = httprequest_create(client->connection);
     if (client->request == NULL) goto failed;
 
-    client->response = http1response_create(client->connection);
+    client->response = httpresponse_create(client->connection);
     if (client->response == NULL) goto failed;
 
     client->set_method(client, method);
@@ -176,7 +176,7 @@ int __httpclient_set_url(httpclient_t* client, const char* url) {
     return 1;
 }
 
-http1response_t* __httpclient_send(httpclient_t* client) {
+httpresponse_t* __httpclient_send(httpclient_t* client) {
     int result = 0;
 
     client->redirect_count = 0;
@@ -204,7 +204,7 @@ http1response_t* __httpclient_send(httpclient_t* client) {
     switch (__httpclient_is_redirect(client)) {
         case CLIENTREDIRECT_NONE: break;
         case CLIENTREDIRECT_EXIST: {
-            http1_header_t* header = client->response->header(client->response, "Location");
+            http_header_t* header = client->response->header(client->response, "Location");
             if (!(header && header->value_length > 0) || !client->set_url(client, header->value))
                 goto failed;
 
@@ -320,7 +320,7 @@ int __httpclient_establish_connection(httpclient_t* client) {
             return 0;
     }
     else
-        set_client_http1(client->connection);
+        set_client_http(client->connection);
 
     return 1;
 }
@@ -412,7 +412,7 @@ int __httpclient_handshake(httpclient_t* client) {
 }
 
 int __httpclient_set_request_uri(httpclient_t* client) {
-    http1request_t* request = (http1request_t*)client->request;
+    httprequest_t* request = (httprequest_t*)client->request;
 
     if (request->uri) free((void*)request->uri);
     request->uri = httpclientparser_move_uri(client->parser);
@@ -431,7 +431,7 @@ int __httpclient_set_request_uri(httpclient_t* client) {
 }
 
 int __httpclient_set_header_host(httpclient_t* client) {
-    http1request_t* request = (http1request_t*)client->request;
+    httprequest_t* request = (httprequest_t*)client->request;
     request->header_del(request, "Host");
 
     char host[128];
@@ -494,7 +494,7 @@ int __httpclient_is_redirect(httpclient_t* client) {
     if (client->redirect_count > 9)
         return CLIENTREDIRECT_MANY_REDIRECTS;
 
-    http1_header_t* header = client->response->header(client->response, "Location");
+    http_header_t* header = client->response->header(client->response, "Location");
     if (!(header && header->value_length > 0))
         return CLIENTREDIRECT_ERROR;
 

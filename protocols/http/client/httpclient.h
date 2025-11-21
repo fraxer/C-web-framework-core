@@ -6,9 +6,9 @@
 
 #include "route.h"
 #include "connection_c.h"
-#include "http1common.h"
-#include "http1request.h"
-#include "http1response.h"
+#include "httpcommon.h"
+#include "httprequest.h"
+#include "httpresponse.h"
 #include "httpclientparser.h"
 
 #define BUF_SIZE 16384
@@ -29,10 +29,10 @@ typedef struct httpclient {
     char* host;
     SSL_CTX* ssl_ctx;
     connection_t* connection;
-    http1request_t* request;
-    http1response_t* response;
+    httprequest_t* request;
+    httpresponse_t* response;
     httpclientparser_t* parser;
-    http1response_t*(*send)();
+    httpresponse_t*(*send)();
     const char*(*error)(struct httpclient*);
     void(*set_method)(struct httpclient*, route_methods_e);
     int(*set_url)(struct httpclient*, const char*);
