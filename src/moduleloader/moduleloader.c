@@ -58,7 +58,7 @@ static int __module_loader_set_http_route(routeloader_lib_t** first_lib, routelo
 static void __module_loader_pass_memory_sharedlib(routeloader_lib_t*, const char*);
 static int __module_loader_http_redirects_load(const json_token_t* token_object, redirect_t** redirect);
 static int __module_loader_middlewares_load(const json_token_t* token_object, middleware_item_t** middleware_item);
-static void __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t** first_lib, const json_token_t* token_array);
+static int __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t** first_lib, const json_token_t* token_object, map_t* ratelimiter_config);
 static int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config);
 static int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config);
 static openssl_t* __module_loader_tls_load(const json_token_t* token_object);
@@ -714,8 +714,10 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
                 goto failed;
             }
 
-            __module_loader_websockets_default_load(&server->websockets.default_handler, &first_lib, json_object_get(token_websockets, "default"));
-
+            if (!__module_loader_websockets_default_load(&server->websockets.default_handler, &first_lib, json_object_get(token_websockets, "default"), server->ratelimits_config)) {
+                log_error("__module_loader_servers_load: can't load default handler\n");
+                goto failed;
+            }
             if (!__module_loader_websockets_ratelimit_load(json_object_get(token_websockets, "ratelimit"), &server->websockets.ratelimiter, server->ratelimits_config)) {
                 log_error("__module_loader_servers_load: can't load routes\n");
                 goto failed;
@@ -1415,46 +1417,70 @@ int __module_loader_middlewares_load(const json_token_t* token_array, middleware
     return result;
 }
 
-void __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t** first_lib, const json_token_t* token_array) {
+int __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t** first_lib, const json_token_t* token_object, map_t* ratelimiter_config) {
     *fn = (void(*)(void*))websockets_default_handler;
 
-    if (token_array == NULL) return;
-    if (!json_is_array(token_array)) {
-        log_error("__module_loader_websockets_default_load: websockets.default must be array\n");
-        return;
+    if (!json_is_object(token_object)) {
+        log_error("__module_loader_websockets_default_load: websockets.route item.value must be object\n");
+        return 0;
     }
-    if (json_array_size(token_array) != 2) {
-        log_error("__module_loader_websockets_default_load: websockets.default must be array with 2 items\n");
-        return;
+    if (json_object_size(token_object) < 2) {
+        log_error("__module_loader_websockets_default_load: websockets.route item.value must be object with at least 2 elements\n");
+        return 0;
     }
 
-    const json_token_t* token_string0 = json_array_get(token_array, 0);
-    if (!json_is_string(token_string0)) {
-        log_error("__module_loader_websockets_default_load: websockets.default item.value[0] must be string\n");
-        return;
+    const json_token_t* token_file = json_object_get(token_object, "file");
+    if (!json_is_string(token_file)) {
+        log_error("__module_loader_websockets_default_load: websockets.route item.value.route must be string\n");
+        return 0;
     }
-    if (json_string_size(token_string0) == 0) {
-        log_error("__module_loader_websockets_default_load: websockets.default item.value[0] must be not empty string\n");
-        return;
+    if (json_string_size(token_file) == 0) {
+        log_error("__module_loader_websockets_default_load: websockets.route item.value.route must be not empty string\n");
+        return 0;
     }
-    const json_token_t* token_string1 = json_array_get(token_array, 1);
-    if (!json_is_string(token_string1)) {
-        log_error("__module_loader_websockets_default_load: websockets.default item.value[1] must be string\n");
-        return;
+    const json_token_t* token_function = json_object_get(token_object, "function");
+    if (!json_is_string(token_function)) {
+        log_error("__module_loader_websockets_default_load: websockets.route item.value.handler must be string\n");
+        return 0;
     }
-    if (json_string_size(token_string1) == 0) {
-        log_error("__module_loader_websockets_default_load: websockets.default item.value[1] must be not empty string\n");
-        return;
+    if (json_string_size(token_function) == 0) {
+        log_error("__module_loader_websockets_default_load: websockets.route item.value.handler must be not empty string\n");
+        return 0;
+    }
+    const json_token_t* token_ratelimit = json_object_get(token_object, "ratelimit");
+    ratelimiter_t* ratelimiter = NULL;
+    if (token_ratelimit != NULL) {
+        if (!json_is_string(token_ratelimit)) {
+            log_error("__module_loader_websockets_default_load: websockets.route item.value.handler must be string\n");
+            return 0;
+        }
+        if (json_string_size(token_ratelimit) == 0) {
+            log_error("__module_loader_websockets_default_load: websockets.route item.value.handler must be not empty string\n");
+            return 0;
+        }
+
+        const char* ratelimit_name = json_string(token_ratelimit);
+        ratelimiter_config_t* config = map_find(ratelimiter_config, ratelimit_name);
+        if (config == NULL) {
+            log_error("__module_loader_websockets_default_load: ratelimiter %s not found\n", ratelimit_name);
+            return 0;
+        }
+
+        ratelimiter = ratelimiter_init(config);
+        if (ratelimiter == NULL) {
+            log_error("__module_loader_websockets_default_load: failed to create ratelimiter %s\n", ratelimit_name);
+            return 0;
+        }
     }
 
     routeloader_lib_t* last_lib = routeloader_get_last(*first_lib);
-    const char* lib_file = json_string(token_string0);
-    const char* lib_handler = json_string(token_string1);
+    const char* lib_file = json_string(token_file);
+    const char* lib_handler = json_string(token_function);
     if (!routeloader_has_lib(*first_lib, lib_file)) {
         routeloader_lib_t* routeloader_lib = routeloader_load_lib(lib_file);
         if (routeloader_lib == NULL) {
             log_error("__module_loader_websockets_default_load: failed to load lib %s\n", lib_file);
-            return;
+            return 0;
         }
 
         if (*first_lib == NULL)
@@ -1467,6 +1493,8 @@ void __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_
     }
 
     *(void**)(&(*fn)) = routeloader_get_handler(*first_lib, lib_file, lib_handler);
+
+    return 1;
 }
 
 int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config) {
