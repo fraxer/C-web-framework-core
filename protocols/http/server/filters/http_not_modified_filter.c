@@ -1,7 +1,7 @@
 #include "http_not_modified_filter.h"
 
 int http_not_modified_header(httpresponse_t* response) {
-    response->header_add(response, "Status", "304 Not Modified");
+    response->add_header(response, "Status", "304 Not Modified");
 
     if (response->cur_filter->next != NULL) {
         response->cur_filter = response->cur_filter->next;

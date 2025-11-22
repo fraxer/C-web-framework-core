@@ -168,17 +168,17 @@ void my_handler(httpctx_t* ctx) {
     const char* name = ctx->request->query(ctx->request, "name");
 
     // Получение JSON из тела запроса
-    json_doc_t* doc = ctx->request->payload_json(ctx->request);
+    json_doc_t* doc = ctx->request->get_payload_json(ctx->request);
 
     // Работа с JSON
     json_token_t* root = json_root(doc);
     json_object_set(root, "status", json_create_string("success"));
 
     // Установка заголовка
-    ctx->response->header_add(ctx->response, "Content-Type", "application/json");
+    ctx->response->add_header(ctx->response, "Content-Type", "application/json");
 
     // Отправка ответа
-    ctx->response->data(ctx->response, json_stringify(doc));
+    ctx->response->send_data(ctx->response, json_stringify(doc));
 
     json_free(doc);
 }
@@ -195,14 +195,14 @@ void ws_join_channel(wsctx_t* ctx) {
     broadcast_add("my_channel", ctx->request->connection,
                   user_id_struct, send_callback);
 
-    ctx->response->data(ctx, "Joined channel");
+    ctx->response->send_data(ctx, "Joined channel");
 }
 
 void ws_send_message(wsctx_t* ctx) {
     websockets_protocol_resource_t* protocol =
         (websockets_protocol_resource_t*)ctx->request->protocol;
 
-    char* message = protocol->payload(protocol);
+    char* message = protocol->get_payload(protocol);
 
     // Отправка сообщения всем в канале
     broadcast_send("my_channel", ctx->request->connection,
@@ -232,7 +232,7 @@ void get_users(httpctx_t* ctx) {
     array_free(params);
 
     if (!dbresult_ok(result)) {
-        ctx->response->data(ctx->response, "Query error");
+        ctx->response->send_data(ctx->response, "Query error");
         dbresult_free(result);
         return;
     }
@@ -267,13 +267,13 @@ void create_user_example(httpctx_t* ctx) {
 
     // Сохранение в БД
     if (!user_create(user)) {
-        ctx->response->data(ctx->response, "Error creating user");
+        ctx->response->send_data(ctx->response, "Error creating user");
         model_free(user);
         return;
     }
 
     // Вывод модели в JSON
-    ctx->response->model(ctx->response, user,
+    ctx->response->send_model(ctx->response, user,
                         display_fields("id", "email", "name"));
 
     model_free(user);
@@ -294,7 +294,7 @@ void secret_page(httpctx_t* ctx) {
 
     // Этот код выполнится только если пользователь авторизован
     user_t* user = httpctx_get_user(ctx);
-    ctx->response->data(ctx->response, "Welcome to secret page!");
+    ctx->response->send_data(ctx->response, "Welcome to secret page!");
 }
 ```
 
@@ -308,7 +308,7 @@ void upload_file(httpctx_t* ctx) {
     file_content_t content = ctx->request->payload_filef(ctx->request, "myfile");
 
     if (!content.ok) {
-        ctx->response->data(ctx->response, "File not found");
+        ctx->response->send_data(ctx->response, "File not found");
         return;
     }
 
@@ -316,7 +316,7 @@ void upload_file(httpctx_t* ctx) {
     storage_file_content_put("remote", &content,
                             "uploads/%s", content.filename);
 
-    ctx->response->data(ctx->response, "File uploaded");
+    ctx->response->send_data(ctx->response, "File uploaded");
 }
 
 void download_file(httpctx_t* ctx) {
@@ -324,12 +324,12 @@ void download_file(httpctx_t* ctx) {
     file_t file = storage_file_get("local", "/path/to/file.txt");
 
     if (!file.ok) {
-        ctx->response->data(ctx->response, "File not found");
+        ctx->response->send_data(ctx->response, "File not found");
         return;
     }
 
     // Отправка файла клиенту
-    ctx->response->file(ctx->response, file.path);
+    ctx->response->send_file(ctx->response, file.path);
     file.close(&file);
 }
 ```
@@ -349,11 +349,11 @@ void send_email(httpctx_t* ctx) {
     };
 
     if (!send_mail(&payload)) {
-        ctx->response->data(ctx->response, "Error sending email");
+        ctx->response->send_data(ctx->response, "Error sending email");
         return;
     }
 
-    ctx->response->data(ctx->response, "Email sent");
+    ctx->response->send_data(ctx->response, "Email sent");
 }
 ```
 

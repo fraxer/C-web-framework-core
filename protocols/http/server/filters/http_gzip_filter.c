@@ -85,8 +85,8 @@ int __header(httpresponse_t* response) {
     if (module->base.cont)
         goto cont;
 
-    if (response->header(response, "Content-Encoding") == NULL)
-        response->header_add(response, "Content-Encoding", "gzip");
+    if (response->get_header(response, "Content-Encoding") == NULL)
+        response->add_header(response, "Content-Encoding", "gzip");
 
     response->transfer_encoding = TE_CHUNKED;
 

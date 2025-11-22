@@ -1,14 +1,14 @@
 #include "websocketsswitch.h"
 
 void switch_to_websockets(httpctx_t* ctx) {
-    const http_header_t* connection  = ctx->request->headern(ctx->request, "Connection", 10);
-    const http_header_t* upgrade     = ctx->request->headern(ctx->request, "Upgrade", 7);
-    const http_header_t* ws_version  = ctx->request->headern(ctx->request, "Sec-WebSocket-Version", 21);
-    const http_header_t* ws_key      = ctx->request->headern(ctx->request, "Sec-WebSocket-Key", 17);
-    const http_header_t* ws_protocol = ctx->request->headern(ctx->request, "Sec-WebSocket-Protocol", 22);
+    const http_header_t* connection  = ctx->request->get_headern(ctx->request, "Connection", 10);
+    const http_header_t* upgrade     = ctx->request->get_headern(ctx->request, "Upgrade", 7);
+    const http_header_t* ws_version  = ctx->request->get_headern(ctx->request, "Sec-WebSocket-Version", 21);
+    const http_header_t* ws_key      = ctx->request->get_headern(ctx->request, "Sec-WebSocket-Key", 17);
+    const http_header_t* ws_protocol = ctx->request->get_headern(ctx->request, "Sec-WebSocket-Protocol", 22);
 
     if (connection == NULL || upgrade == NULL || ws_version == NULL || ws_key == NULL) {
-        ctx->response->data(ctx->response, "error connect to web socket");
+        ctx->response->send_data(ctx->response, "error connect to web socket");
         return;
     }
 
@@ -23,16 +23,16 @@ void switch_to_websockets(httpctx_t* ctx) {
     char base64_string[base64_encode_len(20)];
     int retlen = base64_encode(base64_string, (const char*)result, 20);
 
-    ctx->response->headern_add(ctx->response, "Upgrade", 7, "websocket", 9);
-    ctx->response->headern_add(ctx->response, "Connection", 10, "Upgrade", 7);
-    ctx->response->headern_add(ctx->response, "Sec-WebSocket-Accept", 20, base64_string, retlen);
+    ctx->response->add_headern(ctx->response, "Upgrade", 7, "websocket", 9);
+    ctx->response->add_headern(ctx->response, "Connection", 10, "Upgrade", 7);
+    ctx->response->add_headern(ctx->response, "Sec-WebSocket-Accept", 20, base64_string, retlen);
 
     connection_t* server_connection = ctx->response->connection;
     connection_server_ctx_t* conn_ctx = server_connection->ctx;
     conn_ctx->switch_to_protocol = set_websockets_default;
 
     if (ws_protocol != NULL && strcmp(ws_protocol->value, "resource") == 0) {
-        ctx->response->headern_add(ctx->response, "Sec-WebSocket-Protocol", 22, ws_protocol->value, ws_protocol->value_length);
+        ctx->response->add_headern(ctx->response, "Sec-WebSocket-Protocol", 22, ws_protocol->value, ws_protocol->value_length);
         conn_ctx->switch_to_protocol = set_websockets_resource;
     }
 

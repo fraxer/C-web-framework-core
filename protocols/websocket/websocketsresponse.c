@@ -57,14 +57,14 @@ websocketsresponse_t* websocketsresponse_create(connection_t* connection) {
     response->file_.pos = 0;
     response->file_.size = 0;
     response->connection = connection;
-    response->text = websocketsresponse_text;
-    response->textn = websocketsresponse_textn;
-    response->binary = websocketsresponse_binary;
-    response->binaryn = websocketsresponse_binaryn;
-    response->data = websocketsresponse_data;
-    response->datan = websocketsresponse_datan;
-    response->file = websocketsresponse_file;
-    response->filen = websocketsresponse_filen;
+    response->send_text = websocketsresponse_text;
+    response->send_textn = websocketsresponse_textn;
+    response->send_binary = websocketsresponse_binary;
+    response->send_binaryn = websocketsresponse_binaryn;
+    response->send_data = websocketsresponse_data;
+    response->send_datan = websocketsresponse_datan;
+    response->send_file = websocketsresponse_file;
+    response->send_filen = websocketsresponse_filen;
     response->base.reset = (void(*)(void*))websocketsresponse_reset;
     response->base.free = (void(*)(void*))websocketsresponse_free;
 

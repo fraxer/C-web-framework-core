@@ -84,8 +84,8 @@ int http_chunked_header(httpresponse_t* response) {
     if (module->base.cont)
         goto cont;
 
-    if (response->header(response, "Transfer-Encoding") == NULL)
-        response->header_add(response, "Transfer-Encoding", "chunked");
+    if (response->get_header(response, "Transfer-Encoding") == NULL)
+        response->add_header(response, "Transfer-Encoding", "chunked");
 
     if (!bufo_alloc(module->buf, BUF_SIZE))
         return CWF_ERROR;

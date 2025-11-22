@@ -17,7 +17,7 @@ typedef enum {
 
 /*
  * HTTP cookie structure.
- * Used with response->cookie_add().
+ * Used with response->add_cookie().
  */
 typedef struct {
     const char* name;       /* Cookie name (required) */
@@ -48,7 +48,7 @@ typedef struct httpresponse {
      * @param response - pointer to httpresponse
      * @param data - null-terminated string to send
      */
-    void(*data)(struct httpresponse* response, const char* data);
+    void(*send_data)(struct httpresponse* response, const char* data);
 
     /*
      * Send text data with specified length.
@@ -57,7 +57,7 @@ typedef struct httpresponse {
      * @param data - data to send
      * @param length - data length in bytes
      */
-    void(*datan)(struct httpresponse* response, const char* data, size_t size);
+    void(*send_datan)(struct httpresponse* response, const char* data, size_t size);
 
     /*
      * Render and send HTML template (view).
@@ -67,7 +67,7 @@ typedef struct httpresponse {
      * @param path_format - template path format (supports printf formatting)
      * @param ... - arguments for path formatting
      */
-    void(*view)(struct httpresponse* response, json_doc_t* document, const char* storage_name, const char* path_format, ...);
+    void(*send_view)(struct httpresponse* response, json_doc_t* document, const char* storage_name, const char* path_format, ...);
 
     /*
      * Send default HTTP response with status code.
@@ -75,7 +75,7 @@ typedef struct httpresponse {
      * @param response - pointer to httpresponse
      * @param status_code - HTTP status code (200, 404, 500, etc.)
      */
-    void(*def)(struct httpresponse* response, int status_code);
+    void(*send_default)(struct httpresponse* response, int status_code);
 
     /*
      * Send JSON document.
@@ -83,7 +83,7 @@ typedef struct httpresponse {
      * @param response - pointer to httpresponse
      * @param document - JSON document to serialize and send
      */
-    void(*json)(struct httpresponse* response, json_doc_t* document);
+    void(*send_json)(struct httpresponse* response, json_doc_t* document);
 
     /*
      * Serialize model to JSON and send.
@@ -92,7 +92,7 @@ typedef struct httpresponse {
      * @param model - pointer to data model
      * @param ... - array of field names to display (char**), NULL for all fields
      */
-    void(*model)(struct httpresponse* response, void* model, ...);
+    void(*send_model)(struct httpresponse* response, void* model, ...);
 
     /*
      * Serialize array of models to JSON array and send.
@@ -101,7 +101,7 @@ typedef struct httpresponse {
      * @param models - array of models (array_t*)
      * @param ... - array of field names to display (char**), NULL for all fields
      */
-    void(*models)(struct httpresponse* response, array_t* models, ...);
+    void(*send_models)(struct httpresponse* response, array_t* models, ...);
 
     /*
      * Perform HTTP redirect.
@@ -117,7 +117,7 @@ typedef struct httpresponse {
      * @param key - header name (case-insensitive search)
      * @return pointer to header or NULL if not found
      */
-    http_header_t*(*header)(struct httpresponse* response, const char* key);
+    http_header_t*(*get_header)(struct httpresponse* response, const char* key);
 
     /*
      * Add header to response (null-terminated strings).
@@ -126,7 +126,7 @@ typedef struct httpresponse {
      * @param value - header value
      * @return 1 on success, 0 on error
      */
-    int(*header_add)(struct httpresponse* response, const char* key, const char* value);
+    int(*add_header)(struct httpresponse* response, const char* key, const char* value);
 
     /*
      * Add header to response with specified lengths.
@@ -137,7 +137,7 @@ typedef struct httpresponse {
      * @param value_length - header value length
      * @return 1 on success, 0 on error
      */
-    int(*headern_add)(struct httpresponse* response, const char* key, size_t key_length, const char* value, size_t value_length);
+    int(*add_headern)(struct httpresponse* response, const char* key, size_t key_length, const char* value, size_t value_length);
 
     /*
      * Add header if it doesn't already exist (unique).
@@ -148,7 +148,7 @@ typedef struct httpresponse {
      * @param value_length - header value length
      * @return 1 on success or if header already exists, 0 on error
      */
-    int(*headeru_add)(struct httpresponse* response, const char* key, size_t key_length, const char* value, size_t value_length);
+    int(*add_headeru)(struct httpresponse* response, const char* key, size_t key_length, const char* value, size_t value_length);
 
     /*
      * Add Content-Length header.
@@ -156,7 +156,7 @@ typedef struct httpresponse {
      * @param length - content size in bytes
      * @return 1 on success, 0 on error
      */
-    int(*header_add_content_length)(struct httpresponse* response, size_t length);
+    int(*add_content_length)(struct httpresponse* response, size_t length);
 
     /*
      * Remove header from response.
@@ -164,7 +164,7 @@ typedef struct httpresponse {
      * @param key - header name to remove
      * @return 1 on success, 0 on error
      */
-    int(*header_remove)(struct httpresponse* response, const char* key);
+    int(*remove_header)(struct httpresponse* response, const char* key);
 
     /*
      * Send file by relative path (null-terminated).
@@ -172,7 +172,7 @@ typedef struct httpresponse {
      * @param response - pointer to httpresponse
      * @param path - relative path to file from server root
      */
-    void(*file)(struct httpresponse* response, const char* path);
+    void(*send_file)(struct httpresponse* response, const char* path);
 
     /*
      * Send file by relative path with specified length.
@@ -181,7 +181,7 @@ typedef struct httpresponse {
      * @param path - relative path to file from server root
      * @param length - path length
      */
-    void(*filen)(struct httpresponse* response, const char* path, size_t length);
+    void(*send_filen)(struct httpresponse* response, const char* path, size_t length);
 
     /*
      * Send file from storage with path formatting.
@@ -191,14 +191,14 @@ typedef struct httpresponse {
      * @param path_format - file path format (supports printf formatting)
      * @param ... - arguments for path formatting
      */
-    void(*filef)(struct httpresponse* response, const char* storage_name, const char* path_format, ...);
+    void(*send_filef)(struct httpresponse* response, const char* storage_name, const char* path_format, ...);
 
     /*
      * Add cookie to response.
      * @param response - pointer to httpresponse
      * @param cookie - cookie_t structure with parameters
      */
-    void(*cookie_add)(struct httpresponse* response, cookie_t cookie);
+    void(*add_cookie)(struct httpresponse* response, cookie_t cookie);
 
     /*
      * Get request body as string.
@@ -206,14 +206,14 @@ typedef struct httpresponse {
      * @param response - pointer to httpresponse
      * @return null-terminated string or NULL on error
      */
-    char*(*payload)(struct httpresponse* response);
+    char*(*get_payload)(struct httpresponse* response);
 
     /*
      * Get request body as file.
      * @param response - pointer to httpresponse
      * @return file_content_t structure with file information
      */
-    file_content_t(*payload_file)(struct httpresponse* response);
+    file_content_t(*get_payload_file)(struct httpresponse* response);
 
     /*
      * Parse request body as JSON.
@@ -221,7 +221,7 @@ typedef struct httpresponse {
      * @param response - pointer to httpresponse
      * @return JSON document or NULL on parse error
      */
-    json_doc_t*(*payload_json)(struct httpresponse* response);
+    json_doc_t*(*get_payload_json)(struct httpresponse* response);
     
     size_t content_length;
 

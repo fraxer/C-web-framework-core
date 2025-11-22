@@ -34,7 +34,7 @@ typedef struct httprequest {
      * @param name - header name (null-terminated string)
      * @return pointer to header structure or NULL if not found
      */
-    http_header_t*(*header)(struct httprequest* request, const char* name);
+    http_header_t*(*get_header)(struct httprequest* request, const char* name);
 
     /**
      * Get HTTP header by name with length.
@@ -43,7 +43,7 @@ typedef struct httprequest {
      * @param name_length - length of header name
      * @return pointer to header structure or NULL if not found
      */
-    http_header_t*(*headern)(struct httprequest* request, const char* name, size_t name_length);
+    http_header_t*(*get_headern)(struct httprequest* request, const char* name, size_t name_length);
 
     /**
      * Add new HTTP header to request.
@@ -52,7 +52,7 @@ typedef struct httprequest {
      * @param value - header value (null-terminated string)
      * @return 0 on success, -1 on error
      */
-    int(*header_add)(struct httprequest* request, const char* name, const char* value);
+    int(*add_header)(struct httprequest* request, const char* name, const char* value);
 
     /**
      * Add new HTTP header with explicit lengths.
@@ -63,15 +63,15 @@ typedef struct httprequest {
      * @param value_length - length of header value
      * @return 0 on success, -1 on error
      */
-    int(*headern_add)(struct httprequest* request, const char* name, size_t name_length, const char* value, size_t value_length);
+    int(*add_headern)(struct httprequest* request, const char* name, size_t name_length, const char* value, size_t value_length);
 
     /**
-     * Delete HTTP header by name.
+     * Remove HTTP header by name.
      * @param request - HTTP request instance
-     * @param name - header name to delete (null-terminated string)
+     * @param name - header name to remove (null-terminated string)
      * @return 0 on success, -1 if not found
      */
-    int(*header_del)(struct httprequest* request, const char* name);
+    int(*remove_header)(struct httprequest* request, const char* name);
 
     /**
      * Get cookie value by name.
@@ -79,14 +79,14 @@ typedef struct httprequest {
      * @param name - cookie name (null-terminated string)
      * @return pointer to cookie value or NULL if not found
      */
-    const char*(*cookie)(struct httprequest* request, const char* name);
+    const char*(*get_cookie)(struct httprequest* request, const char* name);
 
     /**
      * Get request payload as string.
      * @param request - HTTP request instance
      * @return pointer to payload data or NULL if no payload
      */
-    char*(*payload)(struct httprequest* request);
+    char*(*get_payload)(struct httprequest* request);
 
     /**
      * Get specific field from request payload.
@@ -94,14 +94,14 @@ typedef struct httprequest {
      * @param field - field name to extract (null-terminated string)
      * @return pointer to field value or NULL if not found
      */
-    char*(*payloadf)(struct httprequest* request, const char* field);
+    char*(*get_payloadf)(struct httprequest* request, const char* field);
 
     /**
      * Get request payload as file content.
      * @param request - HTTP request instance
      * @return file_content_t structure with payload data
      */
-    file_content_t(*payload_file)(struct httprequest* request);
+    file_content_t(*get_payload_file)(struct httprequest* request);
 
     /**
      * Get specific file field from multipart payload.
@@ -109,22 +109,22 @@ typedef struct httprequest {
      * @param field - field name containing file (null-terminated string)
      * @return file_content_t structure with file data
      */
-    file_content_t(*payload_filef)(struct httprequest* request, const char* field);
+    file_content_t(*get_payload_filef)(struct httprequest* request, const char* field);
 
     /**
-     * Parse request payload as JSON document.
+     * Get request payload as JSON document.
      * @param request - HTTP request instance
      * @return pointer to parsed JSON document or NULL on error
      */
-    json_doc_t*(*payload_json)(struct httprequest* request);
+    json_doc_t*(*get_payload_json)(struct httprequest* request);
 
     /**
-     * Parse specific field from payload as JSON.
+     * Get specific field from payload as JSON.
      * @param request - HTTP request instance
      * @param field - field name containing JSON (null-terminated string)
      * @return pointer to parsed JSON document or NULL on error
      */
-    json_doc_t*(*payload_jsonf)(struct httprequest* request, const char* field);
+    json_doc_t*(*get_payload_jsonf)(struct httprequest* request, const char* field);
 
     /**
      * Append URL-encoded form field to request payload.
