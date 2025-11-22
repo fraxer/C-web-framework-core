@@ -85,11 +85,11 @@ void __httpresponse_view(httpresponse_t* response, json_doc_t* document, const c
 
     char* data = render(document, storage_name, path);
     if (data == NULL) {
-        response->data(response, "Render view error");
+        response->send_data(response, "Render view error");
         return;
     }
 
-    response->data(response, data);
+    response->send_data(response, data);
 
     free(data);
 }
@@ -113,24 +113,24 @@ httpresponse_t* httpresponse_create(connection_t* connection) {
     response->headers_sended = 0;
     response->range = 0;
     response->connection = connection;
-    response->data = __httpresponse_data;
-    response->datan = __httpresponse_datan;
-    response->view = __httpresponse_view;
-    response->def = httpresponse_default;
-    response->json = __httpresponse_json;
-    response->model = __httpresponse_model;
-    response->models = __httpresponse_models;
+    response->send_data = __httpresponse_data;
+    response->send_datan = __httpresponse_datan;
+    response->send_view = __httpresponse_view;
+    response->send_default = httpresponse_default;
+    response->send_json = __httpresponse_json;
+    response->send_model = __httpresponse_model;
+    response->send_models = __httpresponse_models;
     response->redirect = httpresponse_redirect;
-    response->header = __httpresponse_header_get;
-    response->header_add = __httpresponse_header_add;
-    response->headern_add = __httpresponse_headern_add;
-    response->headeru_add = __httpresponse_headeru_add;
-    response->header_add_content_length = __httpresponse_header_add_content_length;
-    response->header_remove = NULL;
-    response->file = __httpresponse_file;
-    response->filen = __httpresponse_filen;
-    response->filef = __httpresponse_filef;
-    response->cookie_add = __httpresponse_cookie_add;
+    response->get_header = __httpresponse_header_get;
+    response->add_header = __httpresponse_header_add;
+    response->add_headern = __httpresponse_headern_add;
+    response->add_headeru = __httpresponse_headeru_add;
+    response->add_content_length = __httpresponse_header_add_content_length;
+    response->remove_header = NULL;
+    response->send_file = __httpresponse_file;
+    response->send_filen = __httpresponse_filen;
+    response->send_filef = __httpresponse_filef;
+    response->add_cookie = __httpresponse_cookie_add;
     response->base.reset = (void(*)(void*))__httpresponse_reset;
     response->base.free = (void(*)(void*))httpresponse_free;
 
@@ -188,9 +188,9 @@ void __httpresponse_datan(httpresponse_t* response, const char* data, size_t len
     }
 
     const char* keep_alive = __httpresponse_keepalive_enabled(response) ? "keep-alive" : "close";
-    response->headeru_add(response, "Content-Type", 12, "text/html; charset=utf-8", 24);
-    response->headeru_add(response, "Connection", 10, keep_alive, strlen(keep_alive));
-    response->headeru_add(response, "Cache-Control", 13, "no-store, no-cache", 18);
+    response->add_headeru(response, "Content-Type", 12, "text/html; charset=utf-8", 24);
+    response->add_headeru(response, "Connection", 10, keep_alive, strlen(keep_alive));
+    response->add_headeru(response, "Cache-Control", 13, "no-store, no-cache", 18);
 
     if (!__httpresponse_prepare_body(response, length)) {
         connection->keepalive = 0;
@@ -208,7 +208,7 @@ void __httpresponse_filen(httpresponse_t* response, const char* path, size_t len
     char file_full_path[PATH_MAX];
     const file_status_e status_code = http_get_file_full_path(ctx->server, file_full_path, PATH_MAX, path, length);
     if (status_code != FILE_OK) {
-        response->def(response, status_code);
+        response->send_default(response, status_code);
         return;
     }
 
@@ -264,18 +264,18 @@ file_status_e http_get_file_full_path(server_t* server, char* file_full_path, si
 void http_response_file(httpresponse_t* response, const char* file_full_path) {
     response->file_ = file_open(file_full_path, O_RDONLY);
     if (!response->file_.ok) {
-        response->def(response, 404);
+        response->send_default(response, 404);
         return;
     }
 
     const char* ext = file_extention(file_full_path);
     const char* mimetype = __httpresponse_get_mimetype(ext);
     const char* connection = __httpresponse_keepalive_enabled(response) ? "keep-alive" : "close";
-    response->headeru_add(response, "Connection", 10, connection, strlen(connection));
-    response->headeru_add(response, "Content-Type", 12, mimetype, strlen(mimetype));
+    response->add_headeru(response, "Connection", 10, connection, strlen(connection));
+    response->add_headeru(response, "Content-Type", 12, mimetype, strlen(mimetype));
 
     if (!__httpresponse_prepare_body(response, response->file_.size))
-        response->def(response, 500);
+        response->send_default(response, 500);
 }
 
 void __httpresponse_filef(httpresponse_t* response, const char* storage_name, const char* path_format, ...) {
@@ -287,18 +287,18 @@ void __httpresponse_filef(httpresponse_t* response, const char* storage_name, co
 
     response->file_ = storage_file_get(storage_name, path);
     if (!response->file_.ok) {
-        response->def(response, 404);
+        response->send_default(response, 404);
         return;
     }
 
     const char* ext = file_extention(response->file_.name);
     const char* mimetype = __httpresponse_get_mimetype(ext);
     const char* connection = __httpresponse_keepalive_enabled(response) ? "keep-alive" : "close";
-    response->headeru_add(response, "Connection", 10, connection, strlen(connection));
-    response->headeru_add(response, "Content-Type", 12, mimetype, strlen(mimetype));
+    response->add_headeru(response, "Connection", 10, connection, strlen(connection));
+    response->add_headeru(response, "Content-Type", 12, mimetype, strlen(mimetype));
 
     if (!__httpresponse_prepare_body(response, response->file_.size))
-        response->def(response, 500);
+        response->send_default(response, 500);
 }
 
 http_header_t* __httpresponse_header_get(httpresponse_t* response, const char* key) {
@@ -381,7 +381,7 @@ int __httpresponse_header_exist(httpresponse_t* response, const char* key) {
 
 int __httpresponse_header_add_content_length(httpresponse_t* response, size_t length) {
     if (length == 0)
-        return response->headern_add(response, "Content-Length", 14, "0", 1);
+        return response->add_headern(response, "Content-Length", 14, "0", 1);
 
     size_t value = length;
     size_t content_length = 0;
@@ -390,7 +390,7 @@ int __httpresponse_header_add_content_length(httpresponse_t* response, size_t le
     char content_string[content_length + 1];
     sprintf(content_string, "%ld", length);
 
-    return response->headern_add(response, "Content-Length", 14, content_string, content_length);
+    return response->add_headern(response, "Content-Length", 14, content_string, content_length);
 }
 
 const char* httpresponse_status_string(int status_code) {
@@ -559,17 +559,17 @@ void httpresponse_default(httpresponse_t* response, int status_code) {
 
     data[data_length] = 0;
 
-    response->datan(response, data, data_length);
+    response->send_datan(response, data, data_length);
 }
 
 void __httpresponse_json(httpresponse_t* response, json_doc_t* document) {
     const char* connection = __httpresponse_keepalive_enabled(response) ? "keep-alive" : "close";
-    response->headeru_add(response, "Content-Type", 12, "application/json", 16);
-    response->headeru_add(response, "Connection", 10, connection, strlen(connection));
-    response->headeru_add(response, "Cache-Control", 13, "no-store, no-cache", 18);
+    response->add_headeru(response, "Content-Type", 12, "application/json", 16);
+    response->add_headeru(response, "Connection", 10, connection, strlen(connection));
+    response->add_headeru(response, "Cache-Control", 13, "no-store, no-cache", 18);
 
     if (document == NULL) {
-        response->def(response, 500);
+        response->send_default(response, 500);
         return;
     }
 
@@ -577,22 +577,22 @@ void __httpresponse_json(httpresponse_t* response, json_doc_t* document) {
     const size_t length = json_stringify_size(document);
 
     if (!__httpresponse_prepare_body(response, length)) {
-        response->def(response, 500);
+        response->send_default(response, 500);
         return;
     }
 
     if (!__httpresponse_alloc_body(response, data, length))
-        response->def(response, 500);
+        response->send_default(response, 500);
 }
 
 void __httpresponse_model(httpresponse_t* response, void* model, ...) {
     const char* connection = __httpresponse_keepalive_enabled(response) ? "keep-alive" : "close";
-    response->headeru_add(response, "Content-Type", 12, "application/json", 16);
-    response->headeru_add(response, "Connection", 10, connection, strlen(connection));
-    response->headeru_add(response, "Cache-Control", 13, "no-store, no-cache", 18);
+    response->add_headeru(response, "Content-Type", 12, "application/json", 16);
+    response->add_headeru(response, "Connection", 10, connection, strlen(connection));
+    response->add_headeru(response, "Cache-Control", 13, "no-store, no-cache", 18);
 
     if (model == NULL) {
-        response->def(response, 500);
+        response->send_default(response, 500);
         return;
     }
 
@@ -605,14 +605,14 @@ void __httpresponse_model(httpresponse_t* response, void* model, ...) {
 
     json_doc_t* doc = json_create_empty();
     if (!doc) {
-        response->def(response, 500);
+        response->send_default(response, 500);
         return;
     }
 
     json_token_t* object = model_json_create_object(model, display_fields);
     if (object == NULL) {
         json_free(doc);
-        response->def(response, 500);
+        response->send_default(response, 500);
         return;
     }
 
@@ -622,25 +622,25 @@ void __httpresponse_model(httpresponse_t* response, void* model, ...) {
     const size_t length = json_stringify_size(doc);
 
     if (!__httpresponse_prepare_body(response, length)) {
-        response->def(response, 500);
+        response->send_default(response, 500);
         json_free(doc);
         return;
     }
 
     if (!__httpresponse_alloc_body(response, data, length))
-        response->def(response, 500);
+        response->send_default(response, 500);
 
     json_free(doc);
 }
 
 void __httpresponse_models(httpresponse_t* response, array_t* models, ...) {
     const char* connection = __httpresponse_keepalive_enabled(response) ? "keep-alive" : "close";
-    response->headeru_add(response, "Content-Type", 12, "application/json", 16);
-    response->headeru_add(response, "Connection", 10, connection, strlen(connection));
-    response->headeru_add(response, "Cache-Control", 13, "no-store, no-cache", 18);
+    response->add_headeru(response, "Content-Type", 12, "application/json", 16);
+    response->add_headeru(response, "Connection", 10, connection, strlen(connection));
+    response->add_headeru(response, "Cache-Control", 13, "no-store, no-cache", 18);
 
     if (models == NULL) {
-        response->def(response, 500);
+        response->send_default(response, 500);
         return;
     }
 
@@ -653,7 +653,7 @@ void __httpresponse_models(httpresponse_t* response, array_t* models, ...) {
 
     json_doc_t* doc = json_root_create_array();
     if (!doc) {
-        response->def(response, 500);
+        response->send_default(response, 500);
         return;
     }
 
@@ -663,7 +663,7 @@ void __httpresponse_models(httpresponse_t* response, array_t* models, ...) {
         json_token_t* object = model_json_create_object(model, display_fields);
         if (object == NULL) {
             json_free(doc);
-            response->def(response, 500);
+            response->send_default(response, 500);
             return;
         }
 
@@ -674,13 +674,13 @@ void __httpresponse_models(httpresponse_t* response, array_t* models, ...) {
     const size_t length = json_stringify_size(doc);
 
     if (!__httpresponse_prepare_body(response, length)) {
-        response->def(response, 500);
+        response->send_default(response, 500);
         json_free(doc);
         return;
     }
 
     if (!__httpresponse_alloc_body(response, data, length))
-        response->def(response, 500);
+        response->send_default(response, 500);
 
     json_free(doc);
 }
@@ -693,11 +693,11 @@ int __httpresponse_keepalive_enabled(httpresponse_t* response) {
 void httpresponse_redirect(httpresponse_t* response, const char* path, int status_code) {
     response->status_code = status_code;
 
-    if (!response->header_add(response, "Location", path))
+    if (!response->add_header(response, "Location", path))
         return;
 
     if (httpresponse_redirect_is_external(path))
-        response->header_add(response, "Connection", "Close");
+        response->add_header(response, "Connection", "Close");
 }
 
 int __httpresponse_alloc_body(httpresponse_t* response, const char* data, size_t length) {
@@ -744,7 +744,7 @@ http_ranges_t* httpresponse_init_ranges(void) {
 
 int __httpresponse_prepare_body(httpresponse_t* response, size_t length) {
     (void)length;
-    response->headeru_add(response, "Accept-Ranges", 13, "bytes", 5);
+    response->add_headeru(response, "Accept-Ranges", 13, "bytes", 5);
 
     return 1;
 }
@@ -839,7 +839,7 @@ void __httpresponse_cookie_add(httpresponse_t* response, cookie_t cookie) {
 
     if (string == NULL) return;
 
-    response->header_add(response, "Set-Cookie", string);
+    response->add_header(response, "Set-Cookie", string);
 
     free(string);
 }
@@ -900,9 +900,9 @@ void __httpresponse_init_payload(httpresponse_t* response) {
     response->payload_.boundary = NULL;
     response->payload_.type = NONE;
 
-    response->payload = __httpresponse_payload;
-    response->payload_file = __httpresponse_payload_file;
-    response->payload_json = __httpresponse_payload_json;
+    response->get_payload = __httpresponse_payload;
+    response->get_payload_file = __httpresponse_payload_file;
+    response->get_payload_json = __httpresponse_payload_json;
 }
 
 void __httpresponse_payload_parse_plain(httpresponse_t* response) {

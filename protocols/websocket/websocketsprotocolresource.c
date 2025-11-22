@@ -32,9 +32,9 @@ websockets_protocol_t* websockets_protocol_resource_create(void) {
     protocol->base.get_resource = websocketsrequest_get_resource;
     protocol->base.reset = websockets_protocol_resource_reset;
     protocol->base.free = websockets_protocol_resource_free;
-    protocol->payload = (char*(*)(websockets_protocol_resource_t*))websocketsrequest_payload;
-    protocol->payload_file = (file_content_t(*)(websockets_protocol_resource_t*))websocketsrequest_payload_file;
-    protocol->payload_json = (json_doc_t*(*)(websockets_protocol_resource_t*))websocketsrequest_payload_json;
+    protocol->get_payload = (char*(*)(websockets_protocol_resource_t*))websocketsrequest_payload;
+    protocol->get_payload_file = (file_content_t(*)(websockets_protocol_resource_t*))websocketsrequest_payload_file;
+    protocol->get_payload_json = (json_doc_t*(*)(websockets_protocol_resource_t*))websocketsrequest_payload_json;
     protocol->method = ROUTE_NONE;
     protocol->parser_stage = WSPROTRESOURCE_METHOD;
     protocol->uri_length = 0;
@@ -42,7 +42,7 @@ websockets_protocol_t* websockets_protocol_resource_create(void) {
     protocol->uri = NULL;
     protocol->path = NULL;
     protocol->query_ = NULL;
-    protocol->query = websocketsrequest_query;
+    protocol->get_query = websocketsrequest_query;
 
     websockets_protocol_init_payload((websockets_protocol_t*)protocol);
 

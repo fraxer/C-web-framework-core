@@ -116,9 +116,9 @@ file_t __file_get(void* storage, const char* path) {
     authorization = __create_authtoken(s, client, method, amz_date, EMPTY_PAYLOAD_HASH);
     if (authorization == NULL) goto failed;
 
-    req->header_add(req, "Authorization", authorization);
-    req->header_add(req, "x-amz-content-sha256", EMPTY_PAYLOAD_HASH);
-    req->header_add(req, "x-amz-date", amz_date);
+    req->add_header(req, "Authorization", authorization);
+    req->add_header(req, "x-amz-content-sha256", EMPTY_PAYLOAD_HASH);
+    req->add_header(req, "x-amz-date", amz_date);
 
     httpresponse_t* res = client->send(client);
     if (!res)
@@ -126,7 +126,7 @@ file_t __file_get(void* storage, const char* path) {
     if (res->status_code != 200)
         goto failed;
 
-    file_content_t file_content = res->payload_file(res);
+    file_content_t file_content = res->get_payload_file(res);
     if (!file_content.ok)
         goto failed;
 
@@ -200,18 +200,18 @@ int __file_content_put(void* storage, const file_content_t* file_content, const 
     authorization = __create_authtoken(s, client, method, amz_date, payload_hash);
     if (authorization == NULL) goto failed;
 
-    req->header_add(req, "Authorization", authorization);
-    req->header_add(req, "x-amz-content-sha256", payload_hash);
-    req->header_add(req, "x-amz-date", amz_date);
+    req->add_header(req, "Authorization", authorization);
+    req->add_header(req, "x-amz-content-sha256", payload_hash);
+    req->add_header(req, "x-amz-date", amz_date);
 
     char content_disposition[512];
     snprintf(content_disposition, sizeof(content_disposition), "attachment; filename=%s", file_content->filename);
-    req->header_add(req, "Content-Disposition", content_disposition);
-    req->header_add(req, "Content-Type", mimetype);
+    req->add_header(req, "Content-Disposition", content_disposition);
+    req->add_header(req, "Content-Type", mimetype);
 
     char filesize[32];
     snprintf(filesize, sizeof(filesize), "%ld", file_content->size);
-    req->header_add(req, "Content-Length", filesize);
+    req->add_header(req, "Content-Length", filesize);
 
     req->set_payload_file_content(req, file_content);
 
@@ -275,18 +275,18 @@ int __file_data_put(void* storage, const char* data, const size_t data_size, con
     authorization = __create_authtoken(s, client, method, amz_date, payload_hash);
     if (authorization == NULL) goto failed;
 
-    req->header_add(req, "Authorization", authorization);
-    req->header_add(req, "x-amz-content-sha256", payload_hash);
-    req->header_add(req, "x-amz-date", amz_date);
+    req->add_header(req, "Authorization", authorization);
+    req->add_header(req, "x-amz-content-sha256", payload_hash);
+    req->add_header(req, "x-amz-date", amz_date);
 
     char content_disposition[512];
     snprintf(content_disposition, sizeof(content_disposition), "attachment; filename=%s", filename);
-    req->header_add(req, "Content-Disposition", content_disposition);
-    req->header_add(req, "Content-Type", mimetype);
+    req->add_header(req, "Content-Disposition", content_disposition);
+    req->add_header(req, "Content-Type", mimetype);
 
     char filesize[32];
     snprintf(filesize, sizeof(filesize), "%ld", data_size);
-    req->header_add(req, "Content-Length", filesize);
+    req->add_header(req, "Content-Length", filesize);
 
     req->set_payload_raw(req, data, data_size, mimetype);
 
@@ -336,9 +336,9 @@ int __file_remove(void* storage, const char* path) {
     authorization = __create_authtoken(s, client, method, amz_date, EMPTY_PAYLOAD_HASH);
     if (authorization == NULL) goto failed;
 
-    req->header_add(req, "Authorization", authorization);
-    req->header_add(req, "x-amz-content-sha256", EMPTY_PAYLOAD_HASH);
-    req->header_add(req, "x-amz-date", amz_date);
+    req->add_header(req, "Authorization", authorization);
+    req->add_header(req, "x-amz-content-sha256", EMPTY_PAYLOAD_HASH);
+    req->add_header(req, "x-amz-date", amz_date);
 
     httpresponse_t* res = client->send(client);
     if (!res)
@@ -386,9 +386,9 @@ int __file_exist(void* storage, const char* path) {
     authorization = __create_authtoken(s, client, method, amz_date, EMPTY_PAYLOAD_HASH);
     if (authorization == NULL) goto failed;
 
-    req->header_add(req, "Authorization", authorization);
-    req->header_add(req, "x-amz-content-sha256", EMPTY_PAYLOAD_HASH);
-    req->header_add(req, "x-amz-date", amz_date);
+    req->add_header(req, "Authorization", authorization);
+    req->add_header(req, "x-amz-content-sha256", EMPTY_PAYLOAD_HASH);
+    req->add_header(req, "x-amz-date", amz_date);
 
     httpresponse_t* res = client->send(client);
     if (!res)
@@ -436,9 +436,9 @@ array_t* __file_list(void* storage, const char* path) {
     authorization = __create_authtoken(s, client, method, amz_date, EMPTY_PAYLOAD_HASH);
     if (authorization == NULL) goto failed;
 
-    req->header_add(req, "Authorization", authorization);
-    req->header_add(req, "x-amz-content-sha256", EMPTY_PAYLOAD_HASH);
-    req->header_add(req, "x-amz-date", amz_date);
+    req->add_header(req, "Authorization", authorization);
+    req->add_header(req, "x-amz-content-sha256", EMPTY_PAYLOAD_HASH);
+    req->add_header(req, "x-amz-date", amz_date);
 
     httpresponse_t* res = client->send(client);
     if (!res)
@@ -446,7 +446,7 @@ array_t* __file_list(void* storage, const char* path) {
     if (res->status_code != 200)
         goto failed;
 
-    payload = res->payload(res);
+    payload = res->get_payload(res);
 
     list = __parse_file_list_payload(payload);
 

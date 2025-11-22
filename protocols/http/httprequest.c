@@ -55,12 +55,12 @@ void httprequest_init_payload(httprequest_t* request) {
     request->payload_.boundary = NULL;
     request->payload_.type = NONE;
 
-    request->payload = httprequest_payload;
-    request->payloadf = httprequest_payloadf;
-    request->payload_file = httprequest_payload_file;
-    request->payload_filef = httprequest_payload_filef;
-    request->payload_json = httprequest_payload_json;
-    request->payload_jsonf = httprequest_payload_jsonf;
+    request->get_payload = httprequest_payload;
+    request->get_payloadf = httprequest_payloadf;
+    request->get_payload_file = httprequest_payload_file;
+    request->get_payload_filef = httprequest_payload_filef;
+    request->get_payload_json = httprequest_payload_json;
+    request->get_payload_jsonf = httprequest_payload_jsonf;
 }
 
 httprequest_t* httprequest_alloc() {
@@ -94,12 +94,12 @@ httprequest_t* httprequest_create(connection_t* connection) {
     request->cookie_ = NULL;
     request->ranges = NULL;
     request->connection = connection;
-    request->header = httprequest_header;
-    request->headern = httprequest_headern;
-    request->header_add = httprequest_header_add;
-    request->headern_add = httprequest_headern_add;
-    request->cookie = httprequest_cookie;
-    request->header_del = httprequest_header_del;
+    request->get_header = httprequest_header;
+    request->get_headern = httprequest_headern;
+    request->add_header = httprequest_header_add;
+    request->add_headern = httprequest_headern_add;
+    request->get_cookie = httprequest_cookie;
+    request->remove_header = httprequest_header_del;
     request->append_urlencoded = httprequest_append_urlencoded;
     request->append_formdata_raw = httprequest_append_formdata_raw;
     request->append_formdata_text = httprequest_append_formdata_text;
@@ -595,8 +595,8 @@ int httprequest_append_urlencoded(httprequest_t* request, const char* key, const
         if (!httprequest_create_payload_file(&request->payload_))
             return 0;
 
-        request->header_del(request, "Content-Type");
-        request->headern_add(request, "Content-Type", 12, "application/x-www-form-urlencoded", 33);
+        request->remove_header(request, "Content-Type");
+        request->add_headern(request, "Content-Type", 12, "application/x-www-form-urlencoded", 33);
     }
     else {
         if (!file->append_content(file, "&", 1))
@@ -667,7 +667,7 @@ int httprequest_add_header_multipart(httprequest_t* request) {
         return 0;
 
     snprintf(string, length + 1, "%s%s", multipart, request->payload_.boundary);
-    request->headern_add(request, "Content-Type", 12, string, length);
+    request->add_headern(request, "Content-Type", 12, string, length);
     free(string);
 
     return 1;
@@ -687,7 +687,7 @@ int httprequest_append_formdata_raw(httprequest_t* request, const char* key, con
         if (!httprequest_create_payload_boundary(payload, boundary_size))
             return 0;
 
-        request->header_del(request, "Content-Type");
+        request->remove_header(request, "Content-Type");
         if (!httprequest_add_header_multipart(request))
             return 0;
     }
@@ -767,7 +767,7 @@ int httprequest_append_formdata_file_content(httprequest_t* request, const char*
         if (!httprequest_create_payload_boundary(payload, boundary_size))
             goto failed;
 
-        request->header_del(request, "Content-Type");
+        request->remove_header(request, "Content-Type");
         if (!httprequest_add_header_multipart(request))
             goto failed;
     }
@@ -835,8 +835,8 @@ int httprequest_set_payload_raw(httprequest_t* request, const char* value, const
             return 0;
     }
 
-    request->header_del(request, "Content-Type");
-    request->header_add(request, "Content-Type", mimetype);
+    request->remove_header(request, "Content-Type");
+    request->add_header(request, "Content-Type", mimetype);
 
     if (!file->append_content(file, value, value_size))
         return 0;
@@ -896,8 +896,8 @@ int httprequest_set_payload_file_content(httprequest_t* request, const file_cont
     if (mimetype == NULL)
         mimetype = "text/plain";
 
-    request->header_del(request, "Content-Type");
-    request->header_add(request, "Content-Type", mimetype);
+    request->remove_header(request, "Content-Type");
+    request->add_header(request, "Content-Type", mimetype);
 
     off_t offset = file_content->offset;
     size_t filesize = file_content->size;

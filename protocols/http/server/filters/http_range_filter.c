@@ -162,8 +162,8 @@ int __header(httpresponse_t* response) {
     char bytes[70] = {0};
     int size = snprintf(bytes, sizeof(bytes), "bytes %zu-%zu/%zu", start, end - 1, data_size);
 
-    if (!response->headeru_add(response, "Content-Range", 13, bytes, size)) return CWF_ERROR;
-    if (!response->header_add_content_length(response, end - start)) return CWF_ERROR;
+    if (!response->add_headeru(response, "Content-Range", 13, bytes, size)) return CWF_ERROR;
+    if (!response->add_content_length(response, end - start)) return CWF_ERROR;
 
     if (!bufo_alloc(module->buf, BUF_SIZE))
         return CWF_ERROR;

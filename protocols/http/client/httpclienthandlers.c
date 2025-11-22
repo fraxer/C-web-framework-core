@@ -54,13 +54,13 @@ int http_client_read(connection_t* connection) {
             case HTTP1PARSER_OUT_OF_MEMORY:
                 return 0;
             case HTTP1PARSER_PAYLOAD_LARGE:
-                response->def(response, 413);
+                response->send_default(response, 413);
                 return 1;
             case HTTP1PARSER_BAD_REQUEST:
-                response->def(response, 400);
+                response->send_default(response, 400);
                 return 1;
             case HTTP1PARSER_HOST_NOT_FOUND:
-                response->def(response, 404);
+                response->send_default(response, 404);
                 return 1;
             case HTTP1PARSER_CONTINUE:
                 break;

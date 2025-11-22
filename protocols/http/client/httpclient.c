@@ -204,7 +204,7 @@ httpresponse_t* __httpclient_send(httpclient_t* client) {
     switch (__httpclient_is_redirect(client)) {
         case CLIENTREDIRECT_NONE: break;
         case CLIENTREDIRECT_EXIST: {
-            http_header_t* header = client->response->header(client->response, "Location");
+            http_header_t* header = client->response->get_header(client->response, "Location");
             if (!(header && header->value_length > 0) || !client->set_url(client, header->value))
                 goto failed;
 
@@ -432,7 +432,7 @@ int __httpclient_set_request_uri(httpclient_t* client) {
 
 int __httpclient_set_header_host(httpclient_t* client) {
     httprequest_t* request = (httprequest_t*)client->request;
-    request->header_del(request, "Host");
+    request->remove_header(request, "Host");
 
     char host[128];
     if (client->port == 80 || client->port == 443)
@@ -440,7 +440,7 @@ int __httpclient_set_header_host(httpclient_t* client) {
     else
         snprintf(host, sizeof(host), "%s:%d", client->host, client->port);
 
-    request->header_add(request, "Host", host);
+    request->add_header(request, "Host", host);
 
     return 1;
 }
@@ -449,18 +449,18 @@ int __httpclient_try_set_content_length(httpclient_t* client) {
     if (client->request->transfer_encoding == TE_CHUNKED)
         return 1;
 
-    client->request->header_del(client->request, "Content-Length");
+    client->request->remove_header(client->request, "Content-Length");
     const size_t file_size = client->request->payload_.file.size;
 
     if (file_size == 0 && client->request->transfer_encoding != TE_CHUNKED) {
-        client->request->header_add(client->request, "Content-Length", "0");
+        client->request->add_header(client->request, "Content-Length", "0");
         return 1;
     }
 
     char content_string[32];
     sprintf(content_string, "%ld", file_size);
 
-    client->request->header_add(client->request, "Content-Length", content_string);
+    client->request->add_header(client->request, "Content-Length", content_string);
 
     return 1;
 }
@@ -494,7 +494,7 @@ int __httpclient_is_redirect(httpclient_t* client) {
     if (client->redirect_count > 9)
         return CLIENTREDIRECT_MANY_REDIRECTS;
 
-    http_header_t* header = client->response->header(client->response, "Location");
+    http_header_t* header = client->response->get_header(client->response, "Location");
     if (!(header && header->value_length > 0))
         return CLIENTREDIRECT_ERROR;
 

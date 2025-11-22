@@ -82,7 +82,7 @@ int __header(httpresponse_t* response) {
         if (response->file_.fd > -1)
             data_size = response->file_.size;
 
-        if (!response->header_add_content_length(response, data_size))
+        if (!response->add_content_length(response, data_size))
             return CWF_ERROR;
     }
 
