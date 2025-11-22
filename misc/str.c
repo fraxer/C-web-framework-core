@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <string.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -61,12 +62,15 @@ int str_init(str_t* str, int init_capacity) {
 int str_reset(str_t* str) {
     // Free dynamic buffer if allocated
     if (str->is_dynamic && str->dynamic_buffer != NULL) {
+        explicit_bzero(str->dynamic_buffer, str->capacity);
         free(str->dynamic_buffer);
         str->dynamic_buffer = NULL;
     }
 
+    // Wipe SSO buffer
+    explicit_bzero(str->sso_buffer, STR_SSO_SIZE);
+
     // Reset to SSO mode
-    str->sso_buffer[0] = '\0';
     str->size = 0;
     str->capacity = 0;
     str->is_dynamic = 0;
@@ -96,6 +100,9 @@ int str_reserve(str_t* str, size_t capacity) {
             memcpy(data, str->sso_buffer, str->size);
         data[str->size] = '\0';
 
+        // Wipe SSO buffer after copying
+        explicit_bzero(str->sso_buffer, STR_SSO_SIZE);
+
         str->dynamic_buffer = data;
         str->capacity = capacity;
         str->is_dynamic = 1;
@@ -114,8 +121,13 @@ int str_reserve(str_t* str, size_t capacity) {
 void str_clear(str_t* str) {
     if (str == NULL) return;
 
-    if (str->is_dynamic && str->dynamic_buffer != NULL)
+    if (str->is_dynamic && str->dynamic_buffer != NULL) {
+        explicit_bzero(str->dynamic_buffer, str->capacity);
         free(str->dynamic_buffer);
+    }
+
+    // Wipe SSO buffer
+    explicit_bzero(str->sso_buffer, STR_SSO_SIZE);
 
     str_init(str, str->init_capacity);
 }
@@ -124,6 +136,7 @@ void str_free(str_t* str) {
     if (str == NULL) return;
 
     str_clear(str);
+    explicit_bzero(str, sizeof(str_t));
     free(str);
 }
 

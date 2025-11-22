@@ -813,11 +813,18 @@ void model_free(void* arg) {
     model_t* model = arg;
     if (model == NULL) return;
 
-    for (int i = 0; i < model->fields_count(model); i++) {
-        mfield_t* field = model->first_field(model) + i;
+    int fields_count = model->fields_count(model);
+    mfield_t* first_field = model->first_field(model);
+
+    for (int i = 0; i < fields_count; i++) {
+        mfield_t* field = first_field + i;
         __model_value_free(&field->value, field->type);
         __model_value_free(&field->oldvalue, field->type);
     }
+
+    // Wipe all fields including names
+    if (first_field != NULL && fields_count > 0)
+        explicit_bzero(first_field, fields_count * sizeof(mfield_t));
 
     free(model);
 }
@@ -1326,7 +1333,6 @@ void __model_value_free(mvalue_t* value, mtype_e type) {
     case MODEL_DOUBLE:
     case MODEL_DECIMAL:
     case MODEL_MONEY:
-        value->_short = 0;
         break;
 
     case MODEL_DATE:
@@ -1334,7 +1340,6 @@ void __model_value_free(mvalue_t* value, mtype_e type) {
     case MODEL_TIMETZ:
     case MODEL_TIMESTAMP:
     case MODEL_TIMESTAMPTZ:
-        memset(&value->_tm, 0, sizeof(tm_t));
         break;
 
     case MODEL_JSON:
@@ -1354,6 +1359,7 @@ void __model_value_free(mvalue_t* value, mtype_e type) {
     }
 
     str_free(value->_string);
+    explicit_bzero(value, sizeof(mvalue_t));
 }
 
 int __model_fill(const int row, const int fields_count, mfield_t* first_field, dbresult_t* result) {
