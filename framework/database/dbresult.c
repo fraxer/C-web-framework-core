@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
@@ -41,8 +42,15 @@ dbresultquery_t* dbresult_query_create(int rows, int cols) {
 void dbresult_query_free(dbresultquery_t* query) {
     if (query == NULL) return;
 
-    if (query->fields) free(query->fields);
-    if (query->table) free(query->table);
+    if (query->fields) {
+        explicit_bzero(query->fields, query->cols * sizeof(db_table_cell_t));
+        free(query->fields);
+    }
+    if (query->table) {
+        explicit_bzero(query->table, query->rows * query->cols * sizeof(db_table_cell_t));
+        free(query->table);
+    }
+    explicit_bzero(query, sizeof(dbresultquery_t));
     free(query);
 }
 
@@ -97,6 +105,7 @@ void dbresult_free(dbresult_t* result) {
         query = next;
     }
 
+    explicit_bzero(result, sizeof(dbresult_t));
     free(result);
 }
 

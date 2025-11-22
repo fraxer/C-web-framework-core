@@ -44,9 +44,11 @@ void db_cell_free(db_table_cell_t* cell) {
     if (cell == NULL) return;
 
     if (cell->value != NULL) {
+        explicit_bzero(cell->value, cell->length);
         free(cell->value);
         cell->value = NULL;
     }
+    cell->length = 0;
 }
 
 dbhost_t* db_host_find(db_t* db, const char* host_id) {

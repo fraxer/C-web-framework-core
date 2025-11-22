@@ -268,7 +268,7 @@ void create_user_example(httpctx_t* ctx) {
     // Сохранение в БД
     if (!user_create(user)) {
         ctx->response->send_data(ctx->response, "Error creating user");
-        model_free(user);
+        user_free(user);
         return;
     }
 
@@ -276,7 +276,7 @@ void create_user_example(httpctx_t* ctx) {
     ctx->response->send_model(ctx->response, user,
                         display_fields("id", "email", "name"));
 
-    model_free(user);
+    user_free(user);
 }
 ```
 
