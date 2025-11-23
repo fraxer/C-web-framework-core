@@ -1,197 +1,161 @@
 # C Web Framework
 
-Высокопроизводительный веб-сервер и фреймворк для создания веб-приложений на языке C для Linux. Построен на базе событийно-ориентированной архитектуры epoll, обеспечивающей эффективную обработку большого количества одновременных соединений.
+A high-performance web server and framework for building web applications in C for Linux. Built on an event-driven epoll architecture that efficiently handles a large number of concurrent connections.
 
-Фреймворк предоставляет полный набор инструментов для разработки современных веб-приложений: от базового HTTP-сервера до работы с базами данных, WebSocket-соединениями, системой аутентификации и файловыми хранилищами.
+The framework provides a complete set of tools for developing modern web applications: from a basic HTTP server to database integration, WebSocket connections, authentication system, and file storage.
 
-Документация доступна по адресу: [https://cwebframework.tech/en/introduction.html](https://cwebframework.tech/en/introduction.html)
+Documentation is available at: [https://cwebframework.tech/en/introduction.html](https://cwebframework.tech/en/introduction.html)
 
-## Основные возможности
+## Key Features
 
-### HTTP Сервер
-* **HTTP/1.1** - полная поддержка протокола HTTP/1.1
-* **Маршрутизация** - гибкая система роутинга с поддержкой динамических параметров
-* **Редиректы** - настраиваемые правила перенаправления с поддержкой регулярных выражений
-* **Middleware** - система промежуточных обработчиков для HTTP и WebSocket запросов
-* **Фильтры** - встроенные фильтры для chunked encoding, range requests, gzip, cache control
-* **Multipart/Form-data** - обработка файловых загрузок и форм
-* **Cookie** - полная поддержка cookie с настройками secure, httpOnly, sameSite
-* **Gzip сжатие** - автоматическое сжатие ответов для поддерживаемых типов контента
-* **TLS/SSL** - защищенные соединения с настраиваемыми cipher suites
+### HTTP Server
+* **HTTP/1.1** - full HTTP/1.1 protocol support
+* **Routing** - flexible routing system with dynamic parameter support
+* **Redirects** - configurable redirect rules with regular expression support
+* **Middleware** - middleware handler system for HTTP and WebSocket requests
+* **Filters** - built-in filters for chunked encoding, range requests, gzip, cache control
+* **Multipart/Form-data** - file upload and form processing
+* **Cookie** - full cookie support with secure, httpOnly, sameSite settings
+* **Gzip compression** - automatic response compression for supported content types
+* **TLS/SSL** - secure connections with configurable cipher suites
 
 ### WebSocket
-* **WebSocket сервер** - полная поддержка протокола WebSocket
-* **Broadcasting** - система рассылки сообщений группам клиентов
-* **Кастомные каналы** - создание именованных каналов с фильтрацией получателей
-* **JSON over WebSocket** - встроенная поддержка JSON-сообщений
-* **WebSocket middleware** - система промежуточных обработчиков для WebSocket
+* **WebSocket server** - full WebSocket protocol support
+* **Broadcasting** - message broadcasting system for client groups
+* **Custom channels** - named channel creation with recipient filtering
+* **JSON over WebSocket** - built-in JSON message support
+* **WebSocket middleware** - middleware handler system for WebSocket
 
-### Базы данных
-* **PostgreSQL** - нативная поддержка с prepared statements
-* **MySQL** - нативная поддержка с защитой от SQL-инъекций
-* **Redis** - поддержка Redis для кеширования и сессий
-* **ORM-подобная работа** - система моделей для работы с таблицами
-* **Миграции** - система версионирования схемы базы данных с up/down миграциями
-* **Query Builder** - безопасное построение SQL-запросов с параметризацией
-* **Prepared Statements** - защита от SQL-инъекций на уровне фреймворка
+### Databases
+* **PostgreSQL** - native support with prepared statements
+* **MySQL** - native support with SQL injection protection
+* **Redis** - Redis support for caching and sessions
+* **ORM-like operations** - model system for working with tables
+* **Migrations** - database schema versioning system with up/down migrations
+* **Query Builder** - safe SQL query building with parameterization
+* **Prepared Statements** - SQL injection protection at framework level
 
-### Аутентификация и безопасность
-* **Система аутентификации** - встроенная система регистрации и авторизации
-* **Сессии** - поддержка файловых сессий и сессий в Redis
-* **Хеширование паролей** - безопасное хранение паролей с использованием salt и hash
-* **Валидация** - валидаторы для email, паролей и других данных
-* **Middleware аутентификации** - защита роутов с проверкой сессий
-* **RBAC** - система ролей и прав доступа (Role-Based Access Control)
+### Authentication and Security
+* **Authentication system** - built-in registration and authorization system
+* **Sessions** - support for file-based sessions and Redis sessions
+* **Password hashing** - secure password storage using salt and hash
+* **Validation** - validators for email, passwords, and other data
+* **Authentication middleware** - route protection with session verification
+* **RBAC** - Role-Based Access Control system
 
-### Файловое хранилище
-* **Локальное хранилище** - работа с файловой системой
-* **S3-совместимое хранилище** - интеграция с S3 и S3-совместимыми сервисами
-* **Файловые операции** - создание, чтение, обновление, удаление файлов
-* **Временные файлы** - автоматическое управление временными файлами
-* **Загрузка файлов** - обработка multipart загрузок с сохранением в хранилище
+### File Storage
+* **Local storage** - file system operations
+* **S3-compatible storage** - integration with S3 and S3-compatible services
+* **File operations** - create, read, update, delete files
+* **Temporary files** - automatic temporary file management
+* **File upload** - multipart upload processing with storage saving
 
 ### Email
-* **SMTP клиент** - отправка email через SMTP
-* **DKIM подпись** - поддержка DKIM-подписи для аутентификации отправителя
-* **Шаблоны писем** - возможность использования шаблонов для email
+* **SMTP client** - email sending via SMTP
+* **DKIM signature** - DKIM signature support for sender authentication
+* **Email templates** - email template support
 
-### Шаблонизатор
-* **Template Engine** - встроенный движок шаблонов
-* **Переменные и циклы** - динамическая генерация HTML
-* **Интеграция с моделями** - прямая передача моделей в шаблоны
+### Template Engine
+* **Template Engine** - built-in template engine
+* **Variables and loops** - dynamic HTML generation
+* **Model integration** - direct model passing to templates
 
 ### JSON
-* **JSON парсер** - высокопроизводительный парсер JSON
-* **JSON генератор** - сериализация данных в JSON
-* **Потокобезопасность** - thread-safe операции с JSON
-* **Unicode поддержка** - корректная обработка Unicode-символов и surrogate pairs
+* **JSON parser** - high-performance JSON parser
+* **JSON generator** - data serialization to JSON
+* **Thread safety** - thread-safe JSON operations
+* **Unicode support** - proper handling of Unicode characters and surrogate pairs
 
-### Производительность и масштабируемость
-* **Event-Driven Architecture** - архитектура на основе epoll
-* **Многопоточность** - поддержка нескольких worker-потоков
-* **Пул соединений** - переиспользование соединений к базам данных
-* **Rate Limiting** - ограничение частоты запросов (защита от DDoS)
-* **Горячая перезагрузка** - обновление приложения без остановки сервера
+### Performance and Scalability
+* **Event-Driven Architecture** - epoll-based architecture
+* **Multithreading** - multiple worker thread support
+* **Connection pool** - database connection reuse
+* **Rate Limiting** - request rate limiting (DDoS protection)
+* **Hot reload** - application updates without server restart
 
-### Утилиты и структуры данных
-* **String (str_t)** - динамические строки с SSO-оптимизацией
-* **Array** - динамические массивы
-* **HashMap/Map** - ассоциативные массивы для быстрого поиска
-* **JSON структуры** - работа с JSON как с объектами
-* **Логирование** - система логирования с разными уровнями
-* **Base64** - кодирование/декодирование Base64
+### Utilities and Data Structures
+* **String (str_t)** - dynamic strings with SSO optimization
+* **Array** - dynamic arrays
+* **HashMap/Map** - associative arrays for fast lookup
+* **JSON structures** - working with JSON as objects
+* **Logging** - logging system with different levels
+* **Base64** - Base64 encoding/decoding
 
-### Дополнительно
-* **Модульная архитектура** - легкое подключение и отключение компонентов
-* **Динамическая загрузка** - загрузка обработчиков из shared libraries (.so)
-* **Настройка через JSON** - централизованная конфигурация в config.json
-* **MIME types** - автоматическое определение типов контента
-* **Домены и виртуальные хосты** - поддержка нескольких доменов на одном сервере
+### Additional Features
+* **Modular architecture** - easy component connection and disconnection
+* **Dynamic loading** - handler loading from shared libraries (.so)
+* **JSON configuration** - centralized configuration in config.json
+* **MIME types** - automatic content type detection
+* **Domains and virtual hosts** - multiple domain support on a single server
 
-## Архитектура проекта
+## Project Architecture
 
 ```
-backend/
-├── core/                          # Ядро фреймворка
-│   ├── framework/                 # Компоненты фреймворка
-│   │   ├── database/             # Работа с БД (PostgreSQL, MySQL, Redis)
-│   │   ├── model/                # ORM-система моделей
-│   │   ├── session/              # Система сессий
-│   │   ├── storage/              # Файловые хранилища (FS, S3)
-│   │   ├── view/                 # Шаблонизатор
-│   │   ├── middleware/           # Система middleware
-│   │   └── query/                # Query builder
-│   ├── protocols/                # Реализация протоколов
-│   │   ├── http/                 # HTTP/1.1 сервер и клиент
-│   │   ├── websocket/            # WebSocket сервер
-│   │   └── smtp/                 # SMTP клиент, DKIM
-│   ├── src/                      # Основные компоненты
-│   │   ├── broadcast/            # Broadcasting система
-│   │   ├── connection/           # Управление соединениями
-│   │   ├── server/               # HTTP сервер
-│   │   ├── route/                # Система маршрутизации
-│   │   ├── thread/               # Многопоточность
-│   │   └── multiplexing/         # Epoll multiplexing
-│   └── misc/                     # Утилиты
-│       ├── str.h                 # Динамические строки
-│       ├── array.h               # Массивы
-│       ├── hashmap.h/map.h       # Ассоциативные массивы
-│       ├── json.h                # JSON парсер
-│       ├── log.h                 # Логирование
-│       └── gzip.h                # Gzip сжатие
-│
-└── app/                          # Пользовательское приложение
-    ├── routes/                   # HTTP и WebSocket обработчики
-    │   ├── auth/                # Аутентификация (login, registration)
-    │   ├── index/               # Главная страница
-    │   ├── ws/                  # WebSocket handlers
-    │   ├── files/               # Работа с файлами
-    │   ├── models/              # API для работы с моделями
-    │   ├── email/               # Отправка email
-    │   └── db/                  # Примеры работы с БД
-    ├── models/                   # Модели данных
-    │   ├── user.c               # Модель пользователя
-    │   ├── role.c               # Модель роли
-    │   ├── permission.c         # Модель прав доступа
-    │   └── *view.c              # View модели для JOIN-запросов
-    ├── middlewares/              # Пользовательские middleware
-    │   ├── httpmiddlewares.c    # HTTP middleware (auth, rate limit)
-    │   └── wsmiddlewares.c      # WebSocket middleware
-    ├── migrations/               # Миграции базы данных
-    │   ├── s1/                  # Миграции для сервера s1
-    │   └── s2/                  # Миграции для сервера s2
-    ├── broadcasting/             # Broadcasting каналы
-    │   └── mybroadcast.c        # Пример broadcasting канала
-    ├── auth/                     # Модуль аутентификации
-    │   ├── auth.c               # Функции аутентификации
-    │   ├── password_validator.c # Валидация паролей
-    │   └── email_validator.c    # Валидация email
-    ├── contexts/                 # Контексты запросов
-    │   ├── httpcontext.c        # HTTP контекст
-    │   └── wscontext.c          # WebSocket контекст
-    └── views/                    # Шаблоны
-        ├── index.tpl            # Главная страница
-        └── header.tpl           # Хедер
-
-config.json                       # Конфигурация приложения
+core/                         # Framework core
+├── framework/                # Framework components
+│   ├── database/             # Database operations (PostgreSQL, MySQL, Redis)
+│   ├── model/                # ORM model system
+│   ├── session/              # Session system
+│   ├── storage/              # File storage (FS, S3)
+│   ├── view/                 # Template engine
+│   ├── middleware/           # Middleware system
+│   └── query/                # Query builder
+├── protocols/                # Protocol implementations
+│   ├── http/                 # HTTP/1.1 server and client
+│   ├── websocket/            # WebSocket server
+│   └── smtp/                 # SMTP client, DKIM
+├── src/                      # Core components
+│   ├── broadcast/            # Broadcasting system
+│   ├── connection/           # Connection management
+│   ├── server/               # HTTP server
+│   ├── route/                # Routing system
+│   ├── thread/               # Multithreading
+│   └── multiplexing/         # Epoll multiplexing
+└── misc/                     # Utilities
+    ├── str.h                 # Dynamic strings
+    ├── array.h               # Arrays
+    ├── hashmap.h/map.h       # Associative arrays
+    ├── json.h                # JSON parser
+    ├── log.h                 # Logging
+    └── gzip.h                # Gzip compression
 ```
 
-## Примеры использования
+## Usage Examples
 
-### HTTP обработчик
+### HTTP Handler
 
 ```c
 #include "http.h"
 
 void my_handler(httpctx_t* ctx) {
-    // Получение query параметра
+    // Get query parameter
     const char* name = ctx->request->query(ctx->request, "name");
 
-    // Получение JSON из тела запроса
+    // Get JSON from request body
     json_doc_t* doc = ctx->request->get_payload_json(ctx->request);
 
-    // Работа с JSON
+    // Work with JSON
     json_token_t* root = json_root(doc);
     json_object_set(root, "status", json_create_string("success"));
 
-    // Установка заголовка
+    // Set header
     ctx->response->add_header(ctx->response, "Content-Type", "application/json");
 
-    // Отправка ответа
+    // Send response
     ctx->response->send_data(ctx->response, json_stringify(doc));
 
     json_free(doc);
 }
 ```
 
-### WebSocket обработчик с Broadcasting
+### WebSocket Handler with Broadcasting
 
 ```c
 #include "websockets.h"
 #include "broadcast.h"
 
 void ws_join_channel(wsctx_t* ctx) {
-    // Присоединение к broadcasting каналу
+    // Join broadcasting channel
     broadcast_add("my_channel", ctx->request->connection,
                   user_id_struct, send_callback);
 
@@ -204,7 +168,7 @@ void ws_send_message(wsctx_t* ctx) {
 
     char* message = protocol->get_payload(protocol);
 
-    // Отправка сообщения всем в канале
+    // Send message to everyone in channel
     broadcast_send("my_channel", ctx->request->connection,
                    message, strlen(message), filter_struct, compare_func);
 
@@ -212,14 +176,14 @@ void ws_send_message(wsctx_t* ctx) {
 }
 ```
 
-### Работа с базой данных
+### Database Operations
 
 ```c
 #include "db.h"
 #include "model.h"
 
 void get_users(httpctx_t* ctx) {
-    // Параметризованный запрос (защита от SQL-инъекций)
+    // Parameterized query (SQL injection protection)
     mparams_create_array(params,
         mparam_int(id, 123),
         mparam_text(email, "user@example.com")
@@ -237,42 +201,42 @@ void get_users(httpctx_t* ctx) {
         return;
     }
 
-    // Обработка результатов
+    // Process results
     for (int row = 0; row < dbresult_query_rows(result); row++) {
         const db_table_cell_t* field = dbresult_cell(result, row, 0);
-        // Работа с данными...
+        // Work with data...
     }
 
     dbresult_free(result);
 }
 ```
 
-### Работа с моделями (ORM)
+### Working with Models (ORM)
 
 ```c
 #include "user.h"
 
 void create_user_example(httpctx_t* ctx) {
-    // Создание экземпляра модели
+    // Create model instance
     user_t* user = user_instance();
 
-    // Установка значений
+    // Set values
     user_set_email(user, "newuser@example.com");
     user_set_name(user, "John Doe");
 
-    // Генерация хеша пароля
+    // Generate password hash
     str_t* secret = generate_secret("password123");
     user_set_secret(user, str_get(secret));
     str_free(secret);
 
-    // Сохранение в БД
+    // Save to database
     if (!user_create(user)) {
         ctx->response->send_data(ctx->response, "Error creating user");
         user_free(user);
         return;
     }
 
-    // Вывод модели в JSON
+    // Output model as JSON
     ctx->response->send_model(ctx->response, user,
                         display_fields("id", "email", "name"));
 
@@ -285,26 +249,26 @@ void create_user_example(httpctx_t* ctx) {
 ```c
 #include "httpmiddlewares.h"
 
-// Защищенный роут с middleware
+// Protected route with middleware
 void secret_page(httpctx_t* ctx) {
-    // Проверка аутентификации через middleware
+    // Authentication check via middleware
     middleware(
         middleware_http_auth(ctx)
     )
 
-    // Этот код выполнится только если пользователь авторизован
+    // This code runs only if user is authorized
     user_t* user = httpctx_get_user(ctx);
     ctx->response->send_data(ctx->response, "Welcome to secret page!");
 }
 ```
 
-### Файловое хранилище
+### File Storage
 
 ```c
 #include "storage.h"
 
 void upload_file(httpctx_t* ctx) {
-    // Получение загруженного файла
+    // Get uploaded file
     file_content_t content = ctx->request->payload_filef(ctx->request, "myfile");
 
     if (!content.ok) {
@@ -312,7 +276,7 @@ void upload_file(httpctx_t* ctx) {
         return;
     }
 
-    // Сохранение в S3-хранилище
+    // Save to S3 storage
     storage_file_content_put("remote", &content,
                             "uploads/%s", content.filename);
 
@@ -320,7 +284,7 @@ void upload_file(httpctx_t* ctx) {
 }
 
 void download_file(httpctx_t* ctx) {
-    // Получение файла из локального хранилища
+    // Get file from local storage
     file_t file = storage_file_get("local", "/path/to/file.txt");
 
     if (!file.ok) {
@@ -328,13 +292,13 @@ void download_file(httpctx_t* ctx) {
         return;
     }
 
-    // Отправка файла клиенту
+    // Send file to client
     ctx->response->send_file(ctx->response, file.path);
     file.close(&file);
 }
 ```
 
-### Отправка Email с DKIM
+### Sending Email with DKIM
 
 ```c
 #include "mail.h"
@@ -357,147 +321,92 @@ void send_email(httpctx_t* ctx) {
 }
 ```
 
-## Конфигурация
+## System Requirements
 
-Фреймворк использует `config.json` для централизованной настройки:
-
-```json
-{
-  "main": {
-    "workers": 4,
-    "threads": 2,
-    "reload": "hard",
-    "buffer_size": 16384,
-    "gzip": ["text/html", "application/json"]
-  },
-  "servers": {
-    "s1": {
-      "domains": ["example.com", "*.example.com"],
-      "ip": "127.0.0.1",
-      "port": 80,
-      "http": {
-        "routes": {
-          "/api/users": {
-            "GET": ["path/to/handler.so", "get_users"]
-          }
-        }
-      },
-      "websockets": {
-        "routes": {
-          "/ws": {
-            "GET": ["path/to/ws_handler.so", "websocket_handler"]
-          }
-        }
-      },
-      "tls": {
-        "fullchain": "/path/to/fullchain.pem",
-        "private": "/path/to/privkey.pem"
-      }
-    }
-  },
-  "databases": {
-    "postgresql": [{
-      "host_id": "p1",
-      "ip": "127.0.0.1",
-      "port": 5432,
-      "dbname": "mydb",
-      "user": "dbuser",
-      "password": "dbpass"
-    }]
-  },
-  "sessions": {
-    "driver": "redis",
-    "lifetime": 3600
-  }
-}
-```
-
-## Системные требования
-
-* **Glibc** 2.35 или выше
-* **GCC** 9.5.0 или выше
-* **CMake** 3.12.4 или выше
+* **Glibc** 2.35 or higher
+* **GCC** 9.5.0 or higher
+* **CMake** 3.12.4 or higher
 * **PCRE** 8.43 (Regular Expression Library)
 * **Zlib** 1.2.11 (data compression library)
-* **OpenSSL** 1.1.1k или выше
+* **OpenSSL** 1.1.1k or higher
 * **LibXml2** 2.9.13
 
-### Опциональные зависимости:
-* **PostgreSQL** development libraries (для поддержки PostgreSQL)
-* **MySQL/MariaDB** development libraries (для поддержки MySQL)
-* **Redis** (для Redis-сессий и кеширования)
+### Optional Dependencies:
+* **PostgreSQL** development libraries (for PostgreSQL support)
+* **MySQL/MariaDB** development libraries (for MySQL support)
+* **Redis** (for Redis sessions and caching)
 
-## Сборка проекта
+## Building the Project
 
 ```bash
-# Создание директории для сборки
+# Create build directory
 mkdir build && cd build
 
-# Конфигурация с CMake
+# Configure with CMake
 cmake .. -DCMAKE_BUILD_TYPE=Release \
          -DINCLUDE_POSTGRESQL=yes \
          -DINCLUDE_MYSQL=yes \
          -DINCLUDE_REDIS=yes
 
-# Сборка
+# Build
 cmake --build . -j4
 
-# Запуск
-./exec/app
+# Run
+<workspaceFolder>/build/exec/cpdy
 ```
 
-### Режимы сборки:
-* **Release** - оптимизированная версия для production
-* **Debug** - версия с отладочными символами и AddressSanitizer
-* **RelWithDebInfo** - оптимизированная версия с отладочной информацией
+### Build Modes:
+* **Release** - optimized version for production
+* **Debug** - version with debug symbols and AddressSanitizer
+* **RelWithDebInfo** - optimized version with debug information
 
-## Ключевые особенности
+## Key Highlights
 
-### Производительность
-* **Zero-copy** операции где возможно
-* **Пул соединений** к базам данных для минимизации overhead
-* **Epoll** для эффективного мультиплексирования I/O
-* **SSO (Small String Optimization)** для строк
-* **Lazy-loading** конфигурации и модулей
+### Performance
+* **Zero-copy** operations where possible
+* **Connection pool** to databases to minimize overhead
+* **Epoll** for efficient I/O multiplexing
+* **SSO (Small String Optimization)** for strings
+* **Lazy-loading** of configuration and modules
 
-### Безопасность
-* **Prepared statements** для защиты от SQL-инъекций
-* **Валидация входных данных** на всех уровнях
-* **HTTPS/TLS** с современными cipher suites
-* **Secure cookie** с httpOnly и sameSite флагами
-* **Rate limiting** для защиты от DDoS
-* **DKIM** подписи для email-аутентификации
-* **Хеширование паролей** с использованием криптографически стойких функций
+### Security
+* **Prepared statements** for SQL injection protection
+* **Input data validation** at all levels
+* **HTTPS/TLS** with modern cipher suites
+* **Secure cookie** with httpOnly and sameSite flags
+* **Rate limiting** for DDoS protection
+* **DKIM** signatures for email authentication
+* **Password hashing** using cryptographically strong functions
 
-### Масштабируемость
-* **Горизонтальное масштабирование** через несколько worker-процессов
-* **Вертикальное масштабирование** через многопоточность
-* **Поддержка виртуальных хостов** для множества доменов
-* **Broadcasting** для эффективной рассылки WebSocket-сообщений
-* **Асинхронная обработка** запросов
+### Scalability
+* **Horizontal scaling** through multiple worker processes
+* **Vertical scaling** through multithreading
+* **Virtual host support** for multiple domains
+* **Broadcasting** for efficient WebSocket message distribution
+* **Asynchronous request processing**
 
-### Удобство разработки
-* **Модульная архитектура** - подключайте только нужные компоненты
-* **Динамическая загрузка** обработчиков без перезапуска сервера
-* **Система миграций** для версионирования БД
-* **ORM-like модели** для упрощения работы с данными
-* **Middleware система** для переиспользования логики
-* **Template Engine** для генерации динамического контента
-* **Централизованная конфигурация** через JSON
+### Developer Experience
+* **Modular architecture** - connect only the components you need
+* **Dynamic loading** of handlers without server restart
+* **Migration system** for database versioning
+* **ORM-like models** for simplified data operations
+* **Middleware system** for logic reuse
+* **Template Engine** for dynamic content generation
+* **Centralized configuration** via JSON
 
-## Применение
+## Use Cases
 
-Фреймворк подходит для разработки:
+The framework is suitable for developing:
 
-* **REST API** - высокопроизводительные API для мобильных и веб-приложений
-* **Real-time приложения** - чаты, уведомления, live-обновления через WebSocket
-* **Веб-сервисы** - микросервисы и монолитные приложения
-* **API Gateway** - маршрутизация и проксирование запросов
-* **Админ-панели** - с аутентификацией, RBAC и CRUD-операциями
-* **File upload сервисы** - с поддержкой локального и облачного хранилища
-* **Email сервисы** - отправка транзакционных писем с DKIM
+* **REST API** - high-performance APIs for mobile and web applications
+* **Real-time applications** - chats, notifications, live updates via WebSocket
+* **Web services** - microservices and monolithic applications
+* **API Gateway** - request routing and proxying
+* **Admin panels** - with authentication, RBAC, and CRUD operations
+* **File upload services** - with local and cloud storage support
+* **Email services** - transactional email sending with DKIM
 
-## Документация
+## Documentation
 
-Полная документация доступна по адресу: [https://cwebframework.tech/en/introduction.html](https://cwebframework.tech/en/introduction.html)
+Full documentation is available at: [https://cwebframework.tech/en/introduction.html](https://cwebframework.tech/en/introduction.html)
 
