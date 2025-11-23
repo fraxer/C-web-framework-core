@@ -194,7 +194,6 @@ void websockets_queue_request_handler(void* arg) {
 
     websocketsresponse_t* response = websocketsresponse_create(item->connection);
     if (response == NULL) {
-        // TODO: close connection, return error
         atomic_store(&conn_ctx->destroyed, 1);
         connection_after_read(item->connection);
         return;
@@ -209,14 +208,13 @@ void websockets_queue_request_handler(void* arg) {
         return;
     }
 
-    // TODO: wsctx_t in stack
-    wsctx_t* ctx = wsctx_create(data->request, conn_ctx->response);
-    if (ctx == NULL) return; // close connection
+    wsctx_t ctx;
+    wsctx_init(&ctx, data->request, conn_ctx->response);
 
-    if (run_middlewares(conn_ctx->server->websockets.middleware, ctx))
-        item->handle(ctx);
+    if (run_middlewares(conn_ctx->server->websockets.middleware, &ctx))
+        item->handle(&ctx);
 
-    wsctx_free(ctx);
+    wsctx_clear(&ctx);
 
     connection_after_read(item->connection);
 }
