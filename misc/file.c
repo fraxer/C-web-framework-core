@@ -276,7 +276,7 @@ int __file_internal_set_name(char* dest, const char* src) {
     if (length >= NAME_MAX)
         length = NAME_MAX - 1;
 
-    strncpy(dest, filename, length);
+    memcpy(dest, filename, length);
     dest[length] = 0;
 
     return 1;
