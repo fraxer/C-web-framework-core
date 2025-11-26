@@ -130,7 +130,7 @@ int httpparser_run(httprequestparser_t* parser) {
                 parser->stage = HTTP1REQUESTPARSER_NEWLINE1;
 
                 bufferdata_complete(&parser->buf);
-                if (!__set_protocol(parser->request, &parser->buf))
+                if (__set_protocol(parser->request, &parser->buf) == HTTP1PARSER_BAD_REQUEST)
                     return HTTP1PARSER_BAD_REQUEST;
 
                 bufferdata_reset(&parser->buf);
