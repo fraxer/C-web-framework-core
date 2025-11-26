@@ -50,7 +50,7 @@ appconfig_t* appconfig_create(const char* path) {
     memset(&config->sessionconfig, 0, sizeof(config->sessionconfig));
     config->path = strdup(path);
     if (config->path == NULL) {
-        log_print("Usage: -c <path to config file>\n", "");
+        print("Usage: -c <path to config file>\n", "");
         free(config);
         return NULL;
     }
@@ -70,6 +70,9 @@ appconfig_t* appconfig(void) {
 }
 
 env_t* env(void) {
+    if (__appconfig == NULL)
+        return NULL;
+
     return &__appconfig->env;
 }
 
@@ -180,6 +183,8 @@ void __appconfig_env_init(env_t* env) {
     env->main.threads = 0;
     env->main.workers = 0;
     env->main.tmp = NULL;
+    env->main.log.enabled = false;
+    env->main.log.level = 0;
     env->mail.dkim_private = NULL;
     env->mail.dkim_selector = NULL;
     env->mail.host = NULL;
@@ -202,6 +207,9 @@ void __appconfig_env_free(env_t* env) {
         free(env->main.tmp);
         env->main.tmp = NULL;
     }
+
+    env->main.log.enabled = false;
+    env->main.log.level = 0;
 
     if (env->mail.dkim_private != NULL) {
         free(env->mail.dkim_private);

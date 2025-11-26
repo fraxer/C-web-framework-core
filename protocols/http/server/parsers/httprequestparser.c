@@ -80,8 +80,12 @@ int httpparser_run(httprequestparser_t* parser) {
         switch (parser->stage)
         {
         case HTTP1REQUESTPARSER_METHOD:
-            if (parser->request == NULL)
+            if (parser->request == NULL) {
                 parser->request = httprequest_create(parser->connection);
+
+                const size_t log_size = parser->bytes_readed < 500 ? parser->bytes_readed : 500;
+                log_debug("HTTP Request head (%zu bytes): %.*s", log_size, (int)log_size, parser->buffer);
+            }
 
             if (ch == ' ') {
                 parser->stage = HTTP1REQUESTPARSER_URI;

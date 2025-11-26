@@ -1,6 +1,8 @@
 #ifndef __APPCONFIG__
 #define __APPCONFIG__
 
+#include <stdbool.h>
+
 #include "array.h"
 #include "server.h"
 #include "storage.h"
@@ -19,6 +21,11 @@ typedef enum {
     APPCONFIG_RELOAD_HARD
 } appconfig_reload_state_e;
 
+typedef struct env_log {
+    bool enabled;
+    int level;
+} env_log_t;
+
 typedef struct env_main {
     appconfig_reload_state_e reload;
     unsigned int workers;
@@ -26,6 +33,7 @@ typedef struct env_main {
     unsigned int client_max_body_size;
     char* tmp;
     env_gzip_str_t* gzip;
+    env_log_t log;
 } env_main_t;
 
 typedef struct env_mail {

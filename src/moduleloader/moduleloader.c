@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <syslog.h>
 
 #include "log.h"
 #include "file.h"
@@ -387,6 +388,67 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
             last_gzip_item->next = str;
 
         last_gzip_item = str;
+    }
+
+
+    const json_token_t* token_log = json_object_get(token_main, "log");
+    if (token_log == NULL) {
+        log_error("module_loader_config_load: log not found\n");
+        return 0;
+    }
+    if (!json_is_object(token_log)) {
+        log_error("module_loader_config_load: log must be object\n");
+        return 0;
+    }
+
+    const json_token_t* token_log_enabled = json_object_get(token_log, "enabled");
+    if (token_log_enabled == NULL) {
+        log_error("module_loader_config_load: log.enabled not found\n");
+        return 0;
+    }
+    if (!json_is_bool(token_log_enabled)) {
+        log_error("module_loader_config_load: log.enabled must be boolean\n");
+        return 0;
+    }
+    env->main.log.enabled = json_bool(token_log_enabled);
+
+    const json_token_t* token_log_level = json_object_get(token_log, "level");
+    if (token_log_level == NULL) {
+        log_error("module_loader_config_load: log.level not found\n");
+        return 0;
+    }
+    if (!json_is_string(token_log_level)) {
+        log_error("module_loader_config_load: log.level must be string\n");
+        return 0;
+    }
+    const char* level_str = json_string(token_log_level);
+    if (strcmp(level_str, "emerg") == 0) {
+        env->main.log.level = LOG_EMERG;
+    }
+    else if (strcmp(level_str, "alert") == 0) {
+        env->main.log.level = LOG_ALERT;
+    }
+    else if (strcmp(level_str, "crit") == 0) {
+        env->main.log.level = LOG_CRIT;
+    }
+    else if (strcmp(level_str, "err") == 0 || strcmp(level_str, "error") == 0) {
+        env->main.log.level = LOG_ERR;
+    }
+    else if (strcmp(level_str, "warning") == 0 || strcmp(level_str, "warn") == 0) {
+        env->main.log.level = LOG_WARNING;
+    }
+    else if (strcmp(level_str, "notice") == 0) {
+        env->main.log.level = LOG_NOTICE;
+    }
+    else if (strcmp(level_str, "info") == 0) {
+        env->main.log.level = LOG_INFO;
+    }
+    else if (strcmp(level_str, "debug") == 0) {
+        env->main.log.level = LOG_DEBUG;
+    }
+    else {
+        log_error("module_loader_config_load: log.level must be one of: emerg, alert, crit, err, warning, notice, info, debug\n");
+        return 0;
     }
 
 
