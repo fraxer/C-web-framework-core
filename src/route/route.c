@@ -99,6 +99,7 @@ route_t* route_init_route() {
     route->params_count = 0;
     route->param = NULL;
     route->next = NULL;
+    route->ratelimiter = NULL;
 
     return route;
 }
