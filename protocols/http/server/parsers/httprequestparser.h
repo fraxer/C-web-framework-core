@@ -30,6 +30,10 @@ typedef struct httprequestparser {
     httprequest_t* request;
     httprequestparser_stage_e stage;
     int host_found;
+    int host_header_seen;         // Flag to detect duplicate Host header
+    int content_length_found;     // Flag to detect duplicate Content-Length
+    int transfer_encoding_found;  // Flag to detect Transfer-Encoding header
+    size_t headers_count;         // Counter to limit number of headers
     size_t content_length;
     size_t content_saved_length;
 } httprequestparser_t;
