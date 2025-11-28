@@ -4,34 +4,54 @@
 #include "bufferdata.h"
 
 void bufferdata_init(bufferdata_t* buffer) {
+    if (buffer == NULL) return;
+
     buffer->dynamic_buffer = NULL;
     buffer->offset_sbuffer = 0;
     buffer->offset_dbuffer = 0;
     buffer->dbuffer_size = 0;
     buffer->type = BUFFERDATA_STATIC;
+    buffer->static_buffer[0] = 0;
 }
 
 int bufferdata_push(bufferdata_t* buffer, char ch) {
+    if (buffer == NULL) return 0;
+
+    // Check if static buffer is full BEFORE writing to prevent buffer overflow
+    if (buffer->offset_sbuffer >= BUFFERDATA_SIZE) {
+        bufferdata_type_e prev_type = buffer->type;
+        if (buffer->type == BUFFERDATA_STATIC)
+            buffer->type = BUFFERDATA_DYNAMIC;
+
+        // Move existing data to dynamic buffer
+        if (!bufferdata_move(buffer)) {
+            buffer->type = prev_type;
+            return 0;
+        }
+    }
+
     buffer->static_buffer[buffer->offset_sbuffer] = ch;
     buffer->offset_sbuffer++;
 
-    if (buffer->offset_sbuffer < BUFFERDATA_SIZE) {
+    if (buffer->offset_sbuffer < BUFFERDATA_SIZE)
         buffer->static_buffer[buffer->offset_sbuffer] = 0;
-        return 1;
-    }
 
-    buffer->type = BUFFERDATA_DYNAMIC;
-
-    return bufferdata_move(buffer);
+    return 1;
 }
 
+// NOTE: dynamic_buffer is intentionally NOT freed here for reuse optimization
+// Call bufferdata_clear() to release all memory
 void bufferdata_reset(bufferdata_t* buffer) {
+    if (buffer == NULL) return;
+
     buffer->offset_dbuffer = 0;
     buffer->offset_sbuffer = 0;
     buffer->type = BUFFERDATA_STATIC;
 }
 
 void bufferdata_clear(bufferdata_t* buffer) {
+    if (buffer == NULL) return;
+
     bufferdata_reset(buffer);
 
     if (buffer->dynamic_buffer != NULL)
@@ -42,6 +62,8 @@ void bufferdata_clear(bufferdata_t* buffer) {
 }
 
 size_t bufferdata_writed(bufferdata_t* buffer) {
+    if (buffer == NULL) return 0;
+
     if (buffer->type == BUFFERDATA_DYNAMIC)
         return buffer->offset_dbuffer + buffer->offset_sbuffer;
 
@@ -49,6 +71,8 @@ size_t bufferdata_writed(bufferdata_t* buffer) {
 }
 
 int bufferdata_complete(bufferdata_t* buffer) {
+    if (buffer == NULL) return 0;
+
     if (buffer->type == BUFFERDATA_DYNAMIC)
         return bufferdata_move(buffer);
 
@@ -56,6 +80,8 @@ int bufferdata_complete(bufferdata_t* buffer) {
 }
 
 int bufferdata_move(bufferdata_t* buffer) {
+    if (buffer == NULL) return 0;
+
     if (buffer->type != BUFFERDATA_DYNAMIC)
         return 1;
 
@@ -79,28 +105,43 @@ int bufferdata_move(bufferdata_t* buffer) {
 }
 
 int bufferdata_move_data_to_start(bufferdata_t* buffer, size_t offset, size_t size) {
-    char* buffer_data = buffer->static_buffer;
-    if (buffer->type == BUFFERDATA_DYNAMIC)
-        buffer_data = buffer->dynamic_buffer;
+    if (buffer == NULL) return 0;
 
-    memmove(buffer_data, buffer_data + offset, size);
+    // Validate bounds based on buffer type
+    if (buffer->type == BUFFERDATA_STATIC) {
+        // Check bounds for static buffer
+        if (offset + size > BUFFERDATA_SIZE || size > BUFFERDATA_SIZE)
+            return 0;
 
-    if (buffer->type == BUFFERDATA_DYNAMIC) {
+        memmove(buffer->static_buffer, buffer->static_buffer + offset, size);
+        buffer->static_buffer[size] = 0;
+        buffer->offset_sbuffer = size;
+        buffer->offset_dbuffer = 0;
+    }
+    else {
+        // Check bounds for dynamic buffer
+        size_t current_size = buffer->offset_dbuffer;
+        if (offset + size > current_size)
+            return 0;
+
+        memmove(buffer->dynamic_buffer, buffer->dynamic_buffer + offset, size);
+
         char* data = realloc(buffer->dynamic_buffer, size + 1);
         if (data == NULL) return 0;
 
         buffer->dbuffer_size = size + 1;
         buffer->dynamic_buffer = data;
         buffer->dynamic_buffer[size] = 0;
+        buffer->offset_dbuffer = size;
+        buffer->offset_sbuffer = 0;
     }
-    
-    buffer->offset_dbuffer = size;
-    buffer->offset_sbuffer = 0;
 
     return 1;
 }
 
 char* bufferdata_get(bufferdata_t* buffer) {
+    if (buffer == NULL) return NULL;
+
     if (buffer->type == BUFFERDATA_DYNAMIC)
         return buffer->dynamic_buffer;
 
@@ -108,7 +149,11 @@ char* bufferdata_get(bufferdata_t* buffer) {
 }
 
 char* bufferdata_copy(bufferdata_t* buffer) {
+    if (buffer == NULL) return NULL;
+
     char* string = bufferdata_get(buffer);
+    if (string == NULL) return NULL;
+
     size_t length = bufferdata_writed(buffer);
 
     char* data = malloc(length + 1);
@@ -121,28 +166,34 @@ char* bufferdata_copy(bufferdata_t* buffer) {
 }
 
 char bufferdata_back(bufferdata_t* buffer) {
-    const ssize_t position = bufferdata_writed(buffer) - 1;
-    if (position == -1) return 0;
+    if (buffer == NULL) return 0;
+    if (bufferdata_writed(buffer) == 0) return 0;
 
     if (buffer->offset_sbuffer > 0)
-        return buffer->static_buffer[position];
+        return buffer->static_buffer[buffer->offset_sbuffer - 1];
 
-    return buffer->dynamic_buffer[position];
+    if (buffer->dynamic_buffer == NULL)
+        return 0;
+
+    return buffer->dynamic_buffer[buffer->offset_dbuffer - 1];
 }
 
 char bufferdata_pop_back(bufferdata_t* buffer) {
-    const ssize_t position = bufferdata_writed(buffer) - 1;
-    if (position == -1) return 0;
+    if (buffer == NULL) return 0;
+    if (bufferdata_writed(buffer) == 0) return 0;
 
     char c = 0;
     if (buffer->offset_sbuffer > 0) {
-        c = buffer->static_buffer[position];
-        buffer->static_buffer[position] = 0;
+        c = buffer->static_buffer[buffer->offset_sbuffer - 1];
+        buffer->static_buffer[buffer->offset_sbuffer - 1] = 0;
         buffer->offset_sbuffer--;
     }
     else {
-        c = buffer->dynamic_buffer[position];
-        buffer->dynamic_buffer[position] = 0;
+        if (buffer->dynamic_buffer == NULL)
+            return 0;
+
+        c = buffer->dynamic_buffer[buffer->offset_dbuffer - 1];
+        buffer->dynamic_buffer[buffer->offset_dbuffer - 1] = 0;
         buffer->offset_dbuffer--;
     }
 
