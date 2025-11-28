@@ -9,8 +9,6 @@ void log_close();
 
 void log_reinit();
 
-void print(const char*, ...);
-
 void log_emerg(const char*, ...);
 
 void log_alert(const char*, ...);

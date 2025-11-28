@@ -28,16 +28,6 @@ static void log_message(int priority, const char* format, va_list args) {
     vsyslog(priority, format, args);
 }
 
-void print(const char* format, ...) {
-    va_list args;
-
-    va_start(args, format);
-
-    vprintf(format, args);
-
-    va_end(args);
-}
-
 void log_emerg(const char* format, ...) {
     va_list args;
 
