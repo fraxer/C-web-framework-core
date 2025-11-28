@@ -31,10 +31,24 @@ int appconfig_init(int argc, char* argv[]) {
 }
 
 appconfig_t* appconfig_create(const char* path) {
-    if (path == NULL) return NULL;
+    if (path == NULL)
+        return NULL;
+
+    // Проверяем существование файла
+    if (access(path, F_OK) != 0) {
+        printf("Error: Config file not found: %s\n", path);
+        return NULL;
+    }
+    if (access(path, R_OK) != 0) {
+        printf("Error: Config file is not readable: %s\n", path);
+        return NULL;
+    }
 
     appconfig_t* config = malloc(sizeof * config);
-    if (config == NULL) return NULL;
+    if (config == NULL) {
+        printf("Error: Memory allocation failed\n");
+        return NULL;
+    }
 
     atomic_store(&config->shutdown, 0);
     atomic_store(&config->threads_pause, 1);
@@ -50,7 +64,7 @@ appconfig_t* appconfig_create(const char* path) {
     memset(&config->sessionconfig, 0, sizeof(config->sessionconfig));
     config->path = strdup(path);
     if (config->path == NULL) {
-        print("Usage: -c <path to config file>\n", "");
+        printf("Error: Memory allocation failed for config path\n");
         free(config);
         return NULL;
     }
@@ -254,21 +268,31 @@ const char* __appconfig_get_path(int argc, char* argv[]) {
     while ((opt = getopt(argc, argv, "c:")) != -1) {
         switch (opt) {
             case 'c':
-                if (optarg == NULL)
+                if (optarg == NULL) {
+                    printf("Error: -c flag requires a config file path\n");
                     return NULL;
+                }
 
                 path = optarg;
                 c_found = 1;
                 break;
             default:
+                printf("Error: Unknown option '-%c'\n", optopt);
+                printf("Usage: %s -c <path to config file>\n", argv[0]);
                 return NULL;
         }
     }
 
-    if (!c_found)
+    if (!c_found) {
+        printf("Error: Config file path is required\n");
+        printf("Usage: %s -c <path to config file>\n", argv[0]);
         return NULL;
-    if (argc < 3)
+    }
+    if (argc < 3) {
+        printf("Error: Invalid arguments\n");
+        printf("Usage: %s -c <path to config file>\n", argv[0]);
         return NULL;
+    }
 
     return path;
 }

@@ -24,13 +24,15 @@ static pthread_mutex_t main_mutex = PTHREAD_MUTEX_INITIALIZER;
 int main(int argc, char* argv[]) {
     int result = EXIT_FAILURE;
 
-    if (strcmp(CMAKE_BUILD_TYPE, "Release") == 0)
-        if (daemon(1, 1) < 0) goto failed;
+    if (!appconfig_init(argc, argv))
+        goto failed;
 
     log_init();
     signal_init();
-    if (!appconfig_init(argc, argv))
-        goto failed;
+
+    if (strcmp(CMAKE_BUILD_TYPE, "Release") == 0)
+        if (daemon(1, 1) < 0) goto failed;
+
     if (!module_loader_init(appconfig()))
         goto failed;
 
