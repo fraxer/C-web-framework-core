@@ -342,28 +342,6 @@ char* str_copy(str_t* str) {
     return data;
 }
 
-int str_modify_add_symbols_before(str_t* str, char add_symbol, char before_symbol) {
-    if (str == NULL) return 0;
-
-    size_t i = 0;
-    while (i < str->size) {
-        // Get fresh pointer on each iteration (realloc may change buffer address)
-        char* buffer = __str_get_buffer(str);
-
-        if (buffer[i] == before_symbol) {
-            // Insert symbol before current position
-            if (!str_insertc(str, add_symbol, i)) {
-                return 0;
-            }
-            // Skip the inserted symbol
-            i++;
-        }
-        i++;
-    }
-
-    return 1;
-}
-
 static int __str_expand_buffer(str_t* str, const size_t extra_size) {
     size_t required_size = str->size + extra_size + 1; // +1 for null terminator
     size_t target_size;

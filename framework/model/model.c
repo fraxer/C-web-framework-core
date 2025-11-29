@@ -22,6 +22,7 @@ static int __model_set_date(mfield_t* field, tm_t* value);
 static int __model_allow_field_in_json(const char* field_name, char** display_fields);
 static mfield_t __model_tmpfield_create(mfield_t* source_field);
 static int __model_field_is_primary_and_not_dirty(model_t* model, mfield_t* field);
+static int __str_modify_add_symbols_before(str_t* str, char add_symbol, char before_symbol);
 
 // Numeric types
 void* field_create_bool(const char* field_name, short value) {
@@ -1968,7 +1969,7 @@ str_t* model_array_to_str(mfield_t* field) {
         if (i > 0)
             str_appendc(string, ',');
 
-        str_modify_add_symbols_before(str, '\\', '"');
+        __str_modify_add_symbols_before(str, '\\', '"');
         str_appendc(string, '\"');
         str_append(string, str_get(str), str_size(str));
         str_appendc(string, '\"');
@@ -2151,3 +2152,26 @@ int __model_field_is_primary_and_not_dirty(model_t* model, mfield_t* field) {
     
     return 0;
 }
+
+int __str_modify_add_symbols_before(str_t* str, char add_symbol, char before_symbol) {
+    if (str == NULL) return 0;
+
+    size_t i = 0;
+    while (i < str->size) {
+        // Get fresh pointer on each iteration (realloc may change buffer address)
+        char* buffer = str_get(str);
+
+        if (buffer[i] == before_symbol) {
+            // Insert symbol before current position
+            if (!str_insertc(str, add_symbol, i)) {
+                return 0;
+            }
+            // Skip the inserted symbol
+            i++;
+        }
+        i++;
+    }
+
+    return 1;
+}
+
