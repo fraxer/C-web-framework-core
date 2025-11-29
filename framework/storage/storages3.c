@@ -164,7 +164,7 @@ int __file_content_put(void* storage, const file_content_t* file_content, const 
     int result = 0;
 
     const char* method = "PUT";
-    const char* ext = file_extention(file_content->filename);
+    const char* ext = file_extension(file_content->filename);
     const char* mimetype = mimetype_find_type(appconfig()->mimetype, ext);
     if (mimetype == NULL)
         mimetype = "text/plain";
@@ -238,7 +238,7 @@ int __file_data_put(void* storage, const char* data, const size_t data_size, con
     int result = 0;
 
     const char* method = "PUT";
-    const char* ext = file_extention(path);
+    const char* ext = file_extension(path);
     const char* filename = basename((char*)path);
     const char* mimetype = mimetype_find_type(appconfig()->mimetype, ext);
     if (mimetype == NULL)

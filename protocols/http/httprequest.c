@@ -784,7 +784,7 @@ int httprequest_append_formdata_file_content(httprequest_t* request, const char*
     if (!httprequest_insert_content_disposition_file_header_payload(payload, key, file_content->filename))
         goto failed;
 
-    const char* ext = file_extention(file_content->filename);
+    const char* ext = file_extension(file_content->filename);
     const char* mimetype = mimetype_find_type(appconfig()->mimetype, ext);
     if (mimetype == NULL)
         mimetype = "text/plain";
@@ -891,7 +891,7 @@ int httprequest_set_payload_file_content(httprequest_t* request, const file_cont
             goto failed;
     }
 
-    const char* ext = file_extention(file_content->filename);
+    const char* ext = file_extension(file_content->filename);
     const char* mimetype = mimetype_find_type(appconfig()->mimetype, ext);
     if (mimetype == NULL)
         mimetype = "text/plain";

@@ -89,15 +89,24 @@ char* create_tmppath(const char* tmp_path)
     return path;
 }
 
-const char* file_extention(const char* path) {
+const char* file_extension(const char* path) {
+    if (path == NULL) return NULL;
+
     const size_t length = strlen(path);
-    for (size_t i = length - 1; i > 0; i--) {
+    if (length == 0) return NULL;
+
+    for (size_t i = length - 1; ; i--) {
         switch (path[i]) {
         case '.':
+            // If nothing after the dot, return NULL
+            if (i + 1 >= length || path[i + 1] == '\0') {
+                return NULL;
+            }
             return &path[i + 1];
         case '/':
             return NULL;
         }
+        if (i == 0) break;  // Safe exit for size_t to avoid underflow
     }
 
     return NULL;

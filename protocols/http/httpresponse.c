@@ -268,7 +268,7 @@ void http_response_file(httpresponse_t* response, const char* file_full_path) {
         return;
     }
 
-    const char* ext = file_extention(file_full_path);
+    const char* ext = file_extension(file_full_path);
     const char* mimetype = __httpresponse_get_mimetype(ext);
     const char* connection = __httpresponse_keepalive_enabled(response) ? "keep-alive" : "close";
     response->add_headeru(response, "Connection", 10, connection, strlen(connection));
@@ -291,7 +291,7 @@ void __httpresponse_filef(httpresponse_t* response, const char* storage_name, co
         return;
     }
 
-    const char* ext = file_extention(response->file_.name);
+    const char* ext = file_extension(response->file_.name);
     const char* mimetype = __httpresponse_get_mimetype(ext);
     const char* connection = __httpresponse_keepalive_enabled(response) ? "keep-alive" : "close";
     response->add_headeru(response, "Connection", 10, connection, strlen(connection));

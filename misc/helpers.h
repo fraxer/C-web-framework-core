@@ -6,7 +6,7 @@ int helpers_base_mkdir(const char* base_path, const char* path);
 int cmpstr_lower(const char* a, const char* b);
 int cmpstrn_lower(const char* a, size_t a_length, const char* b, size_t b_length);
 char* create_tmppath(const char*);
-const char* file_extention(const char* path);
+const char* file_extension(const char* path);
 int cmpsubstr_lower(const char* a, const char* b);
 int timezone_offset();
 int hex_to_bytes(const char* hex, unsigned char* raw);
