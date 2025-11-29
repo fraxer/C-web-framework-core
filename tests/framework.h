@@ -18,24 +18,31 @@ extern TestStats stats;
 /* Test suite function pointer type */
 typedef void (*test_suite_fn)(void);
 
-/* Maximum number of test suites */
-#define MAX_TEST_SUITES 100
+/* Initial capacity for test suites */
+#define INITIAL_TEST_SUITES_CAPACITY 16
 
 /* Test suite registry */
 typedef struct {
-    test_suite_fn suites[MAX_TEST_SUITES];
+    test_suite_fn *suites;
     int count;
+    int capacity;
 } TestRegistry;
 
 extern TestRegistry test_registry;
 
 /* Register a test suite */
 static inline void register_test_suite(test_suite_fn suite) {
-    if (test_registry.count < MAX_TEST_SUITES) {
-        test_registry.suites[test_registry.count++] = suite;
-    } else {
-        fprintf(stderr, "ERROR: Too many test suites registered!\n");
+    if (test_registry.count >= test_registry.capacity) {
+        int new_capacity = test_registry.capacity == 0 ? INITIAL_TEST_SUITES_CAPACITY : test_registry.capacity * 2;
+        test_suite_fn *new_suites = (test_suite_fn *)realloc(test_registry.suites, new_capacity * sizeof(test_suite_fn));
+        if (new_suites == NULL) {
+            fprintf(stderr, "ERROR: Failed to allocate memory for test suites!\n");
+            return;
+        }
+        test_registry.suites = new_suites;
+        test_registry.capacity = new_capacity;
     }
+    test_registry.suites[test_registry.count++] = suite;
 }
 
 /* Macro to auto-register test suite */

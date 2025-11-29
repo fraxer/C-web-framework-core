@@ -4,7 +4,7 @@
 TestStats stats = {0, 0, 0};
 
 // Test registry
-TestRegistry test_registry = {{NULL}, 0};
+TestRegistry test_registry = {NULL, 0, 0};
 
 int main(void) {
     printf("Starting test runner...\n");
@@ -22,6 +22,9 @@ int main(void) {
     printf("  Passed: %d\n", stats.passed);
     printf("  Failed: %d\n", stats.failed);
     printf("======================================\n");
+
+    // Cleanup
+    free(test_registry.suites);
 
     if (stats.failed > 0) {
         printf("\nTests FAILED!\n");
