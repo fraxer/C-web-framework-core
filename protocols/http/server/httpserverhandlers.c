@@ -6,6 +6,7 @@
 #include "httprequestparser.h"
 #include "log.h"
 #include "connection_queue.h"
+#include "openssl.h"
 
 typedef struct {
     connection_queue_item_data_t base;
@@ -39,7 +40,7 @@ static void __queue_data_request_free(void* arg);
 static int __run_header_filters(httpresponse_t* response);
 static int __run_body_filters(httpresponse_t* response);
 static int __handshake(connection_t* connection);
-static int __set_servername(connection_t* connection);
+static int __sni_callback(SSL* ssl, int* ad, void* arg);
 static void* __queue_data_response_create(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter);
 static void __queue_data_response_free(void* arg);
 static int __post_reponse_default(connection_t* connection, int status_code);
@@ -515,9 +516,7 @@ int __run_body_filters(httpresponse_t* response) {
 }
 
 int __handshake(connection_t* connection) {
-    int set_server_name = 0;
     if (connection->ssl == NULL) {
-        set_server_name = 1;
         connection->ssl = SSL_new(connection->ssl_ctx);
         if (connection->ssl == NULL) {
             log_error(TLS_ERROR_ALLOC_SSL);
@@ -529,16 +528,14 @@ int __handshake(connection_t* connection) {
             goto epoll_ssl_error;
         }
 
+        SSL_set_app_data(connection->ssl, connection);
+
         SSL_set_accept_state(connection->ssl);
         SSL_set_shutdown(connection->ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
     }
 
     const int result = SSL_do_handshake(connection->ssl);
     if (result == 1) {
-        if (set_server_name)
-            if (!__set_servername(connection))
-                return 0;
-
         if (!set_http(connection))
             return 0;
 
@@ -562,10 +559,15 @@ int __handshake(connection_t* connection) {
     return 1;
 }
 
-int __set_servername(connection_t* connection) {
-    const char* server_name = SSL_get_servername(connection->ssl, TLSEXT_NAMETYPE_host_name);
+int __sni_callback(SSL* ssl, int* ad, void* arg) {
+    (void)ad;
+    (void)arg;
+
+    connection_t* connection = SSL_get_app_data(ssl);
+    const char* server_name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
+
     if (server_name == NULL)
-        return 0;
+        return SSL_TLSEXT_ERR_NOACK;
 
     union tls_addr {
         struct in_addr ip4;
@@ -575,7 +577,7 @@ int __set_servername(connection_t* connection) {
     // Per RFC 6066 section 3: ensure that name is not an IP literal.
     if (inet_pton(AF_INET, server_name, &addrbuf) == 1 ||
         inet_pton(AF_INET6, server_name, &addrbuf) == 1)
-        return 0;
+        return SSL_TLSEXT_ERR_NOACK;
 
     size_t server_name_length = strlen(server_name);
     int vector_struct_size = 6;
@@ -584,31 +586,33 @@ int __set_servername(connection_t* connection) {
     int vector[vector_size];
 
     connection_server_ctx_t* ctx = connection->ctx;
+    connection_t* listener_connection = ctx->listener->connection;
     cqueue_item_t* item = cqueue_first(&ctx->listener->servers);
+
     while (item) {
         server_t* server = item->data;
 
-        if (server->ip == connection->ip && server->port == connection->port) {
+        if (server->ip == listener_connection->ip && server->port == listener_connection->port) {
             for (domain_t* domain = server->domain; domain; domain = domain->next) {
                 int matches_count = pcre_exec(domain->pcre_template, NULL, server_name, server_name_length, 0, 0, vector, vector_size);
                 if (matches_count > 0) {
                     ctx->server = server;
                     connection->ssl_ctx = server->openssl->ctx;
 
-                    SSL_set_SSL_CTX(connection->ssl, server->openssl->ctx);
+                    SSL_set_SSL_CTX(ssl, server->openssl->ctx);
 
     #if OPENSSL_VERSION_NUMBER >= 0x009080dfL
                     /* only in 0.9.8m+ */
-                    SSL_clear_options(connection->ssl, SSL_get_options(connection->ssl) & ~SSL_CTX_get_options(server->openssl->ctx));
+                    SSL_clear_options(ssl, SSL_get_options(ssl) & ~SSL_CTX_get_options(server->openssl->ctx));
     #endif
 
-                    SSL_set_options(connection->ssl, SSL_CTX_get_options(server->openssl->ctx));
+                    SSL_set_options(ssl, SSL_CTX_get_options(server->openssl->ctx));
 
     #ifdef SSL_OP_NO_RENEGOTIATION
-                    SSL_set_options(connection->ssl, SSL_OP_NO_RENEGOTIATION);
+                    SSL_set_options(ssl, SSL_OP_NO_RENEGOTIATION);
     #endif
 
-                    return 1;
+                    return SSL_TLSEXT_ERR_OK;
                 }
             }
         }
@@ -616,7 +620,7 @@ int __set_servername(connection_t* connection) {
         item = item->next;
     }
 
-    return 1;
+    return SSL_TLSEXT_ERR_NOACK;
 }
 
 int __post_reponse_default(connection_t* connection, int status_code) {
@@ -656,4 +660,10 @@ ratelimiter_t* __ratelimiter_find(server_http_t* http_config, route_t* route) {
     if (route->ratelimiter != NULL) return route->ratelimiter;
 
     return http_config->ratelimiter;
+}
+
+void http_server_init_sni_callbacks(server_t* servers) {
+    for (server_t* server = servers; server; server = server->next)
+        if (server->openssl != NULL)
+            openssl_set_sni_callback(server->openssl, __sni_callback);
 }

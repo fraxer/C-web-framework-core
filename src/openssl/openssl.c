@@ -98,6 +98,12 @@ void openssl_free(openssl_t* openssl) {
     free(openssl);
 }
 
+void openssl_set_sni_callback(openssl_t* openssl, int (*callback)(SSL*, int*, void*)) {
+    if (openssl == NULL || openssl->ctx == NULL) return;
+
+    SSL_CTX_set_tlsext_servername_callback(openssl->ctx, callback);
+}
+
 int openssl_read(SSL* ssl, void* buffer, int num) {
     return SSL_read(ssl, buffer, num);
 }

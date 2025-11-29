@@ -30,6 +30,7 @@
 #include "connection_queue.h"
 #include "statement_registry.h"
 #include "middleware_registry.h"
+#include "httpserverhandlers.h"
 #ifdef MySQL_FOUND
     #include "mysql.h"
 #endif
@@ -175,6 +176,10 @@ int __module_loader_init_modules(appconfig_t* config, json_doc_t* document) {
     }
     if (!module_loader_config_load(config, document))
         goto failed;
+
+    if (config->server_chain && config->server_chain->server)
+        http_server_init_sni_callbacks(config->server_chain->server);
+
     if (!__module_loader_thread_workers_load())
         goto failed;
     if (!__module_loader_thread_handlers_load())
