@@ -24,7 +24,7 @@
 
 static int __parse_payload(httprequestparser_t* parser);
 static void __clear(httprequestparser_t* parser);
-static int __validate_content_length(const char* value, size_t* out_length);
+static int __validate_content_length(http_header_t* header, size_t* out_length);
 static int __set_method(httprequest_t* request, bufferdata_t* buf);
 static int __set_protocol(httprequest_t* request, bufferdata_t* buf);
 static int __set_header_key(httprequest_t* request, httprequestparser_t* parser, bufferdata_t* buf);
@@ -798,7 +798,7 @@ int __set_header_value(httprequest_t* request, httprequestparser_t* parser) {
         }
 
         size_t validated_length = 0;
-        if (!__validate_content_length(request->last_header->value, &validated_length))
+        if (!__validate_content_length(request->last_header, &validated_length))
             return HTTP1PARSER_BAD_REQUEST;
 
         parser->content_length = validated_length;
@@ -839,38 +839,41 @@ int __header_is_transfer_encoding(http_header_t* header) {
     return cmpstrn_lower(header->key, header->key_length, "transfer-encoding", 17);
 }
 
-int __validate_content_length(const char* value, size_t* out_length) {
-    if (value == NULL || out_length == NULL) return 0;
-
-    // Проверяем, что строка состоит только из цифр
-    size_t i = 0;
-    while (value[i] != '\0') {
-        if (!isdigit((unsigned char)value[i])) {
-            log_error("HTTP error: Content-Length contains non-digit characters: %s\n", value);
-            return 0;
-        }
-        i++;
-    }
+int __validate_content_length(http_header_t* header, size_t* out_length) {
+    if (header == NULL || header->value == NULL || out_length == NULL) return 0;
 
     // Проверяем, что строка не пустая
-    if (i == 0) {
+    if (header->value_length == 0) {
         log_error("HTTP error: Content-Length is empty\n");
         return 0;
+    }
+
+    // Проверяем, что строка состоит только из цифр
+    for (size_t i = 0; i < header->value_length; i++) {
+        if (!isdigit((unsigned char)header->value[i])) {
+            log_error("HTTP error: Content-Length contains non-digit characters: %s\n", header->value);
+            return 0;
+        }
     }
 
     // Используем strtoul для безопасного преобразования
     errno = 0;
     char* endptr = NULL;
-    unsigned long long result = strtoull(value, &endptr, 10);
+    unsigned long long result = strtoull(header->value, &endptr, 10);
 
     // Проверяем ошибки преобразования
     if (errno == ERANGE || result > env()->main.client_max_body_size) {
-        log_error("HTTP error: Content-Length too large: %s (max: %u)\n", value, env()->main.client_max_body_size);
+        log_error("HTTP error: Content-Length too large: %s (max: %u)\n", header->value, env()->main.client_max_body_size);
         return 0;
     }
 
-    if (endptr == value || *endptr != '\0') {
-        log_error("HTTP error: Content-Length invalid format: %s\n", value);
+    if (endptr == header->value || *endptr != '\0') {
+        log_error("HTTP error: Content-Length invalid format: %s\n", header->value);
+        return 0;
+    }
+
+    if ((size_t)(endptr - header->value) != header->value_length) {
+        log_error("HTTP error: Content-Length invalid format: %s\n", header->value);
         return 0;
     }
 
