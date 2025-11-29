@@ -154,6 +154,8 @@ int memory_block_is_full(memory_block_t* block) {
 // ============================================================================
 
 json_manager_t* json_manager_create(void) {
+    if (manager != NULL) return manager;
+
     manager = malloc(sizeof * manager);
     if (manager == NULL) return NULL;
 
@@ -1563,7 +1565,7 @@ json_doc_t* json_root_create_object(void) {
     json_doc_t* doc = json_create_empty();
     if (doc == NULL) return NULL;
 
-    json_token_t* token = json_create_array();
+    json_token_t* token = json_create_object();
     if (token == NULL) {
         json_free(doc);
         return NULL;
@@ -1578,7 +1580,7 @@ json_doc_t* json_root_create_array(void) {
     json_doc_t* doc = json_create_empty();
     if (doc == NULL) return NULL;
 
-    json_token_t* token = json_create_object();
+    json_token_t* token = json_create_array();
     if (token == NULL) {
         json_free(doc);
         return NULL;
@@ -1717,6 +1719,21 @@ json_token_t* json_array_get(const json_token_t* token_array, int index) {
 int json_object_set(json_token_t* token_object, const char* key, json_token_t* token) {
     if (token_object == NULL || key == NULL || token == NULL) return 0;
 
+    // Проверяем, существует ли уже такой ключ
+    json_token_t* old_value = json_object_get(token_object, key);
+    if (old_value != NULL) {
+        // Ключ уже существует - заменяем значение
+        json_token_t* key_token = old_value->parent;
+        key_token->child = token;
+        token->parent = key_token;
+
+        // Освобождаем старое значение рекурсивно (включая все вложенные структуры)
+        __free_token_tree(old_value);
+
+        return 1;
+    }
+
+    // Ключ не существует - создаём новый
     json_token_t* token_key = json_create_string(key);
     if (token_key == NULL) return 0;
 
