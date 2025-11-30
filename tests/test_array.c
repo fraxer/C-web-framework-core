@@ -1314,3 +1314,156 @@ TEST(test_all_null_safety) {
 
     TEST_ASSERT(1, "All NULL safety checks passed");
 }
+
+// ============================================================================
+// Тесты валидации типов
+// ============================================================================
+
+TEST(test_type_validation_int) {
+    TEST_SUITE("Type Validation");
+    TEST_CASE("array_get_int with type validation");
+
+    array_t* arr = array_create();
+
+    array_push_back(arr, array_create_int(42));
+    array_push_back(arr, array_create_double(3.14));
+    array_push_back(arr, array_create_string("hello"));
+
+    // Correct type - should work
+    int val = array_get_int(arr, 0);
+    TEST_ASSERT(val == 42, "Should get correct int value");
+
+    // Wrong type - should return default value and log error
+    int wrong1 = array_get_int(arr, 1);  // trying to get double as int
+    TEST_ASSERT(wrong1 == 0, "Should return 0 for type mismatch (double->int)");
+
+    int wrong2 = array_get_int(arr, 2);  // trying to get string as int
+    TEST_ASSERT(wrong2 == 0, "Should return 0 for type mismatch (string->int)");
+
+    array_free(arr);
+}
+
+TEST(test_type_validation_double) {
+    TEST_CASE("array_get_double with type validation");
+
+    array_t* arr = array_create();
+
+    array_push_back(arr, array_create_double(3.14159));
+    array_push_back(arr, array_create_int(100));
+    array_push_back(arr, array_create_string("pi"));
+
+    // Correct type - should work
+    double val = array_get_double(arr, 0);
+    TEST_ASSERT(fabs(val - 3.14159) < 1e-6, "Should get correct double value");
+
+    // Wrong type - should return default value
+    double wrong1 = array_get_double(arr, 1);  // trying to get int as double
+    TEST_ASSERT(fabs(wrong1 - 0.0) < 1e-10, "Should return 0.0 for type mismatch (int->double)");
+
+    double wrong2 = array_get_double(arr, 2);  // trying to get string as double
+    TEST_ASSERT(fabs(wrong2 - 0.0) < 1e-10, "Should return 0.0 for type mismatch (string->double)");
+
+    array_free(arr);
+}
+
+TEST(test_type_validation_ldouble) {
+    TEST_CASE("array_get_ldouble with type validation");
+
+    array_t* arr = array_create();
+
+    array_push_back(arr, array_create_ldouble(3.14159265358979323846L));
+    array_push_back(arr, array_create_double(2.71));
+    array_push_back(arr, array_create_int(42));
+
+    // Correct type - should work
+    long double val = array_get_ldouble(arr, 0);
+    TEST_ASSERT(fabsl(val - 3.14159265358979323846L) < 1e-15L,
+                "Should get correct long double value");
+
+    // Wrong type - should return default value
+    long double wrong1 = array_get_ldouble(arr, 1);  // trying to get double as ldouble
+    TEST_ASSERT(fabsl(wrong1 - 0.0L) < 1e-15L,
+                "Should return 0.0L for type mismatch (double->ldouble)");
+
+    long double wrong2 = array_get_ldouble(arr, 2);  // trying to get int as ldouble
+    TEST_ASSERT(fabsl(wrong2 - 0.0L) < 1e-15L,
+                "Should return 0.0L for type mismatch (int->ldouble)");
+
+    array_free(arr);
+}
+
+TEST(test_type_validation_string) {
+    TEST_CASE("array_get_string with type validation");
+
+    array_t* arr = array_create();
+
+    array_push_back(arr, array_create_string("hello world"));
+    array_push_back(arr, array_create_int(123));
+    array_push_back(arr, array_create_double(9.99));
+
+    // Correct type - should work
+    const char* val = array_get_string(arr, 0);
+    TEST_ASSERT_NOT_NULL(val, "Should get string pointer");
+    TEST_ASSERT_STR_EQUAL("hello world", val, "Should get correct string value");
+
+    // Wrong type - should return NULL
+    const char* wrong1 = array_get_string(arr, 1);  // trying to get int as string
+    TEST_ASSERT_NULL(wrong1, "Should return NULL for type mismatch (int->string)");
+
+    const char* wrong2 = array_get_string(arr, 2);  // trying to get double as string
+    TEST_ASSERT_NULL(wrong2, "Should return NULL for type mismatch (double->string)");
+
+    array_free(arr);
+}
+
+TEST(test_type_validation_pointer) {
+    TEST_CASE("array_get_pointer with type validation");
+
+    test_obj_t* obj = malloc(sizeof(test_obj_t));
+    if (obj == NULL) return;
+    obj->id = 999;
+    strcpy(obj->name, "test object");
+
+    array_t* arr = array_create();
+
+    array_push_back(arr, array_create_pointer(obj, test_obj_copy, test_obj_free));
+    array_push_back(arr, array_create_int(777));
+    array_push_back(arr, array_create_string("not a pointer"));
+
+    // Correct type - should work
+    test_obj_t* val = (test_obj_t*)array_get_pointer(arr, 0);
+    TEST_ASSERT_NOT_NULL(val, "Should get pointer");
+    TEST_ASSERT(val->id == 999, "Should get correct object");
+
+    // Wrong type - should return NULL
+    void* wrong1 = array_get_pointer(arr, 1);  // trying to get int as pointer
+    TEST_ASSERT_NULL(wrong1, "Should return NULL for type mismatch (int->pointer)");
+
+    void* wrong2 = array_get_pointer(arr, 2);  // trying to get string as pointer
+    TEST_ASSERT_NULL(wrong2, "Should return NULL for type mismatch (string->pointer)");
+
+    array_free(arr);
+}
+
+TEST(test_type_validation_bounds) {
+    TEST_CASE("Type validation with out of bounds");
+
+    array_t* arr = array_create();
+    array_push_back(arr, array_create_int(42));
+
+    // Out of bounds should also return default values
+    int val1 = array_get_int(arr, 999);
+    TEST_ASSERT(val1 == 0, "Out of bounds should return 0");
+
+    double val2 = array_get_double(arr, 999);
+    TEST_ASSERT(fabs(val2 - 0.0) < 1e-10, "Out of bounds should return 0.0");
+
+    const char* val3 = array_get_string(arr, 999);
+    TEST_ASSERT_NULL(val3, "Out of bounds should return NULL");
+
+    // NULL array should also return default values
+    int val4 = array_get_int(NULL, 0);
+    TEST_ASSERT(val4 == 0, "NULL array should return 0");
+
+    array_free(arr);
+}
