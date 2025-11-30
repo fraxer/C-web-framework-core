@@ -109,8 +109,12 @@ int bufferdata_move_data_to_start(bufferdata_t* buffer, size_t offset, size_t si
 
     // Validate bounds based on buffer type
     if (buffer->type == BUFFERDATA_STATIC) {
-        // Check bounds for static buffer
-        if (offset + size > BUFFERDATA_SIZE || size > BUFFERDATA_SIZE)
+        // Check individual bounds to prevent overflow
+        if (offset > BUFFERDATA_SIZE || size > BUFFERDATA_SIZE)
+            return 0;
+
+        // Safe check for offset + size now that we know both are <= BUFFERDATA_SIZE
+        if (offset + size > BUFFERDATA_SIZE)
             return 0;
 
         memmove(buffer->static_buffer, buffer->static_buffer + offset, size);
@@ -121,7 +125,25 @@ int bufferdata_move_data_to_start(bufferdata_t* buffer, size_t offset, size_t si
     else {
         // Check bounds for dynamic buffer
         size_t current_size = buffer->offset_dbuffer;
-        if (offset + size > current_size)
+
+        // Special case: if size is 0, we can move from any offset <= current_size
+        if (size == 0) {
+            if (offset > current_size)
+                return 0;
+
+            buffer->offset_dbuffer = 0;
+            buffer->offset_sbuffer = 0;
+            return 1;
+        }
+
+        // For non-zero size: offset must be strictly less than current_size
+        // (can't start reading at or past the end)
+        if (offset >= current_size)
+            return 0;
+
+        // Check for integer overflow: offset + size
+        // Safe because we know offset < current_size <= SIZE_MAX
+        if (size > current_size - offset)
             return 0;
 
         memmove(buffer->dynamic_buffer, buffer->dynamic_buffer + offset, size);
