@@ -137,7 +137,7 @@ file_t __file_get(void* storage, const char* path) {
 
     file_content.set_filename(&file_content, filename);
 
-    result = file_content.make_tmpfile(&file_content);
+    result = file_content.make_tmpfile(&file_content, env()->main.tmp);
 
     failed:
 

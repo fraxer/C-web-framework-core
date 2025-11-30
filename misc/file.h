@@ -119,9 +119,10 @@ typedef struct file_content {
      * Creates a temporary file and copies content into it.
      * File will be deleted when close() is called.
      * @param file_content  Pointer to file_content structure
+     * @param tmp_path      Directory path where to create temporary file
      * @return file_t structure with open temporary file
      */
-    file_t(*make_tmpfile)(struct file_content* file_content);
+    file_t(*make_tmpfile)(struct file_content* file_content, const char* tmp_path);
 
     /**
      * Reads content into memory.
@@ -153,11 +154,11 @@ file_t file_alloc();
 
 /**
  * Creates a temporary file.
- * File is created in the directory specified in config (env()->main.tmp).
  * @param filename  File name (used only for the name field)
+ * @param tmp_path  Directory path where to create temporary file
  * @return file_t structure (check ok field for success)
  */
-file_t file_create_tmp(const char* filename);
+file_t file_create_tmp(const char* filename, const char* tmp_path);
 
 /**
  * Opens an existing file or creates a new one.
