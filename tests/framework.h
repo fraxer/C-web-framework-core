@@ -5,6 +5,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ANSI color codes for terminal output */
+#define COLOR_GREEN "\033[32m"
+#define COLOR_RED "\033[31m"
+#define COLOR_RESET "\033[0m"
+
 /* Test statistics structure */
 typedef struct {
     int total;
@@ -77,10 +82,10 @@ static inline void register_test_suite(test_suite_fn suite) {
     stats.total++; \
     if (condition) { \
         stats.passed++; \
-        printf("  [PASS] %s\n", message); \
+        printf("  " COLOR_GREEN "[PASS]" COLOR_RESET " %s\n", message); \
     } else { \
         stats.failed++; \
-        printf("  [FAIL] %s (line %d)\n", message, __LINE__); \
+        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s (line %d)\n", message, __LINE__); \
     } \
 } while(0)
 
@@ -88,10 +93,10 @@ static inline void register_test_suite(test_suite_fn suite) {
     stats.total++; \
     if ((expected) == (actual)) { \
         stats.passed++; \
-        printf("  [PASS] %s\n", message); \
+        printf("  " COLOR_GREEN "[PASS]" COLOR_RESET " %s\n", message); \
     } else { \
         stats.failed++; \
-        printf("  [FAIL] %s: expected %lld, got %lld (line %d)\n", message, (long long)(expected), (long long)(actual), __LINE__); \
+        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: expected %lld, got %lld (line %d)\n", message, (long long)(expected), (long long)(actual), __LINE__); \
     } \
 } while(0)
 
@@ -99,10 +104,10 @@ static inline void register_test_suite(test_suite_fn suite) {
     stats.total++; \
     if ((expected) == (actual)) { \
         stats.passed++; \
-        printf("  [PASS] %s\n", message); \
+        printf("  " COLOR_GREEN "[PASS]" COLOR_RESET " %s\n", message); \
     } else { \
         stats.failed++; \
-        printf("  [FAIL] %s: expected %zu, got %zu (line %d)\n", message, (size_t)(expected), (size_t)(actual), __LINE__); \
+        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: expected %zu, got %zu (line %d)\n", message, (size_t)(expected), (size_t)(actual), __LINE__); \
     } \
 } while(0)
 
@@ -110,10 +115,10 @@ static inline void register_test_suite(test_suite_fn suite) {
     stats.total++; \
     if ((expected) == (actual)) { \
         stats.passed++; \
-        printf("  [PASS] %s\n", message); \
+        printf("  " COLOR_GREEN "[PASS]" COLOR_RESET " %s\n", message); \
     } else { \
         stats.failed++; \
-        printf("  [FAIL] %s: expected %u, got %u (line %d)\n", message, (unsigned int)(expected), (unsigned int)(actual), __LINE__); \
+        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: expected %u, got %u (line %d)\n", message, (unsigned int)(expected), (unsigned int)(actual), __LINE__); \
     } \
 } while(0)
 
@@ -121,10 +126,10 @@ static inline void register_test_suite(test_suite_fn suite) {
     stats.total++; \
     if (strcmp((expected), (actual)) == 0) { \
         stats.passed++; \
-        printf("  [PASS] %s\n", message); \
+        printf("  " COLOR_GREEN "[PASS]" COLOR_RESET " %s\n", message); \
     } else { \
         stats.failed++; \
-        printf("  [FAIL] %s: expected '%s', got '%s' (line %d)\n", message, expected, actual, __LINE__); \
+        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: expected '%s', got '%s' (line %d)\n", message, expected, actual, __LINE__); \
     } \
 } while(0)
 
@@ -132,10 +137,10 @@ static inline void register_test_suite(test_suite_fn suite) {
     stats.total++; \
     if ((ptr) != NULL) { \
         stats.passed++; \
-        printf("  [PASS] %s\n", message); \
+        printf("  " COLOR_GREEN "[PASS]" COLOR_RESET " %s\n", message); \
     } else { \
         stats.failed++; \
-        printf("  [FAIL] %s: pointer is NULL (line %d)\n", message, __LINE__); \
+        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: pointer is NULL (line %d)\n", message, __LINE__); \
     } \
 } while(0)
 
@@ -143,10 +148,10 @@ static inline void register_test_suite(test_suite_fn suite) {
     stats.total++; \
     if ((ptr) == NULL) { \
         stats.passed++; \
-        printf("  [PASS] %s\n", message); \
+        printf("  " COLOR_GREEN "[PASS]" COLOR_RESET " %s\n", message); \
     } else { \
         stats.failed++; \
-        printf("  [FAIL] %s: pointer is not NULL (line %d)\n", message, __LINE__); \
+        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: pointer is not NULL (line %d)\n", message, __LINE__); \
     } \
 } while(0)
 
