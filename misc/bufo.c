@@ -62,6 +62,9 @@ size_t bufo_chunk_size(bufo_t* buf, size_t size) {
 }
 
 char* bufo_data(bufo_t* buf) {
+    if (buf->data == NULL)
+        return NULL;
+
     return buf->data + buf->pos;
 }
 
@@ -72,8 +75,12 @@ size_t bufo_size(bufo_t* buf) {
 size_t bufo_move_front_pos(bufo_t* buf, size_t size) {
     size_t s = 0;
 
+    // Проверяем что pos не вышла за границы size (защита от underflow)
+    if (buf->pos >= buf->size)
+        return 0;
+
     if (buf->pos + size >= buf->size) {
-        s = buf->size - buf->pos;
+        s = buf->size - buf->pos;  // Теперь безопасно: pos < size
         buf->pos = buf->size;
     }
     else {
@@ -85,12 +92,20 @@ size_t bufo_move_front_pos(bufo_t* buf, size_t size) {
 }
 
 void bufo_set_size(bufo_t* buf, size_t size) {
+    // Limit the size to the buffer capacity
+    if (size > buf->capacity)
+        size = buf->capacity;
+
     buf->size = size;
 }
 
 int bufo_alloc(bufo_t* buf, size_t capacity) {
-    if (buf->data != NULL) 
+    if (buf->data != NULL)
         return 1;
+
+    const size_t max_capacity = 10 * 1024 * 1024; // 10 Mb
+    if (capacity > max_capacity)
+        return 0;
 
     buf->data = malloc(capacity);
     if (buf->data == NULL)
