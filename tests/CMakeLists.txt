@@ -21,7 +21,7 @@ add_executable(
 )
 
 # Link test libraries
-target_link_libraries(runner PRIVATE misc)
+target_link_libraries(runner PRIVATE misc ${CMAKE_DL_LIBS})
 
 # Add test to CTest
 add_test(NAME core_tests COMMAND runner)
