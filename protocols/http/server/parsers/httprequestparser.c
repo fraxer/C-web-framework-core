@@ -92,8 +92,6 @@ int __clear_and_return(httprequestparser_t* parser, int error) {
 }
 
 void __clear(httprequestparser_t* parser) {
-    __clear_buf(parser);
-
     // Clean up partially parsed request if it was created but not yet handled by connection layer
     // This prevents memory leaks when parsing fails early (e.g., invalid method, URI)
     if (parser->request != NULL) {
@@ -103,13 +101,7 @@ void __clear(httprequestparser_t* parser) {
         parser->request = NULL;
     }
 
-    parser->stage = HTTP1REQUESTPARSER_METHOD;
-    parser->host_header_seen = 0;
-    parser->content_length_found = 0;
-    parser->transfer_encoding_found = 0;
-    parser->headers_count = 0;
-    parser->content_length = 0;
-    parser->content_saved_length = 0;
+    httpparser_reset(parser);
 }
 
 int httpparser_run(httprequestparser_t* parser) {
@@ -249,6 +241,7 @@ int httpparser_run(httprequestparser_t* parser) {
                 // Don't break - fall through to process current character as value
                 // This handles both "Header: value" and "Header:value"
             }
+        /* fallthrough */
         case HTTP1REQUESTPARSER_HEADER_VALUE:
             if (ch == '\r') {
                 parser->stage = HTTP1REQUESTPARSER_NEWLINE2;
