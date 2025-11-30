@@ -158,6 +158,9 @@ void cqueue_clearcb(cqueue_t* queue, void (*free_cb)(void *)) {
 
         queue->size--;
     }
+
+    queue->item = NULL;
+    queue->last_item = NULL;
 }
 
 cqueue_item_t* cqueue_item_create(void* data) {
