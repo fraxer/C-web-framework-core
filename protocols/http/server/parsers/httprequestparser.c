@@ -102,6 +102,14 @@ void __clear(httprequestparser_t* parser) {
         httprequest_free(parser->request);
         parser->request = NULL;
     }
+
+    parser->stage = HTTP1REQUESTPARSER_METHOD;
+    parser->host_header_seen = 0;
+    parser->content_length_found = 0;
+    parser->transfer_encoding_found = 0;
+    parser->headers_count = 0;
+    parser->content_length = 0;
+    parser->content_saved_length = 0;
 }
 
 int httpparser_run(httprequestparser_t* parser) {
@@ -333,6 +341,10 @@ void httpparser_prepare_continue(httprequestparser_t* parser) {
 
 int __parse_payload(httprequestparser_t* parser) {
     httprequest_t* request = parser->request;
+    if (request == NULL) {
+        log_error("HTTP error: __parse_payload called with NULL request\n");
+        return __clear_and_return(parser, HTTP1PARSER_ERROR);
+    }
 
     if (!httprequest_allow_payload(request))
         return __clear_and_return(parser, HTTP1PARSER_BAD_REQUEST);
