@@ -233,32 +233,83 @@ void* array_get(array_t* array, size_t index) {
 }
 
 int array_get_int(array_t* array, size_t index) {
-    void* value = array_get(array, index);
-    if (value == NULL) return 0;
+    if (array == NULL || index >= array->size) {
+        return 0;
+    }
 
-    return *(int*)value;
+    avalue_t* element = &array->elements[index];
+
+    if (element->type != ARRAY_INT) {
+        log_error("array_get_int: Type mismatch at index %zu (expected INT, got %d)\n",
+                  index, element->type);
+        return 0;
+    }
+
+    return element->_int;
 }
 
 double array_get_double(array_t* array, size_t index) {
-    void* value = array_get(array, index);
-    if (value == NULL) return 0.0;
+    if (array == NULL || index >= array->size) {
+        return 0.0;
+    }
 
-    return *(double*)value;
+    avalue_t* element = &array->elements[index];
+
+    if (element->type != ARRAY_DOUBLE) {
+        log_error("array_get_double: Type mismatch at index %zu (expected DOUBLE, got %d)\n",
+                  index, element->type);
+        return 0.0;
+    }
+
+    return element->_double;
 }
 
 long double array_get_ldouble(array_t* array, size_t index) {
-    void* value = array_get(array, index);
-    if (value == NULL) return 0.0;
+    if (array == NULL || index >= array->size) {
+        return 0.0L;
+    }
 
-    return *(long double*)value;
+    avalue_t* element = &array->elements[index];
+
+    if (element->type != ARRAY_LONGDOUBLE) {
+        log_error("array_get_ldouble: Type mismatch at index %zu (expected LONGDOUBLE, got %d)\n",
+                  index, element->type);
+        return 0.0L;
+    }
+
+    return element->_ldouble;
 }
 
 const char* array_get_string(array_t* array, size_t index) {
-    return array_get(array, index);
+    if (array == NULL || index >= array->size) {
+        return NULL;
+    }
+
+    avalue_t* element = &array->elements[index];
+
+    if (element->type != ARRAY_STRING) {
+        log_error("array_get_string: Type mismatch at index %zu (expected STRING, got %d)\n",
+                  index, element->type);
+        return NULL;
+    }
+
+    return element->_string;
 }
 
 void* array_get_pointer(array_t* array, size_t index) {
-    return array_get(array, index);
+    if (array == NULL || index >= array->size) {
+        return NULL;
+    }
+
+    avalue_t* element = &array->elements[index];
+
+    if (element->type != ARRAY_POINTER) {
+        log_error("array_get_pointer: Type mismatch at index %zu (expected POINTER, got %d)\n",
+                  index, element->type);
+        return NULL;
+    }
+
+    return element->_pointer;
 }
 
 str_t* array_item_to_string(array_t* array, size_t index) {
