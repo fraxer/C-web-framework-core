@@ -98,8 +98,10 @@ array_t* array_copy(array_t* array) {
             array_push_back(copy_array, array_create_ldouble(element->_ldouble));
         else if (element->type == ARRAY_STRING)
             array_push_back(copy_array, array_create_stringn(element->_string, element->_length));
-        else if (element->type == ARRAY_POINTER)
-            array_push_back(copy_array, array_create_pointer(element->_copy(element->_pointer), element->_copy, element->_free));
+        else if (element->type == ARRAY_POINTER) {
+            void* copied_ptr = (element->_copy != NULL) ? element->_copy(element->_pointer) : element->_pointer;
+            array_push_back(copy_array, array_create_pointer(copied_ptr, element->_copy, element->_free));
+        }
     }
 
     return copy_array;
@@ -144,26 +146,37 @@ void array_insert(array_t* array, size_t index, avalue_t value) {
 }
 
 void array_push_front(array_t* array, avalue_t value) {
+    if (array == NULL) return;
+
     array_insert(array, 0, value);
 }
 
 void array_push_back(array_t* array, avalue_t value) {
+    if (array == NULL) return;
+
     array_insert(array, array->size, value);
 }
 
 void array_push_back_str(array_t* array, const char* value) {
+    if (array == NULL || value == NULL) return;
+
     array_push_back(array, array_create_string(value));
 }
 
 void array_push_back_int(array_t* array, int value) {
+    if (array == NULL) return;
+
     array_push_back(array, array_create_int(value));
 }
 
 void array_push_back_double(array_t* array, double value) {
+    if (array == NULL) return;
+
     array_push_back(array, array_create_double(value));
 }
 
 void array_update(array_t* array, size_t index, avalue_t value) {
+    if (array == NULL) return;
     if (index >= array->size) {
         log_error("array_update: Index out of bounds\n");
         return;
@@ -175,6 +188,7 @@ void array_update(array_t* array, size_t index, avalue_t value) {
 }
 
 void array_delete(array_t* array, size_t index) {
+    if (array == NULL) return;
     if (index >= array->size) {
         log_error("array_delete: Index out of bounds\n");
         return;
@@ -331,7 +345,7 @@ avalue_t array_create_double(double value) {
 avalue_t array_create_ldouble(long double value) {
     avalue_t v = {
         .type = ARRAY_LONGDOUBLE,
-        ._double = value,
+        ._ldouble = value,
         ._length = 0,
         ._string = NULL
     };
@@ -340,6 +354,8 @@ avalue_t array_create_ldouble(long double value) {
 }
 
 avalue_t array_create_string(const char* value) {
+    if (value == NULL) return array_create_stringn("", 0);
+
     return array_create_stringn(value, strlen(value));
 }
 
