@@ -6,7 +6,6 @@
 #include <string.h>
 
 /* ANSI color codes for terminal output */
-#define COLOR_GREEN "\033[32m"
 #define COLOR_RED "\033[31m"
 #define COLOR_RESET "\033[0m"
 
@@ -19,6 +18,16 @@ typedef struct {
 
 /* Global test statistics - defined in test_runner.c */
 extern TestStats stats;
+
+/* Current test context for delayed output */
+typedef struct {
+    const char *current_suite;
+    const char *current_case;
+    int suite_printed;
+    int case_printed;
+} TestContext;
+
+extern TestContext test_context;
 
 /* Test suite function pointer type */
 typedef void (*test_suite_fn)(void);
@@ -70,20 +79,38 @@ static inline void register_test_suite(test_suite_fn suite) {
     } \
     static void name(void)
 
-/* Test suite and case macros */
-#define TEST_SUITE(name) \
-    printf("\n=== Running test suite: %s ===\n", name);
+/* Test suite and case macros - only store names, print on failure */
+#define TEST_SUITE(name) do { \
+    test_context.current_suite = name; \
+    test_context.current_case = NULL; \
+    test_context.suite_printed = 0; \
+    test_context.case_printed = 0; \
+} while(0)
 
-#define TEST_CASE(name) \
-    printf("\nTest case: %s\n", name);
+#define TEST_CASE(name) do { \
+    test_context.current_case = name; \
+    test_context.case_printed = 0; \
+} while(0)
+
+/* Helper macro to print test context on first failure */
+#define PRINT_TEST_CONTEXT() do { \
+    if (!test_context.suite_printed && test_context.current_suite) { \
+        printf("\n=== Running test suite: %s ===\n", test_context.current_suite); \
+        test_context.suite_printed = 1; \
+    } \
+    if (!test_context.case_printed && test_context.current_case) { \
+        printf("\nTest case: %s\n", test_context.current_case); \
+        test_context.case_printed = 1; \
+    } \
+} while(0)
 
 /* Assertion macros */
 #define TEST_ASSERT(condition, message) do { \
     stats.total++; \
     if (condition) { \
         stats.passed++; \
-        printf("  " COLOR_GREEN "[PASS]" COLOR_RESET " %s\n", message); \
     } else { \
+        PRINT_TEST_CONTEXT(); \
         stats.failed++; \
         printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s (line %d)\n", message, __LINE__); \
     } \
@@ -93,8 +120,8 @@ static inline void register_test_suite(test_suite_fn suite) {
     stats.total++; \
     if ((expected) == (actual)) { \
         stats.passed++; \
-        printf("  " COLOR_GREEN "[PASS]" COLOR_RESET " %s\n", message); \
     } else { \
+        PRINT_TEST_CONTEXT(); \
         stats.failed++; \
         printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: expected %lld, got %lld (line %d)\n", message, (long long)(expected), (long long)(actual), __LINE__); \
     } \
@@ -104,8 +131,8 @@ static inline void register_test_suite(test_suite_fn suite) {
     stats.total++; \
     if ((expected) == (actual)) { \
         stats.passed++; \
-        printf("  " COLOR_GREEN "[PASS]" COLOR_RESET " %s\n", message); \
     } else { \
+        PRINT_TEST_CONTEXT(); \
         stats.failed++; \
         printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: expected %zu, got %zu (line %d)\n", message, (size_t)(expected), (size_t)(actual), __LINE__); \
     } \
@@ -115,8 +142,8 @@ static inline void register_test_suite(test_suite_fn suite) {
     stats.total++; \
     if ((expected) == (actual)) { \
         stats.passed++; \
-        printf("  " COLOR_GREEN "[PASS]" COLOR_RESET " %s\n", message); \
     } else { \
+        PRINT_TEST_CONTEXT(); \
         stats.failed++; \
         printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: expected %u, got %u (line %d)\n", message, (unsigned int)(expected), (unsigned int)(actual), __LINE__); \
     } \
@@ -126,8 +153,8 @@ static inline void register_test_suite(test_suite_fn suite) {
     stats.total++; \
     if (strcmp((expected), (actual)) == 0) { \
         stats.passed++; \
-        printf("  " COLOR_GREEN "[PASS]" COLOR_RESET " %s\n", message); \
     } else { \
+        PRINT_TEST_CONTEXT(); \
         stats.failed++; \
         printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: expected '%s', got '%s' (line %d)\n", message, expected, actual, __LINE__); \
     } \
@@ -137,8 +164,8 @@ static inline void register_test_suite(test_suite_fn suite) {
     stats.total++; \
     if ((ptr) != NULL) { \
         stats.passed++; \
-        printf("  " COLOR_GREEN "[PASS]" COLOR_RESET " %s\n", message); \
     } else { \
+        PRINT_TEST_CONTEXT(); \
         stats.failed++; \
         printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: pointer is NULL (line %d)\n", message, __LINE__); \
     } \
@@ -148,8 +175,8 @@ static inline void register_test_suite(test_suite_fn suite) {
     stats.total++; \
     if ((ptr) == NULL) { \
         stats.passed++; \
-        printf("  " COLOR_GREEN "[PASS]" COLOR_RESET " %s\n", message); \
     } else { \
+        PRINT_TEST_CONTEXT(); \
         stats.failed++; \
         printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: pointer is not NULL (line %d)\n", message, __LINE__); \
     } \

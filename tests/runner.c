@@ -3,6 +3,9 @@
 // Global test statistics
 TestStats stats = {0, 0, 0};
 
+// Test context
+TestContext test_context = {NULL, NULL, 0, 0};
+
 // Test registry
 TestRegistry test_registry = {NULL, 0, 0};
 
