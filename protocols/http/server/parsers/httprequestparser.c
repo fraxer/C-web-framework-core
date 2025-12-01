@@ -747,6 +747,13 @@ int __set_header_key(httprequest_t* request, httprequestparser_t* parser, buffer
 
     char* string = bufferdata_get(buf);
     size_t length = bufferdata_writed(buf);
+
+    // Reject empty header keys
+    if (length == 0) {
+        log_error("HTTP error: empty header key\n");
+        return HTTP1PARSER_BAD_REQUEST;
+    }
+
     http_header_t* header = http_header_create(string, length, NULL, 0);
 
     if (header == NULL) {
@@ -782,7 +789,7 @@ int __set_header_value(httprequest_t* request, httprequestparser_t* parser) {
         return HTTP1PARSER_OUT_OF_MEMORY;
 
     int r = __try_set_server(parser, request->last_header);
-    if (r == HTTP1PARSER_HOST_NOT_FOUND)
+    if (r != HTTP1PARSER_CONTINUE)
         return r;
 
     __try_set_keepalive(parser);
