@@ -18,10 +18,29 @@ add_executable(
     runner
     runner.c
     ${ALL_TEST_FILES}
+    httprequestparser_stubs.c
 )
 
 # Link test libraries
-target_link_libraries(runner PRIVATE misc ${CMAKE_DL_LIBS})
+target_link_libraries(runner PRIVATE
+    misc
+    http_server_parsers
+    http_server
+    http
+    connection
+    domain
+    socket
+    openssl
+    server
+    route
+    ratelimiter
+    multiplexing
+    ${PCRE_LIBRARIES}
+    ${ZLIB_LIBRARIES}
+    ${OPENSSL_LIBRARIES}
+    ${CMAKE_DL_LIBS}
+    Threads::Threads
+)
 
 # Add test to CTest
 add_test(NAME core_tests COMMAND runner)
