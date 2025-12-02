@@ -30,7 +30,7 @@ int main(int argc, char* argv[]) {
     log_init();
     signal_init();
 
-    if (strcmp(CMAKE_BUILD_TYPE, "Release") == 0)
+    if (strcmp(CMAKE_BUILD_TYPE, "Release") == 0 || strcmp(CMAKE_BUILD_TYPE, "RelWithDebInfo") == 0)
         if (daemon(1, 1) < 0) goto failed;
 
     if (!module_loader_init(appconfig()))
