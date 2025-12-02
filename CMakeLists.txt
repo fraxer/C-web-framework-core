@@ -7,8 +7,7 @@ add_subdirectory(protocols)
 add_subdirectory(src)
 
 # Enable tests if building with tests enabled
-option(BUILD_TESTS "Build tests" ON)
-if(BUILD_TESTS)
+if(BUILD_TESTS STREQUAL yes)
     message(STATUS "Core tests found")
     add_subdirectory(tests)
 endif()
