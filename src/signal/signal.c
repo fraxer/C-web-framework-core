@@ -75,6 +75,7 @@ void signal_before_segmentation_fault(__attribute__((unused))int s) {
     signal_flush_streams();
     print_stack_trace();
     log_error("[signal_before_segmentation_fault] Ошибка доступа к памяти\n");
+    _exit(1);
 }
 
 void signal_before_terminate(__attribute__((unused))int s) {
