@@ -95,6 +95,11 @@ int http_server_guard_read(connection_t* connection) {
 }
 
 int http_server_guard_write(connection_t* connection) {
+    if (connection == NULL) {
+        log_error("http_server_guard_write: connection is NULL\n");
+        return 0;
+    }
+
     connection_s_lock(connection);
     const int r = __write(connection);
     connection_s_unlock(connection);
@@ -103,8 +108,22 @@ int http_server_guard_write(connection_t* connection) {
 }
 
 int __read(connection_t* connection) {
+    if (connection == NULL) {
+        log_error("__read: connection is NULL\n");
+        return 0;
+    }
+
     connection_server_ctx_t* ctx = connection->ctx;
+    if (ctx == NULL) {
+        log_error("__read: ctx is NULL\n");
+        return 0;
+    }
+
     httprequestparser_t* parser = ctx->parser;
+    if (parser == NULL) {
+        log_error("__read: parser is NULL\n");
+        return 0;
+    }
 
     while (1) {
         int bytes_readed = 0;
@@ -169,8 +188,22 @@ int __read(connection_t* connection) {
 }
 
 int __write(connection_t* connection) {
+    if (connection == NULL) {
+        log_error("__write: connection is NULL\n");
+        return 0;
+    }
+
     connection_server_ctx_t* ctx = connection->ctx;
+    if (ctx == NULL) {
+        log_error("__write: ctx is NULL\n");
+        return 0;
+    }
+
     httpresponse_t* response = ctx->response;
+    if (response == NULL) {
+        log_error("__write: response is NULL\n");
+        return 0;
+    }
 
     int r = __run_header_filters(response);
     if (r == CWF_EVENT_AGAIN)
@@ -430,16 +463,37 @@ void __queue_data_response_free(void* arg) {
 }
 
 void __queue_request_handler(void* arg) {
+    if (arg == NULL) {
+        log_error("__queue_request_handler: arg is NULL\n");
+        return;
+    }
+
     connection_queue_item_t* item = arg;
+    if (item->data == NULL) {
+        log_error("__queue_request_handler: item->data is NULL\n");
+        return;
+    }
+
     connection_queue_http_data_t* data = (connection_queue_http_data_t*)item->data;
+    if (item->connection == NULL) {
+        log_error("__queue_request_handler: item->connection is NULL\n");
+        return;
+    }
+
     connection_server_ctx_t* conn_ctx = item->connection->ctx;
+    if (conn_ctx == NULL) {
+        log_error("__queue_request_handler: conn_ctx is NULL\n");
+        return;
+    }
 
     conn_ctx->response = data->response;
 
     if (!ratelimiter_allow(data->ratelimiter, item->connection->ip, 1)) {
         httpresponse_t* response = conn_ctx->response;
-        httpresponse_default(response, 429);
-        response->add_header(response, "Retry-After", "1");
+        if (response != NULL) {
+            httpresponse_default(response, 429);
+            response->add_header(response, "Retry-After", "1");
+        }
         connection_after_read(item->connection);
         return;
     }
@@ -456,9 +510,23 @@ void __queue_request_handler(void* arg) {
 }
 
 void __queue_response_handler(void* arg) {
+    if (arg == NULL) {
+        log_error("__queue_response_handler: arg is NULL\n");
+        return;
+    }
+
     connection_queue_item_t* item = arg;
+    if (item->data == NULL || item->connection == NULL) {
+        log_error("__queue_response_handler: item->data or item->connection is NULL\n");
+        return;
+    }
+
     connection_queue_http_data_t* data = (connection_queue_http_data_t*)item->data;
     connection_server_ctx_t* conn_ctx = item->connection->ctx;
+    if (conn_ctx == NULL) {
+        log_error("__queue_response_handler: conn_ctx is NULL\n");
+        return;
+    }
 
     conn_ctx->response = data->response;
 
@@ -466,13 +534,33 @@ void __queue_response_handler(void* arg) {
 }
 
 int __run_header_filters(httpresponse_t* response) {
+    if (response == NULL) {
+        log_error("__run_header_filters: response is NULL\n");
+        return CWF_ERROR;
+    }
+
     if (response->headers_sended)
         return CWF_OK;
+
+    if (response->filter == NULL) {
+        log_error("__run_header_filters: response->filter is NULL\n");
+        return CWF_ERROR;
+    }
 
     response->event_again = 0;
     response->cur_filter = response->filter;
 
     while (1) {
+        if (response->cur_filter == NULL) {
+            log_error("__run_header_filters: cur_filter is NULL\n");
+            return CWF_ERROR;
+        }
+
+        if (response->cur_filter->handler_header == NULL) {
+            log_error("__run_header_filters: handler_header is NULL\n");
+            return CWF_ERROR;
+        }
+
         const int r = response->cur_filter->handler_header(response);
         switch (r)
         {
@@ -491,11 +579,31 @@ int __run_header_filters(httpresponse_t* response) {
 }
 
 int __run_body_filters(httpresponse_t* response) {
+    if (response == NULL) {
+        log_error("__run_body_filters: response is NULL\n");
+        return CWF_ERROR;
+    }
+
+    if (response->filter == NULL) {
+        log_error("__run_body_filters: response->filter is NULL\n");
+        return CWF_ERROR;
+    }
+
     if (response->event_again)
         response->event_again = 0;
 
     while (1) {
         response->cur_filter = response->filter;
+
+        if (response->cur_filter == NULL) {
+            log_error("__run_body_filters: cur_filter is NULL\n");
+            return CWF_ERROR;
+        }
+
+        if (response->cur_filter->handler_body == NULL) {
+            log_error("__run_body_filters: handler_body is NULL\n");
+            return CWF_ERROR;
+        }
 
         int r = response->cur_filter->handler_body(response, NULL);
         switch (r)
@@ -633,8 +741,22 @@ int __post_reponse_default(connection_t* connection, int status_code) {
 }
 
 int __post_response(httpresponse_t* response) {
+    if (response == NULL) {
+        log_error("__post_response: response is NULL\n");
+        return 0;
+    }
+
     connection_t* connection = response->connection;
+    if (connection == NULL) {
+        log_error("__post_response: connection is NULL\n");
+        return 0;
+    }
+
     connection_server_ctx_t* ctx = connection->ctx;
+    if (ctx == NULL) {
+        log_error("__post_response: ctx is NULL\n");
+        return 0;
+    }
 
     if (cqueue_empty(ctx->queue)) {
         ctx->response = response;
@@ -646,7 +768,16 @@ int __post_response(httpresponse_t* response) {
 }
 
 int __post_deffered_response(httpresponse_t* response) {
+    if (response == NULL) {
+        log_error("__post_deffered_response: response is NULL\n");
+        return 0;
+    }
+
     connection_t* connection = response->connection;
+    if (connection == NULL) {
+        log_error("__post_deffered_response: connection is NULL\n");
+        return 0;
+    }
 
     return __deferred_handler(connection, NULL, response, __queue_response_handler, NULL, __queue_data_response_create, NULL);
 }
