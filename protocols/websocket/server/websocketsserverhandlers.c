@@ -25,7 +25,7 @@ static void __queue_data_request_free(void* arg);
 static void __queue_response_handler(void* arg);
 static void* __queue_data_response_create(connection_t* connection, void* component, ratelimiter_t* ratelimiter);
 static void __queue_data_response_free(void* arg);
-static int __post_reponse_default(connection_t* connection, const char* status_text);
+static int __post_response_default(connection_t* connection, const char* status_text);
 static int __post_response(websocketsresponse_t* response);
 static int __post_deffered_response(websocketsresponse_t* response);
 
@@ -76,9 +76,9 @@ int __read(connection_t* connection) {
                 case WSPARSER_OUT_OF_MEMORY:
                     return 0;
                 case WSPARSER_PAYLOAD_LARGE:
-                    return __post_reponse_default(connection, "Payload large");
+                    return __post_response_default(connection, "Payload large");
                 case WSPARSER_BAD_REQUEST:
-                    return __post_reponse_default(connection, "Bad request");
+                    return __post_response_default(connection, "Bad request");
                 case WSPARSER_CONTINUE:
                     goto read_data;
                 case WSPARSER_HANDLE_AND_CONTINUE:
@@ -243,7 +243,7 @@ void __queue_data_request_free(void* arg) {
     free(data);
 }
 
-int __post_reponse_default(connection_t* connection, const char* status_text) {
+int __post_response_default(connection_t* connection, const char* status_text) {
     websocketsresponse_t* response = websocketsresponse_create(connection);
     if (response == NULL) return 0;
 

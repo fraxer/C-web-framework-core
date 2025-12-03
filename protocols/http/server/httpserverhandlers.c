@@ -43,7 +43,7 @@ static int __handshake(connection_t* connection);
 static int __sni_callback(SSL* ssl, int* ad, void* arg);
 static void* __queue_data_response_create(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter);
 static void __queue_data_response_free(void* arg);
-static int __post_reponse_default(connection_t* connection, int status_code);
+static int __post_response_default(connection_t* connection, int status_code);
 static int __post_response(httpresponse_t* response);
 static int __post_deffered_response(httpresponse_t* response);
 static void __move_headers(httprequest_t* request, httpresponse_t* response);
@@ -153,11 +153,11 @@ int __read(connection_t* connection) {
                 case HTTP1PARSER_OUT_OF_MEMORY:
                     return 0;
                 case HTTP1PARSER_PAYLOAD_LARGE:
-                    return __post_reponse_default(connection, 413);
+                    return __post_response_default(connection, 413);
                 case HTTP1PARSER_BAD_REQUEST:
-                    return __post_reponse_default(connection, 400);
+                    return __post_response_default(connection, 400);
                 case HTTP1PARSER_HOST_NOT_FOUND:
-                    return __post_reponse_default(connection, 404);
+                    return __post_response_default(connection, 404);
                 case HTTP1PARSER_CONTINUE:
                     goto read_data;
                 case HTTP1PARSER_HANDLE_AND_CONTINUE:
@@ -731,7 +731,7 @@ int __sni_callback(SSL* ssl, int* ad, void* arg) {
     return SSL_TLSEXT_ERR_NOACK;
 }
 
-int __post_reponse_default(connection_t* connection, int status_code) {
+int __post_response_default(connection_t* connection, int status_code) {
     httpresponse_t* response = httpresponse_create(connection);
     if (response == NULL) return 0;
 
