@@ -39,6 +39,7 @@ http_module_chunked_t* http_chunked_create(void) {
     module->state_pos = 0;
     module->chunk_head = NULL;
     module->chunk_head_size = 0;
+    module->current_chunk_size = 0;
 
     if (module->buf == NULL) {
         free(module);
@@ -68,6 +69,7 @@ void http_chunked_reset(void* arg) {
     module->state = HTTP_MODULE_CHUNKED_SIZE;
     module->chunk_head_size = 0;
     module->state_pos = 0;
+    module->current_chunk_size = 0;
 
     bufo_flush(module->buf);
 }
@@ -132,14 +134,11 @@ int http_chunked_body(httpresponse_t* response, bufo_t* parent_buf) {
         module->base.cont = 0;
 
         if (r == CWF_DATA_AGAIN) {
-            // if (parent_buf->is_last && !module->base.done)
-            //     continue;
 
             if (parent_buf->pos == parent_buf->size)
                 return r;
 
             continue;
-            // return r;
         }
 
         if (r == CWF_EVENT_AGAIN)
@@ -152,7 +151,7 @@ int http_chunked_body(httpresponse_t* response, bufo_t* parent_buf) {
 }
 
 int __chunk_head_create(http_module_chunked_t* module) {
-    module->chunk_head = malloc(18);
+    module->chunk_head = malloc(20);
     if (module->chunk_head == NULL)
         return 0;
 
@@ -160,15 +159,13 @@ int __chunk_head_create(http_module_chunked_t* module) {
 }
 
 int __chunk_head_set(http_module_chunked_t* module) {
-    const int chunk_head_size = snprintf(module->chunk_head, 18, "%zx\r\n", bufo_size(module->base.parent_buf));
+    const size_t chunk_size = bufo_size(module->base.parent_buf) - module->base.parent_buf->pos;
+    const int chunk_head_size = snprintf(module->chunk_head, 20, "%zx\r\n", chunk_size);
     if (chunk_head_size == -1)
         return 0;
 
-    // if (bufo_size(module->base.parent_buf) == 12) {
-    //     int i = 0;
-    // }
-
     module->chunk_head_size = chunk_head_size;
+    module->current_chunk_size = chunk_size;
 
     return 1;
 }
@@ -186,13 +183,10 @@ void __process(http_module_chunked_t* module, bufo_t* buf) {
                 if (module->state_pos == 0)
                     if (!__update_state(module, parent_buf))
                         return;
-                        // return CWF_ERROR;
 
                 ssize_t writed = bufo_append(buf, module->chunk_head + module->state_pos, module->chunk_head_size - module->state_pos);
 
                 module->state_pos += writed;
-
-                // printf("%.*s", module->chunk_head_size, module->chunk_head);
 
                 if (module->state_pos < module->chunk_head_size)
                     return;
@@ -209,10 +203,10 @@ void __process(http_module_chunked_t* module, bufo_t* buf) {
 
                 module->state_pos += bufo_move_front_pos(parent_buf, writed);
 
-                if (module->state_pos < bufo_size(parent_buf))
+                if (module->state_pos < module->current_chunk_size)
                     return;
 
-                if (module->state_pos == bufo_size(parent_buf)) {
+                if (module->state_pos == module->current_chunk_size) {
                     module->state = HTTP_MODULE_CHUNKED_SEP;
                     module->state_pos = 0;
                 }

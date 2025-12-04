@@ -17,6 +17,7 @@ typedef struct {
     size_t state_pos;
     char* chunk_head;
     size_t chunk_head_size;
+    size_t current_chunk_size;
 } http_module_chunked_t;
 
 http_filter_t* http_chunked_filter_create(void);
