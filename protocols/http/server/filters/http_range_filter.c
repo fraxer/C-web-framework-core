@@ -8,8 +8,8 @@ static http_module_range_t* __create(void);
 static void __free(void* arg);
 static void __reset(void* arg);
 static int __get_range(httpresponse_t* response, http_module_range_t* module);
-static ssize_t __get_file_range(httpresponse_t* response, http_module_range_t* module, size_t offset, size_t capacity);
-static ssize_t __get_data_range(httpresponse_t* response, http_module_range_t* module, size_t offset, size_t capacity);
+static ssize_t __get_file_range(httpresponse_t* response, http_module_range_t* module, size_t offset, size_t capacity, int* is_last);
+static ssize_t __get_data_range(httpresponse_t* response, http_module_range_t* module, size_t offset, size_t capacity, int* is_last);
 static int __header(httpresponse_t* response);
 static int __body(httpresponse_t* response, bufo_t* parent_buf);
 
@@ -90,14 +90,15 @@ int __get_range(httpresponse_t* response, http_module_range_t* module) {
     const size_t remaining = module->range_size - module->range_pos;
     const size_t capacity = remaining < module->buf->capacity ? remaining : module->buf->capacity;
 
-    const ssize_t r = is_file ? __get_file_range(response, module, target_offset, capacity)
-                             : __get_data_range(response, module, target_offset, capacity);
+    int is_last = 0;
+    const ssize_t r = is_file ? __get_file_range(response, module, target_offset, capacity, &is_last)
+                             : __get_data_range(response, module, target_offset, capacity, &is_last);
     if (r < 0)
         return 0;
 
     module->range_pos += r;
 
-    if (module->range_pos == module->range_size)
+    if (module->range_pos == module->range_size || is_last)
         module->buf->is_last = 1;
 
     bufo_reset_pos(module->buf);
@@ -106,17 +107,55 @@ int __get_range(httpresponse_t* response, http_module_range_t* module) {
     return 1;
 }
 
-ssize_t __get_file_range(httpresponse_t* response, http_module_range_t* module, size_t offset, size_t capacity) {
+ssize_t __get_file_range(httpresponse_t* response, http_module_range_t* module, size_t offset, size_t capacity, int* is_last) {
+    *is_last = 0;
+
+    // Calculate how much data is actually available from the offset
+    size_t available = 0;
+    if (offset < response->file_.size) {
+        available = response->file_.size - offset;
+    }
+
+    // Limit capacity to available data
+    size_t read_size = capacity < available ? capacity : available;
+
+    // If no data available from this offset, mark as last
+    if (read_size == 0) {
+        *is_last = 1;
+        return 0;
+    }
+
     lseek(response->file_.fd, offset, SEEK_SET);
-    const ssize_t r = read(response->file_.fd, module->buf->data, capacity);
+    const ssize_t r = read(response->file_.fd, module->buf->data, read_size);
+
+    // Check if we've read all remaining data
+    if (r >= 0 && offset + (size_t)r >= response->file_.size)
+        *is_last = 1;
 
     return r;
 }
 
-ssize_t __get_data_range(httpresponse_t* response, http_module_range_t* module, size_t offset, size_t capacity) {
-    memcpy(module->buf->data, response->body.data + offset, capacity);
+ssize_t __get_data_range(httpresponse_t* response, http_module_range_t* module, size_t offset, size_t capacity, int* is_last) {
+    *is_last = 0;
 
-    return capacity;
+    // Calculate how much data is actually available from the offset
+    size_t available = 0;
+    if (offset < response->body.size) {
+        available = response->body.size - offset;
+    }
+
+    // Limit capacity to available data
+    size_t copy_size = capacity < available ? capacity : available;
+
+    if (copy_size > 0) {
+        memcpy(module->buf->data, response->body.data + offset, copy_size);
+    }
+
+    // Check if we've copied all remaining data
+    if (offset + copy_size >= response->body.size)
+        *is_last = 1;
+
+    return copy_size;
 }
 
 int __header(httpresponse_t* response) {
@@ -124,6 +163,11 @@ int __header(httpresponse_t* response) {
     http_module_range_t* module = cur_filter->module;
 
     if (response->ranges == NULL)
+        return filter_next_handler_header(response);
+
+    // Range requests only apply to successful responses (2xx)
+    // Skip range processing for redirects (3xx), client errors (4xx), server errors (5xx)
+    if (response->status_code < 200 || response->status_code >= 300)
         return filter_next_handler_header(response);
 
     int r = 0;
@@ -155,6 +199,14 @@ int __header(httpresponse_t* response) {
     }
     else if (source_end == -1) {
         end = data_size;
+    }
+    else {
+        // RFC 7233: end is inclusive in Range header, convert to exclusive
+        end = end + 1;
+        // Limit end to actual data size
+        if (end > data_size) {
+            end = data_size;
+        }
     }
 
     module->range_size = end - start;
