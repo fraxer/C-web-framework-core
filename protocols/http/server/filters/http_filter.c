@@ -12,13 +12,15 @@ http_filter_t* filters_create(void) {
     http_filter_t* filter_gzip = http_gzip_filter_create();
     http_filter_t* filter_data = http_data_filter_create();
     http_filter_t* filter_range = http_range_filter_create();
+    http_filter_t* filter_not_modified = http_not_modified_filter_create();
 
     filter_chunked->next = filter_write;
     filter_gzip->next = filter_chunked;
     filter_data->next = filter_gzip;
     filter_range->next = filter_data;
+    filter_not_modified->next = filter_range;
 
-    return filter_range;
+    return filter_not_modified;
 }
 
 void filters_reset(http_filter_t* filter) {
