@@ -115,7 +115,6 @@ void http_write_reset(void* arg) {
 int __wr(httpresponse_t* response, bufo_t* buf) {
     size_t readed = 0;
     while ((readed = bufo_chunk_size(buf, BUF_SIZE)) > 0) {
-        // log_error("%.*s", readed, bufo_data(buf));
         ssize_t writed = __write(response->connection, bufo_data(buf), readed);
         if (writed == -1) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -134,7 +133,8 @@ int __wr(httpresponse_t* response, bufo_t* buf) {
     return CWF_OK;
 }
 
-int http_write_header(httpresponse_t* response) {
+int http_write_header(httprequest_t* request, httpresponse_t* response) {
+    (void)request;
     http_module_write_t* module = response->cur_filter->module;
     bufo_t* buf = module->buf;
 
@@ -142,12 +142,11 @@ int http_write_header(httpresponse_t* response) {
         if (!__build_head(response, buf))
             return CWF_ERROR;
 
-    // printf("%.*s", buf->size, buf->data);
-
     return __wr(response, buf);
 }
 
-int http_write_body(httpresponse_t* response, bufo_t* parent_buf) {
+int http_write_body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf) {
+    (void)request;
     http_module_write_t* module = response->cur_filter->module;
     module->base.parent_buf = parent_buf;
 

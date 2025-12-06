@@ -228,6 +228,7 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
     ctx->listener = listener;
     ctx->parser = NULL;
     ctx->server = NULL;
+    ctx->request = NULL;
     ctx->response = NULL;
     ctx->queue = cqueue_create();
     ctx->broadcast_queue = cqueue_create();
@@ -255,6 +256,12 @@ void __ctx_reset(void* arg) {
 
     ctx->need_write = 0;
 
+    request_t* request = ctx->request;
+    if (request != NULL) {
+        request->free(request);
+        ctx->request = NULL;
+    }
+
     response_t* response = ctx->response;
     if (response != NULL) {
         response->free(response);
@@ -277,6 +284,12 @@ void __ctx_free(void* arg) {
     // Освобождаем очереди с callback'ом для освобождения item'ов
     cqueue_freecb(ctx->queue, __ctx_queue_item_free_callback);
     cqueue_freecb(ctx->broadcast_queue, __ctx_queue_item_free_callback);
+
+    request_t* request = ctx->request;
+    if (request != NULL) {
+        request->free(request);
+        ctx->request = NULL;
+    }
 
     response_t* response = ctx->response;
     if (response != NULL) {

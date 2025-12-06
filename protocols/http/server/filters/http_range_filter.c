@@ -7,11 +7,11 @@
 static http_module_range_t* __create(void);
 static void __free(void* arg);
 static void __reset(void* arg);
-static int __get_range(httpresponse_t* response, http_module_range_t* module);
+static int __get_range(httprequest_t* request, httpresponse_t* response, http_module_range_t* module);
 static ssize_t __get_file_range(httpresponse_t* response, http_module_range_t* module, size_t offset, size_t capacity, int* is_last);
 static ssize_t __get_data_range(httpresponse_t* response, http_module_range_t* module, size_t offset, size_t capacity, int* is_last);
-static int __header(httpresponse_t* response);
-static int __body(httpresponse_t* response, bufo_t* parent_buf);
+static int __header(httprequest_t* request, httpresponse_t* response);
+static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf);
 
 http_filter_t* http_range_filter_create(void) {
     http_filter_t* filter = malloc(sizeof * filter);
@@ -70,14 +70,14 @@ void __reset(void* arg) {
     bufo_flush(module->buf);
 }
 
-int __get_range(httpresponse_t* response, http_module_range_t* module) {
+int __get_range(httprequest_t* request, httpresponse_t* response, http_module_range_t* module) {
     const int is_file = response->file_.fd > -1;
     size_t data_size = response->body.size;
     if (is_file)
         data_size = response->file_.size;
 
-    const ssize_t source_start = response->ranges->start;
-    const ssize_t source_end = response->ranges->end;
+    const ssize_t source_start = request->ranges->start;
+    const ssize_t source_end = request->ranges->end;
 
     size_t start = (size_t)source_start;
     if (source_start == -1)
@@ -158,17 +158,20 @@ ssize_t __get_data_range(httpresponse_t* response, http_module_range_t* module, 
     return copy_size;
 }
 
-int __header(httpresponse_t* response) {
+int __header(httprequest_t* request, httpresponse_t* response) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_range_t* module = cur_filter->module;
 
-    if (response->ranges == NULL)
-        return filter_next_handler_header(response);
+    if (request->ranges == NULL)
+        return filter_next_handler_header(request, response);
 
     // Range requests only apply to successful responses (2xx)
     // Skip range processing for redirects (3xx), client errors (4xx), server errors (5xx)
     if (response->status_code < 200 || response->status_code >= 300)
-        return filter_next_handler_header(response);
+        return filter_next_handler_header(request, response);
+
+    if (response->last_modified)
+        return filter_next_handler_header(request, response);
 
     int r = 0;
 
@@ -183,8 +186,8 @@ int __header(httpresponse_t* response) {
     if (response->file_.fd > -1)
         data_size = response->file_.size;
 
-    const ssize_t source_start = response->ranges->start;
-    const ssize_t source_end = response->ranges->end;
+    const ssize_t source_start = request->ranges->start;
+    const ssize_t source_end = request->ranges->end;
 
     if (source_start > (ssize_t)data_size)
         return CWF_ERROR;
@@ -222,7 +225,7 @@ int __header(httpresponse_t* response) {
 
     cont:
 
-    r = filter_next_handler_header(response);
+    r = filter_next_handler_header(request, response);
 
     module->base.cont = 0;
 
@@ -232,13 +235,16 @@ int __header(httpresponse_t* response) {
     return r;
 }
 
-int __body(httpresponse_t* response, bufo_t* parent_buf) {
+int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_range_t* module = cur_filter->module;
     module->base.parent_buf = parent_buf;
 
     if (!response->range)
-        return filter_next_handler_body(response, parent_buf);
+        return filter_next_handler_body(request, response, parent_buf);
+
+    if (response->last_modified)
+        return filter_next_handler_body(request, response, parent_buf);
 
     int r = 0;
     bufo_t* buf = module->buf;
@@ -251,14 +257,14 @@ int __body(httpresponse_t* response, bufo_t* parent_buf) {
     while (1) {
         response->cur_filter = cur_filter;
 
-        if (!__get_range(response, module))
+        if (!__get_range(request, response, module))
             return CWF_ERROR;
 
         bufo_reset_pos(buf);
 
         cont:
 
-        r = filter_next_handler_body(response, buf);
+        r = filter_next_handler_body(request, response, buf);
 
         module->base.cont = 0;
 

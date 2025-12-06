@@ -35,7 +35,6 @@ typedef struct httpresponse {
 
     http_header_t* header_;
     http_header_t* last_header;
-    http_ranges_t* ranges;
     http_filter_t* filter;
     http_filter_t* cur_filter;
 
@@ -238,6 +237,7 @@ typedef struct httpresponse {
     unsigned event_again : 1;
     unsigned headers_sended : 1;
     unsigned range : 1;
+    unsigned last_modified : 1;
 } httpresponse_t;
 
 httpresponse_t* httpresponse_create(connection_t* connection);

@@ -74,12 +74,15 @@ void http_chunked_reset(void* arg) {
     bufo_flush(module->buf);
 }
 
-int http_chunked_header(httpresponse_t* response) {
+int http_chunked_header(httprequest_t* request, httpresponse_t* response) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_chunked_t* module = cur_filter->module;
 
     if (response->transfer_encoding == TE_NONE)
-        return filter_next_handler_header(response);
+        return filter_next_handler_header(request, response);
+
+    if (response->last_modified)
+        return filter_next_handler_header(request, response);
 
     int r = 0;
 
@@ -94,7 +97,7 @@ int http_chunked_header(httpresponse_t* response) {
 
     cont:
 
-    r = filter_next_handler_header(response);
+    r = filter_next_handler_header(request, response);
 
     module->base.cont = 0;
 
@@ -104,13 +107,16 @@ int http_chunked_header(httpresponse_t* response) {
     return r;
 }
 
-int http_chunked_body(httpresponse_t* response, bufo_t* parent_buf) {
+int http_chunked_body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_chunked_t* module = cur_filter->module;
     module->base.parent_buf = parent_buf;
 
     if (response->transfer_encoding == TE_NONE)
-        return filter_next_handler_body(response, parent_buf);
+        return filter_next_handler_body(request, response, parent_buf);
+
+    if (response->last_modified)
+        return filter_next_handler_body(request, response, parent_buf);
 
     int r = 0;
     bufo_t* buf = module->buf;
@@ -129,7 +135,7 @@ int http_chunked_body(httpresponse_t* response, bufo_t* parent_buf) {
 
         cont:
 
-        r = filter_next_handler_body(response, buf);
+        r = filter_next_handler_body(request, response, buf);
 
         module->base.cont = 0;
 

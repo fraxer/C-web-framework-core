@@ -69,8 +69,16 @@ file_t file_open(const char* path, const int flags) {
     file.fd = open(path, flags, S_IRWXU);
     if (file.fd < 0) return file;
 
+    struct stat stat_buf;
+    if (fstat(file.fd, &stat_buf) == 0) {
+        file.size = stat_buf.st_size;
+        file.mtime = stat_buf.st_mtime;
+    } else {
+        file.size = 0;
+        file.mtime = 0;
+    }
+
     file.ok = 1;
-    file.size = __file_size(file.fd);
     file.set_name(&file, filename);
 
     return file;
@@ -100,6 +108,7 @@ file_t file_alloc() {
         .ok = 0,
         .tmp = 0,
         .size = 0,
+        .mtime = 0,
         .name = {0},
 
         .set_name = __file_set_name,
@@ -215,6 +224,7 @@ void __file_reset(file_t* file) {
     file->ok = 0;
     file->tmp = 0;
     file->size = 0;
+    file->mtime = 0;
     memset(file->name, 0, NAME_MAX);
 }
 

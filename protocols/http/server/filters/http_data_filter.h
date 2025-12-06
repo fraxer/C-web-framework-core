@@ -1,6 +1,7 @@
 #ifndef __HTTP_DATA_FILTER__
 #define __HTTP_DATA_FILTER__
 
+#include "httprequest.h"
 #include "httpresponse.h"
 
 typedef struct {

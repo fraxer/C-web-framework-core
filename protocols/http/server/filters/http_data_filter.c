@@ -5,8 +5,8 @@
 static http_module_data_t* __create(void);
 static void __free(void* arg);
 static void __reset(void* arg);
-static int __header(httpresponse_t* response);
-static int __body(httpresponse_t* response, bufo_t* parent_buf);
+static int __header(httprequest_t* request, httpresponse_t* response);
+static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf);
 static bufo_t* body_next_chunk_data(httpresponse_t* response, bufo_t* proxy_body_buf, int** ok);
 static bufo_t* file_next_chunk_data(httpresponse_t* response, int** ok);
 static bufo_t* next_chunk_data(httpresponse_t* response, bufo_t* proxy_body_buf, int* ok);
@@ -69,7 +69,7 @@ void __reset(void* arg) {
     module->proxy_body_buf->is_proxy = 1;
 }
 
-int __header(httpresponse_t* response) {
+int __header(httprequest_t* request, httpresponse_t* response) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_data_t* module = cur_filter->module;
     int r = 0;
@@ -77,7 +77,12 @@ int __header(httpresponse_t* response) {
     if (module->base.cont)
         goto cont;
 
-    if (!response->range && response->transfer_encoding == TE_NONE) {
+    if (response->file_.fd > -1)
+        if (!response->add_header(response, "Cache-Control", "no-cache"))
+            return CWF_ERROR;
+
+    // RFC 7232: 304 response MUST NOT contain Content-Length for body
+    if (!response->range && response->transfer_encoding == TE_NONE && response->status_code != 304) {
         size_t data_size = response->body.size;
         if (response->file_.fd > -1)
             data_size = response->file_.size;
@@ -88,7 +93,7 @@ int __header(httpresponse_t* response) {
 
     cont:
 
-    r = filter_next_handler_header(response);
+    r = filter_next_handler_header(request, response);
 
     module->base.cont = 0;
 
@@ -98,13 +103,21 @@ int __header(httpresponse_t* response) {
     return r;
 }
 
-int __body(httpresponse_t* response, bufo_t* parent_buf) {
+int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_data_t* module = cur_filter->module;
     module->base.parent_buf = parent_buf;
 
     if (response->range)
-        return filter_next_handler_body(response, parent_buf);
+        return filter_next_handler_body(request, response, parent_buf);
+
+    // RFC 7231: HEAD response MUST NOT contain a message body
+    if (request->method == ROUTE_HEAD)
+        return CWF_OK;
+
+    // RFC 7232: 304 response MUST NOT contain a message body
+    if (response->status_code == 304)
+        return CWF_OK;
 
     int r = 0;
     int ok = 0;
@@ -124,7 +137,7 @@ int __body(httpresponse_t* response, bufo_t* parent_buf) {
 
         cont:
 
-        r = filter_next_handler_body(response, buf);
+        r = filter_next_handler_body(request, response, buf);
 
         module->base.cont = 0;
 
