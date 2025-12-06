@@ -2,6 +2,7 @@
 #define __CFILE__
 
 #include <sys/types.h>
+#include <time.h>
 #include <libgen.h>
 #include <fcntl.h>
 #include <linux/limits.h>
@@ -15,6 +16,9 @@ typedef struct file {
 
     /** File size in bytes */
     size_t size;
+
+    /** Last modification time (mtime from stat) */
+    time_t mtime;
 
     /**
      * Sets the file name.

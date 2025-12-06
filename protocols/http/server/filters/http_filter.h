@@ -8,6 +8,7 @@
 #define CWF_EVENT_AGAIN  -2
 #define CWF_DATA_AGAIN   -3
 
+struct httprequest;
 struct httpresponse;
 
 typedef struct {
@@ -21,8 +22,8 @@ typedef struct {
 typedef struct http_filter {
     void* module; // http_module_t
 
-    int(*handler_header)(struct httpresponse* response);
-    int(*handler_body)(struct httpresponse* response, bufo_t* buf);
+    int(*handler_header)(struct httprequest* request, struct httpresponse* response);
+    int(*handler_body)(struct httprequest* request, struct httpresponse* response, bufo_t* buf);
 
     struct http_filter* next;
 } http_filter_t;
@@ -30,7 +31,7 @@ typedef struct http_filter {
 http_filter_t* filters_create(void);
 void filters_reset(http_filter_t* filter);
 void filters_free(http_filter_t* filter);
-int filter_next_handler_header(struct httpresponse* response);
-int filter_next_handler_body(struct httpresponse* response, bufo_t* buf);
+int filter_next_handler_header(struct httprequest* request, struct httpresponse* response);
+int filter_next_handler_body(struct httprequest* request, struct httpresponse* response, bufo_t* buf);
 
 #endif

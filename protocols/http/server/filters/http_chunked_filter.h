@@ -1,6 +1,7 @@
 #ifndef __HTTP_CHUNKED_FILTER__
 #define __HTTP_CHUNKED_FILTER__
 
+#include "httprequest.h"
 #include "httpresponse.h"
 
 typedef enum {
@@ -23,7 +24,7 @@ typedef struct {
 http_filter_t* http_chunked_filter_create(void);
 http_module_chunked_t* http_chunked_create(void);
 void http_chunked_free(void* arg);
-int http_chunked_header(httpresponse_t* response);
-int http_chunked_body(httpresponse_t* response, bufo_t* buf);
+int http_chunked_header(httprequest_t* request, httpresponse_t* response);
+int http_chunked_body(httprequest_t* request, httpresponse_t* response, bufo_t* buf);
 
 #endif

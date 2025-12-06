@@ -18,7 +18,7 @@ typedef struct {
 
 struct middleware_item;
 
-typedef int(*deferred_handler)(httpresponse_t* response);
+typedef int(*deferred_handler)(httprequest_t* request, httpresponse_t* response);
 typedef void(*queue_handler)(void*);
 typedef void*(*queue_data_create)(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter);
 
@@ -37,16 +37,15 @@ static void __queue_request_handler(void* arg);
 static void __queue_response_handler(void* arg);
 static void* __queue_data_request_create(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter);
 static void __queue_data_request_free(void* arg);
-static int __run_header_filters(httpresponse_t* response);
-static int __run_body_filters(httpresponse_t* response);
+static int __run_header_filters(httprequest_t* request, httpresponse_t* response);
+static int __run_body_filters(httprequest_t* request, httpresponse_t* response);
 static int __handshake(connection_t* connection);
 static int __sni_callback(SSL* ssl, int* ad, void* arg);
 static void* __queue_data_response_create(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter);
 static void __queue_data_response_free(void* arg);
 static int __post_response_default(connection_t* connection, int status_code);
-static int __post_response(httpresponse_t* response);
-static int __post_deffered_response(httpresponse_t* response);
-static void __move_headers(httprequest_t* request, httpresponse_t* response);
+static int __post_response(httprequest_t* request, httpresponse_t* response);
+static int __post_deffered_response(httprequest_t* request, httpresponse_t* response);
 static ratelimiter_t* __ratelimiter_find(server_http_t* http_config, route_t* route);
 
 int __tls_read(connection_t* connection) {
@@ -199,19 +198,25 @@ int __write(connection_t* connection) {
         return 0;
     }
 
+    httprequest_t* request = ctx->request;
+    if (request == NULL) {
+        log_error("__write: request is NULL\n");
+        return 0;
+    }
+
     httpresponse_t* response = ctx->response;
     if (response == NULL) {
         log_error("__write: response is NULL\n");
         return 0;
     }
 
-    int r = __run_header_filters(response);
+    int r = __run_header_filters(request, response);
     if (r == CWF_EVENT_AGAIN)
         return 1;
     if (r == CWF_ERROR)
         return 0;
 
-    r = __run_body_filters(response);
+    r = __run_body_filters(request, response);
     if (r == CWF_EVENT_AGAIN)
         return 1;
     if (r == CWF_ERROR)
@@ -253,19 +258,11 @@ int __handle(connection_t* connection, httprequest_t* request, deferred_handler 
     httpresponse_t* response = httpresponse_create(connection);
     if (response == NULL) return 0;
 
-    __move_headers(request, response);
-
     switch (__apply_redirect(request, response, handler)) {
     case -1:
-    {
-        httprequest_free(request);
         return 0;
-    }
     case 1:
-    {
-        httprequest_free(request);
         return 1;
-    }
     case 0:
     default:
         break;
@@ -277,7 +274,6 @@ int __handle(connection_t* connection, httprequest_t* request, deferred_handler 
     connection_server_ctx_t* ctx = connection->ctx;
     char file_full_path[PATH_MAX];
     const file_status_e file_status = http_get_file_full_path(ctx->server, file_full_path, PATH_MAX, request->path, request->path_length);
-    httprequest_free(request);
 
     if (file_status == FILE_OK) {
         if (!ratelimiter_allow(ctx->server->http.ratelimiter, connection->ip, 1)) {
@@ -292,7 +288,7 @@ int __handle(connection_t* connection, httprequest_t* request, deferred_handler 
     else
         httpresponse_default(response, 404);
 
-    return handler(response);
+    return handler(request, response);
 }
 
 int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
@@ -348,17 +344,17 @@ int __apply_redirect(httprequest_t* request, httpresponse_t* response, deferred_
     case REDIRECT_OUT_OF_MEMORY:
     {
         httpresponse_default(response, 500);
-        return handler(response);
+        return handler(request, response);
     }
     case REDIRECT_LOOP_CYCLE:
     {
         httpresponse_default(response, 508);
-        return handler(response);
+        return handler(request, response);
     }
     case REDIRECT_FOUND:
     {
         httpresponse_redirect(response, request->uri, 301);
-        return handler(response);
+        return handler(request, response);
     }
     case REDIRECT_NOT_FOUND:
     default:
@@ -448,9 +444,6 @@ void __queue_data_request_free(void* arg) {
 
     connection_queue_http_data_t* data = arg;
 
-    if (data->request != NULL)
-        httprequest_free(data->request);
-
     free(data);
 }
 
@@ -486,6 +479,7 @@ void __queue_request_handler(void* arg) {
         return;
     }
 
+    conn_ctx->request = data->request;
     conn_ctx->response = data->response;
 
     if (!ratelimiter_allow(data->ratelimiter, item->connection->ip, 1)) {
@@ -499,7 +493,7 @@ void __queue_request_handler(void* arg) {
     }
 
     httpctx_t ctx;
-    httpctx_init(&ctx, data->request, conn_ctx->response);
+    httpctx_init(&ctx, conn_ctx->request, conn_ctx->response);
 
     if (run_middlewares(conn_ctx->server->http.middleware, &ctx))
         item->handle(&ctx);
@@ -528,12 +522,17 @@ void __queue_response_handler(void* arg) {
         return;
     }
 
+    conn_ctx->request = data->request;
     conn_ctx->response = data->response;
 
     connection_after_read(item->connection);
 }
 
-int __run_header_filters(httpresponse_t* response) {
+int __run_header_filters(httprequest_t* request, httpresponse_t* response) {
+    if (request == NULL) {
+        log_error("__run_header_filters: request is NULL\n");
+        return CWF_ERROR;
+    }
     if (response == NULL) {
         log_error("__run_header_filters: response is NULL\n");
         return CWF_ERROR;
@@ -561,7 +560,7 @@ int __run_header_filters(httpresponse_t* response) {
             return CWF_ERROR;
         }
 
-        const int r = response->cur_filter->handler_header(response);
+        const int r = response->cur_filter->handler_header(request, response);
         switch (r)
         {
         case CWF_ERROR: /* close connection */
@@ -578,7 +577,11 @@ int __run_header_filters(httpresponse_t* response) {
     return CWF_OK;
 }
 
-int __run_body_filters(httpresponse_t* response) {
+int __run_body_filters(httprequest_t* request, httpresponse_t* response) {
+    if (request == NULL) {
+        log_error("__run_body_filters: request is NULL\n");
+        return CWF_ERROR;
+    }
     if (response == NULL) {
         log_error("__run_body_filters: response is NULL\n");
         return CWF_ERROR;
@@ -605,7 +608,7 @@ int __run_body_filters(httpresponse_t* response) {
             return CWF_ERROR;
         }
 
-        int r = response->cur_filter->handler_body(response, NULL);
+        int r = response->cur_filter->handler_body(request, response, NULL);
         switch (r)
         {
         case CWF_OK:
@@ -737,10 +740,10 @@ int __post_response_default(connection_t* connection, int status_code) {
 
     httpresponse_default(response, status_code);
 
-    return __post_response(response);
+    return __post_response(NULL, response);
 }
 
-int __post_response(httpresponse_t* response) {
+int __post_response(httprequest_t* request, httpresponse_t* response) {
     if (response == NULL) {
         log_error("__post_response: response is NULL\n");
         return 0;
@@ -759,15 +762,16 @@ int __post_response(httpresponse_t* response) {
     }
 
     if (cqueue_empty(ctx->queue)) {
+        ctx->request = request;
         ctx->response = response;
         ctx->need_write = 1;
         return connection_after_read(connection);
     }
 
-    return __deferred_handler(connection, NULL, response, __queue_response_handler, NULL, __queue_data_response_create, NULL);
+    return __deferred_handler(connection, request, response, __queue_response_handler, NULL, __queue_data_response_create, NULL);
 }
 
-int __post_deffered_response(httpresponse_t* response) {
+int __post_deffered_response(httprequest_t* request, httpresponse_t* response) {
     if (response == NULL) {
         log_error("__post_deffered_response: response is NULL\n");
         return 0;
@@ -779,12 +783,7 @@ int __post_deffered_response(httpresponse_t* response) {
         return 0;
     }
 
-    return __deferred_handler(connection, NULL, response, __queue_response_handler, NULL, __queue_data_response_create, NULL);
-}
-
-void __move_headers(httprequest_t* request, httpresponse_t* response) {
-    response->ranges = request->ranges;
-    request->ranges = NULL;
+    return __deferred_handler(connection, request, response, __queue_response_handler, NULL, __queue_data_response_create, NULL);
 }
 
 ratelimiter_t* __ratelimiter_find(server_http_t* http_config, route_t* route) {

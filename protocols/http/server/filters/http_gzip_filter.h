@@ -1,6 +1,7 @@
 #ifndef __HTTP_GZIP_FILTER__
 #define __HTTP_GZIP_FILTER__
 
+#include "httprequest.h"
 #include "httpresponse.h"
 #include "gzip.h"
 

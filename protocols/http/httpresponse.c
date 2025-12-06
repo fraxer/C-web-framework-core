@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/stat.h>
 
 #include "log.h"
@@ -33,6 +34,7 @@ static int __httpresponse_header_add(httpresponse_t* response, const char* key, 
 static int __httpresponse_headern_add(httpresponse_t* response, const char* key, size_t key_length, const char* value, size_t value_length);
 static int __httpresponse_headeru_add(httpresponse_t* response, const char* key, size_t key_length, const char* value, size_t value_length);
 static int __httpresponse_header_exist(httpresponse_t* response, const char* key);
+static int __httpresponse_header_remove(httpresponse_t* response, const char* key);
 static int __httpresponse_alloc_body(httpresponse_t* response, const char* data, size_t length);
 static int __httpresponse_header_add_content_length(httpresponse_t* response, size_t length);
 static const char* __httpresponse_get_mimetype(const char* extension);
@@ -106,12 +108,12 @@ httpresponse_t* httpresponse_create(connection_t* connection) {
     response->file_ = file_alloc();
     response->header_ = NULL;
     response->last_header = NULL;
-    response->ranges = NULL;
     response->filter = filters_create();
     response->cur_filter = response->filter;
     response->event_again = 0;
     response->headers_sended = 0;
     response->range = 0;
+    response->last_modified = 0;
     response->connection = connection;
     response->send_data = __httpresponse_data;
     response->send_datan = __httpresponse_datan;
@@ -126,7 +128,7 @@ httpresponse_t* httpresponse_create(connection_t* connection) {
     response->add_headern = __httpresponse_headern_add;
     response->add_headeru = __httpresponse_headeru_add;
     response->add_content_length = __httpresponse_header_add_content_length;
-    response->remove_header = NULL;
+    response->remove_header = __httpresponse_header_remove;
     response->send_file = __httpresponse_file;
     response->send_filen = __httpresponse_filen;
     response->send_filef = __httpresponse_filef;
@@ -153,6 +155,7 @@ void __httpresponse_reset(httpresponse_t* response) {
     response->event_again = 0;
     response->headers_sended = 0;
     response->range = 0;
+    response->last_modified = 0;
 
     filters_reset(response->filter);
     response->cur_filter = response->filter;
@@ -166,9 +169,6 @@ void __httpresponse_reset(httpresponse_t* response) {
     http_headers_free(response->header_);
     response->header_ = NULL;
     response->last_header = NULL;
-
-    http_ranges_free(response->ranges);
-    response->ranges = NULL;
 
     httpresponseparser_reset(response->parser);
 }
@@ -318,7 +318,7 @@ int __httpresponse_header_add(httpresponse_t* response, const char* key, const c
 }
 
 int __httpresponse_headern_add(httpresponse_t* response, const char* key, size_t key_length, const char* value, size_t value_length) {
-    if (response->ranges &&
+    if (response->range &&
         (cmpstr_lower(key, "Transfer-Encoding") ||
          cmpstr_lower(key, "Content-Encoding")
     )) {
@@ -344,7 +344,7 @@ int __httpresponse_headern_add(httpresponse_t* response, const char* key, size_t
     if (response->file_.fd > -1)
         data_size = response->file_.size;
 
-    if (!response->ranges) {
+    if (!response->range) {
         if (cmpstr_lower(header->key, "Content-Type") && data_size >= 1024) {
             __httpresponse_try_enable_gzip(response, header->value);
         }
@@ -377,6 +377,30 @@ int __httpresponse_header_exist(httpresponse_t* response, const char* key) {
     }
 
     return 0;
+}
+
+int __httpresponse_header_remove(httpresponse_t* response, const char* key) {
+    if (response->header_ == NULL)
+        return 0;
+
+    http_header_t* new_head = http_header_delete(response->header_, key);
+
+    if (new_head == response->header_)
+        return 0;
+
+    response->header_ = new_head;
+
+    if (response->header_ == NULL) {
+        response->last_header = NULL;
+    } else {
+        http_header_t* header = response->header_;
+        while (header->next != NULL) {
+            header = header->next;
+        }
+        response->last_header = header;
+    }
+
+    return 1;
 }
 
 int __httpresponse_header_add_content_length(httpresponse_t* response, size_t length) {

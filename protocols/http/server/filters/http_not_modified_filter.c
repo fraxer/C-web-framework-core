@@ -5,14 +5,16 @@
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
 static http_module_not_modified_t* __create(void);
 static void __free(void* arg);
 static void __reset(void* arg);
-static int __check_not_modified(httpresponse_t* response);
+static int __check_not_modified(httprequest_t* request, httpresponse_t* response);
 static int __etag_matches(const char* if_none_match, size_t if_none_match_len,
                           const char* etag, size_t etag_len);
+static int __generate_etag(time_t mtime, off_t size, char* etag_buf, size_t etag_buf_size);
 
 http_filter_t* http_not_modified_filter_create(void) {
     http_filter_t* filter = malloc(sizeof * filter);
@@ -56,7 +58,7 @@ void __reset(void* arg) {
     module->base.parent_buf = NULL;
 }
 
-int http_not_modified_header(httpresponse_t* response) {
+int http_not_modified_header(httprequest_t* request, httpresponse_t* response) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_not_modified_t* module = cur_filter->module;
 
@@ -65,8 +67,26 @@ int http_not_modified_header(httpresponse_t* response) {
     if (module->base.cont)
         goto cont;
 
+    // Add Last-Modified header for files with mtime
+    if (response->file_.fd > -1 && response->file_.mtime > 0) {
+        char last_modified[64];
+        struct tm* tm = gmtime(&response->file_.mtime);
+        if (tm != NULL) {
+            strftime(last_modified, sizeof(last_modified), "%a, %d %b %Y %H:%M:%S GMT", tm);
+            response->add_header(response, "Last-Modified", last_modified);
+            // response->last_modified = 1;
+        }
+
+        // Generate and add ETag header
+        char etag[64];
+        if (__generate_etag(response->file_.mtime, response->file_.size, etag, sizeof(etag)) > 0) {
+            response->add_header(response, "ETag", etag);
+            // response->last_modified = 1;
+        }
+    }
+
     // Check if response should be 304 Not Modified
-    if (__check_not_modified(response)) {
+    if (__check_not_modified(request, response)) {
         // Set status code to 304
         response->status_code = 304;
 
@@ -79,16 +99,22 @@ int http_not_modified_header(httpresponse_t* response) {
         response->remove_header(response, "Transfer-Encoding");
         response->transfer_encoding = TE_NONE;
 
-        // Mark body as empty
-        response->body.size = 0;
-        response->body.pos = 0;
+        // Remove Content-Encoding for 304
+        response->remove_header(response, "Content-Encoding");
+        response->content_encoding = CE_NONE;
 
-        // Close file if opened
-        if (response->file_.fd > -1) {
-            close(response->file_.fd);
-            response->file_.fd = -1;
-            response->file_.size = 0;
-        }
+        response->last_modified = 1;
+
+        // // Mark body as empty
+        // response->body.size = 0;
+        // response->body.pos = 0;
+
+        // // Close file if opened
+        // if (response->file_.fd > -1) {
+        //     close(response->file_.fd);
+        //     response->file_.fd = -1;
+        //     response->file_.size = 0;
+        // }
 
         // Keep cache-related headers: Date, ETag, Cache-Control, Expires, Vary
         // These are already set in the response, so we just pass through
@@ -96,9 +122,9 @@ int http_not_modified_header(httpresponse_t* response) {
 
     cont:
 
-    r = filter_next_handler_header(response);
+    r = filter_next_handler_header(request, response);
 
-    module->base.cont = 0;
+    // module->base.cont = 0;
 
     if (r == CWF_EVENT_AGAIN)
         module->base.cont = 1;
@@ -106,37 +132,27 @@ int http_not_modified_header(httpresponse_t* response) {
     return r;
 }
 
-int http_not_modified_body(httpresponse_t* response, bufo_t* buf) {
-    http_filter_t* cur_filter = response->cur_filter;
-    http_module_not_modified_t* module = cur_filter->module;
+int http_not_modified_body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf) {
+    // http_filter_t* cur_filter = response->cur_filter;
+    // http_module_not_modified_t* module = cur_filter->module;
 
     // RFC 7232: 304 response MUST NOT contain a message body
-    if (response->status_code == 304) {
-        // Don't send any body data
-        buf->size = 0;
-        buf->pos = 0;
-        buf->is_last = 1;
-        module->base.done = 1;
-        return filter_next_handler_body(response, buf);
-    }
+    // if (response->status_code == 304) {
+    //     // Don't send any body data
+    //     module->base.done = 1;
+    //     return filter_next_handler_body(request, response, buf);
+    // }
 
     // If not 304, pass through to next filter
-    return filter_next_handler_body(response, buf);
+    return filter_next_handler_body(request, response, parent_buf);
 }
 
-int __check_not_modified(httpresponse_t* response) {
-    return 1;
+int __check_not_modified(httprequest_t* request, httpresponse_t* response) {
     // Get request from connection
     connection_t* connection = response->connection;
     if (connection == NULL || connection->ctx == NULL)
         return 0;
 
-    connection_server_ctx_t* ctx = connection->ctx;
-    if (ctx->parser == NULL)
-        return 0;
-
-    httprequestparser_t* parser = ctx->parser;
-    httprequest_t* request = parser->request;
     if (request == NULL)
         return 0;
 
@@ -215,4 +231,19 @@ int __etag_matches(const char* if_none_match, size_t if_none_match_len,
     }
 
     return 0; // No match
+}
+
+int __generate_etag(time_t mtime, off_t size, char* etag_buf, size_t etag_buf_size) {
+    if (etag_buf == NULL || etag_buf_size == 0)
+        return -1;
+
+    // Generate ETag in format: "mtime-size" (weak ETag)
+    // Using weak ETag (W/) since we're using mtime which has 1-second granularity
+    int n = snprintf(etag_buf, etag_buf_size, "W/\"%lx-%lx\"",
+                     (unsigned long)mtime, (unsigned long)size);
+
+    if (n < 0 || (size_t)n >= etag_buf_size)
+        return -1;
+
+    return n;
 }

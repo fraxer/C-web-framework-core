@@ -34,6 +34,7 @@ typedef struct {
     listener_t* listener;
     void* parser;
     server_t* server;
+    void* request;
     void* response;
     cqueue_t* queue;
     cqueue_t* broadcast_queue;

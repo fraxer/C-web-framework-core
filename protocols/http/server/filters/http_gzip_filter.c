@@ -5,8 +5,8 @@
 static http_module_gzip_t* __create(void);
 static void __free(void* arg);
 static void __reset(void* arg);
-static int __header(httpresponse_t* response);
-static int __body(httpresponse_t* response, bufo_t* parent_buf);
+static int __header(httprequest_t* request, httpresponse_t* response);
+static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf);
 static int __process(http_module_gzip_t* module, bufo_t* buf);
 
 http_filter_t* http_gzip_filter_create(void) {
@@ -69,7 +69,7 @@ void __reset(void* arg) {
     gzip_free(&module->gzip);
 }
 
-int __header(httpresponse_t* response) {
+int __header(httprequest_t* request, httpresponse_t* response) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_gzip_t* module = cur_filter->module;
 
@@ -78,7 +78,10 @@ int __header(httpresponse_t* response) {
         data_size = response->file_.size;
 
     if (response->content_encoding == CE_NONE || data_size < 1024)
-        return filter_next_handler_header(response);
+        return filter_next_handler_header(request, response);
+
+    if (response->last_modified)
+        return filter_next_handler_header(request, response);
 
     int r = 0;
 
@@ -98,7 +101,7 @@ int __header(httpresponse_t* response) {
 
     cont:
 
-    r = filter_next_handler_header(response);
+    r = filter_next_handler_header(request, response);
 
     module->base.cont = 0;
 
@@ -108,7 +111,7 @@ int __header(httpresponse_t* response) {
     return r;
 }
 
-int __body(httpresponse_t* response, bufo_t* parent_buf) {
+int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_gzip_t* module = cur_filter->module;
     module->base.parent_buf = parent_buf;
@@ -118,7 +121,10 @@ int __body(httpresponse_t* response, bufo_t* parent_buf) {
         data_size = response->file_.size;
 
     if (response->content_encoding == CE_NONE || data_size < 1024)
-        return filter_next_handler_body(response, parent_buf);
+        return filter_next_handler_body(request, response, parent_buf);
+
+    if (response->last_modified)
+        return filter_next_handler_body(request, response, parent_buf);
 
     int r = 0;
     bufo_t* buf = module->buf;
@@ -140,7 +146,7 @@ int __body(httpresponse_t* response, bufo_t* parent_buf) {
 
         cont:
 
-        r = filter_next_handler_body(response, buf);
+        r = filter_next_handler_body(request, response, buf);
 
         module->base.cont = 0;
 
