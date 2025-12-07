@@ -1,5 +1,5 @@
-#ifndef __HTTP_RANGE_FILTER__
-#define __HTTP_RANGE_FILTER__
+#ifndef HTTP_RANGE_FILTER_H
+#define HTTP_RANGE_FILTER_H
 
 #include "httprequest.h"
 #include "httpresponse.h"

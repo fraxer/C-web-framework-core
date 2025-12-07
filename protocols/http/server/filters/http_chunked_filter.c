@@ -1,10 +1,12 @@
 #include "http_chunked_filter.h"
 
 #define BUF_SIZE 16384
+#define CHUNK_HEAD_MAX_SIZE 24
 
-int __chunk_head_create(http_module_chunked_t* module);
-void __process(http_module_chunked_t* module, bufo_t* buf);
-int __update_state(http_module_chunked_t* module, bufo_t* parent_buf);
+static int chunk_head_create(http_module_chunked_t* module);
+static int chunk_head_set(http_module_chunked_t* module);
+static void chunked_process(http_module_chunked_t* module, bufo_t* buf);
+static int chunked_update_state(http_module_chunked_t* module, bufo_t* parent_buf);
 void http_chunked_free(void* arg);
 void http_chunked_reset(void* arg);
 
@@ -129,7 +131,7 @@ int http_chunked_body(httprequest_t* request, httpresponse_t* response, bufo_t* 
     while (1) {
         response->cur_filter = cur_filter;
 
-        __process(module, buf);
+        chunked_process(module, buf);
 
         bufo_reset_pos(buf);
 
@@ -153,21 +155,28 @@ int http_chunked_body(httprequest_t* request, httpresponse_t* response, bufo_t* 
         return r;
     }
 
-    return CWF_ERROR;
 }
 
-int __chunk_head_create(http_module_chunked_t* module) {
-    module->chunk_head = malloc(20);
+static int chunk_head_create(http_module_chunked_t* module) {
+    module->chunk_head = malloc(CHUNK_HEAD_MAX_SIZE);
     if (module->chunk_head == NULL)
         return 0;
 
     return 1;
 }
 
-int __chunk_head_set(http_module_chunked_t* module) {
-    const size_t chunk_size = bufo_size(module->base.parent_buf) - module->base.parent_buf->pos;
-    const int chunk_head_size = snprintf(module->chunk_head, 20, "%zx\r\n", chunk_size);
-    if (chunk_head_size == -1)
+static int chunk_head_set(http_module_chunked_t* module) {
+    bufo_t* parent_buf = module->base.parent_buf;
+    if (parent_buf == NULL)
+        return 0;
+
+    const size_t buf_size = bufo_size(parent_buf);
+    if (parent_buf->pos > buf_size)
+        return 0;
+
+    const size_t chunk_size = buf_size - parent_buf->pos;
+    const int chunk_head_size = snprintf(module->chunk_head, CHUNK_HEAD_MAX_SIZE, "%zx\r\n", chunk_size);
+    if (chunk_head_size < 0 || chunk_head_size >= CHUNK_HEAD_MAX_SIZE)
         return 0;
 
     module->chunk_head_size = chunk_head_size;
@@ -176,7 +185,7 @@ int __chunk_head_set(http_module_chunked_t* module) {
     return 1;
 }
 
-void __process(http_module_chunked_t* module, bufo_t* buf) {
+static void chunked_process(http_module_chunked_t* module, bufo_t* buf) {
     bufo_t* parent_buf = module->base.parent_buf;
 
     bufo_reset_pos(buf);
@@ -187,12 +196,12 @@ void __process(http_module_chunked_t* module, bufo_t* buf) {
             case HTTP_MODULE_CHUNKED_SIZE:
             {
                 if (module->state_pos == 0)
-                    if (!__update_state(module, parent_buf))
+                    if (!chunked_update_state(module, parent_buf))
                         return;
 
-                ssize_t writed = bufo_append(buf, module->chunk_head + module->state_pos, module->chunk_head_size - module->state_pos);
+                ssize_t written = bufo_append(buf, module->chunk_head + module->state_pos, module->chunk_head_size - module->state_pos);
 
-                module->state_pos += writed;
+                module->state_pos += written;
 
                 if (module->state_pos < module->chunk_head_size)
                     return;
@@ -205,9 +214,9 @@ void __process(http_module_chunked_t* module, bufo_t* buf) {
             }
             case HTTP_MODULE_CHUNKED_DATA:
             {
-                ssize_t writed = bufo_append(buf, bufo_data(parent_buf), bufo_size(parent_buf) - parent_buf->pos);
+                ssize_t written = bufo_append(buf, bufo_data(parent_buf), bufo_size(parent_buf) - parent_buf->pos);
 
-                module->state_pos += bufo_move_front_pos(parent_buf, writed);
+                module->state_pos += bufo_move_front_pos(parent_buf, written);
 
                 if (module->state_pos < module->current_chunk_size)
                     return;
@@ -223,16 +232,16 @@ void __process(http_module_chunked_t* module, bufo_t* buf) {
                 const char* sep = "\r\n";
                 const size_t sep_size = 2;
 
-                ssize_t writed = bufo_append(buf, sep + module->state_pos, sep_size - module->state_pos);
+                ssize_t written = bufo_append(buf, sep + module->state_pos, sep_size - module->state_pos);
 
-                module->state_pos += writed;
+                module->state_pos += written;
 
                 if (module->state_pos < sep_size)
                     return;
 
                 if (module->state_pos == sep_size) {
                     module->state_pos = 0;
-                    
+
                     if (parent_buf->is_last)
                         module->state = HTTP_MODULE_CHUNKED_END;
                     else {
@@ -250,11 +259,11 @@ void __process(http_module_chunked_t* module, bufo_t* buf) {
             case HTTP_MODULE_CHUNKED_END:
             {
                 const char* value = "0\r\n\r\n";
-                const size_t value_size = 5;                
+                const size_t value_size = 5;
 
-                ssize_t writed = bufo_append(buf, value + module->state_pos, value_size - module->state_pos);
+                ssize_t written = bufo_append(buf, value + module->state_pos, value_size - module->state_pos);
 
-                module->state_pos += writed;
+                module->state_pos += written;
                 if (module->state_pos < value_size)
                     return;
 
@@ -269,16 +278,16 @@ void __process(http_module_chunked_t* module, bufo_t* buf) {
     }
 }
 
-int __update_state(http_module_chunked_t* module, bufo_t* parent_buf) {
+static int chunked_update_state(http_module_chunked_t* module, bufo_t* parent_buf) {
     module->base.parent_buf = parent_buf;
     module->state = HTTP_MODULE_CHUNKED_SIZE;
     module->state_pos = 0;
 
     if (module->chunk_head == NULL)
-        if (!__chunk_head_create(module))
+        if (!chunk_head_create(module))
             return 0;
 
-    if (!__chunk_head_set(module))
+    if (!chunk_head_set(module))
         return 0;
 
     return 1;
