@@ -44,8 +44,9 @@ websockets_protocol_t* websockets_protocol_default_create(void);
  * Configure connection to use default WebSocket protocol.
  * Sets read/write handlers and creates parser with default protocol.
  * @param connection Connection to configure
+ * @param data Handshake data (ws_handshake_data_t*)
  * @return 1 on success, 0 on failure
  */
-int set_websockets_default(connection_t* connection);
+int set_websockets_default(connection_t* connection, void* data);
 
 #endif

@@ -8,7 +8,7 @@ add_library(${LIB_NAME} STATIC ${SOURCES})
 
 target_include_directories(${LIB_NAME} PUBLIC .)
 
-target_link_libraries(${LIB_NAME} connection middleware mimetype misc websocket_server websocket_server_parsers)
+target_link_libraries(${LIB_NAME} connection middleware mimetype misc websocket_server websocket_server_parsers ZLIB::ZLIB)
 
 MACRO(SUBDIRLIST result curdir)
     FILE(GLOB children RELATIVE ${curdir} ${curdir}/*)

@@ -28,9 +28,15 @@ typedef struct requestparser {
     void(*free)(void*);
 } requestparser_t;
 
+typedef struct switch_to_protocol {
+    int(*fn)(struct connection*, void* data);
+    void(*data_free)(void*);
+    void* data;
+} switch_to_protocol_t;
+
 typedef struct {
     connection_ctx_t base;
-    
+
     listener_t* listener;
     void* parser;
     server_t* server;
@@ -39,7 +45,7 @@ typedef struct {
     cqueue_t* queue;
     cqueue_t* broadcast_queue;
 
-    int(*switch_to_protocol)(struct connection*);
+    switch_to_protocol_t switch_to_protocol;
 
     atomic_int ref_count;
     atomic_int broadcast_ref_count;

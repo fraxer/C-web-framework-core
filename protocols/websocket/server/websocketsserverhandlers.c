@@ -8,6 +8,7 @@
 #include "websocketsserverhandlers.h"
 #include "wscontext.h"
 #include "middleware.h"
+#include "connection_s.h"
 
 typedef struct connection_queue_websockets_data {
     connection_queue_item_data_t base;
@@ -156,25 +157,32 @@ int __write(connection_t* connection) {
 int __handle(websocketsparser_t* parser, deferred_handler handler) {
     connection_t* connection = parser->connection;
 
-    if (parser->frame.fin) {
-        if (parser->frame.opcode == WSOPCODE_CLOSE) {
-            websocketsresponse_t* response = websocketsresponse_create(connection);
-            if (response == NULL) return 0;
-            websocketsresponse_close(response, bufferdata_get(&parser->buf), bufferdata_writed(&parser->buf));
-            connection->keepalive = 0;
-            return handler(response);
-        }
-        else if (parser->frame.opcode == WSOPCODE_PING) {
-            websocketsresponse_t* response = websocketsresponse_create(connection);
-            if (response == NULL) return 0;
-            websocketsresponse_pong(response, bufferdata_get(&parser->buf), bufferdata_writed(&parser->buf));
-            return handler(response);
-        }
-        else if (parser->frame.opcode == WSOPCODE_PONG) {
-            return 1;
-        }
+    /* Handle control frames (FIN=1 already validated in parser) */
+    switch (parser->frame.opcode) {
+    case WSOPCODE_CLOSE:
+    {
+        websocketsresponse_t* response = websocketsresponse_create(connection);
+        if (response == NULL) return 0;
+        websocketsresponse_close(response, bufferdata_get(&parser->buf), bufferdata_writed(&parser->buf));
+        connection->keepalive = 0;
+        return handler(response);
     }
-    else return 1;
+    case WSOPCODE_PING:
+    {
+        websocketsresponse_t* response = websocketsresponse_create(connection);
+        if (response == NULL) return 0;
+        websocketsresponse_pong(response, bufferdata_get(&parser->buf), bufferdata_writed(&parser->buf));
+        return handler(response);
+    }
+    case WSOPCODE_PONG:
+        return 1;
+    default:
+        break;
+    }
+
+    /* Data frames: only process when complete (FIN=1) */
+    if (!parser->frame.fin)
+        return 1;
 
     if (parser->request->protocol->get_resource(connection, parser->request))
         return 1;

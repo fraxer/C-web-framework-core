@@ -74,8 +74,8 @@ int set_http(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
 
     if (ctx->parser != NULL) {
-        httpparser_free(ctx->parser);
-        ctx->parser = NULL;
+        requestparser_t* parser = ctx->parser;
+        parser->free(parser);
     }
 
     ctx->parser = httpparser_create(connection);

@@ -134,9 +134,14 @@ int connection_after_write(connection_t* connection) {
 
     connection_reset(connection);
 
-    if (ctx->switch_to_protocol != NULL) {
-        ctx->switch_to_protocol(connection);
-        ctx->switch_to_protocol = NULL;
+    if (ctx->switch_to_protocol.fn != NULL) {
+        ctx->switch_to_protocol.fn(connection, ctx->switch_to_protocol.data);
+        if (ctx->switch_to_protocol.data_free != NULL) {
+            ctx->switch_to_protocol.data_free(ctx->switch_to_protocol.data);
+        }
+        ctx->switch_to_protocol.fn = NULL;
+        ctx->switch_to_protocol.data = NULL;
+        ctx->switch_to_protocol.data_free = NULL;
     }
 
     cqueue_lock(ctx->broadcast_queue);
@@ -232,7 +237,9 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
     ctx->response = NULL;
     ctx->queue = cqueue_create();
     ctx->broadcast_queue = cqueue_create();
-    ctx->switch_to_protocol = NULL;
+    ctx->switch_to_protocol.fn = NULL;
+    ctx->switch_to_protocol.data = NULL;
+    ctx->switch_to_protocol.data_free = NULL;
 
     cqueue_item_t* item = cqueue_first(&listener->servers);
     if (item)

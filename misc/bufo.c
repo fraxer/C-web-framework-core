@@ -116,6 +116,34 @@ int bufo_alloc(bufo_t* buf, size_t capacity) {
     return 1;
 }
 
+int bufo_ensure_capacity(bufo_t* buf, size_t capacity) {
+    if (buf->is_proxy)
+        return 0;
+
+    if (buf->capacity >= capacity)
+        return 1;
+
+    const size_t max_capacity = 10 * 1024 * 1024; // 10 Mb
+    if (capacity > max_capacity)
+        return 0;
+
+    size_t new_capacity = buf->capacity == 0 ? 4096 : buf->capacity;
+    while (new_capacity < capacity)
+        new_capacity *= 2;
+
+    if (new_capacity > max_capacity)
+        new_capacity = max_capacity;
+
+    char* new_data = realloc(buf->data, new_capacity);
+    if (new_data == NULL)
+        return 0;
+
+    buf->data = new_data;
+    buf->capacity = new_capacity;
+
+    return 1;
+}
+
 ssize_t bufo_append(bufo_t* buf, const char* data, size_t size) {
     if (buf->is_proxy)
         return 0;
