@@ -1,5 +1,5 @@
-#ifndef __BUFFER_OUTPUT__
-#define __BUFFER_OUTPUT__
+#ifndef BUFO_H
+#define BUFO_H
 
 #include <stdlib.h>
 #include <sys/types.h>

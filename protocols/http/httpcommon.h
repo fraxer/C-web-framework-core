@@ -1,5 +1,5 @@
-#ifndef __HTTP1COMMON__
-#define __HTTP1COMMON__
+#ifndef HTTPCOMMON_H
+#define HTTPCOMMON_H
 
 #include <stddef.h>
 
