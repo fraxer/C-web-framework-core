@@ -1,7 +1,9 @@
+#define _GNU_SOURCE
 #include "http_not_modified_filter.h"
 #include "connection_s.h"
 #include "httprequest.h"
 #include "httprequestparser.h"
+#include "route.h"
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
@@ -13,8 +15,9 @@ static void __free(void* arg);
 static void __reset(void* arg);
 static int __check_not_modified(httprequest_t* request, httpresponse_t* response);
 static int __etag_matches(const char* if_none_match, size_t if_none_match_len,
-                          const char* etag, size_t etag_len);
+                           const char* etag, size_t etag_len);
 static int __generate_etag(time_t mtime, off_t size, char* etag_buf, size_t etag_buf_size);
+static time_t __parse_http_date(const char* date, size_t len);
 
 http_filter_t* http_not_modified_filter_create(void) {
     http_filter_t* filter = malloc(sizeof * filter);
@@ -70,18 +73,17 @@ int http_not_modified_header(httprequest_t* request, httpresponse_t* response) {
     // Add Last-Modified header for files with mtime
     if (response->file_.fd > -1 && response->file_.mtime > 0) {
         char last_modified[64];
-        struct tm* tm = gmtime(&response->file_.mtime);
+        struct tm tm_buf;
+        struct tm* tm = gmtime_r(&response->file_.mtime, &tm_buf);
         if (tm != NULL) {
             strftime(last_modified, sizeof(last_modified), "%a, %d %b %Y %H:%M:%S GMT", tm);
             response->add_header(response, "Last-Modified", last_modified);
-            // response->last_modified = 1;
         }
 
         // Generate and add ETag header
         char etag[64];
         if (__generate_etag(response->file_.mtime, response->file_.size, etag, sizeof(etag)) > 0) {
             response->add_header(response, "ETag", etag);
-            // response->last_modified = 1;
         }
     }
 
@@ -105,17 +107,6 @@ int http_not_modified_header(httprequest_t* request, httpresponse_t* response) {
 
         response->last_modified = 1;
 
-        // // Mark body as empty
-        // response->body.size = 0;
-        // response->body.pos = 0;
-
-        // // Close file if opened
-        // if (response->file_.fd > -1) {
-        //     close(response->file_.fd);
-        //     response->file_.fd = -1;
-        //     response->file_.size = 0;
-        // }
-
         // Keep cache-related headers: Date, ETag, Cache-Control, Expires, Vary
         // These are already set in the response, so we just pass through
     }
@@ -124,8 +115,6 @@ int http_not_modified_header(httprequest_t* request, httpresponse_t* response) {
 
     r = filter_next_handler_header(request, response);
 
-    // module->base.cont = 0;
-
     if (r == CWF_EVENT_AGAIN)
         module->base.cont = 1;
 
@@ -133,55 +122,45 @@ int http_not_modified_header(httprequest_t* request, httpresponse_t* response) {
 }
 
 int http_not_modified_body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf) {
-    // http_filter_t* cur_filter = response->cur_filter;
-    // http_module_not_modified_t* module = cur_filter->module;
-
-    // RFC 7232: 304 response MUST NOT contain a message body
-    // if (response->status_code == 304) {
-    //     // Don't send any body data
-    //     module->base.done = 1;
-    //     return filter_next_handler_body(request, response, buf);
-    // }
-
-    // If not 304, pass through to next filter
     return filter_next_handler_body(request, response, parent_buf);
 }
 
 int __check_not_modified(httprequest_t* request, httpresponse_t* response) {
-    // Get request from connection
-    connection_t* connection = response->connection;
-    if (connection == NULL || connection->ctx == NULL)
+    if (request == NULL || response == NULL)
         return 0;
 
-    if (request == NULL)
+    // RFC 7232: Conditional requests apply only to GET and HEAD
+    if (request->method != ROUTE_GET && request->method != ROUTE_HEAD)
         return 0;
 
     // Get response ETag and Last-Modified headers
     http_header_t* etag_header = response->get_header(response, "ETag");
     http_header_t* last_modified_header = response->get_header(response, "Last-Modified");
 
-    // Check If-None-Match (ETag validation)
+    // Check If-None-Match (ETag validation) - takes precedence over If-Modified-Since
     http_header_t* if_none_match = request->get_header(request, "If-None-Match");
     if (if_none_match != NULL && etag_header != NULL) {
         // RFC 7232: If-None-Match can contain multiple ETags or "*"
         if (__etag_matches(if_none_match->value, if_none_match->value_length,
-                          etag_header->value, etag_header->value_length)) {
+                           etag_header->value, etag_header->value_length)) {
             return 1; // Resource not modified
         }
+        // If If-None-Match is present but doesn't match, don't check If-Modified-Since
+        return 0;
     }
 
     // Check If-Modified-Since (date validation)
     http_header_t* if_modified_since = request->get_header(request, "If-Modified-Since");
     if (if_modified_since != NULL && last_modified_header != NULL) {
-        // Simple string comparison is sufficient for RFC 7231 HTTP-date format
-        // since the format is fixed and lexicographically comparable
-        int cmp = strncmp(if_modified_since->value, last_modified_header->value,
-                         if_modified_since->value_length < last_modified_header->value_length ?
-                         if_modified_since->value_length : last_modified_header->value_length);
+        // Parse HTTP-date values and compare as time_t
+        time_t req_time = __parse_http_date(if_modified_since->value, if_modified_since->value_length);
+        time_t res_time = __parse_http_date(last_modified_header->value, last_modified_header->value_length);
 
-        // If Last-Modified is not later than If-Modified-Since, return 304
-        if (cmp >= 0) {
-            return 1; // Resource not modified
+        if (req_time != (time_t)-1 && res_time != (time_t)-1) {
+            // If Last-Modified <= If-Modified-Since, return 304
+            if (res_time <= req_time) {
+                return 1; // Resource not modified
+            }
         }
     }
 
@@ -189,7 +168,7 @@ int __check_not_modified(httprequest_t* request, httpresponse_t* response) {
 }
 
 int __etag_matches(const char* if_none_match, size_t if_none_match_len,
-                   const char* etag, size_t etag_len) {
+                    const char* etag, size_t etag_len) {
     if (if_none_match == NULL || etag == NULL)
         return 0;
 
@@ -246,4 +225,40 @@ int __generate_etag(time_t mtime, off_t size, char* etag_buf, size_t etag_buf_si
         return -1;
 
     return n;
+}
+
+time_t __parse_http_date(const char* date, size_t len) {
+    if (date == NULL || len == 0)
+        return (time_t)-1;
+
+    // Need null-terminated string for strptime
+    char buf[64];
+    if (len >= sizeof(buf))
+        return (time_t)-1;
+
+    memcpy(buf, date, len);
+    buf[len] = '\0';
+
+    struct tm tm_buf;
+    memset(&tm_buf, 0, sizeof(tm_buf));
+
+    // RFC 7231: HTTP-date = IMF-fixdate / obs-date
+    // IMF-fixdate: "Sun, 06 Nov 1994 08:49:37 GMT" (preferred)
+    char* result = strptime(buf, "%a, %d %b %Y %H:%M:%S GMT", &tm_buf);
+    if (result == NULL) {
+        // Try RFC 850 format: "Sunday, 06-Nov-94 08:49:37 GMT" (obsolete)
+        memset(&tm_buf, 0, sizeof(tm_buf));
+        result = strptime(buf, "%A, %d-%b-%y %H:%M:%S GMT", &tm_buf);
+    }
+    if (result == NULL) {
+        // Try asctime format: "Sun Nov  6 08:49:37 1994" (obsolete)
+        memset(&tm_buf, 0, sizeof(tm_buf));
+        result = strptime(buf, "%a %b %d %H:%M:%S %Y", &tm_buf);
+    }
+
+    if (result == NULL)
+        return (time_t)-1;
+
+    // Convert to time_t (UTC)
+    return timegm(&tm_buf);
 }
