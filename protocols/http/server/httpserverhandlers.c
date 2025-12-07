@@ -198,25 +198,19 @@ int __write(connection_t* connection) {
         return 0;
     }
 
-    httprequest_t* request = ctx->request;
-    if (request == NULL) {
-        log_error("__write: request is NULL\n");
-        return 0;
-    }
-
     httpresponse_t* response = ctx->response;
     if (response == NULL) {
         log_error("__write: response is NULL\n");
         return 0;
     }
 
-    int r = __run_header_filters(request, response);
+    int r = __run_header_filters(ctx->request, response);
     if (r == CWF_EVENT_AGAIN)
         return 1;
     if (r == CWF_ERROR)
         return 0;
 
-    r = __run_body_filters(request, response);
+    r = __run_body_filters(ctx->request, response);
     if (r == CWF_EVENT_AGAIN)
         return 1;
     if (r == CWF_ERROR)
@@ -529,10 +523,6 @@ void __queue_response_handler(void* arg) {
 }
 
 int __run_header_filters(httprequest_t* request, httpresponse_t* response) {
-    if (request == NULL) {
-        log_error("__run_header_filters: request is NULL\n");
-        return CWF_ERROR;
-    }
     if (response == NULL) {
         log_error("__run_header_filters: response is NULL\n");
         return CWF_ERROR;
@@ -578,10 +568,6 @@ int __run_header_filters(httprequest_t* request, httpresponse_t* response) {
 }
 
 int __run_body_filters(httprequest_t* request, httpresponse_t* response) {
-    if (request == NULL) {
-        log_error("__run_body_filters: request is NULL\n");
-        return CWF_ERROR;
-    }
     if (response == NULL) {
         log_error("__run_body_filters: response is NULL\n");
         return CWF_ERROR;

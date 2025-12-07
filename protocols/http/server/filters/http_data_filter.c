@@ -112,7 +112,7 @@ int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf)
         return filter_next_handler_body(request, response, parent_buf);
 
     // RFC 7231: HEAD response MUST NOT contain a message body
-    if (request->method == ROUTE_HEAD)
+    if (request != NULL && request->method == ROUTE_HEAD)
         return CWF_OK;
 
     // RFC 7232: 304 response MUST NOT contain a message body

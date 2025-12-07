@@ -228,7 +228,7 @@ int range_handler_header(httprequest_t* request, httpresponse_t* response) {
 
     http_module_range_t* module = cur_filter->module;
 
-    if (request->ranges == NULL)
+    if (request == NULL || request->ranges == NULL)
         return filter_next_handler_header(request, response);
 
     // Range requests only apply to successful responses (2xx)
@@ -331,7 +331,7 @@ int range_handler_body(httprequest_t* request, httpresponse_t* response, bufo_t*
     http_module_range_t* module = cur_filter->module;
     module->base.parent_buf = parent_buf;
 
-    if (!response->range)
+    if (request == NULL || !response->range)
         return filter_next_handler_body(request, response, parent_buf);
 
     if (response->last_modified)
