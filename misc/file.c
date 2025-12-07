@@ -11,7 +11,6 @@
 #include "helpers.h"
 #include "log.h"
 
-size_t __file_size(const int fd);
 int __file_set_name(file_t* file, const char* name);
 char* __file_content(file_t* file);
 int __file_set_content(file_t* file, const char* data, const size_t size);
@@ -118,13 +117,6 @@ file_t file_alloc() {
         .close = __file_close,
         .truncate = __file_truncate,
     };
-}
-
-size_t __file_size(const int fd) {
-    struct stat stat_buf;
-    int r = fstat(fd, &stat_buf);
-
-    return r == 0 ? stat_buf.st_size : 0;
 }
 
 int __file_set_name(file_t* file, const char* name) {
