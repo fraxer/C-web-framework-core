@@ -33,7 +33,7 @@ typedef struct websockets_file {
 
 typedef struct websockets_frame {
     unsigned int fin;
-    unsigned int rsv1;
+    unsigned int rsv1;  /* permessage-deflate: 1 = compressed */
     unsigned int rsv2;
     unsigned int rsv3;
     unsigned int opcode;

@@ -86,8 +86,9 @@ websockets_protocol_t* websockets_protocol_resource_create(void);
  * Configure connection to use resource WebSocket protocol.
  * Sets read/write handlers and creates parser with resource protocol.
  * @param connection Connection to configure
+ * @param data Handshake data (ws_handshake_data_t*)
  * @return 1 on success, 0 on failure
  */
-int set_websockets_resource(connection_t* connection);
+int set_websockets_resource(connection_t* connection, void* data);
 
 #endif

@@ -5,6 +5,7 @@
 #include "websocketsprotocolresource.h"
 #include "websocketsresponse.h"
 #include "websocketsparser.h"
+#include "websocketsswitch.h"
 #include "queryparser.h"
 
 static const size_t method_max_length = 6;
@@ -12,7 +13,7 @@ static const size_t method_max_length = 6;
 int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t* request);
 void websockets_protocol_resource_reset(void*);
 void websockets_protocol_resource_free(void*);
-int websockets_protocol_resource_payload_parse(websocketsparser_t* parser, char* data, size_t size);
+int websockets_protocol_resource_payload_parse(websocketsparser_t* parser, char* data, size_t size, int unmasking);
 const char* websocketsrequest_query(websockets_protocol_resource_t*, const char*);
 query_t* websocketsrequest_last_query_item(websockets_protocol_resource_t*);
 void websocketsrequest_query_free(query_t*);
@@ -139,7 +140,7 @@ int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t
     return 0;
 }
 
-int websockets_protocol_resource_payload_parse(websocketsparser_t* parser, char* string, size_t length) {
+int websockets_protocol_resource_payload_parse(websocketsparser_t* parser, char* string, size_t length, int unmasking) {
     websocketsrequest_t* request = parser->request;
     websockets_protocol_resource_t* protocol = (websockets_protocol_resource_t*)request->protocol;
 
@@ -148,7 +149,11 @@ int websockets_protocol_resource_payload_parse(websocketsparser_t* parser, char*
 
     size_t offset = 0;
     for (size_t i = 0; i < length; i++) {
-        string[i] ^= parser->frame.mask[parser->payload_index++ % 4];
+        if (unmasking)
+            string[i] ^= parser->frame.mask[parser->payload_index++ % 4];
+        else if (protocol->parser_stage == WSPROTRESOURCE_DATA)
+            break;
+
         char ch = string[i];
         int last_symbol = i + 1 == length;
         int last_data = end_data && last_symbol;
@@ -380,18 +385,30 @@ int websocketsrequest_has_payload(websockets_protocol_resource_t* protocol) {
 }
 
 
-int set_websockets_resource(connection_t* connection) {
+int set_websockets_resource(connection_t* connection, void* data) {
     connection->read = websockets_guard_read;
     connection->write = websockets_guard_write;
 
     connection_server_ctx_t* ctx = connection->ctx;
 
-    if (ctx->parser != NULL)
-        websocketsparser_free(ctx->parser);
+    if (ctx->parser != NULL) {
+        requestparser_t* parser = ctx->parser;
+        parser->free(parser);
+    }
 
     ctx->parser = websocketsparser_create(connection, websockets_protocol_resource_create);
     if (ctx->parser == NULL)
         return 0;
+
+    /* Initialize deflate if negotiated during handshake */
+    ws_handshake_data_t* handshake_data = data;
+    if (handshake_data != NULL && handshake_data->deflate_enabled) {
+        websocketsparser_t* parser = ctx->parser;
+        parser->ws_deflate.config = handshake_data->deflate_config;
+        if (ws_deflate_start(&parser->ws_deflate)) {
+            parser->ws_deflate_enabled = 1;
+        }
+    }
 
     return 1;
 }

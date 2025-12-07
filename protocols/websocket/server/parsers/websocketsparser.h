@@ -4,8 +4,10 @@
 #include <unistd.h>
 
 #include "bufferdata.h"
+#include "bufo.h"
 #include "websocketsrequest.h"
 #include "websocketscommon.h"
+#include "ws_deflate.h"
 
 enum websocketsparser_status {
     WSPARSER_ERROR = 0,
@@ -62,6 +64,15 @@ typedef struct websocketsparser {
     connection_t* connection;
 
     websockets_protocol_t*(*protocol_create)(void);
+
+    /** Decompression context for incoming permessage-deflate */
+    ws_deflate_t ws_deflate;
+
+    /** Whether permessage-deflate extension is enabled */
+    int ws_deflate_enabled;
+
+    /** Buffer for compressed payload data (before decompression) */
+    bufo_t compressed_buf;
 } websocketsparser_t;
 
 websocketsparser_t* websocketsparser_create(connection_t* connection, websockets_protocol_t*(*protocol_create)(void));

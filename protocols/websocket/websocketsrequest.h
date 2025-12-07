@@ -28,7 +28,7 @@ typedef struct websockets_protocol {
      * @param size Chunk size in bytes
      * @return 1 on success, 0 on failure (connection will be closed)
      */
-    int(*payload_parse)(struct websocketsparser* parser, char* data, size_t size);
+    int(*payload_parse)(struct websocketsparser* parser, char* data, size_t size, int unmasking);
 
     /**
      * Route request to appropriate handler after frame is complete.
@@ -70,6 +70,9 @@ typedef struct websocketsrequest {
     /** Non-zero if message spans multiple frames (continuation frames) */
     int fragmented;
 
+    /** Non-zero if payload was compressed (RSV1 bit set, permessage-deflate) */
+    int compressed;
+
     /** Connection this request belongs to */
     connection_t* connection;
 } websocketsrequest_t;
@@ -82,12 +85,6 @@ typedef struct websocketsrequest {
  */
 websocketsrequest_t* websocketsrequest_create(connection_t* connection, websockets_protocol_t* protocol);
 
-/**
- * Reset request state for reuse (clears payload, resets type).
- * Respects can_reset flag for fragmented message handling.
- * @param request Request to reset
- */
-void websocketsrequest_reset(websocketsrequest_t* request);
 
 /**
  * Reset request for continuation frame (preserves fragmented state).

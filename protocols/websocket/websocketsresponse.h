@@ -4,6 +4,7 @@
 #include "connection_s.h"
 #include "websocketscommon.h"
 #include "response.h"
+#include "ws_deflate.h"
 
 struct wsctx;
 
@@ -88,6 +89,9 @@ typedef struct websocketsresponse {
      * @return 0 on success, -1 on error
      */
     int(*send_filen)(struct websocketsresponse* response, const char* path, size_t length);
+
+    /** Pointer to compression context (owned by parser) */
+    ws_deflate_t* ws_deflate;
 } websocketsresponse_t;
 
 /**

@@ -4,12 +4,13 @@
 #include "websocketsprotocoldefault.h"
 #include "websocketsresponse.h"
 #include "websocketsparser.h"
+#include "websocketsswitch.h"
 #include "appconfig.h"
 
 int websocketsrequest_get_default(connection_t* connection, websocketsrequest_t* request);
 void websockets_protocol_default_reset(void*);
 void websockets_protocol_default_free(void*);
-int websockets_protocol_default_payload_parse(websocketsparser_t* parser, char* data, size_t size);
+int websockets_protocol_default_payload_parse(websocketsparser_t* parser, char* data, size_t size, int unmasking);
 
 websockets_protocol_t* websockets_protocol_default_create(void) {
     websockets_protocol_default_t* protocol = malloc(sizeof * protocol);
@@ -45,11 +46,12 @@ void websockets_protocol_default_free(void* protocol) {
     free(protocol);
 }
 
-int websockets_protocol_default_payload_parse(websocketsparser_t* parser, char* string, size_t length) {
+int websockets_protocol_default_payload_parse(websocketsparser_t* parser, char* string, size_t length, int unmasking) {
     websocketsrequest_t* request = parser->request;
 
-    for (size_t i = 0; i < length; i++)
-        string[i] ^= parser->frame.mask[parser->payload_index++ % 4];
+    if (unmasking)
+        for (size_t i = 0; i < length; i++)
+            string[i] ^= parser->frame.mask[parser->payload_index++ % 4];
 
     const char* tmp_dir = env()->main.tmp;
     if (!websockets_create_tmpfile(request->protocol, tmp_dir))
@@ -66,18 +68,30 @@ int websockets_protocol_default_payload_parse(websocketsparser_t* parser, char* 
     return 1;
 }
 
-int set_websockets_default(connection_t* connection) {
+int set_websockets_default(connection_t* connection, void* data) {
     connection->read = websockets_guard_read;
     connection->write = websockets_guard_write;
 
     connection_server_ctx_t* ctx = connection->ctx;
 
-    if (ctx->parser != NULL)
-        websocketsparser_free(ctx->parser);
+    if (ctx->parser != NULL) {
+        requestparser_t* parser = ctx->parser;
+        parser->free(parser);
+    }
 
     ctx->parser = websocketsparser_create(connection, websockets_protocol_default_create);
     if (ctx->parser == NULL)
         return 0;
+
+    /* Initialize deflate if negotiated during handshake */
+    ws_handshake_data_t* handshake_data = data;
+    if (handshake_data != NULL && handshake_data->deflate_enabled) {
+        websocketsparser_t* parser = ctx->parser;
+        parser->ws_deflate.config = handshake_data->deflate_config;
+        if (ws_deflate_start(&parser->ws_deflate)) {
+            parser->ws_deflate_enabled = 1;
+        }
+    }
 
     return 1;
 }

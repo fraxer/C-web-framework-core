@@ -6,18 +6,17 @@
 
 #include "helpers.h"
 #include "websocketsrequest.h"
+#include "connection_s.h"
 
-void websocketsrequest_payload_free(websockets_payload_t*);
 int websocketsrequest_get_default(connection_t*);
 int websocketsrequest_get_resource(connection_t*);
+
+static void websocketsrequest_payload_free(websockets_payload_t*);
+static void websocketsrequest_reset(void* arg);
 
 void websockets_protocol_init_payload(websockets_protocol_t* protocol) {
     protocol->payload.fd = 0;
     protocol->payload.path = NULL;
-}
-
-websocketsrequest_t* websocketsrequest_alloc() {
-    return malloc(sizeof(websocketsrequest_t));
 }
 
 void websocketsrequest_free(void* arg) {
@@ -34,21 +33,24 @@ void websocketsrequest_free(void* arg) {
 websocketsrequest_t* websocketsrequest_create(connection_t* connection, websockets_protocol_t* protocol) {
     if (protocol == NULL) return NULL;
 
-    websocketsrequest_t* request = websocketsrequest_alloc();
+    websocketsrequest_t* request = malloc(sizeof * request);
     if (request == NULL) return NULL;
 
     request->type = WEBSOCKETS_NONE;
     request->can_reset = 1;
     request->fragmented = 0;
+    request->compressed = 0;
     request->protocol = protocol;
     request->connection = connection;
-    request->base.reset = (void(*)(void*))websocketsrequest_reset;
-    request->base.free = (void(*)(void*))websocketsrequest_free;
+    request->base.reset = websocketsrequest_reset;
+    request->base.free = websocketsrequest_free;
 
     return request;
 }
 
-void websocketsrequest_reset(websocketsrequest_t* request) {
+void websocketsrequest_reset(void* arg) {
+    websocketsrequest_t* request = (websocketsrequest_t*)arg;
+
     if (request->can_reset) {
         if (request->type != WEBSOCKETS_PING && request->type != WEBSOCKETS_PONG)
             request->fragmented = 0;

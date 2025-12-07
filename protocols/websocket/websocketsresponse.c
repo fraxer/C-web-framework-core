@@ -4,10 +4,16 @@
 #include <string.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <zlib.h>
 
 #include "helpers.h"
 #include "websocketsresponse.h"
 #include "wscontext.h"
+#include "connection_s.h"
+#include "websocketsparser.h"
+
+/** Minimum payload size to enable compression */
+#define WS_COMPRESS_THRESHOLD 128
 
 typedef enum {
     FILE_OK = 0,
@@ -29,6 +35,7 @@ int websocketsresponse_prepare(websocketsresponse_t*, const char*, size_t);
 void websocketsresponse_reset(websocketsresponse_t*);
 int websocketsresponse_set_payload_length(char*, size_t*, size_t);
 file_status_e __get_file_full_path(server_t* server, char* file_full_path, size_t file_full_path_size, const char* path, size_t length);
+static int __compress_and_send(websocketsresponse_t* response, unsigned char opcode, const char* data, size_t length);
 
 websocketsresponse_t* websocketsresponse_alloc() {
     return malloc(sizeof(websocketsresponse_t));
@@ -67,6 +74,10 @@ websocketsresponse_t* websocketsresponse_create(connection_t* connection) {
     response->send_filen = websocketsresponse_filen;
     response->base.reset = (void(*)(void*))websocketsresponse_reset;
     response->base.free = (void(*)(void*))websocketsresponse_free;
+
+    connection_server_ctx_t* ctx = connection->ctx;
+    websocketsparser_t* parser = ctx->parser;
+    response->ws_deflate = parser ? &parser->ws_deflate : NULL;
 
     return response;
 }
@@ -177,10 +188,15 @@ void websocketsresponse_text(websocketsresponse_t* response, const char* data) {
 }
 
 void websocketsresponse_textn(websocketsresponse_t* response, const char* data, size_t length) {
-    response->frame_code = 0x81;
+    /* Try compression if extension is enabled and payload is large enough */
+    if (response->ws_deflate && response->ws_deflate->deflate_init && length >= WS_COMPRESS_THRESHOLD) {
+        if (__compress_and_send(response, 0x01, data, length))
+            return;
+        /* Fall through to uncompressed on compression failure */
+    }
 
+    response->frame_code = 0x81;  /* FIN=1, opcode=text */
     response->body.size = websocketsresponse_data_size(length);
-
     websocketsresponse_prepare(response, data, length);
 }
 
@@ -189,10 +205,15 @@ void websocketsresponse_binary(websocketsresponse_t* response, const char* data)
 }
 
 void websocketsresponse_binaryn(websocketsresponse_t* response, const char* data, size_t length) {
-    response->frame_code = 0x82;
+    /* Try compression if extension is enabled and payload is large enough */
+    if (response->ws_deflate && response->ws_deflate->deflate_init && length >= WS_COMPRESS_THRESHOLD) {
+        if (__compress_and_send(response, 0x02, data, length))
+            return;
+        /* Fall through to uncompressed on compression failure */
+    }
 
+    response->frame_code = 0x82;  /* FIN=1, opcode=binary */
     response->body.size = websocketsresponse_data_size(length);
-
     websocketsresponse_prepare(response, data, length);
 }
 
@@ -293,4 +314,62 @@ void websocketsresponse_close(websocketsresponse_t* response, const char* data, 
     response->body.size = websocketsresponse_data_size(length);
 
     websocketsresponse_prepare(response, data, length);
+}
+
+/**
+ * Compress data and prepare WebSocket frame with RSV1 bit set.
+ * Per RFC 7692: use raw deflate, remove trailing 0x00 0x00 0xff 0xff.
+ * @return 1 on success, 0 on failure (caller should fall back to uncompressed)
+ */
+static int __compress_and_send(websocketsresponse_t* response, unsigned char opcode, const char* data, size_t length) {
+    ws_deflate_t* ws_deflate_ctx = response->ws_deflate;
+    z_stream* stream = &ws_deflate_ctx->deflate_stream;
+
+    /* Allocate compression buffer (worst case: slightly larger than input) */
+    size_t comp_capacity = length + 64;
+    char* compressed = malloc(comp_capacity);
+    if (compressed == NULL)
+        return 0;
+
+    stream->next_in = (Bytef*)data;
+    stream->avail_in = (uInt)length;
+    stream->next_out = (Bytef*)compressed;
+    stream->avail_out = (uInt)comp_capacity;
+
+    int status = deflate(stream, Z_SYNC_FLUSH);
+    if (status != Z_OK && status != Z_BUF_ERROR) {
+        free(compressed);
+        return 0;
+    }
+
+    size_t comp_size = comp_capacity - stream->avail_out;
+
+    /* Remove trailing 0x00 0x00 0xff 0xff per RFC 7692 */
+    if (comp_size >= 4 &&
+        (unsigned char)compressed[comp_size - 4] == 0x00 &&
+        (unsigned char)compressed[comp_size - 3] == 0x00 &&
+        (unsigned char)compressed[comp_size - 2] == 0xff &&
+        (unsigned char)compressed[comp_size - 1] == 0xff) {
+        comp_size -= 4;
+    }
+
+    /* Only use compression if it actually reduces size */
+    if (comp_size >= length) {
+        free(compressed);
+        ws_deflate_reset_deflate(ws_deflate_ctx);
+        return 0;
+    }
+
+    /* Set frame code: FIN=1, RSV1=1 (compressed), opcode */
+    response->frame_code = 0x80 | 0x40 | opcode;  /* 0xC1 for text, 0xC2 for binary */
+    response->body.size = websocketsresponse_data_size(comp_size);
+
+    int result = websocketsresponse_prepare(response, compressed, comp_size);
+
+    free(compressed);
+
+    /* Reset deflate stream if server_no_context_takeover */
+    ws_deflate_reset_deflate(ws_deflate_ctx);
+
+    return result == 0 ? 1 : 0;
 }
