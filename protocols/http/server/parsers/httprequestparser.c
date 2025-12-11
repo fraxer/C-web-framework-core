@@ -23,7 +23,6 @@
 #define PCRE_VECTOR_SIZE 120           // Use static array instead of VLA for better portability
 
 static int __parse_payload(httprequestparser_t* parser);
-static void __clear(httprequestparser_t* parser);
 static int __validate_content_length(http_header_t* header, size_t* out_length);
 static int __set_method(httprequest_t* request, bufferdata_t* buf);
 static int __set_protocol(httprequest_t* request, bufferdata_t* buf);

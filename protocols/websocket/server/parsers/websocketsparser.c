@@ -21,6 +21,8 @@ int websocketsparser_set_payload(websocketsparser_t*, const char*, size_t);
 void websocketsparser_flush(websocketsparser_t*);
 int websocketsparser_is_control_frame(websockets_frame_t*);
 void websockets_frame_init(websockets_frame_t*);
+static void __clear(websocketsparser_t* parser);
+static int __clear_and_return(websocketsparser_t* parser, int error);
 
 websocketsparser_t* websocketsparser_create(connection_t* connection, websockets_protocol_t*(*protocol_create)(void)) {
     websocketsparser_t* parser = malloc(sizeof * parser);
@@ -55,13 +57,31 @@ void websocketsparser_init(websocketsparser_t* parser) {
 void websocketsparser_free(void* arg) {
     websocketsparser_t* parser = arg;
 
-    websocketsparser_flush(parser);
+    __clear(parser);
     ws_deflate_free(&parser->ws_deflate);
     free(parser);
 }
 
 void websocketsparser_reset(websocketsparser_t* parser) {
     websocketsparser_flush(parser);
+}
+
+int __clear_and_return(websocketsparser_t* parser, int error) {
+    __clear(parser);
+    return error;
+}
+
+void __clear(websocketsparser_t* parser) {
+    // Clean up partially parsed request if it was created but not yet handled by connection layer
+    // This prevents memory leaks when parsing fails early (e.g., invalid method, URI)
+    if (parser->request != NULL) {
+        // Only free if the request hasn't been registered with the connection yet
+        // The connection layer will handle cleanup if the request was successfully registered
+        websocketsrequest_free(parser->request);
+        parser->request = NULL;
+    }
+
+    websocketsparser_reset(parser);
 }
 
 void websocketsparser_flush(websocketsparser_t* parser) {
@@ -105,7 +125,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
 
             bufferdata_complete(&parser->buf);
             if (!websocketsparser_parse_first_byte(parser))
-                return WSPARSER_BAD_REQUEST;
+                return __clear_and_return(parser, WSPARSER_BAD_REQUEST);
 
             bufferdata_reset(&parser->buf);
 
@@ -117,7 +137,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
 
             bufferdata_complete(&parser->buf);
             if (!websocketsparser_parse_second_byte(parser))
-                return WSPARSER_BAD_REQUEST;
+                return __clear_and_return(parser, WSPARSER_BAD_REQUEST);
 
             else if (parser->frame.payload_length == 126) {
                 parser->stage = WSPARSER_PAYLOAD_LEN_126;
@@ -136,7 +156,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
         case WSPARSER_PAYLOAD_LEN_126:
         {
             if (websocketsparser_is_control_frame(&parser->frame))
-                return WSPARSER_BAD_REQUEST;
+                return __clear_and_return(parser, WSPARSER_BAD_REQUEST);
 
             bufferdata_push(&parser->buf, ch);
 
@@ -147,7 +167,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
 
             bufferdata_complete(&parser->buf);
             if (!websocketsparser_parse_payload_length_126(parser))
-                return WSPARSER_BAD_REQUEST;
+                return __clear_and_return(parser, WSPARSER_BAD_REQUEST);
 
             bufferdata_reset(&parser->buf);
 
@@ -156,7 +176,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
         case WSPARSER_PAYLOAD_LEN_127:
         {
             if (websocketsparser_is_control_frame(&parser->frame))
-                return WSPARSER_BAD_REQUEST;
+                return __clear_and_return(parser, WSPARSER_BAD_REQUEST);
 
             bufferdata_push(&parser->buf, ch);
 
@@ -167,7 +187,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
 
             bufferdata_complete(&parser->buf);
             if (!websocketsparser_parse_payload_length_127(parser))
-                return WSPARSER_BAD_REQUEST;
+                return __clear_and_return(parser, WSPARSER_BAD_REQUEST);
 
             bufferdata_reset(&parser->buf);
 
@@ -182,7 +202,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
 
             bufferdata_complete(&parser->buf);
             if (!websocketsparser_parse_mask(parser))
-                return WSPARSER_BAD_REQUEST;
+                return __clear_and_return(parser, WSPARSER_BAD_REQUEST);
 
             bufferdata_reset(&parser->buf);
 
@@ -346,7 +366,7 @@ int websocketsparser_parse_payload(websocketsparser_t* parser) {
     }
 
     if (parser->payload_saved_length + size > env()->main.client_max_body_size)
-        return WSPARSER_PAYLOAD_LARGE;
+        return __clear_and_return(parser, WSPARSER_PAYLOAD_LARGE);
 
     parser->payload_saved_length += size;
 
@@ -358,12 +378,12 @@ int websocketsparser_parse_payload(websocketsparser_t* parser) {
     if (request->compressed) {
         int is_message_final = is_final && parser->frame.fin;
         if (!websocketsparser_decompress_chunk(parser, payload_data, payload_size, is_message_final))
-            return WSPARSER_ERROR;
+            return __clear_and_return(parser, WSPARSER_ERROR);
     } else {
         const int unmasking = 1;
         /* Uncompressed: pass directly to payload_parse */
         if (!request->protocol->payload_parse(parser, payload_data, payload_size, unmasking))
-            return WSPARSER_ERROR;
+            return __clear_and_return(parser, WSPARSER_ERROR);
     }
 
     if (has_data_for_next_request) {
