@@ -55,12 +55,6 @@ void print_stack_trace(void) {
     free(symbols);
 }
 
-void signal_before_ctrl_c(__attribute__((unused))int s) {
-    signal_flush_streams();
-    log_error("[signal_before_ctrl_c] Сигнал CTRL + C\n");
-    exit(0);
-}
-
 void signal_before_undefined_instruction(__attribute__((unused))int s) {
     signal_flush_streams();
     log_error("[signal_before_undefined_instruction] Недопустимая инструкция\n");
@@ -157,11 +151,9 @@ void signal_USR1(__attribute__((unused))int s) {
 
 void signal_init(void) {
     signal(SIGPIPE, SIG_IGN);
-    signal(SIGINT,  signal_before_ctrl_c);
     signal(SIGILL,  signal_before_undefined_instruction);
     signal(SIGFPE,  signal_before_float_point);
     signal(SIGSEGV, signal_before_segmentation_fault);
-    signal(SIGTERM, signal_before_terminate);
     signal(SIGHUP,  SIG_IGN);
     signal(SIGBUS,  signal_before_segmentation_fault);
     signal(SIGABRT, signal_before_abort);

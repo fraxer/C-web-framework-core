@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <pthread.h>
+#include <signal.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,9 +17,6 @@
 #include "moduleloader.h"
 #include "log.h"
 #include "signal/signal.h"
-
-static pthread_cond_t main_cond = PTHREAD_COND_INITIALIZER;
-static pthread_mutex_t main_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int main(int argc, char* argv[]) {
     int result = EXIT_FAILURE;
@@ -38,9 +35,14 @@ int main(int argc, char* argv[]) {
 
     result = EXIT_SUCCESS;
 
-    pthread_mutex_lock(&main_mutex);
-    pthread_cond_wait(&main_cond, &main_mutex);
-    pthread_mutex_unlock(&main_mutex);
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &mask, NULL);
+
+    int sig;
+    sigwait(&mask, &sig);
 
     failed:
 
