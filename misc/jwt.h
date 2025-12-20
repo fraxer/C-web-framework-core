@@ -154,6 +154,15 @@ char* jwt_encode(json_doc_t* payload, const jwt_key_t* key);
 jwt_t jwt_decode(const char* token, const jwt_key_t* key);
 
 /**
+ * Verify JWT token signature without full decoding
+ *
+ * @param token   JWT token string
+ * @param key     Key for verification (HMAC secret or public key)
+ * @return        JWT_OK if valid, error code otherwise
+ */
+jwt_result_t jwt_verify(const char* token, const jwt_key_t* key);
+
+/**
  * Free JWT structure resources
  */
 void jwt_free(jwt_t* jwt);

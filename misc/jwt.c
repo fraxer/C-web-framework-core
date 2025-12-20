@@ -792,7 +792,7 @@ cleanup:
     return ret;
 }
 
-static int jwt_verify(const jwt_key_t* key, const char* data, size_t data_len,
+static int jwt_verify_internal(const jwt_key_t* key, const char* data, size_t data_len,
                       const unsigned char* sig, size_t sig_len) {
     switch (key->alg) {
         case JWT_ALG_HS256:
@@ -1105,7 +1105,7 @@ jwt_t jwt_decode(const char* token, const jwt_key_t* key) {
     free(sig_std_b64);
 
     // Verify
-    int sig_valid = jwt_verify(key, signing_input, signing_input_len,
+    int sig_valid = jwt_verify_internal(key, signing_input, signing_input_len,
                                provided_sig, (size_t)actual_sig_len);
 
     free(provided_sig);
@@ -1174,6 +1174,104 @@ jwt_t jwt_decode(const char* token, const jwt_key_t* key) {
     }
 
     return result;
+}
+
+jwt_result_t jwt_verify(const char* token, const jwt_key_t* key) {
+    if (!token || !key) {
+        return JWT_ERROR_INVALID_TOKEN;
+    }
+
+    const char* first_dot = strchr(token, '.');
+    if (!first_dot) {
+        return JWT_ERROR_INVALID_TOKEN;
+    }
+
+    const char* second_dot = strchr(first_dot + 1, '.');
+    if (!second_dot) {
+        return JWT_ERROR_INVALID_TOKEN;
+    }
+
+    size_t header_b64_len = first_dot - token;
+    size_t payload_b64_len = second_dot - first_dot - 1;
+    size_t signature_b64_len = strlen(second_dot + 1);
+
+    // Decode header to check algorithm
+    char* header_b64 = malloc(header_b64_len + 1);
+    if (!header_b64) {
+        return JWT_ERROR_MEMORY;
+    }
+    memcpy(header_b64, token, header_b64_len);
+    header_b64[header_b64_len] = '\0';
+
+    char* header_std_b64 = base64url_to_base64(header_b64);
+    free(header_b64);
+    if (!header_std_b64) {
+        return JWT_ERROR_MEMORY;
+    }
+
+    int header_decoded_len = base64_decode_len(header_std_b64);
+    char* header_json = malloc(header_decoded_len + 1);
+    if (!header_json) {
+        free(header_std_b64);
+        return JWT_ERROR_MEMORY;
+    }
+    base64_decode(header_json, header_std_b64);
+    header_json[header_decoded_len] = '\0';
+    free(header_std_b64);
+
+    json_doc_t* header = json_parse(header_json);
+    free(header_json);
+    if (!header) {
+        return JWT_ERROR_INVALID_TOKEN;
+    }
+
+    json_token_t* header_root = json_root(header);
+    json_token_t* alg_token = json_object_get(header_root, "alg");
+    if (!alg_token || !json_is_string(alg_token)) {
+        json_free(header);
+        return JWT_ERROR_INVALID_TOKEN;
+    }
+
+    jwt_alg_t token_alg = jwt_alg_from_name(json_string(alg_token));
+    json_free(header);
+
+    if (token_alg != key->alg) {
+        return JWT_ERROR_ALG_MISMATCH;
+    }
+
+    // Verify signature
+    size_t signing_input_len = header_b64_len + 1 + payload_b64_len;
+
+    char* sig_b64 = malloc(signature_b64_len + 1);
+    if (!sig_b64) {
+        return JWT_ERROR_MEMORY;
+    }
+    memcpy(sig_b64, second_dot + 1, signature_b64_len);
+    sig_b64[signature_b64_len] = '\0';
+
+    char* sig_std_b64 = base64url_to_base64(sig_b64);
+    free(sig_b64);
+    if (!sig_std_b64) {
+        return JWT_ERROR_MEMORY;
+    }
+
+    int sig_decoded_len = base64_decode_len(sig_std_b64);
+    unsigned char* sig = malloc(sig_decoded_len);
+    if (!sig) {
+        free(sig_std_b64);
+        return JWT_ERROR_MEMORY;
+    }
+    int actual_sig_len = base64_decode((char*)sig, sig_std_b64);
+    free(sig_std_b64);
+
+    int valid = jwt_verify_internal(key, token, signing_input_len, sig, (size_t)actual_sig_len);
+    free(sig);
+
+    if (!valid) {
+        return JWT_ERROR_INVALID_SIGNATURE;
+    }
+
+    return JWT_OK;
 }
 
 // ============================================================================
