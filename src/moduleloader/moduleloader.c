@@ -457,6 +457,42 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     }
 
 
+    const json_token_t* token_env = json_object_get(token_main, "env");
+    if (token_env != NULL) {
+        if (!json_is_object(token_env)) {
+            log_error("module_loader_config_load: main.env must be object\n");
+            return 0;
+        }
+
+        env->custom_store = json_root_create_object();
+        if (env->custom_store == NULL) {
+            log_error("module_loader_config_load: failed to create custom_store\n");
+            return 0;
+        }
+
+        json_token_t* store_root = json_root(env->custom_store);
+        for (json_it_t it = json_init_it(token_env); !json_end_it(&it); it = json_next_it(&it)) {
+            const char* key = json_it_key(&it);
+            json_token_t* value = json_it_value(&it);
+
+            json_token_t* new_value = NULL;
+            if (json_is_string(value)) {
+                new_value = json_create_string(json_string(value));
+            } else if (json_is_number(value)) {
+                new_value = json_create_number(json_ldouble(value));
+            } else if (json_is_bool(value)) {
+                new_value = json_create_bool(json_bool(value));
+            } else if (json_is_null(value)) {
+                new_value = json_create_null();
+            }
+
+            if (new_value != NULL) {
+                json_object_set(store_root, key, new_value);
+            }
+        }
+    }
+
+
     if (!__module_loader_servers_load(config, json_object_get(root, "servers")))
         return 0;
     if (!__module_loader_databases_load(config, json_object_get(root, "databases")))

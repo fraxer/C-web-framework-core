@@ -203,6 +203,7 @@ void __appconfig_env_init(env_t* env) {
     env->mail.dkim_selector = NULL;
     env->mail.host = NULL;
     env->migrations.source_directory = NULL;
+    env->custom_store = NULL;
 }
 
 void __appconfig_env_free(env_t* env) {
@@ -243,6 +244,11 @@ void __appconfig_env_free(env_t* env) {
     if (env->migrations.source_directory != NULL) {
         free(env->migrations.source_directory);
         env->migrations.source_directory = NULL;
+    }
+
+    if (env->custom_store != NULL) {
+        json_free(env->custom_store);
+        env->custom_store = NULL;
     }
 }
 
@@ -299,4 +305,63 @@ const char* __appconfig_get_path(int argc, char* argv[]) {
 
 void appconfig_set_after_run_threads_cb(void (*appconfig_after_run_threads_cb)(void)) {
     __appconfig_after_run_threads_cb = appconfig_after_run_threads_cb;
+}
+
+static json_token_t* __env_get_token(const char* key) {
+    if (key == NULL) return NULL;
+    if (__appconfig == NULL) return NULL;
+    if (__appconfig->env.custom_store == NULL) return NULL;
+
+    json_token_t* root = json_root(__appconfig->env.custom_store);
+    if (root == NULL) return NULL;
+
+    return json_object_get(root, key);
+}
+
+const char* env_get_string(const char* key) {
+    json_token_t* token = __env_get_token(key);
+    if (token == NULL || !json_is_string(token)) return NULL;
+
+    return json_string(token);
+}
+
+int env_get_int(const char* key, int default_value) {
+    json_token_t* token = __env_get_token(key);
+    if (token == NULL || !json_is_number(token)) return default_value;
+
+    int ok = 0;
+    int value = json_int(token, &ok);
+    return ok ? value : default_value;
+}
+
+long long env_get_llong(const char* key, long long default_value) {
+    json_token_t* token = __env_get_token(key);
+    if (token == NULL || !json_is_number(token)) return default_value;
+
+    int ok = 0;
+    long long value = json_llong(token, &ok);
+    return ok ? value : default_value;
+}
+
+int env_get_bool(const char* key, int default_value) {
+    json_token_t* token = __env_get_token(key);
+    if (token == NULL || !json_is_bool(token)) return default_value;
+
+    return json_bool(token);
+}
+
+double env_get_double(const char* key, double default_value) {
+    json_token_t* token = __env_get_token(key);
+    if (token == NULL || !json_is_number(token)) return default_value;
+
+    int ok = 0;
+    double value = json_double(token, &ok);
+    return ok ? value : default_value;
+}
+
+long double env_get_ldouble(const char* key, long double default_value) {
+    json_token_t* token = __env_get_token(key);
+    if (token == NULL || !json_is_number(token)) return default_value;
+
+    return json_ldouble(token);
 }
