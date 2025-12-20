@@ -15,6 +15,8 @@
 #include "model.h"
 #include "database.h"
 #include "moduleloader.h"
+#include "statement_registry.h"
+#include "middleware_registry.h"
 #ifdef MySQL_FOUND
     #include "mysql.h"
 #endif
@@ -110,7 +112,7 @@ mgconfig_t mg_args_parse(int argc, char* argv[]) {
         .appconfig = NULL,
     };
 
-    if (argc < 5) {
+    if (argc < 4) {
         printf("Error: command incorrect\n");
         printf("Example: migrate <db driver> <server id> <action> [number, all] <config path>\n");
         return config;
@@ -256,7 +258,7 @@ int mg_migrate_run(mgconfig_t* config, const char* filename, const char* path) {
     if (config->action == UP) {
         if (!mg_migration_exist(dbid, filename) && function_up(dbid)) {
             mg_migration_commit(dbid, filename);
-            printf("success up %s in %s\n", path, config->database_driver);
+            printf("Success up %s in %s\n", path, config->database_driver);
             make_increment = 1;
         }
     }
@@ -299,12 +301,11 @@ int mg_migrations_process(mgconfig_t* config) {
                 config->count_applied_migrations == config->count_migrations) {
                 break;
             }
-            size_t length = path_length + strlen(namelist[i]->d_name) + 1; // "/"
-            char* filepath = malloc(length + 1);
+            size_t length = strlen(path) + 1 + strlen(namelist[i]->d_name) + 1; // "/" + '\0'
+            char* filepath = malloc(length);
 
             if (filepath == NULL) {
                 printf("Error: out of memory\n");
-                free(filepath);
                 goto failed;
             }
 
@@ -387,7 +388,7 @@ int mg_create_template(const char* source_directory, mgconfig_t* config) {
 
     const char* data =
         "#include <stdlib.h>\n\n"
-        "#include \"dbqueryf.h\"\n"
+        "#include \"dbquery.h\"\n"
         "#include \"dbresult.h\"\n\n"
 
         "int up(const char* dbid) {\n"
@@ -432,10 +433,22 @@ int main(int argc, char* argv[]) {
 
     appconfig_set(config.appconfig);
 
-    if (!module_loader_load_json_config(config.appconfig->path, &document))
+    if (!prepare_statements_init()) {
+        printf("module_loader_init: failed to initialize prepared statements\n");
         goto failed;
-    if (!module_loader_config_load(config.appconfig, document))
+    }
+    if (!middlewares_init()) {
+        printf("Error: failed to initialize middlewares\n");
         goto failed;
+    }
+    if (!module_loader_load_json_config(config.appconfig->path, &document)) {
+        printf("Error: can't load config %s\n", config.appconfig->path);
+        goto failed;
+    }
+    if (!module_loader_config_load(config.appconfig, document)) {
+        printf("Error: can't load config %s\n", config.appconfig->path);
+        goto failed;
+    }
 
     if (config.action == CREATE) {
         if (mg_migration_create(&config) == -1) goto failed;
