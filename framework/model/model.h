@@ -36,19 +36,21 @@
 #define mparam_array(NAME, VALUE) field_create_array(#NAME, VALUE)
 
 
-#define mnfields(TYPE, FIELD, NAME, VALUE) \
+#define mnfields(TYPE, FIELD, NAME, VALUE, ISNULL) \
     .type = TYPE,\
     .name = #NAME,\
     .dirty = 0,\
+    .is_null = ISNULL,\
     .value.FIELD = VALUE,\
     .value._string = NULL,\
     .oldvalue._short = 0,\
     .oldvalue._string = NULL
 
-#define mdfields(TYPE, NAME, VALUE) \
+#define mdfields(TYPE, NAME, VALUE, ISNULL) \
     .type = TYPE,\
     .name = #NAME,\
     .dirty = 0,\
+    .is_null = ISNULL,\
     .value._tm = VALUE,\
     .value._string = NULL,\
     .oldvalue._tm = (tm_t){0},\
@@ -58,28 +60,88 @@
     .type = TYPE,\
     .name = #NAME,\
     .dirty = 0,\
+    .is_null = ((VALUE) == NULL ? 1 : 0),\
     .value._short = 0,\
     .value._string = str_create(VALUE),\
     .oldvalue._short = 0,\
     .oldvalue._string = NULL
 
-#define mfield_bool(NAME, VALUE) .NAME = { mnfields(MODEL_BOOL, _short, NAME, VALUE) }
-#define mfield_smallint(NAME, VALUE) .NAME = { mnfields(MODEL_SMALLINT, _short, NAME, VALUE) }
-#define mfield_int(NAME, VALUE) .NAME = { mnfields(MODEL_INT, _int, NAME, VALUE) }
-#define mfield_bigint(NAME, VALUE) .NAME = { mnfields(MODEL_BIGINT, _bigint, NAME, VALUE) }
-#define mfield_float(NAME, VALUE) .NAME = { mnfields(MODEL_FLOAT, _float, NAME, VALUE) }
-#define mfield_double(NAME, VALUE) .NAME = { mnfields(MODEL_DOUBLE, _double, NAME, VALUE) }
-#define mfield_decimal(NAME, VALUE) .NAME = { mnfields(MODEL_DECIMAL, _ldouble, NAME, VALUE) }
-#define mfield_money(NAME, VALUE) .NAME = { mnfields(MODEL_MONEY, _double, NAME, VALUE) }
-#define mfield_date(NAME, VALUE) .NAME = { mdfields(MODEL_DATE, NAME, VALUE) }
-#define mfield_time(NAME, VALUE) .NAME = { mdfields(MODEL_TIME, NAME, VALUE) }
-#define mfield_timetz(NAME, VALUE) .NAME = { mdfields(MODEL_TIMETZ, NAME, VALUE) }
-#define mfield_timestamp(NAME, VALUE) .NAME = { mdfields(MODEL_TIMESTAMP, NAME, VALUE) }
-#define mfield_timestamptz(NAME, VALUE) .NAME = { mdfields(MODEL_TIMESTAMPTZ, NAME, VALUE) }
+#define NOW NULL
+
+#define mf_is_null(VALUE) _Generic((VALUE), void*: 1, default: 0)
+#define mf_num_val(VALUE, DEFVAL) _Generic((VALUE), void*: DEFVAL, default: (VALUE))
+#define mf_tm_val(VALUE) _Generic((VALUE), void*: (tm_t){0}, default: (VALUE))
+
+#define mfield_bool(NAME, VALUE) .NAME = { \
+    .type = MODEL_BOOL, .name = #NAME, .dirty = 0, \
+    .is_null = mf_is_null(VALUE), \
+    .value._short = mf_num_val(VALUE, 0), .value._string = NULL, \
+    .oldvalue._short = 0, .oldvalue._string = NULL }
+#define mfield_smallint(NAME, VALUE) .NAME = { \
+    .type = MODEL_SMALLINT, .name = #NAME, .dirty = 0, \
+    .is_null = mf_is_null(VALUE), \
+    .value._short = mf_num_val(VALUE, 0), .value._string = NULL, \
+    .oldvalue._short = 0, .oldvalue._string = NULL }
+#define mfield_int(NAME, VALUE) .NAME = { \
+    .type = MODEL_INT, .name = #NAME, .dirty = 0, \
+    .is_null = mf_is_null(VALUE), \
+    .value._int = mf_num_val(VALUE, 0), .value._string = NULL, \
+    .oldvalue._short = 0, .oldvalue._string = NULL }
+#define mfield_bigint(NAME, VALUE) .NAME = { \
+    .type = MODEL_BIGINT, .name = #NAME, .dirty = 0, \
+    .is_null = mf_is_null(VALUE), \
+    .value._bigint = mf_num_val(VALUE, 0), .value._string = NULL, \
+    .oldvalue._short = 0, .oldvalue._string = NULL }
+#define mfield_float(NAME, VALUE) .NAME = { \
+    .type = MODEL_FLOAT, .name = #NAME, .dirty = 0, \
+    .is_null = mf_is_null(VALUE), \
+    .value._float = mf_num_val(VALUE, 0), .value._string = NULL, \
+    .oldvalue._short = 0, .oldvalue._string = NULL }
+#define mfield_double(NAME, VALUE) .NAME = { \
+    .type = MODEL_DOUBLE, .name = #NAME, .dirty = 0, \
+    .is_null = mf_is_null(VALUE), \
+    .value._double = mf_num_val(VALUE, 0), .value._string = NULL, \
+    .oldvalue._short = 0, .oldvalue._string = NULL }
+#define mfield_decimal(NAME, VALUE) .NAME = { \
+    .type = MODEL_DECIMAL, .name = #NAME, .dirty = 0, \
+    .is_null = mf_is_null(VALUE), \
+    .value._ldouble = mf_num_val(VALUE, 0), .value._string = NULL, \
+    .oldvalue._short = 0, .oldvalue._string = NULL }
+#define mfield_money(NAME, VALUE) .NAME = { \
+    .type = MODEL_MONEY, .name = #NAME, .dirty = 0, \
+    .is_null = mf_is_null(VALUE), \
+    .value._double = mf_num_val(VALUE, 0), .value._string = NULL, \
+    .oldvalue._short = 0, .oldvalue._string = NULL }
+#define mfield_date(NAME, VALUE) .NAME = { \
+    .type = MODEL_DATE, .name = #NAME, .dirty = 0, \
+    .is_null = mf_is_null(VALUE), \
+    .value._tm = mf_tm_val(VALUE), .value._string = NULL, \
+    .oldvalue._tm = (tm_t){0}, .oldvalue._string = NULL }
+#define mfield_time(NAME, VALUE) .NAME = { \
+    .type = MODEL_TIME, .name = #NAME, .dirty = 0, \
+    .is_null = mf_is_null(VALUE), \
+    .value._tm = mf_tm_val(VALUE), .value._string = NULL, \
+    .oldvalue._tm = (tm_t){0}, .oldvalue._string = NULL }
+#define mfield_timetz(NAME, VALUE) .NAME = { \
+    .type = MODEL_TIMETZ, .name = #NAME, .dirty = 0, \
+    .is_null = mf_is_null(VALUE), \
+    .value._tm = mf_tm_val(VALUE), .value._string = NULL, \
+    .oldvalue._tm = (tm_t){0}, .oldvalue._string = NULL }
+#define mfield_timestamp(NAME, VALUE) .NAME = { \
+    .type = MODEL_TIMESTAMP, .name = #NAME, .dirty = 0, \
+    .is_null = mf_is_null(VALUE), .use_default = mf_is_null(VALUE), \
+    .value._tm = mf_tm_val(VALUE), .value._string = NULL, \
+    .oldvalue._tm = (tm_t){0}, .oldvalue._string = NULL }
+#define mfield_timestamptz(NAME, VALUE) .NAME = { \
+    .type = MODEL_TIMESTAMPTZ, .name = #NAME, .dirty = 0, \
+    .is_null = mf_is_null(VALUE), .use_default = mf_is_null(VALUE), \
+    .value._tm = mf_tm_val(VALUE), .value._string = NULL, \
+    .oldvalue._tm = (tm_t){0}, .oldvalue._string = NULL }
 #define mfield_json(NAME, VALUE) .NAME = {\
         .type = MODEL_JSON,\
         .name = #NAME,\
         .dirty = 0,\
+        .is_null = ((VALUE) == NULL ? 1 : 0),\
         .value._jsondoc = VALUE,\
         .value._string = NULL,\
         .oldvalue._jsondoc = NULL,\
@@ -93,6 +155,7 @@
         .type = MODEL_ENUM,\
         .name = #NAME,\
         .dirty = 0,\
+        .is_null = ((VALUE) == NULL ? 1 : 0),\
         .value._enum = enums_create(args_str(__VA_ARGS__)),\
         .value._string = str_create(VALUE),\
         .oldvalue._enum = NULL,\
@@ -297,6 +360,9 @@ typedef struct mfield {
     mvalue_t oldvalue;
     mtype_e type;
     unsigned dirty : 1;
+    unsigned is_null : 1;
+    unsigned use_default : 1;
+    unsigned use_raw_sql : 1;
 } mfield_t;
 
 typedef struct model {
@@ -393,7 +459,9 @@ int model_set_decimal(mfield_t* field, long double value);
 int model_set_money(mfield_t* field, double value);
 
 int model_set_timestamp(mfield_t* field, tm_t* value);
+int model_set_timestamp_now(mfield_t* field);
 int model_set_timestamptz(mfield_t* field, tm_t* value);
+int model_set_timestamptz_now(mfield_t* field);
 int model_set_date(mfield_t* field, tm_t* value);
 int model_set_time(mfield_t* field, tm_t* value);
 int model_set_timetz(mfield_t* field, tm_t* value);
