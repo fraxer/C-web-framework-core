@@ -724,6 +724,83 @@ int model_delete(const char* dbid, void* arg) {
     return res;
 }
 
+int model_delete_by_params(const char* dbid, void* arg, array_t* params) {
+    if (dbid == NULL) return 0;
+    if (arg == NULL) return 0;
+    if (params == NULL || array_size(params) == 0) return 0;
+
+    int res = 0;
+    model_t* model = arg;
+
+    if (model->fields_count(model) == 0) return 0;
+
+    dbinstance_t* dbinst = dbinstance(dbid);
+    if (dbinst == NULL) return 0;
+
+    dbconnection_t* conn = dbinst->connection;
+    dbinstance_free(dbinst);
+
+    mfield_t* vfield = model->first_field(arg);
+    str_t* where_params = str_create_empty(256);
+    if (where_params == NULL) return 0;
+
+    for (size_t i = 0, iter_where = 0; i < array_size(params); i++) {
+        const char* param_name = array_get(params, i);
+
+        for (int j = 0; j < model->fields_count(model); j++) {
+            mfield_t* field = vfield + j;
+
+            if (strcmp(param_name, field->name) != 0)
+                continue;
+
+            if (iter_where > 0)
+                str_append(where_params, " AND ", 5);
+
+            str_append(where_params, field->name, strlen(field->name));
+
+            if (field->is_null) {
+                str_append(where_params, " IS NULL", 8);
+            } else {
+                str_appendc(where_params, '=');
+
+                str_t* value = model_field_to_string(field);
+                if (value == NULL) goto failed;
+
+                str_t* escaped_value = conn->escape_string(conn, str_get(value));
+                if (escaped_value == NULL) goto failed;
+
+                str_append(where_params, str_get(escaped_value), str_size(escaped_value));
+                str_free(escaped_value);
+            }
+
+            iter_where++;
+            break;
+        }
+    }
+
+    dbresult_t* result = dbqueryf(dbid,
+        "DELETE FROM "
+            "%s "
+        "WHERE "
+            "%s "
+        ,
+        model->table(model),
+        str_get(where_params)
+    );
+
+    if (!dbresult_ok(result))
+        goto failed;
+
+    res = 1;
+
+    failed:
+
+    str_free(where_params);
+    dbresult_free(result);
+
+    return res;
+}
+
 void* model_one(const char* dbid, void*(create_instance)(void), const char* format, array_t* params) {
     void* model = NULL;
     dbresult_t* result = dbquery(dbid, format, params);

@@ -408,6 +408,7 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
 int model_create(const char* dbid, void* arg);
 int model_update(const char* dbid, void* arg);
 int model_delete(const char* dbid, void* arg);
+int model_delete_by_params(const char* dbid, void* arg, array_t* params);
 void* model_one(const char* dbid, void*(create_instance)(void), const char* format, array_t* params);
 array_t* model_list(const char* dbid, void*(create_instance)(void), const char* format, array_t* params);
 void* model_prepared_one(const char* dbid, void*(create_instance)(void), const char* stat_name, array_t* params);
