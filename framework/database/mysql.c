@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <ctype.h>
 
 #include "log.h"
 #include "array.h"
@@ -61,6 +62,7 @@ static char* __compile_insert(void* connection, const char* table, array_t* para
 static char* __compile_select(void* connection, const char* table, array_t* columns, array_t* where);
 static char* __compile_update(void* connection, const char* table, array_t* set, array_t* where);
 static char* __compile_delete(void* connection, const char* table, array_t* where);
+static int __is_raw_sql(const char* str);
 static enum_field_types __convert_model_type_to_mysql(mtype_e model_type);
 static int __bind_field_value(MYSQL_BIND* bind, mfield_t* field, bool* is_null_indicator);
 
@@ -624,6 +626,65 @@ str_t* __escape_internal(void* connection, const char* str, char quote) {
     return string;
 }
 
+int __is_raw_sql(const char* str) {
+    if (str == NULL || str[0] == '\0') return 0;
+
+    // Wildcard
+    if (strcmp(str, "*") == 0) return 1;
+
+    // NULL
+    if (strcasecmp(str, "NULL") == 0) return 1;
+
+    // Boolean
+    if (strcasecmp(str, "true") == 0 || strcasecmp(str, "false") == 0) return 1;
+
+    // Числа: 123, -45, 3.14, -0.5
+    const char* p = str;
+    if (*p == '-' || *p == '+') p++;
+    if (*p != '\0') {
+        int has_digit = 0;
+        int has_dot = 0;
+        while (*p) {
+            if (isdigit((unsigned char)*p)) {
+                has_digit = 1;
+            } else if (*p == '.' && !has_dot) {
+                has_dot = 1;
+            } else {
+                break;
+            }
+            p++;
+        }
+        if (*p == '\0' && has_digit) return 1;
+    }
+
+    // Функции: name(...) — ищем pattern "identifier("
+    p = str;
+    if (isalpha((unsigned char)*p) || *p == '_') {
+        while (*p && (isalnum((unsigned char)*p) || *p == '_')) p++;
+        if (*p == '(') return 1;
+    }
+
+    // Выражения с операторами: +, -, *, /, ||
+    for (p = str; *p; p++) {
+        if (*p == '+' || *p == '/' || *p == '|') return 1;
+        // * только если не в начале (иначе это wildcard, уже проверили)
+        if (*p == '*' && p != str) return 1;
+        // - только если не в начале (иначе это отрицательное число)
+        if (*p == '-' && p != str) return 1;
+    }
+
+    // CASE выражения
+    if (strncasecmp(str, "CASE ", 5) == 0) return 1;
+
+    // Подзапросы
+    if (str[0] == '(') return 1;
+
+    // Строковые литералы в кавычках
+    if (str[0] == '\'') return 1;
+
+    return 0;
+}
+
 db_t* my_load(const char* database_id, const json_token_t* token_array) {
     db_t* result = NULL;
     db_t* database = db_create(database_id);
@@ -1126,13 +1187,27 @@ char* __compile_select(void* connection, const char* table, array_t* columns, ar
     str_t* where_str = str_create_empty(256);
     if (where_str == NULL) goto failed;
 
+    // Обрабатываем колонки
     for (size_t i = 0; i < array_size(columns); i++) {
         const char* column_name = array_get(columns, i);
+        if (column_name == NULL)
+            goto failed;
 
         if (i > 0)
             str_appendc(columns_str, ',');
 
-        str_append(columns_str, column_name, strlen(column_name));
+        // Литералы, функции и выражения вставляем как есть
+        if (__is_raw_sql(column_name)) {
+            str_append(columns_str, column_name, strlen(column_name));
+        } else {
+            // Идентификаторы экранируем
+            str_t* escaped_col = __escape_identifier(connection, column_name);
+            if (escaped_col == NULL)
+                goto failed;
+
+            str_append(columns_str, str_get(escaped_col), str_size(escaped_col));
+            str_free(escaped_col);
+        }
     }
 
     for (size_t i = 0; i < array_size(where); i++) {
