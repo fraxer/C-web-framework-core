@@ -19,6 +19,7 @@
 #include "view.h"
 #include "json.h"
 #include "model.h"
+#include "str.h"
 
 static void __httpresponse_data(httpresponse_t* response, const char* data);
 static void __httpresponse_datan(httpresponse_t* response, const char* data, size_t length);
@@ -776,96 +777,58 @@ int __httpresponse_prepare_body(httpresponse_t* response, size_t length) {
 void __httpresponse_cookie_add(httpresponse_t* response, cookie_t cookie) {
     if (cookie.name == NULL || cookie.name[0] == 0)
         return;
-    if (cookie.value == NULL || cookie.value[0] == 0)
+    if (cookie.value == NULL)
         return;
 
-    char template[128];
-    char date[32];
-    strcpy(template, "%s=%s");
-    int count = 2;
-    const char* vars[4];
-
-    if (cookie.seconds > 0) {
-        vars[count - 2] = date;
-        count++;
-        time_t t = time(NULL);
-        t += cookie.seconds;
-        struct tm* timeptr = localtime(&t);
-
-        if (strftime(date, sizeof(date), "%a, %d %b %Y %T GMT", timeptr) == 0) return;
-
-        strcat(template, "; Expires=%s");
-    }
-    if (cookie.path != NULL && cookie.path[0] != 0) {
-        vars[count - 2] = cookie.path;
-        count++;
-        strcat(template, "; Path=%s");
-    }
-    if (cookie.domain != NULL && cookie.domain[0] != 0) {
-        vars[count - 2] = cookie.domain;
-        count++;
-        strcat(template, "; Domain=%s");
-    }
-    if (cookie.secure) strcat(template, "; Secure");
-    if (cookie.http_only) strcat(template, "; HttpOnly");
-    if (cookie.same_site != NULL && cookie.same_site[0] != 0) {
-        vars[count - 2] = cookie.same_site;
-        count++;
-        strcat(template, "; SameSite=%s");
-    }
-
-    char* string = NULL;
-
-    switch (count) {
-    case 2:
-    {
-        size_t string_length = snprintf(NULL, 0, template, cookie.name, cookie.value) + 1;
-        string = malloc(string_length);
-        if (string == NULL) return;
-        snprintf(string, string_length, template, cookie.name, cookie.value);
-        break;
-    }
-    case 3:
-    {
-        size_t string_length = snprintf(NULL, 0, template, cookie.name, cookie.value, vars[0]) + 1;
-        string = malloc(string_length);
-        if (string == NULL) return;
-        snprintf(string, string_length, template, cookie.name, cookie.value, vars[0]);
-        break;
-    }
-    case 4:
-    {
-        size_t string_length = snprintf(NULL, 0, template, cookie.name, cookie.value, vars[0], vars[1]) + 1;
-        string = malloc(string_length);
-        if (string == NULL) return;
-        snprintf(string, string_length, template, cookie.name, cookie.value, vars[0], vars[1]);
-        break;
-    }
-    case 5:
-    {
-        size_t string_length = snprintf(NULL, 0, template, cookie.name, cookie.value, vars[0], vars[1], vars[2]) + 1;
-        string = malloc(string_length);
-        if (string == NULL) return;
-        snprintf(string, string_length, template, cookie.name, cookie.value, vars[0], vars[1], vars[2]);
-        break;
-    }
-    case 6:
-    {
-        size_t string_length = snprintf(NULL, 0, template, cookie.name, cookie.value, vars[0], vars[1], vars[2], vars[3]) + 1;
-        string = malloc(string_length);
-        if (string == NULL) return;
-        snprintf(string, string_length, template, cookie.name, cookie.value, vars[0], vars[1], vars[2], vars[3]);
-        break;
-    }
-    default:
+    str_t str;
+    if (!str_init(&str, 256))
         return;
+
+    if (!str_appendf(&str, "%s=%s", cookie.name, cookie.value))
+        goto cleanup;
+
+    if (cookie.seconds == 0) {
+        if (!str_append(&str, "; Max-Age=0", 11))
+            goto cleanup;
+    } else if (cookie.seconds > 0) {
+        time_t t = time(NULL) + cookie.seconds;
+        struct tm* timeptr = gmtime(&t);
+        if (timeptr == NULL)
+            goto cleanup;
+
+        char date[32];
+        if (strftime(date, sizeof(date), "%a, %d %b %Y %T GMT", timeptr) == 0)
+            goto cleanup;
+
+        if (!str_appendf(&str, "; Expires=%s", date))
+            goto cleanup;
     }
 
-    if (string == NULL) return;
+    if (cookie.path != NULL && cookie.path[0] != 0)
+        if (!str_appendf(&str, "; Path=%s", cookie.path))
+            goto cleanup;
 
-    response->add_header(response, "Set-Cookie", string);
+    if (cookie.domain != NULL && cookie.domain[0] != 0)
+        if (!str_appendf(&str, "; Domain=%s", cookie.domain))
+            goto cleanup;
 
-    free(string);
+    if (cookie.secure)
+        if (!str_append(&str, "; Secure", 8))
+            goto cleanup;
+
+    if (cookie.http_only)
+        if (!str_append(&str, "; HttpOnly", 10))
+            goto cleanup;
+
+    if (cookie.same_site != NULL && cookie.same_site[0] != 0)
+        if (!str_appendf(&str, "; SameSite=%s", cookie.same_site))
+            goto cleanup;
+
+    response->add_header(response, "Set-Cookie", str_get(&str));
+
+    cleanup:
+
+    str_clear(&str);
 }
 
 int httpresponse_redirect_is_external(const char* url) {
