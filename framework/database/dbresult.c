@@ -163,6 +163,7 @@ dbresultquery_t* dbresult_query_next(dbresult_t* result) {
 }
 
 int dbresult_query_rows(dbresult_t* result) {
+    if (result == NULL) return 0;
     if (result->current == NULL) return 0;
 
     return result->current->rows;

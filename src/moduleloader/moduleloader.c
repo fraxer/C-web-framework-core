@@ -189,8 +189,10 @@ int __module_loader_init_modules(appconfig_t* config, json_doc_t* document) {
 
     failed:
 
-    if (!result)
+    if (!result) {
         appconfig_free(appconfig());
+        appconfig_set(NULL);
+    }
 
     return result;
 }
