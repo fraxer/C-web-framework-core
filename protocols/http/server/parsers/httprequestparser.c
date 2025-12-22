@@ -15,6 +15,7 @@
 #include "httprequestparser.h"
 #include "helpers.h"
 #include "queryparser.h"
+#include "idn_utils.h"
 
 #define MAX_HEADER_KEY_SIZE 256
 #define MAX_HEADER_VALUE_SIZE 8192
@@ -565,6 +566,15 @@ int __try_set_server(httprequestparser_t* parser, http_header_t* header) {
         }
     }
 
+    // Convert to ASCII/Punycode for matching
+    char* ascii_domain = idn_to_ascii(domain);
+    if (ascii_domain == NULL) {
+        log_warning("Invalid domain in Host header: %s\n", domain);
+        return HTTP1PARSER_HOST_NOT_FOUND;
+    }
+
+    size_t ascii_length = strlen(ascii_domain);
+
     int vector[PCRE_VECTOR_SIZE];
     connection_server_ctx_t* ctx = parser->connection->ctx;
     cqueue_item_t* item = cqueue_first(&ctx->listener->servers);
@@ -575,11 +585,12 @@ int __try_set_server(httprequestparser_t* parser, http_header_t* header) {
             domain_t* server_domain = server->domain;
 
             while (server_domain) {
-                int matches_count = pcre_exec(server_domain->pcre_template, NULL, domain, domain_length, 0, 0, vector, PCRE_VECTOR_SIZE);
+                int matches_count = pcre_exec(server_domain->pcre_template, NULL, ascii_domain, ascii_length, 0, 0, vector, PCRE_VECTOR_SIZE);
 
                 if (matches_count > 0) {
                     ctx->server = server;
                     parser->host_found = 1;
+                    free(ascii_domain);
                     return HTTP1PARSER_CONTINUE;
                 }
 
@@ -590,6 +601,7 @@ int __try_set_server(httprequestparser_t* parser, http_header_t* header) {
         item = item->next;
     }
 
+    free(ascii_domain);
     return HTTP1PARSER_HOST_NOT_FOUND;
 }
 

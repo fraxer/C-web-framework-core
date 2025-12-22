@@ -6,6 +6,7 @@
 typedef struct domain {
     int pcre_erroffset;
     char* template;
+    char* ascii_template;
     char* prepared_template;
     const char* pcre_error;
     pcre* pcre_template;

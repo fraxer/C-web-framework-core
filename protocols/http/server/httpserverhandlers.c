@@ -7,6 +7,7 @@
 #include "log.h"
 #include "connection_queue.h"
 #include "openssl.h"
+#include "idn_utils.h"
 
 typedef struct {
     connection_queue_item_data_t base;
@@ -676,7 +677,14 @@ int __sni_callback(SSL* ssl, int* ad, void* arg) {
         inet_pton(AF_INET6, server_name, &addrbuf) == 1)
         return SSL_TLSEXT_ERR_NOACK;
 
-    size_t server_name_length = strlen(server_name);
+    // Convert SNI to ASCII/Punycode
+    char* ascii_server_name = idn_to_ascii(server_name);
+    if (ascii_server_name == NULL) {
+        log_warning("Invalid SNI domain: %s\n", server_name);
+        return SSL_TLSEXT_ERR_NOACK;
+    }
+
+    size_t server_name_length = strlen(ascii_server_name);
     int vector_struct_size = 6;
     int substring_count = 20;
     int vector_size = substring_count * vector_struct_size;
@@ -691,7 +699,7 @@ int __sni_callback(SSL* ssl, int* ad, void* arg) {
 
         if (server->ip == listener_connection->ip && server->port == listener_connection->port) {
             for (domain_t* domain = server->domain; domain; domain = domain->next) {
-                int matches_count = pcre_exec(domain->pcre_template, NULL, server_name, server_name_length, 0, 0, vector, vector_size);
+                int matches_count = pcre_exec(domain->pcre_template, NULL, ascii_server_name, server_name_length, 0, 0, vector, vector_size);
                 if (matches_count > 0) {
                     ctx->server = server;
                     connection->ssl_ctx = server->openssl->ctx;
@@ -709,6 +717,7 @@ int __sni_callback(SSL* ssl, int* ad, void* arg) {
                     SSL_set_options(ssl, SSL_OP_NO_RENEGOTIATION);
     #endif
 
+                    free(ascii_server_name);
                     return SSL_TLSEXT_ERR_OK;
                 }
             }
@@ -717,6 +726,7 @@ int __sni_callback(SSL* ssl, int* ad, void* arg) {
         item = item->next;
     }
 
+    free(ascii_server_name);
     return SSL_TLSEXT_ERR_NOACK;
 }
 

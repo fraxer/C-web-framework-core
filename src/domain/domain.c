@@ -4,6 +4,7 @@
 
 #include "log.h"
 #include "domain.h"
+#include "idn_utils.h"
 
 typedef struct domain_parser {
     char* template;
@@ -49,6 +50,9 @@ void domains_free(domain_t* domain) {
         if (domain->template != NULL)
             free(domain->template);
 
+        if (domain->ascii_template != NULL)
+            free(domain->ascii_template);
+
         if (domain->prepared_template != NULL)
             free(domain->prepared_template);
 
@@ -66,12 +70,21 @@ domain_t* domain_alloc(const char* value) {
     domain_t* domain = malloc(sizeof * domain);
     if (domain == NULL) return NULL;
 
+    domain->template = NULL;
+    domain->ascii_template = NULL;
+    domain->prepared_template = NULL;
+
     domain->template = malloc(strlen(value) + 1);
     if (domain->template == NULL) goto failed;
 
     strcpy(domain->template, value);
 
-    int pcre_length = domain_estimate_length(domain->template);
+    // Convert to ASCII/Punycode
+    domain->ascii_template = idn_to_ascii(value);
+    if (domain->ascii_template == NULL) goto failed;
+
+    // Use ASCII version for PCRE length calculation
+    int pcre_length = domain_estimate_length(domain->ascii_template);
     if (pcre_length == -1) goto failed;
 
     domain->prepared_template = malloc(pcre_length + 1);
@@ -85,6 +98,7 @@ domain_t* domain_alloc(const char* value) {
     failed:
 
     if (result == NULL) {
+        if (domain->ascii_template != NULL) free(domain->ascii_template);
         if (domain->template != NULL) free(domain->template);
         if (domain != NULL) free(domain);
     }
@@ -97,14 +111,14 @@ int domain_parse(domain_t* domain) {
 
     domain_parser_alloc(&parser, domain);
 
-    size_t length = strlen(domain->template);
+    size_t length = strlen(domain->ascii_template);
 
-    if (domain->template[0] != '^' && domain->template[length - 1] != '$') {
+    if (domain->ascii_template[0] != '^' && domain->ascii_template[length - 1] != '$') {
         parser.prepared_pos = 1;
     }
 
     for (; parser.pos < length; parser.pos++) {
-        switch (domain->template[parser.pos]) {
+        switch (domain->ascii_template[parser.pos]) {
         case '(':
         case '[':
             parser.brackets_count++;
@@ -151,7 +165,7 @@ int domain_parse(domain_t* domain) {
 
     if (parser.brackets_count != 0) return -1;
 
-    if (domain->template[0] != '^' && domain->template[length - 1] != '$') {
+    if (domain->ascii_template[0] != '^' && domain->ascii_template[length - 1] != '$') {
         domain->prepared_template[0] = '^';
         domain->prepared_template[parser.prepared_pos] = '$';
 
@@ -221,7 +235,7 @@ int domain_estimate_length(const char* domain) {
 }
 
 void domain_parser_alloc(domain_parser_t* parser, domain_t* domain) {
-    parser->template = domain->template;
+    parser->template = domain->ascii_template;
     parser->prepared_template = domain->prepared_template;
     parser->pos = 0;
     parser->pcre_pos = 0;
