@@ -80,4 +80,7 @@ int connection_queue_append_broadcast(connection_t*);
 int connection_after_read(connection_t*);
 int connection_close(connection_t* connection);
 
+// Helper функция для получения API из connection
+struct mpxapi* connection_get_api(connection_t* connection);
+
 #endif

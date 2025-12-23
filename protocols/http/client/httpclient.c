@@ -5,11 +5,18 @@
 #include <netinet/tcp.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <fcntl.h>
+#include <sys/time.h>
 
 #include "log.h"
 #include "httpclienthandlers.h"
 #include "httpclientparser.h"
+#include "httpclienthandlers_async.h"
 #include "httpclient.h"
+#include "connection_c_async.h"
+#include "appconfig.h"
+#include "server.h"
+#include "multiplexing.h"
 
 #define HTTPCLIENT_BUFSIZ 16384
 
@@ -34,6 +41,21 @@ int __httpclient_try_set_content_length(httpclient_t*);
 int __httpclient_send_recv_data(httpclient_t*);
 int __httpclient_free_connection(httpclient_t*);
 int __httpclient_is_redirect(httpclient_t*);
+
+// Async forward declarations
+int __httpclient_send_async(httpclient_t*, httpclient_callback_t, void*, struct mpxapi*, struct appconfig*);
+httpclient_async_ctx_t* __httpclient_async_ctx_create(httpclient_callback_t, void*, struct mpxapi*, struct appconfig*, int);
+void __httpclient_async_ctx_free(httpclient_async_ctx_t*);
+int __httpclient_async_check_self_invocation(httpclient_t*);
+int __httpclient_self_invoke(httpclient_t*);
+int __httpclient_async_start(httpclient_t*);
+void __httpclient_async_complete(httpclient_t*, int);
+uint64_t __get_current_time_ms(void);
+
+// Async handlers (будут реализованы в httpclienthandlers_async.c)
+int __httpclient_async_read(connection_t* connection);
+int __httpclient_async_write(connection_t* connection);
+int __httpclient_async_close(connection_t* connection);
 
 httpclient_t* httpclient_init(route_methods_e method, const char* url, int timeout) {
     httpclient_t* result = NULL;
@@ -95,6 +117,10 @@ httpclient_t* __httpclient_create() {
         free(client);
         return NULL;
     }
+
+    // Async поля
+    client->async_ctx = NULL;
+    client->send_async = __httpclient_send_async;
 
     return client;
 }
@@ -247,10 +273,10 @@ int __httpclient_create_connection(httpclient_t* client) {
     ctx->request = (request_t*)client->request;
     ctx->response = (response_t*)client->response;
 
-    if (!__httpclient_establish_connection(client)) {
-        log_error("error establish connection\n");
-        return 0;
-    }
+    // if (!__httpclient_establish_connection(client)) {
+    //     log_error("error establish connection\n");
+    //     return 0;
+    // }
 
     return 1;
 }
@@ -476,12 +502,20 @@ int __httpclient_free_connection(httpclient_t* client) {
     connection_t* connection = client->connection;
     if (connection == NULL) return 1;
 
-    connection_client_ctx_t* ctx = connection->ctx;
+    // Для async соединений ctx имеет другую структуру
+    if (connection->type == CONNECTION_TYPE_CLIENT_ASYNC) {
+        // Для async клиента просто закрываем и освобождаем
+        connection->close(connection);
+        connection_free(connection);
+    } else {
+        // Для обычного синхронного клиента
+        connection_client_ctx_t* ctx = connection->ctx;
+        ctx->request = NULL;
+        ctx->response = NULL;
+        connection->close(connection);
+        connection_free(connection);
+    }
 
-    ctx->request = NULL;
-    ctx->response = NULL;
-    connection->close(connection);
-    connection_free(connection);
     client->connection = NULL;
 
     return 1;
@@ -499,4 +533,278 @@ int __httpclient_is_redirect(httpclient_t* client) {
         return CLIENTREDIRECT_ERROR;
 
     return CLIENTREDIRECT_EXIST;
+}
+
+// ============================================================================
+// ASYNC HTTP CLIENT IMPLEMENTATION
+// ============================================================================
+
+// Helper: получить текущее время в миллисекундах
+uint64_t __get_current_time_ms(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
+
+// Создание async контекста
+httpclient_async_ctx_t* __httpclient_async_ctx_create(
+    httpclient_callback_t callback,
+    void* userdata,
+    struct mpxapi* api,
+    struct appconfig* appconfig,
+    int timeout) {
+
+    httpclient_async_ctx_t* ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) return NULL;
+
+    ctx->callback = callback;
+    ctx->userdata = userdata;
+    ctx->api = api;
+    ctx->appconfig = appconfig;
+    ctx->state = ASYNC_STATE_INIT;
+    ctx->timeout_ms = timeout * 1000;  // секунды -> миллисекунды
+    ctx->start_time_ms = 0;
+
+    ctx->write_buffer = malloc(16384);
+    if (!ctx->write_buffer) {
+        free(ctx);
+        return NULL;
+    }
+    ctx->write_buffer_size = 16384;
+    ctx->write_buffer_pos = 0;
+
+    ctx->registered_in_epoll = 0;
+    ctx->write_completed = 0;
+    ctx->read_completed = 0;
+    ctx->is_self_invocation = 0;
+
+    return ctx;
+}
+
+// Освобождение async контекста
+void __httpclient_async_ctx_free(httpclient_async_ctx_t* ctx) {
+    if (!ctx) return;
+    if (ctx->write_buffer) free(ctx->write_buffer);
+    free(ctx);
+}
+
+// Проверка self-invocation
+int __httpclient_async_check_self_invocation(httpclient_t* client) {
+    httpclient_async_ctx_t* ctx = client->async_ctx;
+    struct appconfig* appconfig = ctx->appconfig;
+
+    // Проверить localhost или 127.0.0.1
+    int is_localhost = 0;
+    if (strcmp(client->host, "localhost") == 0 ||
+        strcmp(client->host, "127.0.0.1") == 0) {
+        is_localhost = 1;
+    }
+
+    if (!is_localhost) {
+        return 0;  // Не self-invocation
+    }
+
+    // Проверить порт против серверов
+    server_chain_t* chain = appconfig->server_chain;
+    if (!chain) return 0;
+
+    pthread_mutex_lock(&chain->mutex);
+
+    server_t* server = chain->server;
+    while (server) {
+        if (server->port == client->port) {
+            pthread_mutex_unlock(&chain->mutex);
+            return 1;  // Self-invocation обнаружен!
+        }
+        server = server->next;
+    }
+
+    pthread_mutex_unlock(&chain->mutex);
+    return 0;
+}
+
+// Self-invocation: упрощенная версия - просто возвращаем ошибку
+// TODO: Полная реализация с прямым вызовом route handler
+int __httpclient_self_invoke(httpclient_t* client) {
+    log_info("Self-invocation detected for %s:%d, but direct handler invocation not implemented yet\n",
+             client->host, client->port);
+
+    // Пока просто вызываем callback с ошибкой
+    // В будущем здесь будет поиск route и прямой вызов handler
+    client->response->status_code = 501;  // Not Implemented
+    __httpclient_async_complete(client, 0);
+    return 1;
+}
+
+// Завершение async операции
+void __httpclient_async_complete(httpclient_t* client, int success) {
+    httpclient_async_ctx_t* ctx = client->async_ctx;
+    if (!ctx) return;
+
+    // Удалить из epoll если зарегистрирован
+    if (ctx->registered_in_epoll && client->connection) {
+        ctx->api->control_del(client->connection);
+        ctx->registered_in_epoll = 0;
+    }
+
+    // Закрыть соединение
+    if (client->connection) {
+        __httpclient_free_connection(client);
+    }
+
+    // Установить status_code при ошибке
+    if (!success && client->response->status_code == 0) {
+        client->response->status_code = 500;
+    }
+
+    // Вызвать callback
+    if (ctx->callback) {
+        ctx->callback(client->response, ctx->userdata);
+    }
+
+    // Освободить async_ctx
+    __httpclient_async_ctx_free(ctx);
+    client->async_ctx = NULL;
+}
+
+// Освобождение async connection context
+static void __httpclient_async_connection_ctx_free(void* arg) {
+    connection_client_async_ctx_t* ctx = arg;
+    free(ctx);
+}
+
+// Запуск async операции
+int __httpclient_async_start(httpclient_t* client) {
+    httpclient_async_ctx_t* ctx = client->async_ctx;
+
+    // Self-invocation обработка
+    if (ctx->is_self_invocation) {
+        return __httpclient_self_invoke(client);
+    }
+
+    // Создать соединение (DNS resolve пока синхронный - TODO: async DNS)
+    if (!__httpclient_create_connection(client)) {
+        log_error("Async: failed to create connection\n");
+        __httpclient_async_complete(client, 0);
+        return 0;
+    }
+
+    if (!__httpclient_set_request_uri(client)) {
+        log_error("Async: failed to set request URI\n");
+        __httpclient_async_complete(client, 0);
+        return 0;
+    }
+
+    // Установить socket в non-blocking режим
+    int flags = fcntl(client->connection->fd, F_GETFL, 0);
+    if (flags == -1 || fcntl(client->connection->fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        log_error("Async: failed to set non-blocking mode\n");
+        __httpclient_async_complete(client, 0);
+        return 0;
+    }
+
+    // Создать async connection context
+    connection_client_async_ctx_t* conn_ctx = malloc(sizeof(*conn_ctx));
+    if (!conn_ctx) {
+        log_error("Async: failed to allocate connection context\n");
+        __httpclient_async_complete(client, 0);
+        return 0;
+    }
+
+    conn_ctx->base.reset = NULL;
+    conn_ctx->base.free = __httpclient_async_connection_ctx_free;
+    conn_ctx->api = ctx->api;
+    conn_ctx->client = client;
+    conn_ctx->destroyed = 0;
+    conn_ctx->registered = 0;
+
+    // Заменить ctx в connection (освободить старый client ctx)
+    connection_client_ctx_t* old_ctx = client->connection->ctx;
+    if (old_ctx && old_ctx->base.free) {
+        old_ctx->base.free(old_ctx);
+    }
+
+    client->connection->ctx = conn_ctx;
+    client->connection->type = CONNECTION_TYPE_CLIENT_ASYNC;
+
+    // Установить async handlers
+    client->connection->read = __httpclient_async_read;
+    client->connection->write = __httpclient_async_write;
+    client->connection->close = __httpclient_async_close;
+
+    // Non-blocking connect
+    ctx->state = ASYNC_STATE_CONNECTING;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(client->connection->port);
+    addr.sin_addr.s_addr = client->connection->ip;
+
+    int result = connect(client->connection->fd, (struct sockaddr*)&addr, sizeof(addr));
+    int e = errno;
+    if (result == -1 && errno != EINPROGRESS) {
+        log_error("Async connect error: %d\n", errno);
+        __httpclient_async_complete(client, 0);
+        return 0;
+    }
+
+    // Добавить в epoll (ждем EPOLLOUT для завершения connect)
+    if (!ctx->api->control_add(client->connection, MPXOUT | MPXRDHUP)) {
+        log_error("Async: failed to add to epoll\n");
+        __httpclient_async_complete(client, 0);
+        return 0;
+    }
+
+    ctx->registered_in_epoll = 1;
+    ctx->start_time_ms = __get_current_time_ms();
+    conn_ctx->registered = 1;
+
+    return 1;  // Success: запрос в процессе
+}
+
+// Главная async функция
+int __httpclient_send_async(
+    httpclient_t* client,
+    httpclient_callback_t callback,
+    void* userdata,
+    struct mpxapi* api,
+    struct appconfig* appconfig) {
+
+    if (!client || !callback || !api || !appconfig) {
+        log_error("Async: invalid parameters\n");
+        return 0;
+    }
+
+    // Создать async контекст
+    client->async_ctx = __httpclient_async_ctx_create(
+        callback, userdata, api, appconfig, client->timeout);
+
+    if (!client->async_ctx) {
+        log_error("Async: failed to create async context\n");
+        return 0;
+    }
+
+    // Проверить self-invocation
+    if (__httpclient_async_check_self_invocation(client)) {
+        client->async_ctx->is_self_invocation = 1;
+        log_info("Async: self-invocation detected\n");
+    }
+
+    // Подготовить request
+    if (!__httpclient_try_set_content_length(client)) {
+        log_error("Async: failed to set content length\n");
+        __httpclient_async_ctx_free(client->async_ctx);
+        client->async_ctx = NULL;
+        return 0;
+    }
+
+    if (!__httpclient_set_header_host(client)) {
+        log_error("Async: failed to set host header\n");
+        __httpclient_async_ctx_free(client->async_ctx);
+        client->async_ctx = NULL;
+        return 0;
+    }
+
+    // Запустить async операцию
+    return __httpclient_async_start(client);
 }

@@ -5,6 +5,11 @@
 
 #include "socket.h"
 
+typedef enum connection_type {
+    CONNECTION_TYPE_SERVER = 0,       // Серверное соединение (входящее)
+    CONNECTION_TYPE_CLIENT_ASYNC      // Асинхронное клиентское соединение
+} connection_type_e;
+
 typedef struct {
     void(*free)(void*);
     void(*reset)(void*);
@@ -14,6 +19,7 @@ typedef struct connection {
     int fd;
     char* buffer;
     void* ctx; // connection_ctx_t
+    connection_type_e type; // Тип соединения
 
     SSL* ssl;
     SSL_CTX* ssl_ctx;

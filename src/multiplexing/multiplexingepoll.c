@@ -4,6 +4,7 @@
 
 #include "log.h"
 #include "connection_s.h"
+#include "connection_c_async.h"
 #include "multiplexingepoll.h"
 
 #define EPOLL_MAX_EVENTS 16
@@ -85,8 +86,17 @@ void __mpx_epoll_free(void* arg) {
 
 int __mpx_epoll_control_add(connection_t* connection, int events) {
     int result = __mpx_epoll_control(connection, EPOLL_CTL_ADD, events);
-    connection_server_ctx_t* ctx = connection->ctx;
-    if (result) ctx->listener->api->connection_count++;
+
+    if (result) {
+        // Универсальное обновление счётчика в зависимости от типа
+        if (connection->type == CONNECTION_TYPE_SERVER) {
+            connection_server_ctx_t* ctx = connection->ctx;
+            ctx->listener->api->connection_count++;
+        } else if (connection->type == CONNECTION_TYPE_CLIENT_ASYNC) {
+            connection_client_async_ctx_t* ctx = connection->ctx;
+            ctx->api->connection_count++;
+        }
+    }
 
     return result;
 }
@@ -97,8 +107,17 @@ int __mpx_epoll_control_mod(connection_t* connection, int events) {
 
 int __mpx_epoll_control_del(connection_t* connection) {
     int result = __mpx_epoll_control(connection, EPOLL_CTL_DEL, 0);
-    connection_server_ctx_t* ctx = connection->ctx;
-    if (result) ctx->listener->api->connection_count--;
+
+    if (result) {
+        // Универсальное обновление счётчика в зависимости от типа
+        if (connection->type == CONNECTION_TYPE_SERVER) {
+            connection_server_ctx_t* ctx = connection->ctx;
+            ctx->listener->api->connection_count--;
+        } else if (connection->type == CONNECTION_TYPE_CLIENT_ASYNC) {
+            connection_client_async_ctx_t* ctx = connection->ctx;
+            ctx->api->connection_count--;
+        }
+    }
 
     return result;
 }
@@ -113,18 +132,43 @@ void __mpx_epoll_process_events(appconfig_t* appconfig, void* arg) {
     while (--n >= 0) {
         epoll_event_t* ev = &events[n];
         connection_t* connection = ev->data.ptr;
-        connection_server_ctx_t* ctx = connection->ctx;
 
-        if (atomic_load(&ctx->destroyed) || (ev->events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) || config_shutdown)
+        // Проверка условия закрытия в зависимости от типа соединения
+        int should_close = 0;
+
+        if (connection->type == CONNECTION_TYPE_SERVER) {
+            connection_server_ctx_t* ctx = connection->ctx;
+            should_close = atomic_load(&ctx->destroyed) ||
+                          (ev->events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) ||
+                          config_shutdown;
+        } else if (connection->type == CONNECTION_TYPE_CLIENT_ASYNC) {
+            connection_client_async_ctx_t* ctx = connection->ctx;
+            // Для async клиентов не закрываем при config_shutdown - дожидаемся завершения
+            should_close = ctx->destroyed ||
+                          (ev->events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP));
+        }
+
+        if (should_close)
             goto close;
 
+        // Обработка событий (одинакова для всех типов)
         if (ev->events & EPOLLIN)
             if (!connection->read(connection))
                 goto close;
 
-        if (ev->events & EPOLLOUT || ctx->need_write)
-            if (!connection->write(connection))
-                goto close;
+        if (ev->events & EPOLLOUT) {
+            // Для серверных проверяем need_write, для клиентских всегда вызываем
+            if (connection->type == CONNECTION_TYPE_SERVER) {
+                connection_server_ctx_t* ctx = connection->ctx;
+                if (ctx->need_write)
+                    if (!connection->write(connection))
+                        goto close;
+            } else {
+                // Для клиентских всегда обрабатываем EPOLLOUT
+                if (!connection->write(connection))
+                    goto close;
+            }
+        }
 
         continue;
 
@@ -135,8 +179,22 @@ void __mpx_epoll_process_events(appconfig_t* appconfig, void* arg) {
 }
 
 int __mpx_epoll_control(connection_t* connection, int action, uint32_t flags) {
-    connection_server_ctx_t* ctx = connection->ctx;
-    mpxapi_epoll_t* api = (mpxapi_epoll_t*)ctx->listener->api;
+    // Универсальное получение API в зависимости от типа соединения
+    mpxapi_epoll_t* api = NULL;
+
+    if (connection->type == CONNECTION_TYPE_SERVER) {
+        connection_server_ctx_t* ctx = connection->ctx;
+        api = (mpxapi_epoll_t*)ctx->listener->api;
+    } else if (connection->type == CONNECTION_TYPE_CLIENT_ASYNC) {
+        connection_client_async_ctx_t* ctx = connection->ctx;
+        api = (mpxapi_epoll_t*)ctx->api;
+    }
+
+    if (api == NULL) {
+        log_error("Epoll error: Unable to get API for connection type %d\n", connection->type);
+        return 0;
+    }
+
     epoll_event_t event = {
         .data = {
             .ptr = connection

@@ -4,6 +4,7 @@
 #include "log.h"
 #include "openssl.h"
 #include "connection_s.h"
+#include "connection_c_async.h"
 #include "connection_queue.h"
 #include "multiplexing.h"
 
@@ -73,6 +74,7 @@ connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, uns
     connection->ip = ip;
     connection->port = port;
     connection->ctx = ctx;
+    connection->type = CONNECTION_TYPE_SERVER;  // Установить тип серверного соединения
     connection->ssl = NULL;
     connection->ssl_ctx = NULL;
     connection->buffer = buffer;
@@ -305,4 +307,18 @@ void __ctx_free(void* arg) {
     }
 
     free(ctx);
+}
+
+struct mpxapi* connection_get_api(connection_t* connection) {
+    if (connection == NULL) return NULL;
+
+    // if (connection->type == CONNECTION_TYPE_SERVER) {
+        connection_server_ctx_t* ctx = connection->ctx;
+        return ctx->listener->api;
+    // } else if (connection->type == CONNECTION_TYPE_CLIENT_ASYNC) {
+    //     connection_client_async_ctx_t* ctx = connection->ctx;
+    //     return ctx->api;
+    // }
+
+    return NULL;
 }
