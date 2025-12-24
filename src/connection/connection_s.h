@@ -68,6 +68,8 @@ typedef struct connection_queue_item {
 
 connection_t* connection_s_create(int fd, in_addr_t ip, unsigned short int port, connection_server_ctx_t* ctx, char* buffer, size_t buffer_size);
 connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, unsigned short int port, char* buffer, size_t buffer_size);
+connection_t* connection_s_create_local(server_t* server);
+void connection_s_free_local(connection_t* connection);
 
 int connection_s_lock(connection_t*);
 int connection_s_unlock(connection_t*);

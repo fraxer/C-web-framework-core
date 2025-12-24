@@ -81,6 +81,27 @@ connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, uns
     return connection;
 }
 
+connection_t* connection_s_create_local(server_t* server) {
+    connection_t* connection = connection_s_alloc(NULL, -1, inet_addr("127.0.0.1"), server->port, NULL, 0);
+    if (connection == NULL) return NULL;
+
+    connection_server_ctx_t* ctx = connection->ctx;
+    ctx->server = server;
+
+    connection->close = NULL;
+    connection->read = NULL;
+    connection->write = NULL;
+
+    return connection;
+}
+
+void connection_s_free_local(connection_t* connection) {
+    if (connection == NULL) return;
+
+    __ctx_free(connection->ctx);
+    free(connection);
+}
+
 int connection_s_lock(connection_t* connection) {
     if (connection == NULL) return 0;
 
@@ -241,9 +262,11 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
     ctx->switch_to_protocol.data = NULL;
     ctx->switch_to_protocol.data_free = NULL;
 
-    cqueue_item_t* item = cqueue_first(&listener->servers);
-    if (item)
-        ctx->server = item->data;
+    if (listener != NULL) {
+        cqueue_item_t* item = cqueue_first(&listener->servers);
+        if (item)
+            ctx->server = item->data;
+    }
 
     if (ctx->queue == NULL) {
         free(ctx);
