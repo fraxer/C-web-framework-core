@@ -10,6 +10,11 @@
 #include "httpclienthandlers.h"
 #include "httpclientparser.h"
 #include "httpclient.h"
+#include "appconfig.h"
+#include "server.h"
+#include "httpcontext.h"
+#include "idn_utils.h"
+#include "connection_s.h"
 
 #define HTTPCLIENT_BUFSIZ 16384
 
@@ -34,6 +39,12 @@ int __httpclient_try_set_content_length(httpclient_t*);
 int __httpclient_send_recv_data(httpclient_t*);
 int __httpclient_free_connection(httpclient_t*);
 int __httpclient_is_redirect(httpclient_t*);
+
+int run_middlewares(struct middleware_item* middleware_item, void* ctx);
+
+// Self-invocation detection and direct handler call
+server_t* __httpclient_is_self_invocation(httpclient_t*);
+httpresponse_t* __httpclient_self_invoke(httpclient_t*, server_t*);
 
 httpclient_t* httpclient_init(route_methods_e method, const char* url, int timeout) {
     httpclient_t* result = NULL;
@@ -188,6 +199,10 @@ httpresponse_t* __httpclient_send(httpclient_t* client) {
 
     if (!__httpclient_set_header_host(client))
         goto failed;
+
+    server_t* self_server = __httpclient_is_self_invocation(client);
+    if (self_server != NULL)
+        return __httpclient_self_invoke(client, self_server);
 
     if (!__httpclient_create_connection(client))
         goto failed;
@@ -466,8 +481,11 @@ int __httpclient_try_set_content_length(httpclient_t* client) {
 }
 
 int __httpclient_send_recv_data(httpclient_t* client) {
-    client->connection->write(client->connection);
-    client->connection->read(client->connection);
+    if (!client->connection->write(client->connection))
+        return 0;
+
+    if (!client->connection->read(client->connection))
+        return 0;
 
     return 1;
 }
@@ -499,4 +517,140 @@ int __httpclient_is_redirect(httpclient_t* client) {
         return CLIENTREDIRECT_ERROR;
 
     return CLIENTREDIRECT_EXIST;
+}
+
+server_t* __httpclient_is_self_invocation(httpclient_t* client) {
+    appconfig_t* config = appconfig();
+    if (!config || !config->server_chain) {
+        log_error("Invalid appconfig\n");
+        return NULL;
+    }
+
+    const char* host = client->host;
+    if (!host) {
+        log_error("Invalid domain in client host\n");
+        return NULL;
+    }
+
+    // Convert to ASCII/Punycode for matching
+    char* ascii_host = idn_to_ascii(host);
+    if (ascii_host == NULL) {
+        log_warning("Invalid domain in client host: %s\n", host);
+        return NULL;
+    }
+
+    const size_t ascii_length = strlen(ascii_host);
+    const int vector_struct_size = 6;
+    const int substring_count = 20;
+    const int vector_size = substring_count * vector_struct_size;
+    int ovector[vector_size];
+    server_t* found_server = NULL;
+    server_t* server = config->server_chain->server;
+    while (server) {
+        if (server->port != client->port) {
+            server = server->next;
+            continue;
+        }
+
+        domain_t* server_domain = server->domain;
+        while (server_domain) {
+            const int matches_count = pcre_exec(server_domain->pcre_template, NULL, ascii_host, ascii_length, 0, 0, ovector, vector_size);
+            if (matches_count > 0) {
+                found_server = server;  // Self-invocation detected
+                goto cleanup;
+            }
+
+            server_domain = server_domain->next;
+        }
+
+        server = server->next;
+    }
+
+    cleanup:
+
+    free(ascii_host);
+
+    return found_server;
+}
+
+httpresponse_t* __httpclient_self_invoke(httpclient_t* client, server_t* server) {
+    if (server == NULL) {
+        log_error("Self-invoke: server is NULL\n");
+        client->response->status_code = 500;
+        return client->response;
+    }
+
+    if (!__httpclient_set_request_uri(client)) {
+        log_error("Self-invoke: failed to set request URI\n");
+        client->response->status_code = 500;
+        return client->response;
+    }
+
+    const char* path = client->request->path;
+    if (path == NULL) {
+        log_error("Self-invoke: URI not found\n");
+        client->response->status_code = 500;
+        return client->response;
+    }
+
+    const int vector_struct_size = 6;
+    const int substring_count = 20;
+    const int vector_size = substring_count * vector_struct_size;
+    route_t* route = server->http.route;
+    route_t* matched_route = NULL;
+
+    while (route) {
+        if (route->is_primitive) {
+            if (route_compare_primitive(route, path, strlen(path))) {
+                matched_route = route;
+                break;
+            }
+        } else {
+            int ovector[vector_size];
+            int rc = pcre_exec(route->location, NULL, path, strlen(path), 0, 0, ovector, vector_size);
+            if (rc >= 0) {
+                matched_route = route;
+                break;
+            }
+        }
+        route = route->next;
+    }
+
+    if (!matched_route) {
+        log_error("Self-invoke: route not found for %s\n", path);
+        client->response->status_code = 404;
+        return client->response;
+    }
+
+    void(*handler)(void*) = matched_route->handler[client->method];
+    if (handler == NULL) {
+        log_error("Self-invoke: handler not found for method %d\n", client->method);
+        client->response->status_code = 405;
+        return client->response;
+    }
+
+    connection_t* connection = connection_s_create_local(server);
+    if (connection == NULL) {
+        log_error("Self-invoke: failed to create local connection\n");
+        client->response->status_code = 500;
+        return client->response;
+    }
+
+    client->request->connection = connection;
+    client->response->connection = connection;
+
+    httpctx_t ctx;
+    httpctx_init(&ctx, client->request, client->response);
+
+    if (run_middlewares(server->http.middleware, &ctx))
+        handler(&ctx);
+
+    httpctx_clear(&ctx);
+
+    client->request->connection = NULL;
+    client->response->connection = NULL;
+
+    connection_s_free_local(connection);
+
+    return client->response;
 }
