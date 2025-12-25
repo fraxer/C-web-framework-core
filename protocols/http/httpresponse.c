@@ -726,8 +726,10 @@ void httpresponse_redirect(httpresponse_t* response, const char* path, int statu
 }
 
 int __httpresponse_alloc_body(httpresponse_t* response, const char* data, size_t length) {
-    if (!bufo_alloc(&response->body, length)) return 0;
+    if (!bufo_alloc(&response->body, length + 1)) return 0; // +1 for \0 only for http client
     if (bufo_append(&response->body, data, length) < 0) return 0;
+
+    response->body.data[response->body.size] = 0;
 
     bufo_reset_pos(&response->body);
 
@@ -903,6 +905,15 @@ void __httpresponse_payload_parse_plain(httpresponse_t* response) {
 }
 
 char* __httpresponse_payload(httpresponse_t* response) {
+    if (response->body.size > 0) {
+        char* buffer = malloc(response->body.size + 1); // body already has \0
+        if (buffer == NULL) return NULL;
+
+        memcpy(buffer, response->body.data, response->body.size + 1);
+
+        return buffer;
+    }
+
     __httpresponse_payload_parse_plain(response);
 
     http_payloadpart_t* part = response->payload_.part;
