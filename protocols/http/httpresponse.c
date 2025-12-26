@@ -20,6 +20,7 @@
 #include "json.h"
 #include "model.h"
 #include "str.h"
+#include "threadpool.h"
 
 static void __httpresponse_data(httpresponse_t* response, const char* data);
 static void __httpresponse_datan(httpresponse_t* response, const char* data, size_t length);
@@ -66,7 +67,7 @@ void httpresponse_free(void* arg) {
     filters_free(response->filter);
     httpresponseparser_free(response->parser);
 
-    free(response);
+    tpool_free(POOL_HTTPRESPONSE, response);
 }
 
 int __httpresponse_init_parser(httpresponse_t* response) {
@@ -99,7 +100,7 @@ void __httpresponse_view(httpresponse_t* response, json_doc_t* document, const c
 }
 
 httpresponse_t* httpresponse_create(connection_t* connection) {
-    httpresponse_t* response = malloc(sizeof * response);
+    httpresponse_t* response = tpool_alloc(POOL_HTTPRESPONSE);
     if (response == NULL) return NULL;
 
     response->status_code = 200;
@@ -143,7 +144,7 @@ httpresponse_t* httpresponse_create(connection_t* connection) {
     bufo_init(&response->body);
 
     if (!__httpresponse_init_parser(response)) {
-        free(response);
+        tpool_free(POOL_HTTPRESPONSE, response);
         return NULL;
     }
 

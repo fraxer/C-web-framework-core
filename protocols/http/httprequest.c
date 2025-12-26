@@ -18,6 +18,7 @@
 #include "multipartparser.h"
 #include "log.h"
 #include "httprequest.h"
+#include "threadpool.h"
 
 static const size_t boundary_size = 30;
 
@@ -64,7 +65,7 @@ void httprequest_init_payload(httprequest_t* request) {
 }
 
 httprequest_t* httprequest_alloc() {
-    return (httprequest_t*)malloc(sizeof(httprequest_t));
+    return tpool_alloc(POOL_HTTPREQUEST);
 }
 
 void httprequest_free(void* arg) {
@@ -72,7 +73,7 @@ void httprequest_free(void* arg) {
 
     httprequest_reset(request);
 
-    free(request);
+    tpool_free(POOL_HTTPREQUEST, request);
 }
 
 httprequest_t* httprequest_create(connection_t* connection) {

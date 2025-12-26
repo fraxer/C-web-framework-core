@@ -2,6 +2,7 @@
 
 #include "connection.h"
 #include "openssl.h"
+#include "threadpool.h"
 
 void connection_reset(connection_t* connection) {
     if (connection == NULL) return;
@@ -24,7 +25,7 @@ void connection_free(connection_t* connection) {
 
     ctx->free(ctx);
 
-    free(connection);
+    tpool_free(POOL_CONNECTION, connection);
 }
 
 ssize_t connection_data_read(connection_t* connection) {

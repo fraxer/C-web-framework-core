@@ -6,6 +6,7 @@
 #include "connection_s.h"
 #include "connection_queue.h"
 #include "multiplexing.h"
+#include "threadpool.h"
 
 void broadcast_clear(connection_t*);
 void httpparser_free(void*);
@@ -59,12 +60,12 @@ connection_t* connection_s_create(int fd, in_addr_t ip, unsigned short int port,
 }
 
 connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, unsigned short int port, char* buffer, size_t buffer_size) {
-    connection_t* connection = malloc(sizeof * connection);
+    connection_t* connection = tpool_alloc(POOL_CONNECTION);
     if (connection == NULL) return NULL;
 
     connection_server_ctx_t* ctx = __ctx_create(listener);
     if (ctx == NULL) {
-        free(connection);
+        tpool_free(POOL_CONNECTION, connection);
         return NULL;
     }
 
@@ -99,7 +100,7 @@ void connection_s_free_local(connection_t* connection) {
     if (connection == NULL) return;
 
     __ctx_free(connection->ctx);
-    free(connection);
+    tpool_free(POOL_CONNECTION, connection);
 }
 
 int connection_s_lock(connection_t* connection) {
@@ -241,7 +242,7 @@ int connection_close(connection_t* connection) {
 }
 
 connection_server_ctx_t* __ctx_create(listener_t* listener) {
-    connection_server_ctx_t* ctx = malloc(sizeof * ctx);
+    connection_server_ctx_t* ctx = tpool_alloc(POOL_CONNECTION_SERVER_CTX);
     if (ctx == NULL) return NULL;
 
     ctx->base.reset = __ctx_reset;
@@ -269,12 +270,12 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
     }
 
     if (ctx->queue == NULL) {
-        free(ctx);
+        tpool_free(POOL_CONNECTION_SERVER_CTX, ctx);
         return NULL;
     }
     if (ctx->broadcast_queue == NULL) {
         cqueue_free(ctx->queue);
-        free(ctx);
+        tpool_free(POOL_CONNECTION_SERVER_CTX, ctx);
         return NULL;
     }
 
@@ -327,5 +328,5 @@ void __ctx_free(void* arg) {
         ctx->response = NULL;
     }
 
-    free(ctx);
+    tpool_free(POOL_CONNECTION_SERVER_CTX, ctx);
 }

@@ -5,6 +5,7 @@
 #include "helpers.h"
 #include "str.h"
 #include "queryparser.h"
+#include "threadpool.h"
 
 queryparser_result_t queryparser_parse(
     const char* string,
@@ -101,7 +102,7 @@ queryparser_result_t queryparser_parse(
 }
 
 query_t* query_create(const char* key, size_t key_length, const char* value, size_t value_length) {
-    query_t* query = malloc(sizeof * query);
+    query_t* query = tpool_alloc(POOL_QUERY);
 
     if (query == NULL) return NULL;
 
@@ -121,7 +122,7 @@ query_t* query_create(const char* key, size_t key_length, const char* value, siz
 void query_free(query_t* query) {
     free((void*)query->key);
     free((void*)query->value);
-    free(query);
+    tpool_free(POOL_QUERY, query);
 }
 
 void queries_free(query_t* query) {
