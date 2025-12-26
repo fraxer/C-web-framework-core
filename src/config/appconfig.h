@@ -83,7 +83,7 @@ void appconfig_lock(appconfig_t* config);
 void appconfig_unlock(appconfig_t* config);
 void appconfg_threads_wait(appconfig_t* config);
 void appconfg_threads_increment(appconfig_t* config);
-void appconfg_threads_decrement(appconfig_t* config);
+int appconfg_threads_decrement(appconfig_t* config);
 void appconfig_set_after_run_threads_cb(void (*appconfig_after_run_threads_cb)(void));
 
 const char* env_get_string(const char* key);

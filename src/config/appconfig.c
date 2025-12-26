@@ -177,15 +177,19 @@ void appconfg_threads_increment(appconfig_t* config) {
     atomic_fetch_add(&config->threads_count, 1);
 }
 
-void appconfg_threads_decrement(appconfig_t* config) {
-    atomic_fetch_sub(&config->threads_count, 1);
+int appconfg_threads_decrement(appconfig_t* config) {
+    int prev_count = atomic_fetch_sub(&config->threads_count, 1);
 
-    if (atomic_load(&config->threads_count) == 0) {
+    // prev_count == 1 means we decremented from 1 to 0 (we're the last thread)
+    if (prev_count == 1) {
         if (__appconfig == config)
             __appconfig = NULL;
 
         appconfig_free(config);
+        return 1; // Was last thread, config freed
     }
+
+    return 0; // Not last thread
 }
 
 void __appconfig_env_init(env_t* env) {

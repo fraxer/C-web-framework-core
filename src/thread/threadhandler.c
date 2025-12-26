@@ -47,9 +47,9 @@ void* thread_handler(void* arg) {
             connection_s_unlock(connection);
     }
 
-    appconfg_threads_decrement(appconfig);
-
-    json_manager_free();
+    const int was_last = appconfg_threads_decrement(appconfig);
+    if (was_last)
+        json_manager_free();
 
     pthread_exit(NULL);
 }

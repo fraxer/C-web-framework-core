@@ -7,6 +7,7 @@
 #include "json.h"
 #include "multiplexingserver.h"
 #include "threadworker.h"
+#include "threadpool.h"
 
 static void(*__thread_worker_threads_pause)(appconfig_t* config) = NULL;
 static void(*__thread_worker_threads_shutdown)(void) = NULL;
@@ -14,18 +15,31 @@ static void(*__thread_worker_threads_shutdown)(void) = NULL;
 void* thread_worker(void* arg) {
     appconfig_t* appconfig = arg;
 
+    /* Initialize thread-local object pools */
+    tpool_thread_init();
+
     appconfg_threads_increment(appconfig);
     appconfg_threads_wait(appconfig);
 
     if (!mpxserver_run(appconfig, __thread_worker_threads_pause)) {
         __thread_worker_threads_shutdown();
-        appconfg_threads_decrement(appconfig);
+        const int was_last = appconfg_threads_decrement(appconfig);
+        if (was_last)
+            json_manager_free();
+
+        tpool_thread_destroy();
         pthread_exit(NULL);
     }
 
-    appconfg_threads_decrement(appconfig);
+    // json_manager_free() must be called BEFORE decrement if we're NOT the last thread,
+    // but we can't know that ahead of time. The thread that allocated config tokens
+    // must keep its manager alive until config is freed by the last thread.
+    // Solution: Let appconfg_threads_decrement handle json_manager_free for the last thread.
+    const int was_last = appconfg_threads_decrement(appconfig);
+    if (was_last)
+        json_manager_free();
 
-    json_manager_free();
+    tpool_thread_destroy();
 
     pthread_exit(NULL);
 }
