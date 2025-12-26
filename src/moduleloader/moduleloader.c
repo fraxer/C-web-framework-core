@@ -42,6 +42,7 @@
 #endif
 
 #include "moduleloader.h"
+#include "threadpool.h"
 
 static atomic_bool __module_loader_wait_signal = ATOMIC_VAR_INIT(0);
 
@@ -80,6 +81,9 @@ int module_loader_init(appconfig_t* config) {
     int result = 0;
 
     appconfig_set_after_run_threads_cb(module_loader_signal_unlock);
+
+    /* Initialize thread-local object pools before creating worker threads */
+    tpool_init_defaults();
 
     if (!prepare_statements_init()) {
         log_error("module_loader_init: failed to initialize prepared statements\n");

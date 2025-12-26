@@ -5,13 +5,14 @@
 #include "str.h"
 #include "helpers.h"
 #include "httpcommon.h"
+#include "threadpool.h"
 
 http_header_t* http_header_alloc();
 http_cookie_t* http_cookie_alloc();
 
 
 http_header_t* http_header_alloc() {
-    return malloc(sizeof(http_header_t));
+    return tpool_alloc(POOL_HTTP_HEADER);
 }
 
 http_header_t* http_header_create(const char* key, size_t key_length, const char* value, size_t value_length) {
@@ -41,7 +42,7 @@ void http_header_free(http_header_t* header) {
     if (header->value)
         free((void*)header->value);
 
-    free(header);
+    tpool_free(POOL_HTTP_HEADER, header);
 }
 
 void http_headers_free(http_header_t* header) {
@@ -83,7 +84,7 @@ http_header_t* http_header_delete(http_header_t* header, const char* key) {
 }
 
 http_payloadpart_t* http_payloadpart_create() {
-    http_payloadpart_t* part = malloc(sizeof * part);
+    http_payloadpart_t* part = tpool_alloc(POOL_HTTP_PAYLOADPART);
     if (part == NULL) return NULL;
 
     part->field = NULL;
@@ -108,14 +109,14 @@ void http_payloadpart_free(http_payloadpart_t* part) {
             header = next;
         }
 
-        free(part);
+        tpool_free(POOL_HTTP_PAYLOADPART, part);
 
         part = next;
     }
 }
 
 http_payloadfield_t* http_payloadfield_create() {
-    http_payloadfield_t* field = malloc(sizeof * field);
+    http_payloadfield_t* field = tpool_alloc(POOL_HTTP_PAYLOADFIELD);
     if (field == NULL) return NULL;
     field->key = NULL;
     field->key_length = 0;
@@ -131,14 +132,14 @@ void http_payloadfield_free(http_payloadfield_t* field) {
 
         if (field->key) free(field->key);
         if (field->value) free(field->value);
-        free(field);
+        tpool_free(POOL_HTTP_PAYLOADFIELD, field);
 
         field = next;
     }
 }
 
 http_cookie_t* http_cookie_alloc() {
-    return malloc(sizeof(http_cookie_t));
+    return tpool_alloc(POOL_HTTP_HEADER);  /* http_cookie_t is same as http_header_t */
 }
 
 http_cookie_t* http_cookie_create() {
@@ -161,7 +162,7 @@ void http_cookie_free(http_cookie_t* cookie) {
 
         if (cookie->key) free(cookie->key);
         if (cookie->value) free(cookie->value);
-        if (cookie) free(cookie);
+        tpool_free(POOL_HTTP_HEADER, cookie);
 
         cookie = next;
     }
