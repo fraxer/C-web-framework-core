@@ -17,16 +17,16 @@
 #include "queryparser.h"
 
 /* Default max cached objects per thread per type */
-#define DEFAULT_MAX_CONNECTION           64
-#define DEFAULT_MAX_CONNECTION_CTX       64
-#define DEFAULT_MAX_CQUEUE              128
-#define DEFAULT_MAX_HTTPREQUEST          64
-#define DEFAULT_MAX_HTTPRESPONSE         64
-#define DEFAULT_MAX_HTTP_HEADER         512   /* Many headers per request */
+#define DEFAULT_MAX_CONNECTION         1024
+#define DEFAULT_MAX_CONNECTION_CTX     1024
+#define DEFAULT_MAX_CQUEUE             1024
+#define DEFAULT_MAX_HTTPREQUEST        1024
+#define DEFAULT_MAX_HTTPRESPONSE       1024
+#define DEFAULT_MAX_HTTP_HEADER        1024   /* Many headers per request */
 #define DEFAULT_MAX_CQUEUE_ITEM        1024   /* High frequency */
-#define DEFAULT_MAX_QUERY               256
-#define DEFAULT_MAX_PAYLOADPART         128
-#define DEFAULT_MAX_PAYLOADFIELD        128
+#define DEFAULT_MAX_QUERY              1024
+#define DEFAULT_MAX_PAYLOADPART        1024
+#define DEFAULT_MAX_PAYLOADFIELD       1024
 
 void tpool_init_defaults(void) {
     tpool_register(POOL_CONNECTION,
