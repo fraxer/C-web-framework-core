@@ -46,6 +46,7 @@ static void __httpresponse_try_enable_te(httpresponse_t* response, const char* d
 static int __httpresponse_prepare_body(httpresponse_t* response, size_t length);
 static void __httpresponse_cookie_add(httpresponse_t* response, cookie_t cookie);
 static void __httpresponse_payload_free(http_payload_t* payload);
+static void __httpresponse_payload_cache_free(httpresponse_t* response);
 static void __httpresponse_init_payload(httpresponse_t* response);
 static void __httpresponse_payload_parse_plain(httpresponse_t* response);
 static char* __httpresponse_payload(httpresponse_t* response);
@@ -162,6 +163,7 @@ void __httpresponse_reset(httpresponse_t* response) {
     response->cur_filter = response->filter;
 
     __httpresponse_payload_free(&response->payload_);
+    __httpresponse_payload_cache_free(response);
 
     response->file_.close(&response->file_);
 
@@ -881,6 +883,18 @@ void __httpresponse_payload_free(http_payload_t* payload) {
     payload->part = NULL;
 }
 
+void __httpresponse_payload_cache_free(httpresponse_t* response) {
+    if (response->cached_payload_ != NULL) {
+        free(response->cached_payload_);
+        response->cached_payload_ = NULL;
+    }
+
+    if (response->cached_payload_json_ != NULL) {
+        json_free(response->cached_payload_json_);
+        response->cached_payload_json_ = NULL;
+    }
+}
+
 void __httpresponse_init_payload(httpresponse_t* response) {
     response->payload_.pos = 0;
     response->payload_.file = file_alloc();
@@ -888,6 +902,9 @@ void __httpresponse_init_payload(httpresponse_t* response) {
     response->payload_.part = NULL;
     response->payload_.boundary = NULL;
     response->payload_.type = NONE;
+
+    response->cached_payload_ = NULL;
+    response->cached_payload_json_ = NULL;
 
     response->get_payload = __httpresponse_payload;
     response->get_payload_file = __httpresponse_payload_file;
@@ -905,34 +922,39 @@ void __httpresponse_payload_parse_plain(httpresponse_t* response) {
 }
 
 char* __httpresponse_payload(httpresponse_t* response) {
+    if (response->cached_payload_ != NULL) {
+        return response->cached_payload_;
+    }
+
+    char* buffer = NULL;
+
     if (response->body.size > 0) {
-        char* buffer = malloc(response->body.size + 1); // body already has \0
+        buffer = malloc(response->body.size + 1); // body already has \0
         if (buffer == NULL) return NULL;
 
         memcpy(buffer, response->body.data, response->body.size + 1);
+    } else {
+        __httpresponse_payload_parse_plain(response);
 
-        return buffer;
+        http_payloadpart_t* part = response->payload_.part;
+        if (part == NULL) return NULL;
+
+        buffer = malloc(part->size + 1);
+        if (buffer == NULL) return NULL;
+
+        lseek(response->payload_.file.fd, part->offset, SEEK_SET);
+        int r = read(response->payload_.file.fd, buffer, part->size);
+        lseek(response->payload_.file.fd, 0, SEEK_SET);
+
+        buffer[part->size] = 0;
+
+        if (r < 0) {
+            free(buffer);
+            return NULL;
+        }
     }
 
-    __httpresponse_payload_parse_plain(response);
-
-    http_payloadpart_t* part = response->payload_.part;
-    if (part == NULL) return NULL;
-
-    char* buffer = malloc(part->size + 1);
-    if (buffer == NULL) return NULL;
-
-    lseek(response->payload_.file.fd, part->offset, SEEK_SET);
-    int r = read(response->payload_.file.fd, buffer, part->size);
-    lseek(response->payload_.file.fd, 0, SEEK_SET);
-
-    buffer[part->size] = 0;
-
-    if (r < 0) {
-        free(buffer);
-        return NULL;
-    }
-
+    response->cached_payload_ = buffer;
     return buffer;
 }
 
@@ -965,12 +987,16 @@ file_content_t __httpresponse_payload_file(httpresponse_t* response) {
 }
 
 json_doc_t* __httpresponse_payload_json(httpresponse_t* response) {
+    if (response->cached_payload_json_ != NULL) {
+        return response->cached_payload_json_;
+    }
+
     char* payload = __httpresponse_payload(response);
     if (payload == NULL) return NULL;
 
     json_doc_t* document = json_parse(payload);
 
-    free(payload);
+    response->cached_payload_json_ = document;
 
     return document;
 }

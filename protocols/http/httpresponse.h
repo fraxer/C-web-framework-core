@@ -230,6 +230,9 @@ typedef struct httpresponse {
     http_version_e version;
     http_payload_t payload_;
 
+    char* cached_payload_;
+    json_doc_t* cached_payload_json_;
+
     short status_code;
 
     unsigned transfer_encoding : 3;
