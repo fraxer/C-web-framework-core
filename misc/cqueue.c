@@ -2,9 +2,10 @@
 #include <stdlib.h>
 
 #include "cqueue.h"
+#include "threadpool.h"
 
 cqueue_t* cqueue_create() {
-    cqueue_t* queue = malloc(sizeof * queue);
+    cqueue_t* queue = tpool_alloc(POOL_CQUEUE);
     if (queue == NULL) return NULL;
 
     cqueue_init(queue);
@@ -27,7 +28,7 @@ void cqueue_free(cqueue_t* queue) {
 
 void cqueue_freecb(cqueue_t* queue, void(*free_cb)(void*)) {
     cqueue_clearcb(queue, free_cb);
-    free(queue);
+    tpool_free(POOL_CQUEUE, queue);
 }
 
 int cqueue_append(cqueue_t* queue, void* data) {
@@ -164,7 +165,7 @@ void cqueue_clearcb(cqueue_t* queue, void (*free_cb)(void *)) {
 }
 
 cqueue_item_t* cqueue_item_create(void* data) {
-    cqueue_item_t* item = malloc(sizeof * item);
+    cqueue_item_t* item = tpool_alloc(POOL_CQUEUE_ITEM);
     if (item == NULL) return NULL;
 
     item->data = data;
@@ -176,5 +177,5 @@ cqueue_item_t* cqueue_item_create(void* data) {
 void cqueue_item_free(cqueue_item_t* item) {
     if (item == NULL) return;
 
-    free(item);
+    tpool_free(POOL_CQUEUE_ITEM, item);
 }
