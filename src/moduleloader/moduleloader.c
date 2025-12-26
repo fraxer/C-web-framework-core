@@ -81,6 +81,11 @@ int module_loader_init(appconfig_t* config) {
 
     appconfig_set_after_run_threads_cb(module_loader_signal_unlock);
 
+    if (!broadcast_pool_init()) {
+        log_error("module_loader_init: failed to initialize broadcast pool\n");
+        goto failed;
+    }
+
     if (!prepare_statements_init()) {
         log_error("module_loader_init: failed to initialize prepared statements\n");
         goto failed;

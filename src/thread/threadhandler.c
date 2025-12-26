@@ -8,10 +8,14 @@
 #include "threadhandler.h"
 #include "connection_queue.h"
 
+#define BROADCAST_BATCH_SIZE 16
+
 static void(*__thread_handler_threads_pause)(appconfig_t* config) = NULL;
 
 void* thread_handler(void* arg) {
     appconfig_t* appconfig = arg;
+    connection_queue_item_t* batch[BROADCAST_BATCH_SIZE];
+
     appconfg_threads_increment(appconfig);
     appconfg_threads_wait(appconfig);
 
@@ -33,13 +37,22 @@ void* thread_handler(void* arg) {
             item->run(item);
             item->free(item);
         } else {
+            // Batch processing for broadcast queue
             cqueue_lock(ctx->broadcast_queue);
-            item = cqueue_pop(ctx->broadcast_queue);
+
+            size_t batch_count = 0;
+            while (batch_count < BROADCAST_BATCH_SIZE) {
+                item = cqueue_pop(ctx->broadcast_queue);
+                if (!item) break;
+                batch[batch_count++] = item;
+            }
+
             cqueue_unlock(ctx->broadcast_queue);
 
-            if (item != NULL) {
-                item->run(item);
-                item->free(item);
+            // Process batch without holding the lock
+            for (size_t i = 0; i < batch_count; i++) {
+                batch[i]->run(batch[i]);
+                batch[i]->free(batch[i]);
             }
         }
 

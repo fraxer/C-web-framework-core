@@ -3,9 +3,45 @@
 
 #include <stddef.h>
 #include <stdatomic.h>
+#include <pthread.h>
 
 #include "connection_queue.h"
 #include "connection_s.h"
+
+/**
+ * Shared broadcast payload with reference counting.
+ * Single allocation shared between all subscribers.
+ */
+typedef struct broadcast_payload {
+    /** Atomic reference counter */
+    atomic_int ref_count;
+
+    /** Payload size in bytes */
+    size_t size;
+
+    /** Flexible array member for payload data */
+    char data[];
+} broadcast_payload_t;
+
+/**
+ * Creates shared payload with initial reference count of 1.
+ * @param data  Source data to copy
+ * @param size  Data size in bytes
+ * @return Pointer to created payload, NULL on error
+ */
+broadcast_payload_t* broadcast_payload_create(const char* data, size_t size);
+
+/**
+ * Increments payload reference count.
+ * @param payload  Payload to reference
+ */
+void broadcast_payload_ref(broadcast_payload_t* payload);
+
+/**
+ * Decrements payload reference count. Frees when count reaches 0.
+ * @param payload  Payload to unreference
+ */
+void broadcast_payload_unref(broadcast_payload_t* payload);
 
 /**
  * Base structure for broadcast subscriber identifier.
@@ -30,30 +66,30 @@ typedef struct broadcast_item {
 
     /** Handler for forming response to subscriber */
     void(*response_handler)(response_t* response, const char* payload, size_t size);
-
-    /** Lock flag for thread-safe access */
-    atomic_bool locked;
-
-    /** Next item in linked list */
-    struct broadcast_item* next;
 } broadcast_item_t;
+
+/** Initial capacity for subscribers array */
+#define BROADCAST_LIST_INITIAL_CAPACITY 16
 
 /**
  * Named broadcast channel.
- * Contains list of subscribers (broadcast_item_t).
+ * Contains array of subscribers (broadcast_item_t).
  */
 typedef struct broadcast_list {
     /** Unique channel name (e.g., "chat", "notifications") */
     char* name;
 
-    /** Lock flag for thread-safe access */
-    atomic_bool locked;
+    /** Read-write lock for thread-safe access */
+    pthread_rwlock_t rwlock;
 
-    /** First item in subscribers list */
-    broadcast_item_t* item;
+    /** Dynamic array of subscriber pointers */
+    broadcast_item_t** items;
 
-    /** Last item in subscribers list (for fast append) */
-    broadcast_item_t* item_last;
+    /** Current number of subscribers */
+    size_t count;
+
+    /** Current array capacity */
+    size_t capacity;
 
     /** Next channel in linked list */
     struct broadcast_list* next;
@@ -64,8 +100,8 @@ typedef struct broadcast_list {
  * Contains list of all server broadcast channels.
  */
 typedef struct broadcast {
-    /** Lock flag for thread-safe access */
-    atomic_bool locked;
+    /** Read-write lock for thread-safe access to channel list */
+    pthread_rwlock_t rwlock;
 
     /** First channel in list */
     broadcast_list_t* list;
@@ -75,10 +111,23 @@ typedef struct broadcast {
 } broadcast_t;
 
 /**
+ * Initializes broadcast data object pool.
+ * Must be called once before using broadcast system.
+ * @return 1 on success, 0 on memory allocation error
+ */
+int broadcast_pool_init(void);
+
+/**
+ * Frees broadcast data object pool.
+ * Should be called on server shutdown.
+ */
+void broadcast_pool_free(void);
+
+/**
  * Creates and initializes root broadcast structure.
  * @return Pointer to created structure, NULL on memory allocation error
  */
-broadcast_t* broadcast_init();
+broadcast_t* broadcast_init(void);
 
 /**
  * Frees all broadcast system resources.

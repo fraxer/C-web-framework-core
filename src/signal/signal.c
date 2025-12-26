@@ -18,6 +18,7 @@
 #include "moduleloader.h"
 #include "signal.h"
 #include "appconfig.h"
+#include "broadcast.h"
 
 int wait = 0;
 
@@ -75,6 +76,7 @@ void signal_before_segmentation_fault(__attribute__((unused))int s) {
 void signal_before_terminate(__attribute__((unused))int s) {
     signal_flush_streams();
     log_error("[signal_before_terminate] Запрос на прекращение работы\n");
+    broadcast_pool_free();
     exit(0);
 }
 
