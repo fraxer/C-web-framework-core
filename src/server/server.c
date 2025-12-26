@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <pthread.h>
+#include <time.h>
 
 #include "log.h"
 #include "server.h"
@@ -31,6 +32,7 @@ server_t* server_create() {
     server->openssl = NULL;
     server->broadcast = NULL;
     server->ratelimits_config = NULL;
+    server->stat_cache = NULL;
     server->next = NULL;
 
     return server;
@@ -83,6 +85,8 @@ void servers_free(server_t* server) {
 
         if (server->ratelimits_config) map_free(server->ratelimits_config);
         server->ratelimits_config = NULL;
+
+        server_stat_cache_free(server);
 
         server->next = NULL;
 
@@ -156,4 +160,66 @@ void server_chain_destroy(server_chain_t* server_chain) {
     routeloader_free(server_chain->routeloader);
 
     free(server_chain);
+}
+
+// Stat cache implementation
+
+static void stat_cache_entry_free(void* entry) {
+    free(entry);
+}
+
+int server_stat_cache_init(server_t* server) {
+    if (server->stat_cache != NULL) return 1;
+
+    server->stat_cache = map_create_ex(
+        map_compare_string,
+        (map_copy_fn)strdup,
+        free,
+        NULL,
+        stat_cache_entry_free
+    );
+
+    return server->stat_cache != NULL;
+}
+
+void server_stat_cache_free(server_t* server) {
+    if (server->stat_cache == NULL) return;
+
+    map_free(server->stat_cache);
+    server->stat_cache = NULL;
+}
+
+stat_cache_entry_t* server_stat_cache_get(server_t* server, const char* path) {
+    if (server->stat_cache == NULL) return NULL;
+
+    stat_cache_entry_t* entry = map_find(server->stat_cache, path);
+    if (entry == NULL) return NULL;
+
+    time_t now = time(NULL);
+    if (now - entry->cached_at > STAT_CACHE_TTL_SEC) {
+        map_erase(server->stat_cache, path);
+        return NULL;
+    }
+
+    return entry;
+}
+
+int server_stat_cache_put(server_t* server, const char* path, const struct stat* st) {
+    if (server->stat_cache == NULL) {
+        if (!server_stat_cache_init(server))
+            return 0;
+    }
+
+    stat_cache_entry_t* entry = malloc(sizeof(stat_cache_entry_t));
+    if (entry == NULL) return 0;
+
+    entry->st = *st;
+    entry->cached_at = time(NULL);
+
+    if (!map_insert_or_assign(server->stat_cache, path, entry)) {
+        free(entry);
+        return 0;
+    }
+
+    return 1;
 }

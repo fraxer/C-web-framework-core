@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
 
 #include "map.h"
 #include "redirect.h"
@@ -48,6 +49,7 @@ typedef struct server {
     openssl_t* openssl;
     map_t* ratelimits_config; // ratelimiter_config_t
     struct broadcast* broadcast;
+    map_t* stat_cache;
     struct server* next;
 } server_t;
 
@@ -64,5 +66,18 @@ void servers_free(server_t* server);
 
 server_chain_t* server_chain_create(server_t* server, routeloader_lib_t*);
 void server_chain_destroy(server_chain_t*);
+
+// Stat cache
+#define STAT_CACHE_TTL_SEC 60
+
+typedef struct stat_cache_entry {
+    struct stat st;
+    time_t cached_at;
+} stat_cache_entry_t;
+
+int server_stat_cache_init(server_t* server);
+void server_stat_cache_free(server_t* server);
+stat_cache_entry_t* server_stat_cache_get(server_t* server, const char* path);
+int server_stat_cache_put(server_t* server, const char* path, const struct stat* st);
 
 #endif

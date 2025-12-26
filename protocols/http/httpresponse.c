@@ -218,6 +218,20 @@ void __httpresponse_filen(httpresponse_t* response, const char* path, size_t len
     http_response_file(response, file_full_path);
 }
 
+static int cached_stat(server_t* server, const char* path, struct stat* stat_obj) {
+    // stat_cache_entry_t* entry = server_stat_cache_get(server, path);
+    // if (entry != NULL) {
+    //     *stat_obj = entry->st;
+    //     return 0;
+    // }
+
+    if (stat(path, stat_obj) == -1)
+        return -1;
+
+    // server_stat_cache_put(server, path, stat_obj);
+    return 0;
+}
+
 file_status_e http_get_file_full_path(server_t* server, char* file_full_path, size_t file_full_path_size, const char* path, size_t length) {
     size_t pos = 0;
 
@@ -234,8 +248,7 @@ file_status_e http_get_file_full_path(server_t* server, char* file_full_path, si
     file_full_path[pos] = 0;
 
     struct stat stat_obj;
-    // TODO: Optimize stat. Make cache.
-    if (stat(file_full_path, &stat_obj) == -1 && errno == ENOENT)
+    if (cached_stat(server, file_full_path, &stat_obj) == -1 && errno == ENOENT)
         return FILE_NOTFOUND;
 
     if (S_ISDIR(stat_obj.st_mode)) {
@@ -252,7 +265,7 @@ file_status_e http_get_file_full_path(server_t* server, char* file_full_path, si
 
         file_full_path[pos] = 0;
 
-        if (stat(file_full_path, &stat_obj) == -1 && errno == ENOENT)
+        if (cached_stat(server, file_full_path, &stat_obj) == -1 && errno == ENOENT)
             return FILE_FORBIDDEN;
 
         if (!S_ISREG(stat_obj.st_mode))
