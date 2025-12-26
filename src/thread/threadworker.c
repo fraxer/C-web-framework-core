@@ -19,13 +19,20 @@ void* thread_worker(void* arg) {
 
     if (!mpxserver_run(appconfig, __thread_worker_threads_pause)) {
         __thread_worker_threads_shutdown();
-        appconfg_threads_decrement(appconfig);
+        const int was_last = appconfg_threads_decrement(appconfig);
+        if (was_last)
+            json_manager_free();
+
         pthread_exit(NULL);
     }
 
-    appconfg_threads_decrement(appconfig);
-
-    json_manager_free();
+    // json_manager_free() must be called BEFORE decrement if we're NOT the last thread,
+    // but we can't know that ahead of time. The thread that allocated config tokens
+    // must keep its manager alive until config is freed by the last thread.
+    // Solution: Let appconfg_threads_decrement handle json_manager_free for the last thread.
+    const int was_last = appconfg_threads_decrement(appconfig);
+    if (was_last)
+        json_manager_free();
 
     pthread_exit(NULL);
 }
