@@ -8,7 +8,7 @@ add_library(${LIB_NAME} STATIC ${SOURCES})
 
 target_include_directories(${LIB_NAME} PUBLIC .)
 
-target_link_libraries(${LIB_NAME} connection config misc -lidn2 -lresolv)
+target_link_libraries(${LIB_NAME} connection config misc taskmanager -lidn2 -lresolv)
 
 MACRO(SUBDIRLIST result curdir)
     FILE(GLOB children RELATIVE ${curdir} ${curdir}/*)
