@@ -31,6 +31,7 @@
 #include "statement_registry.h"
 #include "middleware_registry.h"
 #include "httpserverhandlers.h"
+#include "taskmanager.h"
 #ifdef MySQL_FOUND
     #include "mysql.h"
 #endif
@@ -55,6 +56,7 @@ static void __free_gzip_list(env_gzip_str_t* item) {
 }
 
 static int __module_loader_init_modules(appconfig_t* config, json_doc_t* document);
+static int __module_loader_taskmanager_load(appconfig_t* config, taskmanager_t* manager, const json_token_t* token_taskmanager);
 static int __module_loader_servers_load(appconfig_t* config, const json_token_t* servers);
 static domain_t* __module_loader_domains_load(const json_token_t* token_array);
 static int __module_loader_databases_load(appconfig_t* config, const json_token_t* databases);
@@ -63,6 +65,7 @@ static int __module_loader_mimetype_load(appconfig_t* config, const json_token_t
 static int __module_loader_viewstore_load(appconfig_t* config);
 static int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* sessionconfig);
 static int __module_loader_prepared_queries_load(appconfig_t* config);
+static int __module_loader_taskmanager_init(appconfig_t* config, json_token_t* task_manager);
 
 static int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config);
 static int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config);
@@ -77,8 +80,9 @@ static int __module_loader_check_unique_domainport(server_t* first_server);
 static void* __module_loader_storage_fs_load(const json_token_t* token_object, const char* storage_name);
 static void* __module_loader_storage_s3_load(const json_token_t* token_object, const char* storage_name);
 static const char* __module_loader_storage_field(const char* storage_name, const json_token_t* token_object, const char* key);
-static int __module_loader_thread_workers_load(void);
-static int __module_loader_thread_handlers_load(void);
+static int __module_loader_thread_taskmanager_load(appconfig_t* config);
+static int __module_loader_thread_workers_load(appconfig_t* config);
+static int __module_loader_thread_handlers_load(appconfig_t* config);
 static void __module_loader_on_shutdown_cb(void);
 static map_t* __module_loader_ratelimits_configs_load(const json_token_t* token_object);
 static ratelimiter_config_t* __module_loader_ratelimits_config_load(const json_token_t* token_object);
@@ -87,8 +91,6 @@ static int __module_loader_websockets_ratelimit_load(const json_token_t* token_s
 
 int module_loader_init(appconfig_t* config) {
     int result = 0;
-
-    appconfig_set_after_run_threads_cb(module_loader_signal_unlock);
 
     if (!prepare_statements_init()) {
         log_error("module_loader_init: failed to initialize prepared statements\n");
@@ -189,9 +191,11 @@ int __module_loader_init_modules(appconfig_t* config, json_doc_t* document) {
     if (config->server_chain && config->server_chain->server)
         http_server_init_sni_callbacks(config->server_chain->server);
 
-    if (!__module_loader_thread_workers_load())
+    if (!__module_loader_thread_taskmanager_load(config))
         goto failed;
-    if (!__module_loader_thread_handlers_load())
+    if (!__module_loader_thread_workers_load(config))
+        goto failed;
+    if (!__module_loader_thread_handlers_load(config))
         goto failed;
 
     result = 1;
@@ -525,6 +529,8 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     if (!__module_loader_sessionconfig_load(config, json_object_get(root, "sessions")))
         goto failed;
     if (!__module_loader_prepared_queries_load(config))
+        goto failed;
+    if (!__module_loader_taskmanager_init(config, json_object_get(root, "task_manager")))
         goto failed;
 
 
@@ -1785,31 +1791,6 @@ int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloa
     return 1;
 }
 
-void module_loader_threads_pause(appconfig_t* config) {
-    if (config == NULL) return;
-
-    if (atomic_load(&config->threads_pause) == 0)
-        return;
-
-    appconfig_lock(config);
-
-    atomic_fetch_add(&config->threads_stop_count, 1);
-
-    const int threads_count = config->env.main.threads + config->env.main.workers;
-    if (atomic_load(&config->threads_stop_count) == threads_count) {
-        atomic_store(&config->shutdown, 1);
-        module_loader_create_config_and_init();
-        atomic_store(&config->threads_pause, 0);
-        appconfig_unlock(config);
-        return;
-    }
-
-    appconfig_unlock(config);
-
-    while (atomic_load(&config->threads_pause))
-        usleep(1000);
-}
-
 void module_loader_create_config_and_init(void) {
     appconfig_t* newconfig = appconfig_create(appconfig_path());
     if (newconfig == NULL) {
@@ -1826,7 +1807,6 @@ void module_loader_create_config_and_init(void) {
 void __module_loader_on_shutdown_cb(void) {
     atomic_store(&appconfig()->shutdown, 1);
     module_loader_wakeup_all_threads();
-    module_loader_signal_unlock();
 }
 
 map_t* __module_loader_ratelimits_configs_load(const json_token_t* token_object) {
@@ -2253,27 +2233,282 @@ int __module_loader_check_unique_domainport(server_t* first_server) {
     return 1;
 }
 
-int __module_loader_thread_workers_load(void) {
-    const int count = env()->main.workers;
+int __module_loader_thread_taskmanager_load(appconfig_t* config) {
+    return taskmanager_create_threads(config);
+}
+
+int __module_loader_thread_workers_load(appconfig_t* config) {
+    const int count = config->env.main.workers;
     if (count <= 0) {
         log_error("__module_loader_thread_workers_load: set the number of workers\n");
         return 0;
     }
 
-    thread_worker_set_threads_pause_cb(module_loader_threads_pause);
     thread_worker_set_threads_shutdown_cb(__module_loader_on_shutdown_cb);
 
-    return thread_worker_run(appconfig(), count);
+    return thread_worker_run(config, count);
 }
 
-int __module_loader_thread_handlers_load(void) {
-    const int count = env()->main.threads;
+int __module_loader_thread_handlers_load(appconfig_t* config) {
+    const int count = config->env.main.threads;
     if (count <= 0) {
         log_error("__module_loader_thread_handlers_load: set the number of threads\n");
         return 0;
     }
 
-    thread_handler_set_threads_pause_cb(module_loader_threads_pause);
+    return thread_handler_run(config, count);
+}
 
-    return thread_handler_run(appconfig(), count);
+int __module_loader_taskmanager_init(appconfig_t* config, json_token_t* token_taskmanager) {
+    if (token_taskmanager == NULL)
+        return 1;
+
+    if (!json_is_object(token_taskmanager)) {
+        log_error("__module_loader_taskmanager_init: task_manager must be object\n");
+        return 0;
+    }
+
+    taskmanager_t* manager = taskmanager_init();
+    if (manager == NULL) {
+        log_error("__module_loader_taskmanager_init: failed to initialize taskmanager\n");
+        return 0;
+    }
+
+    config->taskmanager = manager;
+
+    if (!__module_loader_taskmanager_load(config, manager, token_taskmanager)) {
+        log_error("__module_loader_taskmanager_init: failed to load scheduled tasks\n");
+        return 0;
+    }
+
+    return 1;
+}
+
+static int __module_loader_taskmanager_load(appconfig_t* config, taskmanager_t* manager, const json_token_t* token_taskmanager) {
+    const json_token_t* token_schedule = json_object_get(token_taskmanager, "schedule");
+
+    if (token_schedule == NULL) {
+        return 1;
+    }
+
+    if (!json_is_array(token_schedule)) {
+        log_error("__module_loader_taskmanager_load: schedule must be array\n");
+        return 0;
+    }
+
+    routeloader_lib_t* last_lib = routeloader_get_last(config->taskmanager_loader);
+
+    for (int i = 0; i < json_array_size(token_schedule); i++) {
+        const json_token_t* token_task = json_array_get(token_schedule, i);
+
+        if (!json_is_object(token_task)) {
+            log_error("__module_loader_taskmanager_load: task item must be object\n");
+            return 0;
+        }
+
+        const json_token_t* token_name = json_object_get(token_task, "name");
+        if (token_name == NULL || !json_is_string(token_name)) {
+            log_error("__module_loader_taskmanager_load: task name is required and must be string\n");
+            return 0;
+        }
+        const char* name = json_string(token_name);
+
+        const json_token_t* token_type = json_object_get(token_task, "type");
+        if (token_type == NULL || !json_is_string(token_type)) {
+            log_error("__module_loader_taskmanager_load: task type is required and must be string\n");
+            return 0;
+        }
+        const char* type = json_string(token_type);
+
+        const json_token_t* token_file = json_object_get(token_task, "file");
+        if (token_file == NULL || !json_is_string(token_file)) {
+            log_error("__module_loader_taskmanager_load: task file is required and must be string\n");
+            return 0;
+        }
+        const char* lib_file = json_string(token_file);
+
+        const json_token_t* token_function = json_object_get(token_task, "function");
+        if (token_function == NULL || !json_is_string(token_function)) {
+            log_error("__module_loader_taskmanager_load: task function is required and must be string\n");
+            return 0;
+        }
+        const char* function_name = json_string(token_function);
+
+        if (!routeloader_has_lib(config->taskmanager_loader, lib_file)) {
+            routeloader_lib_t* lib = routeloader_load_lib(lib_file);
+            if (lib == NULL) {
+                log_error("__module_loader_taskmanager_load: failed to load library %s\n", lib_file);
+                return 0;
+            }
+
+            if (config->taskmanager_loader == NULL) {
+                config->taskmanager_loader = lib;
+            } else {
+                last_lib->next = lib;
+            }
+            last_lib = lib;
+        }
+
+        void(*handler)(void*);
+        *(void**)(&handler) = routeloader_get_handler(config->taskmanager_loader, lib_file, function_name);
+        if (handler == NULL) {
+            log_error("__module_loader_taskmanager_load: function %s not found in %s\n", function_name, lib_file);
+            return 0;
+        }
+
+        if (strcmp(type, "interval") == 0) {
+            const json_token_t* token_interval = json_object_get(token_task, "interval");
+            if (token_interval == NULL || !json_is_number(token_interval)) {
+                log_error("__module_loader_taskmanager_load: interval is required for interval type\n");
+                return 0;
+            }
+            int ok = 0;
+            int interval = json_int(token_interval, &ok);
+            if (!ok || interval < 1) {
+                log_error("__module_loader_taskmanager_load: interval must be >= 1\n");
+                return 0;
+            }
+
+            if (!taskmanager_schedule(manager, name, interval, handler)) {
+                log_error("__module_loader_taskmanager_load: failed to schedule task %s\n", name);
+                return 0;
+            }
+
+            log_info("taskmanager: loaded scheduled task '%s' (interval: %d sec)\n", name, interval);
+        }
+        else if (strcmp(type, "daily") == 0) {
+            const json_token_t* token_hour = json_object_get(token_task, "hour");
+            if (token_hour == NULL || !json_is_number(token_hour)) {
+                log_error("__module_loader_taskmanager_load: hour is required for daily type\n");
+                return 0;
+            }
+            int ok = 0;
+            int hour = json_int(token_hour, &ok);
+            if (!ok || hour < 0 || hour > 23) {
+                log_error("__module_loader_taskmanager_load: hour must be 0-23\n");
+                return 0;
+            }
+
+            const json_token_t* token_minute = json_object_get(token_task, "minute");
+            if (token_minute == NULL || !json_is_number(token_minute)) {
+                log_error("__module_loader_taskmanager_load: minute is required for daily type\n");
+                return 0;
+            }
+            ok = 0;
+            int minute = json_int(token_minute, &ok);
+            if (!ok || minute < 0 || minute > 59) {
+                log_error("__module_loader_taskmanager_load: minute must be 0-59\n");
+                return 0;
+            }
+
+            if (!taskmanager_schedule_daily(manager, name, hour, minute, handler)) {
+                log_error("__module_loader_taskmanager_load: failed to schedule daily task %s\n", name);
+                return 0;
+            }
+
+            log_info("taskmanager: loaded scheduled task '%s' (daily at %02d:%02d)\n", name, hour, minute);
+        }
+        else if (strcmp(type, "weekly") == 0) {
+            const json_token_t* token_weekday = json_object_get(token_task, "weekday");
+            if (token_weekday == NULL || !json_is_string(token_weekday)) {
+                log_error("__module_loader_taskmanager_load: weekday is required for weekly type\n");
+                return 0;
+            }
+            const char* weekday_str = json_string(token_weekday);
+
+            weekday_e weekday;
+            if (strcmp(weekday_str, "sunday") == 0)          weekday = SUNDAY;
+            else if (strcmp(weekday_str, "monday") == 0)     weekday = MONDAY;
+            else if (strcmp(weekday_str, "tuesday") == 0)    weekday = TUESDAY;
+            else if (strcmp(weekday_str, "wednesday") == 0)  weekday = WEDNESDAY;
+            else if (strcmp(weekday_str, "thursday") == 0)   weekday = THURSDAY;
+            else if (strcmp(weekday_str, "friday") == 0)     weekday = FRIDAY;
+            else if (strcmp(weekday_str, "saturday") == 0)   weekday = SATURDAY;
+            else {
+                log_error("__module_loader_taskmanager_load: invalid weekday '%s'\n", weekday_str);
+                return 0;
+            }
+
+            const json_token_t* token_hour = json_object_get(token_task, "hour");
+            if (token_hour == NULL || !json_is_number(token_hour)) {
+                log_error("__module_loader_taskmanager_load: hour is required for weekly type\n");
+                return 0;
+            }
+            int ok = 0;
+            int hour = json_int(token_hour, &ok);
+            if (!ok || hour < 0 || hour > 23) {
+                log_error("__module_loader_taskmanager_load: hour must be 0-23\n");
+                return 0;
+            }
+
+            const json_token_t* token_minute = json_object_get(token_task, "minute");
+            if (token_minute == NULL || !json_is_number(token_minute)) {
+                log_error("__module_loader_taskmanager_load: minute is required for weekly type\n");
+                return 0;
+            }
+            ok = 0;
+            int minute = json_int(token_minute, &ok);
+            if (!ok || minute < 0 || minute > 59) {
+                log_error("__module_loader_taskmanager_load: minute must be 0-59\n");
+                return 0;
+            }
+
+            if (!taskmanager_schedule_weekly(manager, name, weekday, hour, minute, handler)) {
+                log_error("__module_loader_taskmanager_load: failed to schedule weekly task %s\n", name);
+                return 0;
+            }
+
+            log_info("taskmanager: loaded scheduled task '%s' (weekly: %s at %02d:%02d)\n", name, weekday_str, hour, minute);
+        }
+        else if (strcmp(type, "monthly") == 0) {
+            const json_token_t* token_day = json_object_get(token_task, "day");
+            if (token_day == NULL || !json_is_number(token_day)) {
+                log_error("__module_loader_taskmanager_load: day is required for monthly type\n");
+                return 0;
+            }
+            int ok = 0;
+            int day = json_int(token_day, &ok);
+            if (!ok || day < 1 || day > 31) {
+                log_error("__module_loader_taskmanager_load: day must be 1-31\n");
+                return 0;
+            }
+
+            const json_token_t* token_hour = json_object_get(token_task, "hour");
+            if (token_hour == NULL || !json_is_number(token_hour)) {
+                log_error("__module_loader_taskmanager_load: hour is required for monthly type\n");
+                return 0;
+            }
+            ok = 0;
+            int hour = json_int(token_hour, &ok);
+            if (!ok || hour < 0 || hour > 23) {
+                log_error("__module_loader_taskmanager_load: hour must be 0-23\n");
+                return 0;
+            }
+
+            const json_token_t* token_minute = json_object_get(token_task, "minute");
+            if (token_minute == NULL || !json_is_number(token_minute)) {
+                log_error("__module_loader_taskmanager_load: minute is required for monthly type\n");
+                return 0;
+            }
+            ok = 0;
+            int minute = json_int(token_minute, &ok);
+            if (!ok || minute < 0 || minute > 59) {
+                log_error("__module_loader_taskmanager_load: minute must be 0-59\n");
+                return 0;
+            }
+
+            if (!taskmanager_schedule_monthly(manager, name, day, hour, minute, handler)) {
+                log_error("__module_loader_taskmanager_load: failed to schedule monthly task %s\n", name);
+                return 0;
+            }
+
+            log_info("taskmanager: loaded scheduled task '%s' (monthly: day %d at %02d:%02d)\n", name, day, hour, minute);
+        }
+        else {
+            log_error("__module_loader_taskmanager_load: unknown task type '%s'\n", type);
+            return 0;
+        }
+    }
+
+    return 1;
 }

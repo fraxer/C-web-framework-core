@@ -20,8 +20,6 @@
 #include "signal.h"
 #include "appconfig.h"
 
-int wait = 0;
-
 static void __signal_shutdown_sockets(void);
 static int __signal_is_inet_socket(int fd);
 

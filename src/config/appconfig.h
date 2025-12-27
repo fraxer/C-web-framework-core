@@ -13,6 +13,8 @@
 #include "session.h"
 #include "routeloader.h"
 
+typedef struct taskmanager taskmanager_t;
+
 typedef struct env_gzip_str {
     char* mimetype;
     struct env_gzip_str* next;
@@ -68,6 +70,7 @@ typedef struct appconfig {
     server_chain_t* server_chain;
     array_t* prepared_queries; // prepare_stmt_t
     routeloader_lib_t* taskmanager_loader;
+    taskmanager_t* taskmanager;
 } appconfig_t;
 
 int appconfig_init(int argc, char* argv[]);

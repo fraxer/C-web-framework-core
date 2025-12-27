@@ -6,6 +6,8 @@
 #include "log.h"
 #include "appconfig.h"
 
+void taskmanager_free(taskmanager_t* manager);
+
 static char* __appconfig_path = NULL;
 static appconfig_t* __appconfig = NULL;
 
@@ -58,6 +60,7 @@ appconfig_t* appconfig_create(const char* path) {
     config->viewstore = NULL;
     config->server_chain = NULL;
     config->taskmanager_loader = NULL;
+    config->taskmanager = NULL;
     memset(&config->sessionconfig, 0, sizeof(config->sessionconfig));
     config->path = strdup(path);
     if (config->path == NULL) {
@@ -120,6 +123,8 @@ void appconfig_clear(appconfig_t* config) {
 
     routeloader_free(config->taskmanager_loader);
     config->taskmanager_loader = NULL;
+
+    taskmanager_free(config->taskmanager);
 }
 
 void appconfig_free(appconfig_t* config) {
