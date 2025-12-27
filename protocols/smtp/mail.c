@@ -14,6 +14,7 @@
 #include "dkim.h"
 #include "connection_c.h"
 #include "mail.h"
+#include "taskmanager.h"
 
 void __mail_string_reset(mail_string_t* string);
 void __mail_string_free(mail_string_t* string);
@@ -206,8 +207,51 @@ cleanup:
     return result;
 }
 
+static mail_payload_t* __mail_payload_copy(mail_payload_t* payload) {
+    if (payload == NULL) return NULL;
+
+    mail_payload_t* copy = malloc(sizeof * copy);
+    if (copy == NULL) return NULL;
+
+    copy->from = payload->from ? strdup(payload->from) : NULL;
+    copy->from_name = payload->from_name ? strdup(payload->from_name) : NULL;
+    copy->to = payload->to ? strdup(payload->to) : NULL;
+    copy->subject = payload->subject ? strdup(payload->subject) : NULL;
+    copy->body = payload->body ? strdup(payload->body) : NULL;
+
+    return copy;
+}
+
+static void __mail_payload_free(void* data) {
+    if (data == NULL) return;
+
+    mail_payload_t* payload = data;
+
+    free((void*)payload->from);
+    free((void*)payload->from_name);
+    free((void*)payload->to);
+    free((void*)payload->subject);
+    free((void*)payload->body);
+    free(payload);
+}
+
+static void __send_mail_task(void* data) {
+    send_mail(data);
+}
+
 void send_mail_async(mail_payload_t* payload) {
-    (void)payload;
+    if (payload == NULL) return;
+
+    mail_payload_t* copy = __mail_payload_copy(payload);
+    if (copy == NULL) {
+        log_error("[send_mail_async] Failed to copy payload\n");
+        return;
+    }
+
+    if (!taskmanager_async_with_free(__send_mail_task, copy, __mail_payload_free)) {
+        log_error("[send_mail_async] Failed to queue async task\n");
+        __mail_payload_free(copy);
+    }
 }
 
 void __mail_string_reset(mail_string_t* item) {
