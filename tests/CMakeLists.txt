@@ -19,6 +19,7 @@ add_executable(
     runner.c
     ${ALL_TEST_FILES}
     httprequestparser_stubs.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../framework/taskmanager/taskmanager_calc.c
 )
 
 # Link test libraries
