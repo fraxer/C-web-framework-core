@@ -8,7 +8,6 @@
 
 static char* __appconfig_path = NULL;
 static appconfig_t* __appconfig = NULL;
-static void(*__appconfig_after_run_threads_cb)(void) = NULL;
 
 static const char* __appconfig_get_path(int argc, char* argv[]);
 static void __appconfig_env_init(env_t* env);
@@ -51,9 +50,6 @@ appconfig_t* appconfig_create(const char* path) {
     }
 
     atomic_store(&config->shutdown, 0);
-    atomic_store(&config->threads_pause, 1);
-    atomic_store(&config->threads_pause_lock, 0);
-    atomic_store(&config->threads_stop_count, 0);
     atomic_store(&config->threads_count, 0);
     __appconfig_env_init(&config->env);
     config->mimetype = NULL;
@@ -61,6 +57,7 @@ appconfig_t* appconfig_create(const char* path) {
     config->storages = NULL;
     config->viewstore = NULL;
     config->server_chain = NULL;
+    config->taskmanager_loader = NULL;
     memset(&config->sessionconfig, 0, sizeof(config->sessionconfig));
     config->path = strdup(path);
     if (config->path == NULL) {
@@ -98,9 +95,6 @@ void appconfig_clear(appconfig_t* config) {
     if (config == NULL) return;
 
     atomic_store(&config->shutdown, 0);
-    atomic_store(&config->threads_pause, 1);
-    atomic_store(&config->threads_pause_lock, 0);
-    atomic_store(&config->threads_stop_count, 0);
     atomic_store(&config->threads_count, 0);
     __appconfig_env_free(&config->env);
 
@@ -123,6 +117,9 @@ void appconfig_clear(appconfig_t* config) {
 
     array_free(config->prepared_queries);
     config->prepared_queries = NULL;
+
+    routeloader_free(config->taskmanager_loader);
+    config->taskmanager_loader = NULL;
 }
 
 void appconfig_free(appconfig_t* config) {
@@ -139,57 +136,15 @@ char* appconfig_path(void) {
     return __appconfig_path;
 }
 
-void appconfig_lock(appconfig_t* config) {
-    if (config == NULL) return;
-
-    _Bool expected = 0;
-    _Bool desired = 1;
-
-    do {
-        expected = 0;
-    } while (!atomic_compare_exchange_strong(&config->threads_pause_lock, &expected, desired));
-}
-
-void appconfig_unlock(appconfig_t* config) {
-    if (config == NULL) return;
-
-    atomic_store(&config->threads_pause_lock, 0);
-}
-
-void appconfg_threads_wait(appconfig_t* config) {
-    appconfig_lock(config);
-
-    const int threads_count = config->env.main.threads + config->env.main.workers;
-    if (atomic_load(&config->threads_count) == threads_count) {
-        atomic_store(&config->threads_pause, 0);
-        appconfig_unlock(config);
-        __appconfig_after_run_threads_cb();
-        return;
-    }
-
-    appconfig_unlock(config);
-
-    while (atomic_load(&config->threads_pause))
-        usleep(1000);
-}
-
 void appconfg_threads_increment(appconfig_t* config) {
     atomic_fetch_add(&config->threads_count, 1);
 }
 
-int appconfg_threads_decrement(appconfig_t* config) {
-    int prev_count = atomic_fetch_sub(&config->threads_count, 1);
+void appconfg_threads_decrement(appconfig_t* config) {
+    atomic_fetch_sub(&config->threads_count, 1);
 
-    // prev_count == 1 means we decremented from 1 to 0 (we're the last thread)
-    if (prev_count == 1) {
-        if (__appconfig == config)
-            __appconfig = NULL;
-
+    if (atomic_load(&config->threads_count) == 0)
         appconfig_free(config);
-        return 1; // Was last thread, config freed
-    }
-
-    return 0; // Not last thread
 }
 
 void __appconfig_env_init(env_t* env) {
@@ -305,10 +260,6 @@ const char* __appconfig_get_path(int argc, char* argv[]) {
     }
 
     return path;
-}
-
-void appconfig_set_after_run_threads_cb(void (*appconfig_after_run_threads_cb)(void)) {
-    __appconfig_after_run_threads_cb = appconfig_after_run_threads_cb;
 }
 
 static json_token_t* __env_get_token(const char* key) {

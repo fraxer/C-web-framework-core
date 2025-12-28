@@ -14,10 +14,12 @@ static listener_t* __listener_get(listener_t* listener, server_t* server);
 static void __listeners_free(listener_t* listener);
 static void __listener_free(listener_t* listener);
 static int __listeners_listen(listener_t* listener);
+static void __listeners_unlisten(listener_t* listener);
+static void __listener_unlisten(listener_t* listener);
 static int __listener_read(connection_t* listener_connection);
 static int __set_protocol(connection_t* connection);
 
-int mpxserver_run(appconfig_t* appconfig, void(*thread_worker_threads_pause)(appconfig_t* config)) {
+int mpxserver_run(appconfig_t* appconfig) {
     int result = 0;
     mpxapi_t* api = mpx_create();
     if (api == NULL) return result;
@@ -34,13 +36,15 @@ int mpxserver_run(appconfig_t* appconfig, void(*thread_worker_threads_pause)(app
         goto failed;
 
     while (1) {
-        thread_worker_threads_pause(appconfig);
-
         api->process_events(appconfig, api);
 
-        if (atomic_load(&appconfig->shutdown))
+        if (atomic_load(&appconfig->shutdown)) {
+            if (appconfig->env.main.reload != APPCONFIG_RELOAD_HARD)
+                __listeners_unlisten(listeners);
+
             if (api->connection_count == 0)
                 break;
+        }
     }
 
     result = 1;
@@ -183,6 +187,21 @@ int __listeners_listen(listener_t* listener) {
     }
 
     return 1;
+}
+
+void __listeners_unlisten(listener_t* listener) {
+    while (listener) {
+        __listener_unlisten(listener);
+        listener = listener->next;
+    }
+}
+
+void __listener_unlisten(listener_t* listener) {
+    if (listener == NULL || listener->connection == NULL)
+        return;
+
+    listener->connection->close(listener->connection);
+    listener->connection = NULL;
 }
 
 int __listener_read(connection_t* listener_connection) {

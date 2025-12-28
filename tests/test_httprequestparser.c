@@ -23,9 +23,6 @@ static void init_test_appconfig(void) {
         if (test_appconfig) {
             // Initialize atomic values
             test_appconfig->shutdown = false;
-            test_appconfig->threads_pause = false;
-            test_appconfig->threads_pause_lock = false;
-            test_appconfig->threads_stop_count = 0;
             test_appconfig->threads_count = 0;
 
             // Initialize env
