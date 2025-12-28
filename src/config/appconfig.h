@@ -11,6 +11,7 @@
 #include "viewstore.h"
 #include "mimetype.h"
 #include "session.h"
+#include "routeloader.h"
 
 typedef struct env_gzip_str {
     char* mimetype;
@@ -56,9 +57,6 @@ typedef struct {
 
 typedef struct appconfig {
     atomic_bool shutdown;
-    atomic_bool threads_pause;
-    atomic_bool threads_pause_lock;
-    atomic_int threads_stop_count;
     atomic_int threads_count;
     env_t env;
     sessionconfig_t sessionconfig;
@@ -69,6 +67,7 @@ typedef struct appconfig {
     viewstore_t* viewstore;
     server_chain_t* server_chain;
     array_t* prepared_queries; // prepare_stmt_t
+    routeloader_lib_t* taskmanager_loader;
 } appconfig_t;
 
 int appconfig_init(int argc, char* argv[]);
@@ -79,12 +78,8 @@ void appconfig_set(appconfig_t* config);
 void appconfig_clear(appconfig_t* config);
 void appconfig_free(appconfig_t* config);
 char* appconfig_path(void);
-void appconfig_lock(appconfig_t* config);
-void appconfig_unlock(appconfig_t* config);
-void appconfg_threads_wait(appconfig_t* config);
 void appconfg_threads_increment(appconfig_t* config);
-int appconfg_threads_decrement(appconfig_t* config);
-void appconfig_set_after_run_threads_cb(void (*appconfig_after_run_threads_cb)(void));
+void appconfg_threads_decrement(appconfig_t* config);
 
 const char* env_get_string(const char* key);
 int env_get_int(const char* key, int default_value);

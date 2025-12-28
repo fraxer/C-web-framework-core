@@ -5,19 +5,17 @@
 
 #include "log.h"
 #include "json.h"
+#include "signal/signal.h"
 #include "threadhandler.h"
 #include "connection_queue.h"
 
-static void(*__thread_handler_threads_pause)(appconfig_t* config) = NULL;
-
 void* thread_handler(void* arg) {
+    signal_block_usr1();
+
     appconfig_t* appconfig = arg;
     appconfg_threads_increment(appconfig);
-    appconfg_threads_wait(appconfig);
 
     while (1) {
-        __thread_handler_threads_pause(appconfig);
-
         if (atomic_load(&appconfig->shutdown))
             break;
 
@@ -47,9 +45,8 @@ void* thread_handler(void* arg) {
             connection_s_unlock(connection);
     }
 
-    const int was_last = appconfg_threads_decrement(appconfig);
-    if (was_last)
-        json_manager_free();
+    appconfg_threads_decrement(appconfig);
+    json_manager_free();
 
     pthread_exit(NULL);
 }
@@ -71,9 +68,4 @@ int thread_handler_run(appconfig_t* appconfig, int thread_count) {
 
 void thread_handlers_wakeup() {
     connection_queue_broadcast();
-}
-
-void thread_handler_set_threads_pause_cb(void (*thread_handler_threads_pause)(appconfig_t* config)) {
-    if (__thread_handler_threads_pause == NULL)
-        __thread_handler_threads_pause = thread_handler_threads_pause;
 }

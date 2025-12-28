@@ -3,6 +3,6 @@
 
 #include "appconfig.h"
 
-int mpxserver_run(appconfig_t* appconfig, void(*thread_worker_threads_pause)(appconfig_t* config));
+int mpxserver_run(appconfig_t* appconfig);
 
 #endif

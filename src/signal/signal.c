@@ -13,6 +13,7 @@
 #include <socket.h>
 #include <dirent.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "log.h"
 #include "moduleloader.h"
@@ -139,13 +140,17 @@ void signal_USR1(__attribute__((unused))int s) {
         if (config == NULL) {
             log_error("config is NULL\n");
             module_loader_create_config_and_init();
+            module_loader_signal_unlock();
             return;
         }
+
+        atomic_store(&config->shutdown, 1);
 
         if (config->env.main.reload == APPCONFIG_RELOAD_HARD)
             __signal_shutdown_sockets();
 
-        atomic_store(&config->threads_pause, 1);
+        module_loader_create_config_and_init();
+        module_loader_signal_unlock();
     }
 }
 
@@ -159,4 +164,11 @@ void signal_init(void) {
     signal(SIGABRT, signal_before_abort);
     signal(SIGUSR1, signal_USR1);
     signal(SIGUSR2, SIG_IGN);
+}
+
+void signal_block_usr1(void) {
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR1);
+    pthread_sigmask(SIG_BLOCK, &mask, NULL);
 }
