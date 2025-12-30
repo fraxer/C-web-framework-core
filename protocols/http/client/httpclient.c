@@ -10,6 +10,7 @@
 #include "httpclienthandlers.h"
 #include "httpclientparser.h"
 #include "httpclient.h"
+#include "httpclientpool.h"
 #include "appconfig.h"
 #include "server.h"
 #include "httpcontext.h"
@@ -38,6 +39,7 @@ int __httpclient_set_header_host(httpclient_t*);
 int __httpclient_try_set_content_length(httpclient_t*);
 int __httpclient_send_recv_data(httpclient_t*);
 int __httpclient_free_connection(httpclient_t*);
+int __httpclient_discard_connection(httpclient_t*);
 int __httpclient_is_redirect(httpclient_t*);
 
 int run_middlewares(struct middleware_item* middleware_item, void* ctx);
@@ -188,9 +190,17 @@ int __httpclient_set_url(httpclient_t* client, const char* url) {
 }
 
 httpresponse_t* __httpclient_send(httpclient_t* client) {
+    static int request_count = 0;
+
     int result = 0;
 
     client->redirect_count = 0;
+
+    // Cleanup expired connections every 100 requests
+    if (++request_count >= 10) {
+        request_count = 0;
+        httpclientpool_cleanup_expired(httpclientpool_global());
+    }
 
     if (!__httpclient_try_set_content_length(client))
         goto failed;
@@ -234,8 +244,14 @@ httpresponse_t* __httpclient_send(httpclient_t* client) {
 
     failed:
 
-    if (client->connection != NULL)
-        __httpclient_free_connection(client);
+    if (client->connection != NULL) {
+        if (result) {
+            __httpclient_free_connection(client);
+        } else {
+            // On error, discard the connection (don't return to pool)
+            __httpclient_discard_connection(client);
+        }
+    }
 
     if (!result) {
         client->response->status_code = 500;
@@ -245,7 +261,31 @@ httpresponse_t* __httpclient_send(httpclient_t* client) {
 }
 
 int __httpclient_create_connection(httpclient_t* client) {
-    connection_t* connection = __httpclient_resolve(client->host, client->port);
+    connection_pool_t* pool = httpclientpool_global();
+    if (pool == NULL) {
+        log_error("Connection pool is not initialized\n");
+        return 0;
+    }
+
+    connection_t* connection = httpclientpool_acquire(pool, client->host, client->port, client->use_ssl);
+
+    if (connection != NULL) {
+        // Reuse pooled connection
+        client->connection = connection;
+        client->connection->buffer = client->buffer;
+        client->connection->buffer_size = client->buffer_size;
+        client->request->connection = connection;
+        client->response->connection = connection;
+
+        connection_client_ctx_t* ctx = connection->ctx;
+        ctx->request = (request_t*)client->request;
+        ctx->response = (response_t*)client->response;
+
+        return 1;
+    }
+
+    // Create new connection
+    connection = __httpclient_resolve(client->host, client->port);
     if (connection == NULL)
         return 0;
 
@@ -498,8 +538,27 @@ int __httpclient_free_connection(httpclient_t* client) {
 
     ctx->request = NULL;
     ctx->response = NULL;
-    connection->close(connection);
-    connection_free(connection);
+
+    // Return connection to pool for reuse
+    httpclientpool_release(httpclientpool_global(), client->host, client->port, connection, client->use_ssl);
+
+    client->connection = NULL;
+
+    return 1;
+}
+
+int __httpclient_discard_connection(httpclient_t* client) {
+    connection_t* connection = client->connection;
+    if (connection == NULL) return 1;
+
+    connection_client_ctx_t* ctx = connection->ctx;
+
+    ctx->request = NULL;
+    ctx->response = NULL;
+
+    // Discard connection (don't return to pool)
+    httpclientpool_discard(httpclientpool_global(), client->host, client->port, connection);
+
     client->connection = NULL;
 
     return 1;
