@@ -82,18 +82,30 @@ int urlencodedparser_add_part(urlencodedparser_t* parser) {
 
 int urlencodedparser_set_field(urlencodedparser_t* parser) {
     http_payloadpart_t* part = parser->last_part;
-    part->field = http_payloadfield_create();
-    part->field->value = malloc(part->size + 1);
-    if (!part->field->value) return -1;
+    http_payloadfield_t* field = http_payloadfield_create();
+    if (!field) return -1;
+
+    char* value = malloc(part->size + 1);
+    if (!value) {
+        free(field);
+        return -1;
+    }
 
     off_t payload_offset = lseek(parser->payload_fd, 0, SEEK_CUR);
 
     lseek(parser->payload_fd, part->offset, SEEK_SET);
 
-    ssize_t r = read(parser->payload_fd, part->field->value, part->size);
-    if (r < 0) return -1;
+    ssize_t r = read(parser->payload_fd, value, part->size);
+    if (r < 0) {
+        free(value);
+        free(field);
+        return -1;
+    }
 
-    part->field->value[part->size] = 0;
+    value[part->size] = 0;
+
+    field->value = value;
+    part->field = field;
 
     lseek(parser->payload_fd, payload_offset, SEEK_SET);
 

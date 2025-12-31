@@ -158,10 +158,11 @@ int http_chunked_body(httprequest_t* request, httpresponse_t* response, bufo_t* 
 }
 
 static int chunk_head_create(http_module_chunked_t* module) {
-    module->chunk_head = malloc(CHUNK_HEAD_MAX_SIZE);
-    if (module->chunk_head == NULL)
+    char* chunk_head = malloc(CHUNK_HEAD_MAX_SIZE);
+    if (chunk_head == NULL)
         return 0;
 
+    module->chunk_head = chunk_head;
     return 1;
 }
 

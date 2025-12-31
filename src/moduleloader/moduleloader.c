@@ -45,6 +45,15 @@
 
 static atomic_bool __module_loader_wait_signal = ATOMIC_VAR_INIT(0);
 
+static void __free_gzip_list(env_gzip_str_t* item) {
+    while (item != NULL) {
+        env_gzip_str_t* next = item->next;
+        free(item->mimetype);
+        free(item);
+        item = next;
+    }
+}
+
 static int __module_loader_init_modules(appconfig_t* config, json_doc_t* document);
 static int __module_loader_servers_load(appconfig_t* config, const json_token_t* servers);
 static domain_t* __module_loader_domains_load(const json_token_t* token_array);
@@ -367,16 +376,22 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
         const json_token_t* token_mimetype = json_it_value(&it);
         if (!json_is_string(token_mimetype)) {
             log_error("module_loader_config_load: gzip must be array of strings\n");
+            __free_gzip_list(env->main.gzip);
+            env->main.gzip = NULL;
             return 0;
         }
         if (json_string_size(token_mimetype) == 0) {
             log_error("module_loader_config_load: gzip item must be not empty\n");
+            __free_gzip_list(env->main.gzip);
+            env->main.gzip = NULL;
             return 0;
         }
 
         env_gzip_str_t* str = malloc(sizeof * str);
         if (str == NULL) {
             log_error("module_loader_config_load: memory alloc error for gzip item\n");
+            __free_gzip_list(env->main.gzip);
+            env->main.gzip = NULL;
             return 0;
         }
         str->next = NULL;
@@ -384,6 +399,8 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
         if (str->mimetype == NULL) {
             log_error("module_loader_config_load: memory alloc error for gzip item value\n");
             free(str);
+            __free_gzip_list(env->main.gzip);
+            env->main.gzip = NULL;
             return 0;
         }
         strcpy(str->mimetype, json_string(token_mimetype));
@@ -401,32 +418,32 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     const json_token_t* token_log = json_object_get(token_main, "log");
     if (token_log == NULL) {
         log_error("module_loader_config_load: log not found\n");
-        return 0;
+        goto failed;
     }
     if (!json_is_object(token_log)) {
         log_error("module_loader_config_load: log must be object\n");
-        return 0;
+        goto failed;
     }
 
     const json_token_t* token_log_enabled = json_object_get(token_log, "enabled");
     if (token_log_enabled == NULL) {
         log_error("module_loader_config_load: log.enabled not found\n");
-        return 0;
+        goto failed;
     }
     if (!json_is_bool(token_log_enabled)) {
         log_error("module_loader_config_load: log.enabled must be boolean\n");
-        return 0;
+        goto failed;
     }
     env->main.log.enabled = json_bool(token_log_enabled);
 
     const json_token_t* token_log_level = json_object_get(token_log, "level");
     if (token_log_level == NULL) {
         log_error("module_loader_config_load: log.level not found\n");
-        return 0;
+        goto failed;
     }
     if (!json_is_string(token_log_level)) {
         log_error("module_loader_config_load: log.level must be string\n");
-        return 0;
+        goto failed;
     }
     const char* level_str = json_string(token_log_level);
     if (strcmp(level_str, "emerg") == 0) {
@@ -455,7 +472,7 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     }
     else {
         log_error("module_loader_config_load: log.level must be one of: emerg, alert, crit, err, warning, notice, info, debug\n");
-        return 0;
+        goto failed;
     }
 
 
@@ -496,19 +513,19 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
 
 
     if (!__module_loader_servers_load(config, json_object_get(root, "servers")))
-        return 0;
+        goto failed;
     if (!__module_loader_databases_load(config, json_object_get(root, "databases")))
-        return 0;
+        goto failed;
     if (!__module_loader_storages_load(config, json_object_get(root, "storages")))
-        return 0;
+        goto failed;
     if (!__module_loader_mimetype_load(config, json_object_get(root, "mimetypes")))
-        return 0;
+        goto failed;
     if (!__module_loader_viewstore_load(config))
-        return 0;
+        goto failed;
     if (!__module_loader_sessionconfig_load(config, json_object_get(root, "sessions")))
-        return 0;
+        goto failed;
     if (!__module_loader_prepared_queries_load(config))
-        return 0;
+        goto failed;
 
 
     const json_token_t* token_mail = json_object_get(root, "mail");
@@ -516,7 +533,7 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
         env->mail.dkim_private = malloc(sizeof(char) * 1);
         if (env->mail.dkim_private == NULL) {
             log_error("module_loader_config_load: memory alloc error mail.dkim_private\n");
-            return 0;
+            goto failed;
         }
         strcpy(env->mail.dkim_private, "");
 
@@ -524,7 +541,7 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
         env->mail.dkim_selector = malloc(sizeof(char) * 1);
         if (env->mail.dkim_selector == NULL) {
             log_error("module_loader_config_load: memory alloc error mail.dkim_selector\n");
-            return 0;
+            goto failed;
         }
         strcpy(env->mail.dkim_selector, "");
 
@@ -532,7 +549,7 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
         env->mail.host = malloc(sizeof(char) * 1);
         if (env->mail.host == NULL) {
             log_error("module_loader_config_load: memory alloc error mail.host\n");
-            return 0;
+            goto failed;
         }
         strcpy(env->mail.host, "");
     }
@@ -542,24 +559,24 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
             env->mail.dkim_private = malloc(sizeof(char) * 1);
             if (env->mail.dkim_private == NULL) {
                 log_error("module_loader_config_load: memory alloc error mail.dkim_private\n");
-                return 0;
+                goto failed;
             }
             strcpy(env->mail.dkim_private, "");
         }
         else {
             if (!json_is_string(token_dkim_private)) {
                 log_error("module_loader_config_load: mail.dkim_private must be string\n");
-                return 0;
+                goto failed;
             }
             if (json_string_size(token_dkim_private) == 0) {
                 log_error("module_loader_config_load: mail.dkim_private must be not empty\n");
-                return 0;
+                goto failed;
             }
 
             file_t file = file_open(json_string(token_dkim_private), O_RDONLY);
             if (!file.ok) {
                 log_error("module_loader_config_load: open mail.dkim_private error\n");
-                return 0;
+                goto failed;
             }
 
             env->mail.dkim_private = file.content(&file);
@@ -567,7 +584,7 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
 
             if (env->mail.dkim_private == NULL) {
                 log_error("module_loader_config_load: read mail.dkim_private error\n");
-                return 0;
+                goto failed;
             }
         }
 
@@ -576,24 +593,24 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
             env->mail.dkim_selector = malloc(sizeof(char) * 1);
             if (env->mail.dkim_selector == NULL) {
                 log_error("module_loader_config_load: memory alloc error mail.dkim_selector\n");
-                return 0;
+                goto failed;
             }
             strcpy(env->mail.dkim_selector, "");
         }
         else {
             if (!json_is_string(token_dkim_selector)) {
                 log_error("module_loader_config_load: mail.dkim_selector must be string\n");
-                return 0;
+                goto failed;
             }
             if (json_string_size(token_dkim_selector) == 0) {
                 log_error("module_loader_config_load: mail.dkim_selector must be not empty\n");
-                return 0;
+                goto failed;
             }
 
             env->mail.dkim_selector = malloc(sizeof(char) * (json_string_size(token_dkim_selector) + 1));
             if (env->mail.dkim_selector == NULL) {
                 log_error("module_loader_config_load: memory alloc error mail.dkim_selector\n");
-                return 0;
+                goto failed;
             }
             strcpy(env->mail.dkim_selector, json_string(token_dkim_selector));
         }
@@ -603,30 +620,36 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
             env->mail.host = malloc(sizeof(char) * 1);
             if (env->mail.host == NULL) {
                 log_error("module_loader_config_load: memory alloc error mail.host\n");
-                return 0;
+                goto failed;
             }
             strcpy(env->mail.host, "");
         }
         else {
             if (!json_is_string(token_host)) {
                 log_error("module_loader_config_load: mail.host must be string\n");
-                return 0;
+                goto failed;
             }
             if (json_string_size(token_host) == 0) {
                 log_error("module_loader_config_load: mail.host must be not empty\n");
-                return 0;
+                goto failed;
             }
 
             env->mail.host = malloc(sizeof(char) * (json_string_size(token_host) + 1));
             if (env->mail.host == NULL) {
                 log_error("module_loader_config_load: memory alloc error mail.host\n");
-                return 0;
+                goto failed;
             }
             strcpy(env->mail.host, json_string(token_host));
         }
     }
 
     return 1;
+
+    failed:
+
+    __free_gzip_list(env->main.gzip);
+    env->main.gzip = NULL;
+    return 0;
 }
 
 int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_servers) {

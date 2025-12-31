@@ -6,7 +6,6 @@
 #include <ctype.h>
 
 #include <openssl/rand.h>
-#include <openssl/rsa.h>
 #include <openssl/engine.h>
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
@@ -25,7 +24,7 @@
 int __dkim_relaxed_header_canon(dkim_t* dkim);
 char* __dkim_relaxed_body_canon(const char *body);
 char* __dkim_wrap(char *str, size_t len);
-RSA* __dkim_rsa_read_pem(const char* buffer);
+EVP_PKEY* __dkim_rsa_read_pem(const char* buffer);
 char* __dkim_header_list_create(dkim_t* dkim, int* header_list_length);
 int __dkim_header_count(mail_header_t* header);
 int __dkim_header_keys_length(mail_header_t* header);
@@ -128,14 +127,14 @@ char* __dkim_wrap(char* str, size_t len) {
     return tmp;
 }
 
-RSA* __dkim_rsa_read_pem(const char* buffer) {
+EVP_PKEY* __dkim_rsa_read_pem(const char* buffer) {
     BIO* mem = BIO_new_mem_buf(buffer, strlen(buffer));
     if (mem == NULL) return NULL;
 
-    RSA* rsa = PEM_read_bio_RSAPrivateKey(mem, NULL, NULL, NULL);
+    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(mem, NULL, NULL, NULL);
     BIO_free(mem);
 
-    return rsa;
+    return pkey;
 } 
 
 /* h1:h2:h3 */
@@ -205,20 +204,41 @@ char* __dkim_base64_encode_sha1(const char* body, int* canon_body_length) {
 }
 
 char* __dkim_sign_create(unsigned char* hash, const char* private_key, int* sign64_length) {
-    RSA* rsa_private = __dkim_rsa_read_pem(private_key);
-    if (rsa_private == NULL) {
+    EVP_PKEY* pkey = __dkim_rsa_read_pem(private_key);
+    if (pkey == NULL) {
         log_error("DKIM error loading rsa key\n");
         return NULL;
     }
 
     char* result = NULL;
     char* base64sign = NULL;
-    unsigned int sign_length = 0;
-    char* sign = malloc(RSA_size(rsa_private));
+    unsigned char* sign = NULL;
+    size_t sign_length = 0;
+
+    EVP_MD_CTX* md_ctx = EVP_MD_CTX_new();
+    if (md_ctx == NULL)
+        goto failed;
+
+    if (EVP_DigestSignInit(md_ctx, NULL, EVP_sha1(), NULL, pkey) != 1) {
+        log_error("DKIM error rsa sign init: %s\n", ERR_error_string(ERR_get_error(), NULL));
+        goto failed;
+    }
+
+    if (EVP_DigestSignUpdate(md_ctx, hash, SHA_DIGEST_LENGTH) != 1) {
+        log_error("DKIM error rsa sign update: %s\n", ERR_error_string(ERR_get_error(), NULL));
+        goto failed;
+    }
+
+    if (EVP_DigestSignFinal(md_ctx, NULL, &sign_length) != 1) {
+        log_error("DKIM error rsa sign final (get length): %s\n", ERR_error_string(ERR_get_error(), NULL));
+        goto failed;
+    }
+
+    sign = malloc(sign_length);
     if (sign == NULL)
         goto failed;
 
-    if (!RSA_sign(NID_sha1, hash, SHA_DIGEST_LENGTH, (unsigned char*)sign, (unsigned int*)&sign_length, rsa_private)) {
+    if (EVP_DigestSignFinal(md_ctx, sign, &sign_length) != 1) {
         log_error("DKIM error rsa sign: %s\n", ERR_error_string(ERR_get_error(), NULL));
         goto failed;
     }
@@ -227,7 +247,7 @@ char* __dkim_sign_create(unsigned char* hash, const char* private_key, int* sign
     if (base64sign == NULL)
         goto failed;
 
-    *sign64_length = base64_encode(base64sign, sign, sign_length);
+    *sign64_length = base64_encode(base64sign, (char*)sign, sign_length);
     if (*sign64_length == 0) {
         free(base64sign);
         goto failed;
@@ -237,8 +257,10 @@ char* __dkim_sign_create(unsigned char* hash, const char* private_key, int* sign
 
     failed:
 
-    if (rsa_private != NULL)
-        free(rsa_private);
+    if (md_ctx != NULL)
+        EVP_MD_CTX_free(md_ctx);
+    if (pkey != NULL)
+        EVP_PKEY_free(pkey);
     if (sign != NULL)
         free(sign);
 

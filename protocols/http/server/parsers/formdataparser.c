@@ -132,8 +132,23 @@ int formdataparser_add_entity(formdataparser_t* parser, int type) {
     else if (type == FORMDATAKEY) {
         if (parser->size >= FORMDATABUFSIZ) return -1;
 
-        formdatafield_t* field = malloc(sizeof(formdatafield_t));
+        formdatafield_t* field = malloc(sizeof * field);
         if (!field) return -1;
+
+        char* key = malloc(parser->size + 1);
+        if (!key) {
+            free(field);
+            return -1;
+        }
+
+        strncpy(key, parser->buffer, parser->size);
+        key[parser->size] = 0;
+
+        field->key = key;
+        field->key_size = parser->size;
+        field->value_offset = 0;
+        field->value_size = 0;
+        field->next = NULL;
 
         if (!parser->field) {
             parser->field = field;
@@ -142,16 +157,6 @@ int formdataparser_add_entity(formdataparser_t* parser, int type) {
             parser->last_field->next = field;
         }
         parser->last_field = field;
-
-        field->value_offset = 0;
-        field->value_size = 0;
-        field->next = NULL;
-        field->key_size = parser->size;
-        field->key = malloc(parser->size + 1);
-        if (!field->key) return -1;
-
-        strncpy(field->key, parser->buffer, parser->size);
-        field->key[parser->size] = 0;
     }
     else if (type == FORMDATAVALUE) {
         if (parser->last_field->key == NULL) return -1;

@@ -58,6 +58,7 @@ route_t* route_create(const char* dirty_location) {
     route->path = parser.path;
     route->path_length = strlen(parser.path);
     route->param = parser.first_param;
+    parser.first_param = NULL; // prevent double free
 
     result = 0;
 
@@ -317,23 +318,25 @@ int route_alloc_param(route_parser_t* parser) {
 }
 
 int route_fill_param(route_parser_t* parser) {
-    parser->last_param->end = parser->pos;
-    parser->last_param->string_len = parser->last_param->end - parser->last_param->start;
+    route_param_t* param = parser->last_param;
 
-    if (parser->last_param->string_len == 0) {
+    param->end = parser->pos;
+    param->string_len = param->end - param->start;
+
+    if (param->string_len == 0) {
         log_error(ROUTE_EMPTY_PARAM_NAME, parser->dirty_location);
         return -1;
     }
 
-    parser->last_param->string = malloc(parser->last_param->string_len + 1);
-    if (parser->last_param->string == NULL) {
+    char* string = malloc(param->string_len + 1);
+    if (string == NULL) {
         log_error(ROUTE_OUT_OF_MEMORY);
         return -1;
     }
 
-    strncpy(parser->last_param->string, &parser->location[parser->last_param->start], parser->last_param->string_len);
-
-    parser->last_param->string[parser->last_param->string_len] = 0;
+    strncpy(string, &parser->location[param->start], param->string_len);
+    string[param->string_len] = 0;
+    param->string = string;
 
     return 0;
 }
@@ -341,6 +344,15 @@ int route_fill_param(route_parser_t* parser) {
 void route_parser_free(route_parser_t* parser) {
     if (parser->location != NULL)
         free(parser->location);
+
+    route_param_t* param = parser->first_param;
+    while (param != NULL) {
+        route_param_t* next = param->next;
+        if (param->string != NULL)
+            free(param->string);
+        free(param);
+        param = next;
+    }
 }
 
 int route_set_http_handler(route_t* route, const char* method, void(*function)(void*), ratelimiter_t* ratelimiter) {

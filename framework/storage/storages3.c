@@ -682,7 +682,6 @@ char* __create_authtoken(storages3_t* storage, httpclient_t* client, const char*
 }
 
 int __file_sha256(const int fd, unsigned char* hash) {
-    SHA256_CTX sha256;
     unsigned char buffer[4096];
     ssize_t bytes_read = 0;
     int result = 0;
@@ -692,28 +691,39 @@ int __file_sha256(const int fd, unsigned char* hash) {
         goto failed;
     }
 
-    if (SHA256_Init(&sha256) != 1) {
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (ctx == NULL) {
+        log_error("__file_sha256: EVP_MD_CTX_new failed\n");
+        goto failed;
+    }
+
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1) {
         log_error("__file_sha256: SHA256 initialization failed\n");
+        EVP_MD_CTX_free(ctx);
         goto failed;
     }
 
     while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0) {
-        if (SHA256_Update(&sha256, buffer, bytes_read) != 1) {
+        if (EVP_DigestUpdate(ctx, buffer, bytes_read) != 1) {
             log_error("__file_sha256: SHA256 update failed\n");
+            EVP_MD_CTX_free(ctx);
             goto failed;
         }
     }
 
     if (bytes_read == -1) {
         log_error("__file_sha256: Error reading file fd %d: %s\n", fd, strerror(errno));
+        EVP_MD_CTX_free(ctx);
         goto failed;
     }
 
-    if (SHA256_Final(hash, &sha256) != 1) {
+    if (EVP_DigestFinal_ex(ctx, hash, NULL) != 1) {
         log_error("__file_sha256: SHA256 finalization failed\n");
+        EVP_MD_CTX_free(ctx);
         goto failed;
     }
 
+    EVP_MD_CTX_free(ctx);
     result = 1;
 
     failed:
@@ -724,11 +734,25 @@ int __file_sha256(const int fd, unsigned char* hash) {
 }
 
 int __data_sha256(const char* data, const size_t data_size, unsigned char* hash) {
-    SHA256_CTX sha256;
-    SHA256_Init(&sha256);
-    SHA256_Update(&sha256, data, data_size);
-    SHA256_Final(hash, &sha256);
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (ctx == NULL) return 0;
 
+    if (EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return 0;
+    }
+
+    if (EVP_DigestUpdate(ctx, data, data_size) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return 0;
+    }
+
+    if (EVP_DigestFinal_ex(ctx, hash, NULL) != 1) {
+        EVP_MD_CTX_free(ctx);
+        return 0;
+    }
+
+    EVP_MD_CTX_free(ctx);
     return 1;
 }
 
