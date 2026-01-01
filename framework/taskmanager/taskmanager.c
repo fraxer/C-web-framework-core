@@ -174,6 +174,11 @@ taskmanager_t* taskmanager_init(void) {
 }
 
 int taskmanager_create_threads(appconfig_t* config) {
+    if (config == NULL || config->taskmanager == NULL) {
+        log_info("taskmanager_init: taskmanager not initialized\n");
+        return 1;
+    }
+
     taskmanager_t* manager = config->taskmanager;
 
     if (pthread_create(&manager->async_thread, NULL, __async_worker, config) != 0) {
