@@ -361,8 +361,8 @@ int __httpclient_establish_connection(httpclient_t* client) {
     if (!__httpclient_set_socket_timeout(client->connection->fd, client->timeout))
         return 0;
 
-    // if (!__httpclient_set_socket_keepalive(client->connection->fd))
-    //     return 0;
+    if (!__httpclient_set_socket_keepalive(client->connection->fd))
+        return 0;
 
     if (!__httpclient_connect(client))
         return 0;
@@ -396,16 +396,23 @@ int __httpclient_connect(httpclient_t* client) {
 
 int __httpclient_set_socket_keepalive(int fd) {
     int kenable = 1;
-    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &kenable, sizeof(kenable));
+    if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &kenable, sizeof(kenable)) < 0)
+        return 0;
 
-    int keepcnt = 15;
-    setsockopt(fd, SOL_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+    // Send first keepalive probe after 60 seconds of idle
+    int keepidle = 60;
+    if (setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle)) < 0)
+        return 0;
 
-    int keepidle = 5;
-    setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+    // Send keepalive probes every 60 seconds
+    int keepintvl = 60;
+    if (setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl)) < 0)
+        return 0;
 
-    int keepintvl = 5;
-    setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+    // Drop connection after 5 failed probes (5 minutes total)
+    int keepcnt = 5;
+    if (setsockopt(fd, SOL_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt)) < 0)
+        return 0;
 
     return 1;
 }
@@ -539,8 +546,18 @@ int __httpclient_free_connection(httpclient_t* client) {
     ctx->request = NULL;
     ctx->response = NULL;
 
-    // Return connection to pool for reuse
-    httpclientpool_release(httpclientpool_global(), client->host, client->port, connection, client->use_ssl);
+    // Check Connection header to determine if we should reuse the connection
+    http_header_t* conn_header = client->response->get_header(client->response, "Connection");
+    int keep_alive = conn_header && conn_header->value_length == 10 &&
+                     strncasecmp(conn_header->value, "keep-alive", 10) == 0;
+
+    if (keep_alive) {
+        // Return connection to pool for reuse
+        httpclientpool_release(httpclientpool_global(), client->host, client->port, connection, client->use_ssl);
+    } else {
+        // Close connection if Connection header is missing or "close"
+        httpclientpool_discard(httpclientpool_global(), client->host, client->port, connection);
+    }
 
     client->connection = NULL;
 

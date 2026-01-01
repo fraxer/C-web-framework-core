@@ -274,8 +274,6 @@ static void __global_pool_init_once(void) {
     global_pool = httpclientpool_create();
 }
 
-// Internal functions
-
 static char* __make_host_key(const char* host, short port) {
     size_t len = strlen(host) + 8;  // :port + null
     char* key = malloc(len);
