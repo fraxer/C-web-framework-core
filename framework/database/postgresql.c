@@ -38,6 +38,7 @@ static int __reconnect(void* host, void* connection);
 static dbresult_t* __begin(void* connection, transaction_level_e level);
 static char* __compile_table_exist(dbconnection_t* connection, const char* table);
 static char* __compile_table_migration_create(dbconnection_t* connection, const char* table);
+static str_t* __escape_identifier_part(PGconn* pg_conn, const char* start, size_t len);
 static str_t* __escape_identifier(void* connection, const char* str);
 static str_t* __escape_string(void* connection, const char* str);
 static str_t* __escape_internal(void* connection, const char* str, char*(fn)(PGconn* conn, const char* str, size_t len));
@@ -365,8 +366,119 @@ dbresult_t* __begin(void* connection, transaction_level_e level) {
     return result;
 }
 
+str_t* __escape_identifier_part(PGconn* pg_conn, const char* start, size_t len) {
+    if (len == 0)
+        return NULL;
+
+    int is_quoted = (start[0] == '"' && start[len - 1] == '"' && len >= 2);
+
+    if (is_quoted) {
+        // Extract content between quotes and unescape "" -> "
+        size_t content_len = len - 2;
+        if (content_len == 0)
+            return NULL;
+
+        char* unquoted = malloc(content_len + 1);
+        if (unquoted == NULL)
+            return NULL;
+
+        size_t j = 0;
+        for (size_t i = 0; i < content_len; i++) {
+            char c = start[1 + i];
+            unquoted[j++] = c;
+            // Skip second quote in "" sequence
+            if (c == '"' && i + 1 < content_len && start[1 + i + 1] == '"')
+                i++;
+        }
+        unquoted[j] = '\0';
+
+        char* escaped = PQescapeIdentifier(pg_conn, unquoted, j);
+        free(unquoted);
+
+        if (escaped == NULL)
+            return NULL;
+
+        str_t* result = str_create(escaped);
+        PQfreemem(escaped);
+        return result;
+    } else {
+        char* escaped = PQescapeIdentifier(pg_conn, start, len);
+        if (escaped == NULL)
+            return NULL;
+
+        str_t* result = str_create(escaped);
+        PQfreemem(escaped);
+        return result;
+    }
+}
+
 str_t* __escape_identifier(void* connection, const char* str) {
-    return __escape_internal(connection, str, PQescapeIdentifier);
+    if (str == NULL || str[0] == '\0')
+        return NULL;
+
+    postgresqlconnection_t* conn = connection;
+    str_t* result = str_create_empty(256);
+    if (result == NULL)
+        return NULL;
+
+    const char* p = str;
+    const char* part_start = str;
+    int in_quotes = 0;
+    int first_part = 1;
+
+    while (1) {
+        char c = *p;
+
+        if (c == '"') {
+            // Handle escaped quotes "" inside quoted identifier
+            if (in_quotes && *(p + 1) == '"') {
+                p += 2;
+                continue;
+            }
+            in_quotes = !in_quotes;
+            p++;
+            continue;
+        }
+
+        if ((c == '.' && !in_quotes) || c == '\0') {
+            // Check for unclosed quote at end of string
+            if (c == '\0' && in_quotes) {
+                str_free(result);
+                return NULL;
+            }
+
+            size_t part_len = p - part_start;
+
+            if (part_len == 0) {
+                str_free(result);
+                return NULL;
+            }
+
+            if (!first_part) {
+                str_append(result, ".", 1);
+            }
+
+            str_t* escaped_part = __escape_identifier_part(conn->connection, part_start, part_len);
+            if (escaped_part == NULL) {
+                str_free(result);
+                return NULL;
+            }
+
+            str_append(result, str_get(escaped_part), str_size(escaped_part));
+            str_free(escaped_part);
+
+            first_part = 0;
+
+            if (c == '\0')
+                break;
+
+            part_start = p + 1;
+        }
+
+        p++;
+    }
+
+    return result;
 }
 
 str_t* __escape_string(void* connection, const char* str) {
