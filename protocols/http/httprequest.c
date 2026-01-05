@@ -158,8 +158,10 @@ http_header_t* httprequest_headern(httprequest_t* request, const char* key, size
     http_header_t* header = request->header_;
 
     while (header) {
-        for (size_t i = 0, j = 0; i < header->key_length && j < key_length; i++, j++) {
-            if (tolower(header->key[i]) != tolower(key[j])) goto next;
+        if (header->key_length != key_length) goto next;
+
+        for (size_t i = 0; i < key_length; i++) {
+            if (tolower(header->key[i]) != tolower(key[i])) goto next;
         }
 
         return header;
@@ -177,8 +179,10 @@ const char* httprequest_cookie(httprequest_t* request, const char* key) {
     size_t key_length = strlen(key);
 
     while (cookie) {
-        for (size_t i = 0, j = 0; i < cookie->key_length && j < key_length; i++, j++) {
-            if (tolower(cookie->key[i]) != tolower(key[j])) goto next;
+        if (cookie->key_length != key_length) goto next;
+
+        for (size_t i = 0; i < key_length; i++) {
+            if (tolower(cookie->key[i]) != tolower(key[i])) goto next;
         }
 
         return cookie->value;
