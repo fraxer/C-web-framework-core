@@ -32,6 +32,7 @@
 #include "middleware_registry.h"
 #include "httpserverhandlers.h"
 #include "taskmanager.h"
+#include "i18n.h"
 #ifdef MySQL_FOUND
     #include "mysql.h"
 #endif
@@ -66,6 +67,7 @@ static int __module_loader_viewstore_load(appconfig_t* config);
 static int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* sessionconfig);
 static int __module_loader_prepared_queries_load(appconfig_t* config);
 static int __module_loader_taskmanager_init(appconfig_t* config, json_token_t* task_manager);
+static int __module_loader_translations_load(appconfig_t* config, json_token_t* translations);
 
 static int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config);
 static int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config);
@@ -531,6 +533,8 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     if (!__module_loader_prepared_queries_load(config))
         goto failed;
     if (!__module_loader_taskmanager_init(config, json_object_get(root, "task_manager")))
+        goto failed;
+    if (!__module_loader_translations_load(config, json_object_get(root, "translations")))
         goto failed;
 
 
@@ -2279,6 +2283,75 @@ int __module_loader_taskmanager_init(appconfig_t* config, json_token_t* token_ta
     if (!__module_loader_taskmanager_load(config, manager, token_taskmanager)) {
         log_error("__module_loader_taskmanager_init: failed to load scheduled tasks\n");
         return 0;
+    }
+
+    return 1;
+}
+
+int __module_loader_translations_load(appconfig_t* config, json_token_t* translations) {
+    // translations is optional
+    if (translations == NULL) {
+        config->translations = NULL;
+        return 1;
+    }
+
+    if (!json_is_array(translations)) {
+        log_error("__module_loader_translations_load: translations must be array\n");
+        return 0;
+    }
+
+    config->translations = map_create_ex(
+        map_compare_string,
+        map_copy_string,  // key_copy
+        free,             // key_free
+        NULL,             // value_copy
+        (map_free_fn)i18n_free  // value_free
+    );
+    if (config->translations == NULL) {
+        log_error("__module_loader_translations_load: failed to create translations map\n");
+        return 0;
+    }
+
+    // Load each translation domain
+    // Format: [{ "domain": "identity", "path": "/path/to/locale" }, ...]
+    json_it_t it = json_init_it(translations);
+    while (!json_end_it(&it)) {
+        json_token_t* item = json_it_value(&it);
+
+        if (!json_is_object(item)) {
+            log_error("__module_loader_translations_load: translation item must be object\n");
+            it = json_next_it(&it);
+            continue;
+        }
+
+        const char* domain = json_string(json_object_get(item, "domain"));
+        if (domain == NULL || *domain == '\0') {
+            log_error("__module_loader_translations_load: domain is required\n");
+            it = json_next_it(&it);
+            continue;
+        }
+
+        const char* locale_dir = json_string(json_object_get(item, "path"));
+        if (locale_dir == NULL || *locale_dir == '\0') {
+            log_error("__module_loader_translations_load: path is required\n");
+            it = json_next_it(&it);
+            continue;
+        }
+
+        i18n_t* i18n = i18n_create(locale_dir, domain, "en");
+        if (i18n == NULL) {
+            log_error("__module_loader_translations_load: failed to create i18n for domain %s\n", domain);
+            it = json_next_it(&it);
+            continue;
+        }
+
+        if (map_insert(config->translations, domain, i18n) == -1) {
+            log_error("__module_loader_translations_load: failed to insert i18n for domain %s\n", domain);
+            it = json_next_it(&it);
+            continue;
+        }
+
+        it = json_next_it(&it);
     }
 
     return 1;
