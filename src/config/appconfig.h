@@ -4,6 +4,7 @@
 #include <stdbool.h>
 
 #include "array.h"
+#include "map.h"
 #include "json.h"
 #include "server.h"
 #include "storage.h"
@@ -29,6 +30,8 @@ typedef struct env_log {
     bool enabled;
     int level;
 } env_log_t;
+
+typedef struct i18n i18n_t;
 
 typedef struct env_main {
     appconfig_reload_state_e reload;
@@ -71,6 +74,7 @@ typedef struct appconfig {
     array_t* prepared_queries; // prepare_stmt_t
     routeloader_lib_t* taskmanager_loader;
     taskmanager_t* taskmanager;
+    map_t* translations;  // map: domain -> i18n_t*
 } appconfig_t;
 
 int appconfig_init(int argc, char* argv[]);
