@@ -5,6 +5,7 @@
 
 #include "log.h"
 #include "appconfig.h"
+#include "i18n.h"
 
 void taskmanager_free(taskmanager_t* manager);
 
@@ -61,6 +62,7 @@ appconfig_t* appconfig_create(const char* path) {
     config->server_chain = NULL;
     config->taskmanager_loader = NULL;
     config->taskmanager = NULL;
+    config->translations = NULL;
     memset(&config->sessionconfig, 0, sizeof(config->sessionconfig));
     config->path = strdup(path);
     if (config->path == NULL) {
@@ -125,6 +127,9 @@ void appconfig_clear(appconfig_t* config) {
     config->taskmanager_loader = NULL;
 
     taskmanager_free(config->taskmanager);
+
+    i18n_free(config->translations);
+    config->translations = NULL;
 }
 
 void appconfig_free(appconfig_t* config) {

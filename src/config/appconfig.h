@@ -30,6 +30,8 @@ typedef struct env_log {
     int level;
 } env_log_t;
 
+typedef struct i18n i18n_t;
+
 typedef struct env_main {
     appconfig_reload_state_e reload;
     unsigned int workers;
@@ -71,6 +73,7 @@ typedef struct appconfig {
     array_t* prepared_queries; // prepare_stmt_t
     routeloader_lib_t* taskmanager_loader;
     taskmanager_t* taskmanager;
+    i18n_t* translations;
 } appconfig_t;
 
 int appconfig_init(int argc, char* argv[]);

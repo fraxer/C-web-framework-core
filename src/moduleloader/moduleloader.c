@@ -32,6 +32,7 @@
 #include "middleware_registry.h"
 #include "httpserverhandlers.h"
 #include "taskmanager.h"
+#include "i18n.h"
 #ifdef MySQL_FOUND
     #include "mysql.h"
 #endif
@@ -66,6 +67,7 @@ static int __module_loader_viewstore_load(appconfig_t* config);
 static int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* sessionconfig);
 static int __module_loader_prepared_queries_load(appconfig_t* config);
 static int __module_loader_taskmanager_init(appconfig_t* config, json_token_t* task_manager);
+static int __module_loader_translations_load(appconfig_t* config, json_token_t* translations);
 
 static int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config);
 static int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config);
@@ -531,6 +533,8 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     if (!__module_loader_prepared_queries_load(config))
         goto failed;
     if (!__module_loader_taskmanager_init(config, json_object_get(root, "task_manager")))
+        goto failed;
+    if (!__module_loader_translations_load(config, json_object_get(root, "translations")))
         goto failed;
 
 
@@ -2279,6 +2283,53 @@ int __module_loader_taskmanager_init(appconfig_t* config, json_token_t* token_ta
     if (!__module_loader_taskmanager_load(config, manager, token_taskmanager)) {
         log_error("__module_loader_taskmanager_init: failed to load scheduled tasks\n");
         return 0;
+    }
+
+    return 1;
+}
+
+int __module_loader_translations_load(appconfig_t* config, json_token_t* translations) {
+    // translations is optional
+    if (translations == NULL) {
+        config->translations = NULL;
+        return 1;
+    }
+
+    if (!json_is_array(translations)) {
+        log_error("__module_loader_translations_load: translations must be array\n");
+        return 0;
+    }
+
+    // Create i18n instance with "en" as default language
+    config->translations = i18n_create(NULL, "en");
+    if (config->translations == NULL) {
+        log_error("__module_loader_translations_load: failed to create i18n instance\n");
+        return 0;
+    }
+
+    // Load translations from each directory in the array
+    json_it_t it = json_init_it(translations);
+    while (!json_end_it(&it)) {
+        json_token_t* path_token = json_it_value(&it);
+
+        if (!json_is_string(path_token)) {
+            log_error("__module_loader_translations_load: translation path must be string\n");
+            it = json_next_it(&it);
+            continue;
+        }
+
+        const char* locale_dir = json_string(path_token);
+        if (locale_dir == NULL || *locale_dir == '\0') {
+            log_error("__module_loader_translations_load: translation path is empty\n");
+            it = json_next_it(&it);
+            continue;
+        }
+
+        if (!i18n_load_directory(config->translations, locale_dir)) {
+            log_error("__module_loader_translations_load: failed to load translations from %s\n", locale_dir);
+        }
+
+        it = json_next_it(&it);
     }
 
     return 1;
