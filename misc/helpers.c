@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -6,9 +7,19 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <time.h>
+#include <locale.h>
+#include <pthread.h>
 
 #include "log.h"
 #include "helpers.h"
+
+// C locale for HTTP date formatting (locale-independent)
+static locale_t c_locale = (locale_t)0;
+static pthread_once_t c_locale_once = PTHREAD_ONCE_INIT;
+
+static void init_c_locale(void) {
+    c_locale = newlocale(LC_ALL_MASK, "C", (locale_t)0);
+}
 
 static int __hex_char_to_int(char c);
 static char __hex_to_byte(char);
@@ -304,4 +315,17 @@ char* copy_cstringn(const char* string, size_t length) {
     }
 
     return value;
+}
+
+size_t http_format_date(const struct tm* tm, char* buf, size_t buf_size) {
+    if (tm == NULL || buf == NULL || buf_size == 0)
+        return 0;
+
+    pthread_once(&c_locale_once, init_c_locale);
+
+    if (c_locale == (locale_t)0)
+        return 0;
+
+    // Format: "Thu, 08 Jan 2026 13:15:56 GMT"
+    return strftime_l(buf, buf_size, "%a, %d %b %Y %H:%M:%S GMT", tm, c_locale);
 }
