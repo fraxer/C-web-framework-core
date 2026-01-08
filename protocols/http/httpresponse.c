@@ -796,12 +796,13 @@ void __httpresponse_cookie_add(httpresponse_t* response, cookie_t cookie) {
             goto cleanup;
     } else if (cookie.seconds > 0) {
         time_t t = time(NULL) + cookie.seconds;
-        struct tm* timeptr = gmtime(&t);
+        struct tm tm_buf;
+        struct tm* timeptr = gmtime_r(&t, &tm_buf);
         if (timeptr == NULL)
             goto cleanup;
 
-        char date[32];
-        if (strftime(date, sizeof(date), "%a, %d %b %Y %T GMT", timeptr) == 0)
+        char date[64];
+        if (http_format_date(timeptr, date, sizeof(date)) == 0)
             goto cleanup;
 
         if (!str_appendf(&str, "; Expires=%s", date))
