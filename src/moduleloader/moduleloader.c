@@ -2300,34 +2300,53 @@ int __module_loader_translations_load(appconfig_t* config, json_token_t* transla
         return 0;
     }
 
-    // Create i18n instance with "en" as default language
-    config->translations = i18n_create(NULL, "en");
+    config->translations = map_create_ex(
+        map_compare_string,
+        map_copy_string,  // key_copy
+        free,             // key_free
+        NULL,             // value_copy
+        (map_free_fn)i18n_free  // value_free
+    );
     if (config->translations == NULL) {
-        log_error("__module_loader_translations_load: failed to create i18n instance\n");
+        log_error("__module_loader_translations_load: failed to create translations map\n");
         return 0;
     }
 
-    // Load translations from each directory in the array
+    // Load each translation domain
+    // Format: [{ "domain": "identity", "path": "/path/to/locale" }, ...]
     json_it_t it = json_init_it(translations);
     while (!json_end_it(&it)) {
-        json_token_t* path_token = json_it_value(&it);
+        json_token_t* item = json_it_value(&it);
 
-        if (!json_is_string(path_token)) {
-            log_error("__module_loader_translations_load: translation path must be string\n");
+        if (!json_is_object(item)) {
+            log_error("__module_loader_translations_load: translation item must be object\n");
             it = json_next_it(&it);
             continue;
         }
 
-        const char* locale_dir = json_string(path_token);
+        const char* domain = json_string(json_object_get(item, "domain"));
+        const char* locale_dir = json_string(json_object_get(item, "path"));
+
+        if (domain == NULL || *domain == '\0') {
+            log_error("__module_loader_translations_load: domain is required\n");
+            it = json_next_it(&it);
+            continue;
+        }
+
         if (locale_dir == NULL || *locale_dir == '\0') {
-            log_error("__module_loader_translations_load: translation path is empty\n");
+            log_error("__module_loader_translations_load: path is required\n");
             it = json_next_it(&it);
             continue;
         }
 
-        if (!i18n_load_directory(config->translations, locale_dir)) {
-            log_error("__module_loader_translations_load: failed to load translations from %s\n", locale_dir);
+        i18n_t* i18n = i18n_create(locale_dir, domain, "en");
+        if (i18n == NULL) {
+            log_error("__module_loader_translations_load: failed to create i18n for domain %s\n", domain);
+            it = json_next_it(&it);
+            continue;
         }
+
+        map_insert(config->translations, domain, i18n);
 
         it = json_next_it(&it);
     }

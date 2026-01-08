@@ -4,6 +4,7 @@
 #include <stdbool.h>
 
 #include "array.h"
+#include "map.h"
 #include "json.h"
 #include "server.h"
 #include "storage.h"
@@ -73,7 +74,7 @@ typedef struct appconfig {
     array_t* prepared_queries; // prepare_stmt_t
     routeloader_lib_t* taskmanager_loader;
     taskmanager_t* taskmanager;
-    i18n_t* translations;
+    map_t* translations;  // map: domain -> i18n_t*
 } appconfig_t;
 
 int appconfig_init(int argc, char* argv[]);

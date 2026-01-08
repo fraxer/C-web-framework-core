@@ -1,53 +1,54 @@
 #ifndef __I18N__
 #define __I18N__
 
-#include "json.h"
-#include "hashmap.h"
+#include <libintl.h>
+#include <locale.h>
+#include <stdlib.h>
 
 /**
- * i18n - Internationalization module
+ * i18n - Internationalization module using gettext
  *
- * Loads translations from JSON files in a locale directory.
- * File naming: <lang>.json (e.g., en.json, ru.json)
- *
- * JSON format:
- * {
- *     "key": "translated string",
- *     "another_key": "another translation"
- * }
+ * Uses standard gettext for translations.
+ * File structure: locale_dir/<lang>/LC_MESSAGES/<domain>.mo
  */
 
 typedef struct i18n {
-    hashmap_t* translations;     // key: "lang:message_key", value: char*
-    char default_lang[8];        // default language code (e.g., "en")
+    char* domain;           // domain name (e.g., "identity")
+    char* locale_dir;       // path to locale directory
+    char default_lang[8];   // default language code (e.g., "en")
 } i18n_t;
 
 /**
- * Create i18n instance and optionally load translations from directory.
- * @param locale_dir Path to directory containing JSON translation files (can be NULL)
+ * Create i18n instance and bind textdomain.
+ * @param locale_dir Path to locale directory (e.g., "backend/identity/locale")
+ * @param domain Domain name for translations (e.g., "identity")
  * @param default_lang Default language code (e.g., "en")
  * @return i18n instance or NULL on error
  */
-i18n_t* i18n_create(const char* locale_dir, const char* default_lang);
+i18n_t* i18n_create(const char* locale_dir, const char* domain, const char* default_lang);
 
 /**
- * Load translations from a directory into existing i18n instance.
- * @param i18n i18n instance
- * @param locale_dir Path to directory containing JSON translation files
- * @return 1 on success, 0 on error
- */
-int i18n_load_directory(i18n_t* i18n, const char* locale_dir);
-
-/**
- * Get translation by key and language.
+ * Get translation by msgid and language.
  * Falls back to default language if translation not found.
- * Falls back to key itself if no translation exists.
+ * Falls back to msgid itself if no translation exists.
  * @param i18n i18n instance
- * @param key Message key
+ * @param msgid Message identifier
  * @param lang Language code (e.g., "en", "ru")
  * @return Translated string (do not free)
  */
-const char* i18n_get(i18n_t* i18n, const char* key, const char* lang);
+const char* i18n_get(i18n_t* i18n, const char* msgid, const char* lang);
+
+/**
+ * Get plural translation.
+ * @param i18n i18n instance
+ * @param singular Singular form msgid
+ * @param plural Plural form msgid
+ * @param n Count for plural selection
+ * @param lang Language code
+ * @return Translated string (do not free)
+ */
+const char* i18n_nget(i18n_t* i18n, const char* singular, const char* plural,
+                      unsigned long n, const char* lang);
 
 /**
  * Parse Accept-Language header and return primary language code.
@@ -58,7 +59,7 @@ const char* i18n_get(i18n_t* i18n, const char* key, const char* lang);
 char* i18n_parse_accept_language(const char* header);
 
 /**
- * Free i18n instance and all loaded translations.
+ * Free i18n instance.
  * @param i18n i18n instance
  */
 void i18n_free(i18n_t* i18n);

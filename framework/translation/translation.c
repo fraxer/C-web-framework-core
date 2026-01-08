@@ -4,6 +4,7 @@
 
 #include "i18n.h"
 #include "http.h"
+#include "map.h"
 #include "translation.h"
 
 // Get language from request (query param > Accept-Language > default)
@@ -19,23 +20,15 @@ static char* get_lang(httpctx_t* ctx) {
     return strdup("en");
 }
 
-// Translate message using global translations from appconfig
-const char* tr(httpctx_t* ctx, const char* key) {
-    i18n_t* i18n = appconfig()->translations;
-    if (i18n == NULL) return key;
+// Find i18n instance by domain name
+static i18n_t* find_i18n(const char* domain) {
+    map_t* translations = appconfig()->translations;
+    if (translations == NULL || domain == NULL) return NULL;
 
-    char* lang = get_lang(ctx);
-
-    const char* result = i18n_get(i18n, key, lang);
-
-    free(lang);
-
-    return result;
+    return map_find(translations, domain);
 }
 
 // Replace {placeholders} with values
-// Template: "Hello, {name}! You have {count} messages."
-// Args: "name", "John", "count", "5", NULL
 static char* replace_placeholders(const char* template, va_list args) {
     if (template == NULL) return NULL;
 
@@ -68,7 +61,6 @@ static char* replace_placeholders(const char* template, va_list args) {
             if (end != NULL) {
                 size_t key_len = end - start;
 
-                // Find matching pair
                 int found = 0;
                 for (size_t i = 0; i < pair_count; i++) {
                     if (strlen(pairs[i].key) == key_len && strncmp(pairs[i].key, start, key_len) == 0) {
@@ -79,7 +71,7 @@ static char* replace_placeholders(const char* template, va_list args) {
                 }
 
                 if (!found) {
-                    result_size += (end - p + 1); // keep {key} as-is
+                    result_size += (end - p + 1);
                 }
 
                 p = end + 1;
@@ -106,7 +98,6 @@ static char* replace_placeholders(const char* template, va_list args) {
             if (end != NULL) {
                 size_t key_len = end - start;
 
-                // Find matching pair
                 int found = 0;
                 for (size_t i = 0; i < pair_count; i++) {
                     if (strlen(pairs[i].key) == key_len && strncmp(pairs[i].key, start, key_len) == 0) {
@@ -136,17 +127,45 @@ static char* replace_placeholders(const char* template, va_list args) {
     return result;
 }
 
-// Translate with placeholders
-// Example: trf(ctx, "greeting", "name", username, "count", "5", NULL)
-// JSON: { "greeting": "Hello, {name}! You have {count} messages." }
-char* trf(httpctx_t* ctx, const char* key, ...) {
-    const char* template = tr(ctx, key);
+const char* tr(httpctx_t* ctx, const char* domain, const char* msgid) {
+    i18n_t* i18n = find_i18n(domain);
+    if (i18n == NULL) return msgid;
+
+    char* lang = get_lang(ctx);
+    const char* result = i18n_get(i18n, msgid, lang);
+    free(lang);
+
+    return result;
+}
+
+char* trf(httpctx_t* ctx, const char* domain, const char* msgid, ...) {
+    const char* template = tr(ctx, domain, msgid);
 
     va_list args;
-    va_start(args, key);
-
+    va_start(args, msgid);
     char* result = replace_placeholders(template, args);
+    va_end(args);
 
+    return result;
+}
+
+const char* trn(httpctx_t* ctx, const char* domain, const char* singular, const char* plural, unsigned long n) {
+    i18n_t* i18n = find_i18n(domain);
+    if (i18n == NULL) return n == 1 ? singular : plural;
+
+    char* lang = get_lang(ctx);
+    const char* result = i18n_nget(i18n, singular, plural, n, lang);
+    free(lang);
+
+    return result;
+}
+
+char* trnf(httpctx_t* ctx, const char* domain, const char* singular, const char* plural, unsigned long n, ...) {
+    const char* template = trn(ctx, domain, singular, plural, n);
+
+    va_list args;
+    va_start(args, n);
+    char* result = replace_placeholders(template, args);
     va_end(args);
 
     return result;

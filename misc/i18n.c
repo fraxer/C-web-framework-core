@@ -1,197 +1,141 @@
+#define _GNU_SOURCE
 #include "i18n.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dirent.h>
 
-#include "file.h"
+// Thread-local locale for each thread
+static _Thread_local locale_t thread_locale = (locale_t)0;
 
-
-// Create composite key "lang:message_key"
-static char* make_key(const char* lang, const char* message_key) {
-    size_t lang_len = strlen(lang);
-    size_t key_len = strlen(message_key);
-    char* composite = malloc(lang_len + 1 + key_len + 1);
-    if (composite == NULL) return NULL;
-
-    memcpy(composite, lang, lang_len);
-    composite[lang_len] = ':';
-    memcpy(composite + lang_len + 1, message_key, key_len);
-    composite[lang_len + 1 + key_len] = '\0';
-
-    return composite;
+// Map short lang code to system locale name
+static const char* get_locale_name(const char* lang) {
+    if (strcmp(lang, "ru") == 0) return "ru_RU.utf8";
+    if (strcmp(lang, "en") == 0) return "en_US.utf8";
+    if (strcmp(lang, "de") == 0) return "de_DE.utf8";
+    if (strcmp(lang, "fr") == 0) return "fr_FR.utf8";
+    if (strcmp(lang, "es") == 0) return "es_ES.utf8";
+    if (strcmp(lang, "zh") == 0) return "zh_CN.utf8";
+    if (strcmp(lang, "ja") == 0) return "ja_JP.utf8";
+    // fallback: try lang_LANG.utf8 pattern
+    return NULL;
 }
 
-// Load translations from a single JSON file
-static int load_translations_file(i18n_t* i18n, const char* filepath, const char* lang) {
-    file_t file = file_open(filepath, O_RDONLY);
-    if (!file.ok) return 0;
+static void set_thread_locale(const char* lang) {
+    if (lang == NULL || *lang == '\0') return;
 
-    char* content = file.content(&file);
-    file.close(&file);
-
-    if (content == NULL) return 0;
-
-    json_doc_t* doc = json_parse(content);
-    free(content);
-
-    if (doc == NULL) return 0;
-
-    json_token_t* root = json_root(doc);
-    if (!json_is_object(root)) {
-        json_free(doc);
-        return 0;
+    // Free previous locale if exists
+    if (thread_locale != (locale_t)0) {
+        freelocale(thread_locale);
+        thread_locale = (locale_t)0;
     }
 
-    // Iterate over all key-value pairs
-    json_it_t it = json_init_it(root);
-    while (!json_end_it(&it)) {
-        const char* msg_key = json_it_key(&it);
-        json_token_t* value = json_it_value(&it);
+    const char* locale_name = get_locale_name(lang);
 
-        if (json_is_string(value) && msg_key != NULL) {
-            char* composite_key = make_key(lang, msg_key);
-            if (composite_key != NULL) {
-                const char* translation = json_string(value);
-                char* translation_copy = strdup(translation);
-                if (translation_copy != NULL) {
-                    hashmap_insert(i18n->translations, composite_key, translation_copy);
-                } else {
-                    free(composite_key);
-                }
-            }
-        }
-
-        it = json_next_it(&it);
+    if (locale_name != NULL) {
+        thread_locale = newlocale(LC_MESSAGES_MASK, locale_name, (locale_t)0);
     }
 
-    json_free(doc);
-    return 1;
+    // Fallback: try constructed name like "ru_RU.utf8"
+    if (thread_locale == (locale_t)0) {
+        char constructed[32];
+        snprintf(constructed, sizeof(constructed), "%s_%s.utf8",
+                 lang,
+                 (strcmp(lang, "en") == 0) ? "US" :
+                 (strcmp(lang, "ru") == 0) ? "RU" : "");
+        thread_locale = newlocale(LC_MESSAGES_MASK, constructed, (locale_t)0);
+    }
+
+    // Last fallback: C.UTF-8
+    if (thread_locale == (locale_t)0) {
+        thread_locale = newlocale(LC_MESSAGES_MASK, "C.UTF-8", (locale_t)0);
+    }
+
+    if (thread_locale != (locale_t)0) {
+        uselocale(thread_locale);
+    }
 }
 
-// Extract language code from filename (e.g., "en.json" -> "en")
-static int extract_lang_from_filename(const char* filename, char* lang, size_t lang_size) {
-    const char* dot = strrchr(filename, '.');
-    if (dot == NULL) return 0;
-
-    // Check extension is .json
-    if (strcmp(dot, ".json") != 0) return 0;
-
-    size_t lang_len = dot - filename;
-    if (lang_len == 0 || lang_len >= lang_size) return 0;
-
-    memcpy(lang, filename, lang_len);
-    lang[lang_len] = '\0';
-
-    return 1;
-}
-
-i18n_t* i18n_create(const char* locale_dir, const char* default_lang) {
-    if (default_lang == NULL) return NULL;
+i18n_t* i18n_create(const char* locale_dir, const char* domain, const char* default_lang) {
+    if (domain == NULL || default_lang == NULL) return NULL;
 
     i18n_t* i18n = calloc(1, sizeof(i18n_t));
     if (i18n == NULL) return NULL;
 
-    // Set default language
-    strncpy(i18n->default_lang, default_lang, sizeof(i18n->default_lang) - 1);
-    i18n->default_lang[sizeof(i18n->default_lang) - 1] = '\0';
-
-    // Create hashmap with string keys
-    i18n->translations = hashmap_create_ex(
-        hashmap_hash_string,
-        hashmap_equals_string,
-        64,     // initial capacity
-        0.75f,  // load factor
-        NULL,   // key_copy (we manage keys ourselves)
-        free,   // key_free
-        NULL,   // value_copy
-        free    // value_free
-    );
-
-    if (i18n->translations == NULL) {
+    i18n->domain = strdup(domain);
+    if (i18n->domain == NULL) {
         free(i18n);
         return NULL;
     }
 
-    // Load translations from directory if provided
     if (locale_dir != NULL) {
-        i18n_load_directory(i18n, locale_dir);
+        i18n->locale_dir = strdup(locale_dir);
+        if (i18n->locale_dir == NULL) {
+            free(i18n->domain);
+            free(i18n);
+            return NULL;
+        }
+
+        bindtextdomain(domain, locale_dir);
+        bind_textdomain_codeset(domain, "UTF-8");
     }
+
+    strncpy(i18n->default_lang, default_lang, sizeof(i18n->default_lang) - 1);
+    i18n->default_lang[sizeof(i18n->default_lang) - 1] = '\0';
+
+    // Initialize locale system
+    setlocale(LC_ALL, "");
 
     return i18n;
 }
 
-int i18n_load_directory(i18n_t* i18n, const char* locale_dir) {
-    if (i18n == NULL || locale_dir == NULL) return 0;
-
-    DIR* dir = opendir(locale_dir);
-    if (dir == NULL) return 0;
-
-    struct dirent* entry;
-    char filepath[PATH_MAX];
-    char lang[8];
-    int loaded = 0;
-
-    while ((entry = readdir(dir)) != NULL) {
-        // Skip directories
-        if (entry->d_type == DT_DIR) continue;
-
-        // Extract language from filename
-        if (!extract_lang_from_filename(entry->d_name, lang, sizeof(lang))) continue;
-
-        // Build full path
-        snprintf(filepath, sizeof(filepath), "%s/%s", locale_dir, entry->d_name);
-
-        // Load translations
-        if (load_translations_file(i18n, filepath, lang)) {
-            loaded = 1;
-        }
-    }
-
-    closedir(dir);
-
-    return loaded;
-}
-
-const char* i18n_get(i18n_t* i18n, const char* key, const char* lang) {
-    if (i18n == NULL || key == NULL) return key;
+const char* i18n_get(i18n_t* i18n, const char* msgid, const char* lang) {
+    if (i18n == NULL || msgid == NULL) return msgid;
 
     const char* effective_lang = lang ? lang : i18n->default_lang;
 
-    // Try requested language first
-    char* composite_key = make_key(effective_lang, key);
-    if (composite_key != NULL) {
-        const char* result = hashmap_find(i18n->translations, composite_key);
-        free(composite_key);
-        if (result != NULL) return result;
+    set_thread_locale(effective_lang);
+
+    const char* result = dgettext(i18n->domain, msgid);
+
+    // if translation not found (returns msgid) and lang != default, try default
+    if (result == msgid && lang != NULL && strcmp(lang, i18n->default_lang) != 0) {
+        set_thread_locale(i18n->default_lang);
+        result = dgettext(i18n->domain, msgid);
     }
 
-    // Fallback to default language
-    if (lang != NULL && strcmp(lang, i18n->default_lang) != 0) {
-        composite_key = make_key(i18n->default_lang, key);
-        if (composite_key != NULL) {
-            const char* result = hashmap_find(i18n->translations, composite_key);
-            free(composite_key);
-            if (result != NULL) return result;
-        }
+    return result;
+}
+
+const char* i18n_nget(i18n_t* i18n, const char* singular, const char* plural,
+                      unsigned long n, const char* lang) {
+    if (i18n == NULL || singular == NULL || plural == NULL) {
+        return n == 1 ? singular : plural;
     }
 
-    // Return key itself as last resort
-    return key;
+    const char* effective_lang = lang ? lang : i18n->default_lang;
+
+    set_thread_locale(effective_lang);
+
+    const char* result = dngettext(i18n->domain, singular, plural, n);
+
+    // if not translated, try default language
+    if ((result == singular || result == plural) &&
+        lang != NULL && strcmp(lang, i18n->default_lang) != 0) {
+        set_thread_locale(i18n->default_lang);
+        result = dngettext(i18n->domain, singular, plural, n);
+    }
+
+    return result;
 }
 
 char* i18n_parse_accept_language(const char* header) {
     if (header == NULL || *header == '\0') return strdup("en");
 
-    // Parse first language code from Accept-Language
-    // Format: "ru-RU,ru;q=0.9,en-US;q=0.8"
     const char* p = header;
 
-    // Skip whitespace
     while (*p == ' ') p++;
 
-    // Find end of language code (stop at '-', ',', ';', or end)
     const char* start = p;
     while (*p && *p != '-' && *p != ',' && *p != ';' && *p != ' ') p++;
 
@@ -210,9 +154,7 @@ char* i18n_parse_accept_language(const char* header) {
 void i18n_free(i18n_t* i18n) {
     if (i18n == NULL) return;
 
-    if (i18n->translations != NULL) {
-        hashmap_free(i18n->translations);
-    }
-
+    free(i18n->domain);
+    free(i18n->locale_dir);
     free(i18n);
 }
