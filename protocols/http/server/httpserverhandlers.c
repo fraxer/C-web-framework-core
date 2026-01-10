@@ -48,6 +48,7 @@ static int __post_response_default(connection_t* connection, int status_code);
 static int __post_response(httprequest_t* request, httpresponse_t* response);
 static int __post_deffered_response(httprequest_t* request, httpresponse_t* response);
 static ratelimiter_t* __ratelimiter_find(server_http_t* http_config, route_t* route);
+static int __prepare_static_file_response(connection_server_ctx_t* ctx, httpresponse_t* response, const char* static_file_path);
 
 int __tls_read(connection_t* connection) {
     return __handshake(connection);
@@ -294,6 +295,13 @@ int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
         ratelimiter_t* ratelimiter = __ratelimiter_find(&ctx->server->http, route);
 
         if (route->is_primitive && route_compare_primitive(route, request->path, request->path_length)) {
+            if (route->static_file[request->method] != NULL) {
+                if (!__prepare_static_file_response(ctx, response, route->static_file[request->method]))
+                    return 0;
+
+                return __deferred_handler(connection, request, response, __queue_response_handler, NULL, __queue_data_response_create, ratelimiter);
+            }
+
             if (route->handler[request->method] == NULL) return 0;
 
             return __deferred_handler(connection, request, response, __queue_request_handler, route->handler[request->method], __queue_data_request_create, ratelimiter);
@@ -318,11 +326,25 @@ int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
                 httpparser_append_query(request, query);
             }
 
+            if (route->static_file[request->method] != NULL) {
+                if (!__prepare_static_file_response(ctx, response, route->static_file[request->method]))
+                    return 0;
+
+                return __deferred_handler(connection, request, response, __queue_response_handler, NULL, __queue_data_response_create, ratelimiter);
+            }
+
             if (route->handler[request->method] == NULL) return 0;
 
             return __deferred_handler(connection, request, response,  __queue_request_handler, route->handler[request->method], __queue_data_request_create, ratelimiter);
         }
         else if (matches_count == 1) {
+            if (route->static_file[request->method] != NULL) {
+                if (!__prepare_static_file_response(ctx, response, route->static_file[request->method]))
+                    return 0;
+
+                return __deferred_handler(connection, request, response, __queue_response_handler, NULL, __queue_data_response_create, ratelimiter);
+            }
+
             if (route->handler[request->method] == NULL) return 0;
 
             return __deferred_handler(connection, request, response,  __queue_request_handler, route->handler[request->method], __queue_data_request_create, ratelimiter);
@@ -420,8 +442,6 @@ void* __queue_data_request_create(connection_t* connection, httprequest_t* reque
 }
 
 void* __queue_data_response_create(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter) {
-    (void)ratelimiter;
-
     connection_queue_http_data_t* data = malloc(sizeof * data);
     if (data == NULL) return NULL;
 
@@ -429,7 +449,7 @@ void* __queue_data_response_create(connection_t* connection, httprequest_t* requ
     data->request = request;
     data->connection = connection;
     data->response = response;
-    data->ratelimiter = NULL;
+    data->ratelimiter = ratelimiter;
 
     return data;
 }
@@ -786,6 +806,33 @@ ratelimiter_t* __ratelimiter_find(server_http_t* http_config, route_t* route) {
     if (route->ratelimiter != NULL) return route->ratelimiter;
 
     return http_config->ratelimiter;
+}
+
+int __prepare_static_file_response(connection_server_ctx_t* ctx, httpresponse_t* response, const char* static_file_path) {
+    char file_full_path[PATH_MAX];
+    size_t pos = 0;
+    size_t static_file_len = strlen(static_file_path);
+
+    if (!data_appendn(file_full_path, &pos, PATH_MAX, ctx->server->root, ctx->server->root_length))
+        return 0;
+    if (ctx->server->root[ctx->server->root_length - 1] != '/') {
+        if (!data_appendn(file_full_path, &pos, PATH_MAX, "/", 1))
+            return 0;
+    }
+    if (static_file_path[0] == '/') {
+        if (!data_appendn(file_full_path, &pos, PATH_MAX, static_file_path + 1, static_file_len - 1))
+            return 0;
+    }
+    else {
+        if (!data_appendn(file_full_path, &pos, PATH_MAX, static_file_path, static_file_len))
+            return 0;
+    }
+
+    file_full_path[pos] = '\0';
+
+    http_response_file(response, file_full_path);
+
+    return 1;
 }
 
 void http_server_init_sni_callbacks(server_t* servers) {

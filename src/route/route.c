@@ -94,6 +94,14 @@ route_t* route_init_route() {
     route->handler[ROUTE_PATCH] = NULL;
     route->handler[ROUTE_HEAD] = NULL;
 
+    route->static_file[ROUTE_GET] = NULL;
+    route->static_file[ROUTE_POST] = NULL;
+    route->static_file[ROUTE_PUT] = NULL;
+    route->static_file[ROUTE_DELETE] = NULL;
+    route->static_file[ROUTE_OPTIONS] = NULL;
+    route->static_file[ROUTE_PATCH] = NULL;
+    route->static_file[ROUTE_HEAD] = NULL;
+
     route->location_erroffset = 0;
     route->location = NULL;
     route->is_primitive = 0;
@@ -358,25 +366,25 @@ void route_parser_free(route_parser_t* parser) {
 int route_set_http_handler(route_t* route, const char* method, void(*function)(void*), ratelimiter_t* ratelimiter) {
     int m = ROUTE_NONE;
 
-    if (method[0] == 'G' && method[1] == 'E' && method[2] == 'T') {
+    if (strcmp(method, "GET") == 0) {
         m = ROUTE_GET;
     }
-    else if (method[0] == 'P' && method[1] == 'O' && method[2] == 'S' && method[3] == 'T') {
+    else if (strcmp(method, "POST") == 0) {
         m = ROUTE_POST;
     }
-    else if (method[0] == 'P' && method[1] == 'U' && method[2] == 'T') {
+    else if (strcmp(method, "PUT") == 0) {
         m = ROUTE_PUT;
     }
-    else if (method[0] == 'D' && method[1] == 'E' && method[2] == 'L' && method[3] == 'E' && method[4] == 'T' && method[5] == 'E') {
+    else if (strcmp(method, "DELETE") == 0) {
         m = ROUTE_DELETE;
     }
-    else if (method[0] == 'O' && method[1] == 'P' && method[2] == 'T' && method[3] == 'I' && method[4] == 'O' && method[5] == 'N' && method[6] == 'S') {
+    else if (strcmp(method, "OPTIONS") == 0) {
         m = ROUTE_OPTIONS;
     }
-    else if (method[0] == 'P' && method[1] == 'A' && method[2] == 'T' && method[3] == 'C' && method[4] == 'H') {
+    else if (strcmp(method, "PATCH") == 0) {
         m = ROUTE_PATCH;
     }
-    else if (method[0] == 'H' && method[1] == 'E' && method[2] == 'A' && method[3] == 'D') {
+    else if (strcmp(method, "HEAD") == 0) {
         m = ROUTE_HEAD;
     }
 
@@ -385,6 +393,47 @@ int route_set_http_handler(route_t* route, const char* method, void(*function)(v
     if (route->handler[m]) return 1;
 
     route->handler[m] = function;
+    route->ratelimiter = ratelimiter;
+
+    return 1;
+}
+
+int route_set_http_static(route_t* route, const char* method, const char* static_file, ratelimiter_t* ratelimiter) {
+    int m = ROUTE_NONE;
+
+    if (strcmp(method, "GET") == 0) {
+        m = ROUTE_GET;
+    }
+    else if (strcmp(method, "POST") == 0) {
+        m = ROUTE_POST;
+    }
+    else if (strcmp(method, "PUT") == 0) {
+        m = ROUTE_PUT;
+    }
+    else if (strcmp(method, "DELETE") == 0) {
+        m = ROUTE_DELETE;
+    }
+    else if (strcmp(method, "OPTIONS") == 0) {
+        m = ROUTE_OPTIONS;
+    }
+    else if (strcmp(method, "PATCH") == 0) {
+        m = ROUTE_PATCH;
+    }
+    else if (strcmp(method, "HEAD") == 0) {
+        m = ROUTE_HEAD;
+    }
+
+    if (m == ROUTE_NONE) return 0;
+
+    if (route->static_file[m]) return 1;
+
+    size_t len = strlen(static_file);
+    route->static_file[m] = malloc(len + 1);
+    if (route->static_file[m] == NULL) {
+        log_error(ROUTE_OUT_OF_MEMORY);
+        return 0;
+    }
+    memcpy(route->static_file[m], static_file, len + 1);
     route->ratelimiter = ratelimiter;
 
     return 1;
@@ -419,7 +468,7 @@ int route_set_websockets_handler(route_t* route, const char* method, void(*funct
 void routes_free(route_t* route) {
     while (route != NULL) {
         route_t* route_next = route->next;
-        
+
         route_param_t* param = route->param;
         while (param != NULL) {
             route_param_t* param_next = param->next;
@@ -432,6 +481,11 @@ void routes_free(route_t* route) {
 
         if (route->location != NULL)
             pcre_free(route->location);
+
+        for (int i = 0; i < 7; i++) {
+            if (route->static_file[i] != NULL)
+                free(route->static_file[i]);
+        }
 
         free(route->path);
         ratelimiter_free(route->ratelimiter);
