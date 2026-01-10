@@ -2052,6 +2052,11 @@ json_it_t json_next_it(json_it_t* iterator) {
 
     iterator->key = iterator->key->sibling;
 
+    if (iterator->key == NULL) {
+        *iterator = (json_it_t){0};
+        return *iterator;
+    }
+
     if (iterator->type == JSON_OBJECT)
         iterator->value = iterator->key->child;
     else if (iterator->type == JSON_ARRAY)

@@ -1344,29 +1344,12 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
             log_error("__module_loader_set_http_route: http.route item.value must be object\n");
             return 0;
         }
-        if (json_object_size(token_object) < 2) {
-            log_error("__module_loader_set_http_route: http.route item.value must be object with at least 2 elements\n");
+
+        if (json_object_size(token_object) < 1) {
+            log_error("__module_loader_set_http_route: http.route item.value must be object with at least 1 element\n");
             return 0;
         }
 
-        const json_token_t* token_file = json_object_get(token_object, "file");
-        if (!json_is_string(token_file)) {
-            log_error("__module_loader_set_http_route: http.route item.value.route must be string\n");
-            return 0;
-        }
-        if (json_string_size(token_file) == 0) {
-            log_error("__module_loader_set_http_route: http.route item.value.route must be not empty string\n");
-            return 0;
-        }
-        const json_token_t* token_function = json_object_get(token_object, "function");
-        if (!json_is_string(token_function)) {
-            log_error("__module_loader_set_http_route: http.route item.value.handler must be string\n");
-            return 0;
-        }
-        if (json_string_size(token_function) == 0) {
-            log_error("__module_loader_set_http_route: http.route item.value.handler must be not empty string\n");
-            return 0;
-        }
         const json_token_t* token_ratelimit = json_object_get(token_object, "ratelimit");
         ratelimiter_t* ratelimiter = NULL;
         if (token_ratelimit != NULL) {
@@ -1391,6 +1374,44 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
                 log_error("__module_loader_set_http_route: failed to create ratelimiter %s\n", ratelimit_name);
                 return 0;
             }
+        }
+
+        const json_token_t* token_static_file = json_object_get(token_object, "static_file");
+        if (token_static_file != NULL) {
+            if (!json_is_string(token_static_file)) {
+                log_error("__module_loader_set_http_route: http.route item.value.static_file must be string\n");
+                return 0;
+            }
+            if (json_string_size(token_static_file) == 0) {
+                log_error("__module_loader_set_http_route: http.route item.value.static_file must be not empty string\n");
+                return 0;
+            }
+            const char* static_file = json_string(token_static_file);
+            if (!route_set_http_static(route, method, static_file, ratelimiter)) {
+                log_error("__module_loader_set_http_route: failed to set static file %s\n", static_file);
+                return 0;
+            }
+
+            continue;
+        }
+
+        const json_token_t* token_file = json_object_get(token_object, "file");
+        if (!json_is_string(token_file)) {
+            log_error("__module_loader_set_http_route: http.route item.value.route must be string\n");
+            return 0;
+        }
+        if (json_string_size(token_file) == 0) {
+            log_error("__module_loader_set_http_route: http.route item.value.route must be not empty string\n");
+            return 0;
+        }
+        const json_token_t* token_function = json_object_get(token_object, "function");
+        if (!json_is_string(token_function)) {
+            log_error("__module_loader_set_http_route: http.route item.value.handler must be string\n");
+            return 0;
+        }
+        if (json_string_size(token_function) == 0) {
+            log_error("__module_loader_set_http_route: http.route item.value.handler must be not empty string\n");
+            return 0;
         }
 
         const char* lib_file = json_string(token_file);
