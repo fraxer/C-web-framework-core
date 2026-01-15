@@ -722,7 +722,7 @@ str_t* __escape_identifier(void* connection, const char* str) {
                 return NULL;
             }
 
-            str_append(result, str_get(escaped_part), str_len(escaped_part));
+            str_append(result, str_get(escaped_part), str_size(escaped_part));
             str_free(escaped_part);
 
             first_part = 0;
