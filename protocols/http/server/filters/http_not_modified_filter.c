@@ -74,9 +74,7 @@ int http_not_modified_header(httprequest_t* request, httpresponse_t* response) {
     // Add Last-Modified header for files with mtime
     if (response->file_.fd > -1 && response->file_.mtime > 0) {
         char last_modified[64];
-        struct tm tm_buf;
-        struct tm* tm = gmtime_r(&response->file_.mtime, &tm_buf);
-        if (tm != NULL && http_format_date(tm, last_modified, sizeof(last_modified)) > 0) {
+        if (http_format_date(&response->file_.mtime, last_modified, sizeof(last_modified)) > 0) {
             response->add_header(response, "Last-Modified", last_modified);
         }
 
