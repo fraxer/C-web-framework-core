@@ -305,3 +305,15 @@ char* copy_cstringn(const char* string, size_t length) {
 
     return value;
 }
+
+size_t http_format_date(time_t time, char* buf, size_t buf_size) {
+    if (buf == NULL || buf_size == 0)
+        return 0;
+
+    struct tm tm_buf;
+    struct tm* tm = gmtime_r(&time, &tm_buf);
+    if (tm == NULL)
+        return 0;
+
+    return strftime(buf, buf_size, "%a, %d %b %Y %H:%M:%S GMT", tm);
+}

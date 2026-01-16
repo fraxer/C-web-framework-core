@@ -1,6 +1,8 @@
 #ifndef __HELPERS__
 #define __HELPERS__
 
+#include <time.h>
+
 int helpers_mkdir(const char* path);
 int helpers_base_mkdir(const char* base_path, const char* path);
 int cmpstr_lower(const char* a, const char* b);
@@ -19,5 +21,6 @@ int data_append(char* data, size_t* pos, const char* string, size_t length);
 int data_appendn(char* data, size_t* pos, size_t max, const char* string, size_t length);
 int is_path_traversal(const char* string, size_t length);
 char* copy_cstringn(const char*, size_t);
+size_t http_format_date(time_t time, char* buf, size_t buf_size);
 
 #endif
