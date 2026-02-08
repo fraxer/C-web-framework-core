@@ -154,6 +154,10 @@ void dbinstance_free(dbinstance_t* instance) {
     free(instance);
 }
 
+dbhost_t* dbhost(const char* dbid) {
+    return __get_host(dbid);
+}
+
 dbresult_t* dbqueryf(const char* dbid, const char* format, ...) {
     dbinstance_t* instance = dbinstance(dbid);
     if (instance == NULL) return NULL;

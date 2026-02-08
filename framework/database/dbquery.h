@@ -8,6 +8,7 @@
 
 dbinstance_t* dbinstance(const char* dbid);
 void dbinstance_free(dbinstance_t* instance);
+dbhost_t* dbhost(const char* dbid);
 dbresult_t* dbqueryf(const char* dbid, const char*, ...);
 dbresult_t* dbquery(const char* dbid, const char* format, array_t* params);
 dbresult_t* dbprepared_query(const char* dbid, const char* stmt_name, array_t* params);

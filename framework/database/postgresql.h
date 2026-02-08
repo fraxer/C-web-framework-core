@@ -12,6 +12,7 @@ typedef struct postgresqlhost {
     char* dbname;
     char* user;
     char* password;
+    char* schema;
     int connection_timeout;
 } postgresqlhost_t;
 

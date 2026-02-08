@@ -73,6 +73,7 @@ postgresqlhost_t* __host_create(void) {
     host->dbname = NULL;
     host->user = NULL;
     host->password = NULL;
+    host->schema = NULL;
     host->connection_timeout = 0;
 
     return host;
@@ -88,6 +89,7 @@ void __host_free(void* arg) {
     if (host->dbname) free(host->dbname);
     if (host->user) free(host->user);
     if (host->password) free(host->password);
+    if (host->schema) free(host->schema);
 
     array_free(host->base.connections);
     free(host);
@@ -966,6 +968,24 @@ db_t* postgresql_load(const char* database_id, const json_token_t* token_array) 
                 if (!ok) {
                     log_error("postgresql_load: field %s must be int\n", key);
                     goto host_failed;
+                }
+            }
+            else if (strcmp(key, "schema") == 0) {
+                if (!json_is_string(token_value)) {
+                    log_error("postgresql_load: field %s must be string\n", key);
+                    goto host_failed;
+                }
+
+                size_t schema_size = json_string_size(token_value);
+                if (schema_size > 0) {
+                    host->schema = malloc(schema_size + 1);
+                    if (host->schema == NULL) {
+                        log_error("postgresql_load: alloc memory for %s failed\n", key);
+                        goto host_failed;
+                    }
+                    strcpy(host->schema, json_string(token_value));
+                } else {
+                    host->schema = NULL;
                 }
             }
             else {
