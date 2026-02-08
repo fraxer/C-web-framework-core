@@ -14,7 +14,7 @@ typedef enum {
 } session_type_e;
 
 typedef struct session {
-    char*(*create)(const char* data);
+    char*(*create)(const char* data, long duration);
     char*(*get)(const char* session_id);
     int(*update)(const char* session_id, const char* data);
     int(*destroy)(const char* session_id);
@@ -30,7 +30,7 @@ typedef struct sessionconfig {
 } sessionconfig_t;
 
 char* session_create_id();
-char* session_create(const char* data);
+char* session_create(const char* data, long duration);
 int session_destroy(const char* session_id);
 int session_update(const char* session_id, const char* data);
 char* session_get(const char* session_id);

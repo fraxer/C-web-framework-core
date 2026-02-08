@@ -43,10 +43,10 @@ char* session_create_id() {
  * @param data The data to be stored in the session
  * @return The session id of the newly created session
  */
-char* session_create(const char* data) {
+char* session_create(const char* data, long duration) {
     session_remove_expired();
 
-    return appconfig()->sessionconfig.session->create(data);
+    return appconfig()->sessionconfig.session->create(data, duration);
 }
 
 /**
