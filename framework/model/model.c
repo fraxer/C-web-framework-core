@@ -1406,7 +1406,6 @@ int __model_set_date(mfield_t* field, tm_t* value) {
 
     if (!field->dirty) {
         field->oldvalue._tm = field->value._tm;
-        field->value._tm = (tm_t){0};
         field->dirty = 1;
     }
 
@@ -1761,12 +1760,11 @@ int model_set_timestamp_from_str(mfield_t* field, const char* value) {
     if (field->type != MODEL_TIMESTAMP) return 0;
     if (value == NULL) { field->is_null = 1; return 1; }
 
-    memset(&field->value._tm, 0, sizeof(tm_t));
-
-    if (strlen(value) > 0 && strptime(value, "%Y-%m-%d %H:%M:%S", &field->value._tm) == NULL)
+    tm_t tm = (tm_t){0};
+    if (strlen(value) > 0 && strptime(value, "%Y-%m-%d %H:%M:%S", &tm) == NULL)
         return 0;
 
-    return model_set_timestamp(field, &field->value._tm);
+    return model_set_timestamp(field, &tm);
 }
 
 int model_set_timestamptz_from_str(mfield_t* field, const char* value) {
@@ -1774,12 +1772,11 @@ int model_set_timestamptz_from_str(mfield_t* field, const char* value) {
     if (field->type != MODEL_TIMESTAMPTZ) return 0;
     if (value == NULL) { field->is_null = 1; return 1; }
 
-    memset(&field->value._tm, 0, sizeof(tm_t));
-
-    if (strlen(value) > 0 && strptime(value, "%Y-%m-%d %H:%M:%S%z", &field->value._tm) == NULL)
+    tm_t tm = (tm_t){0};
+    if (strlen(value) > 0 && strptime(value, "%Y-%m-%d %H:%M:%S%z", &tm) == NULL)
         return 0;
 
-    return model_set_timestamptz(field, &field->value._tm);
+    return model_set_timestamptz(field, &tm);
 }
 
 int model_set_date_from_str(mfield_t* field, const char* value) {
@@ -1787,12 +1784,11 @@ int model_set_date_from_str(mfield_t* field, const char* value) {
     if (field->type != MODEL_DATE) return 0;
     if (value == NULL) { field->is_null = 1; return 1; }
 
-    memset(&field->value._tm, 0, sizeof(tm_t));
-
-    if (strlen(value) > 0 && strptime(value, "%Y-%m-%d %H:%M:%S", &field->value._tm) == NULL)
+    tm_t tm = (tm_t){0};
+    if (strlen(value) > 0 && strptime(value, "%Y-%m-%d %H:%M:%S", &tm) == NULL)
         return 0;
 
-    return model_set_date(field, &field->value._tm);
+    return model_set_date(field, &tm);
 }
 
 int model_set_time_from_str(mfield_t* field, const char* value) {
@@ -1800,12 +1796,11 @@ int model_set_time_from_str(mfield_t* field, const char* value) {
     if (field->type != MODEL_TIME) return 0;
     if (value == NULL) { field->is_null = 1; return 1; }
 
-    memset(&field->value._tm, 0, sizeof(tm_t));
-
-    if (strlen(value) > 0 && strptime(value, "%H:%M:%S", &field->value._tm) == NULL)
+    tm_t tm = (tm_t){0};
+    if (strlen(value) > 0 && strptime(value, "%H:%M:%S", &tm) == NULL)
         return 0;
 
-    return model_set_time(field, &field->value._tm);
+    return model_set_time(field, &tm);
 }
 
 int model_set_timetz_from_str(mfield_t* field, const char* value) {
@@ -1813,12 +1808,11 @@ int model_set_timetz_from_str(mfield_t* field, const char* value) {
     if (field->type != MODEL_TIMETZ) return 0;
     if (value == NULL) { field->is_null = 1; return 1; }
 
-    memset(&field->value._tm, 0, sizeof(tm_t));
-
-    if (strlen(value) > 0 && strptime(value, "%H:%M:%S%z", &field->value._tm) == NULL)
+    tm_t tm = (tm_t){0};
+    if (strlen(value) > 0 && strptime(value, "%H:%M:%S%z", &tm) == NULL)
         return 0;
 
-    return model_set_timetz(field, &field->value._tm);
+    return model_set_timetz(field, &tm);
 }
 
 int model_set_json_from_str(mfield_t* field, const char* value) {
