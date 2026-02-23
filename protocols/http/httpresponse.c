@@ -46,7 +46,6 @@ static void __httpresponse_try_enable_te(httpresponse_t* response, const char* d
 static int __httpresponse_prepare_body(httpresponse_t* response, size_t length);
 static void __httpresponse_cookie_add(httpresponse_t* response, cookie_t cookie);
 static void __httpresponse_payload_free(http_payload_t* payload);
-static void __httpresponse_payload_cache_free(httpresponse_t* response);
 static void __httpresponse_init_payload(httpresponse_t* response);
 static void __httpresponse_payload_parse_plain(httpresponse_t* response);
 static char* __httpresponse_payload(httpresponse_t* response);
@@ -163,7 +162,6 @@ void __httpresponse_reset(httpresponse_t* response) {
     response->cur_filter = response->filter;
 
     __httpresponse_payload_free(&response->payload_);
-    __httpresponse_payload_cache_free(response);
 
     response->file_.close(&response->file_);
 
@@ -211,7 +209,7 @@ void __httpresponse_filen(httpresponse_t* response, const char* path, size_t len
     char file_full_path[PATH_MAX];
     const file_status_e status_code = http_get_file_full_path(ctx->server, file_full_path, PATH_MAX, path, length);
     if (status_code != FILE_OK) {
-        response->send_default(response, status_code);
+        response->send_default(response, 404);
         return;
     }
 
@@ -879,18 +877,6 @@ void __httpresponse_payload_free(http_payload_t* payload) {
     payload->part = NULL;
 }
 
-void __httpresponse_payload_cache_free(httpresponse_t* response) {
-    if (response->cached_payload_ != NULL) {
-        free(response->cached_payload_);
-        response->cached_payload_ = NULL;
-    }
-
-    if (response->cached_payload_json_ != NULL) {
-        json_free(response->cached_payload_json_);
-        response->cached_payload_json_ = NULL;
-    }
-}
-
 void __httpresponse_init_payload(httpresponse_t* response) {
     response->payload_.pos = 0;
     response->payload_.file = file_alloc();
@@ -898,9 +884,6 @@ void __httpresponse_init_payload(httpresponse_t* response) {
     response->payload_.part = NULL;
     response->payload_.boundary = NULL;
     response->payload_.type = NONE;
-
-    response->cached_payload_ = NULL;
-    response->cached_payload_json_ = NULL;
 
     response->get_payload = __httpresponse_payload;
     response->get_payload_file = __httpresponse_payload_file;
@@ -918,10 +901,6 @@ void __httpresponse_payload_parse_plain(httpresponse_t* response) {
 }
 
 char* __httpresponse_payload(httpresponse_t* response) {
-    if (response->cached_payload_ != NULL) {
-        return response->cached_payload_;
-    }
-
     char* buffer = NULL;
 
     if (response->body.size > 0) {
@@ -950,7 +929,6 @@ char* __httpresponse_payload(httpresponse_t* response) {
         }
     }
 
-    response->cached_payload_ = buffer;
     return buffer;
 }
 
@@ -983,16 +961,10 @@ file_content_t __httpresponse_payload_file(httpresponse_t* response) {
 }
 
 json_doc_t* __httpresponse_payload_json(httpresponse_t* response) {
-    if (response->cached_payload_json_ != NULL) {
-        return response->cached_payload_json_;
-    }
-
     char* payload = __httpresponse_payload(response);
     if (payload == NULL) return NULL;
 
     json_doc_t* document = json_parse(payload);
-
-    response->cached_payload_json_ = document;
 
     return document;
 }
