@@ -42,7 +42,11 @@ connection_t* connection_s_create(int fd, in_addr_t ip, unsigned short int port,
         goto failed;
     }
 
-    connection = connection_s_alloc(ctx->listener, connfd, ip, port, buffer, buffer_size);
+    struct sockaddr_in* remote_addr = (struct sockaddr_in*)&in_addr;
+    in_addr_t remote_ip = remote_addr->sin_addr.s_addr;
+    unsigned short remote_port = ntohs(remote_addr->sin_port);
+
+    connection = connection_s_alloc(ctx->listener, connfd, ip, port, remote_ip, remote_port, buffer, buffer_size);
     if (connection == NULL) goto failed;
 
     connection->close = connection_close;
@@ -58,7 +62,7 @@ connection_t* connection_s_create(int fd, in_addr_t ip, unsigned short int port,
     return result;
 }
 
-connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, unsigned short int port, char* buffer, size_t buffer_size) {
+connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, unsigned short int port, in_addr_t remote_ip, unsigned short int remote_port, char* buffer, size_t buffer_size) {
     connection_t* connection = malloc(sizeof * connection);
     if (connection == NULL) return NULL;
 
@@ -72,6 +76,8 @@ connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, uns
     connection->keepalive = 0;
     connection->ip = ip;
     connection->port = port;
+    connection->remote_ip = remote_ip;
+    connection->remote_port = remote_port;
     connection->ctx = ctx;
     connection->ssl = NULL;
     connection->ssl_ctx = NULL;
@@ -82,7 +88,7 @@ connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, uns
 }
 
 connection_t* connection_s_create_local(server_t* server) {
-    connection_t* connection = connection_s_alloc(NULL, -1, inet_addr("127.0.0.1"), server->port, NULL, 0);
+    connection_t* connection = connection_s_alloc(NULL, -1, inet_addr("127.0.0.1"), server->port, inet_addr("127.0.0.1"), server->port, NULL, 0);
     if (connection == NULL) return NULL;
 
     connection_server_ctx_t* ctx = connection->ctx;

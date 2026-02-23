@@ -19,6 +19,8 @@ typedef struct connection {
     SSL_CTX* ssl_ctx;
     in_addr_t ip;
     unsigned short int port;
+    in_addr_t remote_ip;
+    unsigned short int remote_port;
     unsigned keepalive: 1;
 
     size_t buffer_size;

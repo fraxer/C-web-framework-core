@@ -125,7 +125,7 @@ listener_t* __listener_create(mpxapi_t* api, char* buffer, server_t* server) {
     const int socketfd = socket_listen_create(server->ip, server->port);
     if (socketfd == -1) goto failed;
 
-    connection = connection_s_alloc(listener, socketfd, server->ip, server->port, buffer, BUFFER_SIZE);
+    connection = connection_s_alloc(listener, socketfd, server->ip, server->port, server->ip, server->port, buffer, BUFFER_SIZE);
     if (connection == NULL) goto failed;
 
     connection->read = __listener_read;

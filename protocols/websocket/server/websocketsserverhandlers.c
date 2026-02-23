@@ -209,7 +209,7 @@ void websockets_queue_request_handler(void* arg) {
 
     conn_ctx->response = response;
 
-    if (!ratelimiter_allow(data->ratelimiter, item->connection->ip, 1)) {
+    if (!ratelimiter_allow(data->ratelimiter, item->connection->remote_ip, 1)) {
         websocketsresponse_t* response = conn_ctx->response;
         websocketsresponse_default(response, "Too Many Requests");
         connection_after_read(item->connection);

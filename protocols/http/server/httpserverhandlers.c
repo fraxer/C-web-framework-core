@@ -272,7 +272,7 @@ int __handle(connection_t* connection, httprequest_t* request, deferred_handler 
     const file_status_e file_status = http_get_file_full_path(ctx->server, file_full_path, PATH_MAX, request->path, request->path_length);
 
     if (file_status == FILE_OK) {
-        if (!ratelimiter_allow(ctx->server->http.ratelimiter, connection->ip, 1)) {
+        if (!ratelimiter_allow(ctx->server->http.ratelimiter, connection->remote_ip, 1)) {
             httpresponse_default(response, 429);
             response->add_header(response, "Retry-After", "1");
         }
@@ -497,7 +497,7 @@ void __queue_request_handler(void* arg) {
     conn_ctx->request = data->request;
     conn_ctx->response = data->response;
 
-    if (!ratelimiter_allow(data->ratelimiter, item->connection->ip, 1)) {
+    if (!ratelimiter_allow(data->ratelimiter, item->connection->remote_ip, 1)) {
         httpresponse_t* response = conn_ctx->response;
         if (response != NULL) {
             httpresponse_default(response, 429);

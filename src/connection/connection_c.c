@@ -23,6 +23,8 @@ connection_t* __connection_c_alloc(int fd, in_addr_t ip, unsigned short int port
     connection->keepalive = 0;
     connection->ip = ip;
     connection->port = port;
+    connection->remote_ip = 0;
+    connection->remote_port = 0;
     connection->ctx = ctx;
     connection->ssl = NULL;
     connection->ssl_ctx = NULL;
