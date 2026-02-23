@@ -196,12 +196,10 @@ db_table_cell_t* __dbresult_field(dbresult_t* result, const char* field) {
 
         if (cell == NULL) continue;
 
-        for (size_t k = 0, j = 0; k < cell->length && j < field_length; k++, j++) {
-            if (cell->value[k] != field[j]) break;
+        if (cell->length == field_length && memcmp(cell->value, field, field_length) == 0) {
             current_col = i;
+            break;
         }
-
-        if (current_col > -1) break;
     }
 
     if (current_col == -1) return NULL;
