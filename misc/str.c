@@ -326,6 +326,24 @@ char* str_get(str_t* str) {
     return str->is_dynamic ? str->dynamic_buffer : str->sso_buffer;
 }
 
+int str_pop(str_t* str) {
+    if (str == NULL || str->size == 0)
+        return 0;
+
+    char* buffer = __str_get_buffer(str);
+    str->size--;
+    buffer[str->size] = '\0';
+
+    return 1;
+}
+
+char str_last(str_t* str) {
+    if (str == NULL || str->size == 0)
+        return '\0';
+
+    return __str_get_buffer(str)[str->size - 1];
+}
+
 char* str_copy(str_t* str) {
     if (str == NULL)
         return NULL;

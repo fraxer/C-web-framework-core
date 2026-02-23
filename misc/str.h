@@ -45,5 +45,7 @@ int str_cmpc(str_t* srcstr, const char* dststr);
 
 char* str_get(str_t* str);
 char* str_copy(str_t* str);
+int str_pop(str_t* str);
+char str_last(str_t* str);
 
 #endif
