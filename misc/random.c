@@ -53,7 +53,12 @@ uint32_t random_uint32_range(uint32_t min, uint32_t max) {
     if (min >= max) return min;
 
     uint32_t range = max - min;
-    uint32_t value = random_uint32();
+    uint32_t threshold = (-range) % range;
+    uint32_t value;
+
+    do {
+        value = random_uint32();
+    } while (value < threshold);
 
     return min + (value % range);
 }
@@ -70,7 +75,12 @@ uint64_t random_uint64_range(uint64_t min, uint64_t max) {
     if (min >= max) return min;
 
     uint64_t range = max - min;
-    uint64_t value = random_uint64();
+    uint64_t threshold = (-range) % range;
+    uint64_t value;
+
+    do {
+        value = random_uint64();
+    } while (value < threshold);
 
     return min + (value % range);
 }
