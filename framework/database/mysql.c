@@ -122,6 +122,7 @@ void* __connection_create(void* host) {
     connection->base.prepare = __prepare;
     connection->base.execute_prepared = __execute_prepared;
     connection->base.begin = __begin;
+    connection->base.host = host;
     connection->connection = __connect(host);
 
     if (connection->connection == NULL) {

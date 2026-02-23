@@ -110,6 +110,7 @@ void* __connection_create(void* host) {
     connection->base.prepare = __prepare;
     connection->base.execute_prepared = __execute_prepared;
     connection->base.begin = __begin;
+    connection->base.host = host;
     connection->connection = __connect(host);
 
     if (connection->connection == NULL) {
@@ -157,14 +158,17 @@ char* __compile_table_migration_create(dbconnection_t* connection, const char* t
 
     char tmp[512] = {0};
 
+    postgresqlhost_t* host = connection->host;
+
     ssize_t written = snprintf(
         tmp,
         sizeof(tmp),
-        "CREATE TABLE %s "
+        "CREATE TABLE %s.%s "
         "("
             "version     varchar(180)  NOT NULL PRIMARY KEY,"
             "apply_time  integer       NOT NULL DEFAULT 0"
         ")",
+        host->schema,
         str_get(quoted_table)
     );
 
@@ -618,7 +622,7 @@ void __prepared_stmt_free(void* data) {
 
         #ifdef PG_MAJORVERSION_NUM
             #if PG_MAJORVERSION_NUM > 16
-                PQsendClosePrepared(pgconnection, str_get(stmt_data->stmt_name));
+                PQsendClosePrepared(pgconnection->connection, str_get(stmt_data->stmt_name));
             #else
                 str_t str;
                 str_init(&str, 64);

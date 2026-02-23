@@ -55,6 +55,7 @@ typedef struct dbconnection {
 
     pid_t thread_id;
     map_t* prepare_statements;
+    void* host;
 } dbconnection_t;
 
 typedef struct dbgrammar {

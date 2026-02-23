@@ -83,6 +83,7 @@ void* __connection_create(void* host) {
     connection->base.reconnect = __reconnect;
     connection->base.prepare = NULL;
     connection->base.execute_prepared = NULL;
+    connection->base.host = host;
     connection->connection = __connect(host);
 
     if (connection->connection == NULL) {
