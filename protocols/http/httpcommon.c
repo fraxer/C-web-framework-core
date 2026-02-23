@@ -4,6 +4,7 @@
 
 #include "str.h"
 #include "helpers.h"
+#include "base64.h"
 #include "httpcommon.h"
 
 http_header_t* http_header_alloc();
@@ -173,4 +174,37 @@ void http_ranges_free(http_ranges_t* ranges) {
         free(ranges);
         ranges = next;
     }
+}
+
+char* create_basic_auth_header(const char* first_value, const char* second_value) {
+    if (first_value == NULL || second_value == NULL) return NULL;
+
+    const char* prefix = "Basic ";
+    const size_t prefix_len = 6;
+
+    size_t first_len = strlen(first_value);
+    size_t second_len = strlen(second_value);
+    size_t raw_len = first_len + 1 + second_len; // "first:second"
+
+    char* raw = malloc(raw_len + 1);
+    if (raw == NULL) return NULL;
+
+    memcpy(raw, first_value, first_len);
+    raw[first_len] = ':';
+    memcpy(raw + first_len + 1, second_value, second_len);
+    raw[raw_len] = '\0';
+
+    int encoded_len = base64_encode_len(raw_len);
+    char* result = malloc(prefix_len + encoded_len);
+    if (result == NULL) {
+        free(raw);
+        return NULL;
+    }
+
+    memcpy(result, prefix, prefix_len);
+    base64_encode(result + prefix_len, raw, raw_len);
+
+    free(raw);
+
+    return result;
 }

@@ -85,4 +85,6 @@ void http_cookie_free(http_cookie_t*);
 
 void http_ranges_free(http_ranges_t* ranges);
 
+char* create_basic_auth_header(const char* first_value, const char* second_value);
+
 #endif
