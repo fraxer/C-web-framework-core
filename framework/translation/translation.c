@@ -10,7 +10,7 @@
 // Get language from request (query param > Accept-Language > default)
 static char* get_lang(httpctx_t* ctx) {
     int ok = 0;
-    const char* lang = query_param_char(ctx->request, "lang", &ok);
+    const char* lang = query_param_char(ctx->request->query_, "lang", &ok);
     if (ok && lang != NULL) {
         char* result = strdup(lang);
         if (result == NULL) return NULL;

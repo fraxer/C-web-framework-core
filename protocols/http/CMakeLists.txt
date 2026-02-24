@@ -8,7 +8,7 @@ add_library(${LIB_NAME} STATIC ${SOURCES})
 
 target_include_directories(${LIB_NAME} PUBLIC .)
 
-target_link_libraries(${LIB_NAME} connection middleware query http_server_parsers http_server_filters)
+target_link_libraries(${LIB_NAME} connection middleware misc http_server_parsers http_server_filters)
 
 MACRO(SUBDIRLIST result curdir)
     FILE(GLOB children RELATIVE ${curdir} ${curdir}/*)

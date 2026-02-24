@@ -3,6 +3,8 @@
 
 #include <stddef.h>
 
+#include "query.h"
+
 /**
  * Query parser result codes
  */
@@ -10,12 +12,6 @@ typedef enum {
     QUERYPARSER_OK = 0,
     QUERYPARSER_ERROR = -1
 } queryparser_result_t;
-
-typedef struct http_query {
-    const char* key;
-    const char* value;
-    struct http_query* next;
-} query_t;
 
 /**
  * Callback function type for appending query to a collection
