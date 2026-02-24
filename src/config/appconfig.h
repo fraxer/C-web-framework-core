@@ -49,14 +49,9 @@ typedef struct env_mail {
     char* host;
 } env_mail_t;
 
-typedef struct env_migrations {
-    char* source_directory;
-} env_migrations_t;
-
 typedef struct {
     env_main_t main;
     env_mail_t mail;
-    env_migrations_t migrations;
     json_doc_t* custom_store;
 } env_t;
 
@@ -88,7 +83,7 @@ char* appconfig_path(void);
 void appconfg_threads_increment(appconfig_t* config);
 void appconfg_threads_decrement(appconfig_t* config);
 
-const char* env_get_string(const char* key);
+const char* env_get_string(const char* key, const char* default_value);
 int env_get_int(const char* key, int default_value);
 long long env_get_llong(const char* key, long long default_value);
 int env_get_bool(const char* key, int default_value);

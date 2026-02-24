@@ -171,7 +171,6 @@ void __appconfig_env_init(env_t* env) {
     env->mail.dkim_private = NULL;
     env->mail.dkim_selector = NULL;
     env->mail.host = NULL;
-    env->migrations.source_directory = NULL;
     env->custom_store = NULL;
 }
 
@@ -208,11 +207,6 @@ void __appconfig_env_free(env_t* env) {
     if (env->mail.host != NULL) {
         free(env->mail.host);
         env->mail.host = NULL;
-    }
-
-    if (env->migrations.source_directory != NULL) {
-        free(env->migrations.source_directory);
-        env->migrations.source_directory = NULL;
     }
 
     if (env->custom_store != NULL) {
@@ -283,9 +277,9 @@ static json_token_t* __env_get_token(const char* key) {
     return json_object_get(root, key);
 }
 
-const char* env_get_string(const char* key) {
+const char* env_get_string(const char* key, const char* default_value) {
     json_token_t* token = __env_get_token(key);
-    if (token == NULL || !json_is_string(token)) return NULL;
+    if (token == NULL || !json_is_string(token)) return default_value;
 
     return json_string(token);
 }

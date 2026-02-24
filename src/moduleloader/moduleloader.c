@@ -216,49 +216,6 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     env_t* env = &config->env;
     const json_token_t* root = json_root(document);
 
-    const json_token_t* token_migrations = json_object_get(root, "migrations");
-    if (token_migrations == NULL) {
-        env->migrations.source_directory = malloc(sizeof(char) * 1);
-        if (env->migrations.source_directory == NULL) {
-            log_error("module_loader_config_load: memory alloc error\n");
-            return 0;
-        }
-
-        strcpy(env->migrations.source_directory, "");
-    }
-    else {
-        if (!json_is_object(token_migrations)) {
-            log_error("module_loader_config_load: migrations must be object\n");
-            return 0;
-        }
-
-        const json_token_t* token_source_directory = json_object_get(token_migrations, "source_directory");
-        if (token_source_directory == NULL) {
-            env->migrations.source_directory = malloc(sizeof(char) * 1);
-            if (env->migrations.source_directory == NULL) {
-                log_error("module_loader_config_load: memory alloc error\n");
-                return 0;
-            }
-
-            strcpy(env->migrations.source_directory, "");
-        }
-        else {
-            if (!json_is_string(token_source_directory)) {
-                log_error("module_loader_config_load: source_directory must be string\n");
-                return 0;
-            }
-
-            env->migrations.source_directory = malloc(sizeof(char) * (json_string_size(token_source_directory) + 1));
-            if (env->migrations.source_directory == NULL) {
-                log_error("module_loader_config_load: memory alloc error\n");
-                return 0;
-            }
-
-            strcpy(env->migrations.source_directory, json_string(token_source_directory));
-        }
-    }
-
-
     const json_token_t* token_main = json_object_get(root, "main");
     if (token_main == NULL) {
         log_error("module_loader_config_load: main not found\n");
@@ -2288,8 +2245,8 @@ int __module_loader_taskmanager_init(appconfig_t* config, json_token_t* token_ta
     if (token_taskmanager == NULL)
         return 1;
 
-    if (!json_is_object(token_taskmanager)) {
-        log_error("__module_loader_taskmanager_init: task_manager must be object\n");
+    if (!json_is_array(token_taskmanager)) {
+        log_error("__module_loader_taskmanager_init: task_manager must be array\n");
         return 0;
     }
 
@@ -2379,21 +2336,10 @@ int __module_loader_translations_load(appconfig_t* config, json_token_t* transla
 }
 
 static int __module_loader_taskmanager_load(appconfig_t* config, taskmanager_t* manager, const json_token_t* token_taskmanager) {
-    const json_token_t* token_schedule = json_object_get(token_taskmanager, "schedule");
-
-    if (token_schedule == NULL) {
-        return 1;
-    }
-
-    if (!json_is_array(token_schedule)) {
-        log_error("__module_loader_taskmanager_load: schedule must be array\n");
-        return 0;
-    }
-
     routeloader_lib_t* last_lib = routeloader_get_last(config->taskmanager_loader);
 
-    for (int i = 0; i < json_array_size(token_schedule); i++) {
-        const json_token_t* token_task = json_array_get(token_schedule, i);
+    for (int i = 0; i < json_array_size(token_taskmanager); i++) {
+        const json_token_t* token_task = json_array_get(token_taskmanager, i);
 
         if (!json_is_object(token_task)) {
             log_error("__module_loader_taskmanager_load: task item must be object\n");

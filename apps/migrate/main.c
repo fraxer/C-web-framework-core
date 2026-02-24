@@ -34,11 +34,14 @@ typedef enum mgactions {
     UP
 } mgactions_e;
 
-// migrate postgresql.p1 s1 create create_users_table config.json
+// migrate create <migration_name> <config_path> <target_dir>
+// migrate create create_users_table config.json ./migrations/s1
 
-// migrate postgresql.p1 s1 up config.json
-// migrate postgresql.p1 s1 up 2 config.json
-// migrate postgresql.p1 s1 up all config.json
+// migrate up <config_path> <db_host> <server_id>
+// migrate up config.json postgresql.p1 s1
+// migrate up <number|all> <config_path> <db_host> <server_id>
+// migrate up 2 config.json postgresql.p1 s1
+// migrate up all config.json postgresql.p1 s1
 
 typedef struct mgconfig {
     int ok;
@@ -46,6 +49,7 @@ typedef struct mgconfig {
     char* server;
     mgactions_e action;
     char* migration_name;
+    char* target_directory;
     int count_migrations;
     int count_applied_migrations;
     appconfig_t* appconfig;
@@ -62,41 +66,58 @@ void mg_config_free(mgconfig_t* config) {
     if (config->server) free(config->server);
     if (config->database_driver) free(config->database_driver);
     if (config->migration_name) free(config->migration_name);
+    if (config->target_directory) free(config->target_directory);
 }
 
 int mg_parse_action_create(mgconfig_t* config, int argc, char* argv[]) {
-    if (argc != 6) {
+    if (argc != 5) {
         printf("Error: command incorrect\n");
-        printf("Example: migrate <db driver> <server id> create <migration name> <config path>\n");
+        printf("Example: migrate create <migration name> <config path> <target directory>\n");
         return -1;
     }
 
     config->ok = 1;
-    config->migration_name = strdup(argv[4]);
-    config->appconfig = appconfig_create(argv[5]);
+    config->migration_name = strdup(argv[2]);
+    config->appconfig = appconfig_create(argv[3]);
+    config->target_directory = strdup(argv[4]);
 
     return 0;
 }
 
-int mg_parse_action_up(mgconfig_t* config, int pos, int argc, char* argv[]) {
-    if (strspn(argv[pos], "0123456789") == strlen(argv[pos])) {
-        config->count_migrations = atoi(argv[pos]);
-        pos++;
-    }
-    else if (strcmp(argv[pos], "all") == 0) {
-        config->count_migrations = 0;
-        pos++;
+int mg_parse_action_up(mgconfig_t* config, int argc, char* argv[]) {
+    if (argc == 5) {
+        // migrate up <config_path> <db_host> <server_id>
+        config->count_migrations = 1;
+        config->ok = 1;
+        config->appconfig = appconfig_create(argv[2]);
+        config->database_driver = strdup(argv[3]);
+        config->server = strdup(argv[4]);
+        return 0;
     }
 
-    if (pos == argc - 1 && strlen(argv[argc - 1]) > 0) {
+    if (argc == 6) {
+        // migrate up <number|all> <config_path> <db_host> <server_id>
+        if (strspn(argv[2], "0123456789") == strlen(argv[2])) {
+            config->count_migrations = atoi(argv[2]);
+        }
+        else if (strcmp(argv[2], "all") == 0) {
+            config->count_migrations = 0;
+        }
+        else {
+            printf("Error: command incorrect\n");
+            printf("Example: migrate up [number|all] <config path> <db host> <server id>\n");
+            return -1;
+        }
+
         config->ok = 1;
-        config->appconfig = appconfig_create(argv[argc - 1]);
+        config->appconfig = appconfig_create(argv[3]);
+        config->database_driver = strdup(argv[4]);
+        config->server = strdup(argv[5]);
         return 0;
     }
 
     printf("Error: command incorrect\n");
-    printf("Example: migrate <db driver> <server id> up [number, all] <config path>\n");
-
+    printf("Example: migrate up [number|all] <config path> <db host> <server id>\n");
     return -1;
 }
 
@@ -107,28 +128,25 @@ mgconfig_t mg_args_parse(int argc, char* argv[]) {
         .server = NULL,
         .action = NONE,
         .migration_name = NULL,
+        .target_directory = NULL,
         .count_migrations = 1,
         .count_applied_migrations = 0,
         .appconfig = NULL,
     };
 
-    if (argc < 4) {
+    if (argc < 2) {
         printf("Error: command incorrect\n");
-        printf("Example: migrate <db driver> <server id> <action> [number, all] <config path>\n");
+        printf("Example: migrate <action> ...\n");
         return config;
     }
 
-    int pos = 1;
-    config.database_driver = strdup(argv[pos++]);
-    config.server = strdup(argv[pos++]);
-
-    if (strcmp(argv[pos], "create") == 0) {
+    if (strcmp(argv[1], "create") == 0) {
         config.action = CREATE;
         if (mg_parse_action_create(&config, argc, argv) == -1) return config;
     }
-    else if (strcmp(argv[pos], "up") == 0) {
+    else if (strcmp(argv[1], "up") == 0) {
         config.action = UP;
-        if (mg_parse_action_up(&config, ++pos, argc, argv) == -1) return config;
+        if (mg_parse_action_up(&config, argc, argv) == -1) return config;
     }
     else {
         printf("Error: command incorrect\n");
@@ -335,18 +353,10 @@ int mg_migrations_process(mgconfig_t* config) {
     return result;
 }
 
-int mg_make_directory(const char* server, const char* source_directory) {
+int mg_make_directory(const char* target_directory) {
     char tmp[PATH_MAX] = {0};
 
-    strcpy(&tmp[0], source_directory);
-
-    size_t len = strlen(tmp);
-
-    if (tmp[len - 1] != '/') {
-        strcat(&tmp[0], "/");
-    }
-
-    strcat(&tmp[0], server);
+    strcpy(tmp, target_directory);
 
     for (char *p = tmp + 1; *p; p++) {
         if (*p == '/') {
@@ -367,17 +377,14 @@ int mg_make_directory(const char* server, const char* source_directory) {
     return 0;
 }
 
-int mg_create_template(const char* source_directory, mgconfig_t* config) {
+int mg_create_template(const char* target_directory, mgconfig_t* config) {
     char tmp[512] = {0};
-    strcpy(&tmp[0], source_directory);
+    strcpy(&tmp[0], target_directory);
 
     size_t len = strlen(tmp);
 
     if (tmp[len - 1] != '/')
         strcat(&tmp[0], "/");
-
-    strcat(&tmp[0], config->server);
-    strcat(&tmp[0], "/");
 
     time_t t = time(0);
     struct tm tm = *localtime(&t);
@@ -418,10 +425,8 @@ int mg_create_template(const char* source_directory, mgconfig_t* config) {
 }
 
 int mg_migration_create(mgconfig_t* config) {
-    const char* source_directory = config->appconfig->env.migrations.source_directory;
-
-    if (mg_make_directory(config->server, source_directory) == -1) return 0;
-    if (mg_create_template(source_directory, config) == -1) return 0;
+    if (mg_make_directory(config->target_directory) == -1) return 0;
+    if (mg_create_template(config->target_directory, config) == -1) return 0;
 
     return 1;
 }
