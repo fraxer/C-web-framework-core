@@ -274,10 +274,15 @@ int mg_migrate_run(mgconfig_t* config, const char* filename, const char* path) {
             goto failed;
 
     if (config->action == UP) {
-        if (!mg_migration_exist(dbid, filename) && function_up(dbid)) {
-            mg_migration_commit(dbid, filename);
-            printf("Success up %s in %s\n", path, config->database_driver);
-            make_increment = 1;
+        if (!mg_migration_exist(dbid, filename)) {
+            if (function_up(dbid)) {
+                mg_migration_commit(dbid, filename);
+                printf("Success up %s in %s\n", path, config->database_driver);
+                make_increment = 1;
+            } else {
+                printf("Error: migration failed %s\n", path);
+                goto failed;
+            }
         }
     }
 
@@ -332,7 +337,6 @@ int mg_migrations_process(mgconfig_t* config) {
             strcat(filepath, namelist[i]->d_name);
 
             if (mg_migrate_run(config, namelist[i]->d_name, filepath) == -1) {
-                printf("Error: can't attach file %s\n", filepath);
                 free(filepath);
                 goto failed;
             }
