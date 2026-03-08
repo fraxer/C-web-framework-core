@@ -6,6 +6,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
     ${CMAKE_CURRENT_SOURCE_DIR}/../misc
     ${CMAKE_CURRENT_SOURCE_DIR}/../framework
+    ${CMAKE_CURRENT_SOURCE_DIR}/../framework/session
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocols
 )
 
@@ -20,6 +21,7 @@ add_executable(
     ${ALL_TEST_FILES}
     httprequestparser_stubs.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../framework/taskmanager/taskmanager_calc.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../framework/session/session.c
 )
 
 # Link test libraries

@@ -63,7 +63,7 @@ appconfig_t* appconfig_create(const char* path) {
     config->taskmanager_loader = NULL;
     config->taskmanager = NULL;
     config->translations = NULL;
-    memset(&config->sessionconfig, 0, sizeof(config->sessionconfig));
+    config->sessionconfigs = NULL;
     config->path = strdup(path);
     if (config->path == NULL) {
         printf("Error: Memory allocation failed for config path\n");
@@ -118,7 +118,10 @@ void appconfig_clear(appconfig_t* config) {
     server_chain_destroy(config->server_chain);
     config->server_chain = NULL;
 
-    sessionconfig_clear(&config->sessionconfig);
+    if (config->sessionconfigs != NULL) {
+        map_free(config->sessionconfigs);
+        config->sessionconfigs = NULL;
+    }
 
     array_free(config->prepared_queries);
     config->prepared_queries = NULL;

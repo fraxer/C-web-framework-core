@@ -59,7 +59,7 @@ typedef struct appconfig {
     atomic_bool shutdown;
     atomic_int threads_count;
     env_t env;
-    sessionconfig_t sessionconfig;
+    map_t* sessionconfigs;
     char* path;
     mimetype_t* mimetype;
     array_t* databases;

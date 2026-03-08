@@ -1128,91 +1128,153 @@ int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* 
         return 0;
     }
 
-    int result = 0;
-    json_token_t* token_driver = json_object_get(token_sessions, "driver");
-    if (!json_is_string(token_driver)) {
-        log_error("__module_loader_sessionconfig_load: field driver must be string in sessions section\n");
-        goto failed;
+    config->sessionconfigs = map_create_ex(
+        map_compare_string,
+        map_copy_string,
+        free,
+        NULL,
+        (map_free_fn)sessionconfig_free
+    );
+    if (config->sessionconfigs == NULL) {
+        log_error("__module_loader_sessionconfig_load: failed to create sessionconfigs map\n");
+        return 0;
     }
 
-    const char* driver = json_string(token_driver);
-    if (strcmp(driver, "storage") == 0) {
-        config->sessionconfig.driver = SESSION_TYPE_FS;
+    for (json_it_t it = json_init_it(token_sessions); !json_end_it(&it); it = json_next_it(&it)) {
+        const char* name = json_it_key(&it);
+        json_token_t* token_entry = json_it_value(&it);
 
-        config->sessionconfig.session = sessionfile_init();
-        if (config->sessionconfig.session == NULL) {
-            log_error("__module_loader_sessionconfig_load: can't create sessionfile\n");
+        if (!json_is_object(token_entry)) {
+            log_error("__module_loader_sessionconfig_load: session entry %s must be object\n", name);
             goto failed;
         }
 
-        json_token_t* token_storage_name = json_object_get(token_sessions, "storage_name");
-        if (!json_is_string(token_storage_name)) {
-            log_error("__module_loader_sessionconfig_load: field storage_name must be string in sessions section\n");
+        sessionconfig_t* sc = calloc(1, sizeof(sessionconfig_t));
+        if (sc == NULL) goto failed;
+
+        json_token_t* token_driver = json_object_get(token_entry, "driver");
+        if (!json_is_string(token_driver)) {
+            log_error("__module_loader_sessionconfig_load: field driver must be string in session %s\n", name);
+            free(sc);
             goto failed;
         }
 
-        const char* storage_name = json_string(token_storage_name);
-        if (strlen(storage_name) == 0) {
-            log_error("__module_loader_sessionconfig_load: field storage_name must be not empty in sessions section\n");
+        const char* driver = json_string(token_driver);
+
+        if (strcmp(driver, "filesystem") == 0) {
+            sc->driver = SESSION_TYPE_FS;
+
+            sc->session = sessionfile_init();
+            if (sc->session == NULL) {
+                log_error("__module_loader_sessionconfig_load: can't create sessionfile for %s\n", name);
+                free(sc);
+                goto failed;
+            }
+
+            json_token_t* token_storage_name = json_object_get(token_entry, "storage_name");
+            if (!json_is_string(token_storage_name)) {
+                log_error("__module_loader_sessionconfig_load: field storage_name must be string in session %s\n", name);
+                sessionconfig_free(sc);
+                goto failed;
+            }
+
+            const char* storage_name = json_string(token_storage_name);
+            if (strlen(storage_name) == 0) {
+                log_error("__module_loader_sessionconfig_load: field storage_name must be not empty in session %s\n", name);
+                sessionconfig_free(sc);
+                goto failed;
+            }
+
+            strcpy(sc->storage_name, storage_name);
+        }
+        else if (strcmp(driver, "redis") == 0) {
+            sc->driver = SESSION_TYPE_REDIS;
+
+            sc->session = sessionredis_init();
+            if (sc->session == NULL) {
+                log_error("__module_loader_sessionconfig_load: can't create sessionredis for %s\n", name);
+                free(sc);
+                goto failed;
+            }
+
+            json_token_t* token_host_id = json_object_get(token_entry, "host_id");
+            if (!json_is_string(token_host_id)) {
+                log_error("__module_loader_sessionconfig_load: field host_id must be string in session %s\n", name);
+                sessionconfig_free(sc);
+                goto failed;
+            }
+
+            const char* host_id = json_string(token_host_id);
+            if (strlen(host_id) == 0) {
+                log_error("__module_loader_sessionconfig_load: field host_id must be not empty in session %s\n", name);
+                sessionconfig_free(sc);
+                goto failed;
+            }
+
+            strcpy(sc->host_id, host_id);
+        }
+        else if (strcmp(driver, "database") == 0) {
+            sc->driver = SESSION_TYPE_DB;
+
+            sc->session = sessiondb_init();
+            if (sc->session == NULL) {
+                log_error("__module_loader_sessionconfig_load: can't create sessiondb for %s\n", name);
+                free(sc);
+                goto failed;
+            }
+
+            json_token_t* token_host_id = json_object_get(token_entry, "host_id");
+            if (!json_is_string(token_host_id)) {
+                log_error("__module_loader_sessionconfig_load: field host_id must be string in session %s\n", name);
+                sessionconfig_free(sc);
+                goto failed;
+            }
+
+            const char* host_id = json_string(token_host_id);
+            if (strlen(host_id) == 0) {
+                log_error("__module_loader_sessionconfig_load: field host_id must be not empty in session %s\n", name);
+                sessionconfig_free(sc);
+                goto failed;
+            }
+
+            strcpy(sc->host_id, host_id);
+        }
+        else {
+            log_error("__module_loader_sessionconfig_load: unknown driver %s in session %s\n", driver, name);
+            free(sc);
             goto failed;
         }
 
-        strcpy(config->sessionconfig.storage_name, storage_name);
-    }
-    else if (strcmp(driver, "redis") == 0) {
-        config->sessionconfig.driver = SESSION_TYPE_REDIS;
-
-        config->sessionconfig.session = sessionredis_init();
-        if (config->sessionconfig.session == NULL) {
-            log_error("__module_loader_sessionconfig_load: can't create sessionredis\n");
+        json_token_t* token_secret = json_object_get(token_entry, "secret");
+        if (token_secret == NULL) {
+            log_error("__module_loader_sessionconfig_load: field secret not found in session %s\n", name);
+            sessionconfig_free(sc);
             goto failed;
         }
 
-        json_token_t* token_host_id = json_object_get(token_sessions, "host_id");
-        if (!json_is_string(token_host_id)) {
-            log_error("__module_loader_sessionconfig_load: field host_id must be string in sessions section\n");
+        if (!json_is_string(token_secret)) {
+            log_error("__module_loader_sessionconfig_load: field secret must be string in session %s\n", name);
+            sessionconfig_free(sc);
             goto failed;
         }
 
-        const char* host_id = json_string(token_host_id);
-        if (strlen(host_id) == 0) {
-            log_error("__module_loader_sessionconfig_load: field host_id must be not empty in sessions section\n");
+        aes256gcm_key_from_passphrase(json_string(token_secret), sc->secret);
+
+        if (map_insert(config->sessionconfigs, name, sc) == -1) {
+            log_error("__module_loader_sessionconfig_load: failed to insert session %s\n", name);
+            sessionconfig_free(sc);
             goto failed;
         }
-
-        strcpy(config->sessionconfig.host_id, host_id);
-    }
-    else {
-        log_error("__module_loader_sessionconfig_load: field driver not found in sessions section\n");
-        goto failed;
     }
 
-    json_token_t* token_lifetime = json_object_get(token_sessions, "lifetime");
-    if (token_lifetime == NULL) {
-        log_error("__module_loader_sessionconfig_load: field lifetime not found in sessions section\n");
-        goto failed;
-    }
-    if (!json_is_number(token_lifetime)) {
-        log_error("__module_loader_sessionconfig_load: field lifetime must be int in sessions section\n");
-        goto failed;
-    }
-    int ok = 0;
-    int lifetime = json_int(token_lifetime, &ok);
-    if (!ok || lifetime <= 0) {
-        log_error("__module_loader_sessionconfig_load: field lifetime must be positive in sessions section\n");
-        goto failed;
-    }
-
-    config->sessionconfig.lifetime = lifetime;
-
-    result = 1;
+    return 1;
 
     failed:
 
-    if (result == 0)
-        sessionconfig_clear(&config->sessionconfig);
+    map_free(config->sessionconfigs);
+    config->sessionconfigs = NULL;
 
-    return result;
+    return 0;
 }
 
 int __module_loader_prepared_queries_load(appconfig_t* config) {
