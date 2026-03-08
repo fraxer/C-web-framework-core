@@ -31,6 +31,36 @@ str_t* str_createn(const char* string, const size_t size) {
     return data;
 }
 
+str_t* str_createf(const char* format, ...) {
+    if (format == NULL) return str_create_empty(0);
+
+    va_list args, args_copy;
+    va_start(args, format);
+    va_copy(args_copy, args);
+
+    int needed_size = vsnprintf(NULL, 0, format, args);
+    va_end(args);
+
+    if (needed_size < 0) {
+        va_end(args_copy);
+        return NULL;
+    }
+
+    char* buffer = malloc(needed_size + 1);
+    if (buffer == NULL) {
+        va_end(args_copy);
+        return NULL;
+    }
+
+    vsnprintf(buffer, needed_size + 1, format, args_copy);
+    va_end(args_copy);
+
+    str_t* str = str_createn(buffer, needed_size);
+    free(buffer);
+
+    return str;
+}
+
 str_t* str_create_empty(int init_capacity) {
     str_t* data = malloc(sizeof * data);
     if (data == NULL) return NULL;

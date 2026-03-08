@@ -24,6 +24,7 @@ typedef struct {
 str_t* str_create(const char* string);
 str_t* str_createn(const char* string, const size_t size);
 str_t* str_create_empty(int init_capacity);
+str_t* str_createf(const char* format, ...);
 int str_init(str_t* str, int init_capacity);
 int str_reset(str_t* str);
 int str_reserve(str_t* str, size_t capacity);
