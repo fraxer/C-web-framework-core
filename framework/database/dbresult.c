@@ -58,6 +58,12 @@ int dbresult_cell_create(db_table_cell_t* cell, const char* string, size_t lengt
     if (cell == NULL) return -1;
 
     cell->length = length;
+
+    if (string == NULL) {
+        cell->value = NULL;
+        return 0;
+    }
+
     cell->value = malloc(length + 1);
 
     if (cell->value == NULL) return -1;

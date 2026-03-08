@@ -248,10 +248,14 @@ dbresult_t* __process_result(void* connection, dbresult_t* result) {
 
             for (int row = 0; row < rows; row++) {
                 for (int col = 0; col < cols; col++) {
-                    size_t length = PQgetlength(res, row, col);
-                    const char* value = PQgetvalue(res, row, col);
+                    if (PQgetisnull(res, row, col)) {
+                        dbresult_query_value_insert(query, NULL, 0, row, col);
+                    } else {
+                        size_t length = PQgetlength(res, row, col);
+                        const char* value = PQgetvalue(res, row, col);
 
-                    dbresult_query_value_insert(query, value, length, row, col);
+                        dbresult_query_value_insert(query, value, length, row, col);
+                    }
                 }
             }
 
