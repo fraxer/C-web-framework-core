@@ -131,8 +131,10 @@ void appconfig_clear(appconfig_t* config) {
 
     taskmanager_free(config->taskmanager);
 
-    i18n_free(config->translations);
-    config->translations = NULL;
+    if (config->translations != NULL) {
+        map_free(config->translations);
+        config->translations = NULL;
+    }
 }
 
 void appconfig_free(appconfig_t* config) {
