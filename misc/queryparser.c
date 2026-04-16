@@ -6,6 +6,37 @@
 #include "str.h"
 #include "queryparser.h"
 
+static int __append_query(query_t** first, query_t** last, void* context, queryparser_append_fn append_fn) {
+    query_t* query = query_create(NULL, 0, NULL, 0);
+    if (query == NULL) return 0;
+
+    if (*last)
+        (*last)->next = query;
+    else
+        *first = query;
+
+    *last = query;
+
+    if (append_fn && context)
+        append_fn(context, query);
+
+    return 1;
+}
+
+static int __finish_pair(query_t* query, const char* string,
+                          size_t key_start, size_t key_end,
+                          int has_value, size_t value_start, size_t value_end) {
+    query->key = urldecode(&string[key_start], key_end - key_start);
+    if (!query->key) return 0;
+
+    if (has_value) {
+        query->value = urldecode(&string[value_start], value_end - value_start);
+        if (!query->value) return 0;
+    }
+
+    return 1;
+}
+
 queryparser_result_t queryparser_parse(
     const char* string,
     size_t length,
@@ -15,89 +46,66 @@ queryparser_result_t queryparser_parse(
     query_t** out_first_query,
     query_t** out_last_query
 ) {
-    size_t pos = start_pos;
-    size_t point_start = start_pos;
+    query_t* first = NULL;
+    query_t* last = NULL;
 
-    enum { KEY, VALUE } stage = KEY;
+    size_t key_start = start_pos;
+    size_t key_end = start_pos;
+    int has_value = 0;
+    size_t value_start = 0;
 
-    // Create first query node
-    query_t* query = query_create(NULL, 0, NULL, 0);
-    if (query == NULL) return QUERYPARSER_ERROR;
+    if (!__append_query(&first, &last, context, append_fn))
+        return QUERYPARSER_ERROR;
 
-    *out_first_query = query;
-    *out_last_query = query;
-
-    // Notify context about first query
-    if (append_fn != NULL && context != NULL)
-        append_fn(context, query);
-
-    for (; pos < length; pos++) {
+    for (size_t pos = start_pos; pos < length; pos++) {
         switch (string[pos]) {
         case '=':
-            // Skip consecutive '=' characters
-            if (pos > start_pos && string[pos - 1] == '=')
-                continue;
-
-            stage = VALUE;
-
-            query->key = urldecode(&string[point_start], pos - point_start);
-            if (query->key == NULL) return QUERYPARSER_ERROR;
-
-            point_start = pos + 1;
+            if (!has_value) {
+                key_end = pos;
+                has_value = 1;
+                value_start = pos + 1;
+            }
             break;
 
         case '&':
-            stage = KEY;
+            if (!has_value) key_end = pos;
+            if (!__finish_pair(last, string, key_start, key_end, has_value, value_start, pos))
+                goto error;
 
-            query->value = urldecode(&string[point_start], pos - point_start);
-            if (query->value == NULL) return QUERYPARSER_ERROR;
+            key_start = pos + 1;
+            key_end = pos + 1;
+            has_value = 0;
 
-            // Create new query node
-            query_t* query_new = query_create(NULL, 0, NULL, 0);
-            if (query_new == NULL) return QUERYPARSER_ERROR;
-
-            // Link to list
-            (*out_last_query)->next = query_new;
-            *out_last_query = query_new;
-
-            // Notify context about new query
-            if (append_fn != NULL && context != NULL)
-                append_fn(context, query_new);
-
-            query = query_new;
-            point_start = pos + 1;
+            if (!__append_query(&first, &last, context, append_fn))
+                goto error;
             break;
 
         case '#':
-            // Fragment identifier - finish parsing
-            if (stage == KEY) {
-                query->key = urldecode(&string[point_start], pos - point_start);
-                if (query->key == NULL) return QUERYPARSER_ERROR;
-            }
-            else if (stage == VALUE) {
-                query->value = urldecode(&string[point_start], pos - point_start);
-                if (query->value == NULL) return QUERYPARSER_ERROR;
-            }
+            if (!has_value) key_end = pos;
+            if (!__finish_pair(last, string, key_start, key_end, has_value, value_start, pos))
+                goto error;
 
+            *out_first_query = first;
+            *out_last_query = last;
             return QUERYPARSER_OK;
         }
     }
 
-    // Handle remaining data
-    if (stage == KEY) {
-        query->key = urldecode(&string[point_start], pos - point_start);
-        if (query->key == NULL) return QUERYPARSER_ERROR;
+    if (!has_value)
+        key_end = length;
 
-        // Empty value for key-only parameters
-        query->value = copy_cstringn("", 1);
-        if (query->value == NULL) return QUERYPARSER_ERROR;
-    }
-    else if (stage == VALUE) {
-        query->value = urldecode(&string[point_start], pos - point_start);
-        if (query->value == NULL) return QUERYPARSER_ERROR;
-    }
+    if (!__finish_pair(last, string, key_start, key_end, has_value, value_start, length))
+        goto error;
 
+    *out_first_query = first;
+    *out_last_query = last;
     return QUERYPARSER_OK;
+
+error:
+    queries_free(first);
+    *out_first_query = NULL;
+    *out_last_query = NULL;
+    return QUERYPARSER_ERROR;
 }
 
 query_t* query_create(const char* key, size_t key_length, const char* value, size_t value_length) {
@@ -119,8 +127,9 @@ query_t* query_create(const char* key, size_t key_length, const char* value, siz
 }
 
 void query_free(query_t* query) {
-    free((void*)query->key);
-    free((void*)query->value);
+    if (!query) return;
+    if (query->key) free((void*)query->key);
+    if (query->value) free((void*)query->value);
     free(query);
 }
 
@@ -141,11 +150,18 @@ char* query_stringify(query_t* query) {
     while (query != NULL) {
         size_t key_length = 0;
         char* key = urlencodel(query->key, strlen(query->key), &key_length);
-        if (key == NULL) return NULL;
+        if (key == NULL) {
+            str_free(uri);
+            return NULL;
+        }
 
         size_t value_length = 0;
         char* value = urlencodel(query->value, strlen(query->value), &value_length);
-        if (value == NULL) return NULL;
+        if (value == NULL) {
+            str_free(uri);
+            free(key);
+            return NULL;
+        }
 
         str_append(uri, key, key_length);
         str_appendc(uri, '=');
