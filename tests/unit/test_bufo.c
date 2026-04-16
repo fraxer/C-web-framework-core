@@ -212,6 +212,9 @@ TEST(test_bufo_append_is_proxy) {
 
     TEST_ASSERT_EQUAL_SIZE(0, written, "Should return 0 for proxy buffer");
 
+    // bufo_free does not free data when is_proxy is set
+    free(buf->data);
+    buf->data = NULL;
     bufo_free(buf);
 }
 
@@ -538,6 +541,10 @@ TEST(test_bufo_clear_proxy) {
     bufo_t* buf = bufo_create();
     bufo_alloc(buf, 1024);
     buf->is_proxy = 1;
+
+    // bufo_clear does not free data when is_proxy is set
+    free(buf->data);
+    buf->data = NULL;
     bufo_clear(buf);
 
     TEST_ASSERT_NULL(buf->data, "Data should be NULL after clear");
@@ -577,6 +584,9 @@ TEST(test_bufo_free_proxy) {
     buf->is_proxy = 1;
 
     // При is_proxy data не должна освобождаться, только буфер
+    // Поэтому освобождаем data вручную перед bufo_free
+    free(buf->data);
+    buf->data = NULL;
     bufo_free(buf);
 
     TEST_ASSERT(1, "Should free proxy buffer without freeing data");
@@ -791,6 +801,9 @@ TEST(test_bufo_proxy_flag_behavior) {
     TEST_ASSERT_EQUAL_SIZE(0, written, "Proxy buffer should reject append");
 
     // Clear proxy buffer не должен освобождать data
+    // Поэтому освобождаем data вручную перед bufo_clear
+    free(buf->data);
+    buf->data = NULL;
     bufo_clear(buf);
     TEST_ASSERT_EQUAL_UINT(0, buf->is_proxy, "is_proxy should be reset");
 

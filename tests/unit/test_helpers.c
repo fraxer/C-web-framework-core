@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <linux/limits.h>
 #include <unistd.h>
 #include <limits.h>
 
@@ -765,4 +766,452 @@ TEST(test_timezone_offset_returns_value) {
 
     int offset = timezone_offset();
     TEST_ASSERT(offset >= -12 && offset <= 14, "Timezone offset should be in valid range");
+}
+
+// ============================================================================
+// Тесты helpers_mkdir / helpers_base_mkdir
+// ============================================================================
+
+TEST(test_helpers_mkdir_null) {
+    TEST_CASE("helpers_mkdir handles NULL");
+    TEST_ASSERT_EQUAL(0, helpers_mkdir(NULL), "NULL path should return 0");
+}
+
+TEST(test_helpers_mkdir_empty_string) {
+    TEST_CASE("helpers_mkdir handles empty string");
+    TEST_ASSERT_EQUAL(0, helpers_mkdir(""), "Empty path should return 0");
+}
+
+TEST(test_helpers_mkdir_nested) {
+    TEST_CASE("helpers_mkdir creates nested directories");
+
+    const char* base = "/tmp/test_helpers_mkdir_XXXXXX";
+    char tmpdir[PATH_MAX];
+    strcpy(tmpdir, base);
+    mkdtemp(tmpdir);
+
+    char path[PATH_MAX];
+    snprintf(path, PATH_MAX, "%s/a/b/c/d", tmpdir);
+
+    int result = helpers_mkdir(path);
+    TEST_ASSERT_EQUAL(1, result, "Should create nested directories");
+
+    // Verify deepest dir exists
+    struct stat st;
+    TEST_ASSERT_EQUAL(0, stat(path, &st), "Deepest directory should exist");
+    TEST_ASSERT(S_ISDIR(st.st_mode), "Should be a directory");
+
+    // Cleanup
+    rmdir(path);
+    snprintf(path, PATH_MAX, "%s/a/b/c", tmpdir);
+    rmdir(path);
+    snprintf(path, PATH_MAX, "%s/a/b", tmpdir);
+    rmdir(path);
+    snprintf(path, PATH_MAX, "%s/a", tmpdir);
+    rmdir(path);
+    rmdir(tmpdir);
+}
+
+TEST(test_helpers_mkdir_already_exists) {
+    TEST_CASE("helpers_mkdir handles existing directory");
+
+    const char* base = "/tmp/test_helpers_mkdir_exists_XXXXXX";
+    char tmpdir[PATH_MAX];
+    strcpy(tmpdir, base);
+    mkdtemp(tmpdir);
+
+    // Already exists
+    int result = helpers_mkdir(tmpdir);
+    TEST_ASSERT_EQUAL(1, result, "Should succeed for existing directory");
+
+    rmdir(tmpdir);
+}
+
+TEST(test_helpers_base_mkdir_empty_path) {
+    TEST_CASE("helpers_base_mkdir handles empty path");
+    TEST_ASSERT_EQUAL(0, helpers_base_mkdir("/tmp", ""), "Empty path should return 0");
+}
+
+TEST(test_helpers_base_mkdir_single_level) {
+    TEST_CASE("helpers_base_mkdir creates single directory");
+
+    const char* base = "/tmp/test_helpers_base_XXXXXX";
+    char tmpdir[PATH_MAX];
+    strcpy(tmpdir, base);
+    mkdtemp(tmpdir);
+
+    char path[PATH_MAX];
+    snprintf(path, PATH_MAX, "%s/newdir", tmpdir);
+
+    int result = helpers_base_mkdir(tmpdir, "newdir");
+    TEST_ASSERT_EQUAL(1, result, "Should create single directory");
+
+    struct stat st;
+    TEST_ASSERT_EQUAL(0, stat(path, &st), "Directory should exist");
+
+    rmdir(path);
+    rmdir(tmpdir);
+}
+
+TEST(test_helpers_base_mkdir_with_leading_slash) {
+    TEST_CASE("helpers_base_mkdir handles path with leading slash");
+
+    const char* base = "/tmp/test_helpers_base_slash_XXXXXX";
+    char tmpdir[PATH_MAX];
+    strcpy(tmpdir, base);
+    mkdtemp(tmpdir);
+
+    int result = helpers_base_mkdir(tmpdir, "/x/y");
+    TEST_ASSERT_EQUAL(1, result, "Should create nested dirs with leading slash");
+
+    char path[PATH_MAX];
+    snprintf(path, PATH_MAX, "%s/x/y", tmpdir);
+    struct stat st;
+    TEST_ASSERT_EQUAL(0, stat(path, &st), "Nested directory should exist");
+
+    rmdir(path);
+    snprintf(path, PATH_MAX, "%s/x", tmpdir);
+    rmdir(path);
+    rmdir(tmpdir);
+}
+
+// ============================================================================
+// Тесты http_format_date
+// ============================================================================
+
+TEST(test_http_format_date_basic) {
+    TEST_CASE("Format basic HTTP date");
+
+    // 2025-01-01 00:00:00 UTC = 1735689600
+    time_t t = 1735689600;
+    char buf[64];
+
+    size_t len = http_format_date(t, buf, sizeof(buf));
+    TEST_ASSERT(len > 0, "Should return non-zero length");
+    TEST_ASSERT_STR_EQUAL("Wed, 01 Jan 2025 00:00:00 GMT", buf, "Should format correctly");
+}
+
+TEST(test_http_format_date_epoch) {
+    TEST_CASE("Format epoch time");
+
+    time_t t = 0;
+    char buf[64];
+
+    size_t len = http_format_date(t, buf, sizeof(buf));
+    TEST_ASSERT(len > 0, "Should return non-zero length");
+    TEST_ASSERT_STR_EQUAL("Thu, 01 Jan 1970 00:00:00 GMT", buf, "Epoch should be correct");
+}
+
+TEST(test_http_format_date_null_buffer) {
+    TEST_CASE("Handle NULL buffer");
+    size_t len = http_format_date(0, NULL, 100);
+    TEST_ASSERT_EQUAL_SIZE(0, len, "Should return 0 for NULL buffer");
+}
+
+TEST(test_http_format_date_zero_size) {
+    TEST_CASE("Handle zero buffer size");
+
+    char buf[64];
+    size_t len = http_format_date(0, buf, 0);
+    TEST_ASSERT_EQUAL_SIZE(0, len, "Should return 0 for zero size");
+}
+
+TEST(test_http_format_date_small_buffer) {
+    TEST_CASE("Handle buffer too small");
+
+    time_t t = 1735689600;
+    char buf[10]; // Way too small
+
+    size_t len = http_format_date(t, buf, sizeof(buf));
+    TEST_ASSERT_EQUAL_SIZE(0, len, "Should return 0 when buffer is too small");
+}
+
+TEST(test_http_format_date_exact_buffer) {
+    TEST_CASE("Handle exact buffer size");
+
+    time_t t = 1735689600;
+    // Format is "Wed, 01 Jan 2025 00:00:00 GMT" = 29 chars + null
+    char buf[30];
+
+    size_t len = http_format_date(t, buf, sizeof(buf));
+    TEST_ASSERT_EQUAL_SIZE(29, len, "Should return correct length");
+}
+
+// ============================================================================
+// Дополнительные edge-case тесты
+// ============================================================================
+
+TEST(test_urlencode_all_special_chars) {
+    TEST_CASE("URL encode all common special characters");
+
+    const char* input = " !\"#$%&'()*+,:;<=>?@[\\]^`{|}";
+    size_t len = strlen(input);
+
+    char* encoded = urlencode(input, len);
+    TEST_ASSERT_NOT_NULL(encoded, "Should encode successfully");
+
+    // Roundtrip verification
+    char* decoded = urldecode(encoded, strlen(encoded));
+    TEST_ASSERT_NOT_NULL(decoded, "Should decode successfully");
+    TEST_ASSERT_STR_EQUAL(input, decoded, "Roundtrip should preserve data");
+
+    free(encoded);
+    free(decoded);
+}
+
+TEST(test_urlencode_empty_string) {
+    TEST_CASE("URL encode empty string");
+
+    char* encoded = urlencode("", 0);
+    TEST_ASSERT_NOT_NULL(encoded, "Should not be NULL");
+    TEST_ASSERT_STR_EQUAL("", encoded, "Should be empty string");
+
+    free(encoded);
+}
+
+TEST(test_urlencodel_output_length_special_chars) {
+    TEST_CASE("urlencodel output_length for string with special chars");
+
+    // "a@b" -> "a%40b" = 5 chars
+    size_t output_length = 0;
+    char* encoded = urlencodel("a@b", 3, &output_length);
+
+    TEST_ASSERT_NOT_NULL(encoded, "Should encode");
+    TEST_ASSERT_STR_EQUAL("a%40b", encoded, "Should percent-encode @");
+    TEST_ASSERT_EQUAL_SIZE(5, output_length, "Output length should be 5");
+
+    free(encoded);
+}
+
+TEST(test_urlencodel_null_output_length) {
+    TEST_CASE("urlencodel with NULL output_length does not crash");
+
+    char* encoded = urlencodel("hello", 5, NULL);
+    TEST_ASSERT_NOT_NULL(encoded, "Should encode");
+    TEST_ASSERT_STR_EQUAL("hello", encoded, "Should match");
+
+    free(encoded);
+}
+
+TEST(test_urldecode_empty_string) {
+    TEST_CASE("URL decode empty string");
+
+    char* decoded = urldecode("", 0);
+    TEST_ASSERT_NOT_NULL(decoded, "Should not be NULL");
+    TEST_ASSERT_STR_EQUAL("", decoded, "Should be empty string");
+
+    free(decoded);
+}
+
+TEST(test_urldecode_null_input) {
+    TEST_CASE("URL decode NULL input");
+
+    // urldecode(NULL, 0) -> urldecodel(NULL, 0, NULL)
+    // urldecodel: malloc(0+1)=malloc(1), string==NULL, loop doesn't execute
+    char* decoded = urldecode(NULL, 0);
+    TEST_ASSERT_NOT_NULL(decoded, "Should allocate buffer");
+    TEST_ASSERT_STR_EQUAL("", decoded, "Should be empty");
+
+    free(decoded);
+}
+
+TEST(test_urldecodel_null_output_length) {
+    TEST_CASE("urldecodel with NULL output_length does not crash");
+
+    char* decoded = urldecodel("hello", 5, NULL);
+    TEST_ASSERT_NOT_NULL(decoded, "Should decode");
+    TEST_ASSERT_STR_EQUAL("hello", decoded, "Should match");
+
+    free(decoded);
+}
+
+TEST(test_urldecode_percent_in_middle_incomplete) {
+    TEST_CASE("Incomplete percent with invalid hex char");
+
+    // "%Gb" is treated as %XX by urldecodel (it doesn't validate hex chars).
+    // __hex_to_byte('G') = 16, __hex_to_byte('b') = 11, result = 16*16+11 = 267 -> char
+    // "a%Gb" -> 'a' + decoded byte = 2 chars (i jumps by 2, 'b' is consumed as hex digit)
+    char* decoded = urldecode("a%Gb", 4);
+    TEST_ASSERT_NOT_NULL(decoded, "Should not crash");
+    TEST_ASSERT_EQUAL_SIZE(2, strlen(decoded), "Should produce 2 chars (%%Gb consumes all 3)");
+
+    free(decoded);
+}
+
+TEST(test_urlencode_decode_plus_roundtrip) {
+    TEST_CASE("Plus sign roundtrip through encode/decode");
+
+    const char* original = "1+2=3";
+    char* encoded = urlencode(original, 5);
+    TEST_ASSERT_NOT_NULL(encoded, "Should encode");
+
+    // '+' is not in safe chars, should be encoded as %2B
+    TEST_ASSERT(strstr(encoded, "%2B") != NULL, "+ should be percent-encoded");
+
+    char* decoded = urldecode(encoded, strlen(encoded));
+    TEST_ASSERT_NOT_NULL(decoded, "Should decode");
+    TEST_ASSERT_STR_EQUAL(original, decoded, "Roundtrip should preserve +");
+
+    free(encoded);
+    free(decoded);
+}
+
+TEST(test_urldecode_percent_encoded_percent) {
+    TEST_CASE("Decode percent-encoded percent sign");
+
+    // %25 = '%'
+    char* decoded = urldecode("100%25", 6);
+    TEST_ASSERT_NOT_NULL(decoded, "Should decode");
+    TEST_ASSERT_STR_EQUAL("100%", decoded, "Should decode %25 as %");
+
+    free(decoded);
+}
+
+TEST(test_urldecode_consecutive_percent) {
+    TEST_CASE("Decode consecutive percent-encoded chars");
+
+    // %21%40 = "!@"
+    char* decoded = urldecode("%21%40", 6);
+    TEST_ASSERT_NOT_NULL(decoded, "Should decode");
+    TEST_ASSERT_STR_EQUAL("!@", decoded, "Should decode consecutive sequences");
+
+    free(decoded);
+}
+
+TEST(test_urlencode_slash) {
+    TEST_CASE("URL encode slash character");
+
+    char* encoded = urlencode("/path/to/file", 13);
+    TEST_ASSERT_NOT_NULL(encoded, "Should encode");
+    TEST_ASSERT(strstr(encoded, "%2F") != NULL, "Slash should be encoded");
+
+    free(encoded);
+}
+
+TEST(test_urldecode_incomplete_percent) {
+    TEST_CASE("URL decode incomplete percent sequence");
+
+    char* decoded = urldecode("hello%", 6);
+    TEST_ASSERT_NOT_NULL(decoded, "Should not crash");
+    TEST_ASSERT_STR_EQUAL("hello", decoded, "Should ignore incomplete percent");
+
+    free(decoded);
+}
+
+TEST(test_urldecode_single_char_after_percent) {
+    TEST_CASE("URL decode percent with single char after");
+
+    char* decoded = urldecode("hello%2", 7);
+    TEST_ASSERT_NOT_NULL(decoded, "Should not crash");
+    // When % has only one char after it (no second hex digit), the % is skipped
+    // and remaining chars are passed through
+    TEST_ASSERT_STR_EQUAL("hello2", decoded, "Should skip incomplete percent and pass remaining");
+
+    free(decoded);
+}
+
+TEST(test_hex_to_bytes_all_values) {
+    TEST_CASE("Hex to bytes covers all hex values");
+
+    const char* hex = "0123456789abcdefABCDEF";
+    unsigned char bytes[11];
+
+    int result = hex_to_bytes(hex, bytes);
+    TEST_ASSERT_EQUAL(1, result, "Should succeed");
+    TEST_ASSERT_EQUAL(0x01, bytes[0], "0x01 should match");
+    TEST_ASSERT_EQUAL(0x23, bytes[1], "0x23 should match");
+    TEST_ASSERT_EQUAL(0x45, bytes[2], "0x45 should match");
+    TEST_ASSERT_EQUAL(0x67, bytes[3], "0x67 should match");
+    TEST_ASSERT_EQUAL(0x89, bytes[4], "0x89 should match");
+    TEST_ASSERT_EQUAL(0xAB, bytes[5], "0xAB should match");
+    TEST_ASSERT_EQUAL(0xCD, bytes[6], "0xCD should match");
+    TEST_ASSERT_EQUAL(0xEF, bytes[7], "0xEF should match");
+    TEST_ASSERT_EQUAL(0xAB, bytes[8], "0xAB should match");
+    TEST_ASSERT_EQUAL(0xCD, bytes[9], "0xCD should match");
+    TEST_ASSERT_EQUAL(0xEF, bytes[10], "0xEF should match");
+}
+
+TEST(test_bytes_to_hex_roundtrip_all) {
+    TEST_CASE("Bytes to hex roundtrip for all byte values");
+
+    unsigned char bytes[256];
+    for (int i = 0; i < 256; i++) bytes[i] = (unsigned char)i;
+
+    char hex[513];
+    bytes_to_hex(bytes, 256, hex);
+
+    unsigned char decoded[256];
+    int result = hex_to_bytes(hex, decoded);
+    TEST_ASSERT_EQUAL(1, result, "Should decode successfully");
+    TEST_ASSERT(memcmp(bytes, decoded, 256) == 0, "Roundtrip should preserve all bytes");
+}
+
+TEST(test_cmpsubstr_lower_single_char_match) {
+    TEST_CASE("Find single char in single char string");
+
+    TEST_ASSERT_EQUAL(1, cmpsubstr_lower("a", "a"), "Single char match");
+    TEST_ASSERT_EQUAL(1, cmpsubstr_lower("a", "A"), "Case insensitive match");
+    TEST_ASSERT_EQUAL(0, cmpsubstr_lower("a", "b"), "Single char no match");
+}
+
+TEST(test_cmpsubstr_lower_overlap_reset) {
+    TEST_CASE("Substring search resets on mismatch");
+
+    // After mismatch j resets to 0 but i does not go back
+    // "aab" searching for "ab" - i=0 matches 'a', i=1 mismatches 'a' vs 'b',
+    // reset j=0, i=2 'b' vs 'a' mismatch again -> not found
+    TEST_ASSERT_EQUAL(0, cmpsubstr_lower("aab", "ab"), "Should not find (no backtracking)");
+
+    // "abb" searching for "ab" - i=0 matches 'a', i=1 matches 'b' -> found
+    TEST_ASSERT_EQUAL(1, cmpsubstr_lower("abb", "ab"), "Should find 'ab' in 'abb'");
+}
+
+TEST(test_is_path_traversal_just_dots) {
+    TEST_CASE("Path with just dots is safe");
+
+    TEST_ASSERT_EQUAL(0, is_path_traversal("..", 2), "Just .. without / is safe");
+    TEST_ASSERT_EQUAL(0, is_path_traversal("...", 3), "Three dots is safe");
+}
+
+TEST(test_data_appendn_null_buffer) {
+    TEST_CASE("data_appendn handles NULL buffer");
+
+    size_t pos = 0;
+    TEST_ASSERT_EQUAL(0, data_appendn(NULL, &pos, 10, "test", 4), "Should fail for NULL buffer");
+}
+
+TEST(test_data_appendn_null_string) {
+    TEST_CASE("data_appendn handles NULL string");
+
+    char buf[10] = {0};
+    size_t pos = 0;
+    TEST_ASSERT_EQUAL(0, data_appendn(buf, &pos, 10, NULL, 4), "Should fail for NULL string");
+}
+
+TEST(test_copy_cstringn_long_string) {
+    TEST_CASE("Copy long string");
+
+    const char* text = "The quick brown fox jumps over the lazy dog";
+    size_t len = strlen(text);
+
+    char* copy = copy_cstringn(text, len);
+    TEST_ASSERT_NOT_NULL(copy, "Should not be NULL");
+    TEST_ASSERT_STR_EQUAL(text, copy, "Should copy entire string");
+    TEST_ASSERT_EQUAL_SIZE(len, strlen(copy), "Length should match");
+
+    free(copy);
+}
+
+TEST(test_file_extension_slash_no_ext) {
+    TEST_CASE("Path ending with slash has no extension");
+
+    TEST_ASSERT_NULL(file_extension("/path/to/dir/"), "Directory path should return NULL");
+}
+
+TEST(test_file_extension_only_filename) {
+    TEST_CASE("Filename with extension only");
+
+    const char* ext = file_extension("archive.tar.xz");
+    TEST_ASSERT_NOT_NULL(ext, "Should find extension");
+    TEST_ASSERT_STR_EQUAL("xz", ext, "Should get last extension");
 }

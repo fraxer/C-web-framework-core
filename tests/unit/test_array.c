@@ -1188,8 +1188,12 @@ TEST(test_update_null_with_string) {
     TEST_CASE("array_update NULL check with string value");
 
     // Test with different value types to ensure NULL check works
-    array_update(NULL, 0, array_create_string("test"));
-    array_update(NULL, 5, array_create_double(3.14));
+    avalue_t str_val = array_create_string("test");
+    array_update(NULL, 0, str_val);
+    free(str_val._string);
+
+    avalue_t dbl_val = array_create_double(3.14);
+    array_update(NULL, 5, dbl_val);
 
     TEST_ASSERT(1, "array_update with NULL should handle all value types");
 }
