@@ -86,7 +86,8 @@ void* __connection_create(void* host) {
     connection->base.host = host;
     connection->connection = __connect(host);
 
-    if (connection->connection == NULL) {
+    if (!__is_active(connection)) {
+        log_error("redis connection not created by host %s\n", ((redishost_t*)host)->base.id);
         connection->base.free(connection);
         connection = NULL;
     }
@@ -233,6 +234,8 @@ redisContext* __connect(void* arg) {
 int __is_active(void* connection) {
     redisconnection_t* conn = connection;
     if (conn == NULL) return 0;
+
+    if (conn->connection == NULL) return 0;
 
     redisReply* reply = redisCommand(conn->connection, "PING");
     if (reply == NULL) {

@@ -139,4 +139,6 @@ int __destroy(const char* key, const char* session_id) {
     return 1;
 }
 
-void __remove_expired(const char* key) {}
+void __remove_expired(const char* key) {
+    (void)key;
+}

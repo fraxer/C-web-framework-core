@@ -113,7 +113,11 @@ void* __connection_create(void* host) {
     connection->base.host = host;
     connection->connection = __connect(host);
 
-    if (connection->connection == NULL) {
+    if (!__is_active(connection)) {
+        const char* err = connection->connection != NULL
+            ? PQerrorMessage(connection->connection)
+            : "connection failed";
+        log_error("postgresql connection not created by host %s: %s\n", ((postgresqlhost_t*)host)->base.id, err);
         connection->base.free(connection);
         connection = NULL;
     }
@@ -319,7 +323,7 @@ int __is_active(void* connection) {
     postgresqlconnection_t* conn = connection;
     if (conn == NULL) return 0;
 
-    return PQstatus(conn->connection) == CONNECTION_OK;
+    return conn->connection != NULL && PQstatus(conn->connection) == CONNECTION_OK;
 }
 
 int __reconnect(void* host, void* connection) {

@@ -125,7 +125,8 @@ void* __connection_create(void* host) {
     connection->base.host = host;
     connection->connection = __connect(host);
 
-    if (connection->connection == NULL) {
+    if (!__is_active(connection)) {
+        log_error("mysql connection not created by host %s\n", ((myhost_t*)host)->base.id);
         connection->base.free(connection);
         connection = NULL;
     }
@@ -531,7 +532,7 @@ int __is_active(void* connection) {
     myconnection_t* conn = connection;
     if (conn == NULL) return 0;
 
-    return mysql_ping(conn->connection) == 0;
+    return conn->connection != NULL && mysql_ping(conn->connection) == 0;
 }
 
 int __reconnect(void* host, void* connection) {
