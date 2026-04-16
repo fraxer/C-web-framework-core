@@ -426,11 +426,11 @@ int __set_method(httprequest_t* request, bufferdata_t* buf) {
 }
 
 int httpparser_set_uri(httprequest_t* request, const char* string, size_t length) {
-    if (string[0] != '/')
-        return HTTP1PARSER_BAD_REQUEST;
-
     request->uri = string;
     request->uri_length = length;
+
+    if (string[0] != '/')
+        return HTTP1PARSER_BAD_REQUEST;
 
     size_t path_point_end = 0;
     for (size_t pos = 0; pos < length; pos++) {

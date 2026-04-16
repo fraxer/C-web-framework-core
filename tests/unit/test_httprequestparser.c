@@ -1461,12 +1461,16 @@ TEST(test_httprequestparser_reset) {
     httpparser_set_bytes_readed(parser, strlen(request));
     httpparser_run(parser);
 
+    httprequest_t* req = parser->request;
+
     // Reset and parse again
     httpparser_reset(parser);
 
     TEST_ASSERT_EQUAL(HTTP1REQUESTPARSER_METHOD, parser->stage, "Stage should be reset");
     TEST_ASSERT_EQUAL_SIZE(0, parser->bytes_readed, "Bytes read should be reset");
     TEST_ASSERT_EQUAL_SIZE(0, parser->pos, "Position should be reset");
+
+    parser->request = req;
 
     httpparser_free(parser);
     free_mock_connection(conn);
