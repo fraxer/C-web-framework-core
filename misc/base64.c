@@ -144,7 +144,7 @@ int __base64_encode_internal(char* encoded, const char* string, const int string
 
         if (wrap > 0) {
             pc += 4;
-            if (pc % 64 == 0) {
+            if (pc % wrap == 0) {
                 *p++ = '\r';
                 *p++ = '\n';
             }
