@@ -73,10 +73,10 @@ sessionconfig_t* sessionconfig_find(const char* key) {
  *         - session creation failed
  */
 char* session_create(const char* key, const char* data, long duration) {
-    session_remove_expired();
-
     sessionconfig_t* config = sessionconfig_find(key);
     if (config == NULL || config->session == NULL) return NULL;
+
+    config->session->remove_expired(key);
 
     return config->session->create(key, data, duration);
 }
@@ -137,28 +137,6 @@ char* session_get(const char* key, const char* session_id) {
     if (config == NULL || config->session == NULL) return NULL;
 
     return config->session->get(key, session_id);
-}
-
-/**
- * @brief Removes all expired sessions from all registered configurations.
- *
- * Iterates over all session configurations in the global table (sessionconfigs)
- * and for each initialized configuration calls the expired session removal
- * handler (remove_expired callback).
- *
- * @note This function does not return a value and silently ignores cases where
- *       the configuration table is not initialized or individual handlers are missing.
- */
-void session_remove_expired(void) {
-    if (appconfig()->sessionconfigs == NULL) return;
-
-    for (map_iterator_t it = map_begin(appconfig()->sessionconfigs);
-         map_iterator_valid(it); it = map_next(it)) {
-        const char* key = (const char*)map_iterator_key(it);
-        sessionconfig_t* config = (sessionconfig_t*)map_iterator_value(it);
-        if (config != NULL && config->session != NULL)
-            config->session->remove_expired(key);
-    }
 }
 
 /**

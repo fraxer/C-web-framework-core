@@ -74,7 +74,6 @@ char* session_create(const char* key, const char* data, long duration);
 int session_destroy(const char* key, const char* session_id);
 int session_update(const char* key, const char* session_id, const char* data);
 char* session_get(const char* key, const char* session_id);
-void session_remove_expired(void);
 void sessionconfig_clear(sessionconfig_t* sessionconfig);
 
 session_t* sessionfile_init();

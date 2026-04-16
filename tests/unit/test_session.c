@@ -470,55 +470,6 @@ TEST(test_session_destroy_dispatch) {
 }
 
 // ============================================================================
-// Test: session_remove_expired
-// ============================================================================
-
-TEST(test_session_remove_expired_null_map) {
-    TEST_SUITE("session");
-    TEST_CASE("session_remove_expired: NULL sessionconfigs doesn't crash");
-
-    appconfig()->sessionconfigs = NULL;
-    session_remove_expired();
-    TEST_ASSERT(1, "session_remove_expired with NULL map should not crash");
-}
-
-TEST(test_session_remove_expired_iterates_all) {
-    TEST_SUITE("session");
-    TEST_CASE("session_remove_expired: calls remove_expired on each config");
-
-    map_t* map = map_create_ex(
-        map_compare_string,
-        map_copy_string,
-        free,
-        NULL,
-        (map_free_fn)sessionconfig_free
-    );
-
-    mock_expired_call_count = 0;
-
-    sessionconfig_t* sc1 = calloc(1, sizeof(sessionconfig_t));
-    sc1->session = malloc(sizeof(session_t));
-    memset(sc1->session, 0, sizeof(session_t));
-    sc1->session->remove_expired = mock_count_expired;
-    map_insert(map, "svc1", sc1);
-
-    sessionconfig_t* sc2 = calloc(1, sizeof(sessionconfig_t));
-    sc2->session = malloc(sizeof(session_t));
-    memset(sc2->session, 0, sizeof(session_t));
-    sc2->session->remove_expired = mock_count_expired;
-    map_insert(map, "svc2", sc2);
-
-    appconfig()->sessionconfigs = map;
-    session_remove_expired();
-
-    TEST_ASSERT_EQUAL(2, mock_expired_call_count,
-        "session_remove_expired should call each driver's remove_expired");
-
-    map_free(map);
-    appconfig()->sessionconfigs = NULL;
-}
-
-// ============================================================================
 // Test: sessionconfig_clear / sessionconfig_free
 // ============================================================================
 
