@@ -201,6 +201,8 @@ void __connection_free(void* connection) {
 dbresult_t* __query(void* connection, const char* sql) {
     myconnection_t* myconnection = connection;
 
+    log_debug("DB query: %s\n", sql);
+
     dbresult_t* result = dbresult_create();
     if (result == NULL) return NULL;
 
@@ -1199,6 +1201,8 @@ int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params) {
 
 dbresult_t* __execute_prepared(void* connection, const char* stmt_name, array_t* params) {
     myconnection_t* myconnection = connection;
+
+    log_debug("DB prepared query: %s\n", stmt_name);
 
     dbresult_t* result = dbresult_create();
     if (result == NULL) return NULL;

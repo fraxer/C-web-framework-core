@@ -107,6 +107,8 @@ void __connection_free(void* connection) {
 dbresult_t* __query(void* connection, const char* sql) {
     redisconnection_t* redisconnection = connection;
 
+    log_debug("DB query: %s\n", sql);
+
     dbresult_t* result = dbresult_create();
     if (result == NULL) return NULL;
 
