@@ -1122,12 +1122,20 @@ char* __compile_select(void* connection, const char* table, array_t* columns, ar
     dbconnection_t* conn = connection;
     char* buffer = NULL;
 
-    str_t* escaped_table = conn->escape_identifier(conn, table);
-    if (escaped_table == NULL)
+    postgresqlhost_t* host = conn->host;
+    str_t* escaped_schema = conn->escape_identifier(conn, host->schema);
+    if (escaped_schema == NULL)
         return NULL;
+
+    str_t* escaped_table = conn->escape_identifier(conn, table);
+    if (escaped_table == NULL) {
+        str_free(escaped_schema);
+        return NULL;
+    }
 
     str_t* columns_str = str_create_empty(256);
     if (columns_str == NULL) {
+        str_free(escaped_schema);
         str_free(escaped_table);
         return NULL;
     }
@@ -1189,8 +1197,8 @@ char* __compile_select(void* connection, const char* table, array_t* columns, ar
         str_free(quoted_str);
     }
 
-    const char* format = "SELECT %s FROM %s WHERE %s";
-    const size_t buffer_size = strlen(format) + str_size(escaped_table) + str_size(columns_str) + str_size(where_str) + 1;
+    const char* format = "SELECT %s FROM %s.%s WHERE %s";
+    const size_t buffer_size = strlen(format) + str_size(escaped_schema) + str_size(escaped_table) + str_size(columns_str) + str_size(where_str) + 1;
     buffer = malloc(buffer_size);
     if (buffer == NULL)
         goto failed;
@@ -1198,12 +1206,14 @@ char* __compile_select(void* connection, const char* table, array_t* columns, ar
     snprintf(buffer, buffer_size,
         format,
         str_get(columns_str),
+        str_get(escaped_schema),
         str_get(escaped_table),
         str_get(where_str)
     );
 
     failed:
 
+    str_free(escaped_schema);
     str_free(escaped_table);
     str_free(columns_str);
     str_free(where_str);

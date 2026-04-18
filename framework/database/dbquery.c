@@ -443,6 +443,7 @@ str_t* parse_sql_parameters(void* connection, const char* query, size_t query_si
 
     // Track string literals and comments to skip parameter parsing inside them
     sql_parse_state_t parse_state = {0, 0, 0, 0};
+    int skip_next_colon = 0;
 
     for (size_t i = 0; i < query_size; i++) {
         // Update parser state based on current character
@@ -453,6 +454,26 @@ str_t* parse_sql_parameters(void* connection, const char* query, size_t query_si
         // Skip parameter processing inside strings and comments
         if (parse_state.in_string || parse_state.in_line_comment || parse_state.in_block_comment) {
             continue;
+        }
+
+        // PostgreSQL type cast syntax :: — treat as literal SQL, not a parameter
+        if (query[i] == ':' && i + 1 < query_size && query[i + 1] == ':') {
+            if (param_start != -1) {
+                // Finalize pending parameter — ':' acts as boundary (ispunct_custom).
+                // Set flag to skip second ':' on next iteration, then fall through
+                // to parameter-end check (':' is ispunct_custom, so it triggers finalization).
+                skip_next_colon = 1;
+            } else {
+                i++;  // Skip second ':'
+                continue;
+            }
+            // Do NOT fall into the param-start block below — skip it.
+            goto param_end_check;
+        } else if (skip_next_colon && query[i] == ':') {
+            skip_next_colon = 0;
+            continue;
+        } else {
+            skip_next_colon = 0;
         }
 
         if (query[i] == ':' || query[i] == '@') {
@@ -466,7 +487,8 @@ str_t* parse_sql_parameters(void* connection, const char* query, size_t query_si
             continue;
         }
 
-        // Check parameter end
+        param_end_check:
+        ; // Check parameter end
         const int string_end = i == query_size - 1;
         // Cast to unsigned char to safely handle non-ASCII bytes and avoid undefined behavior with ctype functions
         const int is_spec_symbol = ispunct_custom((unsigned char)query[i]) ||
