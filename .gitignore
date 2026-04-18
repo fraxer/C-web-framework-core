@@ -1,6 +1,7 @@
 # Directories
 build
 .vscode
+graphify-out
 
 # Prerequisites
 *.d
