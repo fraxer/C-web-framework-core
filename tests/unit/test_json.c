@@ -401,6 +401,49 @@ TEST(test_json_object_operations) {
     json_manager_free();
 }
 
+TEST(test_json_object_remove_then_set) {
+    TEST_CASE("Remove last key then add new key — new key must appear in stringify");
+
+    json_doc_t* doc = json_root_create_object();
+    json_token_t* root = json_root(doc);
+
+    json_object_set(root, "key1", json_create_string("value1"));
+    json_object_set(root, "key2", json_create_string("value2"));
+    json_object_set(root, "user_role", json_create_string("admin"));
+
+    TEST_ASSERT_EQUAL(3, json_object_size(root), "Object should have 3 keys");
+
+    // Remove last key
+    int result = json_object_remove(root, "user_role");
+    TEST_ASSERT_EQUAL(1, result, "Remove should succeed");
+    TEST_ASSERT_EQUAL(2, json_object_size(root), "Object should have 2 keys after remove");
+
+    // Add new key after removal
+    json_object_set(root, "owner", json_create_string("john"));
+    TEST_ASSERT_EQUAL(3, json_object_size(root), "Object should have 3 keys after add");
+
+    // Verify new key is accessible
+    json_token_t* owner = json_object_get(root, "owner");
+    TEST_ASSERT_NOT_NULL(owner, "New key 'owner' should be found");
+    TEST_ASSERT_STR_EQUAL("john", json_string(owner), "Owner value should be 'john'");
+
+    // Verify removed key is gone
+    json_token_t* removed = json_object_get(root, "user_role");
+    TEST_ASSERT_NULL(removed, "Removed key 'user_role' should not be found");
+
+    // Verify stringify contains all expected keys and none of the removed
+    const char* output = json_stringify(doc);
+    TEST_ASSERT_NOT_NULL(output, "Stringify should succeed");
+
+    TEST_ASSERT(strstr(output, "\"key1\"") != NULL, "Output should contain key1");
+    TEST_ASSERT(strstr(output, "\"key2\"") != NULL, "Output should contain key2");
+    TEST_ASSERT(strstr(output, "\"owner\"") != NULL, "Output should contain owner");
+    TEST_ASSERT(strstr(output, "\"user_role\"") == NULL, "Output should NOT contain user_role");
+
+    json_free(doc);
+    json_manager_free();
+}
+
 TEST(test_json_object_replace_value) {
     TEST_CASE("Replace value in object");
 

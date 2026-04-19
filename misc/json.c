@@ -1776,6 +1776,10 @@ int json_object_remove(json_token_t* token_object, const char* key) {
             else
                 token_object->child = token->sibling;
 
+            // Update last_sibling if we're removing the tail
+            if (token_object->last_sibling == token)
+                token_object->last_sibling = token_prev;
+
             token_object->size--;
             return 1;
         }
