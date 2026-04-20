@@ -302,7 +302,7 @@ int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
                 return __deferred_handler(connection, request, response, __queue_response_handler, NULL, __queue_data_response_create, ratelimiter);
             }
 
-            if (route->handler[request->method] == NULL) return 0;
+            if (route->handler[request->method] == NULL) continue;
 
             return __deferred_handler(connection, request, response, __queue_request_handler, route->handler[request->method], __queue_data_request_create, ratelimiter);
         }
@@ -333,7 +333,7 @@ int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
                 return __deferred_handler(connection, request, response, __queue_response_handler, NULL, __queue_data_response_create, ratelimiter);
             }
 
-            if (route->handler[request->method] == NULL) return 0;
+            if (route->handler[request->method] == NULL) continue;
 
             return __deferred_handler(connection, request, response,  __queue_request_handler, route->handler[request->method], __queue_data_request_create, ratelimiter);
         }
@@ -345,7 +345,7 @@ int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
                 return __deferred_handler(connection, request, response, __queue_response_handler, NULL, __queue_data_response_create, ratelimiter);
             }
 
-            if (route->handler[request->method] == NULL) return 0;
+            if (route->handler[request->method] == NULL) continue;
 
             return __deferred_handler(connection, request, response,  __queue_request_handler, route->handler[request->method], __queue_data_request_create, ratelimiter);
         }
@@ -723,6 +723,8 @@ int __sni_callback(SSL* ssl, int* ad, void* arg) {
                 if (matches_count > 0) {
                     ctx->server = server;
                     connection->ssl_ctx = server->openssl->ctx;
+
+                    log_error("sni host found: %s\n", server->domain->template);
 
                     SSL_set_SSL_CTX(ssl, server->openssl->ctx);
 
