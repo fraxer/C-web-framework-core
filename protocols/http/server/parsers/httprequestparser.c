@@ -291,10 +291,10 @@ int httpparser_run(httprequestparser_t* parser) {
                 if (parser->content_length == 0) {
                     // Prevent integer underflow: check if there's data after headers
                     if (parser->pos + 1 < parser->bytes_readed) {
-                        // RFC 7230: POST/PUT/PATCH requires Content-Length or Transfer-Encoding
+                        // RFC 7230: methods that allow payload require Content-Length or Transfer-Encoding
                         // If there's data after headers but no Content-Length, it's an error for these methods
                         if (httprequest_allow_payload(parser->request)) {
-                            log_error("HTTP error: POST/PUT/PATCH request has body but missing Content-Length header\n");
+                            log_error("HTTP error: request with payload-capable method has body but missing Content-Length header\n");
                             return __clear_and_return(parser, HTTP1PARSER_BAD_REQUEST);
                         }
 
@@ -347,8 +347,10 @@ int __parse_payload(httprequestparser_t* parser) {
         return __clear_and_return(parser, HTTP1PARSER_ERROR);
     }
 
-    if (!httprequest_allow_payload(request))
+    if (!httprequest_allow_payload(request)) {
+        log_error("HTTP error: payload (%s) not allowed for current method route_methods_e[%d]\n", request->path, request->method);
         return __clear_and_return(parser, HTTP1PARSER_BAD_REQUEST);
+    }
 
     // Защита от integer underflow
     if (parser->pos > parser->bytes_readed) {
