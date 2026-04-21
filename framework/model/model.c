@@ -24,6 +24,87 @@ static mfield_t __model_tmpfield_create(mfield_t* source_field);
 static int __model_field_is_primary_and_not_dirty(model_t* model, mfield_t* field);
 static int __str_modify_add_symbols_before(str_t* str, char add_symbol, char before_symbol);
 
+/* Convert tm_t to struct tm for strftime/strptime calls */
+struct tm tm_to_strtm(const tm_t* src) {
+    struct tm dst = {
+        .tm_sec = src->tm_sec, .tm_min = src->tm_min,
+        .tm_hour = src->tm_hour, .tm_mday = src->tm_mday,
+        .tm_mon = src->tm_mon, .tm_year = src->tm_year,
+        .tm_wday = src->tm_wday, .tm_yday = src->tm_yday,
+        .tm_isdst = src->tm_isdst,
+        .tm_gmtoff = src->tm_gmtoff, .tm_zone = src->tm_zone
+    };
+    return dst;
+}
+
+/* Convert struct tm (from strptime) to tm_t, initializing tm_usec to 0 */
+void strtm_to_tm(const struct tm* src, tm_t* dst) {
+    dst->tm_sec = src->tm_sec; dst->tm_min = src->tm_min;
+    dst->tm_hour = src->tm_hour; dst->tm_mday = src->tm_mday;
+    dst->tm_mon = src->tm_mon; dst->tm_year = src->tm_year;
+    dst->tm_wday = src->tm_wday; dst->tm_yday = src->tm_yday;
+    dst->tm_isdst = src->tm_isdst;
+    dst->tm_gmtoff = src->tm_gmtoff; dst->tm_zone = src->tm_zone;
+    dst->tm_usec = 0;
+}
+
+int parse_usec(const char* str, const char** end) {
+    long usec = 0;
+    int digits = 0;
+
+    while (*str >= '0' && *str <= '9' && digits < 6) {
+        usec = usec * 10 + (*str - '0');
+        digits++;
+        str++;
+    }
+    while (digits < 6) {
+        usec *= 10;
+        digits++;
+    }
+    if (end)
+        *end = str;
+
+    return (int)usec;
+}
+
+int parse_tz_offset(const char* str, long* gmtoff) {
+    if (*str == 'Z') { *gmtoff = 0; return 1; }
+    if (*str != '+' && *str != '-') return 0;
+
+    int sign = (*str == '-') ? -1 : 1;
+    int hours = 0;
+    int mins = 0;
+
+    str++;
+
+    if (sscanf(str, "%d:%d", &hours, &mins) >= 1) {
+        *gmtoff = sign * (hours * 3600 + mins * 60);
+        return 1;
+    }
+
+    return 0;
+}
+
+const char* strptime_flex(const char* value, struct tm* stm) {
+    const char* r = strptime(value, "%Y-%m-%d %H:%M:%S", stm);
+    if (r == NULL)
+        r = strptime(value, "%Y-%m-%dT%H:%M:%S", stm);
+    return r;
+}
+
+/* Parse datetime from strptime result, extract microseconds, return pointer past them */
+const char* parse_datetime_rest(const char* rest, tm_t* tm) {
+    while (*rest && *rest != '.' && *rest != '+' && *rest != '-' && *rest != 'Z')
+        rest++;
+
+    if (*rest == '.') {
+        rest++;
+        tm->tm_usec = parse_usec(rest, &rest);
+    }
+
+    return rest;
+}
+
 // Numeric types
 void* field_create_bool(const char* field_name, short value) {
     mfield_t* field = malloc(sizeof * field);
@@ -1760,9 +1841,13 @@ int model_set_timestamp_from_str(mfield_t* field, const char* value) {
     if (field->type != MODEL_TIMESTAMP) return 0;
     if (value == NULL) { field->is_null = 1; return 1; }
 
-    tm_t tm = (tm_t){0};
-    if (strlen(value) > 0 && strptime(value, "%Y-%m-%d %H:%M:%S", &tm) == NULL)
-        return 0;
+    struct tm stm = {0};
+    const char* rest = strptime_flex(value, &stm);
+    if (rest == NULL) return 0;
+
+    tm_t tm = {0};
+    strtm_to_tm(&stm, &tm);
+    parse_datetime_rest(rest, &tm);
 
     return model_set_timestamp(field, &tm);
 }
@@ -1772,9 +1857,17 @@ int model_set_timestamptz_from_str(mfield_t* field, const char* value) {
     if (field->type != MODEL_TIMESTAMPTZ) return 0;
     if (value == NULL) { field->is_null = 1; return 1; }
 
-    tm_t tm = (tm_t){0};
-    if (strlen(value) > 0 && strptime(value, "%Y-%m-%d %H:%M:%S%z", &tm) == NULL)
-        return 0;
+    struct tm stm = {0};
+    const char* rest = strptime_flex(value, &stm);
+    if (rest == NULL) return 0;
+
+    tm_t tm = {0};
+    strtm_to_tm(&stm, &tm);
+    tm.tm_isdst = 0;
+    rest = parse_datetime_rest(rest, &tm);
+
+    if (*rest == '+' || *rest == '-' || *rest == 'Z')
+        parse_tz_offset(rest, &tm.tm_gmtoff);
 
     return model_set_timestamptz(field, &tm);
 }
@@ -1784,9 +1877,12 @@ int model_set_date_from_str(mfield_t* field, const char* value) {
     if (field->type != MODEL_DATE) return 0;
     if (value == NULL) { field->is_null = 1; return 1; }
 
-    tm_t tm = (tm_t){0};
-    if (strlen(value) > 0 && strptime(value, "%Y-%m-%d %H:%M:%S", &tm) == NULL)
+    struct tm stm = {0};
+    if (strlen(value) > 0 && strptime(value, "%Y-%m-%d %H:%M:%S", &stm) == NULL)
         return 0;
+
+    tm_t tm = {0};
+    strtm_to_tm(&stm, &tm);
 
     return model_set_date(field, &tm);
 }
@@ -1796,9 +1892,13 @@ int model_set_time_from_str(mfield_t* field, const char* value) {
     if (field->type != MODEL_TIME) return 0;
     if (value == NULL) { field->is_null = 1; return 1; }
 
-    tm_t tm = (tm_t){0};
-    if (strlen(value) > 0 && strptime(value, "%H:%M:%S", &tm) == NULL)
-        return 0;
+    struct tm stm = {0};
+    const char* rest = strptime(value, "%H:%M:%S", &stm);
+    if (rest == NULL) return 0;
+
+    tm_t tm = {0};
+    strtm_to_tm(&stm, &tm);
+    parse_datetime_rest(rest, &tm);
 
     return model_set_time(field, &tm);
 }
@@ -1808,9 +1908,17 @@ int model_set_timetz_from_str(mfield_t* field, const char* value) {
     if (field->type != MODEL_TIMETZ) return 0;
     if (value == NULL) { field->is_null = 1; return 1; }
 
-    tm_t tm = (tm_t){0};
-    if (strlen(value) > 0 && strptime(value, "%H:%M:%S%z", &tm) == NULL)
-        return 0;
+    struct tm stm = {0};
+    const char* rest = strptime(value, "%H:%M:%S", &stm);
+    if (rest == NULL) return 0;
+
+    tm_t tm = {0};
+    strtm_to_tm(&stm, &tm);
+    tm.tm_isdst = 0;
+    rest = parse_datetime_rest(rest, &tm);
+
+    if (*rest == '+' || *rest == '-' || *rest == 'Z')
+        parse_tz_offset(rest, &tm.tm_gmtoff);
 
     return model_set_timetz(field, &tm);
 }
@@ -2055,9 +2163,6 @@ str_t* model_timestamp_to_str(mfield_t* field) {
         return field->value._string;
 
     char value[64] = {0};
-
-    tm_t tm = {0};
-    memcpy(&tm, &field->value._tm, sizeof(tm_t));
     size_t size = 0;
 
     if (field->value._tm.tm_year == 0) {
@@ -2065,11 +2170,13 @@ str_t* model_timestamp_to_str(mfield_t* field) {
         clock_gettime(CLOCK_REALTIME, &ts);
 
         size = strftime(value, sizeof(value), "%Y-%m-%dT%H:%M:%S", gmtime(&ts.tv_sec));
-        // Add milliseconds
         size += sprintf(value + size, ".%06ld", ts.tv_nsec / 1000);
     }
     else {
-        size = strftime(value, sizeof(value), "%Y-%m-%d %H:%M:%S", &tm);
+        struct tm stm = tm_to_strtm(&field->value._tm);
+        size = strftime(value, sizeof(value), "%Y-%m-%d %H:%M:%S", &stm);
+        if (field->value._tm.tm_usec != 0)
+            size += sprintf(value + size, ".%06d", field->value._tm.tm_usec);
     }
 
     if (size == 0)
@@ -2091,8 +2198,15 @@ str_t* model_timestamptz_to_str(mfield_t* field) {
     if (field->value._string != NULL && str_size(field->value._string) > 0)
         return field->value._string;
 
-    char value[32] = {0};
-    const size_t size = strftime(value, sizeof(value), "%Y-%m-%d %H:%M:%S%z", &field->value._tm);
+    struct tm stm = tm_to_strtm(&field->value._tm);
+    char value[48] = {0};
+    size_t size = strftime(value, sizeof(value), "%Y-%m-%d %H:%M:%S", &stm);
+
+    if (field->value._tm.tm_usec != 0)
+        size += sprintf(value + size, ".%06d", field->value._tm.tm_usec);
+
+    size += strftime(value + size, sizeof(value) - size, "%z", &stm);
+
     if (size == 0)
         return NULL;
 
@@ -2108,8 +2222,9 @@ str_t* model_date_to_str(mfield_t* field) {
     if (field == NULL) return NULL;
     if (field->type != MODEL_DATE) return NULL;
 
+    struct tm stm = tm_to_strtm(&field->value._tm);
     char value[32] = {0};
-    const size_t size = strftime(value, sizeof(value), "%Y-%m-%d %H:%M:%S", &field->value._tm);
+    const size_t size = strftime(value, sizeof(value), "%Y-%m-%d %H:%M:%S", &stm);
     if (size == 0)
         return NULL;
 
@@ -2125,8 +2240,12 @@ str_t* model_time_to_str(mfield_t* field) {
     if (field == NULL) return NULL;
     if (field->type != MODEL_TIME) return NULL;
 
-    char value[10] = {0};
-    const size_t size = strftime(value, sizeof(value), "%H:%M:%S", &field->value._tm);
+    struct tm stm = tm_to_strtm(&field->value._tm);
+    char value[20] = {0};
+    size_t size = strftime(value, sizeof(value), "%H:%M:%S", &stm);
+    if (field->value._tm.tm_usec != 0)
+        size += sprintf(value + size, ".%06d", field->value._tm.tm_usec);
+
     if (size == 0)
         return NULL;
 
@@ -2142,8 +2261,15 @@ str_t* model_timetz_to_str(mfield_t* field) {
     if (field == NULL) return NULL;
     if (field->type != MODEL_TIMETZ) return NULL;
 
-    char value[20] = {0};
-    const size_t size = strftime(value, sizeof(value), "%H:%M:%S%z", &field->value._tm);
+    struct tm stm = tm_to_strtm(&field->value._tm);
+    char value[32] = {0};
+    size_t size = strftime(value, sizeof(value), "%H:%M:%S", &stm);
+
+    if (field->value._tm.tm_usec != 0)
+        size += sprintf(value + size, ".%06d", field->value._tm.tm_usec);
+
+    size += strftime(value + size, sizeof(value) - size, "%z", &stm);
+
     if (size == 0)
         return NULL;
 

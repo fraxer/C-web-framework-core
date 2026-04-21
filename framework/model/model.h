@@ -309,7 +309,44 @@
 #define MDL_NSEQ() 64,MW_NSEQ()
 #define display_fields(...) (char*[NARG_(__VA_ARGS__,MDL_NSEQ())]){__VA_ARGS__, NULL}
 
-typedef struct tm tm_t;
+typedef struct {
+    int tm_sec;
+    int tm_min;
+    int tm_hour;
+    int tm_mday;
+    int tm_mon;
+    int tm_year;
+    int tm_wday;
+    int tm_yday;
+    int tm_isdst;
+    long tm_gmtoff;
+    const char* tm_zone;
+    int tm_usec;
+} tm_t;
+
+static inline void tm_from_time(tm_t* dst, time_t t) {
+    struct tm stm;
+    localtime_r(&t, &stm);
+    dst->tm_sec = stm.tm_sec; dst->tm_min = stm.tm_min;
+    dst->tm_hour = stm.tm_hour; dst->tm_mday = stm.tm_mday;
+    dst->tm_mon = stm.tm_mon; dst->tm_year = stm.tm_year;
+    dst->tm_wday = stm.tm_wday; dst->tm_yday = stm.tm_yday;
+    dst->tm_isdst = stm.tm_isdst;
+    dst->tm_gmtoff = stm.tm_gmtoff; dst->tm_zone = stm.tm_zone;
+    dst->tm_usec = 0;
+}
+
+static inline time_t tm_to_time(const tm_t* src) {
+    struct tm stm = {
+        .tm_sec = src->tm_sec, .tm_min = src->tm_min,
+        .tm_hour = src->tm_hour, .tm_mday = src->tm_mday,
+        .tm_mon = src->tm_mon, .tm_year = src->tm_year,
+        .tm_wday = src->tm_wday, .tm_yday = src->tm_yday,
+        .tm_isdst = src->tm_isdst,
+        .tm_gmtoff = src->tm_gmtoff, .tm_zone = src->tm_zone
+    };
+    return mktime(&stm);
+}
 
 typedef enum {
     MODEL_BOOL = 0,

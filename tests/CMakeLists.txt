@@ -24,6 +24,7 @@ add_executable(
 )
 
 target_link_libraries(runner PRIVATE
+    model
     misc
     http_server_parsers
     http_server
