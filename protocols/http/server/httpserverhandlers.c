@@ -724,8 +724,6 @@ int __sni_callback(SSL* ssl, int* ad, void* arg) {
                     ctx->server = server;
                     connection->ssl_ctx = server->openssl->ctx;
 
-                    log_error("sni host found: %s\n", server->domain->template);
-
                     SSL_set_SSL_CTX(ssl, server->openssl->ctx);
 
     #if OPENSSL_VERSION_NUMBER >= 0x009080dfL
