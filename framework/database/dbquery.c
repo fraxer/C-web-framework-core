@@ -600,6 +600,11 @@ static int __build_query_processor(
     (void)param_name;  // Not used in this processor
     (void)user_data;  // Not used in this processor
 
+    if (field->is_null) {
+        str_append(result_sql, "NULL", 4);
+        return 1;
+    }
+
     str_t* field_value = model_field_to_string(field);
     if (field_value == NULL) return 0;
 
