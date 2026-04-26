@@ -185,6 +185,8 @@ int route_parse_location(route_parser_t* parser) {
         memmove(parser->location + 1, parser->location, parser->pos);
         parser->pos++;
         parser->location[0] = '^';
+        parser->location[parser->pos] = '$';
+        parser->pos++;
     }
     else if (parser->is_primitive) {
         memmove(parser->location + 1, parser->location, parser->pos);
