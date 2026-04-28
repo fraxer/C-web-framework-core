@@ -1290,6 +1290,7 @@ json_token_t* json_root(const json_doc_t* document) {
 
 int json_bool(const json_token_t* token) {
     if (token == NULL) return 0;
+    if (token->type != JSON_BOOL) return 0;
 
     return token->value._int;
 }
@@ -1425,12 +1426,14 @@ long long json_llong(const json_token_t* token, int* ok) {
 
 const char* json_string(const json_token_t* token) {
     if (token == NULL) return NULL;
+    if (token->type != JSON_STRING) return NULL;
 
     return str_get((str_t*)&token->value._string);
 }
 
 size_t json_string_size(const json_token_t* token) {
     if (token == NULL) return 0;
+    if (token->type != JSON_STRING) return 0;
 
     return str_size(&token->value._string);
 }
