@@ -69,6 +69,11 @@ void __host_free(void* arg) {
     free(host);
 }
 
+static const char* __type_cast(int field_type) {
+    (void)field_type;
+    return "";
+}
+
 void* __connection_create(void* host) {
     redisconnection_t* connection = malloc(sizeof * connection);
     if (connection == NULL) return NULL;
@@ -83,6 +88,7 @@ void* __connection_create(void* host) {
     connection->base.reconnect = __reconnect;
     connection->base.prepare = NULL;
     connection->base.execute_prepared = NULL;
+    connection->base.type_cast = __type_cast;
     connection->base.host = host;
     connection->connection = __connect(host);
 

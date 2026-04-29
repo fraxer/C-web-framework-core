@@ -107,6 +107,11 @@ void __host_free(void* arg) {
     free(host);
 }
 
+static const char* __type_cast(int field_type) {
+    (void)field_type;
+    return "";
+}
+
 void* __connection_create(void* host) {
     myconnection_t* connection = malloc(sizeof * connection);
     if (connection == NULL) return NULL;
@@ -122,6 +127,7 @@ void* __connection_create(void* host) {
     connection->base.prepare = __prepare;
     connection->base.execute_prepared = __execute_prepared;
     connection->base.begin = __begin;
+    connection->base.type_cast = __type_cast;
     connection->base.host = host;
     connection->connection = __connect(host);
 
