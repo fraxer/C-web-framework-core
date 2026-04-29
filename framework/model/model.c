@@ -1430,7 +1430,7 @@ int model_set_char(mfield_t* field, const char* value) {
 }
 
 int model_set_text(mfield_t* field, const char* value) {
-    return model_set_text_from_str(field, value, strlen(value));
+    return model_set_text_from_str(field, value, value ? strlen(value) : 0);
 }
 
 int model_set_enum(mfield_t* field, const char* value) {

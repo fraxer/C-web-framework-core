@@ -613,6 +613,14 @@ static int __build_query_processor(
         return 0;
     }
 
+    if (parameter_type != '@') {
+        dbconnection_t* conn = (dbconnection_t*)connection;
+        const char* suffix = conn->type_cast(field->type);
+        if (suffix[0] != '\0') {
+            str_append(result_sql, suffix, strlen(suffix));
+        }
+    }
+
     return 1;
 }
 

@@ -53,6 +53,9 @@ typedef struct dbconnection {
     // Transaction isolation level
     dbresult_t*(*begin)(void* connection, transaction_level_e level);
 
+    // Database-specific type cast suffix for inline value substitution
+    const char*(*type_cast)(int field_type);
+
     pid_t thread_id;
     map_t* prepare_statements;
     void* host;

@@ -96,6 +96,32 @@ void __host_free(void* arg) {
     free(host);
 }
 
+static const char* __type_cast(int field_type) {
+    switch ((mtype_e)field_type) {
+        case MODEL_BOOL:        return "::boolean";
+        case MODEL_SMALLINT:    return "::smallint";
+        case MODEL_INT:         return "::integer";
+        case MODEL_BIGINT:      return "::bigint";
+        case MODEL_FLOAT:       return "::real";
+        case MODEL_DOUBLE:      return "::double precision";
+        case MODEL_DECIMAL:     return "::numeric";
+        case MODEL_MONEY:       return "::money";
+        case MODEL_DATE:        return "::date";
+        case MODEL_TIME:        return "::time";
+        case MODEL_TIMETZ:      return "::timetz";
+        case MODEL_TIMESTAMP:   return "::timestamp";
+        case MODEL_TIMESTAMPTZ: return "::timestamptz";
+        case MODEL_JSON:        return "::jsonb";
+        case MODEL_BINARY:      return "::bytea";
+        case MODEL_VARCHAR:     return "::varchar";
+        case MODEL_CHAR:        return "::char";
+        case MODEL_TEXT:        return "::text";
+        case MODEL_ENUM:        return "";
+        case MODEL_ARRAY:       return "::jsonb";
+        default:                return "";
+    }
+}
+
 void* __connection_create(void* host) {
     postgresqlconnection_t* connection = malloc(sizeof * connection);
     if (connection == NULL) return NULL;
@@ -111,6 +137,7 @@ void* __connection_create(void* host) {
     connection->base.prepare = __prepare;
     connection->base.execute_prepared = __execute_prepared;
     connection->base.begin = __begin;
+    connection->base.type_cast = __type_cast;
     connection->base.host = host;
     connection->connection = __connect(host);
 
