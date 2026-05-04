@@ -38,6 +38,7 @@ static int __reconnect(void* host, void* connection);
 static dbresult_t* __begin(void* connection, transaction_level_e level);
 static char* __compile_table_exist(dbconnection_t* connection, const char* table);
 static char* __compile_table_migration_create(dbconnection_t* connection, const char* table);
+static str_t* __compile_table_ref(dbconnection_t* conn, const char* table);
 static str_t* __escape_identifier_part(PGconn* pg_conn, const char* start, size_t len);
 static str_t* __escape_identifier(void* connection, const char* str);
 static str_t* __escape_string(void* connection, const char* str);
@@ -125,6 +126,37 @@ void* __connection_create(void* host) {
     return connection;
 }
 
+str_t* __compile_table_ref(dbconnection_t* conn, const char* table) {
+    str_t* table_ref = str_create_empty(256);
+    if (table_ref == NULL)
+        return NULL;
+
+    str_t* escaped_table = conn->escape_identifier(conn, table);
+    if (escaped_table == NULL) {
+        str_free(table_ref);
+        return NULL;
+    }
+
+    postgresqlhost_t* host = conn->host;
+
+    if (host->schema != NULL && host->schema[0] != '\0') {
+        str_t* escaped_schema = conn->escape_identifier(conn, host->schema);
+        if (escaped_schema == NULL) {
+            str_free(table_ref);
+            str_free(escaped_table);
+            return NULL;
+        }
+        str_append(table_ref, str_get(escaped_schema), str_size(escaped_schema));
+        str_appendc(table_ref, '.');
+        str_free(escaped_schema);
+    }
+
+    str_append(table_ref, str_get(escaped_table), str_size(escaped_table));
+    str_free(escaped_table);
+
+    return table_ref;
+}
+
 char* __compile_table_exist(dbconnection_t* connection, const char* table) {
     str_t* quoted_table = connection->escape_string(connection, table);
     if (quoted_table == NULL)
@@ -156,27 +188,24 @@ char* __compile_table_exist(dbconnection_t* connection, const char* table) {
 }
 
 char* __compile_table_migration_create(dbconnection_t* connection, const char* table) {
-    str_t* quoted_table = connection->escape_identifier(connection, table);
-    if (quoted_table == NULL)
+    str_t* table_ref = __compile_table_ref(connection, table);
+    if (table_ref == NULL)
         return NULL;
 
     char tmp[512] = {0};
 
-    postgresqlhost_t* host = connection->host;
-
     ssize_t written = snprintf(
         tmp,
         sizeof(tmp),
-        "CREATE TABLE %s.%s "
+        "CREATE TABLE %s "
         "("
             "version     varchar(180)  NOT NULL PRIMARY KEY,"
             "apply_time  integer       NOT NULL DEFAULT 0"
         ")",
-        host->schema,
-        str_get(quoted_table)
+        str_get(table_ref)
     );
 
-    str_free(quoted_table);
+    str_free(table_ref);
 
     if (written < 0 || written >= (ssize_t)sizeof(tmp)) {
         log_error("__compile_table_migration_create: buffer overflow prevented\n");
@@ -1048,14 +1077,13 @@ char* __compile_insert(void* connection, const char* table, array_t* params) {
     dbconnection_t* conn = connection;
     char* buffer = NULL;
 
-    // Экранируем название таблицы
-    str_t* escaped_table = conn->escape_identifier(conn, table);
-    if (escaped_table == NULL)
+    str_t* table_ref = __compile_table_ref(conn, table);
+    if (table_ref == NULL)
         return NULL;
 
     str_t* fields = str_create_empty(256);
     if (fields == NULL) {
-        str_free(escaped_table);
+        str_free(table_ref);
         return NULL;
     }
 
@@ -1098,21 +1126,21 @@ char* __compile_insert(void* connection, const char* table, array_t* params) {
     }
 
     const char* format = "INSERT INTO %s (%s) VALUES (%s)";
-    const size_t buffer_size = strlen(format) + str_size(escaped_table) + str_size(fields) + str_size(values) + 1;
+    const size_t buffer_size = strlen(format) + str_size(table_ref) + str_size(fields) + str_size(values) + 1;
     buffer = malloc(buffer_size);
     if (buffer == NULL)
         goto failed;
 
     snprintf(buffer, buffer_size,
         format,
-        str_get(escaped_table),
+        str_get(table_ref),
         str_get(fields),
         str_get(values)
     );
 
     failed:
 
-    str_free(escaped_table);
+    str_free(table_ref);
     str_free(fields);
     str_free(values);
 
@@ -1126,21 +1154,13 @@ char* __compile_select(void* connection, const char* table, array_t* columns, ar
     dbconnection_t* conn = connection;
     char* buffer = NULL;
 
-    postgresqlhost_t* host = conn->host;
-    str_t* escaped_schema = conn->escape_identifier(conn, host->schema);
-    if (escaped_schema == NULL)
+    str_t* table_ref = __compile_table_ref(conn, table);
+    if (table_ref == NULL)
         return NULL;
-
-    str_t* escaped_table = conn->escape_identifier(conn, table);
-    if (escaped_table == NULL) {
-        str_free(escaped_schema);
-        return NULL;
-    }
 
     str_t* columns_str = str_create_empty(256);
     if (columns_str == NULL) {
-        str_free(escaped_schema);
-        str_free(escaped_table);
+        str_free(table_ref);
         return NULL;
     }
 
@@ -1201,8 +1221,8 @@ char* __compile_select(void* connection, const char* table, array_t* columns, ar
         str_free(quoted_str);
     }
 
-    const char* format = "SELECT %s FROM %s.%s WHERE %s";
-    const size_t buffer_size = strlen(format) + str_size(escaped_schema) + str_size(escaped_table) + str_size(columns_str) + str_size(where_str) + 1;
+    const char* format = "SELECT %s FROM %s WHERE %s";
+    const size_t buffer_size = strlen(format) + str_size(table_ref) + str_size(columns_str) + str_size(where_str) + 1;
     buffer = malloc(buffer_size);
     if (buffer == NULL)
         goto failed;
@@ -1210,15 +1230,13 @@ char* __compile_select(void* connection, const char* table, array_t* columns, ar
     snprintf(buffer, buffer_size,
         format,
         str_get(columns_str),
-        str_get(escaped_schema),
-        str_get(escaped_table),
+        str_get(table_ref),
         str_get(where_str)
     );
 
     failed:
 
-    str_free(escaped_schema);
-    str_free(escaped_table);
+    str_free(table_ref);
     str_free(columns_str);
     str_free(where_str);
 
@@ -1233,13 +1251,13 @@ char* __compile_update(void* connection, const char* table, array_t* set, array_
     dbconnection_t* conn = connection;
     char* buffer = NULL;
 
-    str_t* escaped_table = conn->escape_identifier(conn, table);
-    if (escaped_table == NULL)
+    str_t* table_ref = __compile_table_ref(conn, table);
+    if (table_ref == NULL)
         return NULL;
 
     str_t* set_str = str_create_empty(256);
     if (set_str == NULL) {
-        str_free(escaped_table);
+        str_free(table_ref);
         return NULL;
     }
 
@@ -1311,21 +1329,21 @@ char* __compile_update(void* connection, const char* table, array_t* set, array_
     }
 
     const char* format = "UPDATE %s SET %s WHERE %s";
-    const size_t buffer_size = strlen(format) + str_size(escaped_table) + str_size(set_str) + str_size(where_str) + 1;
+    const size_t buffer_size = strlen(format) + str_size(table_ref) + str_size(set_str) + str_size(where_str) + 1;
     buffer = malloc(buffer_size);
     if (buffer == NULL)
         goto failed;
 
     snprintf(buffer, buffer_size,
         format,
-        str_get(escaped_table),
+        str_get(table_ref),
         str_get(set_str),
         str_get(where_str)
     );
 
     failed:
 
-    str_free(escaped_table);
+    str_free(table_ref);
     str_free(set_str);
     str_free(where_str);
 
@@ -1339,13 +1357,13 @@ char* __compile_delete(void* connection, const char* table, array_t* where) {
     dbconnection_t* conn = connection;
     char* buffer = NULL;
 
-    str_t* escaped_table = conn->escape_identifier(conn, table);
-    if (escaped_table == NULL)
+    str_t* table_ref = __compile_table_ref(conn, table);
+    if (table_ref == NULL)
         return NULL;
 
     str_t* where_str = str_create_empty(256);
     if (where_str == NULL) {
-        str_free(escaped_table);
+        str_free(table_ref);
         return NULL;
     }
 
@@ -1383,20 +1401,20 @@ char* __compile_delete(void* connection, const char* table, array_t* where) {
     }
 
     const char* format = "DELETE FROM %s WHERE %s";
-    const size_t buffer_size = strlen(format) + str_size(escaped_table) + str_size(where_str) + 1;
+    const size_t buffer_size = strlen(format) + str_size(table_ref) + str_size(where_str) + 1;
     buffer = malloc(buffer_size);
     if (buffer == NULL)
         goto failed;
 
     snprintf(buffer, buffer_size,
         format,
-        str_get(escaped_table),
+        str_get(table_ref),
         str_get(where_str)
     );
 
     failed:
 
-    str_free(escaped_table);
+    str_free(table_ref);
     str_free(where_str);
 
     return buffer;
