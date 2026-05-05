@@ -1398,6 +1398,11 @@ int model_set_json(mfield_t* field, json_doc_t* value) {
         field->dirty = 1;
     }
 
+    if (value == NULL) {
+        field->is_null = 1;
+        return 1;
+    }
+
     json_free(field->value._jsondoc);
 
     json_doc_t* document = json_create_empty();
@@ -1422,11 +1427,11 @@ int model_set_binary(mfield_t* field, const char* value, const size_t size) {
 }
 
 int model_set_varchar(mfield_t* field, const char* value) {
-    return model_set_varchar_from_str(field, value, strlen(value));
+    return model_set_varchar_from_str(field, value, value ? strlen(value) : 0);
 }
 
 int model_set_char(mfield_t* field, const char* value) {
-    return model_set_char_from_str(field, value, strlen(value));
+    return model_set_char_from_str(field, value, value ? strlen(value) : 0);
 }
 
 int model_set_text(mfield_t* field, const char* value) {
@@ -1434,18 +1439,22 @@ int model_set_text(mfield_t* field, const char* value) {
 }
 
 int model_set_enum(mfield_t* field, const char* value) {
-    return model_set_enum_from_str(field, value, strlen(value));
+    return model_set_enum_from_str(field, value, value ? strlen(value) : 0);
 }
 
 int model_set_array(mfield_t* field, array_t* value) {
     if (field == NULL) return 0;
     if (field->type != MODEL_ARRAY) return 0;
-    if (value == NULL) return 0;
 
     if (!field->dirty) {
         field->oldvalue._array = field->value._array;
         field->value._array = NULL;
         field->dirty = 1;
+    }
+
+    if (value == NULL) {
+        field->is_null = 1;
+        return 1;
     }
 
     field->value._array = value;
@@ -1459,7 +1468,6 @@ int model_set_array(mfield_t* field, array_t* value) {
 
 int __model_set_binary(mfield_t* field, const char* value, const size_t size) {
     if (field == NULL) return 0;
-    if (value == NULL) return 0;
 
     if (!field->dirty) {
         if (field->oldvalue._string == NULL)
@@ -1475,6 +1483,11 @@ int __model_set_binary(mfield_t* field, const char* value, const size_t size) {
     if (!str_reset(field->value._string))
         return 0;
 
+    if (value == NULL) {
+        field->is_null = 1;
+        return 1;
+    }
+
     field->is_null = 0;
     field->use_raw_sql = 0;
 
@@ -1483,11 +1496,15 @@ int __model_set_binary(mfield_t* field, const char* value, const size_t size) {
 
 int __model_set_date(mfield_t* field, tm_t* value) {
     if (field == NULL) return 0;
-    if (value == NULL) return 0;
 
     if (!field->dirty) {
         field->oldvalue._tm = field->value._tm;
         field->dirty = 1;
+    }
+
+    if (value == NULL) {
+        field->is_null = 1;
+        return 1;
     }
 
     memcpy(&field->value._tm, value, sizeof(tm_t));
