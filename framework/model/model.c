@@ -2055,6 +2055,8 @@ int model_set_array_from_str(mfield_t* field, const char* value) {
 
     field->value._array = array;
 
+    json_free(document);
+
     return 1;
 }
 
@@ -2175,7 +2177,7 @@ str_t* model_money_to_str(mfield_t* field) {
     if (field->type != MODEL_MONEY) return NULL;
 
     char str[375] = {0};
-    ssize_t size = snprintf(str, sizeof(str), "%.12f", model_double(field));
+    ssize_t size = snprintf(str, sizeof(str), "%.12f", model_money(field));
     if (size < 0) return NULL;
 
     if (field->value._string == NULL)
@@ -2341,7 +2343,7 @@ str_t* model_array_to_str(mfield_t* field) {
     str_appendc(string, '[');
 
     for (size_t i = 0; i < array_size(array); i++) {
-        avalue_t* item = array_get(array, i);
+        avalue_t* item = &array->elements[i];
         if (item->type == ARRAY_POINTER) continue;
 
         str_t* str = array_item_to_string(array, i);
