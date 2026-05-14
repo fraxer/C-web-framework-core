@@ -543,11 +543,16 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
             str_t* value = model_field_to_string(param);
             if (value == NULL) goto failed;
 
-            str_t* escaped_value = conn->escape_string(conn, str_get(value));
-            if (escaped_value == NULL) goto failed;
+            if (param->use_raw_sql) {
+                str_append(where_params, str_get(value), str_size(value));
+            }
+            else {
+                str_t* escaped_value = conn->escape_string(conn, str_get(value));
+                if (escaped_value == NULL) goto failed;
 
-            str_append(where_params, str_get(escaped_value), str_size(escaped_value));
-            str_free(escaped_value);
+                str_append(where_params, str_get(escaped_value), str_size(escaped_value));
+                str_free(escaped_value);
+            }
         }
     }
 
@@ -667,11 +672,16 @@ int model_update(const char* dbid, void* arg) {
             str_append(where_params, field->name, strlen(field->name));
             str_appendc(where_params, '=');
 
-            str_t* escaped_fieldstr = conn->escape_string(conn, str_get(fieldstr));
-            if (escaped_fieldstr == NULL) goto failed;
+            if (field->use_raw_sql) {
+                str_append(where_params, str_get(fieldstr), str_size(fieldstr));
+            }
+            else {
+                str_t* escaped_fieldstr = conn->escape_string(conn, str_get(fieldstr));
+                if (escaped_fieldstr == NULL) goto failed;
 
-            str_append(where_params, str_get(escaped_fieldstr), str_size(escaped_fieldstr));
-            str_free(escaped_fieldstr);
+                str_append(where_params, str_get(escaped_fieldstr), str_size(escaped_fieldstr));
+                str_free(escaped_fieldstr);
+            }
 
             iter_where++;
 
@@ -691,11 +701,16 @@ int model_update(const char* dbid, void* arg) {
         str_append(set_params, field->name, strlen(field->name));
         str_appendc(set_params, '=');
 
-        str_t* escaped_fieldstr = conn->escape_string(conn, str_get(fieldstr));
-        if (escaped_fieldstr == NULL) goto failed;
+        if (field->use_raw_sql) {
+            str_append(set_params, str_get(fieldstr), str_size(fieldstr));
+        }
+        else {
+            str_t* escaped_fieldstr = conn->escape_string(conn, str_get(fieldstr));
+            if (escaped_fieldstr == NULL) goto failed;
 
-        str_append(set_params, str_get(escaped_fieldstr), str_size(escaped_fieldstr));
-        str_free(escaped_fieldstr);
+            str_append(set_params, str_get(escaped_fieldstr), str_size(escaped_fieldstr));
+            str_free(escaped_fieldstr);
+        }
 
         iter_set++;
     }
@@ -770,11 +785,16 @@ int model_delete(const char* dbid, void* arg) {
             str_append(where_params, field->name, strlen(field->name));
             str_appendc(where_params, '=');
 
-            str_t* escaped_fieldstr = conn->escape_string(conn, str_get(fieldstr));
-            if (escaped_fieldstr == NULL) goto failed;
+            if (field->use_raw_sql) {
+                str_append(where_params, str_get(fieldstr), str_size(fieldstr));
+            }
+            else {
+                str_t* escaped_fieldstr = conn->escape_string(conn, str_get(fieldstr));
+                if (escaped_fieldstr == NULL) goto failed;
 
-            str_append(where_params, str_get(escaped_fieldstr), str_size(escaped_fieldstr));
-            str_free(escaped_fieldstr);
+                str_append(where_params, str_get(escaped_fieldstr), str_size(escaped_fieldstr));
+                str_free(escaped_fieldstr);
+            }
 
             iter_where++;
 
@@ -1957,7 +1977,6 @@ int model_set_json_from_str(mfield_t* field, const char* value) {
 int model_set_binary_from_str(mfield_t* field, const char* value, size_t size) {
     if (field == NULL) return 0;
     if (field->type != MODEL_BINARY) return 0;
-    if (value == NULL) { field->is_null = 1; return 1; }
 
     return __model_set_binary(field, value, size);
 }
@@ -1965,7 +1984,6 @@ int model_set_binary_from_str(mfield_t* field, const char* value, size_t size) {
 int model_set_varchar_from_str(mfield_t* field, const char* value, size_t size) {
     if (field == NULL) return 0;
     if (field->type != MODEL_VARCHAR) return 0;
-    if (value == NULL) { field->is_null = 1; return 1; }
 
     return __model_set_binary(field, value, size);
 }
@@ -1973,7 +1991,6 @@ int model_set_varchar_from_str(mfield_t* field, const char* value, size_t size) 
 int model_set_char_from_str(mfield_t* field, const char* value, size_t size) {
     if (field == NULL) return 0;
     if (field->type != MODEL_CHAR) return 0;
-    if (value == NULL) { field->is_null = 1; return 1; }
 
     return __model_set_binary(field, value, size);
 }
@@ -1981,7 +1998,6 @@ int model_set_char_from_str(mfield_t* field, const char* value, size_t size) {
 int model_set_text_from_str(mfield_t* field, const char* value, size_t size) {
     if (field == NULL) return 0;
     if (field->type != MODEL_TEXT) return 0;
-    if (value == NULL) { field->is_null = 1; return 1; }
 
     return __model_set_binary(field, value, size);
 }
@@ -1989,7 +2005,6 @@ int model_set_text_from_str(mfield_t* field, const char* value, size_t size) {
 int model_set_enum_from_str(mfield_t* field, const char* value, size_t size) {
     if (field == NULL) return 0;
     if (field->type != MODEL_ENUM) return 0;
-    if (value == NULL) { field->is_null = 1; return 1; }
 
     if (size == 0)
         return __model_set_binary(field, value, size);

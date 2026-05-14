@@ -608,7 +608,11 @@ static int __build_query_processor(
     str_t* field_value = model_field_to_string(field);
     if (field_value == NULL) return 0;
 
-    if (!process_value(connection, parameter_type, result_sql, field_value)) {
+    if (field->use_raw_sql) {
+        str_append(result_sql, str_get(field_value), str_size(field_value));
+        return 1;
+    }
+    else if (!process_value(connection, parameter_type, result_sql, field_value)) {
         log_error("__build_query_processor: process_value failed\n");
         return 0;
     }

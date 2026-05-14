@@ -1039,7 +1039,10 @@ int __build_query_processor(void* connection, char parameter_type, const char* p
         str_t* field_value = model_field_to_string(field);
         if (field_value == NULL) return 0;
 
-        if (!process_value(connection, parameter_type, result_sql, field_value)) {
+        if (field->use_raw_sql) {
+            str_append(result_sql, str_get(field_value), str_size(field_value));
+        }
+        else if (!process_value(connection, parameter_type, result_sql, field_value)) {
             log_error("__build_query_processor: process_value failed\n");
             return 0;
         }
@@ -1309,7 +1312,8 @@ char* __compile_insert(void* connection, const char* table, array_t* params) {
         const char* value_str = str_get(value);
         if (field->use_raw_sql) {
             str_append(values, value_str, str_size(value));
-        } else {
+        }
+        else {
             str_t* quoted_str = __escape_string(connection, value_str);
             if (quoted_str == NULL) goto failed;
 
@@ -1385,11 +1389,16 @@ char* __compile_select(void* connection, const char* table, array_t* columns, ar
         str_t* value = model_field_to_string(field);
         if (value == NULL) goto failed;
 
-        str_t* quoted_str = __escape_string(connection, str_get(value));
-        if (quoted_str == NULL) goto failed;
+        if (field->use_raw_sql) {
+            str_append(where_str, str_get(value), str_size(value));
+        }
+        else {
+            str_t* quoted_str = __escape_string(connection, str_get(value));
+            if (quoted_str == NULL) goto failed;
 
-        str_append(where_str, str_get(quoted_str), str_size(quoted_str));
-        str_free(quoted_str);
+            str_append(where_str, str_get(quoted_str), str_size(quoted_str));
+            str_free(quoted_str);
+        }
     }
 
     const char* format = "SELECT %s FROM %s WHERE %s";
@@ -1440,11 +1449,16 @@ char* __compile_update(void* connection, const char* table, array_t* set, array_
         str_t* value = model_field_to_string(field);
         if (value == NULL) goto failed;
 
-        str_t* quoted_str = __escape_string(connection, str_get(value));
-        if (quoted_str == NULL) goto failed;
+        if (field->use_raw_sql) {
+            str_append(set_str, str_get(value), str_size(value));
+        }
+        else {
+            str_t* quoted_str = __escape_string(connection, str_get(value));
+            if (quoted_str == NULL) goto failed;
 
-        str_append(set_str, str_get(quoted_str), str_size(quoted_str));
-        str_free(quoted_str);
+            str_append(set_str, str_get(quoted_str), str_size(quoted_str));
+            str_free(quoted_str);
+        }
     }
 
     for (size_t i = 0; i < array_size(where); i++) {
@@ -1459,11 +1473,16 @@ char* __compile_update(void* connection, const char* table, array_t* set, array_
         str_t* value = model_field_to_string(field);
         if (value == NULL) goto failed;
 
-        str_t* quoted_str = __escape_string(connection, str_get(value));
-        if (quoted_str == NULL) goto failed;
+        if (field->use_raw_sql) {
+            str_append(where_str, str_get(value), str_size(value));
+        }
+        else {
+            str_t* quoted_str = __escape_string(connection, str_get(value));
+            if (quoted_str == NULL) goto failed;
 
-        str_append(where_str, str_get(quoted_str), str_size(quoted_str));
-        str_free(quoted_str);
+            str_append(where_str, str_get(quoted_str), str_size(quoted_str));
+            str_free(quoted_str);
+        }
     }
 
     const char* format = "UPDATE %s SET %s WHERE %s";
@@ -1510,11 +1529,16 @@ char* __compile_delete(void* connection, const char* table, array_t* where) {
         str_t* value = model_field_to_string(field);
         if (value == NULL) goto failed;
 
-        str_t* quoted_str = __escape_string(connection, str_get(value));
-        if (quoted_str == NULL) goto failed;
+        if (field->use_raw_sql) {
+            str_append(where_str, str_get(value), str_size(value));
+        }
+        else {
+            str_t* quoted_str = __escape_string(connection, str_get(value));
+            if (quoted_str == NULL) goto failed;
 
-        str_append(where_str, str_get(quoted_str), str_size(quoted_str));
-        str_free(quoted_str);
+            str_append(where_str, str_get(quoted_str), str_size(quoted_str));
+            str_free(quoted_str);
+        }
     }
 
     const char* format = "DELETE FROM %s WHERE %s";
