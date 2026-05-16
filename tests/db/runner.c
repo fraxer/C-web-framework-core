@@ -13,6 +13,9 @@ int main(int argc, char* argv[]) {
     const char* dbid = argc > 1 ? argv[1] : TEST_DBID;
     const char* config = argc > 2 ? argv[2] : TEST_CONFIG_PATH;
     const char* migrations = argc > 3 ? argv[3] : TEST_MIGRATIONS_DIR;
+    
+    if (migrations != NULL && strlen(migrations) == 0)
+        migrations = NULL;
 
     printf("======================================\n");
     printf("DB Test Runner\n");

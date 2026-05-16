@@ -233,7 +233,7 @@ int testdb_setup(const char* dbid, const char* config_path, const char* migratio
     }
 
     /* Run migrations */
-    if (!run_migrations(dbid, migrations_dir)) {
+    if (migrations_dir && !run_migrations(dbid, migrations_dir)) {
         fprintf(stderr, "testdb: migrations failed, cleaning up\n");
         testdb_teardown();
         return 0;

@@ -66,9 +66,9 @@ if(HAS_DB)
     )
 
     target_compile_definitions(db_runner PRIVATE
-        TEST_DBID="postgresql.identity"
+        TEST_DBID="postgresql.test"
         TEST_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/db/test_config.json"
-        TEST_MIGRATIONS_DIR="${CMAKE_BINARY_DIR}/exec/migrations/identity"
+        TEST_MIGRATIONS_DIR=""
     )
 
     target_include_directories(db_runner PRIVATE
