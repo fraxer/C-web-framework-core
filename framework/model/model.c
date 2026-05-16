@@ -573,12 +573,18 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
     if (!dbresult_ok(result))
         goto failed;
 
-    if (dbresult_query_rows(result) == 0)
+    if (dbresult_query_rows(result) == 0) {
+        model_free(model);
+        model = NULL;
         goto failed;
+    }
 
     const int row = 0;
-    if (!__model_fill(row, model->fields_count(model), model->first_field(model), result))
+    if (!__model_fill(row, model->fields_count(model), model->first_field(model), result)) {
+        model_free(model);
+        model = NULL;
         goto failed;
+    }
 
     res = model;
 
@@ -662,6 +668,8 @@ int model_update(const char* dbid, void* arg) {
                 tmpfield.oldvalue = field->value;
             }
 
+            str_t* tmp_string_before = tmpfield.value._string;
+
             str_t* fieldstr = model_field_to_string(&tmpfield);
             if (fieldstr == NULL)
                 goto failed;
@@ -677,11 +685,18 @@ int model_update(const char* dbid, void* arg) {
             }
             else {
                 str_t* escaped_fieldstr = conn->escape_string(conn, str_get(fieldstr));
-                if (escaped_fieldstr == NULL) goto failed;
+                if (escaped_fieldstr == NULL) {
+                    if (tmpfield.value._string != tmp_string_before)
+                        str_free(tmpfield.value._string);
+                    goto failed;
+                }
 
                 str_append(where_params, str_get(escaped_fieldstr), str_size(escaped_fieldstr));
                 str_free(escaped_fieldstr);
             }
+
+            if (tmpfield.value._string != tmp_string_before)
+                str_free(tmpfield.value._string);
 
             iter_where++;
 
