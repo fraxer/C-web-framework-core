@@ -335,7 +335,12 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     }
 
     env_gzip_str_t* last_gzip_item = NULL;
-    for (json_it_t it = json_init_it(token_gzip); !json_end_it(&it); it = json_next_it(&it)) {
+    json_it_t it = json_init_it(token_gzip);
+    if (!it.ok) {
+        log_error("module_loader_config_load: memory alloc error for gzip\n");
+        return 0;
+    }
+    for (; !json_end_it(&it); it = json_next_it(&it)) {
         const json_token_t* token_mimetype = json_it_value(&it);
         if (!json_is_string(token_mimetype)) {
             log_error("module_loader_config_load: gzip must be array of strings\n");
@@ -443,13 +448,13 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     if (token_env != NULL) {
         if (!json_is_object(token_env)) {
             log_error("module_loader_config_load: main.env must be object\n");
-            return 0;
+            goto failed;
         }
 
         env->custom_store = json_root_create_object();
         if (env->custom_store == NULL) {
             log_error("module_loader_config_load: failed to create custom_store\n");
-            return 0;
+            goto failed;
         }
 
         json_token_t* store_root = json_root(env->custom_store);
@@ -1303,7 +1308,12 @@ int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_t
     }
     if (json_object_size(token_object) == 0) return 1;
 
-    for (json_it_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
+    json_it_t it = json_init_it(token_object);
+    if (!it.ok) {
+        log_error("__module_loader_http_routes_load: failed to iterate\n");
+        goto failed;
+    }
+    for (; !json_end_it(&it); json_next_it(&it)) {
         const char* route_path = json_it_key(&it);
         if (strlen(route_path) == 0) {
             log_error("__module_loader_http_routes_load: route path is empty\n");
@@ -1351,25 +1361,30 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
         log_error("__module_loader_set_http_route: http.route item must be object\n");
         return 0;
     }
-    for (json_it_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
+    json_it_t it = json_init_it(token_object);
+    if (!it.ok) {
+        log_error("__module_loader_set_http_route: failed to iterate http.route item\n");
+        return 0;
+    }
+    for (; !json_end_it(&it); json_next_it(&it)) {
         const char* method = json_it_key(&it);
         if (strlen(method) == 0) {
             log_error("__module_loader_set_http_route: http.route item.key must be not empty\n");
             return 0;
         }
 
-        json_token_t* token_object = json_it_value(&it);
-        if (!json_is_object(token_object)) {
+        json_token_t* token_item = json_it_value(&it);
+        if (!json_is_object(token_item)) {
             log_error("__module_loader_set_http_route: http.route item.value must be object\n");
             return 0;
         }
 
-        if (json_object_size(token_object) < 1) {
+        if (json_object_size(token_item) < 1) {
             log_error("__module_loader_set_http_route: http.route item.value must be object with at least 1 element\n");
             return 0;
         }
 
-        const json_token_t* token_ratelimit = json_object_get(token_object, "ratelimit");
+        const json_token_t* token_ratelimit = json_object_get(token_item, "ratelimit");
         ratelimiter_t* ratelimiter = NULL;
         if (token_ratelimit != NULL) {
             if (!json_is_string(token_ratelimit)) {
@@ -1395,7 +1410,7 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
             }
         }
 
-        const json_token_t* token_static_file = json_object_get(token_object, "static_file");
+        const json_token_t* token_static_file = json_object_get(token_item, "static_file");
         if (token_static_file != NULL) {
             if (!json_is_string(token_static_file)) {
                 log_error("__module_loader_set_http_route: http.route item.value.static_file must be string\n");
@@ -1414,7 +1429,7 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
             continue;
         }
 
-        const json_token_t* token_file = json_object_get(token_object, "file");
+        const json_token_t* token_file = json_object_get(token_item, "file");
         if (!json_is_string(token_file)) {
             log_error("__module_loader_set_http_route: http.route item.value.route must be string\n");
             return 0;
@@ -1423,7 +1438,7 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
             log_error("__module_loader_set_http_route: http.route item.value.route must be not empty string\n");
             return 0;
         }
-        const json_token_t* token_function = json_object_get(token_object, "function");
+        const json_token_t* token_function = json_object_get(token_item, "function");
         if (!json_is_string(token_function)) {
             log_error("__module_loader_set_http_route: http.route item.value.handler must be string\n");
             return 0;

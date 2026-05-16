@@ -965,6 +965,7 @@ json_doc_t* __httpresponse_payload_json(httpresponse_t* response) {
     if (payload == NULL) return NULL;
 
     json_doc_t* document = json_parse(payload);
+    free(payload);
 
     return document;
 }

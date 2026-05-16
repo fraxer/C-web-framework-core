@@ -597,6 +597,125 @@ TEST(test_json_iterator_object) {
     json_manager_free();
 }
 
+TEST(test_json_iterator_end_ok_zero) {
+    TEST_CASE("Iterator ok must be 0 after reaching end");
+
+    json_doc_t* doc = json_parse("[1, 2, 3]");
+    json_token_t* root = json_root(doc);
+
+    json_it_t it = json_init_it(root);
+    TEST_ASSERT_EQUAL(1, it.ok, "Iterator should start with ok=1");
+
+    // Перейти за конец
+    it = json_next_it(&it); // index 1
+    it = json_next_it(&it); // index 2
+    it = json_next_it(&it); // index 3 == size -> end
+
+    TEST_ASSERT_EQUAL(0, it.ok, "ok must be 0 after end");
+    TEST_ASSERT_NULL(it.value, "value must be NULL after end");
+
+    json_free(doc);
+    json_manager_free();
+}
+
+TEST(test_json_iterator_empty_container) {
+    TEST_CASE("Iterator over empty object and array");
+
+    // Пустой массив
+    json_doc_t* doc1 = json_parse("[]");
+    json_token_t* root1 = json_root(doc1);
+
+    json_it_t it1 = json_init_it(root1);
+    TEST_ASSERT_EQUAL(1, it1.ok, "Empty array iterator should init ok=1");
+    TEST_ASSERT(json_end_it(&it1), "Empty array should be at end immediately");
+
+    json_free(doc1);
+
+    // Пустой объект
+    json_doc_t* doc2 = json_parse("{}");
+    json_token_t* root2 = json_root(doc2);
+
+    json_it_t it2 = json_init_it(root2);
+    TEST_ASSERT_EQUAL(1, it2.ok, "Empty object iterator should init ok=1");
+    TEST_ASSERT(json_end_it(&it2), "Empty object should be at end immediately");
+
+    json_free(doc2);
+    json_manager_free();
+}
+
+TEST(test_json_iterator_erase_object) {
+    TEST_CASE("Erase element from object during iteration");
+
+    json_doc_t* doc = json_parse("{\"a\": 1, \"b\": 2, \"c\": 3, \"d\": 4}");
+    json_token_t* root = json_root(doc);
+
+    TEST_ASSERT_EQUAL(4, json_object_size(root), "Object should have 4 keys");
+
+    json_it_t it = json_init_it(root);
+
+    // Пропускаем "a"
+    it = json_next_it(&it);
+
+    // Удаляем "b" (текущий элемент)
+    const char* key_b = (const char*)json_it_key(&it);
+    TEST_ASSERT_NOT_NULL(key_b, "Key should not be NULL");
+    TEST_ASSERT_STR_EQUAL("b", key_b, "Current key should be 'b'");
+
+    json_it_erase(&it);
+
+    TEST_ASSERT_EQUAL(3, json_object_size(root), "Object should have 3 keys after erase");
+
+    // Итератор должен указывать на "c" после erase
+    const char* key = (const char*)json_it_key(&it);
+    TEST_ASSERT_NOT_NULL(key, "Key after erase should not be NULL");
+    TEST_ASSERT_STR_EQUAL("c", key, "Iterator should point to 'c' after erasing 'b'");
+
+    // Продолжаем итерацию — должны получить "d"
+    it = json_next_it(&it);
+    key = (const char*)json_it_key(&it);
+    TEST_ASSERT_NOT_NULL(key, "Next key should not be NULL");
+    TEST_ASSERT_STR_EQUAL("d", key, "Next key should be 'd'");
+
+    json_free(doc);
+    json_manager_free();
+}
+
+TEST(test_json_iterator_erase_array) {
+    TEST_CASE("Erase element from array during iteration");
+
+    json_doc_t* doc = json_parse("[10, 20, 30, 40]");
+    json_token_t* root = json_root(doc);
+
+    TEST_ASSERT_EQUAL(4, json_array_size(root), "Array should have 4 elements");
+
+    json_it_t it = json_init_it(root);
+
+    // index 0: value 10 — пропускаем
+    it = json_next_it(&it);
+
+    // index 1: value 20 — удаляем
+    json_token_t* val = json_it_value(&it);
+    int ok = 0;
+    TEST_ASSERT_EQUAL(20, json_int(val, &ok), "Value should be 20");
+
+    json_it_erase(&it);
+
+    TEST_ASSERT_EQUAL(3, json_array_size(root), "Array should have 3 elements after erase");
+
+    // После erase итератор должен указывать на 30 (бывший index 2, теперь index 1)
+    val = json_it_value(&it);
+    TEST_ASSERT_NOT_NULL(val, "Value after erase should not be NULL");
+    TEST_ASSERT_EQUAL(30, json_int(val, &ok), "Value should be 30 after erasing 20");
+
+    // Продолжаем — должны получить 40
+    it = json_next_it(&it);
+    val = json_it_value(&it);
+    TEST_ASSERT_EQUAL(40, json_int(val, &ok), "Next value should be 40");
+
+    json_free(doc);
+    json_manager_free();
+}
+
 // ============================================================================
 // Тесты stringify
 // ============================================================================

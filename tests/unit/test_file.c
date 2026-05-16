@@ -26,7 +26,7 @@ static void setup_test_dir() {
 static void cleanup_test_dir() {
     char cmd[PATH_MAX + 20];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", test_dir);
-    system(cmd);
+    int __attribute__((unused)) sys_ret = system(cmd);
 }
 
 // ============================================================================
@@ -63,7 +63,7 @@ TEST(test_file_open_existing) {
     char filepath[PATH_MAX];
     snprintf(filepath, sizeof(filepath), "%s/test_file.txt", test_dir);
     int fd = open(filepath, O_CREAT | O_WRONLY, 0644);
-    write(fd, "Hello", 5);
+    ssize_t __attribute__((unused)) wr = write(fd, "Hello", 5);
     close(fd);
 
     file_t file = file_open(filepath, O_RDONLY);
@@ -529,7 +529,7 @@ TEST(test_file_content_create) {
     char source_path[PATH_MAX];
     snprintf(source_path, sizeof(source_path), "%s/source.txt", test_dir);
     int source_fd = open(source_path, O_CREAT | O_RDWR, 0644);
-    write(source_fd, "Hello World", 11);
+    ssize_t __attribute__((unused)) wr = write(source_fd, "Hello World", 11);
 
     file_content_t fc = file_content_create(source_fd, "output.txt", 0, 5);
 
@@ -576,7 +576,7 @@ TEST(test_file_content_read_content) {
     char source_path[PATH_MAX];
     snprintf(source_path, sizeof(source_path), "%s/source.txt", test_dir);
     int source_fd = open(source_path, O_CREAT | O_RDWR, 0644);
-    write(source_fd, "0123456789", 10);
+    ssize_t __attribute__((unused)) wr = write(source_fd, "0123456789", 10);
 
     file_content_t fc = file_content_create(source_fd, "test.txt", 3, 4);
 
@@ -600,7 +600,7 @@ TEST(test_file_content_make_file) {
     char source_path[PATH_MAX];
     snprintf(source_path, sizeof(source_path), "%s/source.txt", test_dir);
     int source_fd = open(source_path, O_CREAT | O_RDWR, 0644);
-    write(source_fd, "Test Data", 9);
+    ssize_t __attribute__((unused)) wr = write(source_fd, "Test Data", 9);
 
     file_content_t fc = file_content_create(source_fd, "output.txt", 0, 9);
 
@@ -626,7 +626,7 @@ TEST(test_file_content_make_file_with_offset) {
     char source_path[PATH_MAX];
     snprintf(source_path, sizeof(source_path), "%s/source.txt", test_dir);
     int source_fd = open(source_path, O_CREAT | O_RDWR, 0644);
-    write(source_fd, "0123456789", 10);
+    ssize_t __attribute__((unused)) wr = write(source_fd, "0123456789", 10);
 
     file_content_t fc = file_content_create(source_fd, "output.txt", 5, 5);
 
@@ -651,7 +651,7 @@ TEST(test_file_content_make_tmpfile) {
     char source_path[PATH_MAX];
     snprintf(source_path, sizeof(source_path), "%s/source.txt", test_dir);
     int source_fd = open(source_path, O_CREAT | O_RDWR, 0644);
-    write(source_fd, "Temporary", 9);
+    ssize_t __attribute__((unused)) wr = write(source_fd, "Temporary", 9);
 
     file_content_t fc = file_content_create(source_fd, "temp.txt", 0, 9);
 
@@ -871,7 +871,7 @@ TEST(test_file_content_memory_leak) {
     TEST_ASSERT(content1 != content2, "Each call should allocate new memory");
 
     free(content1);
-    free(content2);
+    if (content2 != content1) free(content2);
     file.close(&file);
     cleanup_test_dir();
 }

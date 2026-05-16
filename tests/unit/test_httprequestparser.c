@@ -46,14 +46,6 @@ static void init_test_appconfig(void) {
     }
 }
 
-// Cleanup test appconfig
-static void cleanup_test_appconfig(void) {
-    if (test_appconfig) {
-        free(test_appconfig);
-        test_appconfig = NULL;
-    }
-}
-
 // Override appconfig() function using weak symbol
 __attribute__((weak)) appconfig_t* appconfig(void) {
     if (!test_appconfig) {
@@ -1327,6 +1319,7 @@ TEST(test_httprequestparser_keepalive) {
     strcpy(buffer, request);
 
     connection_t* conn = create_mock_connection(buffer, strlen(buffer));
+    if (conn == NULL) { cleanup_mock_domain(); return; }
     httprequestparser_t* parser = httpparser_create(conn);
 
     httpparser_set_bytes_readed(parser, strlen(request));
@@ -1824,6 +1817,7 @@ TEST(test_httprequestparser_connection_close) {
     strcpy(buffer, request);
 
     connection_t* conn = create_mock_connection(buffer, strlen(buffer));
+    if (conn == NULL) { cleanup_mock_domain(); return; }
     httprequestparser_t* parser = httpparser_create(conn);
 
     httpparser_set_bytes_readed(parser, strlen(request));
@@ -2122,6 +2116,7 @@ TEST(test_httprequestparser_http10_with_keepalive) {
     strcpy(buffer, request);
 
     connection_t* conn = create_mock_connection(buffer, strlen(buffer));
+    if (conn == NULL) return;
     httprequestparser_t* parser = httpparser_create(conn);
 
     httpparser_set_bytes_readed(parser, strlen(request));

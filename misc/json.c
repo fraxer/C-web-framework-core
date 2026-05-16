@@ -2055,12 +2055,17 @@ json_it_t json_next_it(json_it_t* iterator) {
 
     iterator->index++;
 
-    if (json_end_it(iterator)) return *iterator;
+    if (json_end_it(iterator)) {
+        iterator->ok = 0;
+        iterator->value = NULL;
+        return *iterator;
+    }
 
     iterator->key = iterator->key->sibling;
 
     if (iterator->key == NULL) {
-        *iterator = (json_it_t){0};
+        iterator->ok = 0;
+        iterator->value = NULL;
         return *iterator;
     }
 
@@ -2068,6 +2073,8 @@ json_it_t json_next_it(json_it_t* iterator) {
         iterator->value = iterator->key->child;
     else if (iterator->type == JSON_ARRAY)
         iterator->value = iterator->key;
+    else
+        iterator->value = NULL;
 
     return *iterator;
 }
@@ -2075,17 +2082,33 @@ json_it_t json_next_it(json_it_t* iterator) {
 void json_it_erase(json_it_t* iterator) {
     if (iterator == NULL) return;
 
+    json_token_t* next_key = NULL;
+
     if (iterator->type == JSON_OBJECT) {
+        next_key = iterator->key->sibling;
         const char* key = json_string(iterator->key);
         if (key) {
             json_object_remove(iterator->parent, key);
         }
     }
     else if (iterator->type == JSON_ARRAY) {
+        next_key = iterator->key->sibling;
         json_array_erase(iterator->parent, iterator->index, 1);
     }
 
     iterator->index--;
+
+    if (next_key) {
+        iterator->key = next_key;
+        if (iterator->type == JSON_OBJECT)
+            iterator->value = next_key->child;
+        else if (iterator->type == JSON_ARRAY)
+            iterator->value = next_key;
+    }
+    else {
+        iterator->key = NULL;
+        iterator->value = NULL;
+    }
 }
 
 // ============================================================================

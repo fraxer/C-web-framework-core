@@ -45,7 +45,6 @@ void* mpx_epoll_init() {
 
     if (result == NULL) {
         api->base.free(api);
-        close(fd);
     }
 
     return result;

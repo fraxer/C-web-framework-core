@@ -118,6 +118,8 @@ void* field_create_bool(const char* field_name, short value) {
     field->oldvalue._short = 0;
     field->oldvalue._string = NULL;
     field->is_null = 0;
+    field->use_default = 0;
+    field->use_raw_sql = 0;
 
     return field;
 }
@@ -134,6 +136,8 @@ void* field_create_smallint(const char* field_name, short value) {
     field->oldvalue._short = 0;
     field->oldvalue._string = NULL;
     field->is_null = 0;
+    field->use_default = 0;
+    field->use_raw_sql = 0;
 
     return field;
 }
@@ -150,6 +154,8 @@ void* field_create_int(const char* field_name, int value) {
     field->oldvalue._int = 0;
     field->oldvalue._string = NULL;
     field->is_null = 0;
+    field->use_default = 0;
+    field->use_raw_sql = 0;
 
     return field;
 }
@@ -166,6 +172,8 @@ void* field_create_bigint(const char* field_name, long long value) {
     field->oldvalue._bigint = 0;
     field->oldvalue._string = NULL;
     field->is_null = 0;
+    field->use_default = 0;
+    field->use_raw_sql = 0;
 
     return field;
 }
@@ -182,6 +190,8 @@ void* field_create_float(const char* field_name, float value) {
     field->oldvalue._float = 0;
     field->oldvalue._string = NULL;
     field->is_null = 0;
+    field->use_default = 0;
+    field->use_raw_sql = 0;
 
     return field;
 }
@@ -198,6 +208,8 @@ void* field_create_double(const char* field_name, double value) {
     field->oldvalue._double = 0;
     field->oldvalue._string = NULL;
     field->is_null = 0;
+    field->use_default = 0;
+    field->use_raw_sql = 0;
 
     return field;
 }
@@ -214,6 +226,8 @@ void* field_create_decimal(const char* field_name, long double value) {
     field->oldvalue._ldouble = 0;
     field->oldvalue._string = NULL;
     field->is_null = 0;
+    field->use_default = 0;
+    field->use_raw_sql = 0;
 
     return field;
 }
@@ -230,6 +244,8 @@ void* field_create_money(const char* field_name, double value) {
     field->oldvalue._double = 0;
     field->oldvalue._string = NULL;
     field->is_null = 0;
+    field->use_default = 0;
+    field->use_raw_sql = 0;
 
     return field;
 }
@@ -508,6 +524,7 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
     dbconnection_t* conn = dbinst->connection;
     dbinstance_free(dbinst);
 
+    dbresult_t* result = NULL;
     void* res = NULL;
     str_t* where_params = str_create_empty(256);
     if (where_params == NULL) goto failed;
@@ -556,7 +573,7 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
         }
     }
 
-    dbresult_t* result = dbqueryf(dbid,
+    result = dbqueryf(dbid,
         "SELECT "
             "%s "
         "FROM "
@@ -647,6 +664,8 @@ int model_update(const char* dbid, void* arg) {
     dbconnection_t* conn = dbinst->connection;
     dbinstance_free(dbinst);
 
+    dbresult_t* result = NULL;
+
     mfield_t* first_field = model->first_field(model);
     const char** unique_fields = model->primary_key(model);
     str_t* set_params = str_create_empty(256);
@@ -730,7 +749,7 @@ int model_update(const char* dbid, void* arg) {
         iter_set++;
     }
 
-    dbresult_t* result = dbqueryf(dbid,
+    result = dbqueryf(dbid,
         "UPDATE "
             "%s "
         "SET "
@@ -778,6 +797,8 @@ int model_delete(const char* dbid, void* arg) {
     dbconnection_t* conn = dbinst->connection;
     dbinstance_free(dbinst);
 
+    dbresult_t* result = NULL;
+
     mfield_t* vfield = model->first_field(arg);
     const char** vunique = model->primary_key(arg);
     str_t* where_params = str_create_empty(256);
@@ -817,7 +838,7 @@ int model_delete(const char* dbid, void* arg) {
         }
     }
 
-    dbresult_t* result = dbqueryf(dbid,
+    result = dbqueryf(dbid,
         "DELETE FROM "
             "%s "
         "WHERE "
@@ -855,6 +876,8 @@ int model_delete_by_params(const char* dbid, void* arg, array_t* params) {
 
     dbconnection_t* conn = dbinst->connection;
     dbinstance_free(dbinst);
+
+    dbresult_t* result = NULL;
 
     mfield_t* vfield = model->first_field(arg);
     str_t* where_params = str_create_empty(256);
@@ -894,7 +917,7 @@ int model_delete_by_params(const char* dbid, void* arg, array_t* params) {
         }
     }
 
-    dbresult_t* result = dbqueryf(dbid,
+    result = dbqueryf(dbid,
         "DELETE FROM "
             "%s "
         "WHERE "

@@ -335,8 +335,8 @@ TEST(test_ws_deflate_compress_decompress) {
     // Add trailer for decompression (RFC 7692)
     compressed[compressed_len++] = 0x00;
     compressed[compressed_len++] = 0x00;
-    compressed[compressed_len++] = 0xff;
-    compressed[compressed_len++] = 0xff;
+    compressed[compressed_len++] = (char)0xff;
+    compressed[compressed_len++] = (char)0xff;
 
     char decompressed[1024];
     ssize_t decompressed_len = ws_deflate_decompress(&deflate, compressed, compressed_len, decompressed, sizeof(decompressed));
@@ -454,8 +454,8 @@ TEST(test_ws_deflate_has_more) {
     // Add trailer
     compressed[compressed_len++] = 0x00;
     compressed[compressed_len++] = 0x00;
-    compressed[compressed_len++] = 0xff;
-    compressed[compressed_len++] = 0xff;
+    compressed[compressed_len++] = (char)0xff;
+    compressed[compressed_len++] = (char)0xff;
 
     // Decompress with small buffer to test has_more
     char decompressed[100];

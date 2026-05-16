@@ -343,7 +343,11 @@ int str_cmpc(str_t* srcstr, const char* dststr) {
     if (srcstr == NULL || dststr == NULL)
         return 0;
 
-    return strcmp(str_get(srcstr), dststr);
+    const char* src = str_get(srcstr);
+    if (src == NULL)
+        return 0;
+
+    return strcmp(src, dststr);
 }
 
 char* str_get(str_t* str) {

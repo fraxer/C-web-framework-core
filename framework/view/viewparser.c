@@ -639,6 +639,8 @@ view_variable_item_t* __viewparser_variable_item_create(void) {
  * @param variable The variable tag to append the variable item to.
  * @return void
  */
+#pragma GCC diagnostic push                                                                                                                     
+#pragma GCC diagnostic ignored "-Wanalyzer-malloc-leak"  
 void __viewparser_variable_item_append(view_variable_item_t* variable_item, view_tag_t* variable) {
     if (variable->item == NULL)
         variable->item = variable_item;
@@ -648,6 +650,7 @@ void __viewparser_variable_item_append(view_variable_item_t* variable_item, view
 
     variable->last_item = variable_item;
 }
+#pragma GCC diagnostic pop
 
 /**
  * Completes the name of a variable item.

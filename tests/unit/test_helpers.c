@@ -788,10 +788,10 @@ TEST(test_helpers_mkdir_nested) {
     const char* base = "/tmp/test_helpers_mkdir_XXXXXX";
     char tmpdir[PATH_MAX];
     strcpy(tmpdir, base);
-    mkdtemp(tmpdir);
+    char *__attribute__((unused)) mkd = mkdtemp(tmpdir);
 
-    char path[PATH_MAX];
-    snprintf(path, PATH_MAX, "%s/a/b/c/d", tmpdir);
+    char path[PATH_MAX + 16];
+    snprintf(path, sizeof(path), "%s/a/b/c/d", tmpdir);
 
     int result = helpers_mkdir(path);
     TEST_ASSERT_EQUAL(1, result, "Should create nested directories");
@@ -803,11 +803,11 @@ TEST(test_helpers_mkdir_nested) {
 
     // Cleanup
     rmdir(path);
-    snprintf(path, PATH_MAX, "%s/a/b/c", tmpdir);
+    snprintf(path, sizeof(path), "%s/a/b/c", tmpdir);
     rmdir(path);
-    snprintf(path, PATH_MAX, "%s/a/b", tmpdir);
+    snprintf(path, sizeof(path), "%s/a/b", tmpdir);
     rmdir(path);
-    snprintf(path, PATH_MAX, "%s/a", tmpdir);
+    snprintf(path, sizeof(path), "%s/a", tmpdir);
     rmdir(path);
     rmdir(tmpdir);
 }
@@ -818,7 +818,7 @@ TEST(test_helpers_mkdir_already_exists) {
     const char* base = "/tmp/test_helpers_mkdir_exists_XXXXXX";
     char tmpdir[PATH_MAX];
     strcpy(tmpdir, base);
-    mkdtemp(tmpdir);
+    char *__attribute__((unused)) mkd = mkdtemp(tmpdir);
 
     // Already exists
     int result = helpers_mkdir(tmpdir);
@@ -838,10 +838,10 @@ TEST(test_helpers_base_mkdir_single_level) {
     const char* base = "/tmp/test_helpers_base_XXXXXX";
     char tmpdir[PATH_MAX];
     strcpy(tmpdir, base);
-    mkdtemp(tmpdir);
+    char *__attribute__((unused)) mkd = mkdtemp(tmpdir);
 
-    char path[PATH_MAX];
-    snprintf(path, PATH_MAX, "%s/newdir", tmpdir);
+    char path[PATH_MAX + 16];
+    snprintf(path, sizeof(path), "%s/newdir", tmpdir);
 
     int result = helpers_base_mkdir(tmpdir, "newdir");
     TEST_ASSERT_EQUAL(1, result, "Should create single directory");
@@ -859,18 +859,18 @@ TEST(test_helpers_base_mkdir_with_leading_slash) {
     const char* base = "/tmp/test_helpers_base_slash_XXXXXX";
     char tmpdir[PATH_MAX];
     strcpy(tmpdir, base);
-    mkdtemp(tmpdir);
+    char *__attribute__((unused)) mkd = mkdtemp(tmpdir);
 
     int result = helpers_base_mkdir(tmpdir, "/x/y");
     TEST_ASSERT_EQUAL(1, result, "Should create nested dirs with leading slash");
 
-    char path[PATH_MAX];
-    snprintf(path, PATH_MAX, "%s/x/y", tmpdir);
+    char path[PATH_MAX + 16];
+    snprintf(path, sizeof(path), "%s/x/y", tmpdir);
     struct stat st;
     TEST_ASSERT_EQUAL(0, stat(path, &st), "Nested directory should exist");
 
     rmdir(path);
-    snprintf(path, PATH_MAX, "%s/x", tmpdir);
+    snprintf(path, sizeof(path), "%s/x", tmpdir);
     rmdir(path);
     rmdir(tmpdir);
 }

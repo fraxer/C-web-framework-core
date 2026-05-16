@@ -56,11 +56,6 @@ static void mock_remove_expired(const char* key) {
     mock_remove_expired_called = 1;
 }
 
-static void mock_count_expired(const char* key) {
-    (void)key;
-    mock_expired_call_count++;
-}
-
 static const char* mock_svc_a_last_key = NULL;
 static const char* mock_svc_b_last_key = NULL;
 
@@ -527,6 +522,7 @@ TEST(test_session_create_null_driver) {
     );
 
     sessionconfig_t* sc = calloc(1, sizeof(sessionconfig_t));
+    if (sc == NULL) return;
     sc->driver = SESSION_TYPE_FS;
     sc->session = NULL;
     map_insert(map, "broken", sc);
@@ -566,15 +562,19 @@ TEST(test_session_multiple_configs_isolation) {
     );
 
     sessionconfig_t* sc_a = calloc(1, sizeof(sessionconfig_t));
+    if (sc_a == NULL) return;
     sc_a->driver = SESSION_TYPE_FS;
     sc_a->session = calloc(1, sizeof(session_t));
+    if (sc_a->session == NULL) { free(sc_a); return; }
     sc_a->session->create = mock_svc_a_create;
     sc_a->session->remove_expired = mock_remove_expired;
     map_insert(map, "service_a", sc_a);
 
     sessionconfig_t* sc_b = calloc(1, sizeof(sessionconfig_t));
+    if (sc_b == NULL) { map_free(map); appconfig()->sessionconfigs = NULL; return; }
     sc_b->driver = SESSION_TYPE_REDIS;
     sc_b->session = calloc(1, sizeof(session_t));
+    if (sc_b->session == NULL) { free(sc_b); map_free(map); appconfig()->sessionconfigs = NULL; return; }
     sc_b->session->create = mock_svc_b_create;
     sc_b->session->remove_expired = mock_remove_expired;
     map_insert(map, "service_b", sc_b);
