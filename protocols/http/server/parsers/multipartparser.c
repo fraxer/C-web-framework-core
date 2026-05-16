@@ -1,6 +1,8 @@
 #include <unistd.h>
 #include <errno.h>
+#include <stdio.h>
 
+#include "log.h"
 #include "formdataparser.h"
 #include "multipartparser.h"
 
@@ -27,11 +29,12 @@ void multipartparser_init(multipartparser_t* parser, int payload_fd, const char*
     parser->header = NULL;
     parser->last_header = NULL;
     parser->payload_fd = payload_fd;
+    parser->error = 0;
 
     lseek(payload_fd, 0, SEEK_SET);
 }
 
-void multipartparser_parse(multipartparser_t* parser, char* buffer, size_t buffer_size) {
+int multipartparser_parse(multipartparser_t* parser, char* buffer, size_t buffer_size) {
     for (size_t i = 0; i < buffer_size; i++) {
         char ch = buffer[i];
 
@@ -41,7 +44,9 @@ void multipartparser_parse(multipartparser_t* parser, char* buffer, size_t buffe
                 parser->stage = BOUNDARY_FN;
             break;
         case BOUNDARY_FN:
-            if (ch == '\n')
+            if (ch == '\r')
+                break;
+            else if (ch == '\n')
                 parser->stage = FIRST_DASH;
             else if (ch == '-')
                 parser->stage = SECOND_DASH;
@@ -49,13 +54,17 @@ void multipartparser_parse(multipartparser_t* parser, char* buffer, size_t buffe
                 parser->stage = BODY;
             break;
         case FIRST_DASH:
-            if (ch == '-')
+            if (ch == '\r')
+                parser->stage = BOUNDARY_FN;
+            else if (ch == '-')
                 parser->stage = SECOND_DASH;
             else
                 parser->stage = BODY;
             break;
         case SECOND_DASH:
-            if (ch == '-') {
+            if (ch == '\r')
+                parser->stage = BOUNDARY_FN;
+            else if (ch == '-') {
                 parser->boundary_offset = parser->payload_offset + 1;
                 parser->stage = BOUNDARY;
             }
@@ -74,34 +83,36 @@ void multipartparser_parse(multipartparser_t* parser, char* buffer, size_t buffe
                     parser->stage = BOUNDARY_FD;
 
                     if (parser->offset > 0)
-                        if (!multipartparser_create_part(parser)) return;
+                        if (!multipartparser_create_part(parser)) {
+                            log_error("multipartparser: create_part failed\n");
+                            parser->error = 1;
+                            return 0;
+                        }
                 }
             }
             else
                 parser->stage = BODY;
             break;
         }
-        case BOUNDARY_SR:
-            if (ch == '\r')
-                parser->stage = BOUNDARY_SN;
-            break;
-        case BOUNDARY_SN:
-            parser->stage = HEADER_KEY;
-            multipartparser_reset_header(parser);
-            break;
         case BOUNDARY_FD:
             if (ch == '-')
                 parser->stage = BOUNDARY_SD;
             else if (ch == '\r')
-                parser->stage = BOUNDARY_SN;
+                parser->stage = BOUNDARY_NL;
             else
-                return;
+                parser->stage = BODY;
+            break;
+        case BOUNDARY_NL:
+            if (ch == '\n') {
+                parser->stage = HEADER_KEY;
+                multipartparser_reset_header(parser);
+            }
+            else
+                parser->stage = BODY;
             break;
         case BOUNDARY_SD:
-            if (ch == '-') {
+            if (ch == '-')
                 parser->stage = BODY;
-                return;
-            }
             break;
         case HEADER_KEY:
             if (ch == ':') {
@@ -116,7 +127,9 @@ void multipartparser_parse(multipartparser_t* parser, char* buffer, size_t buffe
         case HEADER_SPACE:
             if (ch == ' ')
                 parser->header_value_offset = parser->payload_offset + 1;
-            else if (ch != ' ') {
+            else if (ch == '\r')
+                parser->stage = HEADER_N;
+            else {
                 parser->stage = HEADER_VALUE;
                 parser->header_value_size++;
             }
@@ -128,9 +141,14 @@ void multipartparser_parse(multipartparser_t* parser, char* buffer, size_t buffe
                 parser->header_value_size++;
             break;
         case HEADER_N:
-            if (ch == '\n')
-                if (!multipartparser_create_header(parser))
-                    return;
+            if (ch == '\n') {
+                if (!multipartparser_create_header(parser)) {
+                    parser->error = 1;
+                    return 0;
+                }
+            }
+            else
+                parser->stage = BODY;
             break;
         case END_N:
             if (ch == '\n') {
@@ -144,6 +162,8 @@ void multipartparser_parse(multipartparser_t* parser, char* buffer, size_t buffe
         parser->payload_offset++;
         parser->size++;
     }
+
+    return 1;
 }
 
 http_payloadpart_t* multipartparser_part(multipartparser_t* parser) {
@@ -155,7 +175,7 @@ int multipartparser_create_part(multipartparser_t* parser) {
     http_payloadfield_t* field = NULL;
     http_payloadfield_t* last_field = NULL;
     while (header) {
-        if (strcmp(header->key, "Content-Disposition") == 0) {
+        if (header->key && strcmp(header->key, "Content-Disposition") == 0) {
             formdataparser_t fdparser;
             formdataparser_init(&fdparser, header->value_length);
             formdataparser_parse(&fdparser, header->value, header->value_length);
@@ -208,15 +228,28 @@ int multipartparser_create_part(multipartparser_t* parser) {
 }
 
 int multipartparser_create_header(multipartparser_t* parser) {
+    size_t key_offset = parser->header_key_offset;
+    size_t key_size = parser->header_key_size;
+    size_t value_offset = parser->header_value_offset;
+    size_t value_size = parser->header_value_size;
+
+    http_header_t* header = http_header_create(NULL, key_size, NULL, value_size);
+    if (header == NULL) {
+        log_error("multipartparser: header_create failed\n");
+        return 0;
+    }
+
+    if (key_size && !multipartparser_write_header(parser->payload_fd, header->key, key_offset, key_size)) {
+        log_error("multipartparser: write_header key failed\n");
+        return 0;
+    }
+    if (value_size && !multipartparser_write_header(parser->payload_fd, header->value, value_offset, value_size)) {
+        log_error("multipartparser: write_header val failed\n");
+        return 0;
+    }
+
     parser->stage = HEADER_KEY;
-
-    http_header_t* header = http_header_create(NULL, parser->header_key_size, NULL, parser->header_value_size);
-    if (header == NULL) return 0;
-
-    if (!multipartparser_write_header(parser->payload_fd, header->key, parser->header_key_offset, parser->header_key_size))
-        return 0;
-    if (!multipartparser_write_header(parser->payload_fd, header->value, parser->header_value_offset, parser->header_value_size))
-        return 0;
+    multipartparser_reset_header(parser);
 
     if (!parser->header)
         parser->header = header;

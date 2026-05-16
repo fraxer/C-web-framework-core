@@ -13,9 +13,8 @@ typedef enum multipartstage {
     FIRST_DASH,
     SECOND_DASH,
     BOUNDARY,
-    BOUNDARY_SR,
-    BOUNDARY_SN,
     BOUNDARY_FD,
+    BOUNDARY_NL,
     BOUNDARY_SD,
     HEADER_KEY,
     HEADER_SPACE,
@@ -42,11 +41,12 @@ typedef struct multipartparser {
     http_header_t* header;
     http_header_t* last_header;
     int payload_fd;
+    int error;
 } multipartparser_t;
 
 void multipartparser_init(multipartparser_t*, int, const char*);
 
-void multipartparser_parse(multipartparser_t*, char*, size_t);
+int multipartparser_parse(multipartparser_t*, char*, size_t);
 
 http_payloadpart_t* multipartparser_part(multipartparser_t*);
 

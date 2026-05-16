@@ -30,7 +30,7 @@ int httprequest_headern_add(httprequest_t*, const char*, size_t, const char*, si
 int httprequest_header_del(httprequest_t*, const char*);
 const char* httprequest_cookie(httprequest_t*, const char*);
 void httprequest_payload_free(http_payload_t*);
-void httprequest_payload_parse(httprequest_t*);
+int httprequest_payload_parse(httprequest_t*);
 http_payloadpart_t* httprequest_multipart_part(httprequest_t*, const char*);
 http_payloadpart_t* httprequest_urlencoded_part(httprequest_t*, const char*);
 int httprequest_append_urlencoded(httprequest_t*, const char*, const char*);
@@ -218,7 +218,7 @@ char* httprequest_payload(httprequest_t* request) {
 }
 
 char* httprequest_payloadf(httprequest_t* request, const char* field) {
-    httprequest_payload_parse(request);
+    if (!httprequest_payload_parse(request)) return NULL;
 
     http_payloadpart_t* part = NULL;
 
@@ -286,9 +286,18 @@ file_content_t httprequest_payload_file(httprequest_t* request) {
 }
 
 file_content_t httprequest_payload_filef(httprequest_t* request, const char* field) {
-    httprequest_payload_parse(request);
-
     file_content_t file_content = file_content_create(0, NULL, 0, 0);
+
+    if (!httprequest_payload_parse(request)) {
+        file_content.ok = 0;
+        file_content.fd = -1;
+        file_content.offset = 0;
+        file_content.size = 0;
+        file_content.set_filename(&file_content, "");
+
+        return file_content;
+    }
+    
     http_payloadpart_t* part = httprequest_multipart_part(request, field);
     if (part == NULL) return file_content;
 
@@ -339,7 +348,7 @@ int httprequest_allow_payload(httprequest_t* request) {
     return 0;
 }
 
-void httprequest_payload_parse_multipart(httprequest_t* request, const char* header_value) {
+int httprequest_payload_parse_multipart(httprequest_t* request, const char* header_value) {
     size_t payload_size = strlen(header_value);
     formdataparser_t fdparser;
     formdataparser_init(&fdparser, payload_size);
@@ -349,13 +358,13 @@ void httprequest_payload_parse_multipart(httprequest_t* request, const char* hea
 
     formdataparser_free(&fdparser);
 
-    if (!boundary_field.ok) return;
+    if (!boundary_field.ok) return 0;
 
     char* boundary = malloc(boundary_field.size + 1);
-    if (boundary == NULL) return;
+    if (boundary == NULL) return 0;
     if (boundary_field.size == 0) {
         free(boundary);
-        return;
+        return 0;
     }
     strncpy(boundary, &header_value[boundary_field.offset], boundary_field.size);
     boundary[boundary_field.size] = 0;
@@ -367,16 +376,22 @@ void httprequest_payload_parse_multipart(httprequest_t* request, const char* hea
     char* buffer = malloc(buffer_size);
     if (buffer == NULL) {
         free(boundary);
-        return;
+        return 0;
     }
 
     lseek(request->payload_.file.fd, 0, SEEK_SET);
 
     while (1) {
         int r = read(request->payload_.file.fd, buffer, buffer_size);
-        if (r <= 0) break;
+        if (r < 0) {
+            log_error("httprequest: multipart payload read error\n");
+        }
+        if (r == 0) break;
 
-        multipartparser_parse(&mparser, buffer, r);
+        if (!multipartparser_parse(&mparser, buffer, r)) {
+            log_error("httprequest: multipart payload parse error\n");
+            break;
+        }
     }
 
     free(boundary);
@@ -384,22 +399,32 @@ void httprequest_payload_parse_multipart(httprequest_t* request, const char* hea
 
     lseek(request->payload_.file.fd, 0, SEEK_SET);
 
+    if (mparser.error)
+        return 0;
+
     request->payload_.type = MULTIPART;
     request->payload_.part = multipartparser_part(&mparser);
+
+    return 1;
 }
 
-void httprequest_payload_parse_urlencoded(httprequest_t* request) {
+int httprequest_payload_parse_urlencoded(httprequest_t* request) {
     size_t buffer_size = 16384;
     char* buffer = malloc(buffer_size);
-    if (buffer == NULL) return;
+    if (buffer == NULL) return 0;
 
     off_t payload_size = request->payload_.file.size;
     urlencodedparser_t parser;
     urlencodedparser_init(&parser, request->payload_.file.fd, payload_size);
+    int error = 0;
 
     while (1) {
         int r = read(request->payload_.file.fd, buffer, buffer_size);
-        if (r <= 0) break;
+        if (r < 0) {
+            error = 1;
+            log_error("httprequest: urlencoded payload parse error\n");
+        }
+        if (r == 0) break;
 
         urlencodedparser_parse(&parser, buffer, r);
     }
@@ -408,23 +433,30 @@ void httprequest_payload_parse_urlencoded(httprequest_t* request) {
 
     lseek(request->payload_.file.fd, 0, SEEK_SET);
 
+    if (error)
+        return 0;
+
     request->payload_.type = URLENCODED;
     request->payload_.part = urlencodedparser_part(&parser);
+
+    return 1;
 }
 
-void httprequest_payload_parse_plain(httprequest_t* request) {
+int httprequest_payload_parse_plain(httprequest_t* request) {
     http_payloadpart_t* part = http_payloadpart_create();
-    if (part == NULL) return;
+    if (part == NULL) return 0;
 
     part->size = request->payload_.file.size;
 
     request->payload_.type = PLAIN;
     request->payload_.part = part;
+
+    return 1;
 }
 
-void httprequest_payload_parse(httprequest_t* request) {
-    if (request->payload_.file.fd < 0) return;
-    if (request->payload_.part != NULL) return;
+int httprequest_payload_parse(httprequest_t* request) {
+    if (request->payload_.file.fd < 0) return 0;
+    if (request->payload_.part != NULL) return 0;
 
     http_header_t* header = request->header_;
 
@@ -435,17 +467,15 @@ void httprequest_payload_parse(httprequest_t* request) {
         header = header->next;
     }
 
-    if (header == NULL) {
-        httprequest_payload_parse_plain(request);
-        return;
-    }
+    if (header == NULL)
+        return httprequest_payload_parse_plain(request);
 
     if (cmpsubstr_lower(header->value, "multipart/form-data"))
-        httprequest_payload_parse_multipart(request, header->value);
+        return httprequest_payload_parse_multipart(request, header->value);
     else if (cmpstr_lower(header->value, "application/x-www-form-urlencoded"))
-        httprequest_payload_parse_urlencoded(request);
+        return httprequest_payload_parse_urlencoded(request);
     else
-        httprequest_payload_parse_plain(request);
+        return httprequest_payload_parse_plain(request);
 }
 
 int httprequest_header_add(httprequest_t* request, const char* key, const char* value) {
