@@ -156,7 +156,6 @@ void str_clear(str_t* str) {
         free(str->dynamic_buffer);
     }
 
-    // Wipe SSO buffer
     explicit_bzero(str->sso_buffer, STR_SSO_SIZE);
 
     str_init(str, str->init_capacity);
@@ -166,7 +165,6 @@ void str_free(str_t* str) {
     if (str == NULL) return;
 
     str_clear(str);
-    explicit_bzero(str, sizeof(str_t));
     free(str);
 }
 
