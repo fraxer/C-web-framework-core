@@ -4,9 +4,18 @@
 #include <stdlib.h>
 #include <stddef.h>
 
-#define FORMDATABUFSIZ 256
+#include "str.h"
+
+#define FORMDATABUFSIZ 1024
 #define FORMDATAKEY 1
 #define FORMDATAVALUE 2
+
+typedef enum formdataparser_stage {
+    FORMDATA_SEMICOLON = 0,
+    FORMDATA_SKIP,
+    FORMDATA_KEY,
+    FORMDATA_VALUE
+} formdataparser_stage_e;
 
 typedef struct formdatalocation {
     int ok;
@@ -15,36 +24,30 @@ typedef struct formdatalocation {
 } formdatalocation_t;
 
 typedef struct formdatafield {
-    char* key;
-    size_t key_size;
-    size_t value_offset;
-    size_t value_size;
+    str_t key;
+    str_t value;
     struct formdatafield* next;
 } formdatafield_t;
 
 typedef struct formdataparser {
+    char error[512];
     char buffer[FORMDATABUFSIZ];
-    char* type;
-    int quote;
-    int cmp;
-    char prev_symbol;
-    size_t type_size;
-    size_t payload_size;
-    size_t payload_offset;
-    size_t offset;
-    size_t size;
+    const char* disposition_type;
     formdatafield_t* field;
     formdatafield_t* last_field;
+    size_t size;
+    formdataparser_stage_e stage;
+    unsigned int quote : 1;
 } formdataparser_t;
 
-void formdataparser_init(formdataparser_t*, size_t);
+int formdataparser_init(formdataparser_t* parser, const char* disposition_type);
 
-void formdataparser_free(formdataparser_t*);
+void formdataparser_clear(formdataparser_t* parser);
 
-void formdataparser_parse(formdataparser_t*, const char*, size_t);
+int formdataparser_parse(formdataparser_t* parser, const char* buffer, size_t buffer_size);
 
-formdatalocation_t formdataparser_field(formdataparser_t*, const char*);
+const char* formdataparser_find_field(formdataparser_t* parser, const char* field);
 
-formdatafield_t* formdataparser_fields(formdataparser_t*);
+formdatafield_t* formdataparser_first_field(formdataparser_t* parser);
 
 #endif

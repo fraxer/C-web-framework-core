@@ -175,21 +175,25 @@ int multipartparser_create_part(multipartparser_t* parser) {
     http_payloadfield_t* field = NULL;
     http_payloadfield_t* last_field = NULL;
     while (header) {
-        if (header->key && strcmp(header->key, "Content-Disposition") == 0) {
+        if (header->key == NULL) {
+            log_error("multipartparser: header key is NULL\n");
+            break;
+        }
+        if (strcmp(header->key, "Content-Disposition") == 0) {
             formdataparser_t fdparser;
-            formdataparser_init(&fdparser, header->value_length);
+            formdataparser_init(&fdparser, "form-data");
             formdataparser_parse(&fdparser, header->value, header->value_length);
 
-            formdatafield_t* hfield = formdataparser_fields(&fdparser);
+            formdatafield_t* hfield = formdataparser_first_field(&fdparser);
             while (hfield) {
                 http_payloadfield_t* f = http_payloadfield_create();
 
-                f->key_length = hfield->key_size;
-                f->key = copy_cstringn(hfield->key, hfield->key_size);
+                f->key_length = str_size(&hfield->key);
+                f->key = copy_cstringn(str_get(&hfield->key), f->key_length);
                 if (f->key == NULL) return 0;
 
-                f->value_length = hfield->value_size;
-                f->value = copy_cstringn(&header->value[hfield->value_offset], hfield->value_size);
+                f->value_length = str_size(&hfield->value);
+                f->value = copy_cstringn(str_get(&hfield->value), f->value_length);
                 if (f->value == NULL) return 0;
 
                 hfield = hfield->next;
@@ -201,7 +205,7 @@ int multipartparser_create_part(multipartparser_t* parser) {
                 last_field = f;
             }
 
-            formdataparser_free(&fdparser);
+            formdataparser_clear(&fdparser);
             break;
         }
         header = header->next;

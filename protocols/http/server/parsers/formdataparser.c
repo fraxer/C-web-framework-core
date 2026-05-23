@@ -1,31 +1,36 @@
 #include <string.h>
+#include <stdio.h>
+#include <ctype.h>
 
+#include "log.h"
 #include "formdataparser.h"
 
-int formdataparser_add_entity(formdataparser_t*, int);
+int formdataparser_save_key(formdataparser_t* parser);
+int formdataparser_save_value(formdataparser_t* parser);
 
-void formdataparser_init(formdataparser_t* parser, size_t payload_size) {
-    parser->type = NULL;
+int formdataparser_init(formdataparser_t* parser, const char* disposition_type) {
+    if (disposition_type == NULL) return 0;
+
+    parser->disposition_type = disposition_type;
+    parser->stage = FORMDATA_SEMICOLON;
     parser->quote = 0;
-    parser->cmp = 0;
-    parser->prev_symbol = 0;
-    parser->type_size = 0;
-    parser->payload_size = payload_size;
-    parser->payload_offset = 0;
-    parser->offset = 0;
     parser->size = 0;
     parser->field = NULL;
     parser->last_field = NULL;
+
+    memset(parser->error, 0, sizeof(parser->error));
+
+    return 1;
 }
 
-void formdataparser_free(formdataparser_t* parser) {
-    if (parser->type) free(parser->type);
-
+void formdataparser_clear(formdataparser_t* parser) {
     formdatafield_t* field = parser->field;
     while (field) {
         formdatafield_t* next = field->next;
 
-        if (field->key) free(field->key);
+        str_clear(&field->key);
+        str_clear(&field->value);
+        explicit_bzero(parser->buffer, FORMDATABUFSIZ);
 
         free(field);
 
@@ -33,140 +38,302 @@ void formdataparser_free(formdataparser_t* parser) {
     }
 }
 
-void formdataparser_parse(formdataparser_t* parser, const char* buffer, size_t buffer_size) {
-    for (size_t i = 0; i < buffer_size; i++) {
-        switch (buffer[i]) {
-        case ' ':
-            if (!parser->quote) {
-                parser->payload_offset++;
-                continue;
-            }
-            parser->size++;
-            break;
-        case ';':
-            if (!parser->quote) {
-                if (formdataparser_add_entity(parser, FORMDATAVALUE) == -1) return;
-                parser->cmp = 0;
-                parser->payload_offset++;
-                continue;
-            }
-            parser->size++;
-            break;
-        case '=':
-            if (parser->quote) break;
-            else if (parser->cmp) {
-                parser->size++;
-                break;
-            }
+int formdataparser_parse(formdataparser_t* parser, const char* buffer, size_t buffer_size) {
+    if (buffer_size == 0) {
+        log_error("formdataparser: buffer size is empty");
+        strncpy(parser->error, "formdataparser: buffer size is empty", sizeof(parser->error) - 1);
+        return 0;
+    }
+    if (buffer_size > FORMDATABUFSIZ) {
+        log_error("formdataparser: buffer size is too big");
+        strncpy(parser->error, "formdataparser: buffer size is too big", sizeof(parser->error) - 1);
+        return 0;
+    }
 
-            if (formdataparser_add_entity(parser, FORMDATAKEY) == -1) return;
-            parser->cmp = 1;
-            parser->payload_offset++;
-            continue;
-        case '"':
-            if (!parser->quote) {
-                parser->quote = 1;
-                parser->payload_offset++;
-                parser->offset++;
-                continue;
+    size_t disposition_type_size = strlen(parser->disposition_type);
+    size_t i = 0;
+    for (; i < buffer_size && i < disposition_type_size; i++) {
+        if (buffer[i] != parser->disposition_type[i]) {
+            log_error("formdataparser: disposition type \"form-data\" invalid in header Content-Disposition: %s", buffer);
+            strncpy(parser->error, "formdataparser: disposition type \"form-data\" invalid in header Content-Disposition", sizeof(parser->error) - 1);
+            return 0;
+        }
+    }
+
+    for (; i < buffer_size; i++) {
+        char c = buffer[i];
+
+        switch (parser->stage) {
+        case FORMDATA_SEMICOLON: {
+            if (c == ';') {
+                parser->stage = FORMDATA_SKIP;
             }
-            else if (parser->prev_symbol != '\\') {
-                parser->quote = 0;
+            else if (c == ' ') {}
+            else if (isalpha(c)) {
+                parser->stage = FORMDATA_KEY;
+                parser->buffer[parser->size] = c;
+                parser->size++;
             }
             else {
+                log_error("formdataparser: get invalid character instead semicolon: %c", c);
+                strncpy(parser->error, "formdataparser: get invalid character instead semicolon", sizeof(parser->error) - 1);
+                return 0;
+            }
+            break;
+        }
+        case FORMDATA_SKIP: {
+            if (c == ' ') {}
+            else if (isalpha(c) || c == '-' || c == '*') { // creation-date or filename*
+                parser->stage = FORMDATA_KEY;
+                parser->buffer[parser->size] = c;
+                parser->size++;
+            }
+            else {
+                log_error("formdataparser: get invalid character after semicolon: %c", c);
+                strncpy(parser->error, "formdataparser: get invalid character after semicolon", sizeof(parser->error) - 1);
+                return 0;
+            }
+            break;
+        }
+        case FORMDATA_KEY: {
+            if (c == '=') {
+                parser->stage = FORMDATA_VALUE;
+                if (!formdataparser_save_key(parser)) {
+                    log_error("formdataparser: failed to save key before '='");
+                    strncpy(parser->error, "formdataparser: failed to save key", sizeof(parser->error) - 1);
+                    return 0;
+                }
+            }
+            else if (c == ';') {
+                parser->stage = FORMDATA_SKIP;
+                if (!formdataparser_save_key(parser)) {
+                    log_error("formdataparser: failed to save key before ';'");
+                    strncpy(parser->error, "formdataparser: failed to save key", sizeof(parser->error) - 1);
+                    return 0;
+                }
+            }
+            else if (isalpha(c) || c == '-' || c == '*') {
+                parser->buffer[parser->size] = c;
+                parser->size++;
+            }
+            else {
+                log_error("formdataparser: get invalid character in key: %c", c);
+                strncpy(parser->error, "formdataparser: get invalid character in key", sizeof(parser->error) - 1);
+                return 0;
+            }
+            break;
+        }
+        case FORMDATA_VALUE: {
+            if (c == '\"') {
+                if (parser->quote) {
+                    if (buffer[i - 1] != '\\') {
+                        if (!formdataparser_save_value(parser))
+                            return 0;
+
+                        parser->stage = FORMDATA_SEMICOLON;
+                        parser->quote = 0;
+                    }
+                    else {
+                        // Перезаписать последний символ - обратный слеш
+                        parser->buffer[parser->size - 1] = c;
+                    }
+                }
+                else {
+                    if (buffer[i - 1] != '\\') {
+                        // Если неэкранированную кавычку нашли в середине значения
+                        if (parser->size > 0) {
+                            parser->buffer[parser->size] = c;
+                            parser->size++;
+                        }
+                        else {
+                            parser->quote = 1;
+                        }
+                    }
+                    else {
+                        parser->buffer[parser->size] = c;
+                        parser->size++;
+                    }
+                }
+                
+            }
+            else if (c == ' ' || c == ';') {
+                if (parser->quote) {
+                    parser->buffer[parser->size] = c;
+                    parser->size++;
+                }
+                else {
+                    if (!formdataparser_save_value(parser))
+                        return 0;
+
+                    parser->stage = FORMDATA_SEMICOLON;
+                }
+            }
+            else {
+                parser->buffer[parser->size] = c;
                 parser->size++;
             }
             break;
-        default:
-            parser->size++;
-            break;
         }
-
-        parser->prev_symbol = buffer[i];
-        if (parser->size < FORMDATABUFSIZ) {
-            parser->buffer[parser->size - 1] = buffer[i];
         }
-        parser->payload_offset++;
     }
 
-    if (parser->payload_offset == parser->payload_size) {
-        formdataparser_add_entity(parser, FORMDATAVALUE);
+    if (parser->stage == FORMDATA_VALUE) {
+        // Учесть наполовину открытую квотированную строку - это ошибка!
+        if (parser->quote) {
+            log_error("formdataparser: unclosed quoted string in value");
+            strncpy(parser->error, "formdataparser: unclosed quoted string in value", sizeof(parser->error) - 1);
+            return 0;
+        }
+
+        if (!formdataparser_save_value(parser)) {
+            log_error("formdataparser: failed to save value at end of parsing");
+            strncpy(parser->error, "formdataparser: failed to save value", sizeof(parser->error) - 1);
+            return 0;
+        }
     }
+    else if (parser->stage == FORMDATA_KEY) {
+        log_error("formdataparser: key without value at end of parsing");
+        strncpy(parser->error, "formdataparser: key without value at end of parsing", sizeof(parser->error) - 1);
+        return 0;
+    }
+
+    return 1;
 }
 
-formdatalocation_t formdataparser_field(formdataparser_t* parser, const char* field) {
-    formdatalocation_t result = {
-        .ok = 0,
-        .offset = 0,
-        .size = 0
-    };
-    formdatafield_t* pfield = parser->field;
+const char* formdataparser_find_field(formdataparser_t* parser, const char* field) {
+    // RFC 6266: key* has priority over key
+    size_t field_len = strlen(field);
 
-    while (pfield) {
-        if (strcmp(pfield->key, field) == 0) {
-            result.ok = 1;
-            result.offset = pfield->value_offset;
-            result.size = pfield->value_size;
-            break;
+    formdatafield_t* pfield = parser->field;
+    formdatafield_t* without_star = NULL;
+
+    while (pfield != NULL) {
+        const char* key = str_get(&pfield->key);
+        size_t key_len = str_size(&pfield->key);
+
+        if (strcmp(key, field) == 0) {
+            without_star = pfield;
+        }
+        else if (key_len == field_len + 1 && key[field_len] == '*' && strncmp(key, field, field_len) == 0) {
+            return str_get(&pfield->value);
         }
 
         pfield = pfield->next;
     }
 
-    return result;
+    if (without_star) return str_get(&without_star->value);
+
+    return NULL;
 }
 
-formdatafield_t* formdataparser_fields(formdataparser_t* parser) {
+formdatafield_t* formdataparser_first_field(formdataparser_t* parser) {
     return parser->field;
 }
 
-int formdataparser_add_entity(formdataparser_t* parser, int type) {
-    if (parser->type == NULL) {
-        if (parser->size >= FORMDATABUFSIZ) return -1;
-
-        parser->type = malloc(parser->size + 1);
-        if (!parser->type) return -1;
-
-        strncpy(parser->type, parser->buffer, parser->size);
-    }
-    else if (type == FORMDATAKEY) {
-        if (parser->size >= FORMDATABUFSIZ) return -1;
-
-        formdatafield_t* field = malloc(sizeof * field);
-        if (!field) return -1;
-
-        char* key = malloc(parser->size + 1);
-        if (!key) {
-            free(field);
-            return -1;
-        }
-
-        strncpy(key, parser->buffer, parser->size);
-        key[parser->size] = 0;
-
-        field->key = key;
-        field->key_size = parser->size;
-        field->value_offset = 0;
-        field->value_size = 0;
-        field->next = NULL;
-
-        if (!parser->field) {
-            parser->field = field;
-        }
-        if (parser->last_field) {
-            parser->last_field->next = field;
-        }
-        parser->last_field = field;
-    }
-    else if (type == FORMDATAVALUE) {
-        if (parser->last_field->key == NULL) return -1;
-
-        parser->last_field->value_offset = parser->offset;
-        parser->last_field->value_size = parser->size;
+int formdataparser_save_key(formdataparser_t* parser) {
+    if (parser->size == 0) {
+        log_error("formdataparser: key is empty");
+        strncpy(parser->error, "formdataparser: key is empty", sizeof(parser->error) - 1);
+        return 0;
     }
 
-    parser->offset = parser->payload_offset + 1;
+    formdatafield_t* field = malloc(sizeof * field);
+    if (field == NULL) {
+        log_error("formdataparser: malloc failed for field");
+        strncpy(parser->error, "formdataparser: malloc failed for field", sizeof(parser->error) - 1);
+        return 0;
+    }
+
+    str_init(&field->key, 20);
+    str_init(&field->value, 128);
+    field->next = NULL;
+
+    str_assign(&field->key, parser->buffer, parser->size);
+
+    if (parser->field == NULL)
+        parser->field = field;
+
+    if (parser->last_field != NULL)
+        parser->last_field->next = field;
+
+    parser->last_field = field;
     parser->size = 0;
 
-    return 0;
+    return 1;
+}
+
+static int formdataparser_hex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+static int formdataparser_percent_decode(const char* src, size_t src_size, str_t* dst, char* error, size_t error_size) {
+    for (size_t i = 0; i < src_size; i++) {
+        if (src[i] == '%') {
+            if (i + 2 >= src_size) {
+                log_error("formdataparser: incomplete percent-encoding at position %zu", i);
+                strncpy(error, "formdataparser: incomplete percent-encoding", error_size - 1);
+                return 0;
+            }
+            int hi = formdataparser_hex(src[i + 1]);
+            int lo = formdataparser_hex(src[i + 2]);
+            if (hi < 0 || lo < 0) {
+                log_error("formdataparser: invalid hex in percent-encoding at position %zu", i);
+                strncpy(error, "formdataparser: invalid hex in percent-encoding", error_size - 1);
+                return 0;
+            }
+            str_appendc(dst, (char)((hi << 4) | lo));
+            i += 2;
+        }
+        else {
+            str_appendc(dst, src[i]);
+        }
+    }
+    return 1;
+}
+
+int formdataparser_save_value(formdataparser_t* parser) {
+    if (parser->last_field == NULL) {
+        log_error("formdataparser: no field to save value");
+        strncpy(parser->error, "formdataparser: no field to save value", sizeof(parser->error) - 1);
+        return 0;
+    }
+
+    formdatafield_t* field = parser->last_field;
+
+    // RFC 5987: key* = charset'language'percent-encoded-value
+    if (str_last(&field->key) == '*') {
+        const char* buf = parser->buffer;
+        size_t size = parser->size;
+
+        // charset
+        size_t i = 0;
+        while (i < size && buf[i] != '\'') i++;
+        // Skip unknown charset — percent-decode works for UTF-8 bytes regardless
+
+        // language (skip between first and second quote)
+        i++; // skip first '
+        while (i < size && buf[i] != '\'') i++;
+        // language is ignored per RFC 5987
+
+        i++; // skip second '
+        if (i >= size) {
+            log_error("formdataparser: missing value after charset'language' in key*");
+            strncpy(parser->error, "formdataparser: missing value after charset'language' in key*", sizeof(parser->error) - 1);
+            return 0;
+        }
+
+        // percent-decode the remaining value
+        if (!formdataparser_percent_decode(buf + i, size - i, &field->value, parser->error, sizeof(parser->error)))
+            return 0;
+    }
+    else {
+        str_assign(&field->value, parser->buffer, parser->size);
+    }
+
+    parser->size = 0;
+
+    return 1;
 }

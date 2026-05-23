@@ -351,23 +351,14 @@ int httprequest_allow_payload(httprequest_t* request) {
 int httprequest_payload_parse_multipart(httprequest_t* request, const char* header_value) {
     size_t payload_size = strlen(header_value);
     formdataparser_t fdparser;
-    formdataparser_init(&fdparser, payload_size);
+    formdataparser_init(&fdparser, "multipart/form-data");
     formdataparser_parse(&fdparser, header_value, payload_size);
 
-    formdatalocation_t boundary_field = formdataparser_field(&fdparser, "boundary");
-
-    formdataparser_free(&fdparser);
-
-    if (!boundary_field.ok) return 0;
-
-    char* boundary = malloc(boundary_field.size + 1);
-    if (boundary == NULL) return 0;
-    if (boundary_field.size == 0) {
-        free(boundary);
+    const char* boundary = formdataparser_find_field(&fdparser, "boundary");
+    if (boundary == NULL) {
+        formdataparser_clear(&fdparser);
         return 0;
     }
-    strncpy(boundary, &header_value[boundary_field.offset], boundary_field.size);
-    boundary[boundary_field.size] = 0;
 
     multipartparser_t mparser;
     multipartparser_init(&mparser, request->payload_.file.fd, boundary);
@@ -375,7 +366,7 @@ int httprequest_payload_parse_multipart(httprequest_t* request, const char* head
     size_t buffer_size = 16384;
     char* buffer = malloc(buffer_size);
     if (buffer == NULL) {
-        free(boundary);
+        formdataparser_clear(&fdparser);
         return 0;
     }
 
@@ -394,13 +385,14 @@ int httprequest_payload_parse_multipart(httprequest_t* request, const char* head
         }
     }
 
-    free(boundary);
     free(buffer);
+    formdataparser_clear(&fdparser);
 
     lseek(request->payload_.file.fd, 0, SEEK_SET);
 
-    if (mparser.error)
+    if (mparser.error) {
         return 0;
+    }
 
     request->payload_.type = MULTIPART;
     request->payload_.part = multipartparser_part(&mparser);
