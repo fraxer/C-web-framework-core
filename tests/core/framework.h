@@ -116,6 +116,14 @@ static inline void register_test_suite(test_suite_fn suite) {
     } \
 } while(0)
 
+/* Assertion macros */
+#define TEST_FAIL(message) do { \
+    stats.total++; \
+    PRINT_TEST_CONTEXT(); \
+    stats.failed++; \
+    printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s (line %d)\n", message, __LINE__); \
+} while(0)
+
 #define TEST_ASSERT_EQUAL(expected, actual, message) do { \
     stats.total++; \
     if ((expected) == (actual)) { \
