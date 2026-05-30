@@ -30,8 +30,8 @@ typedef struct formdatafield {
 } formdatafield_t;
 
 typedef struct formdataparser {
-    char error[512];
     char buffer[FORMDATABUFSIZ];
+    const char* error;
     const char* disposition_type;
     formdatafield_t* field;
     formdatafield_t* last_field;
