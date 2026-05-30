@@ -348,11 +348,10 @@ int httprequest_allow_payload(httprequest_t* request) {
     return 0;
 }
 
-int httprequest_payload_parse_multipart(httprequest_t* request, const char* header_value) {
-    size_t payload_size = strlen(header_value);
+int httprequest_payload_parse_multipart(httprequest_t* request, const char* header_value, size_t header_value_length) {
     formdataparser_t fdparser;
     formdataparser_init(&fdparser, "multipart/form-data");
-    formdataparser_parse(&fdparser, header_value, payload_size);
+    formdataparser_parse(&fdparser, header_value, header_value_length);
 
     const char* boundary = formdataparser_find_field(&fdparser, "boundary");
     if (boundary == NULL) {
@@ -371,16 +370,23 @@ int httprequest_payload_parse_multipart(httprequest_t* request, const char* head
     }
 
     lseek(request->payload_.file.fd, 0, SEEK_SET);
-
+    multipart_res_e res = MP_RES_ERROR;
     while (1) {
-        int r = read(request->payload_.file.fd, buffer, buffer_size);
+        ssize_t r = read(request->payload_.file.fd, buffer, buffer_size);
         if (r < 0) {
             log_error("httprequest: multipart payload read error\n");
+            free(buffer);
+            formdataparser_clear(&fdparser);
+            multipartparser_clear(&mparser);
+            lseek(request->payload_.file.fd, 0, SEEK_SET);
+            return 0;
         }
+
         if (r == 0) break;
 
-        if (!multipartparser_parse(&mparser, buffer, r)) {
-            log_error("httprequest: multipart payload parse error\n");
+        res = multipartparser_parse(&mparser, buffer, r);
+        if (res == MP_RES_ERROR) {
+            log_error("httprequest: multipart payload parse error. %s\n", mparser.error);
             break;
         }
     }
@@ -390,7 +396,9 @@ int httprequest_payload_parse_multipart(httprequest_t* request, const char* head
 
     lseek(request->payload_.file.fd, 0, SEEK_SET);
 
-    if (mparser.error) {
+    if (res != MP_RES_DONE) {
+        log_error("httprequest: multipart payload parse error. %s\n", mparser.error);
+        multipartparser_clear(&mparser);
         return 0;
     }
 
@@ -463,7 +471,7 @@ int httprequest_payload_parse(httprequest_t* request) {
         return httprequest_payload_parse_plain(request);
 
     if (cmpsubstr_lower(header->value, "multipart/form-data"))
-        return httprequest_payload_parse_multipart(request, header->value);
+        return httprequest_payload_parse_multipart(request, header->value, header->value_length);
     else if (cmpstr_lower(header->value, "application/x-www-form-urlencoded"))
         return httprequest_payload_parse_urlencoded(request);
     else

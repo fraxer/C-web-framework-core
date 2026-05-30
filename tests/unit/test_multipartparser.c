@@ -68,14 +68,16 @@ TEST(test_mp_single_part_single_header) {
         "Content-Disposition: form-data; name=\"field1\"\r\n"
         "\r\n"
         "hello world\r\n"
-        "--BOUNDARY--";
+        "--BOUNDARY--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have one part");
@@ -89,6 +91,11 @@ TEST(test_mp_single_part_single_header) {
     TEST_ASSERT_NOT_NULL(part->field, "Part should have a field");
     TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key should be 'name'");
     TEST_ASSERT_STR_EQUAL("field1", part->field->value, "Field value should be 'field1'");
+
+    char* part_value = strndup(&payload[part->offset], part->size);
+    if (part_value)
+        TEST_ASSERT_STR_EQUAL("hello world", part_value, "Part value should be 'hello world'");
+    free(part_value);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -106,32 +113,44 @@ TEST(test_mp_single_part_multiple_headers) {
     const char boundary[] = "----WebKitFormBoundary7MA4YWxkTrZu0gW";
     const char payload[] =
         "------WebKitFormBoundary7MA4YWxkTrZu0gW\r\n"
-        "Content-Disposition: form-data; name=\"file\"; filename=\"test.txt\"\r\n"
+        "Content-Disposition: form-data; name=\"file\"; filename=test.txt\r\n"
         "Content-Type: text/plain\r\n"
         "\r\n"
         "file content here\r\n"
-        "------WebKitFormBoundary7MA4YWxkTrZu0gW--";
+        "------WebKitFormBoundary7MA4YWxkTrZu0gW--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have one part");
+
+    char* part_value = strndup(&payload[part->offset], part->size);
+    TEST_ASSERT_STR_EQUAL("file content here", part_value, "Part value should be 'file content here'");
+    free(part_value);
 
     TEST_ASSERT_NOT_NULL(part->header, "First header should exist");
     TEST_ASSERT_NOT_NULL(part->header->next, "Second header should exist");
     TEST_ASSERT_NULL(part->header->next->next, "Should have exactly two headers");
 
     TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "First header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"file\"; filename=test.txt", part->header->value, "First header value");
     TEST_ASSERT_STR_EQUAL("Content-Type", part->header->next->key, "Second header key");
+    TEST_ASSERT_STR_EQUAL("text/plain", part->header->next->value, "Second header value");
 
     TEST_ASSERT_NOT_NULL(part->field, "Part should have fields");
     TEST_ASSERT_STR_EQUAL("name", part->field->key, "First field key");
     TEST_ASSERT_STR_EQUAL("file", part->field->value, "First field value");
+
+    TEST_ASSERT_NOT_NULL(part->field->next, "Second field should exist");
+    TEST_ASSERT_STR_EQUAL("filename", part->field->next->key, "Second field key");
+    TEST_ASSERT_STR_EQUAL("test.txt", part->field->next->value, "Second field value");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -149,32 +168,51 @@ TEST(test_mp_two_parts) {
     const char boundary[] = "BOUNDARY";
     const char payload[] =
         "--BOUNDARY\r\n"
-        "Content-Disposition: form-data; name=\"field1\"\r\n"
+        "Content-Disposition: form-data; name=field1\r\n"
         "\r\n"
         "value1\r\n"
         "--BOUNDARY\r\n"
         "Content-Disposition: form-data; name=\"field2\"\r\n"
         "\r\n"
         "value2\r\n"
-        "--BOUNDARY--";
+        "--BOUNDARY--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have first part");
     TEST_ASSERT_NOT_NULL(part->next, "Should have second part");
     TEST_ASSERT_NULL(part->next->next, "Should have exactly two parts");
 
+    TEST_ASSERT_NOT_NULL(part->header, "Part 1 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Part 1 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=field1", part->header->value, "Part 1 header value");
+
     TEST_ASSERT_STR_EQUAL("name", part->field->key, "Part 1 field key");
     TEST_ASSERT_STR_EQUAL("field1", part->field->value, "Part 1 field value");
 
+    char* v1 = strndup(&payload[part->offset], part->size);
+    if (v1)
+        TEST_ASSERT_STR_EQUAL("value1", v1, "Part 1 MP_STG_BODY should be 'value1'");
+    free(v1);
+
+    TEST_ASSERT_NOT_NULL(part->next->header, "Part 2 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->next->header->key, "Part 2 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"field2\"", part->next->header->value, "Part 2 header value");
+
     TEST_ASSERT_STR_EQUAL("name", part->next->field->key, "Part 2 field key");
     TEST_ASSERT_STR_EQUAL("field2", part->next->field->value, "Part 2 field value");
+
+    char* v2 = strndup(&payload[part->next->offset], part->next->size);
+    if (v2)
+        TEST_ASSERT_STR_EQUAL("value2", v2, "Part 2 MP_STG_BODY should be 'value2'");
+    free(v2);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -198,14 +236,15 @@ TEST(test_mp_three_parts) {
         "Content-Disposition: form-data; name=\"c\"\r\n"
         "\r\n"
         "CCC\r\n"
-        "--bnd--";
+        "--bnd--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have first part");
@@ -213,9 +252,38 @@ TEST(test_mp_three_parts) {
     TEST_ASSERT_NOT_NULL(part->next->next, "Should have third part");
     TEST_ASSERT_NULL(part->next->next->next, "Should have exactly three parts");
 
-    TEST_ASSERT_STR_EQUAL("a", part->field->value, "Part 1 value");
-    TEST_ASSERT_STR_EQUAL("b", part->next->field->value, "Part 2 value");
-    TEST_ASSERT_STR_EQUAL("c", part->next->next->field->value, "Part 3 value");
+    TEST_ASSERT_NOT_NULL(part->header, "Part 1 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Part 1 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"a\"", part->header->value, "Part 1 header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Part 1 field key");
+    TEST_ASSERT_STR_EQUAL("a", part->field->value, "Part 1 field value");
+
+    char* b1 = strndup(&payload[part->offset], part->size);
+    if (b1)
+        TEST_ASSERT_STR_EQUAL("AAA", b1, "Part 1 MP_STG_BODY should be 'AAA'");
+    free(b1);
+
+    TEST_ASSERT_NOT_NULL(part->next->header, "Part 2 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->next->header->key, "Part 2 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"b\"", part->next->header->value, "Part 2 header value");
+    TEST_ASSERT_STR_EQUAL("name", part->next->field->key, "Part 2 field key");
+    TEST_ASSERT_STR_EQUAL("b", part->next->field->value, "Part 2 field value");
+
+    char* b2 = strndup(&payload[part->next->offset], part->next->size);
+    if (b2)
+        TEST_ASSERT_STR_EQUAL("BBB", b2, "Part 2 MP_STG_BODY should be 'BBB'");
+    free(b2);
+
+    TEST_ASSERT_NOT_NULL(part->next->next->header, "Part 3 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->next->next->header->key, "Part 3 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"c\"", part->next->next->header->value, "Part 3 header value");
+    TEST_ASSERT_STR_EQUAL("name", part->next->next->field->key, "Part 3 field key");
+    TEST_ASSERT_STR_EQUAL("c", part->next->next->field->value, "Part 3 field value");
+
+    char* b3 = strndup(&payload[part->next->next->offset], part->next->next->size);
+    if (b3)
+        TEST_ASSERT_STR_EQUAL("CCC", b3, "Part 3 MP_STG_BODY should be 'CCC'");
+    free(b3);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -223,12 +291,12 @@ TEST(test_mp_three_parts) {
 }
 
 // ============================================================================
-// Test Suite 4: Empty body and edge cases
+// Test Suite 4: Empty MP_STG_BODY and edge cases
 // ============================================================================
 
 TEST(test_mp_empty_part_body) {
     TEST_SUITE("Multipart Parser - Edge Cases");
-    TEST_CASE("Part with empty body");
+    TEST_CASE("Part with empty MP_STG_BODY");
 
     const char boundary[] = "BOUNDARY";
     const char payload[] =
@@ -236,17 +304,22 @@ TEST(test_mp_empty_part_body) {
         "Content-Disposition: form-data; name=\"empty\"\r\n"
         "\r\n"
         "\r\n"
-        "--BOUNDARY--";
+        "--BOUNDARY--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have one part");
+    TEST_ASSERT_NOT_NULL(part->header, "Part should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"empty\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key should be 'name'");
     TEST_ASSERT_STR_EQUAL("empty", part->field->value, "Field value should be 'empty'");
 
     free_parts(part);
@@ -263,18 +336,29 @@ TEST(test_mp_no_extra_headers) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\r\n"
-        "--X--";
+        "--X--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have one part");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
     TEST_ASSERT_NULL(part->header->next, "Should have only one header");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("data", v, "MP_STG_BODY should be 'data'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -295,19 +379,28 @@ TEST(test_mp_header_value_leading_spaces) {
         "Content-Disposition:  form-data; name=\"x\"\r\n"
         "\r\n"
         "val\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have one part");
     TEST_ASSERT_NOT_NULL(part->header->value, "Header value should exist");
     TEST_ASSERT(part->header->value[0] != ' ', "Header value should not start with space");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"x\"", part->header->value, "Header value content");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("x", part->field->value, "Field value");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("val", v, "MP_STG_BODY should be 'val'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -315,12 +408,12 @@ TEST(test_mp_header_value_leading_spaces) {
 }
 
 // ============================================================================
-// Test Suite 6: Body containing \r\n that is NOT a boundary
+// Test Suite 6: MP_STG_BODY containing \r\n that is NOT a boundary
 // ============================================================================
 
 TEST(test_mp_body_false_boundary_prefix) {
     TEST_SUITE("Multipart Parser - False Boundary Prefixes");
-    TEST_CASE("Body contains \\r\\n-- that doesn't match boundary");
+    TEST_CASE("MP_STG_BODY contains \\r\\n-- that doesn't match boundary");
 
     const char boundary[] = "REALBOUNDARY";
     const char payload[] =
@@ -330,17 +423,22 @@ TEST(test_mp_body_false_boundary_prefix) {
         "line1\r\n"
         "--FAKE\r\n"
         "line2\r\n"
-        "--REALBOUNDARY--";
+        "--REALBOUNDARY--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have one part");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"data\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
     TEST_ASSERT_STR_EQUAL("data", part->field->value, "Field value should be 'data'");
 
     free_parts(part);
@@ -349,7 +447,7 @@ TEST(test_mp_body_false_boundary_prefix) {
 }
 
 TEST(test_mp_body_partial_boundary_match) {
-    TEST_CASE("Body contains partial boundary match");
+    TEST_CASE("MP_STG_BODY contains partial boundary match");
 
     const char boundary[] = "ABC123";
     const char payload[] =
@@ -357,17 +455,23 @@ TEST(test_mp_body_partial_boundary_match) {
         "Content-Disposition: form-data; name=\"x\"\r\n"
         "\r\n"
         "data with --ABC12 inside\r\n"
-        "--ABC123--";
+        "--ABC123--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
-    TEST_ASSERT_NOT_NULL(part, "Should have one part despite partial boundary in body");
+    TEST_ASSERT_NOT_NULL(part, "Should have one part despite partial boundary in MP_STG_BODY");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"x\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("x", part->field->value, "Field value");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -388,7 +492,7 @@ TEST(test_mp_incremental_two_chunks) {
         "Content-Disposition: form-data; name=\"field\"\r\n"
         "\r\n"
         "value\r\n"
-        "--BND--";
+        "--BND--\r\n";
 
     size_t total = sizeof(payload) - 1;
     size_t chunk1 = total / 2;
@@ -399,12 +503,21 @@ TEST(test_mp_incremental_two_chunks) {
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
 
-    multipartparser_parse(&parser, (char*)payload, chunk1);
-    multipartparser_parse(&parser, (char*)payload + chunk1, total - chunk1);
-
+    multipart_res_e res1 = multipartparser_parse(&parser, (char*)payload, chunk1);
+    multipart_res_e res2 = multipartparser_parse(&parser, (char*)payload + chunk1, total - chunk1);
+    TEST_ASSERT(res1 == MP_RES_PARTIAL && res2 == MP_RES_DONE, "Parse should complete");
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should parse across chunks");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"field\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
     TEST_ASSERT_STR_EQUAL("field", part->field->value, "Field value should be correct");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("value", v, "MP_STG_BODY should be 'value'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -420,7 +533,7 @@ TEST(test_mp_incremental_byte_by_byte) {
         "Content-Disposition: form-data; name=\"k\"\r\n"
         "\r\n"
         "v\r\n"
-        "--B--";
+        "--B--\r\n";
 
     size_t total = sizeof(payload) - 1;
 
@@ -430,12 +543,23 @@ TEST(test_mp_incremental_byte_by_byte) {
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
 
-    for (size_t i = 0; i < total; i++)
-        multipartparser_parse(&parser, (char*)payload + i, 1);
+    for (size_t i = 0; i < total; i++) {
+        multipart_res_e res = multipartparser_parse(&parser, (char*)payload + i, 1);
+        TEST_ASSERT(res == MP_RES_DONE || res == MP_RES_PARTIAL, "Parse should complete");
+    }
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should parse byte-by-byte");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"k\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
     TEST_ASSERT_STR_EQUAL("k", part->field->value, "Field value should be correct");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("v", v, "MP_STG_BODY should be 'v'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -446,442 +570,113 @@ TEST(test_mp_incremental_byte_by_byte) {
 // Test Suite 8: State transitions
 // ============================================================================
 
-TEST(test_mp_transition_body_to_boundary_fn) {
-    TEST_SUITE("Multipart Parser - State Transitions");
-    TEST_CASE("BODY -> BOUNDARY_FN on \\r");
-
-    const char boundary[] = "B";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = BODY;
-
-    const char input[] = "\r";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(BOUNDARY_FN, parser.stage, "BODY -> BOUNDARY_FN on \\r");
-    close(fd);
-}
-
-TEST(test_mp_transition_boundary_fn_to_first_dash) {
-    TEST_CASE("BOUNDARY_FN -> FIRST_DASH on \\n");
-
-    const char boundary[] = "B";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = BOUNDARY_FN;
-
-    const char input[] = "\n";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(FIRST_DASH, parser.stage, "BOUNDARY_FN -> FIRST_DASH on \\n");
-    close(fd);
-}
-
-TEST(test_mp_transition_boundary_fn_to_second_dash) {
-    TEST_CASE("BOUNDARY_FN -> SECOND_DASH on '-'");
-
-    const char boundary[] = "B";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = BOUNDARY_FN;
-
-    const char input[] = "-";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(SECOND_DASH, parser.stage, "BOUNDARY_FN -> SECOND_DASH on '-'");
-    close(fd);
-}
-
-TEST(test_mp_transition_boundary_fn_to_body) {
-    TEST_CASE("BOUNDARY_FN -> BODY on other char");
-
-    const char boundary[] = "B";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = BOUNDARY_FN;
-
-    const char input[] = "X";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(BODY, parser.stage, "BOUNDARY_FN -> BODY on 'X'");
-    close(fd);
-}
-
-TEST(test_mp_transition_first_dash_to_second_dash) {
-    TEST_CASE("FIRST_DASH -> SECOND_DASH on '-'");
-
-    const char boundary[] = "B";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = FIRST_DASH;
-
-    const char input[] = "-";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(SECOND_DASH, parser.stage, "FIRST_DASH -> SECOND_DASH on '-'");
-    close(fd);
-}
-
-TEST(test_mp_transition_first_dash_to_boundary_fn) {
-    TEST_CASE("FIRST_DASH -> BOUNDARY_FN on \\r");
-
-    const char boundary[] = "B";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = FIRST_DASH;
-
-    const char input[] = "\r";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(BOUNDARY_FN, parser.stage, "FIRST_DASH -> BOUNDARY_FN on \\r");
-    close(fd);
-}
-
-TEST(test_mp_transition_first_dash_to_body) {
-    TEST_CASE("FIRST_DASH -> BODY on non-dash non-\\r");
-
-    const char boundary[] = "B";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = FIRST_DASH;
-
-    const char input[] = "A";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(BODY, parser.stage, "FIRST_DASH -> BODY on 'A'");
-    close(fd);
-}
-
-TEST(test_mp_transition_second_dash_to_boundary) {
-    TEST_CASE("SECOND_DASH -> BOUNDARY on '-'");
-
-    const char boundary[] = "ABC";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = SECOND_DASH;
-
-    const char input[] = "-";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(BOUNDARY, parser.stage, "SECOND_DASH -> BOUNDARY on '-'");
-    close(fd);
-}
-
-TEST(test_mp_transition_second_dash_to_boundary_fn) {
-    TEST_CASE("SECOND_DASH -> BOUNDARY_FN on \\r");
-
-    const char boundary[] = "B";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = SECOND_DASH;
-
-    const char input[] = "\r";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(BOUNDARY_FN, parser.stage, "SECOND_DASH -> BOUNDARY_FN on \\r");
-    close(fd);
-}
-
-TEST(test_mp_transition_second_dash_to_body) {
-    TEST_CASE("SECOND_DASH -> BODY on non-dash non-\\r");
-
-    const char boundary[] = "B";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = SECOND_DASH;
-
-    const char input[] = "Z";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(BODY, parser.stage, "SECOND_DASH -> BODY on 'Z'");
-    close(fd);
-}
-
-TEST(test_mp_transition_boundary_match) {
-    TEST_CASE("BOUNDARY stays when char matches");
-
-    const char boundary[] = "ABC";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = SECOND_DASH;
-
-    // "--A" : SECOND_DASH -> BOUNDARY (on '-'), BOUNDARY checks 'A' == boundary[0]
-    const char input[] = "-A";
-    multipartparser_parse(&parser, (char*)input, 2);
-    TEST_ASSERT_EQUAL(BOUNDARY, parser.stage, "BOUNDARY stays on match");
-    close(fd);
-}
-
-TEST(test_mp_transition_boundary_mismatch_to_body) {
-    TEST_CASE("BOUNDARY -> BODY on mismatched char");
-
-    const char boundary[] = "ABC";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = SECOND_DASH;
-
-    // "--X" : SECOND_DASH -> BOUNDARY, then BOUNDARY gets 'X' != 'A'
-    const char input[] = "-X";
-    multipartparser_parse(&parser, (char*)input, 2);
-    TEST_ASSERT_EQUAL(BODY, parser.stage, "BOUNDARY -> BODY on mismatch");
-    close(fd);
-}
-
-TEST(test_mp_transition_boundary_complete_to_boundary_fd) {
-    TEST_CASE("BOUNDARY -> BOUNDARY_FD when full boundary matched");
-
-    const char boundary[] = "AB";
-    int fd = create_payload_fd("--AB\r\n", 6);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = SECOND_DASH;
-
-    // "--AB" : SECOND_DASH -> BOUNDARY -> BOUNDARY (A matches) -> BOUNDARY_FD (B matches last)
-    const char input[] = "-AB";
-    multipartparser_parse(&parser, (char*)input, 3);
-    TEST_ASSERT_EQUAL(BOUNDARY_FD, parser.stage, "BOUNDARY -> BOUNDARY_FD when complete");
-    close(fd);
-}
-
-TEST(test_mp_transition_boundary_fd_to_boundary_nl) {
-    TEST_CASE("BOUNDARY_FD -> BOUNDARY_NL on \\r");
-
-    const char boundary[] = "B";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = BOUNDARY_FD;
-
-    const char input[] = "\r";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(BOUNDARY_NL, parser.stage, "BOUNDARY_FD -> BOUNDARY_NL on \\r");
-    close(fd);
-}
-
-TEST(test_mp_transition_boundary_fd_to_boundary_sd) {
-    TEST_CASE("BOUNDARY_FD -> BOUNDARY_SD on '-' (closing)");
-
-    const char boundary[] = "B";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = BOUNDARY_FD;
-
-    const char input[] = "-";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(BOUNDARY_SD, parser.stage, "BOUNDARY_FD -> BOUNDARY_SD on '-'");
-    close(fd);
-}
-
-TEST(test_mp_transition_boundary_fd_to_body) {
-    TEST_CASE("BOUNDARY_FD -> BODY on invalid char");
-
-    const char boundary[] = "B";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = BOUNDARY_FD;
-
-    const char input[] = "Z";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(BODY, parser.stage, "BOUNDARY_FD -> BODY on invalid");
-    close(fd);
-}
-
-TEST(test_mp_transition_boundary_nl_to_header_key) {
-    TEST_CASE("BOUNDARY_NL -> HEADER_KEY on \\n");
-
-    const char boundary[] = "B";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = BOUNDARY_NL;
-
-    const char input[] = "\n";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(HEADER_KEY, parser.stage, "BOUNDARY_NL -> HEADER_KEY on \\n");
-    close(fd);
-}
-
-TEST(test_mp_transition_boundary_nl_to_body) {
-    TEST_CASE("BOUNDARY_NL -> BODY on invalid char");
-
-    const char boundary[] = "B";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = BOUNDARY_NL;
-
-    const char input[] = "X";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(BODY, parser.stage, "BOUNDARY_NL -> BODY on invalid");
-    close(fd);
-}
-
 TEST(test_mp_transition_header_key_to_header_space) {
-    TEST_CASE("HEADER_KEY -> HEADER_SPACE on ':'");
+    TEST_CASE("MP_STG_HEADER_KEY -> MP_STG_HEADER_SPACE on ':'");
 
     const char boundary[] = "B";
     int fd = create_payload_fd("x", 1);
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    parser.stage = HEADER_KEY;
+    parser.stage = MP_STG_HEADER_KEY;
     parser.header_key_offset = 0;
     parser.header_key_size = 0;
 
     const char input[] = "K:";
-    multipartparser_parse(&parser, (char*)input, 2);
-    TEST_ASSERT_EQUAL(HEADER_SPACE, parser.stage, "HEADER_KEY -> HEADER_SPACE on ':'");
+    multipart_res_e res = multipartparser_parse(&parser, (char*)input, 2);
+    TEST_ASSERT(res == MP_RES_PARTIAL, "Parse should complete");
+    TEST_ASSERT_EQUAL(MP_STG_HEADER_SPACE, parser.stage, "MP_STG_HEADER_KEY -> MP_STG_HEADER_SPACE on ':'");
     TEST_ASSERT_EQUAL_SIZE(1, parser.header_key_size, "Key size should be 1");
     close(fd);
 }
 
 TEST(test_mp_transition_header_key_to_end_n) {
-    TEST_CASE("HEADER_KEY -> END_N on \\r (end of headers)");
+    TEST_CASE("MP_STG_HEADER_KEY -> END_N on \\r (end of headers)");
 
     const char boundary[] = "B";
     int fd = create_payload_fd("x", 1);
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    parser.stage = HEADER_KEY;
+    parser.stage = MP_STG_HEADER_KEY;
 
     const char input[] = "\r";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(END_N, parser.stage, "HEADER_KEY -> END_N on \\r");
+    multipart_res_e res = multipartparser_parse(&parser, (char*)input, 1);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should return error");
     close(fd);
 }
 
 TEST(test_mp_transition_header_space_skips_spaces) {
-    TEST_CASE("HEADER_SPACE stays on space chars");
+    TEST_CASE("MP_STG_HEADER_SPACE stays on space chars");
 
     const char boundary[] = "B";
     int fd = create_payload_fd("x", 1);
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    parser.stage = HEADER_SPACE;
+    parser.stage = MP_STG_HEADER_SPACE;
     parser.header_value_offset = 0;
     parser.header_value_size = 0;
 
     const char input[] = "   ";
-    multipartparser_parse(&parser, (char*)input, 3);
-    TEST_ASSERT_EQUAL(HEADER_SPACE, parser.stage, "HEADER_SPACE stays on spaces");
+    multipart_res_e res = multipartparser_parse(&parser, (char*)input, 3);
+    TEST_ASSERT(res == MP_RES_PARTIAL, "Parse should complete");
+    TEST_ASSERT_EQUAL(MP_STG_HEADER_SPACE, parser.stage, "MP_STG_HEADER_SPACE stays on spaces");
     close(fd);
 }
 
 TEST(test_mp_transition_header_space_to_header_value) {
-    TEST_CASE("HEADER_SPACE -> HEADER_VALUE on non-space");
+    TEST_CASE("MP_STG_HEADER_SPACE -> MP_STG_HEADER_VALUE on non-space");
 
     const char boundary[] = "B";
     int fd = create_payload_fd("x", 1);
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    parser.stage = HEADER_SPACE;
+    parser.stage = MP_STG_HEADER_SPACE;
     parser.header_value_offset = 0;
     parser.header_value_size = 0;
 
     const char input[] = "v";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(HEADER_VALUE, parser.stage, "HEADER_SPACE -> HEADER_VALUE");
+    multipart_res_e res = multipartparser_parse(&parser, (char*)input, 1);
+    TEST_ASSERT(res == MP_RES_PARTIAL, "Parse should complete");
+    TEST_ASSERT_EQUAL(MP_STG_HEADER_VALUE, parser.stage, "MP_STG_HEADER_SPACE -> MP_STG_HEADER_VALUE");
     TEST_ASSERT_EQUAL_SIZE(1, parser.header_value_size, "Value size should be 1");
     close(fd);
 }
 
 TEST(test_mp_transition_header_value_to_header_n) {
-    TEST_CASE("HEADER_VALUE -> HEADER_N on \\r");
+    TEST_CASE("MP_STG_HEADER_VALUE -> HEADER_N on \\r");
 
     const char boundary[] = "B";
     int fd = create_payload_fd("x", 1);
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    parser.stage = HEADER_VALUE;
+    parser.stage = MP_STG_HEADER_VALUE;
     parser.header_value_offset = 0;
     parser.header_value_size = 0;
 
     const char input[] = "val\r";
-    multipartparser_parse(&parser, (char*)input, 4);
-    TEST_ASSERT_EQUAL(HEADER_N, parser.stage, "HEADER_VALUE -> HEADER_N on \\r");
+    multipart_res_e res = multipartparser_parse(&parser, (char*)input, 4);
+    TEST_ASSERT(res == MP_RES_PARTIAL, "Parse should complete");
+    TEST_ASSERT_EQUAL(MP_STG_HEADER_END, parser.stage, "MP_STG_HEADER_VALUE -> HEADER_N on \\r");
     TEST_ASSERT_EQUAL_SIZE(3, parser.header_value_size, "Value size should be 3");
     close(fd);
 }
 
 TEST(test_mp_transition_header_n_to_body_on_invalid) {
-    TEST_CASE("HEADER_N -> BODY on non-\\n char");
+    TEST_CASE("HEADER_N -> error on non-\\n char");
 
     const char boundary[] = "B";
     int fd = create_payload_fd("x", 1);
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    parser.stage = HEADER_N;
+    parser.stage = MP_STG_HEADER_END;
     parser.header_key_offset = 0;
     parser.header_key_size = 4;
     parser.header_value_offset = 6;
     parser.header_value_size = 3;
 
     const char input[] = "X";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(BODY, parser.stage, "HEADER_N -> BODY on non-\\n");
-    close(fd);
-}
-
-TEST(test_mp_transition_end_n_to_body) {
-    TEST_CASE("END_N -> BODY on \\n");
-
-    const char boundary[] = "B";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = END_N;
-
-    const char input[] = "\n";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(BODY, parser.stage, "END_N -> BODY on \\n");
-    close(fd);
-}
-
-TEST(test_mp_transition_boundary_sd_to_body) {
-    TEST_CASE("BOUNDARY_SD -> BODY on '-' (closing boundary)");
-
-    const char boundary[] = "B";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = BOUNDARY_SD;
-
-    const char input[] = "-";
-    multipartparser_parse(&parser, (char*)input, 1);
-    TEST_ASSERT_EQUAL(BODY, parser.stage, "BOUNDARY_SD -> BODY on '-'");
-    close(fd);
-}
-
-TEST(test_mp_transition_chain_initial_boundary) {
-    TEST_CASE("Full chain: BOUNDARY_FN -> SECOND_DASH -> BOUNDARY via --");
-
-    const char boundary[] = "ABC";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    // stage is BOUNDARY_FN from init
-
-    const char input[] = "--A";
-    multipartparser_parse(&parser, (char*)input, 3);
-    TEST_ASSERT_EQUAL(BOUNDARY, parser.stage, "BOUNDARY_FN -> SECOND_DASH -> BOUNDARY via --A");
-    close(fd);
-}
-
-TEST(test_mp_transition_chain_body_to_boundary) {
-    TEST_CASE("Full chain: BODY -> BOUNDARY_FN -> FIRST_DASH -> SECOND_DASH -> BOUNDARY");
-
-    const char boundary[] = "ABC";
-    int fd = create_payload_fd("x", 1);
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-    parser.stage = BODY;
-
-    const char input[] = "\r\n--A";
-    multipartparser_parse(&parser, (char*)input, 5);
-    TEST_ASSERT_EQUAL(BOUNDARY, parser.stage, "BODY -> ... -> BOUNDARY via \\r\\n--A");
+    multipart_res_e result = multipartparser_parse(&parser, (char*)input, 1);
+    TEST_ASSERT_EQUAL(MP_RES_ERROR, result, "Should return error on non-\\n after \\r in header");
+    TEST_ASSERT_NOT_NULL(parser.error, "Error should be set");
     close(fd);
 }
 
@@ -899,18 +694,27 @@ TEST(test_mp_header_no_space_after_colon) {
         "Content-Disposition:form-data; name=\"x\"\r\n"
         "\r\n"
         "v\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have one part");
     TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"x\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("x", part->field->value, "Field value");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("v", v, "MP_STG_BODY should be 'v'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -931,14 +735,15 @@ TEST(test_mp_content_disposition_name_and_filename) {
         "Content-Disposition: form-data; name=\"upload\"; filename=\"doc.pdf\"\r\n"
         "\r\n"
         "%PDF-fake\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have one part");
@@ -950,18 +755,23 @@ TEST(test_mp_content_disposition_name_and_filename) {
     TEST_ASSERT_STR_EQUAL("filename", part->field->next->key, "Second field key");
     TEST_ASSERT_STR_EQUAL("doc.pdf", part->field->next->value, "Second field value");
 
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("%PDF-fake", v, "MP_STG_BODY should be '%PDF-fake'");
+    free(v);
+
     free_parts(part);
     free_orphan_headers(parser.header);
     close(fd);
 }
 
 // ============================================================================
-// Test Suite 11: Binary body content
+// Test Suite 11: Binary MP_STG_BODY content
 // ============================================================================
 
 TEST(test_mp_binary_body) {
     TEST_SUITE("Multipart Parser - Binary Content");
-    TEST_CASE("Part with binary body content");
+    TEST_CASE("Part with binary MP_STG_BODY content");
 
     const char boundary[] = "B";
     const char payload[] =
@@ -969,17 +779,23 @@ TEST(test_mp_binary_body) {
         "Content-Disposition: form-data; name=\"bin\"\r\n"
         "\r\n"
         "\x01\x02\x03\x00\xFF\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
-    TEST_ASSERT_NOT_NULL(part, "Should parse part with binary body");
+    TEST_ASSERT_NOT_NULL(part, "Should parse part with binary MP_STG_BODY");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"bin\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("bin", part->field->value, "Field value");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -988,7 +804,7 @@ TEST(test_mp_binary_body) {
 
 TEST(test_mp_binary_body2) {
     TEST_SUITE("Multipart Parser - Binary Content");
-    TEST_CASE("Part with binary body content");
+    TEST_CASE("Part with binary MP_STG_BODY content");
 
     const char boundary[] = "B";
     const char payload[] =
@@ -997,17 +813,26 @@ TEST(test_mp_binary_body2) {
         "Content-Type: application/pdf\r\n"
         "\r\n"
         "\x01\x02\x03\x00\xFF\r\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
-    TEST_ASSERT_NOT_NULL(part, "Should parse part with binary body");
+    TEST_ASSERT_NOT_NULL(part, "Should parse part with binary MP_STG_BODY");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have headers");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "First header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"bin\"", part->header->value, "First header value");
+    TEST_ASSERT_NOT_NULL(part->header->next, "Should have second header");
+    TEST_ASSERT_STR_EQUAL("Content-Type", part->header->next->key, "Second header key");
+    TEST_ASSERT_STR_EQUAL("application/pdf", part->header->next->value, "Second header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("bin", part->field->value, "Field value");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -1016,7 +841,7 @@ TEST(test_mp_binary_body2) {
 
 TEST(test_mp_binary_body3) {
     TEST_SUITE("Multipart Parser - Binary Content");
-    TEST_CASE("Part with binary body content");
+    TEST_CASE("Part with binary MP_STG_BODY content");
 
     const char boundary[] = "B";
     const char payload[] =
@@ -1025,17 +850,26 @@ TEST(test_mp_binary_body3) {
         "Content-Type: application/pdf\r\n"
         "\r\n"
         "\x01\x02\x03\x00\xFF\r\n\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
-    TEST_ASSERT_NOT_NULL(part, "Should parse part with binary body");
+    TEST_ASSERT_NOT_NULL(part, "Should parse part with binary MP_STG_BODY");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have headers");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "First header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"bin\"", part->header->value, "First header value");
+    TEST_ASSERT_NOT_NULL(part->header->next, "Should have second header");
+    TEST_ASSERT_STR_EQUAL("Content-Type", part->header->next->key, "Second header key");
+    TEST_ASSERT_STR_EQUAL("application/pdf", part->header->next->value, "Second header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("bin", part->field->value, "Field value");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -1044,7 +878,7 @@ TEST(test_mp_binary_body3) {
 
 TEST(test_mp_binary_body4) {
     TEST_SUITE("Multipart Parser - Binary Content");
-    TEST_CASE("Part with binary body content");
+    TEST_CASE("Part with binary MP_STG_BODY content");
 
     const char boundary[] = "B";
     const char payload[] =
@@ -1053,17 +887,26 @@ TEST(test_mp_binary_body4) {
         "Content-Type: application/pdf\r\n"
         "\r\n"
         "\x01\x02\x03\x00\xFF\n\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
-    TEST_ASSERT_NOT_NULL(part, "Should parse part with binary body");
+    TEST_ASSERT_NOT_NULL(part, "Should parse part with binary MP_STG_BODY");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have headers");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "First header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"bin\"", part->header->value, "First header value");
+    TEST_ASSERT_NOT_NULL(part->header->next, "Should have second header");
+    TEST_ASSERT_STR_EQUAL("Content-Type", part->header->next->key, "Second header key");
+    TEST_ASSERT_STR_EQUAL("application/pdf", part->header->next->value, "Second header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("bin", part->field->value, "Field value");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -1071,12 +914,12 @@ TEST(test_mp_binary_body4) {
 }
 
 // ============================================================================
-// Test Suite 12: Body with multiline \r\n
+// Test Suite 12: MP_STG_BODY with multiline \r\n
 // ============================================================================
 
 TEST(test_mp_body_multiline_cr_lf) {
-    TEST_SUITE("Multipart Parser - Multiline Body");
-    TEST_CASE("Body with multiple \\r\\n that don't form boundary");
+    TEST_SUITE("Multipart Parser - Multiline MP_STG_BODY");
+    TEST_CASE("MP_STG_BODY with multiple \\r\\n that don't form boundary");
 
     const char boundary[] = "MYBOUNDARY";
     const char payload[] =
@@ -1084,19 +927,29 @@ TEST(test_mp_body_multiline_cr_lf) {
         "Content-Disposition: form-data; name=\"text\"\r\n"
         "\r\n"
         "line1\r\nline2\r\nline3\r\n"
-        "--MYBOUNDARY--";
+        "--MYBOUNDARY--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have one part");
     TEST_ASSERT_NULL(part->next, "Should have exactly one part");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"text\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
     TEST_ASSERT_STR_EQUAL("text", part->field->value, "Field value should be 'text'");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("line1\r\nline2\r\nline3", v, "MP_STG_BODY should be multiline");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -1112,14 +965,15 @@ TEST(test_mp_closing_boundary_only) {
     TEST_CASE("Closing boundary with no parts");
 
     const char boundary[] = "B";
-    const char payload[] = "--B--";
+    const char payload[] = "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NULL(part, "Should have no parts for closing-only boundary");
@@ -1133,7 +987,7 @@ TEST(test_mp_closing_boundary_only) {
 
 TEST(test_mp_part_offset) {
     TEST_SUITE("Multipart Parser - Offset Tracking");
-    TEST_CASE("Verify part offset points to body start");
+    TEST_CASE("Verify part offset points to MP_STG_BODY start");
 
     const char boundary[] = "B";
     const char payload[] =
@@ -1141,14 +995,15 @@ TEST(test_mp_part_offset) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "ABCD\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have one part");
@@ -1157,7 +1012,7 @@ TEST(test_mp_part_offset) {
     // "Content-Disposition: form-data; name=\"f\"\r\n" = 41
     // "\r\n" = 2
     // Total header + separator = 48, +1 for \n after \r in END_N
-    TEST_ASSERT_EQUAL_SIZE(49, part->offset, "Part offset should point to body start");
+    TEST_ASSERT_EQUAL_SIZE(49, part->offset, "Part offset should point to MP_STG_BODY start");
     TEST_ASSERT(part->size > 0, "Part size should be > 0");
 
     free_parts(part);
@@ -1179,17 +1034,28 @@ TEST(test_mp_long_boundary) {
         "Content-Disposition: form-data; name=\"x\"\r\n"
         "\r\n"
         "v\r\n"
-        "------WebKitFormBoundaryRAndOMCharACTerS123456789--";
+        "------WebKitFormBoundaryRAndOMCharACTerS123456789--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should parse with long boundary");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"x\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("x", part->field->value, "Field value");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("v", v, "MP_STG_BODY should be 'v'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -1205,18 +1071,28 @@ TEST(test_mp_short_boundary) {
         "Content-Disposition: form-data; name=\"a\"\r\n"
         "\r\n"
         "b\r\n"
-        "--X--";
+        "--X--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should parse with single-char boundary");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"a\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
     TEST_ASSERT_STR_EQUAL("a", part->field->value, "Field value should be 'a'");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("b", v, "MP_STG_BODY should be 'b'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -1224,12 +1100,12 @@ TEST(test_mp_short_boundary) {
 }
 
 // ============================================================================
-// Test Suite 16: Tricky body content with CR/LF combinations
+// Test Suite 16: Tricky MP_STG_BODY content with CR/LF combinations
 // ============================================================================
 
 TEST(test_mp_body_cr_cr_lf_before_boundary) {
-    TEST_SUITE("Multipart Parser - CR/LF Edge Cases in Body");
-    TEST_CASE("Body ends with \\r\\r\\n before boundary");
+    TEST_SUITE("Multipart Parser - CR/LF Edge Cases in MP_STG_BODY");
+    TEST_CASE("MP_STG_BODY ends with \\r\\r\\n before boundary");
 
     const char boundary[] = "B";
     const char payload[] =
@@ -1237,17 +1113,187 @@ TEST(test_mp_body_cr_cr_lf_before_boundary) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\r\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should find boundary after \\r\\r\\n");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    free_parts(part);
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+TEST(test_mp_body_cr_cr_lf_before_boundary2) {
+    TEST_SUITE("Multipart Parser - CR/LF Edge Cases in MP_STG_BODY");
+    TEST_CASE("MP_STG_BODY ends with \\r\\r\\n before boundary");
+
+    const char boundary[] = "B";
+    const char payload[] =
+        "--B\r\n"
+        "Content-Disposition: form-data; name=\"f\"\r\n"
+        "\r\n"
+        "da\r\r\n-\r\n"
+        "--B--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    http_payloadpart_t* part = multipartparser_part(&parser);
+    TEST_ASSERT_NOT_NULL(part, "Should find boundary after \\r\\r\\n");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    free_parts(part);
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+TEST(test_mp_body_cr_cr_lf_before_boundary3) {
+    TEST_SUITE("Multipart Parser - CR/LF Edge Cases in MP_STG_BODY");
+    TEST_CASE("MP_STG_BODY ends with \\r\\r\\n before boundary");
+
+    const char boundary[] = "B";
+    const char payload[] =
+        "--B\r\n"
+        "Content-Disposition: form-data; name=\"f\"\r\n"
+        "\r\n"
+        "da\r\r\n--\r\n"
+        "--B--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    http_payloadpart_t* part = multipartparser_part(&parser);
+    TEST_ASSERT_NOT_NULL(part, "Should find boundary after \\r\\r\\n");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    free_parts(part);
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+TEST(test_mp_body_cr_cr_lf_before_boundary4) {
+    TEST_SUITE("Multipart Parser - CR/LF Edge Cases in MP_STG_BODY");
+    TEST_CASE("MP_STG_BODY ends with \\r\\r\\n before boundary");
+
+    const char boundary[] = "B";
+    const char payload[] =
+        "--B\r\n"
+        "Content-Disposition: form-data; name=\"f\"\r\n"
+        "\r\n"
+        "da\r\r\n---\r\n"
+        "--B--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    http_payloadpart_t* part = multipartparser_part(&parser);
+    TEST_ASSERT_NOT_NULL(part, "Should find boundary after \\r\\r\\n");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    free_parts(part);
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+TEST(test_mp_body_cr_cr_lf_before_boundary5) {
+    TEST_SUITE("Multipart Parser - CR/LF Edge Cases in MP_STG_BODY");
+    TEST_CASE("MP_STG_BODY ends with \\r\\r\\n before boundary");
+
+    const char boundary[] = "B";
+    const char payload[] =
+        "--B\r\n"
+        "Content-Disposition: form-data; name=\"f\"\r\n"
+        "\r\n"
+        "da\r\r\n----\r\n"
+        "--B--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    http_payloadpart_t* part = multipartparser_part(&parser);
+    TEST_ASSERT_NOT_NULL(part, "Should find boundary after \\r\\r\\n");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    free_parts(part);
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+TEST(test_mp_body_cr_cr_lf_before_boundary6) {
+    TEST_SUITE("Multipart Parser - CR/LF Edge Cases in MP_STG_BODY");
+    TEST_CASE("MP_STG_BODY ends with \\r\\r\\n before boundary");
+
+    const char boundary[] = "B";
+    const char payload[] =
+        "--B\r\n"
+        "Content-Disposition: form-data; name=\"f\"\r\n"
+        "\r\n"
+        "da\r\r\n----B\r\n"
+        "--B--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    http_payloadpart_t* part = multipartparser_part(&parser);
+    TEST_ASSERT_NOT_NULL(part, "Should find boundary after \\r\\r\\n");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
     TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
 
     free_parts(part);
@@ -1256,7 +1302,7 @@ TEST(test_mp_body_cr_cr_lf_before_boundary) {
 }
 
 TEST(test_mp_body_cr_cr_cr_lf_before_boundary) {
-    TEST_CASE("Body ends with \\r\\r\\r\\n before boundary");
+    TEST_CASE("MP_STG_BODY ends with \\r\\r\\r\\n before boundary");
 
     const char boundary[] = "B";
     const char payload[] =
@@ -1264,17 +1310,23 @@ TEST(test_mp_body_cr_cr_cr_lf_before_boundary) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\r\r\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should find boundary after \\r\\r\\r\\n");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -1282,7 +1334,7 @@ TEST(test_mp_body_cr_cr_cr_lf_before_boundary) {
 }
 
 TEST(test_mp_body_lf_before_boundary) {
-    TEST_CASE("Body ends with bare \\n before boundary (no \\r)");
+    TEST_CASE("MP_STG_BODY ends with bare \\n before boundary (no \\r)");
 
     const char boundary[] = "B";
     const char payload[] =
@@ -1290,14 +1342,15 @@ TEST(test_mp_body_lf_before_boundary) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_PARTIAL, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NULL(part, "Bare \\n should not trigger boundary detection (RFC requires CRLF)");
@@ -1308,7 +1361,7 @@ TEST(test_mp_body_lf_before_boundary) {
 }
 
 TEST(test_mp_body_cr_lf_cr_lf_before_boundary) {
-    TEST_CASE("Body ends with \\r\\n\\r\\n before boundary");
+    TEST_CASE("MP_STG_BODY ends with \\r\\n\\r\\n before boundary");
 
     const char boundary[] = "B";
     const char payload[] =
@@ -1316,17 +1369,23 @@ TEST(test_mp_body_cr_lf_cr_lf_before_boundary) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\r\n\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should find boundary after \\r\\n\\r\\n");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -1334,7 +1393,7 @@ TEST(test_mp_body_cr_lf_cr_lf_before_boundary) {
 }
 
 TEST(test_mp_body_lf_cr_lf_before_boundary) {
-    TEST_CASE("Body ends with \\n\\r\\n before boundary");
+    TEST_CASE("MP_STG_BODY ends with \\n\\r\\n before boundary");
 
     const char boundary[] = "B";
     const char payload[] =
@@ -1342,18 +1401,24 @@ TEST(test_mp_body_lf_cr_lf_before_boundary) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\n\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
-    // \n -> BODY, \r -> BOUNDARY_FN, \n -> FIRST_DASH, - -> SECOND_DASH, - -> BOUNDARY
+    // \n -> MP_STG_BODY, \r -> BOUNDARY_FN, \n -> FIRST_DASH, - -> SECOND_DASH, - -> BOUNDARY
     TEST_ASSERT_NOT_NULL(part, "Should find boundary after \\n\\r\\n");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -1361,7 +1426,7 @@ TEST(test_mp_body_lf_cr_lf_before_boundary) {
 }
 
 TEST(test_mp_body_only_cr_before_boundary) {
-    TEST_CASE("Body ends with bare \\r then --boundary");
+    TEST_CASE("MP_STG_BODY ends with bare \\r then --boundary");
 
     const char boundary[] = "B";
     const char payload[] =
@@ -1369,18 +1434,22 @@ TEST(test_mp_body_only_cr_before_boundary) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\r"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_PARTIAL, "Should not find boundary after bare \\r");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     // \r -> BOUNDARY_FN, '-' -> SECOND_DASH, '-' -> BOUNDARY
-    TEST_ASSERT_NOT_NULL(part, "Should find boundary after bare \\r then --");
+    TEST_ASSERT_NULL(part, "Should not find boundary after bare \\r then --");
+    TEST_ASSERT_NOT_NULL(parser.header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", parser.header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", parser.header->value, "Header value");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -1388,7 +1457,7 @@ TEST(test_mp_body_only_cr_before_boundary) {
 }
 
 TEST(test_mp_body_multiple_cr_before_lf) {
-    TEST_CASE("Body ends with \\r\\r\\r\\r\\n before boundary");
+    TEST_CASE("MP_STG_BODY ends with \\r\\r\\r\\r\\n before boundary");
 
     const char boundary[] = "BND";
     const char payload[] =
@@ -1396,17 +1465,23 @@ TEST(test_mp_body_multiple_cr_before_lf) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\r\r\r\r\n"
-        "--BND--";
+        "--BND--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should find boundary after many \\r before \\n");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -1414,7 +1489,7 @@ TEST(test_mp_body_multiple_cr_before_lf) {
 }
 
 TEST(test_mp_body_null_byte_in_middle) {
-    TEST_CASE("Body contains null byte");
+    TEST_CASE("MP_STG_BODY contains null byte");
 
     const char boundary[] = "B";
     const char payload[] =
@@ -1422,17 +1497,23 @@ TEST(test_mp_body_null_byte_in_middle) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "before\x00after\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
-    TEST_ASSERT_NOT_NULL(part, "Should parse body with null byte");
+    TEST_ASSERT_NOT_NULL(part, "Should parse MP_STG_BODY with null byte");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -1440,7 +1521,7 @@ TEST(test_mp_body_null_byte_in_middle) {
 }
 
 TEST(test_mp_body_contains_double_dash) {
-    TEST_CASE("Body contains -- that is not a boundary");
+    TEST_CASE("MP_STG_BODY contains -- that is not a boundary");
 
     const char boundary[] = "MYBOUND";
     const char payload[] =
@@ -1448,18 +1529,29 @@ TEST(test_mp_body_contains_double_dash) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "text with -- inside\r\n"
-        "--MYBOUND--";
+        "--MYBOUND--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
-    TEST_ASSERT_NOT_NULL(part, "Should not confuse -- in body with boundary");
+    TEST_ASSERT_NOT_NULL(part, "Should not confuse -- in MP_STG_BODY with boundary");
     TEST_ASSERT_NULL(part->next, "Should have exactly one part");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("text with -- inside", v, "MP_STG_BODY should be 'text with -- inside'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -1467,7 +1559,7 @@ TEST(test_mp_body_contains_double_dash) {
 }
 
 TEST(test_mp_body_cr_only_no_closing_boundary) {
-    TEST_CASE("Body is just \\r with no closing boundary");
+    TEST_CASE("MP_STG_BODY is just \\r with no closing boundary");
 
     const char boundary[] = "B";
     const char payload[] =
@@ -1481,7 +1573,8 @@ TEST(test_mp_body_cr_only_no_closing_boundary) {
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_PARTIAL, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NULL(part, "Incomplete payload should not produce part");
@@ -1492,7 +1585,7 @@ TEST(test_mp_body_cr_only_no_closing_boundary) {
 }
 
 TEST(test_mp_body_lf_lf_before_boundary) {
-    TEST_CASE("Body ends with \\n\\n before boundary");
+    TEST_CASE("MP_STG_BODY ends with \\n\\n before boundary");
 
     const char boundary[] = "B";
     const char payload[] =
@@ -1500,14 +1593,15 @@ TEST(test_mp_body_lf_lf_before_boundary) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\n\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_PARTIAL, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NULL(part, "Bare \\n\\n should not trigger boundary");
@@ -1518,7 +1612,7 @@ TEST(test_mp_body_lf_lf_before_boundary) {
 }
 
 TEST(test_mp_two_parts_first_body_cr_cr_lf) {
-    TEST_CASE("Two parts where first body ends with \\r\\r\\n");
+    TEST_CASE("Two parts where first MP_STG_BODY ends with \\r\\r\\n");
 
     const char boundary[] = "B";
     const char payload[] =
@@ -1530,22 +1624,83 @@ TEST(test_mp_two_parts_first_body_cr_cr_lf) {
         "Content-Disposition: form-data; name=\"b\"\r\n"
         "\r\n"
         "BBB\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have first part");
     TEST_ASSERT_NOT_NULL(part->next, "Should have second part");
+
+    TEST_ASSERT_NOT_NULL(part->header, "Part 1 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Part 1 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"a\"", part->header->value, "Part 1 header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Part 1 field key");
     TEST_ASSERT_STR_EQUAL("a", part->field->value, "Part 1 value");
+
+    TEST_ASSERT_NOT_NULL(part->next->header, "Part 2 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->next->header->key, "Part 2 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"b\"", part->next->header->value, "Part 2 header value");
+    TEST_ASSERT_STR_EQUAL("name", part->next->field->key, "Part 2 field key");
     TEST_ASSERT_STR_EQUAL("b", part->next->field->value, "Part 2 value");
 
     free_parts(part);
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+TEST(test_mp_first_header_lf_lf) {
+    TEST_CASE("Two parts where first MP_STG_BODY ends with \\n\\n");
+
+    const char boundary[] = "B";
+    const char payload[] =
+        "--B\r\n"
+        "Content-Disposition: form-data; name=\"a\"\r\n"
+        "\n\n"
+        "AAA\r\r\n"
+        "--B\r\n"
+        "Content-Disposition: form-data; name=\"b\"\r\n"
+        "\r\n"
+        "BBB\r\n"
+        "--B--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
+
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+TEST(test_mp_first_incorrect_header_key) {
+    TEST_CASE("Two parts where first MP_STG_BODY ends with \\n\\n");
+
+    const char boundary[] = "B";
+    const char payload[] =
+        "--B\r\n"
+        "Content-Dispo;sition: form-data; name=\"a\"\r\n"
+        "\n\n"
+        "BBB\r\n"
+        "--B--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
+
     free_orphan_headers(parser.header);
     close(fd);
 }
@@ -1556,25 +1711,26 @@ TEST(test_mp_two_parts_first_body_cr_cr_lf) {
 
 TEST(test_mp_no_headers_at_all) {
     TEST_SUITE("Multipart Parser - Malformed Payloads");
-    TEST_CASE("Part with no headers, body immediately after boundary");
+    TEST_CASE("Part with no headers, MP_STG_BODY immediately after boundary");
 
     const char boundary[] = "B";
-    // After boundary there is \r\n then immediately body data
-    // No headers, no \r\n separator between headers and body
+    // After boundary there is \r\n then immediately MP_STG_BODY data
+    // No headers, no \r\n separator between headers and MP_STG_BODY
     const char payload[] =
         "--B\r\n"
-        "body data\r\n"
-        "--B--";
+        "MP_STG_BODY data\r\n"
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
-    // "body data" is treated as a header key (no colon) -> stays in HEADER_KEY
-    // until \r triggers END_N, then \n -> BODY (offset set)
+    // "MP_STG_BODY data" is treated as a header key (no colon) -> stays in MP_STG_HEADER_KEY
+    // until \r triggers END_N, then \n -> MP_STG_BODY (offset set)
     // Then --B-- is closing boundary -> creates part with no headers
     http_payloadpart_t* part = multipartparser_part(&parser);
     // Parser should not crash; part may or may not be created
@@ -1593,14 +1749,15 @@ TEST(test_mp_header_without_crlf_terminator) {
     const char payload[] =
         "--B\r\n"
         "X: value"
-        "\r\n--B--";
+        "\r\n--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
     TEST_ASSERT(1, "Parser should not crash on unterminated header");
 
@@ -1619,21 +1776,73 @@ TEST(test_mp_empty_header_value) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should parse with empty header value");
     TEST_ASSERT_NOT_NULL(part->header, "Should have headers");
-    TEST_ASSERT_NULL(part->header->value, "Should not have header value");
     // First header: "X" with empty value, second: Content-Disposition
-    TEST_ASSERT_NOT_NULL(part->header->next, "Should have second header");
+    TEST_ASSERT_STR_EQUAL("X", part->header->key, "First header key");
+    TEST_ASSERT_STR_EQUAL("", part->header->value, "First empty value");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->next->key, "Second header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->next->value, "Second header key");
+
+    char* part_value = strndup(&payload[part->offset], part->size);
+    if (part_value)
+        TEST_ASSERT_STR_EQUAL("data", part_value, "Part value should be 'data'");
+
+    free(part_value);
+
+    free_parts(part);
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+TEST(test_mp_empty_header_value_after_space) {
+    TEST_SUITE("Multipart Parser - Empty Header Value After Space");
+    TEST_CASE("Empty header value after space with one header");
+
+    const char boundary[] = "BOUNDARY";
+    const char payload[] =
+        "--BOUNDARY\r\n"
+        "Content-Disposition: \r\n"
+        "\r\n"
+        "hello world\r\n"
+        "--BOUNDARY--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    http_payloadpart_t* part = multipartparser_part(&parser);
+    TEST_ASSERT_NOT_NULL(part, "Should have one part");
+    TEST_ASSERT_NULL(part->next, "Should have exactly one part");
+
+    TEST_ASSERT_NOT_NULL(part->header, "Part should have headers");
+    TEST_ASSERT_NOT_NULL(part->header->key, "Header key should be allocated");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key should match");
+    TEST_ASSERT_NOT_NULL(part->header->value, "Header value should be allocated");
+
+    char* part_value = strndup(&payload[part->offset], part->size);
+    if (part_value)
+        TEST_ASSERT_STR_EQUAL("hello world", part_value, "Part value should be 'hello world'");
+
+    free(part_value);
+
+    TEST_ASSERT_NULL(part->field, "Part should have a field");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -1649,17 +1858,18 @@ TEST(test_mp_header_colon_only) {
         ":\r\n"
         "\r\n"
         "data\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     // ":" produces a header with key_size=0, value_size=0
-    // Then \r\n is blank line -> END_N -> BODY
+    // Then \r\n is blank line -> END_N -> MP_STG_BODY
     // Part is created with a header that has empty key and value
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should create part with colon-only header");
@@ -1673,7 +1883,7 @@ TEST(test_mp_header_colon_only) {
 }
 
 TEST(test_mp_truncated_after_boundary) {
-    TEST_CASE("Payload ends right after boundary, no headers or body");
+    TEST_CASE("Payload ends right after boundary, no headers or MP_STG_BODY");
 
     const char boundary[] = "B";
     const char payload[] = "--B\r\n";
@@ -1683,7 +1893,8 @@ TEST(test_mp_truncated_after_boundary) {
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_PARTIAL, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NULL(part, "Truncated payload should not produce part");
@@ -1706,7 +1917,8 @@ TEST(test_mp_truncated_mid_header) {
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_PARTIAL, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NULL(part, "Truncated mid-header should not produce part");
@@ -1729,7 +1941,8 @@ TEST(test_mp_truncated_mid_header_value) {
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_PARTIAL, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NULL(part, "Truncated mid-value should not produce part");
@@ -1754,7 +1967,8 @@ TEST(test_mp_no_closing_boundary) {
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_PARTIAL, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NULL(part, "No closing boundary means no part created");
@@ -1773,14 +1987,15 @@ TEST(test_mp_wrong_boundary) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\r\n"
-        "--WRONG--";
+        "--WRONG--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NULL(part, "Wrong boundary should not produce part");
@@ -1801,7 +2016,8 @@ TEST(test_mp_empty_payload) {
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, 0);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, 0);
+    TEST_ASSERT_EQUAL(MP_RES_ERROR, res, "Parse should fail");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NULL(part, "Empty payload should not produce part");
@@ -1815,14 +2031,15 @@ TEST(test_mp_only_dashes) {
     TEST_CASE("Payload is just -- (incomplete boundary)");
 
     const char boundary[] = "B";
-    const char payload[] = "--";
+    const char payload[] = "--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NULL(part, "Incomplete boundary should not produce part");
@@ -1833,7 +2050,7 @@ TEST(test_mp_only_dashes) {
 }
 
 TEST(test_mp_only_boundary_no_dash_suffix) {
-    TEST_CASE("Boundary without closing -- and no headers/body");
+    TEST_CASE("Boundary without closing -- and no headers/MP_STG_BODY");
 
     const char boundary[] = "B";
     const char payload[] = "--B";
@@ -1843,7 +2060,8 @@ TEST(test_mp_only_boundary_no_dash_suffix) {
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_PARTIAL, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NULL(part, "Boundary without content should not produce part");
@@ -1854,25 +2072,26 @@ TEST(test_mp_only_boundary_no_dash_suffix) {
 }
 
 TEST(test_mp_no_blank_line_between_headers_and_body) {
-    TEST_CASE("Headers present but no \\r\\n separator before body");
+    TEST_CASE("Headers present but no \\r\\n separator before MP_STG_BODY");
 
     const char boundary[] = "B";
-    // Header line, then body immediately without \r\n blank line
+    // Header line, then MP_STG_BODY immediately without \r\n blank line
     const char payload[] =
         "--B\r\n"
         "Content-Disposition: form-data; name=\"f\"\r\n"
-        "body data\r\n"
-        "--B--";
+        "MP_STG_BODY data\r\n"
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
-    // "body data" is parsed as another header key (no colon) -> HEADER_KEY
-    // \r -> END_N, \n -> BODY (offset set). Then --B-- creates part.
+    // "MP_STG_BODY data" is parsed as another header key (no colon) -> MP_STG_HEADER_KEY
+    // \r -> END_N, \n -> MP_STG_BODY (offset set). Then --B-- creates part.
     TEST_ASSERT(1, "Parser should not crash without blank line separator");
 
     free_parts(multipartparser_part(&parser));
@@ -1889,14 +2108,15 @@ TEST(test_mp_lf_only_newlines) {
         "Content-Disposition: form-data; name=\"f\"\n"
         "\n"
         "data\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
     // Bare \n in BOUNDARY_FN triggers FIRST_DASH,
     // but after headers \n doesn't trigger END_N (expects \r first)
@@ -1917,14 +2137,15 @@ TEST(test_mp_cr_only_newlines) {
         "Content-Disposition: form-data; name=\"f\"\r"
         "\r"
         "data\r"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
     TEST_ASSERT(1, "Parser should not crash on CR-only payload");
 
@@ -1943,16 +2164,17 @@ TEST(test_mp_binary_garbage_before_boundary) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    // Start in BODY so garbage is consumed, then \r\n triggers boundary search
-    parser.stage = BODY;
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    // Start in MP_STG_BODY so garbage is consumed, then \r\n triggers boundary search
+    parser.stage = MP_STG_BODY;
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should find boundary after binary garbage preamble");
@@ -1963,7 +2185,7 @@ TEST(test_mp_binary_garbage_before_boundary) {
 }
 
 TEST(test_mp_binary_garbage_after_body) {
-    TEST_CASE("Random binary garbage after body, no closing boundary");
+    TEST_CASE("Random binary garbage after MP_STG_BODY, no closing boundary");
 
     const char boundary[] = "B";
     const char payload[] =
@@ -1978,10 +2200,11 @@ TEST(test_mp_binary_garbage_after_body) {
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_PARTIAL, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
-    // No closing boundary -> part not created (garbage consumed as body)
+    // No closing boundary -> part not created (garbage consumed as MP_STG_BODY)
     TEST_ASSERT_NULL(part, "No closing boundary with trailing garbage");
 
     free_parts(part);
@@ -1999,17 +2222,18 @@ TEST(test_mp_boundary_substring_prefix) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\r\n"
-        "--BORDER--";
+        "--BORDER--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
     // Parser matches "B" from "BORDER" -> BOUNDARY_FD
-    // Then 'R' is not '-' or '\r' -> BODY. Part created with wrong size.
+    // Then 'R' is not '-' or '\r' -> MP_STG_BODY. Part created with wrong size.
     // This tests that parser doesn't crash on boundary prefix mismatch.
     TEST_ASSERT(1, "Parser should not crash on boundary prefix confusion");
 
@@ -2028,17 +2252,28 @@ TEST(test_mp_double_closing_boundary) {
         "\r\n"
         "data\r\n"
         "--B--\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should parse part even with double closing");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("data", v, "MP_STG_BODY should be 'data'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -2055,18 +2290,30 @@ TEST(test_mp_header_value_with_colon) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should parse headers with colons in value");
     TEST_ASSERT_NOT_NULL(part->header->next, "Should have two headers");
+    TEST_ASSERT_STR_EQUAL("Content-Type", part->header->key, "First header key");
+    TEST_ASSERT_STR_EQUAL("text/plain; charset=utf-8", part->header->value, "First header value");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->next->key, "Second header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->next->value, "Second header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("data", v, "MP_STG_BODY should be 'data'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -2082,14 +2329,15 @@ TEST(test_mp_single_dash_before_boundary_name) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
     // Single dash doesn't form boundary, parser won't find opening boundary
     TEST_ASSERT(1, "Parser should not crash on single dash");
@@ -2108,14 +2356,15 @@ TEST(test_mp_three_dashes_before_boundary) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
     TEST_ASSERT(1, "Parser should not crash on three dashes");
 
@@ -2133,18 +2382,27 @@ TEST(test_mp_no_content_disposition) {
         "Content-Type: text/plain\r\n"
         "\r\n"
         "data\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should create part even without Content-Disposition");
     TEST_ASSERT_NULL(part->field, "Should have no fields without Content-Disposition");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Type", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("text/plain", part->header->value, "Header value");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("data", v, "MP_STG_BODY should be 'data'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -2160,16 +2418,17 @@ TEST(test_mp_header_with_tab_after_colon) {
         "Content-Disposition:\tform-data; name=\"f\"\r\n"
         "\r\n"
         "data\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
-    // Tab is not space, so HEADER_SPACE transitions to HEADER_VALUE with tab as first char
+    // Tab is not space, so MP_STG_HEADER_SPACE transitions to MP_STG_HEADER_VALUE with tab as first char
     TEST_ASSERT(1, "Parser should not crash on tab after colon");
 
     free_parts(multipartparser_part(&parser));
@@ -2199,7 +2458,8 @@ TEST(test_mp_very_long_header_value) {
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, payload, pos);
+    multipart_res_e res = multipartparser_parse(&parser, payload, pos);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
     TEST_ASSERT(1, "Parser should not crash on very long header value");
 
@@ -2232,7 +2492,8 @@ TEST(test_mp_many_headers) {
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, payload, pos);
+    multipart_res_e res = multipartparser_parse(&parser, payload, pos);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
     TEST_ASSERT(1, "Parser should not crash with many headers");
 
@@ -2251,14 +2512,15 @@ TEST(test_mp_boundary_inside_header_value) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     TEST_ASSERT(1, "Parser should not confuse boundary in header value");
 
@@ -2268,7 +2530,7 @@ TEST(test_mp_boundary_inside_header_value) {
 }
 
 TEST(test_mp_part_size_with_empty_body) {
-    TEST_CASE("Part size calculation with empty body");
+    TEST_CASE("Part size calculation with empty MP_STG_BODY");
 
     const char boundary[] = "BOUNDARY";
     const char payload[] =
@@ -2276,17 +2538,23 @@ TEST(test_mp_part_size_with_empty_body) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "\r\n"
-        "--BOUNDARY--";
+        "--BOUNDARY--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
-    TEST_ASSERT_NOT_NULL(part, "Should create part with empty body");
+    TEST_ASSERT_NOT_NULL(part, "Should create part with empty MP_STG_BODY");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -2316,14 +2584,15 @@ TEST(test_mp_mixed_text_file_empty) {
         "Content-Disposition: form-data; name=\"optional\"\r\n"
         "\r\n"
         "\r\n"
-        "------WebKitFormBoundary--";
+        "------WebKitFormBoundary--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have first part (title)");
@@ -2332,8 +2601,16 @@ TEST(test_mp_mixed_text_file_empty) {
     TEST_ASSERT_NULL(part->next->next->next, "Should have exactly three parts");
 
     // Part 1: text field "title"
+    TEST_ASSERT_NOT_NULL(part->header, "Part 1 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Part 1 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"title\"", part->header->value, "Part 1 header value");
     TEST_ASSERT_STR_EQUAL("name", part->field->key, "Part 1 field key");
     TEST_ASSERT_STR_EQUAL("title", part->field->value, "Part 1 field value");
+
+    char* v1 = strndup(&payload[part->offset], part->size);
+    if (v1)
+        TEST_ASSERT_STR_EQUAL("My Document", v1, "Part 1 MP_STG_BODY should be 'My Document'");
+    free(v1);
 
     // Part 2: file upload — should have name + filename + Content-Type
     TEST_ASSERT_STR_EQUAL("name", part->next->field->key, "Part 2 first field key");
@@ -2342,6 +2619,8 @@ TEST(test_mp_mixed_text_file_empty) {
     TEST_ASSERT_STR_EQUAL("filename", part->next->field->next->key, "Part 2 filename key");
     TEST_ASSERT_STR_EQUAL("doc.pdf", part->next->field->next->value, "Part 2 filename value");
     TEST_ASSERT_NOT_NULL(part->next->header->next, "Part 2 should have Content-Type header");
+    TEST_ASSERT_STR_EQUAL("Content-Type", part->next->header->next->key, "Part 2 Content-Type header key");
+    TEST_ASSERT_STR_EQUAL("application/pdf", part->next->header->next->value, "Part 2 Content-Type header value");
 
     // Part 3: empty field
     TEST_ASSERT_STR_EQUAL("optional", part->next->next->field->value, "Part 3 field value");
@@ -2378,14 +2657,15 @@ TEST(test_mp_five_parts_mixed) {
         "Content-Type: application/json\r\n"
         "\r\n"
         "{\"key\":\"val\"}\r\n"
-        "--b--";
+        "--b--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have first part");
@@ -2396,8 +2676,20 @@ TEST(test_mp_five_parts_mixed) {
     TEST_ASSERT_NULL(part->next->next->next->next->next, "Should have exactly five parts");
 
     // Verify name attribute values in order
-    // field->value stores the attribute value from name="..." (not the body content)
+    // field->value stores the attribute value from name="..." (not the MP_STG_BODY content)
+
+    // Part 1
+    TEST_ASSERT_NOT_NULL(part->header, "Part 1 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Part 1 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"field1\"", part->header->value, "Part 1 header value");
     TEST_ASSERT_STR_EQUAL("field1", part->field->value, "Part 1 name");
+
+    // Part 2
+    TEST_ASSERT_NOT_NULL(part->next->header, "Part 2 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->next->header->key, "Part 2 header key");
+    TEST_ASSERT_NOT_NULL(part->next->header->next, "Part 2 should have Content-Type header");
+    TEST_ASSERT_STR_EQUAL("Content-Type", part->next->header->next->key, "Part 2 Content-Type key");
+    TEST_ASSERT_STR_EQUAL("text/plain", part->next->header->next->value, "Part 2 Content-Type value");
     TEST_ASSERT_STR_EQUAL("file1", part->next->field->value, "Part 2 name");
     TEST_ASSERT_STR_EQUAL("field2", part->next->next->field->value, "Part 3 name");
     TEST_ASSERT_STR_EQUAL("empty_field", part->next->next->next->field->value, "Part 4 name");
@@ -2426,18 +2718,28 @@ TEST(test_mp_boundary_with_dashes) {
         "Content-Disposition: form-data; name=\"x\"\r\n"
         "\r\n"
         "val\r\n"
-        "------WebKitFormBoundary7MA4YWxkTrZu0gW--";
+        "------WebKitFormBoundary7MA4YWxkTrZu0gW--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should parse with dash-heavy boundary");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"x\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
     TEST_ASSERT_STR_EQUAL("x", part->field->value, "Field value");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("val", v, "MP_STG_BODY should be 'val'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -2453,17 +2755,28 @@ TEST(test_mp_boundary_with_digits_and_underscores) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\r\n"
-        "--abc_123_XYZ--";
+        "--abc_123_XYZ--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should parse boundary with digits and underscores");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("data", v, "MP_STG_BODY should be 'data'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -2484,17 +2797,22 @@ TEST(test_mp_utf8_field_value) {
         "Content-Disposition: form-data; name=\"description\"\r\n"
         "\r\n"
         "\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82 \xd0\xbc\xd0\xb8\xd1\x80\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should parse UTF-8 field value");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"description\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
     TEST_ASSERT_STR_EQUAL("description", part->field->value, "Field name");
 
     free_parts(part);
@@ -2513,18 +2831,28 @@ TEST(test_mp_utf8_filename) {
         "Content-Type: application/pdf\r\n"
         "\r\n"
         "%PDF-fake\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should parse UTF-8 filename");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have headers");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "First header key");
+    TEST_ASSERT_NOT_NULL(part->header->next, "Should have Content-Type header");
+    TEST_ASSERT_STR_EQUAL("Content-Type", part->header->next->key, "Second header key");
+    TEST_ASSERT_STR_EQUAL("application/pdf", part->header->next->value, "Second header value");
+    TEST_ASSERT_NOT_NULL(part->field, "Should have name field");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Name field key");
+    TEST_ASSERT_STR_EQUAL("file", part->field->value, "Name field value");
     TEST_ASSERT_NOT_NULL(part->field->next, "Should have filename field");
+    TEST_ASSERT_STR_EQUAL("filename", part->field->next->key, "Filename field key");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -2548,19 +2876,30 @@ TEST(test_mp_escaped_quotes_in_filename) {
         "Content-Disposition: form-data; name=\"file\"; filename=\"test\\\"file.txt\"\r\n"
         "\r\n"
         "content\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should parse part with escaped quotes in filename");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
     TEST_ASSERT_NOT_NULL(part->field, "Should have fields");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Name field key");
+    TEST_ASSERT_STR_EQUAL("file", part->field->value, "Name field value");
     TEST_ASSERT_NOT_NULL(part->field->next, "Should have filename field");
+    TEST_ASSERT_STR_EQUAL("filename", part->field->next->key, "Filename field key");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("content", v, "MP_STG_BODY should be 'content'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -2585,7 +2924,7 @@ TEST(test_mp_incremental_two_parts_split) {
         "Content-Disposition: form-data; name=\"b\"\r\n"
         "\r\n"
         "BBB\r\n"
-        "--BND--";
+        "--BND--\r\n";
 
     size_t total = sizeof(payload) - 1;
     // Split roughly into header1 | body1+header2 | body2+close
@@ -2598,14 +2937,24 @@ TEST(test_mp_incremental_two_parts_split) {
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
 
-    multipartparser_parse(&parser, (char*)payload, chunk1);
-    multipartparser_parse(&parser, (char*)payload + chunk1, chunk2);
-    multipartparser_parse(&parser, (char*)payload + chunk1 + chunk2, total - chunk1 - chunk2);
-
+    multipart_res_e res1 = multipartparser_parse(&parser, (char*)payload, chunk1);
+    multipart_res_e res2 = multipartparser_parse(&parser, (char*)payload + chunk1, chunk2);
+    multipart_res_e res3 = multipartparser_parse(&parser, (char*)payload + chunk1 + chunk2, total - chunk1 - chunk2);
+    TEST_ASSERT(res1 == MP_RES_PARTIAL && res2 == MP_RES_PARTIAL && res3 == MP_RES_DONE, "Parse should complete");
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have first part");
     TEST_ASSERT_NOT_NULL(part->next, "Should have second part");
+
+    TEST_ASSERT_NOT_NULL(part->header, "Part 1 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Part 1 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"a\"", part->header->value, "Part 1 header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Part 1 field key");
     TEST_ASSERT_STR_EQUAL("a", part->field->value, "Part 1 value");
+
+    TEST_ASSERT_NOT_NULL(part->next->header, "Part 2 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->next->header->key, "Part 2 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"b\"", part->next->header->value, "Part 2 header value");
+    TEST_ASSERT_STR_EQUAL("name", part->next->field->key, "Part 2 field key");
     TEST_ASSERT_STR_EQUAL("b", part->next->field->value, "Part 2 value");
 
     free_parts(part);
@@ -2626,7 +2975,7 @@ TEST(test_mp_incremental_byte_by_byte_two_parts) {
         "Content-Disposition: form-data; name=\"y\"\r\n"
         "\r\n"
         "Y\r\n"
-        "--B--";
+        "--B--\r\n";
 
     size_t total = sizeof(payload) - 1;
 
@@ -2636,13 +2985,25 @@ TEST(test_mp_incremental_byte_by_byte_two_parts) {
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
 
-    for (size_t i = 0; i < total; i++)
-        multipartparser_parse(&parser, (char*)payload + i, 1);
+    for (size_t i = 0; i < total; i++) {
+        multipart_res_e res = multipartparser_parse(&parser, (char*)payload + i, 1);
+        TEST_ASSERT(res == MP_RES_DONE || res == MP_RES_PARTIAL, "Parse should complete");
+    }
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have first part (byte-by-byte)");
     TEST_ASSERT_NOT_NULL(part->next, "Should have second part (byte-by-byte)");
+
+    TEST_ASSERT_NOT_NULL(part->header, "Part 1 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Part 1 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"x\"", part->header->value, "Part 1 header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Part 1 field key");
     TEST_ASSERT_STR_EQUAL("x", part->field->value, "Part 1 value");
+
+    TEST_ASSERT_NOT_NULL(part->next->header, "Part 2 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->next->header->key, "Part 2 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"y\"", part->next->header->value, "Part 2 header value");
+    TEST_ASSERT_STR_EQUAL("name", part->next->field->key, "Part 2 field key");
     TEST_ASSERT_STR_EQUAL("y", part->next->field->value, "Part 2 value");
 
     free_parts(part);
@@ -2651,12 +3012,12 @@ TEST(test_mp_incremental_byte_by_byte_two_parts) {
 }
 
 // ============================================================================
-// Test Suite 23: Body with content identical to boundary prefix
+// Test Suite 23: MP_STG_BODY with content identical to boundary prefix
 // ============================================================================
 
 TEST(test_mp_body_starts_with_boundary_prefix) {
-    TEST_SUITE("Multipart Parser - Boundary Prefix in Body");
-    TEST_CASE("Body starts with \\r\\n-- followed by partial boundary");
+    TEST_SUITE("Multipart Parser - Boundary Prefix in MP_STG_BODY");
+    TEST_CASE("MP_STG_BODY starts with \\r\\n-- followed by partial boundary");
 
     const char boundary[] = "ABC";
     const char payload[] =
@@ -2664,17 +3025,23 @@ TEST(test_mp_body_starts_with_boundary_prefix) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "\r\n--ABextra\r\n"
-        "--ABC--";
+        "--ABC--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
-    TEST_ASSERT_NOT_NULL(part, "Should not confuse body prefix with boundary");
+    TEST_ASSERT_NOT_NULL(part, "Should not confuse MP_STG_BODY prefix with boundary");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -2682,7 +3049,7 @@ TEST(test_mp_body_starts_with_boundary_prefix) {
 }
 
 TEST(test_mp_body_contains_full_boundary_but_no_crlf_prefix) {
-    TEST_CASE("Body contains --BOUNDARY but without preceding \\r\\n");
+    TEST_CASE("MP_STG_BODY contains --BOUNDARY but without preceding \\r\\n");
 
     const char boundary[] = "ABC";
     const char payload[] =
@@ -2690,18 +3057,29 @@ TEST(test_mp_body_contains_full_boundary_but_no_crlf_prefix) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "prefix--ABCsuffix\r\n"
-        "--ABC--";
+        "--ABC--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should not confuse mid-text boundary string");
     TEST_ASSERT_NULL(part->next, "Should have exactly one part");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("prefix--ABCsuffix", v, "MP_STG_BODY should be 'prefix--ABCsuffix'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -2726,28 +3104,51 @@ TEST(test_mp_two_parts_offset_and_size) {
         "Content-Disposition: form-data; name=\"b\"\r\n"
         "\r\n"
         "WORLD\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have first part");
     TEST_ASSERT_NOT_NULL(part->next, "Should have second part");
 
-    // Part 1: offset should point to body start after headers
+    // Part 1: offset should point to MP_STG_BODY start after headers
     // "--B\r\n" (5) + "Content-Disposition: form-data; name=\"a\"\r\n" (40) + "\r\n" (2) = 47
     // +1 for \n after \r in END_N transition = 48
     TEST_ASSERT(part->offset > 0, "Part 1 offset should be > 0");
     TEST_ASSERT(part->size > 0, "Part 1 size should be > 0");
 
+    TEST_ASSERT_NOT_NULL(part->header, "Part 1 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Part 1 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"a\"", part->header->value, "Part 1 header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Part 1 field key");
+    TEST_ASSERT_STR_EQUAL("a", part->field->value, "Part 1 field value");
+
+    char* v1 = strndup(&payload[part->offset], part->size);
+    if (v1)
+        TEST_ASSERT_STR_EQUAL("HELLO", v1, "Part 1 MP_STG_BODY should be 'HELLO'");
+    free(v1);
+
     // Part 2: offset should be greater than part 1 offset
     TEST_ASSERT(part->next->offset > part->offset, "Part 2 offset should be > Part 1 offset");
     TEST_ASSERT(part->next->size > 0, "Part 2 size should be > 0");
+
+    TEST_ASSERT_NOT_NULL(part->next->header, "Part 2 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->next->header->key, "Part 2 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"b\"", part->next->header->value, "Part 2 header value");
+    TEST_ASSERT_STR_EQUAL("name", part->next->field->key, "Part 2 field key");
+    TEST_ASSERT_STR_EQUAL("b", part->next->field->value, "Part 2 field value");
+
+    char* v2 = strndup(&payload[part->next->offset], part->next->size);
+    if (v2)
+        TEST_ASSERT_STR_EQUAL("WORLD", v2, "Part 2 MP_STG_BODY should be 'WORLD'");
+    free(v2);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -2770,18 +3171,22 @@ TEST(test_mp_with_preamble) {
         "Content-Disposition: form-data; name=\"f\"\r\n"
         "\r\n"
         "data\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    parser.stage = BODY; // Start in BODY to consume preamble
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    parser.stage = MP_STG_BODY; // Start in MP_STG_BODY to consume preamble
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should find part after preamble");
+    // Note: when starting in MP_STG_BODY, the part created by the preamble-to-boundary
+    // transition may not have proper headers/fields — the primary assertion is
+    // that a part is found after the boundary is detected.
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -2805,11 +3210,22 @@ TEST(test_mp_with_postamble) {
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should find part before postamble");
     TEST_ASSERT_NULL(part->next, "Should have exactly one part");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("data", v, "MP_STG_BODY should be 'data'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -2839,14 +3255,15 @@ TEST(test_mp_text_binary_text_sequence) {
         "Content-Disposition: form-data; name=\"caption\"\r\n"
         "\r\n"
         "A photo description\r\n"
-        "--SEP--";
+        "--SEP--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should have first part (metadata)");
@@ -2854,6 +3271,9 @@ TEST(test_mp_text_binary_text_sequence) {
     TEST_ASSERT_NOT_NULL(part->next->next, "Should have third part (caption)");
     TEST_ASSERT_NULL(part->next->next->next, "Should have exactly three parts");
 
+    TEST_ASSERT_NOT_NULL(part->header, "Part 1 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Part 1 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"metadata\"", part->header->value, "Part 1 header value");
     TEST_ASSERT_STR_EQUAL("metadata", part->field->value, "Part 1 name");
     TEST_ASSERT_STR_EQUAL("image", part->next->field->value, "Part 2 name");
     TEST_ASSERT_STR_EQUAL("caption", part->next->next->field->value, "Part 3 name");
@@ -2864,6 +3284,13 @@ TEST(test_mp_text_binary_text_sequence) {
 
     // Image part should have two headers (Content-Disposition + Content-Type)
     TEST_ASSERT_NOT_NULL(part->next->header->next, "Part 2 should have Content-Type");
+    TEST_ASSERT_STR_EQUAL("Content-Type", part->next->header->next->key, "Part 2 Content-Type key");
+    TEST_ASSERT_STR_EQUAL("image/png", part->next->header->next->value, "Part 2 Content-Type value");
+
+    // Part 3 header check
+    TEST_ASSERT_NOT_NULL(part->next->next->header, "Part 3 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->next->next->header->key, "Part 3 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"caption\"", part->next->next->header->value, "Part 3 header value");
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -2885,18 +3312,33 @@ TEST(test_mp_content_type_with_charset) {
         "Content-Type: text/html; charset=utf-8\r\n"
         "\r\n"
         "<h1>Hello</h1>\r\n"
-        "--B--";
+        "--B--\r\n";
 
     int fd = create_payload_fd(payload, sizeof(payload) - 1);
     TEST_ASSERT(fd >= 0, "memfd_create should succeed");
 
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
-    multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should parse Content-Type with charset");
     TEST_ASSERT_NOT_NULL(part->header->next, "Should have two headers");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "First header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"; filename=\"page.html\"", part->header->value, "First header value");
+    TEST_ASSERT_STR_EQUAL("Content-Type", part->header->next->key, "Second header key");
+    TEST_ASSERT_STR_EQUAL("text/html; charset=utf-8", part->header->next->value, "Second header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Name field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Name field value");
+    TEST_ASSERT_NOT_NULL(part->field->next, "Should have filename field");
+    TEST_ASSERT_STR_EQUAL("filename", part->field->next->key, "Filename field key");
+    TEST_ASSERT_STR_EQUAL("page.html", part->field->next->value, "Filename field value");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("<h1>Hello</h1>", v, "MP_STG_BODY should be '<h1>Hello</h1>'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
@@ -2930,6 +3372,10 @@ TEST(test_mp_repeated_parse_calls_accumulate) {
 
     // Build contiguous payload for fd
     char* payload = malloc(total);
+    if (payload == NULL) {
+        TEST_FAIL("malloc should succeed");
+        return;
+    }
     size_t pos = 0;
     for (int i = 0; i < num_chunks; i++) {
         size_t len = strlen(chunks[i]);
@@ -2947,16 +3393,485 @@ TEST(test_mp_repeated_parse_calls_accumulate) {
     pos = 0;
     for (int i = 0; i < num_chunks; i++) {
         size_t len = strlen(chunks[i]);
-        multipartparser_parse(&parser, payload + pos, len);
+        multipart_res_e res = multipartparser_parse(&parser, payload + pos, len);
+        TEST_ASSERT(res == MP_RES_PARTIAL || res == MP_RES_DONE, "Parse should complete");
         pos += len;
     }
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should parse across many small chunks");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
     TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    char* v = strndup(&payload[part->offset], part->size);
+    if (v)
+        TEST_ASSERT_STR_EQUAL("hello world", v, "MP_STG_BODY should be 'hello world'");
+    free(v);
 
     free_parts(part);
     free_orphan_headers(parser.header);
     free(payload);
+    close(fd);
+}
+
+// ============================================================================
+// Test Suite 29: Bug verification — state machine edge cases
+// ============================================================================
+
+TEST(test_mp_bug_boundary_sd_non_dash) {
+    TEST_SUITE("Multipart Parser - Bug: BOUNDARY_SD non-dash");
+    TEST_CASE("BOUNDARY_SD with non-dash char should not hang parser");
+
+    // After boundary match, we get "--B-" then 'X'.
+    // BOUNDARY_FD gets '-' -> BOUNDARY_SD, then 'X' should go to MP_STG_BODY.
+    // Without the fix, parser stays stuck in BOUNDARY_SD forever.
+    const char boundary[] = "B";
+    const char payload[] =
+        "--B\r\n"
+        "Content-Disposition: form-data; name=\"f\"\r\n"
+        "\r\n"
+        "data\r\n"
+        "--B-Xgarbage\r\n"
+        "--B--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    // Without fix: --B-X is treated as a boundary (wrong!), creating a part
+    // with truncated MP_STG_BODY. With fix: --B-X is MP_STG_BODY content, --B-- is closing.
+    http_payloadpart_t* part = multipartparser_part(&parser);
+    TEST_ASSERT_NOT_NULL(part, "Should find part");
+    TEST_ASSERT_NULL(part->next, "Should have exactly one part");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value should be 'f'");
+
+    free_parts(part);
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+TEST(test_mp_bug_boundary_sd_non_dash_multi_part) {
+    TEST_CASE("BOUNDARY_SD followed by non-dash should recover to find next part");
+
+    const char boundary[] = "BND";
+    const char payload[] =
+        "--BND\r\n"
+        "Content-Disposition: form-data; name=\"f\"\r\n"
+        "\r\n"
+        "data\r\n"
+        "--BND-X\r\n"
+        "--BND\r\n"
+        "Content-Disposition: form-data; name=\"g\"\r\n"
+        "\r\n"
+        "data2\r\n"
+        "--BND--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    http_payloadpart_t* part = multipartparser_part(&parser);
+    TEST_ASSERT_NOT_NULL(part, "Should have first part");
+    TEST_ASSERT_NOT_NULL(part->next, "Should have second part after false --BND-X");
+
+    TEST_ASSERT_NOT_NULL(part->header, "Part 1 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Part 1 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Part 1 header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Part 1 field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Part 1 value");
+
+    TEST_ASSERT_NOT_NULL(part->next->header, "Part 2 should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->next->header->key, "Part 2 header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"g\"", part->next->header->value, "Part 2 header value");
+    TEST_ASSERT_STR_EQUAL("name", part->next->field->key, "Part 2 field key");
+    TEST_ASSERT_STR_EQUAL("g", part->next->field->value, "Part 2 value");
+
+    free_parts(part);
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+TEST(test_mp_bug_boundary_sd_cr_recovery) {
+    TEST_CASE("BOUNDARY_SD followed by \\r should transition to BOUNDARY_FN");
+
+    const char boundary[] = "B";
+    const char payload[] =
+        "--B\r\n"
+        "Content-Disposition: form-data; name=\"f\"\r\n"
+        "\r\n"
+        "data\r\n"
+        "--B-\rX\r\n"
+        "--B--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    http_payloadpart_t* part = multipartparser_part(&parser);
+    TEST_ASSERT_NOT_NULL(part, "Should find part despite --B-\\r false boundary");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    free_parts(part);
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+TEST(test_mp_bug_body_after_partial_boundary_then_dash_dash) {
+    TEST_CASE("MP_STG_BODY contains \\r\\n-- followed by partial match then -- (not boundary)");
+
+    const char boundary[] = "ABC";
+    const char payload[] =
+        "--ABC\r\n"
+        "Content-Disposition: form-data; name=\"f\"\r\n"
+        "\r\n"
+        "data\r\n"
+        "--AB--extra\r\n"
+        "--ABC--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    http_payloadpart_t* part = multipartparser_part(&parser);
+    TEST_ASSERT_NOT_NULL(part, "Should find part despite --AB-- false boundary");
+    TEST_ASSERT_NULL(part->next, "Should have exactly one part");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    free_parts(part);
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+// ============================================================================
+// Test Suite 30: Size counting bugs — false positive boundary chars lost
+// ============================================================================
+
+TEST(test_mp_size_false_positive_boundary) {
+    TEST_SUITE("Multipart Parser - Size Tracking Bugs");
+    TEST_CASE("False-positive \\r\\n-- in MP_STG_BODY loses size bytes");
+
+    // MP_STG_BODY contains \r\n--FAKE which is a false boundary prefix.
+    // The \r that triggers BOUNDARY_FN is NOT counted in size (line 194-195
+    // only increments size when stage==MP_STG_BODY). When the false boundary is
+    // detected and we return to MP_STG_BODY, the \r is lost from size.
+    // Same for \n, -, -, F, A, K, E that are consumed during false boundary detection.
+    const char boundary[] = "B";
+    const char payload[] =
+        "--B\r\n"
+        "Content-Disposition: form-data; name=\"f\"\r\n"
+        "\r\n"
+        "1234\r\n"
+        "--FAKE\r\n"
+        "5678\r\n"
+        "--B--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    http_payloadpart_t* part = multipartparser_part(&parser);
+    TEST_ASSERT_NOT_NULL(part, "Should have one part");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    // Expected MP_STG_BODY content: "1234\r\n--FAKE\r\n5678"
+    // Actual MP_STG_BODY between \n (after blank line) and \r\n--B
+    // The \r\n before --B is the CRLF delimiter (subtracted in create_part: size-2).
+    // So expected size (before -2 adjustment) = strlen("1234\r\n--FAKE\r\n5678") + 2 = 20
+    // If \r from false boundary is lost, size will be off by at least 1.
+    //
+    // Let's verify by reading back from the fd at the offset
+    char buf[64] = {0};
+    lseek(fd, part->offset, SEEK_SET);
+    read(fd, buf, part->size);
+    TEST_ASSERT(part->size > 0, "Part size should be > 0");
+
+    // The MP_STG_BODY should contain "1234", "FAKE", and "5678"
+    TEST_ASSERT(memmem(buf, part->size, "1234", 4) != NULL, "MP_STG_BODY should contain '1234'");
+    TEST_ASSERT(memmem(buf, part->size, "FAKE", 4) != NULL, "MP_STG_BODY should contain 'FAKE'");
+    TEST_ASSERT(memmem(buf, part->size, "5678", 4) != NULL, "MP_STG_BODY should contain '5678'");
+
+    free_parts(part);
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+TEST(test_mp_size_multiple_false_positives) {
+    TEST_CASE("Multiple false-positive boundaries in MP_STG_BODY");
+
+    const char boundary[] = "REAL";
+    const char payload[] =
+        "--REAL\r\n"
+        "Content-Disposition: form-data; name=\"f\"\r\n"
+        "\r\n"
+        "A\r\n"
+        "--FAKE1\r\n"
+        "B\r\n"
+        "--FAKE2\r\n"
+        "C\r\n"
+        "--REAL--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    http_payloadpart_t* part = multipartparser_part(&parser);
+    TEST_ASSERT_NOT_NULL(part, "Should have one part");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    char buf[128] = {0};
+    lseek(fd, part->offset, SEEK_SET);
+    read(fd, buf, part->size);
+    TEST_ASSERT(part->size > 0, "Part size should be > 0");
+
+    TEST_ASSERT(memmem(buf, part->size, "FAKE1", 5) != NULL, "MP_STG_BODY should contain 'FAKE1'");
+    TEST_ASSERT(memmem(buf, part->size, "FAKE2", 5) != NULL, "MP_STG_BODY should contain 'FAKE2'");
+
+    free_parts(part);
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+TEST(test_mp_size_false_positive_cr_only) {
+    TEST_CASE("False-positive \\r in MP_STG_BODY (no \\n following)");
+
+    // MP_STG_BODY contains lone \r followed by non-\n, non-dash char
+    // \r -> BOUNDARY_FN, then non-\n/non-dash -> MP_STG_BODY
+    // The \r is lost from size.
+    const char boundary[] = "B";
+    const char payload[] =
+        "--B\r\n"
+        "Content-Disposition: form-data; name=\"f\"\r\n"
+        "\r\n"
+        "ab\rcd\r\n"
+        "--B--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    http_payloadpart_t* part = multipartparser_part(&parser);
+    TEST_ASSERT_NOT_NULL(part, "Should have one part");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    char buf[64] = {0};
+    lseek(fd, part->offset, SEEK_SET);
+    read(fd, buf, part->size);
+
+    // MP_STG_BODY should contain "ab\rcd" — the \r between ab and cd
+    TEST_ASSERT(part->size >= 5, "Part size should include the \\r");
+    // Check that "cd" appears after "ab" in the MP_STG_BODY data
+    TEST_ASSERT(memmem(buf, part->size, "cd", 2) != NULL, "MP_STG_BODY should contain 'cd'");
+
+    free_parts(part);
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+TEST(test_mp_header_space_lf_as_value) {
+    TEST_CASE("MP_STG_HEADER_SPACE treats bare \\n as header value start (should be empty value)");
+
+    // After ':', a bare \n should ideally signal end of header with empty value.
+    // Currently \n in MP_STG_HEADER_SPACE falls to else branch, transitioning to MP_STG_HEADER_VALUE
+    // and incrementing header_value_size — the \n becomes part of the value.
+    const char boundary[] = "B";
+    const char payload[] =
+        "--B\r\n"
+        "X:\n"
+        "Content-Disposition: form-data; name=\"f\"\r\n"
+        "\r\n"
+        "data\r\n"
+        "--B--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    // Parser should not crash. Whether a part is created depends on how the
+    // bare \n is handled in the state machine.
+    TEST_ASSERT(1, "Parser should not crash on bare \\n after colon");
+
+    free_parts(multipartparser_part(&parser));
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+TEST(test_mp_header_value_lf_not_handled) {
+    TEST_CASE("MP_STG_HEADER_VALUE treats bare \\n as MP_STG_BODY content");
+
+    // Bare \n in header value is not handled — it stays in MP_STG_HEADER_VALUE
+    // and is counted as part of the value. This means a header like:
+    //   X: value\nextra
+    // will include \n and "extra" in the value until \r\n terminator.
+    const char boundary[] = "B";
+    const char payload[] =
+        "--B\r\n"
+        "X: val\nue\r\n"
+        "Content-Disposition: form-data; name=\"f\"\r\n"
+        "\r\n"
+        "data\r\n"
+        "--B--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    TEST_ASSERT(1, "Parser should not crash on bare \\n in header value");
+
+    free_parts(multipartparser_part(&parser));
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+TEST(test_mp_size_cr_only_false_positive) {
+    TEST_CASE("False-positive \\r\\n in MP_STG_BODY followed by non-dash");
+
+    // \r -> BOUNDARY_FN, \n -> FIRST_DASH, non-dash -> MP_STG_BODY
+    // Both \r and \n are lost from size count
+    const char boundary[] = "B";
+    const char payload[] =
+        "--B\r\n"
+        "Content-Disposition: form-data; name=\"f\"\r\n"
+        "\r\n"
+        "AB\r\n"
+        "CD\r\n"
+        "--B--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    http_payloadpart_t* part = multipartparser_part(&parser);
+    TEST_ASSERT_NOT_NULL(part, "Should have one part");
+    TEST_ASSERT_NOT_NULL(part->header, "Should have header");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key");
+    TEST_ASSERT_STR_EQUAL("form-data; name=\"f\"", part->header->value, "Header value");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key");
+    TEST_ASSERT_STR_EQUAL("f", part->field->value, "Field value");
+
+    // MP_STG_BODY: "AB\r\nCD" — part->size should reflect this
+    // With -2 in create_part, actual stored = size - 2 (the trailing \r\n before boundary)
+    char buf[64] = {0};
+    lseek(fd, part->offset, SEEK_SET);
+    read(fd, buf, part->size);
+
+    TEST_ASSERT(memmem(buf, part->size, "AB", 2) != NULL, "MP_STG_BODY should contain 'AB'");
+    TEST_ASSERT(memmem(buf, part->size, "CD", 2) != NULL, "MP_STG_BODY should contain 'CD'");
+
+    free_parts(part);
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
+// ============================================================================
+// Test: partial separator match in MP_STG_BODY inflates part_size
+// ============================================================================
+
+TEST(test_mp_partial_separator_match_size) {
+    TEST_SUITE("Multipart Parser - Partial Separator");
+    TEST_CASE("Partial boundary match in MP_STG_BODY does not inflate part size");
+
+    // MP_STG_BODY contains "\r\n--BOUNDAR" which partially matches the intermediate
+    // separator "\r\n--BOUNDARY\r\n" but diverges at 'X' instead of 'Y'.
+    // The parser should roll back and the part size must be correct.
+    const char boundary[] = "BOUNDARY";
+    const char payload[] =
+        "--BOUNDARY\r\n"
+        "Content-Disposition: form-data; name=\"f\"\r\n"
+        "\r\n"
+        "before\r\n--BOUNDARXafter\r\n"
+        "--BOUNDARY--\r\n";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    http_payloadpart_t* part = multipartparser_part(&parser);
+    TEST_ASSERT_NOT_NULL(part, "Should have one part");
+
+    // Expected MP_STG_BODY: "before\r\n--BOUNDARXafter"
+    // part->size is computed as part_size - intermediate_separator_size
+    // If partial match bytes are not properly accounted for, size will be wrong.
+    char* actual = strndup(&payload[part->offset], part->size);
+    if (actual) {
+        TEST_ASSERT_NOT_NULL(actual, "strndup should succeed");
+        TEST_ASSERT_STR_EQUAL("before\r\n--BOUNDARXafter", actual,
+            "Part MP_STG_BODY should contain full content including partial separator match");
+    }
+    free(actual);
+
+    free_parts(part);
+    free_orphan_headers(parser.header);
     close(fd);
 }
