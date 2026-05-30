@@ -7,41 +7,22 @@
 #include "base64.h"
 #include "httpcommon.h"
 
-http_header_t* http_header_alloc();
-http_cookie_t* http_cookie_alloc();
-
-
-http_header_t* http_header_alloc() {
-    return malloc(sizeof(http_header_t));
-}
-
 http_header_t* http_header_create(const char* key, size_t key_length, const char* value, size_t value_length) {
-    http_header_t* header = http_header_alloc();
-
+    http_header_t* header = malloc(sizeof * header);
     if (header == NULL) return NULL;
 
-    header->key = NULL;
+    header->key = copy_cstringn(key, key_length);
     header->key_length = key_length;
-    header->value = NULL;
+    header->value = copy_cstringn(value, value_length);
     header->value_length = value_length;
     header->next = NULL;
-
-    if (key_length)
-        header->key = copy_cstringn(key, key_length);
-
-    if (value_length)
-        header->value = copy_cstringn(value, value_length);
 
     return header;
 }
 
 void http_header_free(http_header_t* header) {
-    if (header->key)
-        free((void*)header->key);
-
-    if (header->value)
-        free((void*)header->value);
-
+    free(header->key);
+    free(header->value);
     free(header);
 }
 
@@ -138,13 +119,8 @@ void http_payloadfield_free(http_payloadfield_t* field) {
     }
 }
 
-http_cookie_t* http_cookie_alloc() {
-    return malloc(sizeof(http_cookie_t));
-}
-
 http_cookie_t* http_cookie_create() {
-    http_cookie_t* cookie = http_cookie_alloc();
-
+    http_cookie_t* cookie = malloc(sizeof * cookie);
     if (cookie == NULL) return NULL;
 
     cookie->key = NULL;

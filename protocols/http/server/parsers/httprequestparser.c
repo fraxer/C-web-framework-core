@@ -803,6 +803,7 @@ int __set_header_value(httprequest_t* request, httprequestparser_t* parser) {
     char* string = bufferdata_get(&parser->buf);
     size_t length = bufferdata_writed(&parser->buf);
 
+    free(request->last_header->value);
     request->last_header->value = copy_cstringn(string, length);
     request->last_header->value_length = length;
 
