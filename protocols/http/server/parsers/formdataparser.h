@@ -14,7 +14,9 @@ typedef enum formdataparser_stage {
     FORMDATA_SEMICOLON = 0,
     FORMDATA_SKIP,
     FORMDATA_KEY,
-    FORMDATA_VALUE
+    FORMDATA_EQUAL,
+    FORMDATA_VALUE,
+    FORMDATA_AFTER_VALUE
 } formdataparser_stage_e;
 
 typedef struct formdatalocation {

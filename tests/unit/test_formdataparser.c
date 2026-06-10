@@ -263,6 +263,28 @@ TEST(test_fdp_multiple_spaces_between_parts) {
     formdataparser_clear(&parser);
 }
 
+TEST(test_fdp_multiple_spaces_in_value) {
+    TEST_CASE("Multiple spaces in value");
+
+    int ok;
+    formdataparser_t parser = parse_fd("form-data;    name= \"x\"; filename = \"y\"", &ok);
+    TEST_ASSERT_EQUAL(1, ok, "Parse should succeed");
+    TEST_ASSERT_NOT_NULL(parser.field, "Should have first field");
+    TEST_ASSERT_NOT_NULL(parser.field->next, "Should have second field");
+
+    formdataparser_clear(&parser);
+}
+
+TEST(test_fdp_parameters_without_semicolon) {
+    TEST_CASE("Parameters without semicolon");
+
+    int ok;
+    formdataparser_t parser = parse_fd("form-data;    name= \"x\"filename = \"y\"", &ok);
+    TEST_ASSERT_EQUAL(0, ok, "Parse should succeed");
+
+    formdataparser_clear(&parser);
+}
+
 // ============================================================================
 // Test Suite 8: Special characters in values
 // ============================================================================
@@ -664,10 +686,10 @@ TEST(test_fdp_backslash_not_before_quote) {
 }
 
 TEST(test_fdp_double_backslash_before_quote) {
-    TEST_CASE("Double backslash before quote: name=\"a\\\\\"\"");
+    TEST_CASE("Double backslash before quote: name=\"a\\\\\\\"\"");
 
     int ok;
-    formdataparser_t parser = parse_fd("form-data; name=\"a\\\\\"\"", &ok);
+    formdataparser_t parser = parse_fd("form-data; name=\"a\\\\\\\"\"", &ok);
     TEST_ASSERT_EQUAL(1, ok, "Parse should succeed");
     TEST_ASSERT_NOT_NULL(parser.field, "Should have field");
     // a(1) \(2) \(3) "(4) — second \ before " means escape: backslash overwritten by "
@@ -1066,6 +1088,270 @@ TEST(test_rfc5987_no_star_fallback) {
     const char* val = formdataparser_find_field(&parser, "filename");
     TEST_ASSERT_NOT_NULL(val, "Should find filename");
     TEST_ASSERT_STR_EQUAL("fallback.txt", val, "Should return plain filename value");
+
+    formdataparser_clear(&parser);
+}
+
+// ============================================================================
+// Test Suite 29: OWS around '='
+// ============================================================================
+
+TEST(test_fdp_space_before_equals_only) {
+    TEST_SUITE("FormDataParser - OWS around '='");
+    TEST_CASE("Space before equals: filename =\"y\"");
+
+    int ok;
+    formdataparser_t parser = parse_fd("form-data; filename =\"y\"", &ok);
+    TEST_ASSERT_EQUAL(1, ok, "Parse should succeed");
+    TEST_ASSERT_STR_EQUAL("y", formdataparser_find_field(&parser, "filename"), "Value is 'y'");
+
+    formdataparser_clear(&parser);
+}
+
+TEST(test_fdp_space_after_equals_only) {
+    TEST_CASE("Space after equals: name= \"x\"");
+
+    int ok;
+    formdataparser_t parser = parse_fd("form-data; name= \"x\"", &ok);
+    TEST_ASSERT_EQUAL(1, ok, "Parse should succeed");
+    TEST_ASSERT_STR_EQUAL("x", formdataparser_find_field(&parser, "name"), "Value is 'x'");
+
+    formdataparser_clear(&parser);
+}
+
+// ============================================================================
+// Test Suite 30: Additional error cases
+// ============================================================================
+
+TEST(test_fdp_err_key_space_eof) {
+    TEST_SUITE("FormDataParser - Key Without Value Errors");
+    TEST_CASE("Key followed by space then EOF: name ");
+
+    formdataparser_t parser;
+    formdataparser_init(&parser, "form-data");
+    int result = formdataparser_parse(&parser, "form-data; name ", 16);
+    TEST_ASSERT_EQUAL(0, result, "Should fail — key without value (space then EOF)");
+
+    formdataparser_clear(&parser);
+}
+
+TEST(test_fdp_key_equals_empty_value_with_space) {
+    TEST_CASE("Key with space before equals and empty value: name =");
+
+    int ok;
+    formdataparser_t parser = parse_fd("form-data; name =", &ok);
+    TEST_ASSERT_EQUAL(1, ok, "Parse should succeed — empty value is valid");
+    const char* val = formdataparser_find_field(&parser, "name");
+    TEST_ASSERT_NOT_NULL(val, "Should find 'name'");
+    TEST_ASSERT_STR_EQUAL("", val, "Value should be empty");
+
+    formdataparser_clear(&parser);
+}
+
+TEST(test_fdp_key_equals_empty_value_no_space) {
+    TEST_CASE("Key with equals and empty value: name=");
+
+    int ok;
+    formdataparser_t parser = parse_fd("form-data; name=", &ok);
+    TEST_ASSERT_EQUAL(1, ok, "Parse should succeed — empty value is valid");
+    const char* val = formdataparser_find_field(&parser, "name");
+    TEST_ASSERT_NOT_NULL(val, "Should find 'name'");
+    TEST_ASSERT_STR_EQUAL("", val, "Value should be empty");
+
+    formdataparser_clear(&parser);
+}
+
+TEST(test_fdp_err_letter_after_quoted_value) {
+    TEST_CASE("Letter right after closing quote without semicolon: name=\"x\"filename=\"y\"");
+
+    formdataparser_t parser;
+    formdataparser_init(&parser, "form-data");
+    int result = formdataparser_parse(&parser, "form-data; name=\"x\"filename=\"y\"", 35);
+    TEST_ASSERT_EQUAL(0, result, "Should fail — no semicolon between fields");
+
+    formdataparser_clear(&parser);
+}
+
+TEST(test_fdp_err_garbage_after_quoted_value) {
+    TEST_CASE("Garbage character after closing quote: name=\"x\"@");
+
+    formdataparser_t parser;
+    formdataparser_init(&parser, "form-data");
+    int result = formdataparser_parse(&parser, "form-data; name=\"x\"@", 22);
+    TEST_ASSERT_EQUAL(0, result, "Should fail — garbage after closing quote");
+
+    formdataparser_clear(&parser);
+}
+
+TEST(test_fdp_err_bad_char_in_key) {
+    TEST_CASE("Invalid character in key name: na@me=\"x\"");
+
+    formdataparser_t parser;
+    formdataparser_init(&parser, "form-data");
+    int result = formdataparser_parse(&parser, "form-data; na@me=\"x\"", 21);
+    TEST_ASSERT_EQUAL(0, result, "Should fail — '@' is not valid in key name");
+
+    formdataparser_clear(&parser);
+}
+
+// ============================================================================
+// Test Suite 31: Additional backslash edge cases
+// ============================================================================
+
+TEST(test_fdp_trailing_escaped_backslash) {
+    TEST_SUITE("FormDataParser - Backslash Edge Cases");
+    TEST_CASE("Trailing escaped backslash: name=\"a\\\\\"\" -> a\\");
+
+    int ok;
+    formdataparser_t parser = parse_fd("form-data; name=\"a\\\\\"", &ok);
+    TEST_ASSERT_EQUAL(1, ok, "Parse should succeed");
+    TEST_ASSERT_NOT_NULL(parser.field, "Should have field");
+    TEST_ASSERT_STR_EQUAL("a\\", field_value(parser.field), "Value should be 'a\\'");
+    TEST_ASSERT_EQUAL_SIZE(2, field_value_len(parser.field), "Value size for 'a\\'");
+
+    formdataparser_clear(&parser);
+}
+
+TEST(test_fdp_backslash_before_normal_char) {
+    TEST_CASE("Backslash before normal char: name=\"C:\\temp\" -> C:\\temp");
+
+    int ok;
+    formdataparser_t parser = parse_fd("form-data; name=\"C:\\temp\"", &ok);
+    TEST_ASSERT_EQUAL(1, ok, "Parse should succeed");
+    TEST_ASSERT_NOT_NULL(parser.field, "Should have field");
+    TEST_ASSERT_STR_EQUAL("C:\\temp", field_value(parser.field), "Value should be 'C:\\temp'");
+
+    formdataparser_clear(&parser);
+}
+
+TEST(test_fdp_value_ends_with_escaped_quote) {
+    TEST_CASE("Value ending with escaped quote: name=\"a\\\"\"\" -> a\"");
+
+    int ok;
+    formdataparser_t parser = parse_fd("form-data; name=\"a\\\"\"", &ok);
+    TEST_ASSERT_EQUAL(1, ok, "Parse should succeed");
+    TEST_ASSERT_NOT_NULL(parser.field, "Should have field");
+    TEST_ASSERT_STR_EQUAL("a\"", field_value(parser.field), "Value should be 'a\"'");
+
+    formdataparser_clear(&parser);
+}
+
+TEST(test_fdp_quoted_value_with_semicolon_and_next_field) {
+    TEST_CASE("Semicolon in quoted value with second field: name=\"a;b\"; filename=\"c\"");
+
+    int ok;
+    formdataparser_t parser = parse_fd("form-data; name=\"a;b\"; filename=\"c\"", &ok);
+    TEST_ASSERT_EQUAL(1, ok, "Parse should succeed");
+    TEST_ASSERT_STR_EQUAL("a;b", formdataparser_find_field(&parser, "name"), "Name value is 'a;b'");
+    TEST_ASSERT_STR_EQUAL("c", formdataparser_find_field(&parser, "filename"), "Filename value is 'c'");
+
+    formdataparser_clear(&parser);
+}
+
+// ============================================================================
+// Test Suite 32: RFC 5987 additional cases
+// ============================================================================
+
+TEST(test_rfc5987_lowercase_hex) {
+    TEST_SUITE("FormDataParser - RFC 5987 Additional");
+    TEST_CASE("Lowercase hex in percent encoding: %c3%a9 -> é");
+
+    int ok;
+    formdataparser_t parser = parse_fd("form-data; name*=UTF-8''%c3%a9", &ok);
+    TEST_ASSERT_EQUAL(1, ok, "Parse should succeed");
+    TEST_ASSERT_STR_EQUAL("\xc3\xa9", formdataparser_find_field(&parser, "name"), "Value should be 'é'");
+
+    formdataparser_clear(&parser);
+}
+
+TEST(test_rfc5987_star_priority_reordered) {
+    TEST_CASE("name* appears before name — order should not matter");
+
+    int ok;
+    formdataparser_t parser = parse_fd("form-data; name*=UTF-8''%41; name=\"plain\"", &ok);
+    TEST_ASSERT_EQUAL(1, ok, "Parse should succeed");
+    TEST_ASSERT_STR_EQUAL("A", formdataparser_find_field(&parser, "name"),
+                          "Should return decoded name* value regardless of order");
+
+    formdataparser_clear(&parser);
+}
+
+// ============================================================================
+// Test Suite 33: Field order preserved
+// ============================================================================
+
+TEST(test_fdp_field_order_preserved) {
+    TEST_SUITE("FormDataParser - Field Order");
+    TEST_CASE("Three fields should preserve order: a=1, b=2, c=3");
+
+    int ok;
+    formdataparser_t parser = parse_fd("form-data; a=\"1\"; b=\"2\"; c=\"3\"", &ok);
+    TEST_ASSERT_EQUAL(1, ok, "Parse should succeed");
+
+    formdatafield_t* f = formdataparser_first_field(&parser);
+    TEST_ASSERT_NOT_NULL(f, "First field");
+    TEST_ASSERT_STR_EQUAL("a", str_get(&f->key), "First key is 'a'");
+    TEST_ASSERT_STR_EQUAL("1", str_get(&f->value), "First value is '1'");
+
+    f = f->next;
+    TEST_ASSERT_NOT_NULL(f, "Second field");
+    TEST_ASSERT_STR_EQUAL("b", str_get(&f->key), "Second key is 'b'");
+    TEST_ASSERT_STR_EQUAL("2", str_get(&f->value), "Second value is '2'");
+
+    f = f->next;
+    TEST_ASSERT_NOT_NULL(f, "Third field");
+    TEST_ASSERT_STR_EQUAL("c", str_get(&f->key), "Third key is 'c'");
+    TEST_ASSERT_STR_EQUAL("3", str_get(&f->value), "Third value is '3'");
+    TEST_ASSERT_NULL(f->next, "Should have exactly three fields");
+
+    formdataparser_clear(&parser);
+}
+
+// ============================================================================
+// Test Suite 34: Reuse safety — full lifecycle test
+// ============================================================================
+
+TEST(test_fdp_reuse_after_clear) {
+    TEST_SUITE("FormDataParser - Reuse After Clear");
+    TEST_CASE("Parse, clear, re-init, parse again — no state leaks");
+
+    formdataparser_t parser;
+    formdataparser_init(&parser, "form-data");
+    const char input1[] = "form-data; name=\"first\"";
+    int ok = formdataparser_parse(&parser, input1, sizeof(input1) - 1);
+    TEST_ASSERT_EQUAL(1, ok, "First parse should succeed");
+    TEST_ASSERT_STR_EQUAL("first", formdataparser_find_field(&parser, "name"), "First value is 'first'");
+
+    formdataparser_clear(&parser);
+    // Double clear should be safe (no double-free)
+    formdataparser_clear(&parser);
+
+    formdataparser_init(&parser, "form-data");
+    const char input2[] = "form-data; name=\"second\"";
+    ok = formdataparser_parse(&parser, input2, sizeof(input2) - 1);
+    TEST_ASSERT_EQUAL(1, ok, "Second parse should succeed");
+    TEST_ASSERT_STR_EQUAL("second", formdataparser_find_field(&parser, "name"), "Second value is 'second'");
+
+    // First parse result should not leak into second parse
+    formdatafield_t* f = formdataparser_first_field(&parser);
+    TEST_ASSERT_NOT_NULL(f, "Should have one field");
+    TEST_ASSERT_NULL(f->next, "Should have exactly one field — no leak from first parse");
+
+    formdataparser_clear(&parser);
+}
+
+// ============================================================================
+// Test Suite 35: Error — key without equals sign
+// ============================================================================
+
+TEST(test_fdp_err_key_without_value) {
+    TEST_SUITE("FormDataParser - Key Without Equals");
+    TEST_CASE("Key followed by EOF without equals: form-data; name");
+
+    formdataparser_t parser;
+    formdataparser_init(&parser, "form-data");
+    int result = formdataparser_parse(&parser, "form-data; name", 15);
+    TEST_ASSERT_EQUAL(0, result, "Should fail — key without value (no equals)");
 
     formdataparser_clear(&parser);
 }

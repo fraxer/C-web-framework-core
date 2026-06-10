@@ -29,12 +29,17 @@ void formdataparser_clear(formdataparser_t* parser) {
 
         str_clear(&field->key);
         str_clear(&field->value);
-        explicit_bzero(parser->buffer, FORMDATABUFSIZ);
-
         free(field);
 
         field = next;
     }
+
+    explicit_bzero(parser->buffer, FORMDATABUFSIZ);
+    parser->field = NULL;
+    parser->last_field = NULL;
+    parser->size = 0;
+    parser->stage = FORMDATA_SEMICOLON;
+    parser->quote = 0;
 }
 
 int formdataparser_parse(formdataparser_t* parser, const char* buffer, size_t buffer_size) {
@@ -59,6 +64,7 @@ int formdataparser_parse(formdataparser_t* parser, const char* buffer, size_t bu
         }
     }
 
+    int escaped = 0;
     for (; i < buffer_size; i++) {
         char c = buffer[i];
 
@@ -68,7 +74,7 @@ int formdataparser_parse(formdataparser_t* parser, const char* buffer, size_t bu
                 parser->stage = FORMDATA_SKIP;
             }
             else if (c == ' ') {}
-            else if (isalpha(c)) {
+            else if (isalpha((unsigned char)c)) {
                 parser->stage = FORMDATA_KEY;
                 parser->buffer[parser->size] = c;
                 parser->size++;
@@ -82,7 +88,7 @@ int formdataparser_parse(formdataparser_t* parser, const char* buffer, size_t bu
         }
         case FORMDATA_SKIP: {
             if (c == ' ') {}
-            else if (isalpha(c) || c == '-' || c == '*') { // creation-date or filename*
+            else if (isalpha((unsigned char)c) || c == '-' || c == '*') { // creation-date or filename*
                 parser->stage = FORMDATA_KEY;
                 parser->buffer[parser->size] = c;
                 parser->size++;
@@ -111,7 +117,16 @@ int formdataparser_parse(formdataparser_t* parser, const char* buffer, size_t bu
                     return 0;
                 }
             }
-            else if (isalpha(c) || c == '-' || c == '*') {
+            else if (c == ' ') {
+                // Пробел после имени ключа: "filename = ..."
+                if (!formdataparser_save_key(parser)) {
+                    log_error("formdataparser: failed to save key before space");
+                    parser->error = "formdataparser: failed to save key";
+                    return 0;
+                }
+                parser->stage = FORMDATA_EQUAL;
+            }
+            else if (isalpha((unsigned char)c) || c == '-' || c == '*') {
                 parser->buffer[parser->size] = c;
                 parser->size++;
             }
@@ -122,54 +137,85 @@ int formdataparser_parse(formdataparser_t* parser, const char* buffer, size_t bu
             }
             break;
         }
-        case FORMDATA_VALUE: {
-            if (c == '\"') {
-                if (parser->quote) {
-                    if (buffer[i - 1] != '\\') {
-                        if (!formdataparser_save_value(parser))
-                            return 0;
-
-                        parser->stage = FORMDATA_SEMICOLON;
-                        parser->quote = 0;
-                    }
-                    else {
-                        // Перезаписать последний символ - обратный слеш
-                        parser->buffer[parser->size - 1] = c;
-                    }
-                }
-                else {
-                    if (buffer[i - 1] != '\\') {
-                        // Если неэкранированную кавычку нашли в середине значения
-                        if (parser->size > 0) {
-                            parser->buffer[parser->size] = c;
-                            parser->size++;
-                        }
-                        else {
-                            parser->quote = 1;
-                        }
-                    }
-                    else {
-                        parser->buffer[parser->size] = c;
-                        parser->size++;
-                    }
-                }
-                
+        case FORMDATA_EQUAL: {
+            if (c == ' ') {}
+            else if (c == '=') {
+                parser->stage = FORMDATA_VALUE;
             }
-            else if (c == ' ' || c == ';') {
-                if (parser->quote) {
-                    parser->buffer[parser->size] = c;
-                    parser->size++;
+            else {
+                log_error("formdataparser: expected '=' after key, got: %c", c);
+                parser->error = "formdataparser: expected '=' after key";
+                return 0;
+            }
+            break;
+        }
+        case FORMDATA_VALUE: {
+            if (parser->quote) {
+                // Внутри кавычек
+                if (escaped) {
+                    // Предыдущий символ — обратный слеш.
+                    // Экранируются только \" и \\, иначе слеш литеральный.
+                    if (c == '\"' || c == '\\') {
+                        parser->buffer[parser->size++] = c;
+                    }
+                    else {
+                        parser->buffer[parser->size++] = '\\';
+                        parser->buffer[parser->size++] = c;
+                    }
+                    escaped = 0;
                 }
-                else {
+                else if (c == '\\') {
+                    escaped = 1;            // начало escape, слеш пока не пишем
+                }
+                else if (c == '\"') {
+                    // Закрывающая кавычка
                     if (!formdataparser_save_value(parser))
                         return 0;
-
-                    parser->stage = FORMDATA_SEMICOLON;
+                    parser->stage = FORMDATA_AFTER_VALUE;
+                    parser->quote = 0;
+                }
+                else {
+                    parser->buffer[parser->size++] = c;
                 }
             }
             else {
-                parser->buffer[parser->size] = c;
-                parser->size++;
+                // Вне кавычек
+                if (c == '\"') {
+                    if (parser->size == 0)
+                        parser->quote = 1;                  // открывающая кавычка
+                    else
+                        parser->buffer[parser->size++] = c; // кавычка в середине значения
+                }
+                else if (c == ' ') {
+                    if (parser->size == 0) {
+                        // ведущий пробел перед значением (OWS после '=') — пропускаем
+                    }
+                    else {
+                        if (!formdataparser_save_value(parser))
+                            return 0;
+                        parser->stage = FORMDATA_SEMICOLON;
+                    }
+                }
+                else if (c == ';') {
+                    if (!formdataparser_save_value(parser))
+                        return 0;
+                    parser->stage = FORMDATA_SEMICOLON;
+                }
+                else {
+                    parser->buffer[parser->size++] = c;
+                }
+            }
+            break;
+        }
+        case FORMDATA_AFTER_VALUE: {
+            if (c == ' ') {}
+            else if (c == ';') {
+                parser->stage = FORMDATA_SKIP;
+            }
+            else {
+                log_error("formdataparser: expected ';' after quoted value, got: %c", c);
+                parser->error = "formdataparser: expected ';' after quoted value";
+                return 0;
             }
             break;
         }
@@ -190,7 +236,7 @@ int formdataparser_parse(formdataparser_t* parser, const char* buffer, size_t bu
             return 0;
         }
     }
-    else if (parser->stage == FORMDATA_KEY) {
+    else if (parser->stage == FORMDATA_KEY || parser->stage == FORMDATA_EQUAL) {
         log_error("formdataparser: key without value at end of parsing");
         parser->error = "formdataparser: key without value at end of parsing";
         return 0;
