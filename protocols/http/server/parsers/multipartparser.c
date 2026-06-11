@@ -37,7 +37,7 @@ multipart_fs_e __multipartparser_first_separator_check(char c, multipartparser_t
         return MP_FS_PASS;
     else if (index == 1 && c == '-')
         return MP_FS_PASS;
-    else if (index > 1 && index < separator_size - 1 && c == parser->boundary[index - 2])
+    else if (index > 1 && index < separator_size - 2 && c == parser->boundary[index - 2])
         return MP_FS_PASS;
     else if (index == separator_size - 2 && c == '\r')
         return MP_FS_PASS;
@@ -65,7 +65,7 @@ multipart_im_e __multipartparser_intermediate_separator_check(char c, multipartp
         return MP_IM_PASS;
     else if (index == 3 && c == '-')
         return MP_IM_PASS;
-    else if (index > 3 && index < separator_size - 1 && c == parser->boundary[index - 4])
+    else if (index > 3 && index < separator_size - 2 && c == parser->boundary[index - 4])
         return MP_IM_PASS;
     else if (index == separator_size - 2 && (c == '\r' || c == '-'))
         return MP_IM_PASS;
@@ -186,6 +186,10 @@ multipart_res_e multipartparser_parse(multipartparser_t* parser, char* buffer, s
             else if (ch == '\r')
                 parser->stage = MP_STG_HEADER_END;
             else {
+                if (!is_valid_header_value_char((unsigned char)ch)) {
+                    parser->error = "multipartparser: invalid character in header value";
+                    return MP_RES_ERROR;
+                }
                 if (parser->header_value_size >= 4096) {
                     parser->error = "multipartparser: header value size exceeds limit (HEADER_SPACE)";
                     return MP_RES_ERROR;
@@ -199,6 +203,10 @@ multipart_res_e multipartparser_parse(multipartparser_t* parser, char* buffer, s
             if (ch == '\r')
                 parser->stage = MP_STG_HEADER_END;
             else {
+                if (!is_valid_header_value_char((unsigned char)ch)) {
+                    parser->error = "multipartparser: invalid character in header value";
+                    return MP_RES_ERROR;
+                }
                 if (parser->header_value_size >= 4096) {
                     parser->error = "multipartparser: header value size exceeds limit (HEADER_VALUE)";
                     return MP_RES_ERROR;
@@ -226,6 +234,10 @@ multipart_res_e multipartparser_parse(multipartparser_t* parser, char* buffer, s
                 parser->stage = MP_STG_EXTRA_LF;
             }
             else {
+                if (!is_valid_header_key_char((unsigned char)ch)) {
+                    parser->error = "multipartparser: invalid character in header key";
+                    return MP_RES_ERROR;
+                }
                 parser->stage = MP_STG_HEADER_KEY;
                 multipartparser_reset_header(parser);
                 parser->header_key_size++;
@@ -280,31 +292,9 @@ multipart_res_e multipartparser_parse(multipartparser_t* parser, char* buffer, s
                     return MP_RES_ERROR;
                 }
 
-                parser->stage = MP_STG_END_CR;
-                parser->separator_index = 0;
+                return MP_RES_DONE;
             }
             break;
-        }
-        case MP_STG_END_CR: {
-            if (ch == '\r') {
-                parser->stage = MP_STG_END_LF;
-            }
-            else {
-                parser->error = "multipartparser: expected LF after CR in END_CR";
-                return MP_RES_ERROR;
-            }
-            break;
-        }
-        case MP_STG_END_LF: {
-            if (ch == '\n') {
-                if (i == buffer_size - 1)
-                    return MP_RES_DONE;
-
-                parser->error = "multipartparser: unexpected EOF in END_LF";
-                return MP_RES_ERROR;
-            }
-            parser->error = "multipartparser: expected LF after CR in END_LF";
-            return MP_RES_ERROR;
         }
         }
 
@@ -342,6 +332,9 @@ int multipartparser_create_part(multipartparser_t* parser) {
                 f->key = copy_cstringn(str_get(&hfield->key), f->key_length);
                 if (f->key == NULL) {
                     parser->error = "multipartparser: failed to copy field key";
+                    formdataparser_clear(&fdparser);
+                    http_payloadfield_free(field);
+                    http_payloadfield_free(f);
                     return 0;
                 }
 
@@ -349,6 +342,9 @@ int multipartparser_create_part(multipartparser_t* parser) {
                 f->value = copy_cstringn(str_get(&hfield->value), f->value_length);
                 if (f->value == NULL) {
                     parser->error = "multipartparser: failed to copy field value";
+                    formdataparser_clear(&fdparser);
+                    http_payloadfield_free(field);
+                    http_payloadfield_free(f);
                     return 0;
                 }
 
@@ -393,7 +389,7 @@ int multipartparser_create_part(multipartparser_t* parser) {
 }
 
 int multipartparser_create_header(multipartparser_t* parser) {
-    if (parser->header_count > 10) {
+    if (parser->header_count >= 10) {
         parser->error = "multipartparser: too many headers in part";
         return 0;
     }
@@ -439,17 +435,23 @@ void multipartparser_reset_header(multipartparser_t* parser) {
 }
 
 int multipartparser_write_header(int fd, char* value, size_t offset, size_t size) {
-    off_t current_offset = lseek(fd, 0, SEEK_CUR);
+    size_t total = 0;
 
-    lseek(fd, offset, SEEK_SET);
-    ssize_t r = read(fd, value, size);
+    while (total < size) {
+        ssize_t r = pread(fd, value + total, size - total, (off_t)(offset + total));
 
-    lseek(fd, current_offset, SEEK_SET);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            return 0;
+        }
+        if (r == 0)
+            return 0;
 
-    if (r < 0 || r != (ssize_t)size) return 0;
+        total += (size_t)r;
+    }
 
     value[size] = 0;
-
     return 1;
 }
 

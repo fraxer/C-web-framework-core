@@ -11,7 +11,6 @@
 #include "helpers.h"
 
 static int __hex_char_to_int(char c);
-static char __hex_to_byte(char);
 static char __byte_to_hex(char);
 
 int helpers_mkdir(const char* path) {
@@ -55,7 +54,8 @@ int helpers_base_mkdir(const char* base_path, const char* path) {
 
     struct stat stat_obj;
     if(stat(local_path, &stat_obj) == -1)
-        if(mkdir(local_path, S_IRWXU) == -1) return 1;
+        if(mkdir(local_path, S_IRWXU) == -1)
+            return 0;
 
     if (*p_path != 0)
         if (!helpers_base_mkdir(local_path, p_path)) return 0;
@@ -225,9 +225,17 @@ char* urldecodel(const char* string, size_t length, size_t* output_length) {
     for (size_t i = 0; i < length; i++) {
         char ch = string[i];
         if (ch == '%') {
-            if (string[i + 1] && string[i + 2]) {
-                *pbuffer++ = __hex_to_byte(string[i + 1]) << 4 | __hex_to_byte(string[i + 2]);
-                i += 2;
+            if (i + 2 < length) {
+                int hi = __hex_char_to_int(string[i + 1]);
+                int lo = __hex_char_to_int(string[i + 2]);
+                if (hi >= 0 && lo >= 0) {
+                    *pbuffer++ = (char)((hi << 4) | lo);
+                    i += 2;
+                } else {
+                    *pbuffer++ = '%';   // битый %XX — оставляем литералом
+                }
+            } else {
+                *pbuffer++ = '%';
             }
         } else if (ch == '+') { 
             *pbuffer++ = ' ';
@@ -242,12 +250,6 @@ char* urldecodel(const char* string, size_t length, size_t* output_length) {
         *output_length = pbuffer - buffer;
 
     return buffer;
-}
-
-char __hex_to_byte(char hex) {
-    return hex <= '9' ? hex - '0' : 
-           hex <= 'F' ? hex - 'A' + 10 : 
-           hex - 'a' + 10;
 }
 
 char __byte_to_hex(char code) {
@@ -279,17 +281,21 @@ int data_appendn(char* data, size_t* pos, size_t max, const char* string, size_t
 int is_path_traversal(const char* string, size_t length) {
     char ch_1 = 0;
     char ch_2 = 0;
-    char ch_3 = 0;
-    for (size_t i = 0; i <= length; i++) {
-        if (ch_1 == '/' && ch_2 == '.' && ch_3 == '.' && string[i] == '/')
-            return 1;
-        else if (ch_1 == '/' && ch_2 == '.' && ch_3 == '.' && string[i] == '\0')
+    char ch_3 = '/';
+
+    for (size_t i = 0; i < length; i++) {
+        char c = string[i];
+
+        if (ch_1 == '/' && ch_2 == '.' && ch_3 == '.' && c == '/')
             return 1;
 
         ch_1 = ch_2;
         ch_2 = ch_3;
-        ch_3 = string[i];
+        ch_3 = c;
     }
+
+    if (ch_1 == '/' && ch_2 == '.' && ch_3 == '.')
+        return 1;
 
     return 0;
 }

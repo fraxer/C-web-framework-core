@@ -16,8 +16,6 @@ typedef enum multipartstage {
     MP_STG_EXTRA_CR,
     MP_STG_EXTRA_LF,
     MP_STG_BODY,
-    MP_STG_END_CR,
-    MP_STG_END_LF,
 } multipartstage_e;
 
 typedef enum multipart_res {

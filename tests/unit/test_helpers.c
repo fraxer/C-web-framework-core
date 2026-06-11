@@ -565,6 +565,9 @@ TEST(test_is_path_traversal_simple) {
 
     TEST_ASSERT_EQUAL(1, is_path_traversal("/../etc/passwd", 14), "Should detect /../");
     TEST_ASSERT_EQUAL(1, is_path_traversal("/var/../etc", 11), "Should detect /../ in middle");
+    TEST_ASSERT_EQUAL(1, is_path_traversal("/../", 4), "Should detect /../");
+    TEST_ASSERT_EQUAL(1, is_path_traversal("../", 3), "Should detect ../");
+    TEST_ASSERT_EQUAL(1, is_path_traversal("/..", 3), "Should detect /..");
 }
 
 TEST(test_is_path_traversal_at_end) {
@@ -611,7 +614,7 @@ TEST(test_is_path_traversal_dots_in_filename) {
 TEST(test_is_path_traversal_without_slash) {
     TEST_CASE("Path traversal patterns without slash prefix");
 
-    TEST_ASSERT_EQUAL(0, is_path_traversal("../etc/passwd", 13), ".. without leading / should be safe");
+    TEST_ASSERT_EQUAL(1, is_path_traversal("../etc/passwd", 13), ".. without leading / should be not safe");
 }
 
 // ============================================================================
@@ -1033,7 +1036,7 @@ TEST(test_urldecode_percent_in_middle_incomplete) {
     // "a%Gb" -> 'a' + decoded byte = 2 chars (i jumps by 2, 'b' is consumed as hex digit)
     char* decoded = urldecode("a%Gb", 4);
     TEST_ASSERT_NOT_NULL(decoded, "Should not crash");
-    TEST_ASSERT_EQUAL_SIZE(2, strlen(decoded), "Should produce 2 chars (%%Gb consumes all 3)");
+    TEST_ASSERT_EQUAL_SIZE(4, strlen(decoded), "Should produce 4 chars (%%Gb consumes all 3)");
 
     free(decoded);
 }
@@ -1093,7 +1096,7 @@ TEST(test_urldecode_incomplete_percent) {
 
     char* decoded = urldecode("hello%", 6);
     TEST_ASSERT_NOT_NULL(decoded, "Should not crash");
-    TEST_ASSERT_STR_EQUAL("hello", decoded, "Should ignore incomplete percent");
+    TEST_ASSERT_STR_EQUAL("hello%", decoded, "Should show incomplete percent");
 
     free(decoded);
 }
@@ -1105,7 +1108,7 @@ TEST(test_urldecode_single_char_after_percent) {
     TEST_ASSERT_NOT_NULL(decoded, "Should not crash");
     // When % has only one char after it (no second hex digit), the % is skipped
     // and remaining chars are passed through
-    TEST_ASSERT_STR_EQUAL("hello2", decoded, "Should skip incomplete percent and pass remaining");
+    TEST_ASSERT_STR_EQUAL("hello%2", decoded, "Should show incomplete percent and pass remaining");
 
     free(decoded);
 }
@@ -1169,7 +1172,7 @@ TEST(test_cmpsubstr_lower_overlap_reset) {
 TEST(test_is_path_traversal_just_dots) {
     TEST_CASE("Path with just dots is safe");
 
-    TEST_ASSERT_EQUAL(0, is_path_traversal("..", 2), "Just .. without / is safe");
+    TEST_ASSERT_EQUAL(1, is_path_traversal("..", 2), "Just .. without / is not safe");
     TEST_ASSERT_EQUAL(0, is_path_traversal("...", 3), "Three dots is safe");
 }
 

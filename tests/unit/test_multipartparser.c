@@ -102,6 +102,50 @@ TEST(test_mp_single_part_single_header) {
     close(fd);
 }
 
+TEST(test_mp_single_part_without_tail_cr_lf) {
+    TEST_SUITE("Multipart Parser - Single Part");
+    TEST_CASE("Single part with one header without tail CR LF");
+
+    const char boundary[] = "BOUNDARY";
+    const char payload[] =
+        "--BOUNDARY\r\n"
+        "Content-Disposition: form-data; name=\"field1\"\r\n"
+        "\r\n"
+        "hello world\r\n"
+        "--BOUNDARY--";
+
+    int fd = create_payload_fd(payload, sizeof(payload) - 1);
+    TEST_ASSERT(fd >= 0, "memfd_create should succeed");
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+    multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
+
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+
+    http_payloadpart_t* part = multipartparser_part(&parser);
+    TEST_ASSERT_NOT_NULL(part, "Should have one part");
+    TEST_ASSERT_NULL(part->next, "Should have exactly one part");
+
+    TEST_ASSERT_NOT_NULL(part->header, "Part should have headers");
+    TEST_ASSERT_NOT_NULL(part->header->key, "Header key should be allocated");
+    TEST_ASSERT_STR_EQUAL("Content-Disposition", part->header->key, "Header key should match");
+    TEST_ASSERT_NOT_NULL(part->header->value, "Header value should be allocated");
+
+    TEST_ASSERT_NOT_NULL(part->field, "Part should have a field");
+    TEST_ASSERT_STR_EQUAL("name", part->field->key, "Field key should be 'name'");
+    TEST_ASSERT_STR_EQUAL("field1", part->field->value, "Field value should be 'field1'");
+
+    char* part_value = strndup(&payload[part->offset], part->size);
+    if (part_value)
+        TEST_ASSERT_STR_EQUAL("hello world", part_value, "Part value should be 'hello world'");
+    free(part_value);
+
+    free_parts(part);
+    free_orphan_headers(parser.header);
+    close(fd);
+}
+
 // ============================================================================
 // Test Suite 2: Single part, multiple headers
 // ============================================================================
@@ -2260,7 +2304,7 @@ TEST(test_mp_double_closing_boundary) {
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
     multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
-    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should parse part even with double closing");
@@ -2459,7 +2503,7 @@ TEST(test_mp_very_long_header_value) {
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
     multipart_res_e res = multipartparser_parse(&parser, payload, pos);
-    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     TEST_ASSERT(1, "Parser should not crash on very long header value");
 
@@ -3211,7 +3255,7 @@ TEST(test_mp_with_postamble) {
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
     multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
-    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
+    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
 
     http_payloadpart_t* part = multipartparser_part(&parser);
     TEST_ASSERT_NOT_NULL(part, "Should find part before postamble");
@@ -3743,7 +3787,7 @@ TEST(test_mp_header_space_lf_as_value) {
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
     multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
-    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
     // Parser should not crash. Whether a part is created depends on how the
     // bare \n is handled in the state machine.
@@ -3776,7 +3820,7 @@ TEST(test_mp_header_value_lf_not_handled) {
     multipartparser_t parser;
     multipartparser_init(&parser, fd, boundary);
     multipart_res_e res = multipartparser_parse(&parser, (char*)payload, sizeof(payload) - 1);
-    TEST_ASSERT(res == MP_RES_DONE, "Parse should complete");
+    TEST_ASSERT(res == MP_RES_ERROR, "Parse should complete");
 
     TEST_ASSERT(1, "Parser should not crash on bare \\n in header value");
 
