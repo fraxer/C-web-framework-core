@@ -127,7 +127,7 @@ int __read(connection_t* connection) {
     }
 
     while (1) {
-        int bytes_readed = 0;
+        ssize_t bytes_readed = 0;
         read_data:
 
         bytes_readed = connection_data_read(connection);
@@ -144,7 +144,7 @@ int __read(connection_t* connection) {
             return 0;
         default:
         {
-            httpparser_set_bytes_readed(parser, bytes_readed);
+            httpparser_set_bytes_readed(parser, (size_t)bytes_readed);
             parser->pos_start = 0;
             parser->pos = 0;
 
@@ -363,6 +363,11 @@ int __apply_redirect(httprequest_t* request, httpresponse_t* response, deferred_
         httpresponse_default(response, 500);
         return handler(request, response);
     }
+    case REDIRECT_BAD_REQUEST:
+    {
+        httpresponse_default(response, 400);
+        return handler(request, response);
+    }
     case REDIRECT_LOOP_CYCLE:
     {
         httpresponse_default(response, 508);
@@ -417,8 +422,17 @@ int __get_redirect(connection_t* connection, httprequest_t* request) {
             return REDIRECT_FOUND;
         }
 
-        if (!httpparser_set_uri(request, new_uri, strlen(new_uri)))
+        int uri_result = httpparser_set_uri(request, new_uri, strlen(new_uri));
+        if (uri_result == HTTP1PARSER_OUT_OF_MEMORY) {
+            request->uri = NULL;
+            free(new_uri);
             return REDIRECT_OUT_OF_MEMORY;
+        }
+        if (uri_result != HTTP1PARSER_CONTINUE) {
+            request->uri = NULL;
+            free(new_uri);
+            return REDIRECT_BAD_REQUEST;
+        }
 
         redirect = ctx->server->http.redirect;
 

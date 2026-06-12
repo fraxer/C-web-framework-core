@@ -7,7 +7,8 @@ enum redirect_status {
     REDIRECT_OUT_OF_MEMORY,
     REDIRECT_LOOP_CYCLE,
     REDIRECT_FOUND,
-    REDIRECT_NOT_FOUND
+    REDIRECT_NOT_FOUND,
+    REDIRECT_BAD_REQUEST
 };
 
 typedef struct redirect_param {

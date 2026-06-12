@@ -16,6 +16,7 @@
 #include "helpers.h"
 #include "queryparser.h"
 #include "idn_utils.h"
+#include "connection_s.h"
 
 #define MAX_HEADER_KEY_SIZE 256
 #define MAX_HEADER_VALUE_SIZE 8192
@@ -105,6 +106,12 @@ void __clear(httprequestparser_t* parser) {
 }
 
 int httpparser_run(httprequestparser_t* parser) {
+    // Safety check: ensure parser and buffer are valid
+    if (parser == NULL || parser->buffer == NULL) {
+        log_error("HTTP error: parser or buffer is NULL in httpparser_run\n");
+        return HTTP1PARSER_ERROR;
+    }
+
     if (parser->stage == HTTP1REQUESTPARSER_PAYLOAD)
         return __parse_payload(parser);
 
@@ -217,7 +224,7 @@ int httpparser_run(httprequestparser_t* parser) {
 
                 break;
             }
-            else if (httpparser_is_ctl(ch)) {
+            else if (httpparser_is_ctl(ch) || ch == ' ' || ch == '\t') {
                 return __clear_and_return(parser, HTTP1PARSER_BAD_REQUEST);
             }
             else {
@@ -289,6 +296,18 @@ int httpparser_run(httprequestparser_t* parser) {
                 }
 
                 if (parser->content_length == 0) {
+                    if (parser->content_length_found) {
+                        // Content-Length: 0 was explicitly set — no body expected,
+                        // treat remaining data as pipelined request
+                        if (parser->pos + 1 < parser->bytes_readed) {
+                            parser->pos++;
+                            return HTTP1PARSER_HANDLE_AND_CONTINUE;
+                        }
+
+                        return HTTP1PARSER_COMPLETE;
+                    }
+
+                    // No Content-Length header at all
                     // Prevent integer underflow: check if there's data after headers
                     if (parser->pos + 1 < parser->bytes_readed) {
                         // RFC 7230: methods that allow payload require Content-Length or Transfer-Encoding
@@ -321,7 +340,7 @@ int httpparser_run(httprequestparser_t* parser) {
     return HTTP1PARSER_CONTINUE;
 }
 
-void httpparser_set_bytes_readed(httprequestparser_t* parser, int readed) {
+void httpparser_set_bytes_readed(httprequestparser_t* parser, size_t readed) {
     parser->bytes_readed = readed;
 }
 
@@ -487,11 +506,13 @@ int __set_path(httprequest_t* request, const char* string, size_t length) {
     char* path = urldecodel(string, length, &decoded_length);
     if (path == NULL) return HTTP1PARSER_OUT_OF_MEMORY;
 
+    if (is_path_traversal(path, decoded_length)) {
+        free(path);
+        return HTTP1PARSER_BAD_REQUEST;
+    }
+
     request->path = path;
     request->path_length = decoded_length;
-
-    if (is_path_traversal(path, decoded_length))
-        return HTTP1PARSER_BAD_REQUEST;
 
     return HTTP1PARSER_CONTINUE;
 }
@@ -613,20 +634,53 @@ void __try_set_keepalive(httprequestparser_t* parser) {
 
     const char* connection_key = "connection";
     const size_t connection_key_length = 10;
-    const char* connection_value = "keep-alive";
-    const size_t connection_value_length = 10;
 
     if (header->key_length != connection_key_length) return;
     if (!cmpstrn_lower(header->key, header->key_length, connection_key, connection_key_length)) return;
 
-    parser->connection->keepalive = cmpstrn_lower(header->value, header->value_length, connection_value, connection_value_length);
+    // RFC 7230: Connection header is a comma-separated list of tokens
+    // e.g. "keep-alive", "keep-alive, Upgrade", "close"
+    const char* value = header->value;
+    const size_t value_length = header->value_length;
+    const char* token = "keep-alive";
+    const size_t token_length = 10;
+
+    size_t start = 0;
+
+    while (start < value_length) {
+        // Skip leading OWS
+        while (start < value_length && (value[start] == ' ' || value[start] == '\t'))
+            start++;
+
+        // Find end of token (comma or end of string)
+        size_t end = start;
+        while (end < value_length && value[end] != ',')
+            end++;
+
+        // Trim trailing OWS
+        size_t tok_end = end;
+        while (tok_end > start && (value[tok_end - 1] == ' ' || value[tok_end - 1] == '\t'))
+            tok_end--;
+
+        if (tok_end - start == token_length &&
+            cmpstrn_lower(&value[start], tok_end - start, token, token_length)) {
+            parser->connection->keepalive = 1;
+            return;
+        }
+
+        start = end + 1;
+    }
+
+    parser->connection->keepalive = 0;
 }
 
 void __try_set_range(httprequestparser_t* parser) {
     httprequest_t* request = parser->request;
 
-    if (cmpstrn_lower(request->last_header->key, request->last_header->key_length, "range", 5))
+    if (cmpstrn_lower(request->last_header->key, request->last_header->key_length, "range", 5)) {
+        http_ranges_free(request->ranges);
         request->ranges = httpparser_parse_range((char*)request->last_header->value, request->last_header->value_length);
+    }
 }
 
 void __try_set_cookie(httprequest_t* request) {
@@ -645,6 +699,7 @@ void __try_set_cookie(httprequest_t* request) {
         return;
     }
 
+    http_cookie_free(request->cookie_);
     request->cookie_ = cookieparser_cookie(&parser);
 }
 
@@ -661,7 +716,7 @@ http_ranges_t* httpparser_parse_range(char* str, size_t length) {
     for (size_t i = start_position; i < length; i++) {
         long long int end = -1;
 
-        if (isdigit(str[i])) continue;
+        if (isdigit((unsigned char)str[i])) continue;
         else if (str[i] == '-') {
             if (last_range && last_range->end == -1) goto failed;
             if (last_range && last_range->start == -1) goto failed;

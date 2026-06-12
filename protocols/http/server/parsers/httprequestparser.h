@@ -43,7 +43,7 @@ void httpparser_init(httprequestparser_t* parser, connection_t* connection);
 void httpparser_free(void* arg);
 void httpparser_reset(httprequestparser_t*);
 int httpparser_run(httprequestparser_t* parser);
-void httpparser_set_bytes_readed(httprequestparser_t*, int);
+void httpparser_set_bytes_readed(httprequestparser_t*, size_t);
 void httpparser_prepare_continue(httprequestparser_t* parser);
 int httpparser_set_uri(httprequest_t*, const char*, size_t);
 void httpparser_append_query(httprequest_t*, query_t*);
