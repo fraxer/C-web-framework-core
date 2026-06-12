@@ -72,12 +72,17 @@ myhost_t* __host_create(void) {
     myhost_t* host = malloc(sizeof * host);
     if (host == NULL) return NULL;
 
+    host->base.connections = array_create();
+    if (host->base.connections == NULL) {
+        free(host);
+        return NULL;
+    }
+
     host->base.free = __host_free;
     host->base.port = 0;
     host->base.ip = NULL;
     host->base.id = NULL;
     host->base.connection_create = __connection_create;
-    host->base.connections = array_create();
     host->base.connections_locked = 0;
     host->base.grammar.compile_table_exist = __compile_table_exist;
     host->base.grammar.compile_table_migration_create = __compile_table_migration_create;
@@ -304,6 +309,7 @@ dbresult_t* __process_prepared_result(void* connection, MYSQL_STMT* stmt, dbresu
         MYSQL_RES* res = mysql_stmt_result_metadata(stmt);
         if (res == NULL && mysql_stmt_field_count(stmt) > 0) {
             log_error("__process_prepared_result: mysql_stmt_result_metadata failed: %s\n", mysql_stmt_error(stmt));
+            result->ok = 0;
             return result;
         }
 
@@ -314,6 +320,7 @@ dbresult_t* __process_prepared_result(void* connection, MYSQL_STMT* stmt, dbresu
             if (mysql_stmt_store_result(stmt)) {
                 log_error("__process_prepared_result: mysql_stmt_store_result failed: %s\n", mysql_stmt_error(stmt));
                 mysql_free_result(res);
+                result->ok = 0;
                 return result;
             }
 
@@ -435,9 +442,11 @@ dbresult_t* __process_prepared_result(void* connection, MYSQL_STMT* stmt, dbresu
             }
 
             // Получаем строки
+            // MYSQL_DATA_TRUNCATED не ошибка чтения: строка получена, усечение
+            // обрабатывается поколоночно через *bind->error ниже
             int row = 0;
             int fetch_status;
-            while ((fetch_status = mysql_stmt_fetch(stmt)) == 0) {
+            while ((fetch_status = mysql_stmt_fetch(stmt)) == 0 || fetch_status == MYSQL_DATA_TRUNCATED) {
                 for (int col = 0; col < cols; col++) {
                     // ИСПРАВЛЕНИЕ: Используем указатель вместо копии структуры
                     // Это избегает ненужного копирования и потенциальных race conditions
@@ -522,7 +531,9 @@ MYSQL* __connect(void* arg) {
     MYSQL* connection = mysql_init(NULL);
     if (connection == NULL) return NULL;
 
-    connection = mysql_real_connect(
+    // mysql_real_connect при ошибке возвращает NULL: хэндл из mysql_init
+    // нужно закрыть самостоятельно, иначе он утечёт
+    if (mysql_real_connect(
         connection,
         host->base.ip,
         host->user,
@@ -531,7 +542,11 @@ MYSQL* __connect(void* arg) {
         host->base.port,
         NULL,
         CLIENT_MULTI_STATEMENTS
-    );
+    ) == NULL) {
+        log_error("mysql connect error: %s\n", mysql_error(connection));
+        mysql_close(connection);
+        return NULL;
+    }
 
     return connection;
 }
@@ -546,7 +561,12 @@ int __is_active(void* connection) {
 int __reconnect(void* host, void* connection) {
     myconnection_t* conn = connection;
 
-    if (__is_active(conn)) {
+    if (!__is_active(conn)) {
+        // MYSQL_STMT привязаны к старому хэндлу: закрываем их до mysql_close,
+        // иначе mysql_stmt_close обратится к освобождённому соединению
+        if (conn->base.prepare_statements != NULL)
+            map_clear(conn->base.prepare_statements);
+
         mysql_close(conn->connection);
 
         conn->connection = __connect(host);
@@ -601,84 +621,46 @@ dbresult_t* __begin(void* connection, transaction_level_e level) {
 }
 
 str_t* __escape_identifier_part(void* connection, const char* start, size_t len) {
+    (void)connection;
+
     if (len == 0)
         return NULL;
 
-    myconnection_t* conn = connection;
-    int is_quoted = (start[0] == '`' && start[len - 1] == '`' && len >= 2);
+    // Внутри `...` единственный спецсимвол — сам бэктик, он удваивается;
+    // backslash-экранирование (mysql_real_escape_string) для идентификаторов
+    // не работает: оно предназначено для строковых литералов
+    const char* content = start;
+    size_t content_len = len;
+    int unescape_pairs = 0;
 
+    int is_quoted = (len >= 2 && start[0] == '`' && start[len - 1] == '`');
     if (is_quoted) {
-        // Extract content between backticks and unescape `` -> `
-        size_t content_len = len - 2;
+        content = start + 1;
+        content_len = len - 2;
+        unescape_pairs = 1;
         if (content_len == 0)
             return NULL;
+    }
 
-        char* unquoted = malloc(content_len + 1);
-        if (unquoted == NULL)
-            return NULL;
+    str_t* result = str_create_empty(content_len + 3);
+    if (result == NULL)
+        return NULL;
 
-        size_t j = 0;
-        for (size_t i = 0; i < content_len; i++) {
-            char c = start[1 + i];
-            unquoted[j++] = c;
-            // Skip second backtick in `` sequence
-            if (c == '`' && i + 1 < content_len && start[1 + i + 1] == '`')
+    str_appendc(result, '`');
+    for (size_t i = 0; i < content_len; i++) {
+        char c = content[i];
+        str_appendc(result, c);
+        if (c == '`') {
+            str_appendc(result, '`');
+            // В заквоченном исходнике бэктики уже удвоены: схлопываем пару,
+            // чтобы не учетверить
+            if (unescape_pairs && i + 1 < content_len && content[i + 1] == '`')
                 i++;
         }
-        unquoted[j] = '\0';
-
-        // Escape and quote the content
-        char* escaped = malloc(j * 2 + 1);
-        if (escaped == NULL) {
-            free(unquoted);
-            return NULL;
-        }
-
-        unsigned long esc_len = mysql_real_escape_string(conn->connection, escaped, unquoted, j);
-        free(unquoted);
-
-        if (esc_len == (unsigned long)-1) {
-            free(escaped);
-            return NULL;
-        }
-
-        str_t* result = str_create_empty(esc_len + 3);
-        if (result == NULL) {
-            free(escaped);
-            return NULL;
-        }
-
-        str_appendc(result, '`');
-        str_append(result, escaped, esc_len);
-        str_appendc(result, '`');
-        free(escaped);
-
-        return result;
-    } else {
-        // Not quoted - escape directly
-        char* escaped = malloc(len * 2 + 1);
-        if (escaped == NULL)
-            return NULL;
-
-        unsigned long esc_len = mysql_real_escape_string(conn->connection, escaped, start, len);
-        if (esc_len == (unsigned long)-1) {
-            free(escaped);
-            return NULL;
-        }
-
-        str_t* result = str_create_empty(esc_len + 3);
-        if (result == NULL) {
-            free(escaped);
-            return NULL;
-        }
-
-        str_appendc(result, '`');
-        str_append(result, escaped, esc_len);
-        str_appendc(result, '`');
-        free(escaped);
-
-        return result;
     }
+    str_appendc(result, '`');
+
+    return result;
 }
 
 str_t* __escape_identifier(void* connection, const char* str) {
@@ -849,7 +831,7 @@ db_t* my_load(const char* database_id, const json_token_t* token_array) {
         return NULL;
     }
 
-    enum fields { HOST_ID = 0, PORT, IP, DBNAME, USER, PASSWORD, MIGRATION, FIELDS_COUNT };
+    enum fields { HOST_ID = 0, PORT, IP, DBNAME, USER, PASSWORD, FIELDS_COUNT };
     enum required_fields { R_HOST_ID = 0, R_PORT, R_IP, R_DBNAME, R_USER, R_PASSWORD, R_FIELDS_COUNT };
     char* field_names[FIELDS_COUNT] = {"host_id", "port", "ip", "dbname", "user", "password"};
 
@@ -1002,14 +984,17 @@ db_t* my_load(const char* database_id, const json_token_t* token_array) {
             }
         }
 
-        array_push_back(database->hosts, array_create_pointer(host, array_nocopy, host->base.free));
-
         for (int i = 0; i < R_FIELDS_COUNT; i++) {
             if (finded_fields[i] == 0) {
                 log_error("my_load: required field %s not found\n", field_names[i]);
                 goto host_failed;
             }
         }
+
+        // Добавляем host в массив только после всех проверок: элемент массива
+        // владеет host (освобождается через db_free), ручной free после
+        // push привёл бы к двойному освобождению
+        array_push_back(database->hosts, array_create_pointer(host, array_nocopy, host->base.free));
 
         lresult = 1;
 
@@ -1049,7 +1034,10 @@ int __build_query_processor(void* connection, char parameter_type, const char* p
     }
     else if (parameter_type == ':') {
         // Replace :param with ?
-        str_appendc(result_sql, '?');
+        if (!str_appendc(result_sql, '?')) {
+            log_error("__build_query_processor: str_appendc failed\n");
+            return 0;
+        }
         array_push_back_str(param_order, param_name);
     }
     else {
@@ -1290,21 +1278,32 @@ char* __compile_insert(void* connection, const char* table, array_t* params) {
 
     char* buffer = NULL;
 
+    str_t* table_ref = __escape_identifier(connection, table);
+    if (table_ref == NULL) return NULL;
+
     str_t* fields = str_create_empty(256);
-    if (fields == NULL) return NULL;
+    if (fields == NULL) {
+        str_free(table_ref);
+        return NULL;
+    }
 
     str_t* values = str_create_empty(256);
     if (values == NULL) goto failed;
 
     for (size_t i = 0; i < array_size(params); i++) {
         mfield_t* field = array_get(params, i);
+        if (field == NULL) goto failed;
 
         if (i > 0) {
             str_appendc(fields, ',');
             str_appendc(values, ',');
         }
 
-        str_append(fields, field->name, strlen(field->name));
+        str_t* escaped_field = __escape_identifier(connection, field->name);
+        if (escaped_field == NULL) goto failed;
+
+        str_append(fields, str_get(escaped_field), str_size(escaped_field));
+        str_free(escaped_field);
 
         str_t* value = model_field_to_string(field);
         if (value == NULL) goto failed;
@@ -1323,19 +1322,20 @@ char* __compile_insert(void* connection, const char* table, array_t* params) {
     }
 
     const char* format = "INSERT INTO %s (%s) VALUES (%s)";
-    const size_t buffer_size = strlen(format) + strlen(table) + str_size(fields) + str_size(values) + 1;
+    const size_t buffer_size = strlen(format) + str_size(table_ref) + str_size(fields) + str_size(values) + 1;
     buffer = malloc(buffer_size);
     if (buffer == NULL) goto failed;
 
     snprintf(buffer, buffer_size,
         format,
-        table,
+        str_get(table_ref),
         str_get(fields),
         str_get(values)
     );
 
     failed:
 
+    str_free(table_ref);
     str_free(fields);
     str_free(values);
 
@@ -1343,13 +1343,19 @@ char* __compile_insert(void* connection, const char* table, array_t* params) {
 }
 
 char* __compile_select(void* connection, const char* table, array_t* columns, array_t* where) {
-    if (connection == NULL) return 0;
-    if (table == NULL) return 0;
+    if (connection == NULL) return NULL;
+    if (table == NULL) return NULL;
 
     char* buffer = NULL;
 
+    str_t* table_ref = __escape_identifier(connection, table);
+    if (table_ref == NULL) return NULL;
+
     str_t* columns_str = str_create_empty(256);
-    if (columns_str == NULL) return 0;
+    if (columns_str == NULL) {
+        str_free(table_ref);
+        return NULL;
+    }
 
     str_t* where_str = str_create_empty(256);
     if (where_str == NULL) goto failed;
@@ -1379,11 +1385,17 @@ char* __compile_select(void* connection, const char* table, array_t* columns, ar
 
     for (size_t i = 0; i < array_size(where); i++) {
         mfield_t* field = array_get(where, i);
+        if (field == NULL) goto failed;
 
         if (i > 0)
             str_append(where_str, " AND ", 5);
 
-        str_append(where_str, field->name, strlen(field->name));
+        str_t* escaped_field = __escape_identifier(connection, field->name);
+        if (escaped_field == NULL) goto failed;
+
+        str_append(where_str, str_get(escaped_field), str_size(escaped_field));
+        str_free(escaped_field);
+
         str_appendc(where_str, '=');
 
         str_t* value = model_field_to_string(field);
@@ -1402,19 +1414,20 @@ char* __compile_select(void* connection, const char* table, array_t* columns, ar
     }
 
     const char* format = "SELECT %s FROM %s WHERE %s";
-    const size_t buffer_size = strlen(format) + strlen(table) + str_size(columns_str) + str_size(where_str) + 1;
+    const size_t buffer_size = strlen(format) + str_size(table_ref) + str_size(columns_str) + str_size(where_str) + 1;
     buffer = malloc(buffer_size);
     if (buffer == NULL) goto failed;
 
     snprintf(buffer, buffer_size,
         format,
         str_get(columns_str),
-        table,
+        str_get(table_ref),
         str_get(where_str)
     );
 
     failed:
 
+    str_free(table_ref);
     str_free(columns_str);
     str_free(where_str);
 
@@ -1422,14 +1435,20 @@ char* __compile_select(void* connection, const char* table, array_t* columns, ar
 }
 
 char* __compile_update(void* connection, const char* table, array_t* set, array_t* where) {
-    if (connection == NULL) return 0;
-    if (table == NULL) return 0;
-    if (set == NULL) return 0;
+    if (connection == NULL) return NULL;
+    if (table == NULL) return NULL;
+    if (set == NULL) return NULL;
 
     char* buffer = NULL;
 
+    str_t* table_ref = __escape_identifier(connection, table);
+    if (table_ref == NULL) return NULL;
+
     str_t* set_str = str_create_empty(256);
-    if (set_str == NULL) return 0;
+    if (set_str == NULL) {
+        str_free(table_ref);
+        return NULL;
+    }
 
     str_t* where_str = str_create_empty(256);
     if (where_str == NULL) goto failed;
@@ -1439,11 +1458,17 @@ char* __compile_update(void* connection, const char* table, array_t* set, array_
 
     for (size_t i = 0; i < array_size(set); i++) {
         mfield_t* field = array_get(set, i);
+        if (field == NULL) goto failed;
 
         if (i > 0)
             str_appendc(set_str, ',');
 
-        str_append(set_str, field->name, strlen(field->name));
+        str_t* escaped_field = __escape_identifier(connection, field->name);
+        if (escaped_field == NULL) goto failed;
+
+        str_append(set_str, str_get(escaped_field), str_size(escaped_field));
+        str_free(escaped_field);
+
         str_appendc(set_str, '=');
 
         str_t* value = model_field_to_string(field);
@@ -1463,11 +1488,17 @@ char* __compile_update(void* connection, const char* table, array_t* set, array_
 
     for (size_t i = 0; i < array_size(where); i++) {
         mfield_t* field = array_get(where, i);
+        if (field == NULL) goto failed;
 
         if (i > 0)
             str_append(where_str, " AND ", 5);
 
-        str_append(where_str, field->name, strlen(field->name));
+        str_t* escaped_field = __escape_identifier(connection, field->name);
+        if (escaped_field == NULL) goto failed;
+
+        str_append(where_str, str_get(escaped_field), str_size(escaped_field));
+        str_free(escaped_field);
+
         str_appendc(where_str, '=');
 
         str_t* value = model_field_to_string(field);
@@ -1486,19 +1517,20 @@ char* __compile_update(void* connection, const char* table, array_t* set, array_
     }
 
     const char* format = "UPDATE %s SET %s WHERE %s";
-    const size_t buffer_size = strlen(format) + strlen(table) + str_size(set_str) + str_size(where_str) + 1;
+    const size_t buffer_size = strlen(format) + str_size(table_ref) + str_size(set_str) + str_size(where_str) + 1;
     buffer = malloc(buffer_size);
     if (buffer == NULL) goto failed;
 
     snprintf(buffer, buffer_size,
         format,
-        table,
+        str_get(table_ref),
         str_get(set_str),
         str_get(where_str)
     );
 
     failed:
 
+    str_free(table_ref);
     str_free(set_str);
     str_free(where_str);
 
@@ -1506,24 +1538,36 @@ char* __compile_update(void* connection, const char* table, array_t* set, array_
 }
 
 char* __compile_delete(void* connection, const char* table, array_t* where) {
-    if (connection == NULL) return 0;
-    if (table == NULL) return 0;
+    if (connection == NULL) return NULL;
+    if (table == NULL) return NULL;
 
     char* buffer = NULL;
 
+    str_t* table_ref = __escape_identifier(connection, table);
+    if (table_ref == NULL) return NULL;
+
     str_t* where_str = str_create_empty(256);
-    if (where_str == NULL) goto failed;
+    if (where_str == NULL) {
+        str_free(table_ref);
+        return NULL;
+    }
 
     if (where == NULL || array_size(where) == 0)
         str_append(where_str, "true", 4);
 
     for (size_t i = 0; i < array_size(where); i++) {
         mfield_t* field = array_get(where, i);
+        if (field == NULL) goto failed;
 
         if (i > 0)
             str_append(where_str, " AND ", 5);
 
-        str_append(where_str, field->name, strlen(field->name));
+        str_t* escaped_field = __escape_identifier(connection, field->name);
+        if (escaped_field == NULL) goto failed;
+
+        str_append(where_str, str_get(escaped_field), str_size(escaped_field));
+        str_free(escaped_field);
+
         str_appendc(where_str, '=');
 
         str_t* value = model_field_to_string(field);
@@ -1542,28 +1586,34 @@ char* __compile_delete(void* connection, const char* table, array_t* where) {
     }
 
     const char* format = "DELETE FROM %s WHERE %s";
-    const size_t buffer_size = strlen(format) + strlen(table) + str_size(where_str) + 1;
+    const size_t buffer_size = strlen(format) + str_size(table_ref) + str_size(where_str) + 1;
     buffer = malloc(buffer_size);
     if (buffer == NULL) goto failed;
 
     snprintf(buffer, buffer_size,
         format,
-        table,
+        str_get(table_ref),
         str_get(where_str)
     );
 
     failed:
 
+    str_free(table_ref);
     str_free(where_str);
 
     return buffer;
 }
 
 enum_field_types __convert_model_type_to_mysql(mtype_e model_type) {
+    // buffer_type должен соответствовать тому, что __bind_field_value кладёт
+    // в buffer: бинарные типы — только там, где буфер действительно бинарный;
+    // даты, DECIMAL и JSON биндятся строкой (MYSQL_TYPE_DATE и т.п. ожидали бы
+    // структуру MYSQL_TIME, MYSQL_TYPE_JSON для входных параметров сервер
+    // отвергает)
     switch (model_type) {
         // Логические и целые типы
         case MODEL_BOOL:
-            return MYSQL_TYPE_TINY;        // TINYINT
+            return MYSQL_TYPE_SHORT;       // буфер — short
         case MODEL_SMALLINT:
             return MYSQL_TYPE_SHORT;       // SMALLINT
         case MODEL_INT:
@@ -1577,25 +1627,22 @@ enum_field_types __convert_model_type_to_mysql(mtype_e model_type) {
         case MODEL_DOUBLE:
             return MYSQL_TYPE_DOUBLE;      // DOUBLE
         case MODEL_DECIMAL:
-            return MYSQL_TYPE_NEWDECIMAL;  // DECIMAL
+            return MYSQL_TYPE_STRING;      // DECIMAL передаётся строкой
         case MODEL_MONEY:
-            return MYSQL_TYPE_NEWDECIMAL;  // DECIMAL
+            return MYSQL_TYPE_DOUBLE;      // буфер — double
 
-        // Типы даты и времени
+        // Типы даты и времени (передаются строкой)
         case MODEL_DATE:
-            return MYSQL_TYPE_DATE;        // DATE
         case MODEL_TIME:
-            return MYSQL_TYPE_TIME;        // TIME
         case MODEL_TIMETZ:
-            return MYSQL_TYPE_TIME;        // TIME (без поддержки часового пояса в MySQL)
         case MODEL_TIMESTAMP:
-            return MYSQL_TYPE_TIMESTAMP;   // TIMESTAMP
         case MODEL_TIMESTAMPTZ:
-            return MYSQL_TYPE_DATETIME;    // DATETIME (без поддержки часового пояса)
+            return MYSQL_TYPE_STRING;
 
-        // Типы данных JSON
+        // JSON и массивы (передаются строкой)
         case MODEL_JSON:
-            return MYSQL_TYPE_JSON;        // JSON
+        case MODEL_ARRAY:
+            return MYSQL_TYPE_STRING;
 
         // Строковые типы
         case MODEL_BINARY:
@@ -1608,8 +1655,6 @@ enum_field_types __convert_model_type_to_mysql(mtype_e model_type) {
             return MYSQL_TYPE_STRING;      // LONGBLOB/TEXT
         case MODEL_ENUM:
             return MYSQL_TYPE_STRING;      // VARCHAR (enum хранится как строка)
-        case MODEL_ARRAY:
-            return MYSQL_TYPE_JSON;        // JSON (массив как JSON)
 
         default:
             return MYSQL_TYPE_STRING;      // Значение по умолчанию
@@ -1621,6 +1666,16 @@ int __bind_field_value(MYSQL_BIND* bind, mfield_t* field, bool* is_null_indicato
 
     // Инициализируем NULL индикатор для этого параметра
     *is_null_indicator = false;
+
+    // NULL-поле отправляем как NULL независимо от типа: иначе числовые
+    // типы ушли бы в базу нулями
+    if (field->is_null) {
+        bind->buffer = NULL;
+        bind->buffer_length = 0;
+        bind->is_null = is_null_indicator;
+        *is_null_indicator = true;
+        return 1;
+    }
 
     switch (field->type) {
         case MODEL_BOOL:
@@ -1650,11 +1705,7 @@ int __bind_field_value(MYSQL_BIND* bind, mfield_t* field, bool* is_null_indicato
             bind->buffer_length = sizeof(double);
             break;
         }
-        case MODEL_DECIMAL: {
-            bind->buffer = &field->value._ldouble;
-            bind->buffer_length = sizeof(long double);
-            break;
-        }
+        case MODEL_DECIMAL:
         case MODEL_DATE:
         case MODEL_TIME:
         case MODEL_TIMETZ:

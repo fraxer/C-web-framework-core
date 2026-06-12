@@ -58,12 +58,17 @@ postgresqlhost_t* __host_create(void) {
     postgresqlhost_t* host = malloc(sizeof * host);
     if (host == NULL) return NULL;
 
+    host->base.connections = array_create();
+    if (host->base.connections == NULL) {
+        free(host);
+        return NULL;
+    }
+
     host->base.free = __host_free;
     host->base.port = 0;
     host->base.ip = NULL;
     host->base.id = NULL;
     host->base.connection_create = __connection_create;
-    host->base.connections = array_create();
     host->base.connections_locked = 0;
     host->base.grammar.compile_table_exist = __compile_table_exist;
     host->base.grammar.compile_table_migration_create = __compile_table_migration_create;
@@ -189,6 +194,16 @@ char* __compile_table_exist(dbconnection_t* connection, const char* table) {
     if (quoted_table == NULL)
         return NULL;
 
+    postgresqlhost_t* host = connection->host;
+    str_t* quoted_schema = NULL;
+    if (host->schema != NULL && host->schema[0] != '\0') {
+        quoted_schema = connection->escape_string(connection, host->schema);
+        if (quoted_schema == NULL) {
+            str_free(quoted_table);
+            return NULL;
+        }
+    }
+
     char tmp[512] = {0};
 
     ssize_t written = snprintf(
@@ -200,11 +215,14 @@ char* __compile_table_exist(dbconnection_t* connection, const char* table) {
             "\"information_schema\".\"tables\" "
         "WHERE "
             "table_name = %s AND "
+            "table_schema = %s AND "
             "table_type = 'BASE TABLE'",
-        str_get(quoted_table)
+        str_get(quoted_table),
+        quoted_schema != NULL ? str_get(quoted_schema) : "current_schema()"
     );
 
     str_free(quoted_table);
+    str_free(quoted_schema);
 
     if (written < 0 || written >= (ssize_t)sizeof(tmp)) {
         log_error("__compile_table_exist: buffer overflow prevented\n");
@@ -344,37 +362,18 @@ dbresult_t* __process_result(void* connection, dbresult_t* result) {
     return result;
 }
 
-size_t postgresql_connection_string(char* buffer, size_t size, postgresqlhost_t* host) {
-    return snprintf(buffer, size,
-        "host=%s "
-        "port=%d "
-        "dbname=%s "
-        "user=%s "
-        "password=%s "
-        "connect_timeout=%d ",
-        host->base.ip,
-        host->base.port,
-        host->dbname,
-        host->user,
-        host->password,
-        host->connection_timeout
-    );
-}
-
 PGconn* __connect(void* arg) {
     postgresqlhost_t* host = arg;
 
-    size_t string_length = postgresql_connection_string(NULL, 0, host);
-    char* string = malloc(string_length + 1);
-    if (string == NULL) return NULL;
+    char port[16] = {0};
+    char timeout[16] = {0};
+    snprintf(port, sizeof(port), "%d", host->base.port);
+    snprintf(timeout, sizeof(timeout), "%d", host->connection_timeout);
 
-    postgresql_connection_string(string, string_length, host);
+    const char* keywords[] = {"host", "port", "dbname", "user", "password", "connect_timeout", NULL};
+    const char* values[] = {host->base.ip, port, host->dbname, host->user, host->password, timeout, NULL};
 
-    PGconn* connection = PQconnectdb(string);
-
-    free(string);
-
-    return connection;
+    return PQconnectdbParams(keywords, values, 0);
 }
 
 int __is_active(void* connection) {
@@ -388,6 +387,18 @@ int __reconnect(void* host, void* connection) {
     postgresqlconnection_t* conn = connection;
 
     if (!__is_active(conn)) {
+        // Серверные prepared statements умирают вместе со старым соединением:
+        // сбрасываем локальную карту, отвязав записи от соединения, чтобы
+        // деструктор не слал DEALLOCATE по новому соединению
+        if (conn->base.prepare_statements != NULL) {
+            for (map_iterator_t it = map_begin(conn->base.prepare_statements); map_iterator_valid(it); it = map_next(it)) {
+                pg_prepared_stmt_t* stmt_data = map_iterator_value(it);
+                if (stmt_data != NULL)
+                    stmt_data->connection = NULL;
+            }
+            map_clear(conn->base.prepare_statements);
+        }
+
         PQfinish(conn->connection);
 
         conn->connection = __connect(host);
@@ -566,13 +577,13 @@ str_t* __escape_internal(void* connection, const char* str, char*(fn)(PGconn* co
 
     str_t* string = str_create_empty(256);
     if (string == NULL) {
-        free(quoted);
+        PQfreemem(quoted);
         return NULL;
     }
 
     str_append(string, quoted, strlen(quoted));
 
-    free(quoted);
+    PQfreemem(quoted);
 
     return string;
 }
@@ -655,7 +666,10 @@ int __build_query_processor(void* connection, char parameter_type, const char* p
     }
     else if (parameter_type == ':') {
         // Replace :param with $N
-        str_appendf(result_sql, "$%d", *param_index);
+        if (!str_appendf(result_sql, "$%d", *param_index)) {
+            log_error("__build_query_processor: str_appendf failed\n");
+            return 0;
+        }
         array_push_back_str(param_order, param_name);
         (*param_index)++;
     }
@@ -689,17 +703,20 @@ void __prepared_stmt_free(void* data) {
     if (stmt_data->connection != NULL && stmt_data->stmt_name != NULL) {
         postgresqlconnection_t* pgconnection = stmt_data->connection;
 
-        #ifdef PG_MAJORVERSION_NUM
-            #if PG_MAJORVERSION_NUM > 16
-                PQsendClosePrepared(pgconnection->connection, str_get(stmt_data->stmt_name));
-            #else
-                str_t str;
-                str_init(&str, 64);
-                str_appendf(&str, "DEALLOCATE %s", str_get(stmt_data->stmt_name));
-
+        #if defined(PG_MAJORVERSION_NUM) && PG_MAJORVERSION_NUM > 16
+            // Асинхронная отправка: обязательно вычитываем результаты,
+            // иначе соединение останется в состоянии "команда в процессе"
+            if (PQsendClosePrepared(pgconnection->connection, str_get(stmt_data->stmt_name))) {
+                PGresult* res = NULL;
+                while ((res = PQgetResult(pgconnection->connection)))
+                    PQclear(res);
+            }
+        #else
+            str_t str;
+            str_init(&str, 64);
+            if (str_appendf(&str, "DEALLOCATE %s", str_get(stmt_data->stmt_name)))
                 PQclear(PQexec(pgconnection->connection, str_get(&str)));
-                str_clear(&str);
-            #endif
+            str_clear(&str);
         #endif
     }
 
@@ -736,10 +753,21 @@ int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params) {
         return 0;
     }
 
+    ExecStatusType status = PQresultStatus(res);
+    PQclear(res);
+
+    if (status != PGRES_COMMAND_OK) {
+        log_error("PQprepare error: %s\nSQL: %s\n", PQerrorMessage(pgconnection->connection), str_get(processed_sql));
+        str_free(processed_sql);
+        array_free(param_order);
+        return 0;
+    }
+
+    str_free(processed_sql);
+
     pg_prepared_stmt_t* stmt_data = malloc(sizeof * stmt_data);
     if (stmt_data == NULL) {
         log_error("__prepare: memory allocation failed for stmt_data\n");
-        str_free(processed_sql);
         array_free(param_order);
         return 0;
     }
@@ -749,22 +777,9 @@ int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params) {
     stmt_data->stmt_name = str_createn(str_get(stmt_name), str_size(stmt_name));
     if (stmt_data->stmt_name == NULL) {
         log_error("__prepare: memory allocation failed for stmt_name\n");
-        str_free(processed_sql);
         __prepared_stmt_free(stmt_data);
         return 0;
     }
-
-    ExecStatusType status = PQresultStatus(res);
-    PQclear(res);
-
-    if (status != PGRES_COMMAND_OK) {
-        log_error("PQprepare error: %s\nSQL: %s\n", PQerrorMessage(pgconnection->connection), str_get(processed_sql));
-        str_free(processed_sql);
-        __prepared_stmt_free(stmt_data);
-        return 0;
-    }
-
-    str_free(processed_sql);
 
     // Сохраняем порядок параметров в prepare_statements. Даже пустой.
     const int r = map_insert_or_assign(pgconnection->base.prepare_statements, str_get(stmt_name), stmt_data);
@@ -879,9 +894,9 @@ db_t* postgresql_load(const char* database_id, const json_token_t* token_array) 
         return NULL;
     }
 
-    enum fields { HOST_ID = 0, PORT, IP, DBNAME, USER, PASSWORD, CONNECTION_TIMEOUT, FIELDS_COUNT };
+    enum fields { HOST_ID = 0, PORT, IP, DBNAME, USER, PASSWORD, CONNECTION_TIMEOUT, SCHEMA, FIELDS_COUNT };
     enum reqired_fields { R_HOST_ID = 0, R_PORT, R_IP, R_DBNAME, R_USER, R_PASSWORD, R_CONNECTION_TIMEOUT, R_FIELDS_COUNT };
-    char* field_names[FIELDS_COUNT] = {"host_id", "port", "ip", "dbname", "user", "password", "connection_timeout"};
+    char* field_names[FIELDS_COUNT] = {"host_id", "port", "ip", "dbname", "user", "password", "connection_timeout", "schema"};
 
     for (json_it_t it_array = json_init_it(token_array); !json_end_it(&it_array); json_next_it(&it_array)) {
         json_token_t* token_object = json_it_value(&it_array);
@@ -1046,9 +1061,20 @@ db_t* postgresql_load(const char* database_id, const json_token_t* token_array) 
                 }
             }
             else if (strcmp(key, "schema") == 0) {
+                if (finded_fields[SCHEMA]) {
+                    log_error("postgresql_load: field %s must be unique\n", key);
+                    goto host_failed;
+                }
                 if (!json_is_string(token_value)) {
                     log_error("postgresql_load: field %s must be string\n", key);
                     goto host_failed;
+                }
+
+                finded_fields[SCHEMA] = 1;
+
+                if (host->schema != NULL) {
+                    free(host->schema);
+                    host->schema = NULL;
                 }
 
                 size_t schema_size = json_string_size(token_value);
@@ -1059,8 +1085,6 @@ db_t* postgresql_load(const char* database_id, const json_token_t* token_array) 
                         goto host_failed;
                     }
                     strcpy(host->schema, json_string(token_value));
-                } else {
-                    host->schema = NULL;
                 }
             }
             else {
@@ -1069,14 +1093,17 @@ db_t* postgresql_load(const char* database_id, const json_token_t* token_array) 
             }
         }
 
-        array_push_back(database->hosts, array_create_pointer(host, array_nocopy, host->base.free));
-
         for (int i = 0; i < R_FIELDS_COUNT; i++) {
             if (finded_fields[i] == 0) {
                 log_error("postgresql_load: required field %s not found\n", field_names[i]);
                 goto host_failed;
             }
         }
+
+        // Добавляем host в массив только после всех проверок: элемент массива
+        // владеет host (освобождается через db_free), ручной free после
+        // push привёл бы к двойному освобождению
+        array_push_back(database->hosts, array_create_pointer(host, array_nocopy, host->base.free));
 
         lresult = 1;
 

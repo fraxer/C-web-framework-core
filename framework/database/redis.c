@@ -17,7 +17,6 @@ static void __host_free(void* arg);
 static void* __connection_create(void* host);
 static void __connection_free(void* connection);
 static dbresult_t* __query(void* connection, const char* sql);
-int redis_send_command(redisContext*, const char*);
 int redis_auth(redisContext*, const char*, const char*);
 int redis_selectdb(redisContext*, const int);
 static redisContext* __connect(void* host);
@@ -35,12 +34,17 @@ redishost_t* __host_create(void) {
     redishost_t* host = malloc(sizeof * host);
     if (host == NULL) return NULL;
 
+    host->base.connections = array_create();
+    if (host->base.connections == NULL) {
+        free(host);
+        return NULL;
+    }
+
     host->base.free = __host_free;
     host->base.port = 0;
     host->base.ip = NULL;
     host->base.id = NULL;
     host->base.connection_create = __connection_create;
-    host->base.connections = array_create();
     host->base.connections_locked = 0;
     host->base.grammar.compile_table_exist = NULL;
     host->base.grammar.compile_table_migration_create = NULL;
@@ -118,7 +122,22 @@ dbresult_t* __query(void* connection, const char* sql) {
     dbresult_t* result = dbresult_create();
     if (result == NULL) return NULL;
 
-    redisReply* reply = redisCommand(redisconnection->connection, sql);
+    // hiredis трактует строку как printf-формат: экранируем '%' -> '%%',
+    // иначе '%' в данных ломает команду и читает мусор из va_args
+    redisReply* reply = NULL;
+    if (strchr(sql, '%') == NULL) {
+        reply = redisCommand(redisconnection->connection, sql);
+    } else {
+        str_t escaped;
+        str_init(&escaped, 256);
+        for (const char* p = sql; *p != '\0'; p++) {
+            str_appendc(&escaped, *p);
+            if (*p == '%')
+                str_appendc(&escaped, '%');
+        }
+        reply = redisCommand(redisconnection->connection, str_get(&escaped));
+        str_clear(&escaped);
+    }
 
     if (reply == NULL || redisconnection->connection->err != 0) {
         log_error("Redis error: %s\n", redisconnection->connection->errstr);
@@ -166,50 +185,36 @@ dbresult_t* __query(void* connection, const char* sql) {
     return result;
 }
 
-int redis_send_command(redisContext* connection, const char* string) {
-    redisReply* reply = redisCommand(connection, string);
+// Проверяет ответ Redis: ошибка протокола или REDIS_REPLY_ERROR -> 0
+static int __redis_check_reply(redisReply* reply) {
     if (reply == NULL) return 0;
 
-    if (reply->type == REDIS_REPLY_ERROR)
+    int ok = 1;
+    if (reply->type == REDIS_REPLY_ERROR) {
         log_error("Redis error: %s\n", reply->str);
+        ok = 0;
+    }
 
     freeReplyObject(reply);
 
-    return 1;
+    return ok;
 }
 
 int redis_auth(redisContext* connection, const char* user, const char* password) {
-    const size_t string_length = 256;
-    char string[string_length];
+    if (password == NULL || password[0] == '\0') return 1;
 
-    const size_t user_length = strlen(user);
-    const size_t password_length = strlen(password);
+    // Формат-аргументы hiredis бинарно-безопасны: пробелы и '%' в
+    // user/password не ломают команду. Без user — legacy AUTH с одним
+    // аргументом
+    redisReply* reply = (user == NULL || user[0] == '\0')
+        ? redisCommand(connection, "AUTH %s", password)
+        : redisCommand(connection, "AUTH %s %s", user, password);
 
-    if (string_length <= user_length + password_length + 6) {
-        log_error("Redis error: user or password is too large");
-        return 0;
-    }
-
-    const char* arg1 = user;
-    const char* arg2 = password;
-
-    if (user_length == 0) {
-        arg1 = password;
-        arg2 = user;
-    }
-
-    if (password_length == 0) return 1;
-
-    sprintf(&string[0], "AUTH %s %s", arg1, arg2);
-
-    return redis_send_command(connection, &string[0]);
+    return __redis_check_reply(reply);
 }
 
 int redis_selectdb(redisContext* connection, const int index) {
-    char string[10];
-    sprintf(&string[0], "SELECT %d", index);
-
-    return redis_send_command(connection, &string[0]);
+    return __redis_check_reply(redisCommand(connection, "SELECT %d", index));
 }
 
 redisContext* __connect(void* arg) {
@@ -217,7 +222,7 @@ redisContext* __connect(void* arg) {
 
     redisContext* connection = redisConnect(host->base.ip, host->base.port);
     if (connection == NULL || connection->err != 0) {
-        log_error("Redis error: %s\n", connection->errstr);
+        log_error("Redis error: %s\n", connection != NULL ? connection->errstr : "can't allocate redis context");
         redisFree(connection);
         return NULL;
     }
@@ -247,7 +252,7 @@ int __is_active(void* connection) {
 
     redisReply* reply = redisCommand(conn->connection, "PING");
     if (reply == NULL) {
-        printf("Redis error: connection lost\n");
+        log_error("Redis error: connection lost\n");
         return 0;
     }
 
@@ -265,7 +270,7 @@ int __is_active(void* connection) {
 int __reconnect(void* host, void* connection) {
     redisconnection_t* conn = connection;
 
-    if (__is_active(conn)) {
+    if (!__is_active(conn)) {
         redisFree(conn->connection);
 
         conn->connection = __connect(host);
@@ -403,8 +408,9 @@ db_t* redis_load(const char* database_id, const json_token_t* token_array) {
 
                 int ok = 0;
                 host->dbindex = json_int(token_value, &ok);
-                if (!ok || host->dbindex < 0 || host->dbindex > 16) {
-                    log_error("redis_load: dbindex must be in range 0..16\n");
+                // Базы Redis по умолчанию: 0..15
+                if (!ok || host->dbindex < 0 || host->dbindex > 15) {
+                    log_error("redis_load: dbindex must be in range 0..15\n");
                     goto host_failed;
                 }
             }
@@ -458,14 +464,12 @@ db_t* redis_load(const char* database_id, const json_token_t* token_array) {
             }
         }
 
-        array_push_back(database->hosts, array_create_pointer(host, array_nocopy, host->base.free));
-
         if (finded_fields[USER] == 0) {
             if (host->user == NULL)
                 host->user = malloc(1);
 
             if (host->user == NULL) {
-                log_error("redir_load: can't alloc memory for user\n");
+                log_error("redis_load: can't alloc memory for user\n");
                 goto host_failed;
             }
             strcpy(host->user, "");
@@ -476,7 +480,7 @@ db_t* redis_load(const char* database_id, const json_token_t* token_array) {
                 host->password = malloc(1);
 
             if (host->password == NULL) {
-                log_error("redir_load: can't alloc memory for password\n");
+                log_error("redis_load: can't alloc memory for password\n");
                 goto host_failed;
             }
             strcpy(host->password, "");
@@ -484,10 +488,15 @@ db_t* redis_load(const char* database_id, const json_token_t* token_array) {
 
         for (int i = 0; i < R_FIELDS_COUNT; i++) {
             if (finded_fields[i] == 0) {
-                log_error("redir_load: required field %s not found\n", field_names[i]);
+                log_error("redis_load: required field %s not found\n", field_names[i]);
                 goto host_failed;
             }
         }
+
+        // Добавляем host в массив только после всех проверок: элемент массива
+        // владеет host (освобождается через db_free), ручной free после
+        // push привёл бы к двойному освобождению
+        array_push_back(database->hosts, array_create_pointer(host, array_nocopy, host->base.free));
 
         lresult = 1;
 
