@@ -1,23 +1,18 @@
 #ifndef __HTTP1COOKIEPARSER__
 #define __HTTP1COOKIEPARSER__
 
-#include <stdlib.h>
 #include <stddef.h>
 
 #include "httpcommon.h"
 
 typedef struct cookieparser {
-    size_t payload_offset;
-    size_t offset;
-    size_t size;
+    const char* error;
     http_cookie_t* cookie;
     http_cookie_t* last_cookie;
 } cookieparser_t;
 
-void cookieparser_init(cookieparser_t*);
-
-void cookieparser_parse(cookieparser_t*, char*, size_t);
-
-http_cookie_t* cookieparser_cookie(cookieparser_t*);
+void cookieparser_init(cookieparser_t* parser);
+int cookieparser_parse(cookieparser_t* parser, const char* buffer, size_t buffer_size);
+http_cookie_t* cookieparser_cookie(cookieparser_t* parser);
 
 #endif

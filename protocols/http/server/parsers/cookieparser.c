@@ -1,77 +1,81 @@
 #include "cookieparser.h"
 
 void cookieparser_init(cookieparser_t* parser) {
-    parser->payload_offset = 0;
-    parser->offset = 0;
-    parser->size = 0;
+    parser->error = NULL;
     parser->cookie = NULL;
     parser->last_cookie = NULL;
 }
 
-void cookieparser_parse(cookieparser_t* parser, char* buffer, size_t buffer_size) {
-    enum { KEY, VALUE, SPACE } stage = KEY;
+int cookieparser_parse(cookieparser_t* parser, const char* buffer, size_t buffer_size) {
+    if (buffer == NULL) {
+        if (parser) parser->error = "cookie parser: invalid arguments";
+        return 0;
+    }
+    if (parser == NULL) {
+        return 0;
+    }
 
-    http_cookie_t* cookie = http_cookie_create();
-    if (cookie == NULL) return;
+    size_t token_start = 0;
+    size_t eq_pos = 0;
+    int has_eq = 0;
 
-    parser->cookie = cookie;
-    parser->last_cookie = cookie;
+    for (size_t i = 0; ; i++) {
+        const int at_end = (i == buffer_size);
+        const char ch = at_end ? '\0' : buffer[i];
 
-    for (size_t i = 0; i <= buffer_size; i++) {
-        char ch = buffer[i];
+        if (!at_end && ch == '=' && !has_eq) {
+            eq_pos = i;
+            has_eq = 1;
+        }
+        else if (at_end || ch == ';') {
+            /* Токен без '=' или с пустым ключом молча пропускаем,
+               не ломая разбор последующих пар. */
+            if (has_eq) {
+                size_t key_start = token_start;
+                while (key_start < eq_pos && buffer[key_start] == ' ')
+                    key_start++;
 
-        switch (stage) {
-        case KEY:
-            if (ch == '=') {
-                cookie->key = copy_cstringn(&buffer[parser->offset], parser->size);
-                cookie->key_length = parser->size;
+                const size_t key_length = eq_pos - key_start;
+                const size_t value_start = eq_pos + 1;
+                const size_t value_length = i - value_start;
 
-                parser->offset = parser->payload_offset + 1;
-                parser->size = -1;
+                if (key_length > 0) {
+                    http_cookie_t* cookie = http_cookie_create();
+                    if (cookie == NULL) {
+                        parser->error = "cookie parser: failed to allocate cookie";
+                        return 0;
+                    }
 
-                if (cookie->key == NULL) return;
+                    cookie->key = copy_cstringn(&buffer[key_start], key_length);
+                    cookie->value = copy_cstringn(&buffer[value_start], value_length);
 
-                stage = VALUE;
+                    if (cookie->key == NULL || cookie->value == NULL) {
+                        http_cookie_free(cookie);
+                        parser->error = "cookie parser: failed to allocate key or value";
+                        return 0;
+                    }
+
+                    cookie->key_length = key_length;
+                    cookie->value_length = value_length;
+
+                    if (parser->last_cookie != NULL)
+                        parser->last_cookie->next = cookie;
+                    else
+                        parser->cookie = cookie;
+
+                    parser->last_cookie = cookie;
+                }
             }
-            break;
-        case VALUE:
-            if (ch == ';' || ch == '\0') {
-                cookie->value = copy_cstringn(&buffer[parser->offset], parser->size);
-                cookie->value_length = parser->size;
 
-                parser->offset = parser->payload_offset + 1;
-                parser->size = 0;
-
-                if (cookie->value == NULL) return;
-
-                if (ch == '\0') return;
-
-                http_cookie_t* cookie_new = http_cookie_create();
-
-                if (cookie_new == NULL) return;
-
-                if (parser->last_cookie)
-                    parser->last_cookie->next = cookie_new;
-                parser->last_cookie = cookie_new;
-
-                cookie = cookie_new;
-
-                stage = SPACE;
-            }
-            break;
-        case SPACE:
-            if (ch != ' ') {
-                parser->offset = parser->payload_offset;
-                parser->size = 0;
-
-                stage = KEY;
-            }
-            break;
+            token_start = i + 1;
+            has_eq = 0;
         }
 
-        parser->payload_offset++;
-        parser->size++;
+        if (at_end) return 1;
     }
+
+    parser->error = "cookie parser: failed to parse cookie";
+    return 0;
 }
 
 http_cookie_t* cookieparser_cookie(cookieparser_t* parser) {

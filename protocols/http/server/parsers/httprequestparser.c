@@ -638,11 +638,14 @@ void __try_set_cookie(httprequest_t* request) {
     if (header->key_length != key_length) return;
     if (!cmpstrn_lower(header->key, header->key_length, key, key_length)) return;
 
-    cookieparser_t cparser;
-    cookieparser_init(&cparser);
-    cookieparser_parse(&cparser, header->value, header->value_length);
+    cookieparser_t parser;
+    cookieparser_init(&parser);
+    if (!cookieparser_parse(&parser, header->value, header->value_length)) {
+        log_error("Cookie parser error: %s\n", parser.error);
+        return;
+    }
 
-    request->cookie_ = cookieparser_cookie(&cparser);
+    request->cookie_ = cookieparser_cookie(&parser);
 }
 
 http_ranges_t* httpparser_parse_range(char* str, size_t length) {
