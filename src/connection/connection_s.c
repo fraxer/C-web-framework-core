@@ -142,8 +142,10 @@ void connection_s_inc(connection_t* connection) {
 connection_dec_result_e connection_s_dec(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
 
-    atomic_fetch_sub(&ctx->ref_count, 1);
-    if (atomic_load(&ctx->ref_count) == 0) {
+    // решение об освобождении принимается по значению, возвращённому fetch_sub:
+    // отдельная проверка load после декремента позволяла двум потокам
+    // одновременно увидеть ноль и дважды освободить соединение
+    if (atomic_fetch_sub(&ctx->ref_count, 1) == 1) {
         connection_free(connection);
         return CONNECTION_DEC_RESULT_DESTROY;
     }
@@ -182,6 +184,21 @@ int connection_after_write(connection_t* connection) {
 
     int expected = 2;
     atomic_compare_exchange_strong(&ctx->broadcast_ref_count, &expected, 1);
+
+    // повторная проверка после сброса флага: отправитель мог добавить сообщение
+    // между первой проверкой и CAS 2->1 — его собственный CAS 1->2 провалился,
+    // и без этой проверки сообщение зависло бы в очереди до следующей активности
+    cqueue_lock(ctx->broadcast_queue);
+    const int broadcast_empty_recheck = cqueue_empty(ctx->broadcast_queue);
+    cqueue_unlock(ctx->broadcast_queue);
+
+    if (!broadcast_empty_recheck) {
+        expected = 1;
+        if (atomic_compare_exchange_strong(&ctx->broadcast_ref_count, &expected, 2)) {
+            connection_queue_guard_append(connection);
+            return ctx->listener->api->control_mod(connection, MPXONESHOT);
+        }
+    }
 
     return ctx->listener->api->control_mod(connection, MPXIN | MPXRDHUP);
 }

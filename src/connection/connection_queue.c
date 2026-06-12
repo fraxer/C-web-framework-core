@@ -110,11 +110,13 @@ connection_t* connection_queue_guard_pop() {
         .tv_nsec = 0
     };
 
-    if (__connection_queue_empty(queue)) {
-        pthread_mutex_lock(&connection_queue_mutex);
+    // проверка пустоты выполняется под тем же мьютексом, что и signal в append:
+    // проверка вне мьютекса позволяла пропустить сигнал, отправленный между
+    // проверкой и ожиданием, и задержать обработку на величину таймаута
+    pthread_mutex_lock(&connection_queue_mutex);
+    if (__connection_queue_empty(queue))
         pthread_cond_timedwait(&connection_queue_cond, &connection_queue_mutex, &timeToWait);
-        pthread_mutex_unlock(&connection_queue_mutex);
-    }
+    pthread_mutex_unlock(&connection_queue_mutex);
 
     return __connection_queue_pop();
 }

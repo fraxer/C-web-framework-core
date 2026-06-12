@@ -31,10 +31,7 @@ typedef struct broadcast_item {
     /** Handler for forming response to subscriber */
     void(*response_handler)(response_t* response, const char* payload, size_t size);
 
-    /** Lock flag for thread-safe access */
-    atomic_bool locked;
-
-    /** Next item in linked list */
+    /** Next item in linked list. Protected by the owning list's lock */
     struct broadcast_item* next;
 } broadcast_item_t;
 
@@ -46,7 +43,7 @@ typedef struct broadcast_list {
     /** Unique channel name (e.g., "chat", "notifications") */
     char* name;
 
-    /** Lock flag for thread-safe access */
+    /** Lock protecting the channel's subscribers (item, item_last, next pointers) */
     atomic_bool locked;
 
     /** First item in subscribers list */
@@ -64,7 +61,7 @@ typedef struct broadcast_list {
  * Contains list of all server broadcast channels.
  */
 typedef struct broadcast {
-    /** Lock flag for thread-safe access */
+    /** Lock protecting the channel list structure (list, list_last). Lock order: broadcast before list */
     atomic_bool locked;
 
     /** First channel in list */
@@ -101,6 +98,7 @@ int broadcast_add(const char* broadcast_name, connection_t* connection, void* id
 
 /**
  * Unsubscribes connection from specified broadcast channel.
+ * A channel left without subscribers is destroyed.
  * @param broadcast_name  Channel name
  * @param connection      WebSocket connection to unsubscribe
  */
@@ -114,7 +112,8 @@ void broadcast_remove(const char* broadcast_name, connection_t* connection);
 void broadcast_clear(connection_t* connection);
 
 /**
- * Sends message to all channel subscribers (except sender).
+ * Sends message to all channel subscribers except the sender.
+ * Note: the sender never receives the message, even if subscribed.
  * @param broadcast_name  Channel name
  * @param connection      Sender connection (will not receive message)
  * @param payload         Data to send
@@ -125,6 +124,10 @@ void broadcast_send_all(const char* broadcast_name, connection_t* connection, co
 /**
  * Sends message to channel subscribers with identifier filtering.
  * Allows sending message only to specific subscribers.
+ * Filtering applies only when both id and compare_handler are provided;
+ * if either is NULL, the message is sent to all subscribers (except sender).
+ * Ownership of id is taken by this function: it is always freed via
+ * its broadcast_id_t free handler before returning. Do not reuse id after the call.
  * @param broadcast_name   Channel name
  * @param connection       Sender connection (will not receive message)
  * @param payload          Data to send

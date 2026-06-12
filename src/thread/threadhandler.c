@@ -25,7 +25,10 @@ void* thread_handler(void* arg) {
             continue;
 
         connection_server_ctx_t* ctx = connection->ctx;
+
+        cqueue_lock(ctx->queue);
         connection_queue_item_t* item = cqueue_pop(ctx->queue);
+        cqueue_unlock(ctx->queue);
 
         if (item != NULL) {
             item->run(item);
