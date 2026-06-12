@@ -3,6 +3,9 @@
 
 #include "bufferdata.h"
 
+// Максимум полезных байт в static_buffer (один байт под терминатор)
+#define BUFFERDATA_CAPACITY (BUFFERDATA_SIZE - 1)
+
 void bufferdata_init(bufferdata_t* buffer) {
     if (buffer == NULL) return;
 
@@ -17,13 +20,13 @@ void bufferdata_init(bufferdata_t* buffer) {
 int bufferdata_push(bufferdata_t* buffer, char ch) {
     if (buffer == NULL) return 0;
 
-    // Check if static buffer is full BEFORE writing to prevent buffer overflow
-    if (buffer->offset_sbuffer >= BUFFERDATA_SIZE) {
+    // Сбрасываем при заполнении CAPACITY, а не SIZE, чтобы
+    // в static_buffer всегда оставалось место под завершающий '\0'.
+    if (buffer->offset_sbuffer >= BUFFERDATA_CAPACITY) {
         bufferdata_type_e prev_type = buffer->type;
         if (buffer->type == BUFFERDATA_STATIC)
             buffer->type = BUFFERDATA_DYNAMIC;
 
-        // Move existing data to dynamic buffer
         if (!bufferdata_move(buffer)) {
             buffer->type = prev_type;
             return 0;
@@ -32,21 +35,18 @@ int bufferdata_push(bufferdata_t* buffer, char ch) {
 
     buffer->static_buffer[buffer->offset_sbuffer] = ch;
     buffer->offset_sbuffer++;
-
-    if (buffer->offset_sbuffer < BUFFERDATA_SIZE)
-        buffer->static_buffer[buffer->offset_sbuffer] = 0;
+    buffer->static_buffer[buffer->offset_sbuffer] = 0;
 
     return 1;
 }
 
-// NOTE: dynamic_buffer is intentionally NOT freed here for reuse optimization
-// Call bufferdata_clear() to release all memory
 void bufferdata_reset(bufferdata_t* buffer) {
     if (buffer == NULL) return;
 
     buffer->offset_dbuffer = 0;
     buffer->offset_sbuffer = 0;
     buffer->type = BUFFERDATA_STATIC;
+    buffer->static_buffer[0] = 0;
 }
 
 void bufferdata_clear(bufferdata_t* buffer) {
@@ -109,12 +109,10 @@ int bufferdata_move_data_to_start(bufferdata_t* buffer, size_t offset, size_t si
 
     // Validate bounds based on buffer type
     if (buffer->type == BUFFERDATA_STATIC) {
-        // Check individual bounds to prevent overflow
-        if (offset > BUFFERDATA_SIZE || size > BUFFERDATA_SIZE)
+        if (offset >= BUFFERDATA_SIZE || size >= BUFFERDATA_SIZE)
             return 0;
 
-        // Safe check for offset + size now that we know both are <= BUFFERDATA_SIZE
-        if (offset + size > BUFFERDATA_SIZE)
+        if (offset + size >= BUFFERDATA_SIZE)
             return 0;
 
         memmove(buffer->static_buffer, buffer->static_buffer + offset, size);
@@ -164,8 +162,13 @@ int bufferdata_move_data_to_start(bufferdata_t* buffer, size_t offset, size_t si
 char* bufferdata_get(bufferdata_t* buffer) {
     if (buffer == NULL) return NULL;
 
-    if (buffer->type == BUFFERDATA_DYNAMIC)
+    if (buffer->type == BUFFERDATA_DYNAMIC) {
+        if (buffer->offset_sbuffer > 0) {
+            if (!bufferdata_move(buffer))
+                return NULL;
+        }
         return buffer->dynamic_buffer;
+    }
 
     return buffer->static_buffer;
 }

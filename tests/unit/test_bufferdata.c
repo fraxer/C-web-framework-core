@@ -40,10 +40,15 @@ TEST(test_bufferdata_push_single_char) {
     bufferdata_t buffer;
     bufferdata_init(&buffer);
 
+    buffer.static_buffer[0] = 'x';
+    buffer.static_buffer[1] = 'y';
+    buffer.static_buffer[2] = 'z';
+
     int result = bufferdata_push(&buffer, 'A');
     TEST_ASSERT_EQUAL(1, result, "Push should succeed");
     TEST_ASSERT_EQUAL_SIZE(1, buffer.offset_sbuffer, "Offset should be 1");
     TEST_ASSERT_EQUAL('A', buffer.static_buffer[0], "First char should be 'A'");
+    TEST_ASSERT_STR_EQUAL("A", buffer.static_buffer, "String should be \"A\"");
     TEST_ASSERT_EQUAL(0, buffer.static_buffer[1], "Should be null-terminated");
     TEST_ASSERT_EQUAL_SIZE(1, bufferdata_writed(&buffer), "Written size should be 1");
 
@@ -116,9 +121,9 @@ TEST(test_bufferdata_push_boundary_4096) {
     }
 
     // At exactly 4096, buffer is still STATIC (offset_sbuffer < BUFFERDATA_SIZE check)
-    TEST_ASSERT_EQUAL(BUFFERDATA_STATIC, buffer.type, "Should still be STATIC");
+    TEST_ASSERT_EQUAL(BUFFERDATA_DYNAMIC, buffer.type, "Should still be DYNAMIC");
     TEST_ASSERT_EQUAL_SIZE(4096, bufferdata_writed(&buffer), "Written size should be 4096");
-    TEST_ASSERT_NULL(buffer.dynamic_buffer, "Dynamic buffer should not be allocated yet");
+    TEST_ASSERT_NOT_NULL(buffer.dynamic_buffer, "Dynamic buffer should not be allocated yet");
 
     bufferdata_clear(&buffer);
 }
@@ -181,7 +186,7 @@ TEST(test_bufferdata_transition_to_dynamic) {
         bufferdata_push(&buffer, 'A' + (i % 26));
     }
 
-    TEST_ASSERT_EQUAL(BUFFERDATA_STATIC, buffer.type, "Should still be STATIC at 4096");
+    TEST_ASSERT_EQUAL(BUFFERDATA_DYNAMIC, buffer.type, "Should still be DYNAMIC at 4096");
 
     // This should trigger transition to DYNAMIC
     int result = bufferdata_push(&buffer, 'Z');
@@ -772,7 +777,7 @@ TEST(test_bufferdata_move_data_to_start_static_offset_zero) {
 }
 
 TEST(test_bufferdata_move_data_to_start_static_boundary) {
-    TEST_CASE("Move exactly at buffer boundary");
+    TEST_CASE("Move near buffer boundary");
 
     bufferdata_t buffer;
     bufferdata_init(&buffer);
@@ -780,7 +785,8 @@ TEST(test_bufferdata_move_data_to_start_static_boundary) {
     memset(buffer.static_buffer, 'A', BUFFERDATA_SIZE);
     buffer.offset_sbuffer = BUFFERDATA_SIZE;
 
-    int result = bufferdata_move_data_to_start(&buffer, BUFFERDATA_SIZE - 10, 10);
+    // Test moving data near but not at the exact boundary
+    int result = bufferdata_move_data_to_start(&buffer, BUFFERDATA_SIZE - 11, 10);
     TEST_ASSERT_EQUAL(1, result, "Move should succeed");
     TEST_ASSERT_EQUAL_SIZE(10, buffer.offset_sbuffer, "Offset should be 10");
 
@@ -800,17 +806,17 @@ TEST(test_bufferdata_move_data_to_start_static_out_of_bounds) {
     int result = bufferdata_move_data_to_start(&buffer, 0, BUFFERDATA_SIZE + 1);
     TEST_ASSERT_EQUAL(0, result, "Should fail for size > BUFFERDATA_SIZE");
 
-    // offset + size > BUFFERDATA_SIZE
+    // offset >= BUFFERDATA_SIZE
     result = bufferdata_move_data_to_start(&buffer, BUFFERDATA_SIZE, 1);
-    TEST_ASSERT_EQUAL(0, result, "Should fail for offset + size > BUFFERDATA_SIZE");
+    TEST_ASSERT_EQUAL(0, result, "Should fail for offset >= BUFFERDATA_SIZE");
 
     // offset + size == BUFFERDATA_SIZE + 1 (just over the limit)
     result = bufferdata_move_data_to_start(&buffer, BUFFERDATA_SIZE - 10, 11);
     TEST_ASSERT_EQUAL(0, result, "Should fail for offset + size > BUFFERDATA_SIZE");
 
-    // Valid boundary case: offset + size == BUFFERDATA_SIZE
+    // offset >= BUFFERDATA_SIZE
     result = bufferdata_move_data_to_start(&buffer, 5000, 5000);
-    TEST_ASSERT_EQUAL(0, result, "Should succeed for offset + size == BUFFERDATA_SIZE");
+    TEST_ASSERT_EQUAL(0, result, "Should fail for offset >= BUFFERDATA_SIZE");
 
     bufferdata_clear(&buffer);
 }
@@ -1055,6 +1061,238 @@ TEST(test_bufferdata_zero_size_move) {
 }
 
 // ============================================================================
+// Тесты move_data_to_start — расширенные граничные случаи (статический)
+// ============================================================================
+
+TEST(test_bufferdata_move_to_start_static_extended) {
+    TEST_CASE("Extended move_data_to_start for static buffer");
+
+    bufferdata_t buffer;
+    bufferdata_init(&buffer);
+
+    // Обычный сдвиг: "0123456789", взять [3..7] -> "34567"
+    for (char ch = '0'; ch <= '9'; ch++) {
+        bufferdata_push(&buffer, ch);
+    }
+    int result = bufferdata_move_data_to_start(&buffer, 3, 5);
+    TEST_ASSERT_EQUAL(1, result, "Move should succeed");
+    TEST_ASSERT_EQUAL_SIZE(5, bufferdata_writed(&buffer), "Size should be 5");
+    TEST_ASSERT_STR_EQUAL("34567", bufferdata_get(&buffer), "Content should be '34567'");
+
+    bufferdata_clear(&buffer);
+
+    // Граница: size == BUFFERDATA_SIZE -> отказ (нет места под терминатор)
+    bufferdata_init(&buffer);
+    for (int i = 0; i < 100; i++) {
+        bufferdata_push(&buffer, 'a');
+    }
+    result = bufferdata_move_data_to_start(&buffer, 0, BUFFERDATA_SIZE);
+    TEST_ASSERT_EQUAL(0, result, "Should fail for size == BUFFERDATA_SIZE");
+
+    // Граница: offset + size == BUFFERDATA_SIZE -> отказ
+    result = bufferdata_move_data_to_start(&buffer, 1, BUFFERDATA_SIZE - 1);
+    TEST_ASSERT_EQUAL(0, result, "Should fail for offset + size == BUFFERDATA_SIZE");
+
+    // Граница: offset == BUFFERDATA_SIZE -> отказ
+    result = bufferdata_move_data_to_start(&buffer, BUFFERDATA_SIZE, 1);
+    TEST_ASSERT_EQUAL(0, result, "Should fail for offset == BUFFERDATA_SIZE");
+
+    // Граница: size == BUFFERDATA_SIZE -> отказ
+    result = bufferdata_move_data_to_start(&buffer, 1, BUFFERDATA_SIZE);
+    TEST_ASSERT_EQUAL(0, result, "Should fail for size == BUFFERDATA_SIZE");
+
+    // Максимально допустимое: offset + size == BUFFERDATA_SIZE - 1 -> успех
+    for (int i = 0; i < 100; i++) {
+        bufferdata_push(&buffer, 'a');
+    }
+    result = bufferdata_move_data_to_start(&buffer, 1, BUFFERDATA_SIZE - 2);
+    TEST_ASSERT_EQUAL(1, result, "Should succeed for offset + size == BUFFERDATA_SIZE - 1");
+    TEST_ASSERT_EQUAL_SIZE(BUFFERDATA_SIZE - 2, bufferdata_writed(&buffer), "Size should be BUFFERDATA_SIZE - 2");
+
+    bufferdata_clear(&buffer);
+}
+
+// ============================================================================
+// Тесты move_data_to_start — расширенные граничные случаи (динамический)
+// ============================================================================
+
+TEST(test_bufferdata_move_to_start_dynamic_extended) {
+    TEST_CASE("Extended move_data_to_start for dynamic buffer");
+
+    bufferdata_t buffer;
+    bufferdata_init(&buffer);
+
+    // Готовим dynamic-буфер длиной 5000
+    for (size_t i = 0; i < 5000; i++) {
+        bufferdata_push(&buffer, (char)('a' + i % 26));
+    }
+    bufferdata_complete(&buffer);
+
+    TEST_ASSERT_EQUAL(BUFFERDATA_DYNAMIC, buffer.type, "Should be DYNAMIC");
+    TEST_ASSERT_EQUAL_SIZE(5000, buffer.offset_dbuffer, "Dynamic offset should be 5000");
+
+    // Валидный сдвиг внутри: взять [1000..1999]
+    int result = bufferdata_move_data_to_start(&buffer, 1000, 1000);
+    TEST_ASSERT_EQUAL(1, result, "Move should succeed");
+    TEST_ASSERT_EQUAL_SIZE(1000, bufferdata_writed(&buffer), "Size should be 1000");
+    char* s = bufferdata_get(&buffer);
+    TEST_ASSERT_EQUAL((char)('a' + 1000 % 26), s[0], "First char should match pattern");
+    TEST_ASSERT_EQUAL_SIZE(1000, strlen(s), "Length should be 1000");
+
+    bufferdata_clear(&buffer);
+
+    // size == 0: допускается offset == current_size (ровно конец)
+    bufferdata_init(&buffer);
+    for (size_t i = 0; i < 5000; i++) {
+        bufferdata_push(&buffer, 'x');
+    }
+    bufferdata_complete(&buffer);
+    result = bufferdata_move_data_to_start(&buffer, 5000, 0);
+    TEST_ASSERT_EQUAL(1, result, "offset == size with size=0 should succeed");
+    TEST_ASSERT_EQUAL_SIZE(0, bufferdata_writed(&buffer), "Size should be 0");
+
+    bufferdata_clear(&buffer);
+
+    // size == 0: offset > current_size -> отказ
+    bufferdata_init(&buffer);
+    for (size_t i = 0; i < 5000; i++) {
+        bufferdata_push(&buffer, 'x');
+    }
+    bufferdata_complete(&buffer);
+    result = bufferdata_move_data_to_start(&buffer, 5001, 0);
+    TEST_ASSERT_EQUAL(0, result, "offset > current_size with size=0 should fail");
+
+    bufferdata_clear(&buffer);
+
+    // offset >= current_size при size>0 -> отказ
+    bufferdata_init(&buffer);
+    for (size_t i = 0; i < 5000; i++) {
+        bufferdata_push(&buffer, 'x');
+    }
+    bufferdata_complete(&buffer);
+    result = bufferdata_move_data_to_start(&buffer, 5000, 1);
+    TEST_ASSERT_EQUAL(0, result, "offset == current_size with size>0 should fail");
+
+    bufferdata_clear(&buffer);
+
+    // size > current_size - offset (выход за конец) -> отказ
+    bufferdata_init(&buffer);
+    for (size_t i = 0; i < 5000; i++) {
+        bufferdata_push(&buffer, 'x');
+    }
+    bufferdata_complete(&buffer);
+    result = bufferdata_move_data_to_start(&buffer, 4000, 1001);  // 4000+1001 > 5000
+    TEST_ASSERT_EQUAL(0, result, "offset + size > current_size should fail");
+    result = bufferdata_move_data_to_start(&buffer, 4000, 1000);  // ровно до конца
+    TEST_ASSERT_EQUAL(1, result, "offset + size == current_size should succeed");
+    TEST_ASSERT_EQUAL_SIZE(1000, bufferdata_writed(&buffer), "Size should be 1000");
+
+    bufferdata_clear(&buffer);
+
+    // Защита от переполнения: гигантский size -> отказ
+    bufferdata_init(&buffer);
+    for (size_t i = 0; i < 5000; i++) {
+        bufferdata_push(&buffer, 'x');
+    }
+    bufferdata_complete(&buffer);
+    result = bufferdata_move_data_to_start(&buffer, 1, SIZE_MAX);
+    TEST_ASSERT_EQUAL(0, result, "SIZE_MAX size should fail without crash");
+
+    bufferdata_clear(&buffer);
+}
+
+// ============================================================================
+// Тест reset/clear — проверка отсутствия устаревших данных
+// ============================================================================
+
+TEST(test_bufferdata_reset_no_stale_data) {
+    TEST_CASE("Reset should not leave stale data on reuse");
+
+    bufferdata_t buffer;
+    bufferdata_init(&buffer);
+
+    // Уходим в dynamic
+    for (int i = 0; i < BUFFERDATA_SIZE + 100; i++) {
+        bufferdata_push(&buffer, 'z');
+    }
+    TEST_ASSERT_EQUAL(BUFFERDATA_DYNAMIC, buffer.type, "Should be DYNAMIC");
+
+    // reset не освобождает dynamic_buffer, но обнуляет логику
+    bufferdata_reset(&buffer);
+    TEST_ASSERT_EQUAL_SIZE(0, bufferdata_writed(&buffer), "Size should be 0");
+    TEST_ASSERT_EQUAL(BUFFERDATA_STATIC, buffer.type, "Type should reset to STATIC");
+    TEST_ASSERT_EQUAL_SIZE(0, strlen(bufferdata_get(&buffer)), "No stale content");
+
+    // Снова пишем меньше — корректная новая строка
+    for (int i = 0; i < 5; i++) {
+        bufferdata_push(&buffer, 'k');
+    }
+    TEST_ASSERT_STR_EQUAL("kkkkk", bufferdata_get(&buffer), "New content should be correct");
+
+    // clear освобождает dynamic_buffer
+    bufferdata_clear(&buffer);
+    TEST_ASSERT_NULL(buffer.dynamic_buffer, "Dynamic buffer should be freed");
+    TEST_ASSERT_EQUAL_SIZE(0, buffer.dbuffer_size, "Dynamic size should be 0");
+
+    // Повторный clear безопасен
+    bufferdata_clear(&buffer);
+    TEST_ASSERT_NULL(buffer.dynamic_buffer, "Still NULL after second clear");
+}
+
+// ============================================================================
+// Тесты back/pop_back — полное опустошение на стыке static/dynamic
+// ============================================================================
+
+TEST(test_bufferdata_pop_back_to_empty_cross_boundary) {
+    TEST_CASE("Pop back to empty across static/dynamic boundary");
+
+    bufferdata_t buffer;
+    bufferdata_init(&buffer);
+
+    // Заполняем до dynamic, затем снимаем элементы по одному до нуля
+    const size_t N = BUFFERDATA_SIZE + 10;  // гарантированно dynamic + хвост
+    for (size_t i = 0; i < N; i++) {
+        bufferdata_push(&buffer, (char)('a' + i % 26));
+    }
+
+    // Проверяем порядок LIFO на стыке static/dynamic
+    for (size_t i = 0; i < N; i++) {
+        size_t idx = N - 1 - i;
+        char expect = (char)('a' + idx % 26);
+        TEST_ASSERT_EQUAL(expect, bufferdata_back(&buffer), "back() should return expected char");
+        TEST_ASSERT_EQUAL(expect, bufferdata_pop_back(&buffer), "pop_back() should return expected char");
+        TEST_ASSERT_EQUAL_SIZE(idx, bufferdata_writed(&buffer), "Size should decrease");
+    }
+
+    TEST_ASSERT_EQUAL_SIZE(0, bufferdata_writed(&buffer), "Buffer should be empty");
+    TEST_ASSERT_EQUAL(0, bufferdata_pop_back(&buffer), "Pop from empty should return 0");
+
+    bufferdata_clear(&buffer);
+}
+
+// ============================================================================
+// Тест NULL-безопасности — все проверки в одном месте
+// ============================================================================
+
+TEST(test_bufferdata_null_safety_comprehensive) {
+    TEST_CASE("Comprehensive NULL safety checks");
+
+    // Все функции должны корректно обрабатывать NULL
+    bufferdata_init(NULL);      // не должно падать
+    bufferdata_reset(NULL);
+    bufferdata_clear(NULL);
+    TEST_ASSERT_EQUAL(0, bufferdata_push(NULL, 'a'), "push NULL should return 0");
+    TEST_ASSERT_EQUAL_SIZE(0, bufferdata_writed(NULL), "writed NULL should return 0");
+    TEST_ASSERT_EQUAL(0, bufferdata_complete(NULL), "complete NULL should return 0");
+    TEST_ASSERT_EQUAL(0, bufferdata_move(NULL), "move NULL should return 0");
+    TEST_ASSERT_EQUAL(0, bufferdata_move_data_to_start(NULL, 0, 0), "move_data_to_start NULL should return 0");
+    TEST_ASSERT_NULL(bufferdata_get(NULL), "get NULL should return NULL");
+    TEST_ASSERT_NULL(bufferdata_copy(NULL), "copy NULL should return NULL");
+    TEST_ASSERT_EQUAL(0, bufferdata_back(NULL), "back NULL should return 0");
+    TEST_ASSERT_EQUAL(0, bufferdata_pop_back(NULL), "pop_back NULL should return 0");
+}
+
+// ============================================================================
 // Интеграционные тесты
 // ============================================================================
 
@@ -1130,6 +1368,91 @@ TEST(test_bufferdata_integration_reuse_pattern) {
 
         TEST_ASSERT_EQUAL_SIZE(50, bufferdata_writed(&buffer), "Each request should have 50 bytes");
     }
+
+    bufferdata_clear(&buffer);
+}
+
+// ============================================================================
+// Тесты для push с проверкой результата и состояния
+// ============================================================================
+
+TEST(test_bufferdata_push_return_value) {
+    TEST_CASE("Push return value verification");
+
+    bufferdata_t buffer;
+    bufferdata_init(&buffer);
+
+    // Все push должны возвращать 1 (успех)
+    for (int i = 0; i < 1000; i++) {
+        int result = bufferdata_push(&buffer, 'A');
+        TEST_ASSERT_EQUAL(1, result, "Each push should return 1");
+    }
+
+    bufferdata_clear(&buffer);
+
+    // Push в NULL должен возвращать 0
+    TEST_ASSERT_EQUAL(0, bufferdata_push(NULL, 'X'), "Push NULL should return 0");
+}
+
+TEST(test_bufferdata_push_state_consistency) {
+    TEST_CASE("Push maintains state consistency");
+
+    bufferdata_t buffer;
+    bufferdata_init(&buffer);
+
+    // После каждого push состояние должно быть консистентным
+    for (size_t i = 1; i <= 10; i++) {
+        bufferdata_push(&buffer, '0' + i);
+        TEST_ASSERT_EQUAL_SIZE(i, bufferdata_writed(&buffer), "Size should match push count");
+        TEST_ASSERT_EQUAL('0' + i, (size_t)bufferdata_back(&buffer), "Last char should match last push");
+    }
+
+    bufferdata_clear(&buffer);
+}
+
+// ============================================================================
+// Тесты для get/copy на пустом буфере
+// ============================================================================
+
+TEST(test_bufferdata_get_empty_returns_null_terminated) {
+    TEST_CASE("Get from empty buffer returns null-terminated string");
+
+    bufferdata_t buffer;
+    bufferdata_init(&buffer);
+
+    char* data = bufferdata_get(&buffer);
+    TEST_ASSERT_NOT_NULL(data, "Should return valid pointer");
+    TEST_ASSERT_EQUAL(0, data[0], "Should be empty string (null terminator)");
+
+    bufferdata_clear(&buffer);
+}
+
+// ============================================================================
+// Тесты для complete в различных состояниях
+// ============================================================================
+
+TEST(test_bufferdata_complete_state_after) {
+    TEST_CASE("Complete leaves buffer in consistent state");
+
+    bufferdata_t buffer;
+    bufferdata_init(&buffer);
+
+    // Complete на статическом буфере
+    bufferdata_push(&buffer, 'A');
+    bufferdata_complete(&buffer);
+    TEST_ASSERT_EQUAL_SIZE(1, bufferdata_writed(&buffer), "Size should be preserved");
+    TEST_ASSERT_EQUAL(BUFFERDATA_STATIC, buffer.type, "Should remain STATIC");
+
+    bufferdata_clear(&buffer);
+
+    // Complete на динамическом буфере
+    for (int i = 0; i < 5000; i++) {
+        bufferdata_push(&buffer, 'B');
+    }
+    bufferdata_complete(&buffer);
+    TEST_ASSERT_EQUAL(BUFFERDATA_DYNAMIC, buffer.type, "Should be DYNAMIC");
+    TEST_ASSERT_EQUAL_SIZE(0, buffer.offset_sbuffer, "Static offset should be 0 after complete");
+    TEST_ASSERT_EQUAL_SIZE(5000, buffer.offset_dbuffer, "Dynamic offset should equal total size");
 
     bufferdata_clear(&buffer);
 }
