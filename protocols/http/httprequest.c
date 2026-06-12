@@ -269,11 +269,11 @@ http_payloadpart_t* httprequest_multipart_part(httprequest_t* request, const cha
 http_payloadpart_t* httprequest_urlencoded_part(httprequest_t* request, const char* field) {
     http_payloadpart_t* part = request->payload_.part;
     if (part == NULL) return NULL;
-    if (field == NULL) return part->next;
+    if (field == NULL) return NULL;
 
-    while (field != NULL && part) {
-        if (part->field && strcmp(part->field->value, field) == 0)
-            return part->next;
+    while (part) {
+        if (part->field && part->field->key && strcmp(part->field->key, field) == 0)
+            return part;
 
         part = part->next;
     }
