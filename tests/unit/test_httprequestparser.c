@@ -902,7 +902,7 @@ TEST(test_httprequestparser_content_length_leading_zeros) {
 }
 
 TEST(test_httprequestparser_content_length_with_spaces) {
-    TEST_CASE("Reject Content-Length with spaces");
+    TEST_CASE("Trim trailing OWS in Content-Length value");
 
     setup_mock_domain();
 
@@ -919,7 +919,35 @@ TEST(test_httprequestparser_content_length_with_spaces) {
     httpparser_set_bytes_readed(parser, strlen(request));
     int result = httpparser_run(parser);
 
-    TEST_ASSERT_EQUAL(HTTP1PARSER_BAD_REQUEST, result, "Should reject Content-Length with spaces");
+    // RFC 7230 (3.2.4): field value excludes trailing OWS, so "10 " is valid;
+    // the parser then waits for the 10-byte body
+    TEST_ASSERT_EQUAL(HTTP1PARSER_CONTINUE, result, "Should trim trailing OWS and accept Content-Length");
+    TEST_ASSERT_EQUAL_SIZE(10, parser->content_length, "Content-Length should be 10");
+
+    httpparser_free(parser);
+    free_mock_connection(conn);
+    cleanup_mock_domain();
+}
+
+TEST(test_httprequestparser_content_length_inner_space) {
+    TEST_CASE("Reject Content-Length with inner space");
+
+    setup_mock_domain();
+
+    char buffer[4096];
+    const char* request = "POST /test HTTP/1.1\r\n"
+                         "Host: localhost\r\n"
+                         "Content-Length: 1 0\r\n"
+                         "\r\n";
+    strcpy(buffer, request);
+
+    connection_t* conn = create_mock_connection(buffer, strlen(buffer));
+    httprequestparser_t* parser = httpparser_create(conn);
+
+    httpparser_set_bytes_readed(parser, strlen(request));
+    int result = httpparser_run(parser);
+
+    TEST_ASSERT_EQUAL(HTTP1PARSER_BAD_REQUEST, result, "Should reject Content-Length with inner space");
 
     httpparser_free(parser);
     free_mock_connection(conn);
@@ -1002,7 +1030,7 @@ TEST(test_httprequestparser_post_without_content_length) {
 }
 
 TEST(test_httprequestparser_post_with_body_without_content_length) {
-    TEST_CASE("Reject POST with body but without Content-Length");
+    TEST_CASE("POST without Content-Length has empty body, remaining bytes are pipelined");
 
     setup_mock_domain();
 
@@ -1019,7 +1047,10 @@ TEST(test_httprequestparser_post_with_body_without_content_length) {
     httpparser_set_bytes_readed(parser, strlen(request));
     int result = httpparser_run(parser);
 
-    TEST_ASSERT_EQUAL(HTTP1PARSER_BAD_REQUEST, result, "Should reject POST with body but without Content-Length");
+    // RFC 7230 (3.3.3): without Content-Length the request has no body;
+    // the trailing bytes belong to the next (here: malformed) pipelined request
+    TEST_ASSERT_EQUAL(HTTP1PARSER_HANDLE_AND_CONTINUE, result, "Should complete POST with empty body and continue with pipelined data");
+    TEST_ASSERT_EQUAL_SIZE(0, parser->content_length, "Content-Length should be 0");
 
     httpparser_free(parser);
     free_mock_connection(conn);
@@ -1027,7 +1058,7 @@ TEST(test_httprequestparser_post_with_body_without_content_length) {
 }
 
 TEST(test_httprequestparser_put_with_body_without_content_length) {
-    TEST_CASE("Reject PUT with body but without Content-Length");
+    TEST_CASE("PUT without Content-Length has empty body, remaining bytes are pipelined");
 
     setup_mock_domain();
 
@@ -1044,7 +1075,7 @@ TEST(test_httprequestparser_put_with_body_without_content_length) {
     httpparser_set_bytes_readed(parser, strlen(request));
     int result = httpparser_run(parser);
 
-    TEST_ASSERT_EQUAL(HTTP1PARSER_BAD_REQUEST, result, "Should reject PUT with body but without Content-Length");
+    TEST_ASSERT_EQUAL(HTTP1PARSER_HANDLE_AND_CONTINUE, result, "Should complete PUT with empty body and continue with pipelined data");
 
     httpparser_free(parser);
     free_mock_connection(conn);
@@ -1052,7 +1083,7 @@ TEST(test_httprequestparser_put_with_body_without_content_length) {
 }
 
 TEST(test_httprequestparser_patch_with_body_without_content_length) {
-    TEST_CASE("Reject PATCH with body but without Content-Length");
+    TEST_CASE("PATCH without Content-Length has empty body, remaining bytes are pipelined");
 
     setup_mock_domain();
 
@@ -1069,7 +1100,7 @@ TEST(test_httprequestparser_patch_with_body_without_content_length) {
     httpparser_set_bytes_readed(parser, strlen(request));
     int result = httpparser_run(parser);
 
-    TEST_ASSERT_EQUAL(HTTP1PARSER_BAD_REQUEST, result, "Should reject PATCH with body but without Content-Length");
+    TEST_ASSERT_EQUAL(HTTP1PARSER_HANDLE_AND_CONTINUE, result, "Should complete PATCH with empty body and continue with pipelined data");
 
     httpparser_free(parser);
     free_mock_connection(conn);
@@ -1950,7 +1981,7 @@ TEST(test_httprequestparser_tab_in_header_value) {
 }
 
 TEST(test_httprequestparser_trailing_whitespace_header) {
-    TEST_CASE("Reject trailing whitespace in Host header value");
+    TEST_CASE("Trim trailing whitespace in Host header value");
 
     setup_mock_domain();
 
@@ -1966,8 +1997,9 @@ TEST(test_httprequestparser_trailing_whitespace_header) {
     httpparser_set_bytes_readed(parser, strlen(request));
     int result = httpparser_run(parser);
 
-    // Trailing spaces in Host header prevent domain matching
-    TEST_ASSERT_EQUAL(HTTP1PARSER_HOST_NOT_FOUND, result, "Should reject Host with trailing whitespace");
+    // RFC 7230 (3.2.4): trailing OWS is not part of the field value,
+    // so the Host still matches the configured domain
+    TEST_ASSERT_EQUAL(HTTP1PARSER_COMPLETE, result, "Should trim trailing whitespace and match Host");
 
     httpparser_free(parser);
     free_mock_connection(conn);

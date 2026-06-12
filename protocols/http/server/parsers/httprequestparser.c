@@ -21,7 +21,8 @@
 #define MAX_HEADER_KEY_SIZE 256
 #define MAX_HEADER_VALUE_SIZE 8192
 #define MAX_URI_SIZE 32768             // Maximum URI size to prevent DoS
-#define MAX_HEADERS_COUNT 30           // Maximum number of headers to prevent DoS
+#define MAX_HEADERS_COUNT 100          // Maximum number of headers to prevent DoS
+#define MAX_HOST_SIZE 256              // Maximum Host header length (DNS name limit is 255)
 #define PCRE_VECTOR_SIZE 120           // Use static array instead of VLA for better portability
 
 static int __parse_payload(httprequestparser_t* parser);
@@ -33,6 +34,7 @@ static int __set_header_value(httprequest_t* request, httprequestparser_t* parse
 static int __set_path(httprequest_t* request, const char* string, size_t length);
 static int __set_query(httprequest_t* request, const char* string, size_t length, size_t pos);
 static int __try_set_server(httprequestparser_t* parser, http_header_t* header);
+static int __server_matches_host(server_t* server, const char* host, size_t host_length);
 static void __try_set_keepalive(httprequestparser_t* parser);
 static void __try_set_range(httprequestparser_t* parser);
 static void __try_set_cookie(httprequest_t* request);
@@ -121,19 +123,27 @@ int httpparser_run(httprequestparser_t* parser) {
         switch (parser->stage)
         {
         case HTTP1REQUESTPARSER_METHOD:
+            // RFC 7230 (3.5): ignore CRLF preceding the request-line
+            // (some clients send an extra CRLF after a request body)
+            if ((ch == '\r' || ch == '\n') && bufferdata_writed(&parser->buf) == 0)
+                break;
+
             if (parser->request == NULL) {
                 parser->request = httprequest_create(parser->connection);
                 if (parser->request == NULL)
                     return __clear_and_return(parser, HTTP1PARSER_OUT_OF_MEMORY);
 
-                const size_t log_size = parser->bytes_readed < 500 ? parser->bytes_readed : 500;
-                log_debug("HTTP Request head (%zu bytes): %.*s", log_size, (int)log_size, parser->buffer);
+                const size_t remaining = parser->bytes_readed - parser->pos;
+                const size_t log_size = remaining < 500 ? remaining : 500;
+                log_debug("HTTP Request head (%zu bytes): %.*s", log_size, (int)log_size, &parser->buffer[parser->pos]);
             }
 
             if (ch == ' ') {
                 parser->stage = HTTP1REQUESTPARSER_URI;
 
-                bufferdata_complete(&parser->buf);
+                if (!bufferdata_complete(&parser->buf))
+                    return __clear_and_return(parser, HTTP1PARSER_OUT_OF_MEMORY);
+
                 if (!__set_method(parser->request, &parser->buf))
                     return __clear_and_return(parser, HTTP1PARSER_BAD_REQUEST);
 
@@ -144,14 +154,17 @@ int httpparser_run(httprequestparser_t* parser) {
                 if (bufferdata_writed(&parser->buf) >= 7)
                     return __clear_and_return(parser, HTTP1PARSER_BAD_REQUEST);
 
-                bufferdata_push(&parser->buf, ch);
+                if (!bufferdata_push(&parser->buf, ch))
+                    return __clear_and_return(parser, HTTP1PARSER_OUT_OF_MEMORY);
+
                 break;
             }
         case HTTP1REQUESTPARSER_URI:
             if (ch == ' ') {
                 parser->stage = HTTP1REQUESTPARSER_PROTOCOL;
 
-                bufferdata_complete(&parser->buf);
+                if (!bufferdata_complete(&parser->buf))
+                    return __clear_and_return(parser, HTTP1PARSER_OUT_OF_MEMORY);
 
                 size_t length = bufferdata_writed(&parser->buf);
                 char* uri = bufferdata_copy(&parser->buf);
@@ -174,16 +187,24 @@ int httpparser_run(httprequestparser_t* parser) {
                     log_error("HTTP error: URI too large (max: %d)\n", MAX_URI_SIZE);
                     return __clear_and_return(parser, HTTP1PARSER_BAD_REQUEST);
                 }
-                bufferdata_push(&parser->buf, ch);
+                if (!bufferdata_push(&parser->buf, ch))
+                    return __clear_and_return(parser, HTTP1PARSER_OUT_OF_MEMORY);
+
                 break;
             }
         case HTTP1REQUESTPARSER_PROTOCOL:
             if (ch == '\r') {
                 parser->stage = HTTP1REQUESTPARSER_NEWLINE1;
 
-                bufferdata_complete(&parser->buf);
+                if (!bufferdata_complete(&parser->buf))
+                    return __clear_and_return(parser, HTTP1PARSER_OUT_OF_MEMORY);
+
                 if (__set_protocol(parser->request, &parser->buf) == HTTP1PARSER_BAD_REQUEST)
                     return __clear_and_return(parser, HTTP1PARSER_BAD_REQUEST);
+
+                // RFC 7230 (6.3): HTTP/1.1 connections are persistent by default,
+                // HTTP/1.0 connections are not; a Connection header may override this
+                parser->connection->keepalive = parser->request->version == HTTP1_VER_1_1;
 
                 bufferdata_reset(&parser->buf);
 
@@ -193,7 +214,9 @@ int httpparser_run(httprequestparser_t* parser) {
                 if (bufferdata_writed(&parser->buf) >= 8)
                     return __clear_and_return(parser, HTTP1PARSER_BAD_REQUEST);
 
-                bufferdata_push(&parser->buf, ch);
+                if (!bufferdata_push(&parser->buf, ch))
+                    return __clear_and_return(parser, HTTP1PARSER_OUT_OF_MEMORY);
+
                 break;
             }
         case HTTP1REQUESTPARSER_NEWLINE1:
@@ -215,7 +238,9 @@ int httpparser_run(httprequestparser_t* parser) {
             else if (ch == ':') {
                 parser->stage = HTTP1REQUESTPARSER_HEADER_SPACE;
 
-                bufferdata_complete(&parser->buf);
+                if (!bufferdata_complete(&parser->buf))
+                    return __clear_and_return(parser, HTTP1PARSER_OUT_OF_MEMORY);
+
                 int r = __set_header_key(parser->request, parser, &parser->buf);
                 if (r != HTTP1PARSER_CONTINUE)
                     return __clear_and_return(parser, r);
@@ -233,7 +258,9 @@ int httpparser_run(httprequestparser_t* parser) {
                     log_error("HTTP error: header key too large (max: %d)\n", MAX_HEADER_KEY_SIZE);
                     return __clear_and_return(parser, HTTP1PARSER_BAD_REQUEST);
                 }
-                bufferdata_push(&parser->buf, ch);
+                if (!bufferdata_push(&parser->buf, ch))
+                    return __clear_and_return(parser, HTTP1PARSER_OUT_OF_MEMORY);
+
                 break;
             }
         case HTTP1REQUESTPARSER_HEADER_SPACE:
@@ -253,7 +280,9 @@ int httpparser_run(httprequestparser_t* parser) {
             if (ch == '\r') {
                 parser->stage = HTTP1REQUESTPARSER_NEWLINE2;
 
-                bufferdata_complete(&parser->buf);
+                if (!bufferdata_complete(&parser->buf))
+                    return __clear_and_return(parser, HTTP1PARSER_OUT_OF_MEMORY);
+
                 int r = __set_header_value(parser->request, parser);
                 if (r != HTTP1PARSER_CONTINUE)
                     return __clear_and_return(parser, r);
@@ -272,7 +301,9 @@ int httpparser_run(httprequestparser_t* parser) {
                     log_error("HTTP error: header value too large (max: %d)\n", MAX_HEADER_VALUE_SIZE);
                     return __clear_and_return(parser, HTTP1PARSER_BAD_REQUEST);
                 }
-                bufferdata_push(&parser->buf, ch);
+                if (!bufferdata_push(&parser->buf, ch))
+                    return __clear_and_return(parser, HTTP1PARSER_OUT_OF_MEMORY);
+
                 break;
             }
         case HTTP1REQUESTPARSER_NEWLINE2:
@@ -288,41 +319,28 @@ int httpparser_run(httprequestparser_t* parser) {
                 parser->stage = HTTP1REQUESTPARSER_PAYLOAD;
 
                 // RFC 7230: Host header is mandatory for HTTP/1.1
-                // For non-SSL connections, host_found is set only when valid Host header is parsed
-                // For SSL connections, host_found is initialized to true (SNI available)
                 if (parser->request->version == HTTP1_VER_1_1 && !parser->host_header_seen) {
                     log_error("HTTP error: missing required Host header for HTTP/1.1\n");
                     return __clear_and_return(parser, HTTP1PARSER_BAD_REQUEST);
                 }
 
                 if (parser->content_length == 0) {
-                    if (parser->content_length_found) {
-                        // Content-Length: 0 was explicitly set — no body expected,
-                        // treat remaining data as pipelined request
-                        if (parser->pos + 1 < parser->bytes_readed) {
-                            parser->pos++;
-                            return HTTP1PARSER_HANDLE_AND_CONTINUE;
-                        }
-
-                        return HTTP1PARSER_COMPLETE;
-                    }
-
-                    // No Content-Length header at all
-                    // Prevent integer underflow: check if there's data after headers
+                    // RFC 7230 (3.3.3): without Content-Length (or with an explicit
+                    // Content-Length: 0) the request has no body; any remaining
+                    // bytes belong to the next pipelined request
                     if (parser->pos + 1 < parser->bytes_readed) {
-                        // RFC 7230: methods that allow payload require Content-Length or Transfer-Encoding
-                        // If there's data after headers but no Content-Length, it's an error for these methods
-                        if (httprequest_allow_payload(parser->request)) {
-                            log_error("HTTP error: request with payload-capable method has body but missing Content-Length header\n");
-                            return __clear_and_return(parser, HTTP1PARSER_BAD_REQUEST);
-                        }
-
-                        // For other methods (GET, DELETE, etc.), treat as pipelined request
                         parser->pos++;
                         return HTTP1PARSER_HANDLE_AND_CONTINUE;
                     }
 
                     return HTTP1PARSER_COMPLETE;
+                }
+
+                // Body announced: reject it right away for methods without payload
+                // instead of waiting for body bytes that may never arrive
+                if (!httprequest_allow_payload(parser->request)) {
+                    log_error("HTTP error: Content-Length not allowed for method route_methods_e[%d]\n", parser->request->method);
+                    return __clear_and_return(parser, HTTP1PARSER_BAD_REQUEST);
                 }
 
                 break;
@@ -426,6 +444,9 @@ int __set_method(httprequest_t* request, bufferdata_t* buf) {
     char* s = bufferdata_get(buf);
     size_t l = bufferdata_writed(buf);
 
+    if (s == NULL)
+        return 0;
+
     if (l == 3 && s[0] == 'G' && s[1] == 'E' && s[2] == 'T')
         request->method = ROUTE_GET;
     else if (l == 3 && s[0] == 'P' && s[1] == 'U' && s[2] == 'T')
@@ -480,6 +501,9 @@ int httpparser_set_uri(httprequest_t* request, const char* string, size_t length
 int __set_protocol(httprequest_t* request, bufferdata_t* buf) {
     char* s = bufferdata_get(buf);
     size_t len = bufferdata_writed(buf);
+
+    if (s == NULL)
+        return HTTP1PARSER_BAD_REQUEST;
 
     // Проверяем, что длина протокола ровно 8 символов
     if (len != 8) {
@@ -556,6 +580,17 @@ void httpparser_append_query(httprequest_t* request, query_t* query) {
     request->last_query = query;
 }
 
+int __server_matches_host(server_t* server, const char* host, size_t host_length) {
+    int vector[PCRE_VECTOR_SIZE];
+
+    for (domain_t* domain = server->domain; domain; domain = domain->next) {
+        if (pcre_exec(domain->pcre_template, NULL, host, host_length, 0, 0, vector, PCRE_VECTOR_SIZE) > 0)
+            return 1;
+    }
+
+    return 0;
+}
+
 int __try_set_server(httprequestparser_t* parser, http_header_t* header) {
     if (!__header_is_host(header)) return HTTP1PARSER_CONTINUE;
 
@@ -567,26 +602,32 @@ int __try_set_server(httprequestparser_t* parser, http_header_t* header) {
 
     parser->host_header_seen = 1;
 
-    // Для SSL соединений Host заголовок опционален (домен из SNI)
-    if (parser->host_found) return HTTP1PARSER_CONTINUE;
+    if (header->value_length == 0 || header->value_length >= MAX_HOST_SIZE) {
+        log_error("HTTP error: invalid Host header length %zu\n", header->value_length);
+        return HTTP1PARSER_BAD_REQUEST;
+    }
 
-    const size_t MAX_DOMAIN_LENGTH = 255;
-    char domain[MAX_DOMAIN_LENGTH];
+    char domain[MAX_HOST_SIZE];
+    memcpy(domain, header->value, header->value_length);
+    domain[header->value_length] = '\0';
 
-    const size_t copy_length = header->value_length < MAX_DOMAIN_LENGTH - 1 ?
-        header->value_length :
-        MAX_DOMAIN_LENGTH - 1;
-
-    strncpy(domain, header->value, copy_length);
-    domain[copy_length] = '\0';  // Гарантируем null-терминацию
-
-    size_t domain_length = 0;
-
-    for (; domain_length < copy_length; domain_length++) {
-        if (domain[domain_length] == ':') {
-            domain[domain_length] = '\0';
-            break;
+    // Отрезаем опциональный порт; в IPv6-литерале двоеточия находятся
+    // внутри квадратных скобок (RFC 3986), порт идет после ']'
+    if (domain[0] == '[') {
+        char* closing = strchr(domain, ']');
+        if (closing == NULL || (closing[1] != '\0' && closing[1] != ':')) {
+            log_error("HTTP error: malformed IPv6 literal in Host header: %s\n", domain);
+            return HTTP1PARSER_BAD_REQUEST;
         }
+
+        // Матчинг по адресу без скобок
+        const size_t address_length = (size_t)(closing - domain) - 1;
+        memmove(domain, domain + 1, address_length);
+        domain[address_length] = '\0';
+    }
+    else {
+        char* colon = strchr(domain, ':');
+        if (colon != NULL) *colon = '\0';
     }
 
     // Convert to ASCII/Punycode for matching
@@ -596,29 +637,35 @@ int __try_set_server(httprequestparser_t* parser, http_header_t* header) {
         return HTTP1PARSER_HOST_NOT_FOUND;
     }
 
-    size_t ascii_length = strlen(ascii_domain);
-
-    int vector[PCRE_VECTOR_SIZE];
+    const size_t ascii_length = strlen(ascii_domain);
     connection_server_ctx_t* ctx = parser->connection->ctx;
+
+    // RFC 9110 (7.4): на TLS-соединении с SNI заголовок Host обязан
+    // соответствовать серверу, выбранному по SNI, иначе запрос misdirected
+    if (parser->connection->ssl != NULL &&
+        SSL_get_servername(parser->connection->ssl, TLSEXT_NAMETYPE_host_name) != NULL) {
+        if (ctx->server != NULL && __server_matches_host(ctx->server, ascii_domain, ascii_length)) {
+            parser->host_found = 1;
+            free(ascii_domain);
+            return HTTP1PARSER_CONTINUE;
+        }
+
+        log_error("HTTP error: Host header does not match SNI-selected server: %s\n", domain);
+        free(ascii_domain);
+        return HTTP1PARSER_HOST_NOT_FOUND;
+    }
+
+    // Plain HTTP или TLS без SNI: выбираем виртуальный сервер по Host
     cqueue_item_t* item = cqueue_first(&ctx->listener->servers);
     while (item) {
         server_t* server = item->data;
 
-        if (server->ip == parser->connection->ip && server->port == parser->connection->port) {
-            domain_t* server_domain = server->domain;
-
-            while (server_domain) {
-                int matches_count = pcre_exec(server_domain->pcre_template, NULL, ascii_domain, ascii_length, 0, 0, vector, PCRE_VECTOR_SIZE);
-
-                if (matches_count > 0) {
-                    ctx->server = server;
-                    parser->host_found = 1;
-                    free(ascii_domain);
-                    return HTTP1PARSER_CONTINUE;
-                }
-
-                server_domain = server_domain->next;
-            }
+        if (server->ip == parser->connection->ip && server->port == parser->connection->port &&
+            __server_matches_host(server, ascii_domain, ascii_length)) {
+            ctx->server = server;
+            parser->host_found = 1;
+            free(ascii_domain);
+            return HTTP1PARSER_CONTINUE;
         }
 
         item = item->next;
@@ -638,12 +685,15 @@ void __try_set_keepalive(httprequestparser_t* parser) {
     if (header->key_length != connection_key_length) return;
     if (!cmpstrn_lower(header->key, header->key_length, connection_key, connection_key_length)) return;
 
-    // RFC 7230: Connection header is a comma-separated list of tokens
-    // e.g. "keep-alive", "keep-alive, Upgrade", "close"
+    // RFC 7230: Connection header is a comma-separated list of tokens,
+    // e.g. "keep-alive", "keep-alive, Upgrade", "close".
+    // "close" disables keep-alive, "keep-alive" enables it; without either
+    // token the per-version default set at the protocol stage stays in effect
     const char* value = header->value;
     const size_t value_length = header->value_length;
-    const char* token = "keep-alive";
-    const size_t token_length = 10;
+
+    int found_keepalive = 0;
+    int found_close = 0;
 
     size_t start = 0;
 
@@ -662,16 +712,18 @@ void __try_set_keepalive(httprequestparser_t* parser) {
         while (tok_end > start && (value[tok_end - 1] == ' ' || value[tok_end - 1] == '\t'))
             tok_end--;
 
-        if (tok_end - start == token_length &&
-            cmpstrn_lower(&value[start], tok_end - start, token, token_length)) {
-            parser->connection->keepalive = 1;
-            return;
-        }
+        if (cmpstrn_lower(&value[start], tok_end - start, "close", 5))
+            found_close = 1;
+        else if (cmpstrn_lower(&value[start], tok_end - start, "keep-alive", 10))
+            found_keepalive = 1;
 
         start = end + 1;
     }
 
-    parser->connection->keepalive = 0;
+    if (found_close)
+        parser->connection->keepalive = 0;
+    else if (found_keepalive)
+        parser->connection->keepalive = 1;
 }
 
 void __try_set_range(httprequestparser_t* parser) {
@@ -705,7 +757,6 @@ void __try_set_cookie(httprequest_t* request) {
 
 http_ranges_t* httpparser_parse_range(char* str, size_t length) {
     int result = -1;
-    long long int max = 9223372036854775807;
     long long int start_finded = 0;
     size_t start_position = 6;
     http_ranges_t* ranges = NULL;
@@ -730,8 +781,6 @@ http_ranges_t* httpparser_parse_range(char* str, size_t length) {
                 char* endptr = NULL;
                 start = strtoll(&str[start_position], &endptr, 10);
                 if (endptr != &str[i]) goto failed;  // Parse error
-
-                if (start > max) goto failed;
 
                 if (last_range && last_range->start > start) goto failed;
 
@@ -765,7 +814,6 @@ http_ranges_t* httpparser_parse_range(char* str, size_t length) {
                 end = strtoll(&str[start_position], &endptr, 10);
                 if (endptr != &str[i]) goto failed;  // Parse error
 
-                if (end > max) goto failed;
                 if (last_range && end < last_range->start) goto failed;
                 if (start_finded == 0) goto failed;
 
@@ -793,7 +841,6 @@ http_ranges_t* httpparser_parse_range(char* str, size_t length) {
         // endptr should point to end of string or non-digit
         if (endptr == &str[start_position]) goto failed;  // No digits parsed
 
-        if (end > max) goto failed;
         if (last_range && end < last_range->start) goto failed;
         if (start_finded == 0) goto failed;
 
@@ -826,6 +873,11 @@ int __set_header_key(httprequest_t* request, httprequestparser_t* parser, buffer
 
     char* string = bufferdata_get(buf);
     size_t length = bufferdata_writed(buf);
+
+    if (string == NULL) {
+        log_error("HTTP error: can't access header key buffer\n");
+        return HTTP1PARSER_OUT_OF_MEMORY;
+    }
 
     // Reject empty header keys
     if (length == 0) {
@@ -860,6 +912,15 @@ int __set_header_key(httprequest_t* request, httprequestparser_t* parser, buffer
 int __set_header_value(httprequest_t* request, httprequestparser_t* parser) {
     char* string = bufferdata_get(&parser->buf);
     size_t length = bufferdata_writed(&parser->buf);
+
+    if (string == NULL) {
+        log_error("HTTP error: can't access header value buffer\n");
+        return HTTP1PARSER_OUT_OF_MEMORY;
+    }
+
+    // RFC 7230 (3.2.4): field value does not include trailing OWS
+    while (length > 0 && (string[length - 1] == ' ' || string[length - 1] == '\t'))
+        length--;
 
     free(request->last_header->value);
     request->last_header->value = copy_cstringn(string, length);
