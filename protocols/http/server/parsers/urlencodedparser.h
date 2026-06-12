@@ -25,5 +25,6 @@ typedef struct urlencodedparser {
 void urlencodedparser_init(urlencodedparser_t* parser, int payload_fd, size_t payload_size);
 int urlencodedparser_parse(urlencodedparser_t* parser, char* buffer, size_t buffer_size);
 http_payloadpart_t* urlencodedparser_part(urlencodedparser_t* parser);
+void urlencodedparser_clear(urlencodedparser_t* parser);
 
 #endif

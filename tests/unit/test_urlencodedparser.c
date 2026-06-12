@@ -74,6 +74,7 @@ static void run_parse(const char* body, size_t len,
     *fd = make_payload(body, len);
     urlencodedparser_init(parser, *fd, len);
     char* buf = malloc(len ? len : 1);
+    if (!buf) return;
     memcpy(buf, body, len);
     urlencodedparser_parse(parser, buf, len);
     free(buf);
@@ -91,6 +92,7 @@ static void run_chunked(const char* body, size_t len,
         size_t csz = chunks[c];
         if (pos + csz > len) csz = len - pos;
         char* buf = malloc(csz ? csz : 1);
+        if (!buf) return;
         memcpy(buf, body + pos, csz);
         urlencodedparser_parse(parser, buf, csz);
         free(buf);
@@ -99,6 +101,7 @@ static void run_chunked(const char* body, size_t len,
     if (pos < len) {
         size_t csz = len - pos;
         char* buf = malloc(csz);
+        if (!buf) return;
         memcpy(buf, body + pos, csz);
         urlencodedparser_parse(parser, buf, csz);
         free(buf);
@@ -618,6 +621,7 @@ TEST(test_oversized_buffer) {
 
     size_t total = len + tlen;
     char* buf = malloc(total);
+    if (!buf) { close(fd); return; }
     memcpy(buf, body, len);
     memcpy(buf + len, trailing, tlen);
     urlencodedparser_parse(&p, buf, total);
@@ -646,6 +650,7 @@ TEST(test_oversized_trailing_after_ampersand) {
 
     size_t total = len + tlen;
     char* buf = malloc(total);
+    if (!buf) { close(fd); return; }
     memcpy(buf, body, len);
     memcpy(buf + len, trailing, tlen);
     urlencodedparser_parse(&p, buf, total);

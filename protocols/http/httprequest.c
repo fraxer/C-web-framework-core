@@ -409,32 +409,34 @@ int httprequest_payload_parse_multipart(httprequest_t* request, const char* head
 }
 
 int httprequest_payload_parse_urlencoded(httprequest_t* request) {
-    size_t buffer_size = 16384;
-    char* buffer = malloc(buffer_size);
-    if (buffer == NULL) return 0;
+    const size_t buffer_size = 16384;
+    char buffer[buffer_size];
 
-    off_t payload_size = request->payload_.file.size;
+    const off_t payload_size = request->payload_.file.size;
     urlencodedparser_t parser;
     urlencodedparser_init(&parser, request->payload_.file.fd, payload_size);
-    int error = 0;
 
-    while (1) {
-        int r = read(request->payload_.file.fd, buffer, buffer_size);
+    off_t offset = 0;
+    while (offset < payload_size) {
+        ssize_t r = pread(request->payload_.file.fd, buffer, buffer_size, offset);
         if (r < 0) {
-            error = 1;
             log_error("httprequest: urlencoded payload parse error\n");
+            urlencodedparser_clear(&parser);
+            return 0;
         }
-        if (r == 0) break;
+        if (r == 0) {
+            log_info("httprequest: urlencoded payload truncated (file smaller than declared)\n");
+            break;
+        }
 
-        urlencodedparser_parse(&parser, buffer, r);
+        if (!urlencodedparser_parse(&parser, buffer, r)) {
+            log_error("httprequest: urlencoded payload parse error: %s\n", parser.error);
+            urlencodedparser_clear(&parser);
+            return 0;
+        }
+
+        offset += (off_t)r;
     }
-
-    free(buffer);
-
-    lseek(request->payload_.file.fd, 0, SEEK_SET);
-
-    if (error)
-        return 0;
 
     request->payload_.type = URLENCODED;
     request->payload_.part = urlencodedparser_part(&parser);
