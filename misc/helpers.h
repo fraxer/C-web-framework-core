@@ -11,7 +11,7 @@ char* create_tmppath(const char*);
 const char* file_extension(const char* path);
 int cmpsubstr_lower(const char* a, const char* b);
 int timezone_offset();
-int hex_to_bytes(const char* hex, unsigned char* raw);
+int hex_to_bytes(const char* hex, unsigned char* raw, size_t raw_size);
 void bytes_to_hex(const unsigned char* raw, size_t raw_length, char* hex);
 char* urlencode(const char* string, size_t length);
 char* urlencodel(const char* string, size_t length, size_t* output_length);

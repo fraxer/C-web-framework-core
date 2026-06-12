@@ -238,7 +238,7 @@ TEST(test_hex_to_bytes_valid) {
     TEST_CASE("Convert valid hex string to bytes");
 
     unsigned char bytes[4];
-    int result = hex_to_bytes("48656c6c", bytes);
+    int result = hex_to_bytes("48656c6c", bytes, sizeof(bytes));
 
     TEST_ASSERT_EQUAL(1, result, "Conversion should succeed");
     TEST_ASSERT_EQUAL(0x48, bytes[0], "First byte should be 0x48");
@@ -251,7 +251,7 @@ TEST(test_hex_to_bytes_uppercase) {
     TEST_CASE("Convert uppercase hex to bytes");
 
     unsigned char bytes[2];
-    int result = hex_to_bytes("ABCD", bytes);
+    int result = hex_to_bytes("ABCD", bytes, sizeof(bytes));
 
     TEST_ASSERT_EQUAL(1, result, "Conversion should succeed");
     TEST_ASSERT_EQUAL(0xAB, bytes[0], "First byte should be 0xAB");
@@ -262,7 +262,7 @@ TEST(test_hex_to_bytes_mixed_case) {
     TEST_CASE("Convert mixed case hex to bytes");
 
     unsigned char bytes[2];
-    int result = hex_to_bytes("aBcD", bytes);
+    int result = hex_to_bytes("aBcD", bytes, sizeof(bytes));
 
     TEST_ASSERT_EQUAL(1, result, "Conversion should succeed");
     TEST_ASSERT_EQUAL(0xAB, bytes[0], "First byte should be 0xAB");
@@ -273,7 +273,7 @@ TEST(test_hex_to_bytes_odd_length) {
     TEST_CASE("Convert odd length hex string");
 
     unsigned char bytes[2];
-    int result = hex_to_bytes("ABC", bytes);
+    int result = hex_to_bytes("ABC", bytes, sizeof(bytes));
 
     TEST_ASSERT_EQUAL(0, result, "Should fail for odd length");
 }
@@ -282,7 +282,7 @@ TEST(test_hex_to_bytes_invalid_chars) {
     TEST_CASE("Convert hex with invalid characters");
 
     unsigned char bytes[2];
-    int result = hex_to_bytes("GHIJ", bytes);
+    int result = hex_to_bytes("GHIJ", bytes, sizeof(bytes));
 
     TEST_ASSERT_EQUAL(0, result, "Should fail for invalid characters");
 }
@@ -291,7 +291,7 @@ TEST(test_hex_to_bytes_empty_string) {
     TEST_CASE("Convert empty hex string");
 
     unsigned char bytes[1];
-    int result = hex_to_bytes("", bytes);
+    int result = hex_to_bytes("", bytes, sizeof(bytes));
 
     TEST_ASSERT_EQUAL(1, result, "Empty string should succeed");
 }
@@ -336,7 +336,7 @@ TEST(test_hex_roundtrip) {
     unsigned char bytes[5];
     char hex[11];
 
-    hex_to_bytes(original, bytes);
+    hex_to_bytes(original, bytes, sizeof(bytes));
     bytes_to_hex(bytes, 5, hex);
 
     TEST_ASSERT_STR_EQUAL(original, hex, "Roundtrip should preserve data");
@@ -727,7 +727,7 @@ TEST(test_helpers_long_hex_string) {
     }
     hex[200] = '\0';
 
-    int result = hex_to_bytes(hex, bytes);
+    int result = hex_to_bytes(hex, bytes, sizeof(bytes));
     TEST_ASSERT_EQUAL(1, result, "Should convert long hex string");
 
     bytes_to_hex(bytes, 100, hex_out);
@@ -1009,13 +1009,8 @@ TEST(test_urldecode_empty_string) {
 TEST(test_urldecode_null_input) {
     TEST_CASE("URL decode NULL input");
 
-    // urldecode(NULL, 0) -> urldecodel(NULL, 0, NULL)
-    // urldecodel: malloc(0+1)=malloc(1), string==NULL, loop doesn't execute
     char* decoded = urldecode(NULL, 0);
-    TEST_ASSERT_NOT_NULL(decoded, "Should allocate buffer");
-    TEST_ASSERT_STR_EQUAL("", decoded, "Should be empty");
-
-    free(decoded);
+    TEST_ASSERT_NULL(decoded, "Should return NULL for NULL input");
 }
 
 TEST(test_urldecodel_null_output_length) {
@@ -1119,7 +1114,7 @@ TEST(test_hex_to_bytes_all_values) {
     const char* hex = "0123456789abcdefABCDEF";
     unsigned char bytes[11];
 
-    int result = hex_to_bytes(hex, bytes);
+    int result = hex_to_bytes(hex, bytes, sizeof(bytes));
     TEST_ASSERT_EQUAL(1, result, "Should succeed");
     TEST_ASSERT_EQUAL(0x01, bytes[0], "0x01 should match");
     TEST_ASSERT_EQUAL(0x23, bytes[1], "0x23 should match");
@@ -1144,7 +1139,7 @@ TEST(test_bytes_to_hex_roundtrip_all) {
     bytes_to_hex(bytes, 256, hex);
 
     unsigned char decoded[256];
-    int result = hex_to_bytes(hex, decoded);
+    int result = hex_to_bytes(hex, decoded, sizeof(decoded));
     TEST_ASSERT_EQUAL(1, result, "Should decode successfully");
     TEST_ASSERT(memcmp(bytes, decoded, 256) == 0, "Roundtrip should preserve all bytes");
 }
