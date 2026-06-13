@@ -59,6 +59,7 @@ static str_t* __build_query(void* connection, str_t* sql, array_t* params, array
 static void __prepared_stmt_free(void* data);
 static int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params);
 static dbresult_t* __execute_prepared(void* connection, const char* stmt_name, array_t* params);
+static dbresult_t* __execute_params(void* connection, const char* sql, array_t* params);
 static char* __compile_insert(void* connection, const char* table, array_t* params);
 static char* __compile_select(void* connection, const char* table, array_t* columns, array_t* where);
 static char* __compile_update(void* connection, const char* table, array_t* set, array_t* where);
@@ -131,6 +132,7 @@ void* __connection_create(void* host) {
     connection->base.reconnect = __reconnect;
     connection->base.prepare = __prepare;
     connection->base.execute_prepared = __execute_prepared;
+    connection->base.execute_params = __execute_params;
     connection->base.begin = __begin;
     connection->base.type_cast = __type_cast;
     connection->base.host = host;
@@ -1194,6 +1196,144 @@ int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params) {
 
     __prepared_stmt_free(stmt_data);
     return 0;
+}
+
+// Rewrite PostgreSQL-style positional placeholders ($1..$N) into MySQL '?'.
+// MySQL binds '?' by order of appearance, which matches the order of `params`,
+// so the actual digits are irrelevant — every "$<digits>" becomes one '?'.
+// '$' inside a quoted identifier/string is left untouched. Returns the rewritten
+// SQL and, via *out_count, the number of placeholders emitted.
+static str_t* __pg_placeholders_to_mysql(const char* sql, size_t size, int* out_count) {
+    str_t* out = str_create_empty(size + 16);
+    if (out == NULL) return NULL;
+
+    char quote = 0;
+    int count = 0;
+
+    for (size_t i = 0; i < size; i++) {
+        const char c = sql[i];
+
+        if (quote != 0) {
+            str_appendc(out, c);
+            if (c == quote) quote = 0;
+            continue;
+        }
+
+        if (c == '\'' || c == '"' || c == '`') {
+            quote = c;
+            str_appendc(out, c);
+            continue;
+        }
+
+        if (c == '$' && i + 1 < size && sql[i + 1] >= '0' && sql[i + 1] <= '9') {
+            // Skip the whole digit run; emit a single positional marker.
+            while (i + 1 < size && sql[i + 1] >= '0' && sql[i + 1] <= '9')
+                i++;
+            str_appendc(out, '?');
+            count++;
+            continue;
+        }
+
+        str_appendc(out, c);
+    }
+
+    *out_count = count;
+    return out;
+}
+
+dbresult_t* __execute_params(void* connection, const char* sql, array_t* params) {
+    myconnection_t* myconnection = connection;
+
+    log_debug("DB params query: %s\n", sql);
+
+    dbresult_t* result = dbresult_create();
+    if (result == NULL) return NULL;
+
+    const int n_params = params != NULL ? (int)array_size(params) : 0;
+
+    int placeholders = 0;
+    str_t* processed_sql = __pg_placeholders_to_mysql(sql, strlen(sql), &placeholders);
+    if (processed_sql == NULL) {
+        result->ok = 0;
+        return result;
+    }
+
+    if (placeholders != n_params) {
+        log_error("__execute_params: placeholder/param count mismatch (%d vs %d)\n", placeholders, n_params);
+        str_free(processed_sql);
+        result->ok = 0;
+        return result;
+    }
+
+    MYSQL_BIND* binds = NULL;
+    bool* null_indicators = NULL;
+
+    MYSQL_STMT* stmt = mysql_stmt_init(myconnection->connection);
+    if (stmt == NULL) {
+        log_error("__execute_params: mysql_stmt_init failed: out of memory\n");
+        goto failed;
+    }
+
+    if (mysql_stmt_prepare(stmt, str_get(processed_sql), str_size(processed_sql))) {
+        log_error("__execute_params: mysql_stmt_prepare error: %s\nSQL: %s\n",
+            mysql_stmt_error(stmt), str_get(processed_sql));
+        goto failed;
+    }
+
+    if (n_params > 0) {
+        binds = calloc(n_params, sizeof(MYSQL_BIND));
+        null_indicators = calloc(n_params, sizeof(bool));
+        if (binds == NULL || null_indicators == NULL) {
+            log_error("__execute_params: memory allocation failed\n");
+            goto failed;
+        }
+
+        for (int i = 0; i < n_params; i++) {
+            mfield_t* field = array_get(params, i);
+            if (field == NULL) {
+                log_error("__execute_params: param %d is NULL\n", i);
+                goto failed;
+            }
+
+            // buffer_type is set separately from __bind_field_value (which only
+            // fills buffer/length/is_null), mirroring __prepare's bind setup.
+            binds[i].buffer_type = __convert_model_type_to_mysql(field->type);
+
+            if (!__bind_field_value(&binds[i], field, &null_indicators[i])) {
+                log_error("__execute_params: failed to bind field %s\n", field->name);
+                goto failed;
+            }
+        }
+
+        if (mysql_stmt_bind_param(stmt, binds)) {
+            log_error("__execute_params: mysql_stmt_bind_param failed: %s\n", mysql_stmt_error(stmt));
+            goto failed;
+        }
+    }
+
+    if (mysql_stmt_execute(stmt)) {
+        log_error("__execute_params: mysql_stmt_execute failed: %s\n", mysql_stmt_error(stmt));
+        goto failed;
+    }
+
+    result = __process_prepared_result(myconnection, stmt, result);
+
+    str_free(processed_sql);
+    free(binds);
+    free(null_indicators);
+    mysql_stmt_close(stmt);
+
+    return result;
+
+    failed:
+
+    str_free(processed_sql);
+    free(binds);
+    free(null_indicators);
+    if (stmt != NULL) mysql_stmt_close(stmt);
+
+    result->ok = 0;
+    return result;
 }
 
 dbresult_t* __execute_prepared(void* connection, const char* stmt_name, array_t* params) {

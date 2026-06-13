@@ -160,6 +160,60 @@ TEST_DB(test_model_create_basic) {
     test_item_free(item);
 }
 
+TEST_DB(test_model_create_sql_injection) {
+    TEST_SUITE("model_create");
+    TEST_CASE("malicious value is bound as data, not executed");
+
+    const char* dbid = testdb_dbid();
+
+    // Classic injection payload: if the value were interpolated into the SQL
+    // text it would terminate the INSERT and drop the table. With server-side
+    // binding it must be stored verbatim as the row's name.
+    const char* payload = "O'Brien'); DROP TABLE test_items;--";
+
+    test_item_t* item = test_item_instance();
+    TEST_ASSERT_NOT_NULL(item, "instance should be created");
+
+    model_set_text(model_field(&item->record, TEST_ITEM_COL_NAME), payload);
+    model_set_int(model_field(&item->record, TEST_ITEM_COL_STATUS), 1);
+
+    int res = model_create(dbid, item);
+    TEST_ASSERT_EQUAL(1, res, "model_create should return 1");
+    test_item_free(item);
+
+    // Table must still exist.
+    dbresult_t* r = dbqueryf(dbid,
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'test_items')");
+    TEST_ASSERT_NOT_NULL(r, "table existence check should succeed");
+    TEST_ASSERT(dbresult_ok(r), "table existence check should be ok");
+    TEST_ASSERT_STR_EQUAL("t", dbresult_field(r, "exists")->value, "test_items table must still exist");
+    dbresult_free(r);
+
+    // The payload must be stored verbatim. Read it back via model_get and via a
+    // parameterized control query, then verify the value round-trips.
+    r = dbqueryf(dbid, "SELECT COUNT(*) AS c FROM test_items");
+    TEST_ASSERT_NOT_NULL(r, "count query should succeed");
+    TEST_ASSERT(dbresult_ok(r), "count query should be ok");
+    TEST_ASSERT_STR_EQUAL("1", dbresult_field(r, "c")->value, "exactly one row should be inserted");
+    dbresult_free(r);
+
+    array_t* params = array_create();
+    mparams_fill_array(params, mparam_text(name, payload));
+    array_t* list = model_list(dbid, test_item_instance,
+        "SELECT * FROM test_items WHERE name = :name", params);
+    array_free(params);
+    TEST_ASSERT_NOT_NULL(list, "row with the literal payload as name should be found");
+    if (list == NULL) return;
+
+    TEST_ASSERT_EQUAL_SIZE(1, array_size(list), "exactly one matching row");
+    test_item_t* found = array_get(list, 0);
+    TEST_ASSERT_STR_EQUAL(payload,
+        str_get(model_text(model_field(&found->record, TEST_ITEM_COL_NAME))),
+        "stored name must equal the raw payload verbatim");
+
+    array_free(list);
+}
+
 // ============================================================================
 // model_get tests
 // ============================================================================

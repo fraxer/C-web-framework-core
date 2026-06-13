@@ -48,6 +48,7 @@ static str_t* __build_query(void* connection, str_t* sql, array_t* params, array
 static void __prepared_stmt_free(void* data);
 static int __prepare(void* connection, str_t* stmt_name, str_t* sql, array_t* params);
 static dbresult_t* __execute_prepared(void* connection, const char* stmt_name, array_t* params);
+static dbresult_t* __execute_params(void* connection, const char* sql, array_t* params);
 static char* __compile_insert(void* connection, const char* table, array_t* params);
 static char* __compile_select(void* connection, const char* table, array_t* columns, array_t* where);
 static char* __compile_update(void* connection, const char* table, array_t* set, array_t* where);
@@ -141,6 +142,7 @@ void* __connection_create(void* host) {
     connection->base.reconnect = __reconnect;
     connection->base.prepare = __prepare;
     connection->base.execute_prepared = __execute_prepared;
+    connection->base.execute_params = __execute_params;
     connection->base.begin = __begin;
     connection->base.type_cast = __type_cast;
     connection->base.host = host;
@@ -868,6 +870,73 @@ dbresult_t* __execute_prepared(void* connection, const char* stmt_name, array_t*
 
     if (!PQsendQueryPrepared(pgconnection->connection, stmt_name, n_params, param_values, param_lengths, 0, 0)) {
         log_error("PQsendQueryPrepared failed: %s\n", PQerrorMessage(pgconnection->connection));
+        goto failed;
+    }
+
+    res = 1;
+
+    failed:
+
+    if (param_values != NULL) free(param_values);
+    if (param_lengths != NULL) free(param_lengths);
+
+    if (!res) {
+        result->ok = 0;
+        return result;
+    }
+
+    return __process_result(pgconnection, result);
+}
+
+dbresult_t* __execute_params(void* connection, const char* sql, array_t* params) {
+    postgresqlconnection_t* pgconnection = connection;
+
+    log_debug("DB params query: %s\n", sql);
+
+    int res = 0;
+    dbresult_t* result = dbresult_create();
+    if (result == NULL) return NULL;
+
+    const int n_params = params != NULL ? (int)array_size(params) : 0;
+    const char** param_values = NULL;
+    int* param_lengths = NULL;
+
+    if (n_params > 0) {
+        param_values = malloc(sizeof(char*) * n_params);
+        param_lengths = malloc(sizeof(int) * n_params);
+        if (param_values == NULL || param_lengths == NULL) {
+            log_error("__execute_params: memory allocation failed\n");
+            goto failed;
+        }
+
+        for (int i = 0; i < n_params; i++) {
+            mfield_t* field = array_get(params, i);
+            if (field == NULL) {
+                log_error("__execute_params: param %d is NULL\n", i);
+                goto failed;
+            }
+
+            // NULL values are bound as SQL NULL (not interpolated into the text).
+            if (field->is_null) {
+                param_values[i] = NULL;
+                param_lengths[i] = 0;
+                continue;
+            }
+
+            str_t* str = model_field_to_string(field);
+            if (str == NULL) {
+                log_error("__execute_params: model_field_to_string failed for %s\n", field->name);
+                goto failed;
+            }
+
+            param_values[i] = str_get(str);
+            param_lengths[i] = (int)str_size(str);
+        }
+    }
+
+    // Text format params (paramFormats=NULL); PostgreSQL infers types from context.
+    if (!PQsendQueryParams(pgconnection->connection, sql, n_params, NULL, param_values, param_lengths, NULL, 0)) {
+        log_error("PQsendQueryParams failed: %s\n", PQerrorMessage(pgconnection->connection));
         goto failed;
     }
 

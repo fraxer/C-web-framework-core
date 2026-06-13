@@ -2001,6 +2001,83 @@ int __str_modify_add_symbols_before(str_t* str, char add_symbol, char before_sym
 }
 
 /* =========================================================================
+ * Parameterized CRUD value binding (R2)
+ *
+ * Values are never interpolated into SQL text. A field carrying `use_raw_sql`
+ * (NULL, NOW(), ...) is inlined as a trusted framework fragment; every other
+ * value is emitted as a positional placeholder ($N) and the field is appended
+ * to an ordered bind array consumed by dbquery_params -> execute_params. Only
+ * identifiers (table/column names from the compile-time schema) reach the SQL
+ * text directly.
+ * ========================================================================= */
+
+// Append a bound value to `sql`: either inline a trusted raw fragment, or emit
+// "$N[::cast]" and push `field` onto `params`. *idx is the running placeholder
+// counter, incremented only when a placeholder is emitted.
+// Returns 1 on success, 0 on conversion failure.
+static int __model_append_bind(dbconnection_t* conn, str_t* sql, mfield_t* field, array_t* params, int* idx) {
+    str_t* value = model_field_to_string(field);
+    if (value == NULL) return 0;
+
+    // model_field_to_string sets use_raw_sql for is_null fields ("NULL"), so the
+    // raw branch also covers NULLs and SQL functions — inline, never bound.
+    if (field->use_raw_sql) {
+        str_append(sql, str_get(value), str_size(value));
+        return 1;
+    }
+
+    (*idx)++;
+
+    char placeholder[16];
+    const int n = snprintf(placeholder, sizeof(placeholder), "$%d", *idx);
+    str_append(sql, placeholder, n);
+
+    const char* suffix = conn->type_cast(field->type);
+    if (suffix != NULL && suffix[0] != '\0')
+        str_append(sql, suffix, strlen(suffix));
+
+    array_push_back(params, array_create_pointer(field, array_nocopy, array_nofree));
+
+    return 1;
+}
+
+// Clone a field carrying `srcval`, owning a fresh string slot so that binding it
+// neither mutates nor frees the source field's buffers. Used to bind the OLD
+// primary-key value in UPDATE ... WHERE when the key itself changed (the source
+// field is bound separately in SET with its new value).
+static mfield_t* __model_bind_clone(const mfield_t* field, mvalue_t srcval) {
+    mfield_t* f = malloc(sizeof(*f));
+    if (f == NULL) return NULL;
+
+    *f = *field;
+    f->value = srcval;
+    f->value._string = NULL;
+    f->is_null = 0;
+    f->use_raw_sql = 0;
+    f->dirty = 0;
+
+    // String-backed types keep their data in _string; copy it so the clone owns
+    // an independent buffer. Scalars carry their value in the union and format
+    // lazily into a freshly allocated _string.
+    if (srcval._string != NULL) {
+        f->value._string = str_createn(str_get(srcval._string), str_size(srcval._string));
+        if (f->value._string == NULL) {
+            free(f);
+            return NULL;
+        }
+    }
+
+    return f;
+}
+
+static void __model_bind_clone_free(void* p) {
+    mfield_t* f = p;
+    if (f == NULL) return;
+    if (f->value._string != NULL) str_free(f->value._string);
+    free(f);
+}
+
+/* =========================================================================
  * Schema/record model (R1)
  *
  * Generic CRUD/serialization over a shared `const mschema_t*` and a heap cell
@@ -2115,11 +2192,12 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
     dbinstance_free(dbinst);
 
     str_t* fields = str_create_empty(256);
-    str_t* where_params = str_create_empty(256);
+    str_t* sql = str_create_empty(256);
+    array_t* bind = array_create();
     dbresult_t* result = NULL;
     void* res = NULL;
 
-    if (fields == NULL || where_params == NULL) goto failed;
+    if (fields == NULL || sql == NULL || bind == NULL) goto failed;
 
     for (int i = 0; i < schema->columns_count; i++) {
         if (i > 0)
@@ -2132,37 +2210,32 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
         str_free(escaped);
     }
 
+    str_append(sql, "SELECT ", 7);
+    str_append(sql, str_get(fields), str_size(fields));
+    str_append(sql, " FROM ", 6);
+    str_append(sql, record->table, strlen(record->table));
+    str_append(sql, " WHERE ", 7);
+
+    int idx = 0;
     for (size_t i = 0; i < array_size(params); i++) {
         mfield_t* param = array_get(params, i);
 
         if (i > 0)
-            str_append(where_params, " AND ", 5);
+            str_append(sql, " AND ", 5);
 
-        str_append(where_params, param->name, strlen(param->name));
+        str_append(sql, param->name, strlen(param->name));
 
         if (param->is_null) {
-            str_append(where_params, " IS NULL", 8);
+            str_append(sql, " IS NULL", 8);
         } else {
-            str_appendc(where_params, '=');
-
-            str_t* value = model_field_to_string(param);
-            if (value == NULL) goto failed;
-
-            if (param->use_raw_sql) {
-                str_append(where_params, str_get(value), str_size(value));
-            } else {
-                str_t* escaped = conn->escape_string(conn, str_get(value));
-                if (escaped == NULL) goto failed;
-
-                str_append(where_params, str_get(escaped), str_size(escaped));
-                str_free(escaped);
-            }
+            str_appendc(sql, '=');
+            if (!__model_append_bind(conn, sql, param, bind, &idx)) goto failed;
         }
     }
 
-    result = dbqueryf(dbid,
-        "SELECT %s FROM %s WHERE %s LIMIT 1 ",
-        str_get(fields), record->table, str_get(where_params));
+    str_append(sql, " LIMIT 1 ", 9);
+
+    result = dbquery_params(dbid, str_get(sql), bind);
 
     if (!dbresult_ok(result)) goto failed;
     if (dbresult_query_rows(result) == 0) goto failed;
@@ -2178,7 +2251,8 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
         model_free(record);
 
     str_free(fields);
-    str_free(where_params);
+    str_free(sql);
+    array_free(bind);
     dbresult_free(result);
 
     return res;
@@ -2191,12 +2265,23 @@ int model_create(const char* dbid, void* arg) {
     const mschema_t* schema = record->schema;
     if (schema->columns_count == 0) return 0;
 
-    array_t* arr = array_create();
-    if (arr == NULL) return 0;
+    dbinstance_t* dbinst = dbinstance(dbid);
+    if (dbinst == NULL) return 0;
+
+    dbconnection_t* conn = dbinst->connection;
+    dbinstance_free(dbinst);
 
     int res = 0;
     dbresult_t* result = NULL;
+    str_t* columns = str_create_empty(256);
+    str_t* values = str_create_empty(256);
+    str_t* sql = str_create_empty(256);
+    array_t* bind = array_create();
 
+    if (columns == NULL || values == NULL || sql == NULL || bind == NULL) goto failed;
+
+    int idx = 0;
+    int written = 0;
     for (int i = 0; i < schema->columns_count; i++) {
         mfield_t* field = &record->fields[i];
 
@@ -2205,17 +2290,43 @@ int model_create(const char* dbid, void* arg) {
         if (field->use_default)
             continue;
 
-        array_push_back(arr, array_create_pointer(field, array_nocopy, array_nofree));
+        if (written > 0) {
+            str_appendc(columns, ',');
+            str_appendc(values, ',');
+        }
+
+        str_t* escaped = conn->escape_identifier(conn, field->name);
+        if (escaped == NULL) goto failed;
+
+        str_append(columns, str_get(escaped), str_size(escaped));
+        str_free(escaped);
+
+        if (!__model_append_bind(conn, values, field, bind, &idx)) goto failed;
+
+        written++;
     }
 
-    result = dbinsert(dbid, record->table, arr);
+    if (written == 0) goto failed;
+
+    str_append(sql, "INSERT INTO ", 12);
+    str_append(sql, record->table, strlen(record->table));
+    str_append(sql, " (", 2);
+    str_append(sql, str_get(columns), str_size(columns));
+    str_append(sql, ") VALUES (", 10);
+    str_append(sql, str_get(values), str_size(values));
+    str_appendc(sql, ')');
+
+    result = dbquery_params(dbid, str_get(sql), bind);
     if (!dbresult_ok(result)) goto failed;
 
     res = 1;
 
     failed:
 
-    array_free(arr);
+    str_free(columns);
+    str_free(values);
+    str_free(sql);
+    array_free(bind);
     dbresult_free(result);
 
     return res;
@@ -2236,58 +2347,24 @@ int model_update(const char* dbid, void* arg) {
     int res = 0;
     dbresult_t* result = NULL;
     str_t* set_params = str_create_empty(256);
-    if (set_params == NULL) return 0;
-
     str_t* where_params = str_create_empty(256);
-    if (where_params == NULL) goto failed;
+    str_t* sql = str_create_empty(256);
+    array_t* bind = array_create();
+    // Owns the heap clones used to bind the OLD primary-key value (dirty PK case).
+    array_t* clones = array_create();
 
-    for (int i = 0, iter_set = 0, iter_where = 0; i < schema->columns_count; i++) {
+    if (set_params == NULL || where_params == NULL || sql == NULL || bind == NULL || clones == NULL)
+        goto failed;
+
+    // Placeholder numbering follows SQL text order: SET ($1..) precedes WHERE,
+    // so SET is built before WHERE and they share a single running counter.
+    int idx = 0;
+
+    // Pass 1 — SET clause: every dirty field bound with its (new) value.
+    for (int i = 0, iter_set = 0; i < schema->columns_count; i++) {
         mfield_t* field = &record->fields[i];
 
-        if (schema->columns[i].is_primary) {
-            mfield_t tmpfield = __model_tmpfield_create(field);
-            if (field->dirty) {
-                tmpfield.value = field->oldvalue;
-                tmpfield.oldvalue = field->value;
-            }
-
-            str_t* tmp_string_before = tmpfield.value._string;
-
-            str_t* fieldstr = model_field_to_string(&tmpfield);
-            if (fieldstr == NULL)
-                goto failed;
-
-            if (iter_where > 0)
-                str_append(where_params, " AND ", 5);
-
-            str_append(where_params, field->name, strlen(field->name));
-            str_appendc(where_params, '=');
-
-            if (field->use_raw_sql) {
-                str_append(where_params, str_get(fieldstr), str_size(fieldstr));
-            } else {
-                str_t* escaped = conn->escape_string(conn, str_get(fieldstr));
-                if (escaped == NULL) {
-                    if (tmpfield.value._string != tmp_string_before)
-                        str_free(tmpfield.value._string);
-                    goto failed;
-                }
-
-                str_append(where_params, str_get(escaped), str_size(escaped));
-                str_free(escaped);
-            }
-
-            if (tmpfield.value._string != tmp_string_before)
-                str_free(tmpfield.value._string);
-
-            iter_where++;
-        }
-
         if (!field->dirty)
-            continue;
-
-        str_t* fieldstr = model_field_to_string(field);
-        if (fieldstr == NULL)
             continue;
 
         if (iter_set > 0)
@@ -2296,22 +2373,47 @@ int model_update(const char* dbid, void* arg) {
         str_append(set_params, field->name, strlen(field->name));
         str_appendc(set_params, '=');
 
-        if (field->use_raw_sql) {
-            str_append(set_params, str_get(fieldstr), str_size(fieldstr));
-        } else {
-            str_t* escaped = conn->escape_string(conn, str_get(fieldstr));
-            if (escaped == NULL) goto failed;
-
-            str_append(set_params, str_get(escaped), str_size(escaped));
-            str_free(escaped);
-        }
+        if (!__model_append_bind(conn, set_params, field, bind, &idx)) goto failed;
 
         iter_set++;
     }
 
-    result = dbqueryf(dbid,
-        "UPDATE %s SET %s WHERE %s ",
-        record->table, str_get(set_params), str_get(where_params));
+    // Pass 2 — WHERE clause: locate the row by primary key. A dirty key is bound
+    // by its OLD value (the SET above already bound its new value).
+    for (int i = 0, iter_where = 0; i < schema->columns_count; i++) {
+        if (!schema->columns[i].is_primary)
+            continue;
+
+        mfield_t* field = &record->fields[i];
+
+        if (iter_where > 0)
+            str_append(where_params, " AND ", 5);
+
+        str_append(where_params, field->name, strlen(field->name));
+        str_appendc(where_params, '=');
+
+        if (field->dirty) {
+            mfield_t* clone = __model_bind_clone(field, field->oldvalue);
+            if (clone == NULL) goto failed;
+
+            array_push_back(clones, array_create_pointer(clone, array_nocopy, __model_bind_clone_free));
+
+            if (!__model_append_bind(conn, where_params, clone, bind, &idx)) goto failed;
+        } else {
+            if (!__model_append_bind(conn, where_params, field, bind, &idx)) goto failed;
+        }
+
+        iter_where++;
+    }
+
+    str_append(sql, "UPDATE ", 7);
+    str_append(sql, record->table, strlen(record->table));
+    str_append(sql, " SET ", 5);
+    str_append(sql, str_get(set_params), str_size(set_params));
+    str_append(sql, " WHERE ", 7);
+    str_append(sql, str_get(where_params), str_size(where_params));
+
+    result = dbquery_params(dbid, str_get(sql), bind);
 
     if (!dbresult_ok(result)) goto failed;
 
@@ -2327,6 +2429,9 @@ int model_update(const char* dbid, void* arg) {
 
     str_free(set_params);
     str_free(where_params);
+    str_free(sql);
+    array_free(bind);
+    array_free(clones);
     dbresult_free(result);
 
     return res;
@@ -2348,16 +2453,17 @@ int model_delete(const char* dbid, void* arg) {
     int res = 0;
     dbresult_t* result = NULL;
     str_t* where_params = str_create_empty(256);
-    if (where_params == NULL) return 0;
+    str_t* sql = str_create_empty(256);
+    array_t* bind = array_create();
 
+    if (where_params == NULL || sql == NULL || bind == NULL) goto failed;
+
+    int idx = 0;
     for (int i = 0, iter_where = 0; i < schema->columns_count; i++) {
         if (!schema->columns[i].is_primary)
             continue;
 
         mfield_t* field = &record->fields[i];
-
-        str_t* fieldstr = model_field_to_string(field);
-        if (fieldstr == NULL) goto failed;
 
         if (iter_where > 0)
             str_append(where_params, " AND ", 5);
@@ -2365,22 +2471,17 @@ int model_delete(const char* dbid, void* arg) {
         str_append(where_params, field->name, strlen(field->name));
         str_appendc(where_params, '=');
 
-        if (field->use_raw_sql) {
-            str_append(where_params, str_get(fieldstr), str_size(fieldstr));
-        } else {
-            str_t* escaped = conn->escape_string(conn, str_get(fieldstr));
-            if (escaped == NULL) goto failed;
-
-            str_append(where_params, str_get(escaped), str_size(escaped));
-            str_free(escaped);
-        }
+        if (!__model_append_bind(conn, where_params, field, bind, &idx)) goto failed;
 
         iter_where++;
     }
 
-    result = dbqueryf(dbid,
-        "DELETE FROM %s WHERE %s ",
-        record->table, str_get(where_params));
+    str_append(sql, "DELETE FROM ", 12);
+    str_append(sql, record->table, strlen(record->table));
+    str_append(sql, " WHERE ", 7);
+    str_append(sql, str_get(where_params), str_size(where_params));
+
+    result = dbquery_params(dbid, str_get(sql), bind);
 
     if (!dbresult_ok(result)) goto failed;
 
@@ -2389,6 +2490,8 @@ int model_delete(const char* dbid, void* arg) {
     failed:
 
     str_free(where_params);
+    str_free(sql);
+    array_free(bind);
     dbresult_free(result);
 
     return res;
@@ -2411,8 +2514,12 @@ int model_delete_by_params(const char* dbid, void* arg, array_t* params) {
     int res = 0;
     dbresult_t* result = NULL;
     str_t* where_params = str_create_empty(256);
-    if (where_params == NULL) return 0;
+    str_t* sql = str_create_empty(256);
+    array_t* bind = array_create();
 
+    if (where_params == NULL || sql == NULL || bind == NULL) goto failed;
+
+    int idx = 0;
     for (size_t i = 0, iter_where = 0; i < array_size(params); i++) {
         const char* param_name = array_get(params, i);
 
@@ -2430,15 +2537,7 @@ int model_delete_by_params(const char* dbid, void* arg, array_t* params) {
                 str_append(where_params, " IS NULL", 8);
             } else {
                 str_appendc(where_params, '=');
-
-                str_t* value = model_field_to_string(field);
-                if (value == NULL) goto failed;
-
-                str_t* escaped = conn->escape_string(conn, str_get(value));
-                if (escaped == NULL) goto failed;
-
-                str_append(where_params, str_get(escaped), str_size(escaped));
-                str_free(escaped);
+                if (!__model_append_bind(conn, where_params, field, bind, &idx)) goto failed;
             }
 
             iter_where++;
@@ -2446,9 +2545,12 @@ int model_delete_by_params(const char* dbid, void* arg, array_t* params) {
         }
     }
 
-    result = dbqueryf(dbid,
-        "DELETE FROM %s WHERE %s ",
-        record->table, str_get(where_params));
+    str_append(sql, "DELETE FROM ", 12);
+    str_append(sql, record->table, strlen(record->table));
+    str_append(sql, " WHERE ", 7);
+    str_append(sql, str_get(where_params), str_size(where_params));
+
+    result = dbquery_params(dbid, str_get(sql), bind);
 
     if (!dbresult_ok(result)) goto failed;
 
@@ -2457,6 +2559,8 @@ int model_delete_by_params(const char* dbid, void* arg, array_t* params) {
     failed:
 
     str_free(where_params);
+    str_free(sql);
+    array_free(bind);
     dbresult_free(result);
 
     return res;

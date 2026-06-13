@@ -50,6 +50,11 @@ typedef struct dbconnection {
     int(*prepare)(void* connection, str_t* stmt_name, str_t* sql, array_t* params);
     dbresult_t*(*execute_prepared)(void* connection, const char* stmt_name, array_t* params);
 
+    // Parameterized execution without a server-side PREPARE.
+    // `sql` carries positional placeholders ($1..$N), `params` is an ordered
+    // array of mfield_t* whose values are bound (never interpolated into SQL).
+    dbresult_t*(*execute_params)(void* connection, const char* sql, array_t* params);
+
     // Transaction isolation level
     dbresult_t*(*begin)(void* connection, transaction_level_e level);
 

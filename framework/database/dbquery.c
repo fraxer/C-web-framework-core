@@ -229,6 +229,21 @@ dbresult_t* dbprepared_query(const char* dbid, const char* stmt_name, array_t* p
     return connection->execute_prepared(connection, stmt_name, params);
 }
 
+dbresult_t* dbquery_params(const char* dbid, const char* sql, array_t* ordered_params) {
+    dbinstance_t* dbinst = dbinstance(dbid);
+    if (dbinst == NULL) return NULL;
+
+    dbconnection_t* connection = dbinst->connection;
+    dbinstance_free(dbinst);
+
+    if (connection->execute_params == NULL) {
+        log_error("dbquery_params: execute_params not implemented for this database\n");
+        return NULL;
+    }
+
+    return connection->execute_params(connection, sql, ordered_params);
+}
+
 dbresult_t* dbtable_exist(const char* dbid, const char* table) {
     dbinstance_t* instance = dbinstance(dbid);
     if (instance == NULL) return NULL;

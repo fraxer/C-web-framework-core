@@ -12,6 +12,7 @@ dbhost_t* dbhost(const char* dbid);
 dbresult_t* dbqueryf(const char* dbid, const char*, ...);
 dbresult_t* dbquery(const char* dbid, const char* format, array_t* params);
 dbresult_t* dbprepared_query(const char* dbid, const char* stmt_name, array_t* params);
+dbresult_t* dbquery_params(const char* dbid, const char* sql, array_t* ordered_params);
 dbresult_t* dbtable_exist(const char* dbid, const char* table);
 dbresult_t* dbtable_migration_create(const char* dbid, const char* table);
 dbresult_t* dbbegin(const char* dbid, transaction_level_e level);
