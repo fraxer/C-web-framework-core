@@ -392,7 +392,7 @@ typedef struct {
 } mvalue_t;
 
 typedef struct mfield {
-    char name[128];
+    const char* name;
     mvalue_t value;
     mvalue_t oldvalue;
     mtype_e type;
@@ -402,18 +402,59 @@ typedef struct mfield {
     unsigned use_raw_sql : 1;
 } mfield_t;
 
+/* ---------------------------------------------------------------------------
+ * Schema/record model (R1)
+ *
+ * Splits the immutable, compile-time schema (shared via a single `static const`
+ * per model type) from the per-instance row data. Replaces the legacy
+ * per-instance vtable of 5 function pointers + inline table/primary_key arrays
+ * with one `const mschema_t*`, and lets each cell's name point at the schema
+ * instead of carrying a 128-byte inline copy.
+ * ------------------------------------------------------------------------- */
+typedef struct mcolumn {
+    const char* name;
+    mtype_e type;
+    unsigned is_primary : 1;
+    unsigned has_default : 1;       /* DB provides a default: cell starts skipped on INSERT until set */
+    unsigned nullable : 1;          /* numeric/temporal column starts NULL (mirrors mfield_x(name, NULL)) */
+    const char* const* enum_values; /* MODEL_ENUM only, else NULL */
+    int enum_count;
+} mcolumn_t;
+
+typedef struct mschema {
+    const char* table;
+    const mcolumn_t* columns;
+    int columns_count;
+    const int* primary_keys;        /* indexes into columns */
+    int primary_keys_count;
+} mschema_t;
+
 typedef struct model {
-    mfield_t*(*first_field)(void* arg);
-    int(*fields_count)(void* arg);
-    const char*(*table)(void* arg);
-    const char**(*primary_key)(void* arg);
-    int(*primary_key_count)(void* arg);
+    const mschema_t* schema;
+    mfield_t* fields;               /* columns_count cells, heap-allocated */
+    const char* table;              /* effective table; defaults to schema->table, per-instance overridable */
 } model_t;
 
-typedef struct modelview {
-    mfield_t*(*first_field)(void* arg);
-    int(*fields_count)(void* arg);
-} modelview_t;
+/* Initialize an embedded record: allocates and default-inits the cell array
+   from the schema. The record must be the first member of the concrete model
+   struct, so a concrete pointer can be passed wherever `void* arg` is taken. */
+int model_init(model_t* record, const mschema_t* schema);
+/* Cell accessor by column index (use generated column-index enums). */
+mfield_t* model_field(void* arg, int index);
+
+void* model_get(const char* dbid, void*(create_instance)(void), array_t* params);
+int model_create(const char* dbid, void* arg);
+int model_update(const char* dbid, void* arg);
+int model_delete(const char* dbid, void* arg);
+int model_delete_by_params(const char* dbid, void* arg, array_t* params);
+void* model_one(const char* dbid, void*(create_instance)(void), const char* format, array_t* params);
+array_t* model_list(const char* dbid, void*(create_instance)(void), const char* format, array_t* params);
+void* model_prepared_one(const char* dbid, void*(create_instance)(void), const char* stat_name, array_t* params);
+array_t* model_prepared_list(const char* dbid, void*(create_instance)(void), const char* stat_name, array_t* params);
+json_token_t* model_to_json(void* arg, char** display_fields);
+char* model_stringify(void* arg, char** display_fields);
+char* model_list_stringify(array_t* array);
+void model_free(void* arg);
 
 // Specialized field creation functions
 void* field_create_bool(const char* field_name, short value);
@@ -440,21 +481,6 @@ void* field_create_text(const char* field_name, const char* value);
 
 void* field_create_enum(const char* field_name, const char* default_value, char** values, int count);
 void* field_create_array(const char* field_name, array_t* value);
-
-void* model_get(const char* dbid, void*(create_instance)(void), array_t* params);
-int model_create(const char* dbid, void* arg);
-int model_update(const char* dbid, void* arg);
-int model_delete(const char* dbid, void* arg);
-int model_delete_by_params(const char* dbid, void* arg, array_t* params);
-void* model_one(const char* dbid, void*(create_instance)(void), const char* format, array_t* params);
-array_t* model_list(const char* dbid, void*(create_instance)(void), const char* format, array_t* params);
-void* model_prepared_one(const char* dbid, void*(create_instance)(void), const char* stat_name, array_t* params);
-array_t* model_prepared_list(const char* dbid, void*(create_instance)(void), const char* stat_name, array_t* params);
-
-json_token_t* model_to_json(void* arg, char** display_fields);
-char* model_stringify(void* arg, char** display_fields);
-char* model_list_stringify(array_t* array);
-void model_free(void* arg);
 
 
 

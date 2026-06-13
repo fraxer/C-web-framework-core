@@ -11,70 +11,44 @@
 // Test model: test_item
 // ============================================================================
 
+enum test_item_column {
+    TEST_ITEM_COL_ID = 0,
+    TEST_ITEM_COL_NAME,
+    TEST_ITEM_COL_STATUS,
+    TEST_ITEM_COL_DESCRIPTION,
+    TEST_ITEM_COLUMNS_COUNT
+};
+
 typedef struct {
-    model_t base;
-    struct {
-        mfield_t id;
-        mfield_t name;
-        mfield_t status;
-        mfield_t description;
-    } field;
-    char table[64];
-    char* primary_key[1];
+    model_t record;
 } test_item_t;
 
-static mfield_t* __test_item_first_field(void* arg) {
-    test_item_t* item = arg;
-    if (item == NULL) return NULL;
-    return (void*)&item->field;
-}
+static const mcolumn_t __test_item_columns[TEST_ITEM_COLUMNS_COUNT] = {
+    [TEST_ITEM_COL_ID]          = { .name = "id",          .type = MODEL_INT, .is_primary = 1 },
+    [TEST_ITEM_COL_NAME]        = { .name = "name",        .type = MODEL_TEXT },
+    [TEST_ITEM_COL_STATUS]      = { .name = "status",      .type = MODEL_INT, .nullable = 1 },
+    [TEST_ITEM_COL_DESCRIPTION] = { .name = "description", .type = MODEL_TEXT },
+};
 
-static int __test_item_fields_count(void* arg) {
-    test_item_t* item = arg;
-    if (item == NULL) return 0;
-    return sizeof(item->field) / sizeof(mfield_t);
-}
+static const int __test_item_primary_keys[] = { TEST_ITEM_COL_ID };
 
-static const char* __test_item_table(void* arg) {
-    test_item_t* item = arg;
-    if (item == NULL) return NULL;
-    return item->table;
-}
-
-static const char** __test_item_primary_key(void* arg) {
-    test_item_t* item = arg;
-    if (item == NULL) return NULL;
-    return (const char**)&item->primary_key[0];
-}
-
-static int __test_item_primary_key_count(void* arg) {
-    (void)arg;
-    return 1;
-}
+static const mschema_t __test_item_schema = {
+    .table = "test_items",
+    .columns = __test_item_columns,
+    .columns_count = TEST_ITEM_COLUMNS_COUNT,
+    .primary_keys = __test_item_primary_keys,
+    .primary_keys_count = 1,
+};
 
 static void* test_item_instance(void) {
-    test_item_t* item = malloc(sizeof * item);
+    test_item_t* item = calloc(1, sizeof * item);
     if (item == NULL) return NULL;
 
-    test_item_t st = {
-        .base = {
-            .fields_count = __test_item_fields_count,
-            .primary_key_count = __test_item_primary_key_count,
-            .first_field = __test_item_first_field,
-            .table = __test_item_table,
-            .primary_key = __test_item_primary_key
-        },
-        .field = {
-            mfield_int(id, NULL),
-            mfield_text(name, NULL),
-            mfield_int(status, NULL),
-            mfield_text(description, NULL),
-        },
-        .table = "test_items",
-        .primary_key = { "id" }
-    };
+    if (!model_init(&item->record, &__test_item_schema)) {
+        free(item);
+        return NULL;
+    }
 
-    memcpy(item, &st, sizeof st);
     return item;
 }
 
@@ -169,8 +143,8 @@ TEST_DB(test_model_create_basic) {
     test_item_t* item = test_item_instance();
     TEST_ASSERT_NOT_NULL(item, "instance should be created");
 
-    model_set_text(&item->field.name, "Test Item");
-    model_set_int(&item->field.status, 1);
+    model_set_text(model_field(&item->record, TEST_ITEM_COL_NAME), "Test Item");
+    model_set_int(model_field(&item->record, TEST_ITEM_COL_STATUS), 1);
 
     int res = model_create(dbid, item);
     TEST_ASSERT_EQUAL(1, res, "model_create should return 1");
@@ -206,10 +180,10 @@ TEST_DB(test_model_get_by_id) {
     TEST_ASSERT_NOT_NULL(item, "model_get should return item");
     if (item == NULL) return;
 
-    TEST_ASSERT_EQUAL(id, model_int(&item->field.id), "id should match");
-    TEST_ASSERT_STR_EQUAL("Alpha", str_get(model_text(&item->field.name)), "name should match");
-    TEST_ASSERT_EQUAL(5, model_int(&item->field.status), "status should match");
-    TEST_ASSERT_STR_EQUAL("desc", str_get(model_text(&item->field.description)), "description should match");
+    TEST_ASSERT_EQUAL(id, model_int(model_field(&item->record, TEST_ITEM_COL_ID)), "id should match");
+    TEST_ASSERT_STR_EQUAL("Alpha", str_get(model_text(model_field(&item->record, TEST_ITEM_COL_NAME))), "name should match");
+    TEST_ASSERT_EQUAL(5, model_int(model_field(&item->record, TEST_ITEM_COL_STATUS)), "status should match");
+    TEST_ASSERT_STR_EQUAL("desc", str_get(model_text(model_field(&item->record, TEST_ITEM_COL_DESCRIPTION))), "description should match");
 
     test_item_free(item);
 }
@@ -245,7 +219,7 @@ TEST_DB(test_model_get_null_field) {
     TEST_ASSERT_NOT_NULL(item, "model_get should return item");
     if (item == NULL) return;
 
-    TEST_ASSERT_EQUAL(1, item->field.description.is_null, "description should be null");
+    TEST_ASSERT_EQUAL(1, model_field(&item->record, TEST_ITEM_COL_DESCRIPTION)->is_null, "description should be null");
 
     test_item_free(item);
 }
@@ -271,8 +245,8 @@ TEST_DB(test_model_update_basic) {
     if (item == NULL) return;
 
     // Modify and update
-    model_set_text(&item->field.name, "NewName");
-    model_set_int(&item->field.status, 2);
+    model_set_text(model_field(&item->record, TEST_ITEM_COL_NAME), "NewName");
+    model_set_int(model_field(&item->record, TEST_ITEM_COL_STATUS), 2);
 
     int res = model_update(dbid, item);
     TEST_ASSERT_EQUAL(1, res, "model_update should return 1");
@@ -288,8 +262,8 @@ TEST_DB(test_model_update_basic) {
     dbresult_free(r);
 
     // Verify dirty flags cleared
-    TEST_ASSERT_EQUAL(0, item->field.name.dirty, "name dirty should be cleared after update");
-    TEST_ASSERT_EQUAL(0, item->field.status.dirty, "status dirty should be cleared after update");
+    TEST_ASSERT_EQUAL(0, model_field(&item->record, TEST_ITEM_COL_NAME)->dirty, "name dirty should be cleared after update");
+    TEST_ASSERT_EQUAL(0, model_field(&item->record, TEST_ITEM_COL_STATUS)->dirty, "status dirty should be cleared after update");
 
     test_item_free(item);
 }
@@ -310,7 +284,7 @@ TEST_DB(test_model_update_dirty_tracking) {
     if (item == NULL) return;
 
     // Only update status
-    model_set_int(&item->field.status, 99);
+    model_set_int(model_field(&item->record, TEST_ITEM_COL_STATUS), 99);
 
     int res = model_update(dbid, item);
     TEST_ASSERT_EQUAL(1, res, "model_update should return 1");
@@ -340,7 +314,7 @@ TEST_DB(test_model_delete_basic) {
     TEST_ASSERT(id > 0, "insert should return valid id");
 
     test_item_t* item = test_item_instance();
-    model_set_int(&item->field.id, id);
+    model_set_int(model_field(&item->record, TEST_ITEM_COL_ID), id);
 
     int res = model_delete(dbid, item);
     TEST_ASSERT_EQUAL(1, res, "model_delete should return 1");
@@ -363,7 +337,7 @@ TEST_DB(test_model_delete_not_found) {
     const char* dbid = testdb_dbid();
 
     test_item_t* item = test_item_instance();
-    model_set_int(&item->field.id, 99999);
+    model_set_int(model_field(&item->record, TEST_ITEM_COL_ID), 99999);
 
     int res = model_delete(dbid, item);
     TEST_ASSERT_EQUAL(1, res, "model_delete should return 1 even for missing row");
@@ -389,7 +363,7 @@ TEST_DB(test_model_delete_by_params) {
 
     // Create model instance with status=10 set
     test_item_t* item = test_item_instance();
-    model_set_int(&item->field.status, 10);
+    model_set_int(model_field(&item->record, TEST_ITEM_COL_STATUS), 10);
 
     // Build params array with field names to match
     array_t* params = array_create();
@@ -439,9 +413,9 @@ TEST_DB(test_model_one_basic) {
     TEST_ASSERT_NOT_NULL(item, "model_one should return item");
     if (item == NULL) return;
 
-    TEST_ASSERT_EQUAL(id, model_int(&item->field.id), "id should match");
-    TEST_ASSERT_STR_EQUAL("OneItem", str_get(model_text(&item->field.name)), "name should match");
-    TEST_ASSERT_EQUAL(7, model_int(&item->field.status), "status should match");
+    TEST_ASSERT_EQUAL(id, model_int(model_field(&item->record, TEST_ITEM_COL_ID)), "id should match");
+    TEST_ASSERT_STR_EQUAL("OneItem", str_get(model_text(model_field(&item->record, TEST_ITEM_COL_NAME))), "name should match");
+    TEST_ASSERT_EQUAL(7, model_int(model_field(&item->record, TEST_ITEM_COL_STATUS)), "status should match");
 
     test_item_free(item);
 }
@@ -487,10 +461,10 @@ TEST_DB(test_model_list_basic) {
     TEST_ASSERT_EQUAL_SIZE(2, array_size(list), "should find 2 rows with status=1");
 
     test_item_t* first = array_get(list, 0);
-    TEST_ASSERT_STR_EQUAL("L1", str_get(model_text(&first->field.name)), "first name should be L1");
+    TEST_ASSERT_STR_EQUAL("L1", str_get(model_text(model_field(&first->record, TEST_ITEM_COL_NAME))), "first name should be L1");
 
     test_item_t* second = array_get(list, 1);
-    TEST_ASSERT_STR_EQUAL("L2", str_get(model_text(&second->field.name)), "second name should be L2");
+    TEST_ASSERT_STR_EQUAL("L2", str_get(model_text(model_field(&second->record, TEST_ITEM_COL_NAME))), "second name should be L2");
 
     array_free(list);
 }
@@ -541,9 +515,9 @@ TEST_DB(test_model_prepared_one) {
     TEST_ASSERT_NOT_NULL(item, "model_prepared_one should return item");
     if (item == NULL) return;
 
-    TEST_ASSERT_EQUAL(id, model_int(&item->field.id), "id should match");
-    TEST_ASSERT_STR_EQUAL("PrepOne", str_get(model_text(&item->field.name)), "name should match");
-    TEST_ASSERT_EQUAL(42, model_int(&item->field.status), "status should match");
+    TEST_ASSERT_EQUAL(id, model_int(model_field(&item->record, TEST_ITEM_COL_ID)), "id should match");
+    TEST_ASSERT_STR_EQUAL("PrepOne", str_get(model_text(model_field(&item->record, TEST_ITEM_COL_NAME))), "name should match");
+    TEST_ASSERT_EQUAL(42, model_int(model_field(&item->record, TEST_ITEM_COL_STATUS)), "status should match");
 
     test_item_free(item);
 }
@@ -582,10 +556,10 @@ TEST_DB(test_model_prepared_list) {
     TEST_ASSERT_EQUAL_SIZE(2, array_size(list), "should find 2 rows with status=5");
 
     test_item_t* first = array_get(list, 0);
-    TEST_ASSERT_STR_EQUAL("PL1", str_get(model_text(&first->field.name)), "first name should be PL1");
+    TEST_ASSERT_STR_EQUAL("PL1", str_get(model_text(model_field(&first->record, TEST_ITEM_COL_NAME))), "first name should be PL1");
 
     test_item_t* second = array_get(list, 1);
-    TEST_ASSERT_STR_EQUAL("PL2", str_get(model_text(&second->field.name)), "second name should be PL2");
+    TEST_ASSERT_STR_EQUAL("PL2", str_get(model_text(model_field(&second->record, TEST_ITEM_COL_NAME))), "second name should be PL2");
 
     array_free(list);
 }
