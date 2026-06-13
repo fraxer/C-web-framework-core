@@ -447,6 +447,78 @@ TEST_DB(test_model_delete_by_params) {
 }
 
 // ============================================================================
+// dbquery list binding (:list__) tests
+// ============================================================================
+
+TEST_DB(test_dbquery_in_list_binding) {
+    TEST_SUITE("dbquery :list__");
+    TEST_CASE("IN (:list__) expands to bound placeholders");
+
+    const char* dbid = testdb_dbid();
+    int id1 = __insert_test_row("InA", 1, NULL);
+    int id2 = __insert_test_row("InB", 1, NULL);
+    int id3 = __insert_test_row("InC", 1, NULL);
+    TEST_ASSERT(id1 > 0 && id2 > 0 && id3 > 0, "inserts should succeed");
+
+    // Select only id1 and id3 via a bound IN-list.
+    int ids[] = { id1, id3 };
+    array_t* id_arr = array_create_from_ints(ids, 2);
+
+    array_t* params = array_create();
+    mparams_fill_array(params, mparam_array(id, id_arr));
+
+    array_t* list = model_list(dbid, test_item_instance,
+        "SELECT * FROM test_items WHERE id IN (:list__id) ORDER BY id", params);
+    // params owns id_arr (mparam_array does not copy); freeing params frees it.
+    array_free(params);
+
+    TEST_ASSERT_NOT_NULL(list, "model_list should return matches");
+    if (list == NULL) return;
+
+    TEST_ASSERT_EQUAL_SIZE(2, array_size(list), "should match exactly id1 and id3");
+
+    test_item_t* a = array_get(list, 0);
+    test_item_t* b = array_get(list, 1);
+    TEST_ASSERT_EQUAL(id1, model_int(model_field(&a->record, TEST_ITEM_COL_ID)), "first match is id1");
+    TEST_ASSERT_EQUAL(id3, model_int(model_field(&b->record, TEST_ITEM_COL_ID)), "second match is id3");
+
+    array_free(list);
+}
+
+TEST_DB(test_dbquery_string_list_injection) {
+    TEST_SUITE("dbquery :list__");
+    TEST_CASE("malicious string list elements are bound, not executed");
+
+    const char* dbid = testdb_dbid();
+    const char* evil = "x'); DROP TABLE test_items;--";
+    __insert_test_row("safe-name", 1, NULL);
+
+    // The payload is a list element; it must be bound (matches nothing) and must
+    // not damage the schema.
+    char* names[] = { (char*)evil, (char*)"safe-name" };
+    array_t* name_arr = array_create_from_strings(names, 2);
+
+    array_t* params = array_create();
+    mparams_fill_array(params, mparam_array(name, name_arr));
+
+    array_t* list = model_list(dbid, test_item_instance,
+        "SELECT * FROM test_items WHERE name IN (:list__name) ORDER BY id", params);
+    // params owns name_arr (mparam_array does not copy); freeing params frees it.
+    array_free(params);
+
+    TEST_ASSERT_NOT_NULL(list, "the legit row should still match");
+    if (list == NULL) return;
+    TEST_ASSERT_EQUAL_SIZE(1, array_size(list), "only the safe-name row matches");
+    array_free(list);
+
+    // Table must still exist.
+    dbresult_t* r = dbqueryf(dbid,
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'test_items')");
+    TEST_ASSERT_STR_EQUAL("t", dbresult_field(r, "exists")->value, "test_items table must still exist");
+    dbresult_free(r);
+}
+
+// ============================================================================
 // model_one tests
 // ============================================================================
 

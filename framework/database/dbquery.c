@@ -26,7 +26,89 @@ typedef struct {
 static int __update_sql_parse_state(const char* query, size_t query_size, size_t* i, sql_parse_state_t* state);
 
 static dbhost_t* __get_host(const char* identificator);
-static str_t* __build_query(dbconnection_t* connection, const char* query, array_t* params);
+
+/* =========================================================================
+ * Parameterized immediate queries (R2, Phase 2)
+ *
+ * dbquery() no longer interpolates escaped values into the SQL text. A ':name'
+ * value parameter becomes a positional placeholder ($N) and its field is
+ * collected into an ordered bind array handed to execute_params; an '@name'
+ * parameter is a dynamic identifier (not bindable) and stays inline via
+ * escape_identifier. ':list__x' expands to a comma list of bound placeholders,
+ * '@list__x' to a comma list of escaped identifiers.
+ * ========================================================================= */
+
+typedef struct {
+    array_t* bind;   // ordered mfield_t* to bind (borrowed: owned by `owned`)
+    array_t* owned;  // owns every bound field clone; freed after execution
+    int idx;         // running $N counter
+} immediate_bind_t;
+
+static str_t* __build_query(dbconnection_t* connection, const char* query, array_t* params, immediate_bind_t* ud);
+
+// Clone a field with an independent string buffer so it survives until the
+// query executes, regardless of the lifetime of the source (a caller param or
+// a transient list element).
+static mfield_t* __dbquery_clone_field(const mfield_t* field) {
+    mfield_t* f = malloc(sizeof(*f));
+    if (f == NULL) return NULL;
+
+    *f = *field;
+    f->value._string = NULL;
+
+    if (field->value._string != NULL) {
+        f->value._string = str_createn(str_get(field->value._string), str_size(field->value._string));
+        if (f->value._string == NULL) {
+            free(f);
+            return NULL;
+        }
+    }
+
+    return f;
+}
+
+static void __dbquery_clone_free(void* p) {
+    mfield_t* f = p;
+    if (f == NULL) return;
+    if (f->value._string != NULL) str_free(f->value._string);
+    free(f);
+}
+
+// Build a transient field from one array element so list items can be routed
+// through the same processor as scalar parameters. For MODEL_TEXT the caller
+// must free out->value._string after use.
+static int __sql_array_element_field(array_t* array, size_t index, const char* name, mfield_t* out) {
+    memset(out, 0, sizeof(*out));
+    out->name = name;
+
+    switch (array->elements[index].type) {
+        case ARRAY_INT:
+            out->type = MODEL_INT;
+            out->value._int = array_get_int(array, index);
+            break;
+        case ARRAY_DOUBLE:
+            out->type = MODEL_DOUBLE;
+            out->value._double = array_get_double(array, index);
+            break;
+        case ARRAY_LONGDOUBLE:
+            out->type = MODEL_DECIMAL;
+            out->value._ldouble = array_get_ldouble(array, index);
+            break;
+        case ARRAY_STRING: {
+            const char* s = array_get_string(array, index);
+            if (s == NULL) return 0;
+            out->type = MODEL_TEXT;
+            out->value._string = str_create(s);
+            if (out->value._string == NULL) return 0;
+            break;
+        }
+        default:
+            log_error("__sql_array_element_field: unsupported list element type\n");
+            return 0;
+    }
+
+    return 1;
+}
 
 /**
  * Update SQL parser state based on the current character
@@ -191,12 +273,30 @@ dbresult_t* dbquery(const char* dbid, const char* format, array_t* params) {
     dbconnection_t* connection = dbinst->connection;
     dbinstance_free(dbinst);
 
-    str_t* result_query = __build_query(connection, format, params);
-    if (result_query == NULL) return NULL;
+    if (connection->execute_params == NULL) {
+        log_error("dbquery: execute_params not implemented for this database\n");
+        return NULL;
+    }
 
-    dbresult_t* result = connection->query(connection, str_get(result_query));
-    
+    immediate_bind_t ud = { .bind = array_create(), .owned = array_create(), .idx = 0 };
+    if (ud.bind == NULL || ud.owned == NULL) {
+        array_free(ud.bind);
+        array_free(ud.owned);
+        return NULL;
+    }
+
+    str_t* result_query = __build_query(connection, format, params, &ud);
+    if (result_query == NULL) {
+        array_free(ud.bind);
+        array_free(ud.owned);
+        return NULL;
+    }
+
+    dbresult_t* result = connection->execute_params(connection, str_get(result_query), ud.bind);
+
     str_free(result_query);
+    array_free(ud.bind);   // borrowed wrappers, no field free
+    array_free(ud.owned);  // frees the cloned bound fields
 
     return result;
 }
@@ -548,21 +648,31 @@ str_t* parse_sql_parameters(void* connection, const char* query, size_t query_si
                                 return 0;
                             }
 
-                            // Add array items separated by comma
+                            // Expand each element through the same processor so a
+                            // ':list__' becomes bound placeholders and '@list__'
+                            // escaped identifiers, comma-separated.
                             for (size_t k = 0; k < size; k++) {
-                                str_t* str = array_item_to_string(array, k);
-                                if (str == NULL) return 0;
-
                                 if (k > 0)
                                     str_appendc(result_query, ',');
 
-                                if (!process_value(connection, parameter_type, result_query, str)) {
-                                    log_error("__build_query_processor: process_value failed\n");
-                                    str_free(str);
-                                    return 0;
+                                mfield_t elem;
+                                if (!__sql_array_element_field(array, k, param_name_p, &elem)) {
+                                    log_error("parse_sql_parameters: failed to build list element field <%s>\n", param_name_p);
+                                    goto failed;
                                 }
 
-                                str_free(str);
+                                const int ok = processor(connection, parameter_type, param_name_p, &elem, result_query, user_data);
+
+                                // model_field_to_string may allocate _string for any
+                                // type as its formatting buffer; the clone (if bound)
+                                // owns an independent copy, so free the transient here.
+                                if (elem.value._string != NULL)
+                                    str_free(elem.value._string);
+
+                                if (!ok) {
+                                    log_error("parse_sql_parameters: processor failed for list element <%s>\n", param_name_p);
+                                    goto failed;
+                                }
                             }
                         } else {
                             // Call processor callback to handle the parameter
@@ -600,9 +710,13 @@ str_t* parse_sql_parameters(void* connection, const char* query, size_t query_si
 }
 
 /**
- * Callback function for __build_query
- * Directly substitutes parameter values into SQL string
- * Handles both single values and array lists
+ * Callback function for __build_query (immediate, parameterized path).
+ *
+ * '@' parameters are dynamic identifiers — escaped inline via escape_identifier
+ * (identifiers cannot be bound). ':' parameters are values — emitted as a
+ * positional placeholder ($N) with a type cast, their cloned field collected
+ * into the ordered bind array. NULL and raw-SQL values (NOW(), ...) are inlined
+ * as trusted fragments.
  */
 static int __build_query_processor(
     void* connection,
@@ -612,9 +726,33 @@ static int __build_query_processor(
     str_t* result_sql,
     void* user_data
 ) {
-    (void)param_name;  // Not used in this processor
-    (void)user_data;  // Not used in this processor
+    (void)param_name;
+    dbconnection_t* conn = connection;
+    immediate_bind_t* ud = user_data;
 
+    if (parameter_type == '@') {
+        str_t* field_value = model_field_to_string(field);
+        if (field_value == NULL) return 0;
+
+        if (field->use_raw_sql) {
+            str_append(result_sql, str_get(field_value), str_size(field_value));
+            return 1;
+        }
+
+        if (!process_value(conn, '@', result_sql, field_value)) {
+            log_error("__build_query_processor: escape_identifier failed\n");
+            return 0;
+        }
+
+        return 1;
+    }
+
+    if (parameter_type != ':') {
+        log_error("__build_query_processor: unknown parameter type: %c\n", parameter_type);
+        return 0;
+    }
+
+    // NULL is inlined as a literal (not a bindable value, not an injection risk).
     if (field->is_null) {
         str_append(result_sql, "NULL", 4);
         return 1;
@@ -623,31 +761,37 @@ static int __build_query_processor(
     str_t* field_value = model_field_to_string(field);
     if (field_value == NULL) return 0;
 
+    // Raw SQL fragments (e.g. NOW()) are trusted and inlined.
     if (field->use_raw_sql) {
         str_append(result_sql, str_get(field_value), str_size(field_value));
         return 1;
     }
-    else if (!process_value(connection, parameter_type, result_sql, field_value)) {
-        log_error("__build_query_processor: process_value failed\n");
-        return 0;
-    }
 
-    if (parameter_type != '@') {
-        dbconnection_t* conn = (dbconnection_t*)connection;
-        const char* suffix = conn->type_cast(field->type);
-        if (suffix[0] != '\0') {
-            str_append(result_sql, suffix, strlen(suffix));
-        }
-    }
+    ud->idx++;
+
+    char placeholder[16];
+    const int n = snprintf(placeholder, sizeof(placeholder), "$%d", ud->idx);
+    str_append(result_sql, placeholder, n);
+
+    const char* suffix = conn->type_cast(field->type);
+    if (suffix != NULL && suffix[0] != '\0')
+        str_append(result_sql, suffix, strlen(suffix));
+
+    // Clone so the bound value outlives both the caller's params and any
+    // transient list-element field.
+    mfield_t* clone = __dbquery_clone_field(field);
+    if (clone == NULL) return 0;
+
+    array_push_back(ud->owned, array_create_pointer(clone, array_nocopy, __dbquery_clone_free));
+    array_push_back(ud->bind, array_create_pointer(clone, array_nocopy, array_nofree));
 
     return 1;
 }
 
-str_t* __build_query(dbconnection_t* connection, const char* query, array_t* params) {
+str_t* __build_query(dbconnection_t* connection, const char* query, array_t* params, immediate_bind_t* ud) {
     const size_t query_size = strlen(query);
-    void* processor_data = NULL;
 
-    return parse_sql_parameters(connection, query, query_size, params, __build_query_processor, processor_data);
+    return parse_sql_parameters(connection, query, query_size, params, __build_query_processor, ud);
 }
 
 
