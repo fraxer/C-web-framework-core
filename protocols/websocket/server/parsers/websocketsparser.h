@@ -59,6 +59,11 @@ typedef struct websocketsparser {
     ssize_t payload_index;
     size_t payload_saved_length;
 
+    /** Non-zero while a fragmented data message is in progress (between its
+     *  first non-final frame and the final fin=1 frame). Tracked on the parser
+     *  rather than the request so interleaved control frames don't disturb it. */
+    int message_fragmented;
+
     char* buffer;
     websocketsrequest_t* request;
     connection_t* connection;

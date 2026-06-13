@@ -23,6 +23,7 @@ int websocketsparser_is_control_frame(websockets_frame_t*);
 void websockets_frame_init(websockets_frame_t*);
 static void __clear(websocketsparser_t* parser);
 static int __clear_and_return(websocketsparser_t* parser, int error);
+static int __frame_end(websocketsparser_t* parser);
 
 websocketsparser_t* websocketsparser_create(connection_t* connection, websockets_protocol_t*(*protocol_create)(void)) {
     websocketsparser_t* parser = malloc(sizeof * parser);
@@ -47,6 +48,7 @@ void websocketsparser_init(websocketsparser_t* parser) {
     parser->pos = 0;
     parser->payload_index = 0;
     parser->payload_saved_length = 0;
+    parser->message_fragmented = 0;
     parser->request = NULL;
     bufo_init(&parser->compressed_buf);
 
@@ -95,6 +97,7 @@ void websocketsparser_flush(websocketsparser_t* parser) {
     parser->pos = 0;
     parser->payload_index = 0;
     parser->payload_saved_length = 0;
+    parser->message_fragmented = 0;
     parser->request = NULL;
 
     websockets_frame_init(&parser->frame);
@@ -104,6 +107,28 @@ void websocketsparser_flush(websocketsparser_t* parser) {
 
 void websocketsparser_set_bytes_readed(websocketsparser_t* parser, size_t bytes_readed) {
 	parser->bytes_readed = bytes_readed;
+}
+
+/**
+ * Decide how a fully-received frame ends, given any data still left in the
+ * read buffer. A frame yields WSPARSER_COMPLETE only when it is the final frame
+ * of its message (fin=1), no fragmented data message is in progress, and there
+ * is nothing pipelined behind it; otherwise the caller must keep parsing
+ * (WSPARSER_HANDLE_AND_CONTINUE) so the next frame and any in-progress
+ * fragmented request are preserved. Used by control frames and empty frames,
+ * where parser->pos still points at the last consumed byte.
+ */
+int __frame_end(websocketsparser_t* parser) {
+    const int has_remaining = parser->pos + 1 < parser->bytes_readed;
+
+    if (parser->frame.fin && !parser->message_fragmented && !has_remaining)
+        return WSPARSER_COMPLETE;
+
+    /* Advance past the last consumed byte so prepare_remains resumes on the
+     * next frame's first byte. */
+    parser->pos += 1;
+
+    return WSPARSER_HANDLE_AND_CONTINUE;
 }
 
 int websocketsparser_run(websocketsparser_t* parser) {
@@ -116,9 +141,9 @@ int websocketsparser_run(websocketsparser_t* parser) {
         switch (parser->stage) {
         case WSPARSER_FIRST_BYTE:
         {
-            if (parser->request == NULL)
-                parser->request = websocketsrequest_create(parser->connection, parser->protocol_create());
-
+            /* The request is created lazily for data frames inside
+             * websocketsparser_parse_first_byte. Control frames carry no
+             * request and must not disturb an in-progress fragmented message. */
             bufferdata_push(&parser->buf, ch);
 
             parser->stage = WSPARSER_SECOND_BYTE;
@@ -207,7 +232,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
             bufferdata_reset(&parser->buf);
 
             if (parser->frame.payload_length == 0)
-                return WSPARSER_COMPLETE;
+                return __frame_end(parser);
 
             break;
         }
@@ -222,7 +247,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
 
             if (end) {
                 bufferdata_complete(&parser->buf);
-                return WSPARSER_COMPLETE;
+                return __frame_end(parser);
             }
 
             break;
@@ -247,9 +272,12 @@ void websocketsparser_prepare_remains(websocketsparser_t* parser) {
     parser->payload_index = 0;
     parser->payload_saved_length = 0;
 
-    /* Preserve request context for fragmented messages (RFC 6455 §5.4:
-     * control frames may be injected in the middle of a fragmented message) */
-    if (parser->request == NULL || !parser->request->fragmented)
+    /* Preserve the request only while a fragmented data message is still in
+     * progress (RFC 6455 §5.4: control frames may be injected mid-message).
+     * Once the final frame has been dispatched, ownership of the request has
+     * passed to the queue, so the parser must drop its pointer here to avoid a
+     * use-after-free on the next frame. */
+    if (parser->request == NULL || !parser->message_fragmented)
         parser->request = NULL;
 
     /* Reset compressed buffer for next message */
@@ -266,42 +294,72 @@ int websocketsparser_parse_first_byte(websocketsparser_t* parser) {
     parser->frame.rsv3 = (c >> 4) & 0x01;
     parser->frame.opcode = c & 0x0F;
 
+    /* Reject reserved/unknown opcodes per RFC 6455 §5.2.
+     * Only continuation, text, binary, close, ping and pong are defined. */
+    switch (parser->frame.opcode) {
+    case WSOPCODE_CONTINUE:
+    case WSOPCODE_TEXT:
+    case WSOPCODE_BINARY:
+    case WSOPCODE_CLOSE:
+    case WSOPCODE_PING:
+    case WSOPCODE_PONG:
+        break;
+    default:
+        return 0;
+    }
+
+    /* RSV2 and RSV3 are reserved and must be 0 (RFC 6455 §5.2). */
+    if (parser->frame.rsv2 || parser->frame.rsv3)
+        return 0;
+
+    /* Control frames (close/ping/pong) carry no message state. They must be
+     * final (§5.5) and uncompressed, may be interleaved inside a fragmented
+     * data message, and never own parser->request - which may hold an
+     * in-progress fragmented data message that must survive the control frame. */
+    if (websocketsparser_is_control_frame(&parser->frame)) {
+        if (!parser->frame.fin)
+            return 0;
+        if (parser->frame.rsv1)
+            return 0;
+        return 1;
+    }
+
+    /* --- Data frame: continuation / text / binary --- */
+
+    /* Opcode sequencing for fragmented messages (RFC 6455 §5.4). */
+    if (parser->frame.opcode == WSOPCODE_CONTINUE) {
+        if (!parser->message_fragmented)
+            return 0; /* continuation without an initial data frame */
+    }
+    else if (parser->message_fragmented) {
+        return 0; /* new data frame while a fragmented message is unfinished */
+    }
+
+    /* Create the request lazily on the first frame of a data message. */
+    if (parser->request == NULL) {
+        parser->request = websocketsrequest_create(parser->connection, parser->protocol_create());
+        if (parser->request == NULL)
+            return 0;
+    }
+
     websocketsrequest_t* request = parser->request;
 
-    /* Validate RSV bits per RFC 6455 / RFC 7692 */
-    if (parser->frame.rsv2 || parser->frame.rsv3) {
-        /* RSV2 and RSV3 are reserved and must be 0 */
-        return 0;
-    }
-
-    /* Control frames MUST NOT be fragmented (RFC 6455 §5.5) */
-    if (websocketsparser_is_control_frame(&parser->frame) && !parser->frame.fin) {
-        return 0;
-    }
-
-    if (parser->frame.fin == 0)
-        request->fragmented = 1;
-
     if (parser->frame.rsv1) {
-        /* RSV1 is used by permessage-deflate extension */
-        if (!parser->ws_deflate_enabled) {
-            /* Extension not negotiated, RSV1 must be 0 */
+        /* RSV1 is used by the permessage-deflate extension and, per RFC 7692,
+         * is only set on the first frame of a message. Continuation frames
+         * carry rsv1=0, so this block runs exactly once per message. */
+        if (!parser->ws_deflate_enabled)
             return 0;
-        }
-        /* Mark message as compressed (only first frame in fragmented message) */
-        if (!request->fragmented) {
-            request->compressed = 1;
-        }
+        request->compressed = 1;
     }
 
     if (request->type == WEBSOCKETS_NONE)
         request->type = parser->frame.opcode + 0x80;
 
-    if (request->fragmented)
-        request->can_reset = 0;
-
-    if (parser->frame.fin == 1 || parser->frame.opcode == WSOPCODE_CLOSE)
-        request->can_reset = 1;
+    /* A message is fragmented from its first non-final frame until the final
+     * (fin=1) frame that closes it. */
+    parser->message_fragmented = (parser->frame.fin == 0);
+    request->fragmented = parser->message_fragmented;
 
     return 1;
 }
@@ -343,7 +401,9 @@ int websocketsparser_set_payload_length(websocketsparser_t* parser, int byte_cou
 int websocketsparser_parse_mask(websocketsparser_t* parser) {
     char* string = bufferdata_get(&parser->buf);
 
-    for (size_t i = 0; i < bufferdata_writed(&parser->buf); i++) 
+    /* The mask is exactly 4 bytes; this stage is only reached once 4 bytes
+     * are buffered. Bound the copy explicitly to never overrun frame.mask[4]. */
+    for (size_t i = 0; i < 4; i++)
         parser->frame.mask[i] = string[i];
 
     if (websocketsparser_is_control_frame(&parser->frame))
@@ -391,10 +451,17 @@ int websocketsparser_parse_payload(websocketsparser_t* parser) {
         return WSPARSER_HANDLE_AND_CONTINUE;
     }
 
-    if (is_final)
+    /* This frame's payload is not fully received yet - wait for the next read. */
+    if (!is_final)
+        return WSPARSER_CONTINUE;
+
+    /* The frame is complete. Only a final (fin=1) frame finishes the message;
+     * a non-final fragment must keep the request alive for the continuation
+     * frames that follow (handled via prepare_remains). */
+    if (parser->frame.fin)
         return WSPARSER_COMPLETE;
 
-    return WSPARSER_CONTINUE;
+    return WSPARSER_HANDLE_AND_CONTINUE;
 }
 
 int websocketsparser_is_control_frame(websockets_frame_t* frame) {
