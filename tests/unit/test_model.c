@@ -1968,3 +1968,101 @@ TEST(test_model_timestamptz_to_str_now_raw_sql) {
 
     model_param_free(field);
 }
+
+// ============================================================================
+// R6: rich JSON serialization (model_stringify with JSON/ARRAY columns)
+// ============================================================================
+
+enum r6_item_column {
+    R6_COL_ID = 0,
+    R6_COL_META,
+    R6_COL_TAGS,
+    R6_COLUMNS_COUNT
+};
+
+static const mcolumn_t __r6_columns[R6_COLUMNS_COUNT] = {
+    [R6_COL_ID]   = { .name = "id",   .type = MODEL_INT, .is_primary = 1 },
+    [R6_COL_META] = { .name = "meta", .type = MODEL_JSON, .nullable = 1 },
+    [R6_COL_TAGS] = { .name = "tags", .type = MODEL_ARRAY, .nullable = 1 },
+};
+
+static const int __r6_primary_keys[] = { R6_COL_ID };
+
+static const mschema_t __r6_schema = {
+    .table = "r6_items",
+    .columns = __r6_columns,
+    .columns_count = R6_COLUMNS_COUNT,
+    .primary_keys = __r6_primary_keys,
+    .primary_keys_count = 1,
+};
+
+static model_t* __r6_record_create(void) {
+    model_t* record = calloc(1, sizeof * record);
+    if (record == NULL) return NULL;
+    if (!model_init(record, &__r6_schema)) {
+        free(record);
+        return NULL;
+    }
+    return record;
+}
+
+TEST(test_model_stringify_json_nested_object) {
+    TEST_CASE("JSON column serialized as nested object, not a string");
+
+    model_t* record = __r6_record_create();
+    TEST_ASSERT_NOT_NULL(record, "Record should not be NULL");
+
+    model_set_int(model_field(record, R6_COL_ID), 7);
+    TEST_ASSERT_EQUAL(1, model_set_json_from_str(model_field(record, R6_COL_META),
+        "{\"a\":1,\"b\":[2,3]}"), "set json should succeed");
+    TEST_ASSERT_EQUAL(1, model_set_array_from_str(model_field(record, R6_COL_TAGS),
+        "[1,2,3]"), "set array should succeed");
+
+    char* json = model_stringify(record, NULL);
+    TEST_ASSERT_NOT_NULL(json, "stringify should not be NULL");
+    TEST_ASSERT_STR_EQUAL("{\"id\":7,\"meta\":{\"a\":1,\"b\":[2,3]},\"tags\":[1,2,3]}",
+        json, "JSON/array should be nested natively");
+
+    free(json);
+    model_free(record);
+}
+
+TEST(test_model_stringify_array_string_elements) {
+    TEST_CASE("ARRAY of strings keeps quotes, numbers do not");
+
+    model_t* record = __r6_record_create();
+    TEST_ASSERT_NOT_NULL(record, "Record should not be NULL");
+
+    model_set_int(model_field(record, R6_COL_ID), 1);
+    model_field(record, R6_COL_META)->is_null = 1;
+    TEST_ASSERT_EQUAL(1, model_set_array_from_str(model_field(record, R6_COL_TAGS),
+        "[\"a\",\"b\"]"), "set array should succeed");
+
+    char* json = model_stringify(record, NULL);
+    TEST_ASSERT_NOT_NULL(json, "stringify should not be NULL");
+    TEST_ASSERT_STR_EQUAL("{\"id\":1,\"meta\":null,\"tags\":[\"a\",\"b\"]}",
+        json, "string array elements stay quoted, null meta stays null");
+
+    free(json);
+    model_free(record);
+}
+
+TEST(test_model_stringify_json_deeply_nested) {
+    TEST_CASE("Deeply nested JSON column clones recursively");
+
+    model_t* record = __r6_record_create();
+    TEST_ASSERT_NOT_NULL(record, "Record should not be NULL");
+
+    model_set_int(model_field(record, R6_COL_ID), 2);
+    TEST_ASSERT_EQUAL(1, model_set_json_from_str(model_field(record, R6_COL_META),
+        "{\"x\":{\"y\":{\"z\":[true,false,null,\"s\"]}}}"), "set json should succeed");
+    model_field(record, R6_COL_TAGS)->is_null = 1;
+
+    char* json = model_stringify(record, NULL);
+    TEST_ASSERT_NOT_NULL(json, "stringify should not be NULL");
+    TEST_ASSERT_STR_EQUAL("{\"id\":2,\"meta\":{\"x\":{\"y\":{\"z\":[true,false,null,\"s\"]}}},\"tags\":null}",
+        json, "nested structure should be preserved");
+
+    free(json);
+    model_free(record);
+}

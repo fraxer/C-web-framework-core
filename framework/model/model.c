@@ -22,6 +22,8 @@ static int __model_allow_field_in_json(const char* field_name, char** display_fi
 static mfield_t __model_tmpfield_create(mfield_t* source_field);
 static int __str_modify_add_symbols_before(str_t* str, char add_symbol, char before_symbol);
 static json_token_t* __model_json_object_fields(mfield_t* first_field, int fields_count, char** display_fields);
+static json_token_t* __json_clone(const json_token_t* src);
+static json_token_t* __model_array_to_json(array_t* array);
 static void __model_cell_init(mfield_t* cell, const mcolumn_t* col);
 static void* __model_fill_one(void*(create_instance)(void), dbresult_t* result);
 static array_t* __model_fill_array(void*(create_instance)(void), dbresult_t* result);
@@ -1859,6 +1861,95 @@ json_token_t* model_json_create_object(void* arg, char** display_fields) {
     return model_to_json(arg, display_fields);
 }
 
+/* Рекурсивный клон токена в standalone-токены (не привязанные к документу).
+   Нужен потому, что токены json_parse-документа принадлежат memory-block
+   аллокатору своего документа: их нельзя переподвесить в родительский объект
+   модели (двойное освобождение / висячие ссылки при json_free документа). */
+static json_token_t* __json_clone(const json_token_t* src) {
+    if (src == NULL) return json_create_null();
+
+    if (json_is_object(src)) {
+        json_token_t* object = json_create_object();
+        if (object == NULL) return NULL;
+
+        for (json_it_t it = json_init_it(src); !json_end_it(&it); json_next_it(&it)) {
+            const char* key = json_it_key(&it);
+            json_token_t* value = __json_clone(json_it_value(&it));
+            if (value == NULL || !json_object_set(object, key, value)) {
+                json_token_free_tree(value);
+                json_token_free_tree(object);
+                return NULL;
+            }
+        }
+
+        return object;
+    }
+
+    if (json_is_array(src)) {
+        json_token_t* array = json_create_array();
+        if (array == NULL) return NULL;
+
+        for (json_it_t it = json_init_it(src); !json_end_it(&it); json_next_it(&it)) {
+            json_token_t* value = __json_clone(json_it_value(&it));
+            if (value == NULL || !json_array_append(array, value)) {
+                json_token_free_tree(value);
+                json_token_free_tree(array);
+                return NULL;
+            }
+        }
+
+        return array;
+    }
+
+    if (json_is_string(src))
+        return json_create_string(json_string(src));
+    if (json_is_number(src))
+        return json_create_number(json_ldouble(src));
+    if (json_is_bool(src))
+        return json_create_bool(json_bool(src));
+
+    return json_create_null();
+}
+
+/* Нативная JSON-сериализация массива модели: числа отдаются числами, строки —
+   строками, без обёртывания всех элементов в кавычки (как делает model_array_to_str). */
+static json_token_t* __model_array_to_json(array_t* array) {
+    json_token_t* token_array = json_create_array();
+    if (token_array == NULL) return NULL;
+
+    if (array == NULL) return token_array;
+
+    for (size_t i = 0; i < array_size(array); i++) {
+        avalue_t* item = &array->elements[i];
+
+        json_token_t* value = NULL;
+        switch (item->type) {
+        case ARRAY_INT:
+            value = json_create_number(item->_int);
+            break;
+        case ARRAY_DOUBLE:
+            value = json_create_number(item->_double);
+            break;
+        case ARRAY_LONGDOUBLE:
+            value = json_create_number(item->_ldouble);
+            break;
+        case ARRAY_STRING:
+            value = json_create_string(item->_string ? item->_string : "");
+            break;
+        case ARRAY_POINTER:
+            continue;
+        }
+
+        if (value == NULL || !json_array_append(token_array, value)) {
+            json_token_free_tree(value);
+            json_token_free_tree(token_array);
+            return NULL;
+        }
+    }
+
+    return token_array;
+}
+
 static json_token_t* __model_json_object_fields(mfield_t* first_field, int fields_count, char** display_fields) {
     int result = 0;
     json_token_t* object = json_create_object();
@@ -1915,7 +2006,9 @@ static json_token_t* __model_json_object_fields(mfield_t* first_field, int field
             token_value = json_create_string(str_get(model_timestamptz_to_str(field)));
             break;
         case MODEL_JSON:
-            token_value = json_create_string(str_get(model_json_to_str(field)));
+            token_value = field->value._jsondoc != NULL
+                ? __json_clone(json_root(field->value._jsondoc))
+                : json_create_null();
             break;
         case MODEL_BINARY:
             token_value = json_create_string(str_get(model_binary(field)));
@@ -1933,7 +2026,7 @@ static json_token_t* __model_json_object_fields(mfield_t* first_field, int field
             token_value = json_create_string(str_get(model_enum(field)));
             break;
         case MODEL_ARRAY:
-            token_value = json_create_string(str_get(model_array_to_str(field)));
+            token_value = __model_array_to_json(field->value._array);
             break;
         }
 
@@ -1946,8 +2039,10 @@ static json_token_t* __model_json_object_fields(mfield_t* first_field, int field
 
     failed:
 
-    if (result == 0)
+    if (result == 0) {
+        json_token_free_tree(object);
         return NULL;
+    }
 
     return object;
 }

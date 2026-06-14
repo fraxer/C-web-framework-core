@@ -1282,6 +1282,10 @@ void json_free(json_doc_t* document) {
     free(document);
 }
 
+void json_token_free_tree(json_token_t* token) {
+    __free_token_tree(token);
+}
+
 json_token_t* json_root(const json_doc_t* document) {
     if (document == NULL) return NULL;
 

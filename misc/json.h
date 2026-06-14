@@ -95,6 +95,8 @@ size_t json_manager_destroy_empty_blocks(void);
 json_token_t* json_token_alloc(json_token_type_t type);
 // Освобождение токена
 void json_token_free(json_token_t* token);
+// Рекурсивное освобождение standalone-токена вместе с потомками (child/sibling)
+void json_token_free_tree(json_token_t* token);
 
 // Парсинг JSON
 json_doc_t* json_parse(const char* string);
