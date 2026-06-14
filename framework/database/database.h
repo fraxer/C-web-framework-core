@@ -36,6 +36,11 @@ typedef struct dbresult {
 
     char* error; // driver error text (heap, owned); NULL when ok or unavailable
 
+    // Last generated auto-increment / identity key for the statement, when the
+    // driver can report one (MySQL: mysql_insert_id). 0 when unavailable or when
+    // the key is read back via RETURNING (PostgreSQL).
+    long long insert_id;
+
     dbresultquery_t* query;
     dbresultquery_t* current;
 } dbresult_t;
@@ -62,6 +67,11 @@ typedef struct dbconnection {
 
     // Database-specific type cast suffix for inline value substitution
     const char*(*type_cast)(int field_type);
+
+    // 1 if the driver reads a generated key back via an INSERT ... RETURNING
+    // clause (PostgreSQL); 0 if it reports it out-of-band (MySQL insert_id) or
+    // not at all (Redis). Set by each driver's connection_create.
+    unsigned uses_returning : 1;
 
     pid_t thread_id;
     map_t* prepare_statements;

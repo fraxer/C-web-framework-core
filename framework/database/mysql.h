@@ -11,6 +11,8 @@ typedef struct myhost {
     char* dbname;
     char* user;
     char* password;
+    char* charset;            // optional; defaults to "utf8mb4" at connect time
+    int connection_timeout;   // optional; 0 = driver default (no explicit timeout)
 } myhost_t;
 
 typedef struct myconnection {

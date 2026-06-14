@@ -21,6 +21,9 @@ const char* dbresult_error(dbresult_t*);
 // Store (copy) a driver error message; replaces any previous text.
 void dbresult_set_error(dbresult_t*, const char*);
 
+// Last generated auto-increment / identity key, or 0 when unavailable.
+long long dbresult_insert_id(dbresult_t*);
+
 void dbresult_free(dbresult_t*);
 
 int dbresult_row_next(dbresult_t*);

@@ -2493,6 +2493,18 @@ int model_create(const char* dbid, void* arg) {
         goto failed;
     }
 
+    // Generated-key read-back: an AUTO_INCREMENT/SERIAL primary key the caller
+    // left unset (not dirty → omitted from the INSERT above). RETURNING-capable
+    // drivers (PostgreSQL) append a RETURNING clause; others (MySQL) report the
+    // key out-of-band via dbresult_insert_id after the INSERT.
+    int ai_col = -1;
+    for (int i = 0; i < schema->columns_count; i++) {
+        if (schema->columns[i].is_primary && schema->columns[i].auto_increment && !record->fields[i].dirty) {
+            ai_col = i;
+            break;
+        }
+    }
+
     str_append(sql, "INSERT INTO ", 12);
     str_append(sql, record->table, strlen(record->table));
     str_append(sql, " (", 2);
@@ -2501,10 +2513,43 @@ int model_create(const char* dbid, void* arg) {
     str_append(sql, str_get(values), str_size(values));
     str_appendc(sql, ')');
 
+    if (ai_col >= 0 && conn->uses_returning) {
+        str_t* escaped = conn->escape_identifier(conn, schema->columns[ai_col].name);
+        if (escaped == NULL) {
+            __model_set_status(MODEL_ERR_ALLOC);
+            goto failed;
+        }
+        str_append(sql, " RETURNING ", 11);
+        str_append(sql, str_get(escaped), str_size(escaped));
+        str_free(escaped);
+    }
+
     result = dbquery_params(dbid, str_get(sql), bind);
     if (!dbresult_ok(result)) {
         __model_set_db_error(result);
         goto failed;
+    }
+
+    if (ai_col >= 0) {
+        mfield_t* pk = &record->fields[ai_col];
+
+        if (conn->uses_returning) {
+            // The RETURNING column name matches the PK name, so __model_fill
+            // dispatches by the field's type and clears its dirty flag.
+            if (dbresult_query_rows(result) > 0)
+                __model_fill(0, 1, pk, result);
+        } else {
+            const long long id = dbresult_insert_id(result);
+            if (id != 0) {
+                switch (pk->type) {
+                case MODEL_BIGINT:   model_set_bigint(pk, id); break;
+                case MODEL_INT:      model_set_int(pk, (int)id); break;
+                case MODEL_SMALLINT: model_set_smallint(pk, (short)id); break;
+                default: break;
+                }
+                pk->dirty = 0;
+            }
+        }
     }
 
     res = 1;

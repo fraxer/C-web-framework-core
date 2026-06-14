@@ -94,6 +94,8 @@ myhost_t* __host_create(void) {
     host->dbname = NULL;
     host->user = NULL;
     host->password = NULL;
+    host->charset = NULL;
+    host->connection_timeout = 0;
 
     return host;
 }
@@ -108,6 +110,7 @@ void __host_free(void* arg) {
     if (host->dbname) free(host->dbname);
     if (host->user) free(host->user);
     if (host->password) free(host->password);
+    if (host->charset) free(host->charset);
 
     array_free(host->base.connections);
     free(host);
@@ -135,6 +138,7 @@ void* __connection_create(void* host) {
     connection->base.execute_params = __execute_params;
     connection->base.begin = __begin;
     connection->base.type_cast = __type_cast;
+    connection->base.uses_returning = 0;  // reports generated keys via insert_id
     connection->base.host = host;
     connection->connection = __connect(host);
 
@@ -231,6 +235,9 @@ dbresult_t* __process_result(void* connection, dbresult_t* result) {
     myconnection_t* myconnection = connection;
 
     result->ok = 1;
+
+    // Generated key from the most recent INSERT on this connection (0 otherwise).
+    result->insert_id = (long long)mysql_insert_id(myconnection->connection);
 
     int status = 0;
     dbresultquery_t* query_last = NULL;
@@ -458,37 +465,59 @@ dbresult_t* __process_prepared_result(void* connection, MYSQL_STMT* stmt, dbresu
 
                     if (*bind->is_null) {
                         dbresult_query_value_insert(query, NULL, 0, row, col);
-                    } else {
-                        // ИСПРАВЛЕНИЕ: Улучшена логика проверки buffer overread
-                        // Всегда используем минимум из двух значений для безопасности
-                        unsigned long safe_length;
+                    } else if (*bind->error) {
+                        // Колонка усечена: буфер был меньше фактических данных.
+                        // *bind->length хранит полную длину — перечитываем колонку
+                        // вторым проходом mysql_stmt_fetch_column в буфер нужного
+                        // размера, чтобы не терять данные (LONGTEXT/динамические).
+                        const unsigned long full_length = *bind->length;
+                        char* full = malloc(full_length > 0 ? full_length : 1);
 
-                        if (*bind->error) {
-                            // Данные были усечены
-                            log_error("Data truncated in column %d at row %d. Buffer size: %lu, Actual data length: %lu\n",
-                                    col, row, bind->buffer_length, *bind->length);
-                            result->ok = 0;
+                        if (full != NULL) {
+                            MYSQL_BIND refetch;
+                            memset(&refetch, 0, sizeof(refetch));
+                            unsigned long got = 0;
+                            bool rf_null = 0;
+                            bool rf_error = 0;
+                            refetch.buffer_type = MYSQL_TYPE_STRING;
+                            refetch.buffer = full;
+                            refetch.buffer_length = full_length;
+                            refetch.length = &got;
+                            refetch.is_null = &rf_null;
+                            refetch.error = &rf_error;
 
-                            // При усечении: берем меньшее значение, но не больше buffer_length
-                            safe_length = (*bind->length < bind->buffer_length)
-                                ? *bind->length
-                                : bind->buffer_length;
-                        } else {
-                            // Нет усечения, но проверяем на переполнение буфера
-                            // *bind->length должно быть <= buffer_length, но проверяем для безопасности
-                            if (*bind->length > bind->buffer_length) {
-                                log_error("Buffer overread detected in column %d at row %d: length %lu > buffer_length %lu\n",
-                                        col, row, *bind->length, bind->buffer_length);
-                                safe_length = bind->buffer_length;
-                                result->ok = 0;
+                            if (mysql_stmt_fetch_column(stmt, &refetch, col, 0) == 0) {
+                                const unsigned long len = got < full_length ? got : full_length;
+                                dbresult_query_value_insert(query, full, len, row, col);
+                                free(full);
                             } else {
-                                safe_length = *bind->length;
+                                log_error("Truncated column %d at row %d, refetch failed: %s\n",
+                                        col, row, mysql_stmt_error(stmt));
+                                free(full);
+                                result->ok = 0;
+                                const unsigned long safe_length = full_length < bind->buffer_length
+                                    ? full_length : bind->buffer_length;
+                                dbresult_query_value_insert(query, bind->buffer, safe_length, row, col);
                             }
+                        } else {
+                            log_error("Truncated column %d at row %d, alloc %lu failed\n",
+                                    col, row, full_length);
+                            result->ok = 0;
+                            const unsigned long safe_length = full_length < bind->buffer_length
+                                ? full_length : bind->buffer_length;
+                            dbresult_query_value_insert(query, bind->buffer, safe_length, row, col);
                         }
-
-                        // Дополнительная проверка: исключаем null-терминатор из длины
-                        if (safe_length > 0 && bind->buffer_type == MYSQL_TYPE_STRING) {
-                            safe_length = (safe_length > bind->buffer_length) ? bind->buffer_length : safe_length;
+                    } else {
+                        // Нет усечения, но защищаемся от переполнения буфера:
+                        // *bind->length должно быть <= buffer_length.
+                        unsigned long safe_length;
+                        if (*bind->length > bind->buffer_length) {
+                            log_error("Buffer overread detected in column %d at row %d: length %lu > buffer_length %lu\n",
+                                    col, row, *bind->length, bind->buffer_length);
+                            safe_length = bind->buffer_length;
+                            result->ok = 0;
+                        } else {
+                            safe_length = *bind->length;
                         }
 
                         dbresult_query_value_insert(query, bind->buffer, safe_length, row, col);
@@ -534,6 +563,19 @@ MYSQL* __connect(void* arg) {
 
     MYSQL* connection = mysql_init(NULL);
     if (connection == NULL) return NULL;
+
+    // Charset должен быть задан до mysql_real_connect, иначе соединение
+    // использует серверный дефолт (риск порчи UTF-8). Дефолт — utf8mb4.
+    const char* charset = host->charset != NULL ? host->charset : "utf8mb4";
+    mysql_options(connection, MYSQL_SET_CHARSET_NAME, charset);
+
+    // Таймауты (в секундах) — зеркало Postgres connect_timeout. 0 = не задавать.
+    if (host->connection_timeout > 0) {
+        const unsigned int timeout = (unsigned int)host->connection_timeout;
+        mysql_options(connection, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+        mysql_options(connection, MYSQL_OPT_READ_TIMEOUT, &timeout);
+        mysql_options(connection, MYSQL_OPT_WRITE_TIMEOUT, &timeout);
+    }
 
     // mysql_real_connect при ошибке возвращает NULL: хэндл из mysql_init
     // нужно закрыть самостоятельно, иначе он утечёт
@@ -835,9 +877,11 @@ db_t* my_load(const char* database_id, const json_token_t* token_array) {
         return NULL;
     }
 
-    enum fields { HOST_ID = 0, PORT, IP, DBNAME, USER, PASSWORD, FIELDS_COUNT };
+    // charset/connection_timeout — опциональные: входят в FIELDS_COUNT (для
+    // дедупликации), но не в required-набор (он останавливается на password).
+    enum fields { HOST_ID = 0, PORT, IP, DBNAME, USER, PASSWORD, CHARSET, CONNECTION_TIMEOUT, FIELDS_COUNT };
     enum required_fields { R_HOST_ID = 0, R_PORT, R_IP, R_DBNAME, R_USER, R_PASSWORD, R_FIELDS_COUNT };
-    char* field_names[FIELDS_COUNT] = {"host_id", "port", "ip", "dbname", "user", "password"};
+    char* field_names[FIELDS_COUNT] = {"host_id", "port", "ip", "dbname", "user", "password", "charset", "connection_timeout"};
 
     for (json_it_t it_array = json_init_it(token_array); !json_end_it(&it_array); json_next_it(&it_array)) {
         json_token_t* token_object = json_it_value(&it_array);
@@ -981,6 +1025,47 @@ db_t* my_load(const char* database_id, const json_token_t* token_array) {
                 }
 
                 strcpy(host->password, json_string(token_value));
+            }
+            else if (strcmp(key, "charset") == 0) {
+                if (finded_fields[CHARSET]) {
+                    log_error("my_load: field %s must be unique\n", key);
+                    goto host_failed;
+                }
+                if (!json_is_string(token_value)) {
+                    log_error("my_load: field %s must be string\n", key);
+                    goto host_failed;
+                }
+
+                finded_fields[CHARSET] = 1;
+
+                if (host->charset != NULL) free(host->charset);
+
+                host->charset = malloc(json_string_size(token_value) + 1);
+                if (host->charset == NULL) {
+                    log_error("my_load: alloc memory for %s failed\n", key);
+                    goto host_failed;
+                }
+
+                strcpy(host->charset, json_string(token_value));
+            }
+            else if (strcmp(key, "connection_timeout") == 0) {
+                if (finded_fields[CONNECTION_TIMEOUT]) {
+                    log_error("my_load: field %s must be unique\n", key);
+                    goto host_failed;
+                }
+                if (!json_is_number(token_value)) {
+                    log_error("my_load: field %s must be int\n", key);
+                    goto host_failed;
+                }
+
+                finded_fields[CONNECTION_TIMEOUT] = 1;
+
+                int ok = 0;
+                host->connection_timeout = json_int(token_value, &ok);
+                if (!ok) {
+                    log_error("my_load: field %s must be int\n", key);
+                    goto host_failed;
+                }
             }
             else {
                 log_error("my_load: unknown field: %s\n", key);
@@ -1248,10 +1333,18 @@ dbresult_t* __execute_params(void* connection, const char* sql, array_t* params)
 
     log_debug("DB params query: %s\n", sql);
 
+    const int n_params = params != NULL ? (int)array_size(params) : 0;
+
+    // No bound values → utility/DDL statement (USE, CREATE/DROP DATABASE, SET,
+    // BEGIN/COMMIT/SAVEPOINT, multi-statement) or DDL whose @identifiers were
+    // already inlined. The prepared protocol (mysql_stmt_prepare) rejects many
+    // of these, so route them through the simple protocol. No $N→? conversion
+    // is needed because there are no placeholders to rewrite.
+    if (n_params == 0)
+        return __query(connection, sql);
+
     dbresult_t* result = dbresult_create();
     if (result == NULL) return NULL;
-
-    const int n_params = params != NULL ? (int)array_size(params) : 0;
 
     int placeholders = 0;
     str_t* processed_sql = __pg_placeholders_to_mysql(sql, strlen(sql), &placeholders);
@@ -1319,6 +1412,10 @@ dbresult_t* __execute_params(void* connection, const char* sql, array_t* params)
     }
 
     result = __process_prepared_result(myconnection, stmt, result);
+
+    // Generated key for INSERT (0 for non-inserting statements). Read from the
+    // statement handle so model_create can fill an AUTO_INCREMENT PK.
+    result->insert_id = (long long)mysql_stmt_insert_id(stmt);
 
     str_free(processed_sql);
     free(binds);

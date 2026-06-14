@@ -417,6 +417,7 @@ typedef struct mcolumn {
     unsigned is_primary : 1;
     unsigned has_default : 1;       /* DB provides a default: cell starts skipped on INSERT until set */
     unsigned nullable : 1;          /* numeric/temporal column starts NULL (mirrors mfield_x(name, NULL)) */
+    unsigned auto_increment : 1;    /* SERIAL/AUTO_INCREMENT PK: generated key read back on model_create */
     const char* const* enum_values; /* MODEL_ENUM only, else NULL */
     int enum_count;
 } mcolumn_t;

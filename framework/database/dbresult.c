@@ -14,6 +14,7 @@ dbresult_t* dbresult_create(void) {
 
     result->ok = 0;
     result->error = NULL;
+    result->insert_id = 0;
     result->query = NULL;
     result->current = NULL;
 
@@ -96,6 +97,12 @@ const char* dbresult_error(dbresult_t* result) {
     if (result == NULL) return NULL;
 
     return result->error;
+}
+
+long long dbresult_insert_id(dbresult_t* result) {
+    if (result == NULL) return 0;
+
+    return result->insert_id;
 }
 
 void dbresult_set_error(dbresult_t* result, const char* error) {

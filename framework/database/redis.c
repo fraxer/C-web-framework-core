@@ -96,6 +96,7 @@ void* __connection_create(void* host) {
     connection->base.execute_prepared = NULL;
     connection->base.execute_params = __execute_params;
     connection->base.type_cast = __type_cast;
+    connection->base.uses_returning = 0;  // no generated-key read-back
     connection->base.host = host;
     connection->connection = __connect(host);
 

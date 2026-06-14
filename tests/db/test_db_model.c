@@ -24,7 +24,7 @@ typedef struct {
 } test_item_t;
 
 static const mcolumn_t __test_item_columns[TEST_ITEM_COLUMNS_COUNT] = {
-    [TEST_ITEM_COL_ID]          = { .name = "id",          .type = MODEL_INT, .is_primary = 1 },
+    [TEST_ITEM_COL_ID]          = { .name = "id",          .type = MODEL_INT, .is_primary = 1, .auto_increment = 1 },
     [TEST_ITEM_COL_NAME]        = { .name = "name",        .type = MODEL_TEXT },
     [TEST_ITEM_COL_STATUS]      = { .name = "status",      .type = MODEL_INT, .nullable = 1 },
     [TEST_ITEM_COL_DESCRIPTION] = { .name = "description", .type = MODEL_TEXT },
@@ -142,6 +142,12 @@ TEST_DB(test_model_create_basic) {
 
     int res = model_create(dbid, item);
     TEST_ASSERT_EQUAL(1, res, "model_create should return 1");
+
+    // The id column is AUTO_INCREMENT/SERIAL and was left unset, so model_create
+    // must read the generated key back into the field (RETURNING on PostgreSQL,
+    // insert_id on MySQL).
+    TEST_ASSERT(model_int(model_field(&item->record, TEST_ITEM_COL_ID)) > 0,
+        "generated id should be read back into the model");
 
     // Verify row exists
     dbresult_t* r = dbquery(dbid,

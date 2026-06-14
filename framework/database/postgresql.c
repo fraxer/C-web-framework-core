@@ -145,6 +145,7 @@ void* __connection_create(void* host) {
     connection->base.execute_params = __execute_params;
     connection->base.begin = __begin;
     connection->base.type_cast = __type_cast;
+    connection->base.uses_returning = 1;  // reads generated keys via RETURNING
     connection->base.host = host;
     connection->connection = __connect(host);
 
