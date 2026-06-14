@@ -62,13 +62,14 @@ static void test_item_free(test_item_t* item) {
 
 static void __ensure_test_table(void) {
     const char* dbid = testdb_dbid();
-    dbresult_t* r = dbqueryf(dbid,
+    dbresult_t* r = dbquery(dbid,
         "CREATE TABLE IF NOT EXISTS test_items ("
             "id          SERIAL PRIMARY KEY,"
             "name        TEXT NOT NULL,"
             "status      INT DEFAULT 0,"
             "description TEXT"
-        ")"
+        ")",
+        NULL
     );
     dbresult_free(r);
 }
@@ -76,16 +77,27 @@ static void __ensure_test_table(void) {
 // Insert a row and return the generated id. Returns -1 on failure.
 static int __insert_test_row(const char* name_val, int status_val, const char* desc_val) {
     const char* dbid = testdb_dbid();
+    array_t* params = array_create();
+    if (params == NULL) return -1;
+
     dbresult_t* r;
     if (desc_val) {
-        r = dbqueryf(dbid,
-            "INSERT INTO test_items (name, status, description) VALUES ('%s', %d, '%s') RETURNING id",
-            name_val, status_val, desc_val);
+        mparams_fill_array(params,
+            mparam_text(name, name_val),
+            mparam_int(status, status_val),
+            mparam_text(description, desc_val));
+        r = dbquery(dbid,
+            "INSERT INTO test_items (name, status, description) VALUES (:name, :status, :description) RETURNING id",
+            params);
     } else {
-        r = dbqueryf(dbid,
-            "INSERT INTO test_items (name, status) VALUES ('%s', %d) RETURNING id",
-            name_val, status_val);
+        mparams_fill_array(params,
+            mparam_text(name, name_val),
+            mparam_int(status, status_val));
+        r = dbquery(dbid,
+            "INSERT INTO test_items (name, status) VALUES (:name, :status) RETURNING id",
+            params);
     }
+    array_free(params);
     if (!dbresult_ok(r) || dbresult_query_rows(r) == 0) {
         dbresult_free(r);
         return -1;
@@ -105,8 +117,8 @@ TEST(test_db_model_setup) {
     __ensure_test_table();
     // Verify table exists
     const char* dbid = testdb_dbid();
-    dbresult_t* r = dbqueryf(dbid,
-        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'test_items')");
+    dbresult_t* r = dbquery(dbid,
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'test_items')", NULL);
     TEST_ASSERT_NOT_NULL(r, "Table existence check should succeed");
     TEST_ASSERT(dbresult_ok(r), "Query should be ok");
     dbresult_free(r);
@@ -132,8 +144,8 @@ TEST_DB(test_model_create_basic) {
     TEST_ASSERT_EQUAL(1, res, "model_create should return 1");
 
     // Verify row exists
-    dbresult_t* r = dbqueryf(dbid,
-        "SELECT * FROM test_items WHERE name = 'Test Item'");
+    dbresult_t* r = dbquery(dbid,
+        "SELECT * FROM test_items WHERE name = 'Test Item'", NULL);
     TEST_ASSERT_NOT_NULL(r, "select should succeed");
     TEST_ASSERT(dbresult_ok(r), "select should be ok");
     TEST_ASSERT_EQUAL(1, dbresult_query_rows(r), "should find 1 row");
@@ -164,8 +176,8 @@ TEST_DB(test_model_create_sql_injection) {
     test_item_free(item);
 
     // Table must still exist.
-    dbresult_t* r = dbqueryf(dbid,
-        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'test_items')");
+    dbresult_t* r = dbquery(dbid,
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'test_items')", NULL);
     TEST_ASSERT_NOT_NULL(r, "table existence check should succeed");
     TEST_ASSERT(dbresult_ok(r), "table existence check should be ok");
     TEST_ASSERT_STR_EQUAL("t", dbresult_field(r, "exists")->value, "test_items table must still exist");
@@ -173,7 +185,7 @@ TEST_DB(test_model_create_sql_injection) {
 
     // The payload must be stored verbatim. Read it back via model_get and via a
     // parameterized control query, then verify the value round-trips.
-    r = dbqueryf(dbid, "SELECT COUNT(*) AS c FROM test_items");
+    r = dbquery(dbid, "SELECT COUNT(*) AS c FROM test_items", NULL);
     TEST_ASSERT_NOT_NULL(r, "count query should succeed");
     TEST_ASSERT(dbresult_ok(r), "count query should be ok");
     TEST_ASSERT_STR_EQUAL("1", dbresult_field(r, "c")->value, "exactly one row should be inserted");
@@ -288,8 +300,11 @@ TEST_DB(test_model_update_basic) {
     TEST_ASSERT_EQUAL(1, res, "model_update should return 1");
 
     // Verify update
-    dbresult_t* r = dbqueryf(dbid,
-        "SELECT * FROM test_items WHERE id = %d", id);
+    array_t* idp = array_create();
+    mparams_fill_array(idp, mparam_int(id, id));
+    dbresult_t* r = dbquery(dbid,
+        "SELECT * FROM test_items WHERE id = :id", idp);
+    array_free(idp);
     TEST_ASSERT_NOT_NULL(r, "select should succeed");
     TEST_ASSERT(dbresult_ok(r), "select should be ok");
     TEST_ASSERT_EQUAL(1, dbresult_query_rows(r), "should find 1 row");
@@ -326,8 +341,11 @@ TEST_DB(test_model_update_dirty_tracking) {
     TEST_ASSERT_EQUAL(1, res, "model_update should return 1");
 
     // Verify only status changed
-    dbresult_t* r = dbqueryf(dbid,
-        "SELECT * FROM test_items WHERE id = %d", id);
+    array_t* idp = array_create();
+    mparams_fill_array(idp, mparam_int(id, id));
+    dbresult_t* r = dbquery(dbid,
+        "SELECT * FROM test_items WHERE id = :id", idp);
+    array_free(idp);
     TEST_ASSERT_NOT_NULL(r, "select should succeed");
     TEST_ASSERT(dbresult_ok(r), "select should be ok");
     TEST_ASSERT_STR_EQUAL("KeepName", dbresult_field(r, "name")->value, "name should not change");
@@ -356,8 +374,11 @@ TEST_DB(test_model_delete_basic) {
     TEST_ASSERT_EQUAL(1, res, "model_delete should return 1");
 
     // Verify deleted
-    dbresult_t* r = dbqueryf(dbid,
-        "SELECT * FROM test_items WHERE id = %d", id);
+    array_t* idp = array_create();
+    mparams_fill_array(idp, mparam_int(id, id));
+    dbresult_t* r = dbquery(dbid,
+        "SELECT * FROM test_items WHERE id = :id", idp);
+    array_free(idp);
     TEST_ASSERT_NOT_NULL(r, "select should succeed");
     TEST_ASSERT(dbresult_ok(r), "select should be ok");
     TEST_ASSERT_EQUAL(0, dbresult_query_rows(r), "row should be deleted");
@@ -410,15 +431,15 @@ TEST_DB(test_model_delete_by_params) {
     TEST_ASSERT_EQUAL(1, res, "model_delete_by_params should return 1");
 
     // Verify: items with status=10 deleted, item with status=20 remains
-    dbresult_t* r = dbqueryf(dbid,
-        "SELECT * FROM test_items WHERE status = 20");
+    dbresult_t* r = dbquery(dbid,
+        "SELECT * FROM test_items WHERE status = 20", NULL);
     TEST_ASSERT_NOT_NULL(r, "select should succeed");
     TEST_ASSERT(dbresult_ok(r), "select should be ok");
     TEST_ASSERT_EQUAL(1, dbresult_query_rows(r), "status=20 row should remain");
     dbresult_free(r);
 
-    r = dbqueryf(dbid,
-        "SELECT * FROM test_items WHERE status = 10");
+    r = dbquery(dbid,
+        "SELECT * FROM test_items WHERE status = 10", NULL);
     TEST_ASSERT_NOT_NULL(r, "select should succeed");
     TEST_ASSERT(dbresult_ok(r), "select should be ok");
     TEST_ASSERT_EQUAL(0, dbresult_query_rows(r), "status=10 rows should be deleted");
@@ -494,8 +515,8 @@ TEST_DB(test_dbquery_string_list_injection) {
     array_free(list);
 
     // Table must still exist.
-    dbresult_t* r = dbqueryf(dbid,
-        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'test_items')");
+    dbresult_t* r = dbquery(dbid,
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'test_items')", NULL);
     TEST_ASSERT_STR_EQUAL("t", dbresult_field(r, "exists")->value, "test_items table must still exist");
     dbresult_free(r);
 }
@@ -1005,8 +1026,8 @@ TEST_DB(test_model_find_one_injection) {
     TEST_ASSERT_EQUAL(MODEL_ERR_NOTFOUND, model_last_status(), "status should be NOTFOUND");
 
     // Table must still exist.
-    dbresult_t* r = dbqueryf(dbid,
-        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'test_items')");
+    dbresult_t* r = dbquery(dbid,
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'test_items')", NULL);
     TEST_ASSERT_STR_EQUAL("t", dbresult_field(r, "exists")->value, "test_items table must still exist");
     dbresult_free(r);
 }

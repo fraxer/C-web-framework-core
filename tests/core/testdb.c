@@ -28,6 +28,21 @@ static appconfig_t* __appconfig = NULL;
 static json_doc_t* __document = NULL;
 static int __teardown_registered = 0;
 
+/* Run a control/DDL statement whose only dynamic part is a single identifier
+   (schema/database name). The name is bound via @name (escaped identifier,
+   inlined — no positional parameter), so e.g. "CREATE SCHEMA @name". */
+static dbresult_t* __exec_ident(const char* dbid, const char* sql, const char* ident) {
+    array_t* params = array_create();
+    if (params == NULL) return NULL;
+
+    mparams_fill_array(params, mparam_text(name, ident));
+
+    dbresult_t* result = dbquery(dbid, sql, params);
+    array_free(params);
+
+    return result;
+}
+
 static int sort_asc(const struct dirent **a, const struct dirent **b) {
     return strcoll((*a)->d_name, (*b)->d_name);
 }
@@ -166,7 +181,7 @@ int testdb_setup(const char* dbid, const char* config_path, const char* migratio
         host->schema = strdup(__temp_name);
 
         /* Create temporary schema */
-        result = dbqueryf(dbid, "CREATE SCHEMA %s", __temp_name);
+        result = __exec_ident(dbid, "CREATE SCHEMA @name", __temp_name);
         if (!dbresult_ok(result)) {
             fprintf(stderr, "testdb: failed to create schema %s\n", __temp_name);
             dbresult_free(result);
@@ -175,7 +190,7 @@ int testdb_setup(const char* dbid, const char* config_path, const char* migratio
         dbresult_free(result);
 
         /* Set search_path for unqualified table names */
-        result = dbqueryf(dbid, "SET search_path TO %s", __temp_name);
+        result = __exec_ident(dbid, "SET search_path TO @name", __temp_name);
         if (!dbresult_ok(result)) {
             fprintf(stderr, "testdb: failed to set search_path\n");
             dbresult_free(result);
@@ -196,7 +211,7 @@ int testdb_setup(const char* dbid, const char* config_path, const char* migratio
         }
 
         /* Create temporary database */
-        result = dbqueryf(dbid, "CREATE DATABASE %s", __temp_name);
+        result = __exec_ident(dbid, "CREATE DATABASE @name", __temp_name);
         if (!dbresult_ok(result)) {
             fprintf(stderr, "testdb: failed to create database %s\n", __temp_name);
             dbresult_free(result);
@@ -205,7 +220,7 @@ int testdb_setup(const char* dbid, const char* config_path, const char* migratio
         dbresult_free(result);
 
         /* Switch to temporary database */
-        result = dbqueryf(dbid, "USE %s", __temp_name);
+        result = __exec_ident(dbid, "USE @name", __temp_name);
         if (!dbresult_ok(result)) {
             fprintf(stderr, "testdb: failed to switch to database %s\n", __temp_name);
             dbresult_free(result);
@@ -249,7 +264,7 @@ void testdb_teardown(void) {
 
 #ifdef PostgreSQL_FOUND
     if (__driver == TESTDB_DRIVER_POSTGRESQL) {
-        result = dbqueryf(__dbid, "DROP SCHEMA IF EXISTS %s CASCADE", __temp_name);
+        result = __exec_ident(__dbid, "DROP SCHEMA IF EXISTS @name CASCADE", __temp_name);
         if (result) {
             if (dbresult_ok(result))
                 printf("testdb: dropped schema %s\n", __temp_name);
@@ -260,7 +275,7 @@ void testdb_teardown(void) {
 
 #ifdef MySQL_FOUND
     if (__driver == TESTDB_DRIVER_MYSQL) {
-        result = dbqueryf(__dbid, "DROP DATABASE IF EXISTS %s", __temp_name);
+        result = __exec_ident(__dbid, "DROP DATABASE IF EXISTS @name", __temp_name);
         if (result) {
             if (dbresult_ok(result))
                 printf("testdb: dropped database %s\n", __temp_name);
@@ -286,20 +301,20 @@ void testdb_teardown(void) {
 void testdb_begin_test(void) {
     dbresult_t* r;
 
-    r = dbqueryf(__dbid, "BEGIN");
+    r = dbquery(__dbid, "BEGIN", NULL);
     if (r) dbresult_free(r);
 
-    r = dbqueryf(__dbid, "SAVEPOINT test_sp");
+    r = dbquery(__dbid, "SAVEPOINT test_sp", NULL);
     if (r) dbresult_free(r);
 }
 
 void testdb_rollback_test(void) {
     dbresult_t* r;
 
-    r = dbqueryf(__dbid, "ROLLBACK TO SAVEPOINT test_sp");
+    r = dbquery(__dbid, "ROLLBACK TO SAVEPOINT test_sp", NULL);
     if (r) dbresult_free(r);
 
-    r = dbqueryf(__dbid, "COMMIT");
+    r = dbquery(__dbid, "COMMIT", NULL);
     if (r) dbresult_free(r);
 }
 

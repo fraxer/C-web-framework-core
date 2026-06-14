@@ -17,6 +17,8 @@ static void __host_free(void* arg);
 static void* __connection_create(void* host);
 static void __connection_free(void* connection);
 static dbresult_t* __query(void* connection, const char* sql);
+static dbresult_t* __execute_params(void* connection, const char* sql, array_t* params);
+static int __redis_fill_result(redisReply* reply, dbresult_t* result);
 int redis_auth(redisContext*, const char*, const char*);
 int redis_selectdb(redisContext*, const int);
 static redisContext* __connect(void* host);
@@ -92,6 +94,7 @@ void* __connection_create(void* host) {
     connection->base.reconnect = __reconnect;
     connection->base.prepare = NULL;
     connection->base.execute_prepared = NULL;
+    connection->base.execute_params = __execute_params;
     connection->base.type_cast = __type_cast;
     connection->base.host = host;
     connection->connection = __connect(host);
@@ -112,6 +115,40 @@ void __connection_free(void* connection) {
 
     redisFree(conn->connection);
     free(conn);
+}
+
+// Map a successful redisReply into `result`: a single unnamed column, one row
+// per array element (REDIS_REPLY_ARRAY) or a single row otherwise. Returns 1 on
+// success, 0 on allocation failure. Shared by __query and __execute_params.
+static int __redis_fill_result(redisReply* reply, dbresult_t* result) {
+    int rows = reply->type == REDIS_REPLY_ARRAY ? reply->elements : 1;
+    int cols = 1;
+    int col = 0;
+    dbresultquery_t* query = dbresult_query_create(rows, cols);
+
+    if (query == NULL) {
+        log_error("Out of memory\n");
+        return 0;
+    }
+
+    result->query = query;
+    result->current = query;
+
+    dbresult_query_field_insert(query, "", col);
+
+    for (int row = 0; row < rows; row++) {
+        size_t length = reply->len;
+        const char* value = reply->str;
+
+        if (rows > 1) {
+            length = reply->element[row]->len;
+            value = reply->element[row]->str;
+        }
+
+        dbresult_query_value_insert(query, value, length, row, col);
+    }
+
+    return 1;
 }
 
 dbresult_t* __query(void* connection, const char* sql) {
@@ -149,38 +186,144 @@ dbresult_t* __query(void* connection, const char* sql) {
         goto failed;
     }
 
-    int rows = reply->type == REDIS_REPLY_ARRAY ? reply->elements : 1;
-    int cols = 1;
-    int col = 0;
-    dbresultquery_t* query = dbresult_query_create(rows, cols);
-
-    if (query == NULL) {
-        log_error("Out of memory\n");
+    if (!__redis_fill_result(reply, result))
         goto failed;
-    }
-
-    result->query = query;
-    result->current = query;
-
-    dbresult_query_field_insert(query, "", col);
-
-    for (int row = 0; row < rows; row++) {
-        size_t length = reply->len;
-        const char* value = reply->str;
-
-        if (rows > 1) {
-            length = reply->element[row]->len;
-            value = reply->element[row]->str;
-        }
-
-        dbresult_query_value_insert(query, value, length, row, col);
-    }
 
     result->ok = 1;
 
     failed:
 
     freeReplyObject(reply);
+
+    return result;
+}
+
+/* Parameterized execution (universal named-parameter path).
+ *
+ * `sql` arrives from the shared builder (__build_query) carrying positional
+ * placeholders $1..$N (Redis type_cast is "", so a placeholder token is exactly
+ * "$N"); `params` is the ordered array of mfield_t* to bind. We tokenize the
+ * command on whitespace and pass it to redisCommandArgv as an argument vector:
+ * each "$N" token becomes a single, binary-safe argv element holding the bound
+ * value, every other token is forwarded verbatim. Because values are discrete
+ * argv elements they can never split into extra command words — this is the
+ * binding guarantee Redis lacks via the printf path.
+ *
+ * v1 scope: scalar `:name` only. `:list__` (comma-joined "$1,$2") and `@name`
+ * identifiers are not supported for Redis.
+ */
+static dbresult_t* __execute_params(void* connection, const char* sql, array_t* params) {
+    redisconnection_t* redisconnection = connection;
+
+    log_debug("DB params query: %s\n", sql);
+
+    dbresult_t* result = dbresult_create();
+    if (result == NULL) return NULL;
+
+    const int n_params = params != NULL ? (int)array_size(params) : 0;
+
+    char* buf = NULL;
+    const char** argv = NULL;
+    size_t* argvlen = NULL;
+    redisReply* reply = NULL;
+
+    buf = strdup(sql);
+    if (buf == NULL) {
+        log_error("redis execute_params: out of memory\n");
+        goto failed;
+    }
+
+    // Count whitespace-separated tokens to size the argv vector.
+    size_t argc = 0;
+    for (const char* p = sql; *p != '\0'; ) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (*p == '\0') break;
+        argc++;
+        while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+    }
+
+    if (argc == 0) {
+        log_error("redis execute_params: empty command\n");
+        goto failed;
+    }
+
+    argv = malloc(sizeof(char*) * argc);
+    argvlen = malloc(sizeof(size_t) * argc);
+    if (argv == NULL || argvlen == NULL) {
+        log_error("redis execute_params: out of memory\n");
+        goto failed;
+    }
+
+    size_t ai = 0;
+    for (char* p = buf; *p != '\0'; ) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (*p == '\0') break;
+
+        char* start = p;
+        while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') p++;
+        if (*p != '\0') { *p = '\0'; p++; }
+
+        // A "$<digits>" token is a positional placeholder: bind params[N-1].
+        int is_placeholder = start[0] == '$' && start[1] != '\0';
+        for (const char* d = start + 1; is_placeholder && *d != '\0'; d++)
+            if (*d < '0' || *d > '9') is_placeholder = 0;
+
+        if (is_placeholder) {
+            const int pidx = atoi(start + 1);
+            if (pidx < 1 || pidx > n_params) {
+                log_error("redis execute_params: placeholder $%d out of range (have %d params)\n", pidx, n_params);
+                goto failed;
+            }
+
+            mfield_t* field = array_get(params, pidx - 1);
+            if (field == NULL) {
+                log_error("redis execute_params: param %d is NULL\n", pidx);
+                goto failed;
+            }
+
+            if (field->is_null) {
+                argv[ai] = "";
+                argvlen[ai] = 0;
+            } else {
+                str_t* value = model_field_to_string(field);
+                if (value == NULL) {
+                    log_error("redis execute_params: model_field_to_string failed for %s\n", field->name);
+                    goto failed;
+                }
+                argv[ai] = str_get(value);
+                argvlen[ai] = str_size(value);
+            }
+        } else {
+            argv[ai] = start;
+            argvlen[ai] = strlen(start);
+        }
+
+        ai++;
+    }
+
+    reply = redisCommandArgv(redisconnection->connection, (int)ai, argv, argvlen);
+
+    if (reply == NULL || redisconnection->connection->err != 0) {
+        log_error("Redis error: %s\n", redisconnection->connection->errstr);
+        goto failed;
+    }
+
+    if (reply->type == REDIS_REPLY_ERROR) {
+        log_error("Redis error: %s\n", reply->str);
+        goto failed;
+    }
+
+    if (!__redis_fill_result(reply, result))
+        goto failed;
+
+    result->ok = 1;
+
+    failed:
+
+    freeReplyObject(reply);
+    free(argv);
+    free(argvlen);
+    free(buf);
 
     return result;
 }

@@ -45,6 +45,14 @@
                 "user": "test",
                 "password": ""
             }
+        ],
+        "redis": [
+            {
+                "host_id": "test",
+                "ip": "127.0.0.1",
+                "port": 6379,
+                "dbindex": 0
+            }
         ]
     },
     "storages": {

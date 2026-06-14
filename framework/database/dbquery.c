@@ -239,32 +239,6 @@ dbhost_t* dbhost(const char* dbid) {
     return __get_host(dbid);
 }
 
-dbresult_t* dbqueryf(const char* dbid, const char* format, ...) {
-    dbinstance_t* instance = dbinstance(dbid);
-    if (instance == NULL) return NULL;
-
-    va_list args;
-    va_start(args, format);
-    size_t string_length = vsnprintf(NULL, 0, format, args);
-    va_end(args);
-
-    char* string = malloc(string_length + 1);
-    if (string == NULL) return NULL;
-
-    va_start(args, format);
-    vsnprintf(string, string_length + 1, format, args);
-    va_end(args);
-
-    dbconnection_t* connection = instance->connection;
-    dbinstance_free(instance);
-
-    dbresult_t* result = connection->query(connection, string);
-
-    free(string);
-
-    return result;
-}
-
 dbresult_t* dbquery(const char* dbid, const char* format, array_t* params) {
     dbinstance_t* dbinst = dbinstance(dbid);
     if (dbinst == NULL) return NULL;
@@ -400,11 +374,11 @@ dbresult_t* dbbegin(const char* dbid, transaction_level_e level) {
 }
 
 dbresult_t* dbcommit(const char* dbid) {
-    return dbqueryf(dbid, "commit");
+    return dbquery(dbid, "commit", NULL);
 }
 
 dbresult_t* dbrollback(const char* dbid) {
-    return dbqueryf(dbid, "rollback");
+    return dbquery(dbid, "rollback", NULL);
 }
 
 dbresult_t* dbinsert(const char* dbid, const char* table, array_t* params) {

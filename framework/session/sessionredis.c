@@ -2,6 +2,7 @@
 #include "log.h"
 #include "appconfig.h"
 #include "helpers.h"
+#include "model.h"
 #include "sessionredis.h"
 #include "aes256gcm.h"
 
@@ -44,7 +45,21 @@ char* __create(const char* key, const char* data, long duration) {
     int res = 0;
     const db_table_cell_t* field = NULL;
 
-    dbresult_t* result = dbqueryf(config->host_id, "SET %s %s EX %ld", session_id, encrypted_data, duration);
+    array_t* params = array_create();
+    if (params == NULL) {
+        free(encrypted_data);
+        free(session_id);
+        return NULL;
+    }
+
+    mparams_fill_array(params,
+        mparam_text(id, session_id),
+        mparam_text(data, encrypted_data),
+        mparam_bigint(ttl, (long long)duration)
+    );
+
+    dbresult_t* result = dbquery(config->host_id, "SET :id :data EX :ttl", params);
+    array_free(params);
     free(encrypted_data);
 
     if (!dbresult_ok(result))
@@ -77,7 +92,15 @@ char* __get(const char* key, const char* session_id) {
 
     char* data = NULL;
 
-    dbresult_t* result = dbqueryf(config->host_id, "GET %s", session_id);
+    array_t* params = array_create();
+    if (params == NULL) return NULL;
+
+    mparams_fill_array(params,
+        mparam_text(id, session_id)
+    );
+
+    dbresult_t* result = dbquery(config->host_id, "GET :id", params);
+    array_free(params);
     if (!dbresult_ok(result))
         goto failed;
 
@@ -108,7 +131,19 @@ int __update(const char* key, const char* session_id, const char* data) {
         return 0;
     }
 
-    dbresult_t* result = dbqueryf(config->host_id, "SET %s %s KEEPTTL", session_id, encrypted_data);
+    array_t* params = array_create();
+    if (params == NULL) {
+        free(encrypted_data);
+        return 0;
+    }
+
+    mparams_fill_array(params,
+        mparam_text(id, session_id),
+        mparam_text(data, encrypted_data)
+    );
+
+    dbresult_t* result = dbquery(config->host_id, "SET :id :data KEEPTTL", params);
+    array_free(params);
     free(encrypted_data);
 
     if (!dbresult_ok(result))
@@ -133,7 +168,15 @@ int __destroy(const char* key, const char* session_id) {
     sessionconfig_t* config = sessionconfig_find(key);
     if (config == NULL) return 0;
 
-    dbresult_t* result = dbqueryf(config->host_id, "DEL %s", session_id);
+    array_t* params = array_create();
+    if (params == NULL) return 0;
+
+    mparams_fill_array(params,
+        mparam_text(id, session_id)
+    );
+
+    dbresult_t* result = dbquery(config->host_id, "DEL :id", params);
+    array_free(params);
     dbresult_free(result);
 
     return 1;

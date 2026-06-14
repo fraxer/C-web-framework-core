@@ -402,7 +402,7 @@ int mg_create_template(const char* target_directory, mgconfig_t* config) {
         "#include \"dbresult.h\"\n\n"
 
         "int up(const char* dbid) {\n"
-        "    dbresult_t* result = dbqueryf(dbid, \"\");\n\n"
+        "    dbresult_t* result = dbquery(dbid, \"\", NULL);\n\n"
 
         "    int res = dbresult_ok(result);\n\n"
 
