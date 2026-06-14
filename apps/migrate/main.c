@@ -15,7 +15,6 @@
 #include "model.h"
 #include "database.h"
 #include "moduleloader.h"
-#include "statement_registry.h"
 #include "middleware_registry.h"
 #ifdef MySQL_FOUND
     #include "mysql.h"
@@ -442,10 +441,6 @@ int main(int argc, char* argv[]) {
 
     appconfig_set(config.appconfig);
 
-    if (!prepare_statements_init()) {
-        printf("module_loader_init: failed to initialize prepared statements\n");
-        goto failed;
-    }
     if (!middlewares_init()) {
         printf("Error: failed to initialize middlewares\n");
         goto failed;

@@ -73,24 +73,6 @@ static void __ensure_test_table(void) {
     dbresult_free(r);
 }
 
-static int __prepare_statement(const char* stmt_name, const char* sql, array_t* params) {
-    const char* dbid = testdb_dbid();
-    dbinstance_t* dbinst = dbinstance(dbid);
-    if (dbinst == NULL) return 0;
-
-    dbconnection_t* conn = dbinst->connection;
-    dbinstance_free(dbinst);
-
-    str_t* name = str_create(stmt_name);
-    str_t* query = str_create(sql);
-
-    int res = conn->prepare(conn, name, query, params);
-
-    str_free(name);
-    str_free(query);
-    return res;
-}
-
 // Insert a row and return the generated id. Returns -1 on failure.
 static int __insert_test_row(const char* name_val, int status_val, const char* desc_val) {
     const char* dbid = testdb_dbid();
@@ -623,20 +605,12 @@ TEST_DB(test_model_prepared_one) {
     int id = __insert_test_row("PrepOne", 42, "prepdesc");
     TEST_ASSERT(id > 0, "insert should return valid id");
 
-    // Prepare statement
-    array_t* prep_params = array_create();
-    mparams_fill_array(prep_params, mparam_int(id, 0));
-
-    int prepared = __prepare_statement("get_item_by_id",
-        "SELECT * FROM test_items WHERE id = :id", prep_params);
-    array_free(prep_params);
-    TEST_ASSERT_EQUAL(1, prepared, "prepare should succeed");
-
+    // Prepare-on-first-use: SQL is supplied inline, no separate prepare step.
     array_t* params = array_create();
     mparams_fill_array(params, mparam_int(id, id));
 
     test_item_t* item = model_prepared_one(dbid, test_item_instance,
-        "get_item_by_id", params);
+        "get_item_by_id", "SELECT * FROM test_items WHERE id = :id", params);
     array_free(params);
     TEST_ASSERT_NOT_NULL(item, "model_prepared_one should return item");
     if (item == NULL) return;
@@ -661,20 +635,12 @@ TEST_DB(test_model_prepared_list) {
     __insert_test_row("PL2", 5, NULL);
     __insert_test_row("PL3", 6, NULL);
 
-    // Prepare statement
-    array_t* prep_params = array_create();
-    mparams_fill_array(prep_params, mparam_int(status, 0));
-
-    int prepared = __prepare_statement("get_items_by_status",
-        "SELECT * FROM test_items WHERE status = :status", prep_params);
-    array_free(prep_params);
-    TEST_ASSERT_EQUAL(1, prepared, "prepare should succeed");
-
+    // Prepare-on-first-use: SQL is supplied inline.
     array_t* params = array_create();
     mparams_fill_array(params, mparam_int(status, 5));
 
     array_t* list = model_prepared_list(dbid, test_item_instance,
-        "get_items_by_status", params);
+        "get_items_by_status", "SELECT * FROM test_items WHERE status = :status", params);
     array_free(params);
     TEST_ASSERT_NOT_NULL(list, "model_prepared_list should return array");
     if (list == NULL) return;
@@ -688,4 +654,41 @@ TEST_DB(test_model_prepared_list) {
     TEST_ASSERT_STR_EQUAL("PL2", str_get(model_text(model_field(&second->record, TEST_ITEM_COL_NAME))), "second name should be PL2");
 
     array_free(list);
+}
+
+// ============================================================================
+// dbprepared tests
+// ============================================================================
+
+TEST_DB(test_dbprepared_prepare_and_reuse) {
+    TEST_SUITE("dbprepared");
+    TEST_CASE("prepare-on-first-use; second call reuses the cached plan");
+
+    const char* dbid = testdb_dbid();
+    int id = __insert_test_row("PrepReuse", 7, NULL);
+    TEST_ASSERT(id > 0, "insert should succeed");
+
+    const char* name = "prep_reuse_by_id";
+    const char* sql = "SELECT * FROM test_items WHERE id = :id";
+
+    // First call prepares the statement, then executes it.
+    array_t* p1 = array_create();
+    mparams_fill_array(p1, mparam_int(id, id));
+    dbresult_t* r1 = dbprepared(dbid, name, sql, p1);
+    array_free(p1);
+    TEST_ASSERT_NOT_NULL(r1, "first dbprepared should succeed");
+    TEST_ASSERT(dbresult_ok(r1), "first result should be ok");
+    TEST_ASSERT_EQUAL(1, dbresult_query_rows(r1), "first call should return one row");
+    dbresult_free(r1);
+
+    // Second call: statement already in the connection map → prepare is skipped,
+    // the cached plan is reused. Result must be identical.
+    array_t* p2 = array_create();
+    mparams_fill_array(p2, mparam_int(id, id));
+    dbresult_t* r2 = dbprepared(dbid, name, sql, p2);
+    array_free(p2);
+    TEST_ASSERT_NOT_NULL(r2, "second dbprepared should succeed");
+    TEST_ASSERT(dbresult_ok(r2), "second result should be ok");
+    TEST_ASSERT_EQUAL(1, dbresult_query_rows(r2), "second call should return one row");
+    dbresult_free(r2);
 }

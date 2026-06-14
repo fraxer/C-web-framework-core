@@ -12,7 +12,6 @@
 #include "dbresult.h"
 #include "database.h"
 #include "moduleloader.h"
-#include "statement_registry.h"
 #include "middleware_registry.h"
 
 #ifdef PostgreSQL_FOUND
@@ -138,10 +137,6 @@ int testdb_setup(const char* dbid, const char* config_path, const char* migratio
     }
     appconfig_set(__appconfig);
 
-    if (!prepare_statements_init()) {
-        fprintf(stderr, "testdb: failed to initialize prepared statements\n");
-        return 0;
-    }
     if (!middlewares_init()) {
         fprintf(stderr, "testdb: failed to initialize middlewares\n");
         return 0;

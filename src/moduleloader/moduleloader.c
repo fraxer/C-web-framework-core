@@ -28,7 +28,6 @@
 #include "threadworker.h"
 #include "broadcast.h"
 #include "connection_queue.h"
-#include "statement_registry.h"
 #include "middleware_registry.h"
 #include "httpserverhandlers.h"
 #include "taskmanager.h"
@@ -65,7 +64,6 @@ static int __module_loader_storages_load(appconfig_t* config, const json_token_t
 static int __module_loader_mimetype_load(appconfig_t* config, const json_token_t* mimetypes);
 static int __module_loader_viewstore_load(appconfig_t* config);
 static int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* sessionconfig);
-static int __module_loader_prepared_queries_load(appconfig_t* config);
 static int __module_loader_taskmanager_init(appconfig_t* config, json_token_t* task_manager);
 static int __module_loader_translations_load(appconfig_t* config, json_token_t* translations);
 
@@ -94,10 +92,6 @@ static int __module_loader_websockets_ratelimit_load(const json_token_t* token_s
 int module_loader_init(appconfig_t* config) {
     int result = 0;
 
-    if (!prepare_statements_init()) {
-        log_error("module_loader_init: failed to initialize prepared statements\n");
-        goto failed;
-    }
 
     if (!middlewares_init()) {
         log_error("module_loader_init: failed to initialize middlewares\n");
@@ -491,8 +485,6 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     if (!__module_loader_viewstore_load(config))
         goto failed;
     if (!__module_loader_sessionconfig_load(config, json_object_get(root, "sessions")))
-        goto failed;
-    if (!__module_loader_prepared_queries_load(config))
         goto failed;
     if (!__module_loader_taskmanager_init(config, json_object_get(root, "task_manager")))
         goto failed;
@@ -1282,19 +1274,6 @@ int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* 
     return 0;
 }
 
-int __module_loader_prepared_queries_load(appconfig_t* config) {
-    for (int i = 0; i < pstmt_count(); i++) {
-        prepare_stmt_t* stmt = (pstmt_list()[i])();
-        if (stmt == NULL) {
-            log_error("__module_loader_prepared_queries_load: can't create prepared statement\n");
-            return 0;
-        }
-        array_push_back(config->prepared_queries, array_create_pointer(stmt, array_nocopy, pstmt_free));
-    }
-
-    return 1;
-}
-
 int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config) {
     int result = 0;
     route_t* first_route = NULL;
@@ -1857,7 +1836,6 @@ void module_loader_create_config_and_init(void) {
         return;
     }
 
-    pstmt_registry_clear();
     middleware_registry_clear();
     appconfig_set(newconfig);
     module_loader_init(newconfig);

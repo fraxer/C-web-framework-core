@@ -71,13 +71,6 @@ appconfig_t* appconfig_create(const char* path) {
         return NULL;
     }
 
-    config->prepared_queries = array_create();
-    if (config->prepared_queries == NULL) {
-        free(config->path);
-        free(config);
-        return NULL;
-    }
-
     return config;
 }
 
@@ -122,9 +115,6 @@ void appconfig_clear(appconfig_t* config) {
         map_free(config->sessionconfigs);
         config->sessionconfigs = NULL;
     }
-
-    array_free(config->prepared_queries);
-    config->prepared_queries = NULL;
 
     routeloader_free(config->taskmanager_loader);
     config->taskmanager_loader = NULL;

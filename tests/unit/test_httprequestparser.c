@@ -41,7 +41,6 @@ static void init_test_appconfig(void) {
             test_appconfig->storages = NULL;
             test_appconfig->viewstore = NULL;
             test_appconfig->server_chain = NULL;
-            test_appconfig->prepared_queries = NULL;
         }
     }
 }

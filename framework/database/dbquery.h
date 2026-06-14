@@ -11,7 +11,7 @@ void dbinstance_free(dbinstance_t* instance);
 dbhost_t* dbhost(const char* dbid);
 dbresult_t* dbqueryf(const char* dbid, const char*, ...);
 dbresult_t* dbquery(const char* dbid, const char* format, array_t* params);
-dbresult_t* dbprepared_query(const char* dbid, const char* stmt_name, array_t* params);
+dbresult_t* dbprepared(const char* dbid, const char* name, const char* sql, array_t* params);
 dbresult_t* dbquery_params(const char* dbid, const char* sql, array_t* ordered_params);
 dbresult_t* dbtable_exist(const char* dbid, const char* table);
 dbresult_t* dbtable_migration_create(const char* dbid, const char* table);
@@ -23,7 +23,6 @@ dbresult_t* dbupdate(const char* dbid, const char* table, array_t* set, array_t*
 dbresult_t* dbdelete(const char* dbid, const char* table, array_t* where);
 dbresult_t* dbselect(const char* dbid, const char* table, array_t* columns, array_t* where);
 int dbexec(const char* dbid, const char* format, array_t* params);
-int dbprepared_exec(const char* dbid, const char* stmt_name, array_t* params);
 
 
 /**

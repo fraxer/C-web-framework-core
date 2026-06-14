@@ -11,7 +11,6 @@
 #include "dbquery.h"
 #include "model.h"
 #include "dbresult.h"
-#include "statement_registry.h"
 
 /**
  * SQL parser state for tracking strings, comments, and context
@@ -301,33 +300,38 @@ dbresult_t* dbquery(const char* dbid, const char* format, array_t* params) {
     return result;
 }
 
-dbresult_t* dbprepared_query(const char* dbid, const char* stmt_name, array_t* params) {
+// Prepare-on-first-use: prepares `sql` under `name` on first call per connection,
+// then executes it. prepare and execute MUST run on the same connection, so this
+// grabs one connection and does both on it (a separate execute call could pick a
+// different pooled connection where the statement is not prepared). `params`
+// doubles as the prepare template (names/types) and the execution values (matched
+// by field name).
+dbresult_t* dbprepared(const char* dbid, const char* name, const char* sql, array_t* params) {
     dbinstance_t* dbinst = dbinstance(dbid);
     if (dbinst == NULL) return NULL;
 
     dbconnection_t* connection = dbinst->connection;
-
     dbinstance_free(dbinst);
 
     if (connection->prepare_statements == NULL)
         return NULL;
 
-    void* stmt = map_find(connection->prepare_statements, stmt_name);
-    if (stmt == NULL) {
-        array_t* prepared_queries = appconfig()->prepared_queries;
-        for (size_t i = 0; i < array_size(prepared_queries); i++) {
-            prepare_stmt_t* stmt = array_get(prepared_queries, i);
-            if (str_cmpc(stmt->name, stmt_name) != 0) continue;
+    if (map_find(connection->prepare_statements, name) == NULL) {
+        str_t* n = str_create(name);
+        str_t* q = str_create(sql);
 
-            if (!connection->prepare(connection, stmt->name, stmt->query, stmt->params))
-                return NULL;
+        const int ok = n != NULL && q != NULL &&
+            connection->prepare(connection, n, q, params);
 
-            break;
-        }
+        str_free(n);
+        str_free(q);
+
+        if (!ok) return NULL;
     }
 
-    return connection->execute_prepared(connection, stmt_name, params);
+    return connection->execute_prepared(connection, name, params);
 }
+
 
 dbresult_t* dbquery_params(const char* dbid, const char* sql, array_t* ordered_params) {
     dbinstance_t* dbinst = dbinstance(dbid);
@@ -479,22 +483,6 @@ int dbexec(const char* dbid, const char* format, array_t* params) {
     int res = 0;
 
     dbresult_t* result = dbquery(dbid, format, params);
-    if (!dbresult_ok(result))
-        goto failed;
-
-    res = 1;
-
-    failed:
-
-    dbresult_free(result);
-
-    return res;
-}
-
-int dbprepared_exec(const char* dbid, const char* stmt_name, array_t* params) {
-    int res = 0;
-
-    dbresult_t* result = dbprepared_query(dbid, stmt_name, params);
     if (!dbresult_ok(result))
         goto failed;
 

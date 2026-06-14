@@ -66,7 +66,6 @@ typedef struct appconfig {
     storage_t* storages;
     viewstore_t* viewstore;
     server_chain_t* server_chain;
-    array_t* prepared_queries; // prepare_stmt_t
     routeloader_lib_t* taskmanager_loader;
     taskmanager_t* taskmanager;
     map_t* translations;  // map: domain -> i18n_t*

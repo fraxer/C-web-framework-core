@@ -11,7 +11,6 @@
 #include "log.h"
 #include "array.h"
 #include "appconfig.h"
-#include "statement_registry.h"
 #include "model.h"
 
 static void __model_value_clear(mvalue_t* value, mtype_e type);
@@ -2635,9 +2634,9 @@ array_t* model_list(const char* dbid, void*(create_instance)(void), const char* 
     return array;
 }
 
-void* model_prepared_one(const char* dbid, void*(create_instance)(void), const char* stat_name, array_t* params) {
+void* model_prepared_one(const char* dbid, void*(create_instance)(void), const char* stat_name, const char* sql, array_t* params) {
     void* record = NULL;
-    dbresult_t* result = dbprepared_query(dbid, stat_name, params);
+    dbresult_t* result = dbprepared(dbid, stat_name, sql, params);
     if (!dbresult_ok(result)) goto failed;
 
     if (dbresult_query_rows(result) == 0) goto failed;
@@ -2651,9 +2650,9 @@ void* model_prepared_one(const char* dbid, void*(create_instance)(void), const c
     return record;
 }
 
-array_t* model_prepared_list(const char* dbid, void*(create_instance)(void), const char* stat_name, array_t* params) {
+array_t* model_prepared_list(const char* dbid, void*(create_instance)(void), const char* stat_name, const char* sql, array_t* params) {
     array_t* array = NULL;
-    dbresult_t* result = dbprepared_query(dbid, stat_name, params);
+    dbresult_t* result = dbprepared(dbid, stat_name, sql, params);
     if (!dbresult_ok(result)) goto failed;
 
     if (dbresult_query_rows(result) == 0) goto failed;
