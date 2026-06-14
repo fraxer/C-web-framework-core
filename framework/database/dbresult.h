@@ -16,6 +16,11 @@ void dbresult_query_field_insert(dbresultquery_t*, const char*, int);
 
 int dbresult_ok(dbresult_t*);
 
+// Driver error text for the last failed query, or NULL when ok/unavailable.
+const char* dbresult_error(dbresult_t*);
+// Store (copy) a driver error message; replaces any previous text.
+void dbresult_set_error(dbresult_t*, const char*);
+
 void dbresult_free(dbresult_t*);
 
 int dbresult_row_next(dbresult_t*);

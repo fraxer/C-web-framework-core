@@ -284,6 +284,7 @@ dbresult_t* __query(void* connection, const char* sql) {
 
     if (!PQsendQuery(pgconnection->connection, sql)) {
         log_error("PQsendQuery error: %s", PQerrorMessage(pgconnection->connection));
+        dbresult_set_error(result, PQerrorMessage(pgconnection->connection));
         return result;
     }
 
@@ -349,6 +350,7 @@ dbresult_t* __process_result(void* connection, dbresult_t* result) {
         case PGRES_BAD_RESPONSE:
         case PGRES_PIPELINE_ABORTED: {
             log_error("Postgresql error: %s", PQresultErrorMessage(res));
+            dbresult_set_error(result, PQresultErrorMessage(res));
             result->ok = 0;
             break;
         }

@@ -28,6 +28,48 @@ static void __model_cell_init(mfield_t* cell, const mcolumn_t* col);
 static void* __model_fill_one(void*(create_instance)(void), dbresult_t* result);
 static array_t* __model_fill_array(void*(create_instance)(void), dbresult_t* result);
 
+/* ---------------------------------------------------------------------------
+ * Error contract (R7): thread-local "last status" + DB error text.
+ *
+ * Each public model operation resets the status to MODEL_OK on entry and sets
+ * it at the point of failure. State is per-thread and lives only until the next
+ * model operation in that thread, mirroring errno semantics.
+ * ------------------------------------------------------------------------- */
+static __thread model_status_e __model_status = MODEL_OK;
+static __thread char __model_error[512];
+
+static void __model_set_status(model_status_e status) {
+    __model_status = status;
+    if (status != MODEL_ERR_DB)
+        __model_error[0] = '\0';
+}
+
+/* Record a DB failure together with the driver's error text (if any). */
+static void __model_set_db_error(dbresult_t* result) {
+    __model_status = MODEL_ERR_DB;
+
+    const char* msg = dbresult_error(result);
+    if (msg == NULL) {
+        __model_error[0] = '\0';
+        return;
+    }
+
+    const size_t n = sizeof(__model_error) - 1;
+    strncpy(__model_error, msg, n);
+    __model_error[n] = '\0';
+}
+
+model_status_e model_last_status(void) {
+    return __model_status;
+}
+
+const char* model_last_error(void) {
+    if (__model_status == MODEL_ERR_DB && __model_error[0] != '\0')
+        return __model_error;
+
+    return NULL;
+}
+
 /* Locale-independent numeric formatting.
    Numeric SQL literals and JSON numbers must always use '.' as the decimal
    separator. Under a locale such as ru_RU (LC_NUMERIC with ',') snprintf("%f")
@@ -2269,15 +2311,24 @@ void model_free(void* arg) {
 }
 
 void* model_get(const char* dbid, void*(create_instance)(void), array_t* params) {
-    if (create_instance == NULL) return NULL;
+    __model_set_status(MODEL_OK);
+
+    if (create_instance == NULL) {
+        __model_set_status(MODEL_ERR_PARAM);
+        return NULL;
+    }
 
     model_t* record = create_instance();
-    if (record == NULL) return NULL;
+    if (record == NULL) {
+        __model_set_status(MODEL_ERR_ALLOC);
+        return NULL;
+    }
 
     const mschema_t* schema = record->schema;
 
     dbinstance_t* dbinst = dbinstance(dbid);
     if (dbinst == NULL) {
+        __model_set_status(MODEL_ERR_DB);
         model_free(record);
         return NULL;
     }
@@ -2291,14 +2342,20 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
     dbresult_t* result = NULL;
     void* res = NULL;
 
-    if (fields == NULL || sql == NULL || bind == NULL) goto failed;
+    if (fields == NULL || sql == NULL || bind == NULL) {
+        __model_set_status(MODEL_ERR_ALLOC);
+        goto failed;
+    }
 
     for (int i = 0; i < schema->columns_count; i++) {
         if (i > 0)
             str_appendc(fields, ',');
 
         str_t* escaped = conn->escape_identifier(conn, schema->columns[i].name);
-        if (escaped == NULL) goto failed;
+        if (escaped == NULL) {
+            __model_set_status(MODEL_ERR_ALLOC);
+            goto failed;
+        }
 
         str_append(fields, str_get(escaped), str_size(escaped));
         str_free(escaped);
@@ -2323,7 +2380,10 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
             str_append(sql, " IS NULL", 8);
         } else {
             str_appendc(sql, '=');
-            if (!__model_append_bind(conn, sql, param, bind, &idx)) goto failed;
+            if (!__model_append_bind(conn, sql, param, bind, &idx)) {
+                __model_set_status(MODEL_ERR_ALLOC);
+                goto failed;
+            }
         }
     }
 
@@ -2331,11 +2391,19 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
 
     result = dbquery_params(dbid, str_get(sql), bind);
 
-    if (!dbresult_ok(result)) goto failed;
-    if (dbresult_query_rows(result) == 0) goto failed;
-
-    if (!__model_fill(0, schema->columns_count, record->fields, result))
+    if (!dbresult_ok(result)) {
+        __model_set_db_error(result);
         goto failed;
+    }
+    if (dbresult_query_rows(result) == 0) {
+        __model_set_status(MODEL_ERR_NOTFOUND);
+        goto failed;
+    }
+
+    if (!__model_fill(0, schema->columns_count, record->fields, result)) {
+        __model_set_status(MODEL_ERR_ALLOC);
+        goto failed;
+    }
 
     res = record;
 
@@ -2353,14 +2421,25 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
 }
 
 int model_create(const char* dbid, void* arg) {
-    if (dbid == NULL || arg == NULL) return 0;
+    __model_set_status(MODEL_OK);
+
+    if (dbid == NULL || arg == NULL) {
+        __model_set_status(MODEL_ERR_PARAM);
+        return 0;
+    }
 
     model_t* record = arg;
     const mschema_t* schema = record->schema;
-    if (schema->columns_count == 0) return 0;
+    if (schema->columns_count == 0) {
+        __model_set_status(MODEL_ERR_PARAM);
+        return 0;
+    }
 
     dbinstance_t* dbinst = dbinstance(dbid);
-    if (dbinst == NULL) return 0;
+    if (dbinst == NULL) {
+        __model_set_status(MODEL_ERR_DB);
+        return 0;
+    }
 
     dbconnection_t* conn = dbinst->connection;
     dbinstance_free(dbinst);
@@ -2372,7 +2451,10 @@ int model_create(const char* dbid, void* arg) {
     str_t* sql = str_create_empty(256);
     array_t* bind = array_create();
 
-    if (columns == NULL || values == NULL || sql == NULL || bind == NULL) goto failed;
+    if (columns == NULL || values == NULL || sql == NULL || bind == NULL) {
+        __model_set_status(MODEL_ERR_ALLOC);
+        goto failed;
+    }
 
     int idx = 0;
     int written = 0;
@@ -2390,17 +2472,26 @@ int model_create(const char* dbid, void* arg) {
         }
 
         str_t* escaped = conn->escape_identifier(conn, field->name);
-        if (escaped == NULL) goto failed;
+        if (escaped == NULL) {
+            __model_set_status(MODEL_ERR_ALLOC);
+            goto failed;
+        }
 
         str_append(columns, str_get(escaped), str_size(escaped));
         str_free(escaped);
 
-        if (!__model_append_bind(conn, values, field, bind, &idx)) goto failed;
+        if (!__model_append_bind(conn, values, field, bind, &idx)) {
+            __model_set_status(MODEL_ERR_ALLOC);
+            goto failed;
+        }
 
         written++;
     }
 
-    if (written == 0) goto failed;
+    if (written == 0) {
+        __model_set_status(MODEL_ERR_PARAM);
+        goto failed;
+    }
 
     str_append(sql, "INSERT INTO ", 12);
     str_append(sql, record->table, strlen(record->table));
@@ -2411,7 +2502,10 @@ int model_create(const char* dbid, void* arg) {
     str_appendc(sql, ')');
 
     result = dbquery_params(dbid, str_get(sql), bind);
-    if (!dbresult_ok(result)) goto failed;
+    if (!dbresult_ok(result)) {
+        __model_set_db_error(result);
+        goto failed;
+    }
 
     res = 1;
 
@@ -2427,13 +2521,21 @@ int model_create(const char* dbid, void* arg) {
 }
 
 int model_update(const char* dbid, void* arg) {
-    if (arg == NULL) return 0;
+    __model_set_status(MODEL_OK);
+
+    if (arg == NULL) {
+        __model_set_status(MODEL_ERR_PARAM);
+        return 0;
+    }
 
     model_t* record = arg;
     const mschema_t* schema = record->schema;
 
     dbinstance_t* dbinst = dbinstance(dbid);
-    if (dbinst == NULL) return 0;
+    if (dbinst == NULL) {
+        __model_set_status(MODEL_ERR_DB);
+        return 0;
+    }
 
     dbconnection_t* conn = dbinst->connection;
     dbinstance_free(dbinst);
@@ -2447,8 +2549,10 @@ int model_update(const char* dbid, void* arg) {
     // Owns the heap clones used to bind the OLD primary-key value (dirty PK case).
     array_t* clones = array_create();
 
-    if (set_params == NULL || where_params == NULL || sql == NULL || bind == NULL || clones == NULL)
+    if (set_params == NULL || where_params == NULL || sql == NULL || bind == NULL || clones == NULL) {
+        __model_set_status(MODEL_ERR_ALLOC);
         goto failed;
+    }
 
     // Placeholder numbering follows SQL text order: SET ($1..) precedes WHERE,
     // so SET is built before WHERE and they share a single running counter.
@@ -2467,7 +2571,10 @@ int model_update(const char* dbid, void* arg) {
         str_append(set_params, field->name, strlen(field->name));
         str_appendc(set_params, '=');
 
-        if (!__model_append_bind(conn, set_params, field, bind, &idx)) goto failed;
+        if (!__model_append_bind(conn, set_params, field, bind, &idx)) {
+            __model_set_status(MODEL_ERR_ALLOC);
+            goto failed;
+        }
 
         iter_set++;
     }
@@ -2488,13 +2595,22 @@ int model_update(const char* dbid, void* arg) {
 
         if (field->dirty) {
             mfield_t* clone = __model_bind_clone(field, field->oldvalue);
-            if (clone == NULL) goto failed;
+            if (clone == NULL) {
+                __model_set_status(MODEL_ERR_ALLOC);
+                goto failed;
+            }
 
             array_push_back(clones, array_create_pointer(clone, array_nocopy, __model_bind_clone_free));
 
-            if (!__model_append_bind(conn, where_params, clone, bind, &idx)) goto failed;
+            if (!__model_append_bind(conn, where_params, clone, bind, &idx)) {
+                __model_set_status(MODEL_ERR_ALLOC);
+                goto failed;
+            }
         } else {
-            if (!__model_append_bind(conn, where_params, field, bind, &idx)) goto failed;
+            if (!__model_append_bind(conn, where_params, field, bind, &idx)) {
+                __model_set_status(MODEL_ERR_ALLOC);
+                goto failed;
+            }
         }
 
         iter_where++;
@@ -2509,7 +2625,10 @@ int model_update(const char* dbid, void* arg) {
 
     result = dbquery_params(dbid, str_get(sql), bind);
 
-    if (!dbresult_ok(result)) goto failed;
+    if (!dbresult_ok(result)) {
+        __model_set_db_error(result);
+        goto failed;
+    }
 
     res = 1;
 
@@ -2532,14 +2651,25 @@ int model_update(const char* dbid, void* arg) {
 }
 
 int model_delete(const char* dbid, void* arg) {
-    if (dbid == NULL || arg == NULL) return 0;
+    __model_set_status(MODEL_OK);
+
+    if (dbid == NULL || arg == NULL) {
+        __model_set_status(MODEL_ERR_PARAM);
+        return 0;
+    }
 
     model_t* record = arg;
     const mschema_t* schema = record->schema;
-    if (schema->columns_count == 0) return 0;
+    if (schema->columns_count == 0) {
+        __model_set_status(MODEL_ERR_PARAM);
+        return 0;
+    }
 
     dbinstance_t* dbinst = dbinstance(dbid);
-    if (dbinst == NULL) return 0;
+    if (dbinst == NULL) {
+        __model_set_status(MODEL_ERR_DB);
+        return 0;
+    }
 
     dbconnection_t* conn = dbinst->connection;
     dbinstance_free(dbinst);
@@ -2550,7 +2680,10 @@ int model_delete(const char* dbid, void* arg) {
     str_t* sql = str_create_empty(256);
     array_t* bind = array_create();
 
-    if (where_params == NULL || sql == NULL || bind == NULL) goto failed;
+    if (where_params == NULL || sql == NULL || bind == NULL) {
+        __model_set_status(MODEL_ERR_ALLOC);
+        goto failed;
+    }
 
     int idx = 0;
     for (int i = 0, iter_where = 0; i < schema->columns_count; i++) {
@@ -2565,7 +2698,10 @@ int model_delete(const char* dbid, void* arg) {
         str_append(where_params, field->name, strlen(field->name));
         str_appendc(where_params, '=');
 
-        if (!__model_append_bind(conn, where_params, field, bind, &idx)) goto failed;
+        if (!__model_append_bind(conn, where_params, field, bind, &idx)) {
+            __model_set_status(MODEL_ERR_ALLOC);
+            goto failed;
+        }
 
         iter_where++;
     }
@@ -2577,7 +2713,10 @@ int model_delete(const char* dbid, void* arg) {
 
     result = dbquery_params(dbid, str_get(sql), bind);
 
-    if (!dbresult_ok(result)) goto failed;
+    if (!dbresult_ok(result)) {
+        __model_set_db_error(result);
+        goto failed;
+    }
 
     res = 1;
 
@@ -2592,15 +2731,29 @@ int model_delete(const char* dbid, void* arg) {
 }
 
 int model_delete_by_params(const char* dbid, void* arg, array_t* params) {
-    if (dbid == NULL || arg == NULL) return 0;
-    if (params == NULL || array_size(params) == 0) return 0;
+    __model_set_status(MODEL_OK);
+
+    if (dbid == NULL || arg == NULL) {
+        __model_set_status(MODEL_ERR_PARAM);
+        return 0;
+    }
+    if (params == NULL || array_size(params) == 0) {
+        __model_set_status(MODEL_ERR_PARAM);
+        return 0;
+    }
 
     model_t* record = arg;
     const mschema_t* schema = record->schema;
-    if (schema->columns_count == 0) return 0;
+    if (schema->columns_count == 0) {
+        __model_set_status(MODEL_ERR_PARAM);
+        return 0;
+    }
 
     dbinstance_t* dbinst = dbinstance(dbid);
-    if (dbinst == NULL) return 0;
+    if (dbinst == NULL) {
+        __model_set_status(MODEL_ERR_DB);
+        return 0;
+    }
 
     dbconnection_t* conn = dbinst->connection;
     dbinstance_free(dbinst);
@@ -2611,7 +2764,10 @@ int model_delete_by_params(const char* dbid, void* arg, array_t* params) {
     str_t* sql = str_create_empty(256);
     array_t* bind = array_create();
 
-    if (where_params == NULL || sql == NULL || bind == NULL) goto failed;
+    if (where_params == NULL || sql == NULL || bind == NULL) {
+        __model_set_status(MODEL_ERR_ALLOC);
+        goto failed;
+    }
 
     int idx = 0;
     for (size_t i = 0, iter_where = 0; i < array_size(params); i++) {
@@ -2631,7 +2787,10 @@ int model_delete_by_params(const char* dbid, void* arg, array_t* params) {
                 str_append(where_params, " IS NULL", 8);
             } else {
                 str_appendc(where_params, '=');
-                if (!__model_append_bind(conn, where_params, field, bind, &idx)) goto failed;
+                if (!__model_append_bind(conn, where_params, field, bind, &idx)) {
+                    __model_set_status(MODEL_ERR_ALLOC);
+                    goto failed;
+                }
             }
 
             iter_where++;
@@ -2646,7 +2805,10 @@ int model_delete_by_params(const char* dbid, void* arg, array_t* params) {
 
     result = dbquery_params(dbid, str_get(sql), bind);
 
-    if (!dbresult_ok(result)) goto failed;
+    if (!dbresult_ok(result)) {
+        __model_set_db_error(result);
+        goto failed;
+    }
 
     res = 1;
 
@@ -2698,13 +2860,23 @@ static array_t* __model_fill_array(void*(create_instance)(void), dbresult_t* res
 }
 
 void* model_one(const char* dbid, void*(create_instance)(void), const char* format, array_t* params) {
+    __model_set_status(MODEL_OK);
+
     void* record = NULL;
     dbresult_t* result = dbquery(dbid, format, params);
-    if (!dbresult_ok(result)) goto failed;
+    if (!dbresult_ok(result)) {
+        __model_set_db_error(result);
+        goto failed;
+    }
 
-    if (dbresult_query_rows(result) == 0) goto failed;
+    if (dbresult_query_rows(result) == 0) {
+        __model_set_status(MODEL_ERR_NOTFOUND);
+        goto failed;
+    }
 
     record = __model_fill_one(create_instance, result);
+    if (record == NULL)
+        __model_set_status(MODEL_ERR_ALLOC);
 
     failed:
 
@@ -2714,13 +2886,23 @@ void* model_one(const char* dbid, void*(create_instance)(void), const char* form
 }
 
 array_t* model_list(const char* dbid, void*(create_instance)(void), const char* format, array_t* params) {
+    __model_set_status(MODEL_OK);
+
     array_t* array = NULL;
     dbresult_t* result = dbquery(dbid, format, params);
-    if (!dbresult_ok(result)) goto failed;
+    if (!dbresult_ok(result)) {
+        __model_set_db_error(result);
+        goto failed;
+    }
 
-    if (dbresult_query_rows(result) == 0) goto failed;
+    if (dbresult_query_rows(result) == 0) {
+        __model_set_status(MODEL_ERR_NOTFOUND);
+        goto failed;
+    }
 
     array = __model_fill_array(create_instance, result);
+    if (array == NULL)
+        __model_set_status(MODEL_ERR_ALLOC);
 
     failed:
 
@@ -2730,13 +2912,23 @@ array_t* model_list(const char* dbid, void*(create_instance)(void), const char* 
 }
 
 void* model_prepared_one(const char* dbid, void*(create_instance)(void), const char* stat_name, const char* sql, array_t* params) {
+    __model_set_status(MODEL_OK);
+
     void* record = NULL;
     dbresult_t* result = dbprepared(dbid, stat_name, sql, params);
-    if (!dbresult_ok(result)) goto failed;
+    if (!dbresult_ok(result)) {
+        __model_set_db_error(result);
+        goto failed;
+    }
 
-    if (dbresult_query_rows(result) == 0) goto failed;
+    if (dbresult_query_rows(result) == 0) {
+        __model_set_status(MODEL_ERR_NOTFOUND);
+        goto failed;
+    }
 
     record = __model_fill_one(create_instance, result);
+    if (record == NULL)
+        __model_set_status(MODEL_ERR_ALLOC);
 
     failed:
 
@@ -2746,13 +2938,23 @@ void* model_prepared_one(const char* dbid, void*(create_instance)(void), const c
 }
 
 array_t* model_prepared_list(const char* dbid, void*(create_instance)(void), const char* stat_name, const char* sql, array_t* params) {
+    __model_set_status(MODEL_OK);
+
     array_t* array = NULL;
     dbresult_t* result = dbprepared(dbid, stat_name, sql, params);
-    if (!dbresult_ok(result)) goto failed;
+    if (!dbresult_ok(result)) {
+        __model_set_db_error(result);
+        goto failed;
+    }
 
-    if (dbresult_query_rows(result) == 0) goto failed;
+    if (dbresult_query_rows(result) == 0) {
+        __model_set_status(MODEL_ERR_NOTFOUND);
+        goto failed;
+    }
 
     array = __model_fill_array(create_instance, result);
+    if (array == NULL)
+        __model_set_status(MODEL_ERR_ALLOC);
 
     failed:
 

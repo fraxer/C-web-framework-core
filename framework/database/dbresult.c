@@ -13,6 +13,7 @@ dbresult_t* dbresult_create(void) {
     if (result == NULL) return NULL;
 
     result->ok = 0;
+    result->error = NULL;
     result->query = NULL;
     result->current = NULL;
 
@@ -91,8 +92,27 @@ int dbresult_ok(dbresult_t* result) {
     return result->ok;
 }
 
+const char* dbresult_error(dbresult_t* result) {
+    if (result == NULL) return NULL;
+
+    return result->error;
+}
+
+void dbresult_set_error(dbresult_t* result, const char* error) {
+    if (result == NULL) return;
+
+    free(result->error);
+    result->error = NULL;
+
+    if (error == NULL || error[0] == '\0') return;
+
+    result->error = strdup(error);
+}
+
 void dbresult_free(dbresult_t* result) {
     if (result == NULL) return;
+
+    free(result->error);
 
     dbresultquery_t* query = result->query;
     while (query) {

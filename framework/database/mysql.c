@@ -286,12 +286,14 @@ dbresult_t* __process_result(void* connection, dbresult_t* result) {
         }
         else if (mysql_field_count(myconnection->connection) != 0) {
             log_error("Mysql error: %s\n", mysql_error(myconnection->connection));
+            dbresult_set_error(result, mysql_error(myconnection->connection));
             result->ok = 0;
             break;
         }
 
         if ((status = mysql_next_result(myconnection->connection)) > 0) {
             log_error("Mysql error: %s\n", mysql_error(myconnection->connection));
+            dbresult_set_error(result, mysql_error(myconnection->connection));
             result->ok = 0;
         }
 

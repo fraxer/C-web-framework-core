@@ -692,3 +692,97 @@ TEST_DB(test_dbprepared_prepare_and_reuse) {
     TEST_ASSERT_EQUAL(1, dbresult_query_rows(r2), "second call should return one row");
     dbresult_free(r2);
 }
+
+// ============================================================================
+// Error contract (R7): model_last_status() / model_last_error()
+// ============================================================================
+
+TEST_DB(test_model_status_ok_on_get) {
+    TEST_SUITE("error_contract");
+    TEST_CASE("successful model_get sets MODEL_OK");
+
+    const char* dbid = testdb_dbid();
+    int id = __insert_test_row("OkStatus", 3, NULL);
+    TEST_ASSERT(id > 0, "insert should return valid id");
+
+    array_t* params = array_create();
+    mparams_fill_array(params, mparam_int(id, id));
+
+    test_item_t* item = model_get(dbid, test_item_instance, params);
+    array_free(params);
+    TEST_ASSERT_NOT_NULL(item, "model_get should return item");
+    TEST_ASSERT_EQUAL(MODEL_OK, model_last_status(), "status should be MODEL_OK");
+    TEST_ASSERT_NULL((void*)model_last_error(), "no error text on success");
+
+    if (item != NULL) test_item_free(item);
+}
+
+TEST_DB(test_model_status_notfound_on_get) {
+    TEST_SUITE("error_contract");
+    TEST_CASE("missing row -> NULL + MODEL_ERR_NOTFOUND");
+
+    const char* dbid = testdb_dbid();
+
+    array_t* params = array_create();
+    mparams_fill_array(params, mparam_int(id, 99999));
+
+    test_item_t* item = model_get(dbid, test_item_instance, params);
+    array_free(params);
+
+    TEST_ASSERT_NULL(item, "model_get should return NULL for missing row");
+    TEST_ASSERT_EQUAL(MODEL_ERR_NOTFOUND, model_last_status(), "status should be NOTFOUND");
+    TEST_ASSERT_NULL((void*)model_last_error(), "not-found is not a DB error");
+}
+
+TEST_DB(test_model_status_notfound_on_one) {
+    TEST_SUITE("error_contract");
+    TEST_CASE("model_one with no rows -> NULL + MODEL_ERR_NOTFOUND");
+
+    const char* dbid = testdb_dbid();
+
+    array_t* params = array_create();
+    mparams_fill_array(params, mparam_int(id, 99999));
+
+    test_item_t* item = model_one(dbid, test_item_instance,
+        "SELECT * FROM test_items WHERE id = :id", params);
+    array_free(params);
+
+    TEST_ASSERT_NULL(item, "model_one should return NULL for missing row");
+    TEST_ASSERT_EQUAL(MODEL_ERR_NOTFOUND, model_last_status(), "status should be NOTFOUND");
+}
+
+TEST_DB(test_model_status_param_on_null_arg) {
+    TEST_SUITE("error_contract");
+    TEST_CASE("model_create(NULL) -> 0 + MODEL_ERR_PARAM");
+
+    const char* dbid = testdb_dbid();
+
+    int res = model_create(dbid, NULL);
+    TEST_ASSERT_EQUAL(0, res, "model_create(NULL) should return 0");
+    TEST_ASSERT_EQUAL(MODEL_ERR_PARAM, model_last_status(), "status should be PARAM");
+    TEST_ASSERT_NULL((void*)model_last_error(), "param error is not a DB error");
+}
+
+TEST_DB(test_model_status_db_error_on_create) {
+    TEST_SUITE("error_contract");
+    TEST_CASE("duplicate primary key -> 0 + MODEL_ERR_DB with text");
+
+    const char* dbid = testdb_dbid();
+    int id = __insert_test_row("Dup", 1, NULL);
+    TEST_ASSERT(id > 0, "insert should return valid id");
+
+    test_item_t* item = test_item_instance();
+    TEST_ASSERT_NOT_NULL(item, "instance should be created");
+    if (item == NULL) return;
+
+    // Reuse the existing row's primary key to trigger a unique violation.
+    model_set_int(model_field(&item->record, TEST_ITEM_COL_ID), id);
+    model_set_text(model_field(&item->record, TEST_ITEM_COL_NAME), "Dup2");
+
+    int res = model_create(dbid, item);
+    TEST_ASSERT_EQUAL(0, res, "model_create should fail on duplicate key");
+    TEST_ASSERT_EQUAL(MODEL_ERR_DB, model_last_status(), "status should be MODEL_ERR_DB");
+    TEST_ASSERT_NOT_NULL((void*)model_last_error(), "model_last_error should carry driver text");
+
+    test_item_free(item);
+}

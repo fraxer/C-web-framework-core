@@ -34,6 +34,8 @@ typedef struct dbresultquery {
 typedef struct dbresult {
     int ok;
 
+    char* error; // driver error text (heap, owned); NULL when ok or unavailable
+
     dbresultquery_t* query;
     dbresultquery_t* current;
 } dbresult_t;

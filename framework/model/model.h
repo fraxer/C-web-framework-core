@@ -435,6 +435,34 @@ typedef struct model {
     const char* table;              /* effective table; defaults to schema->table, per-instance overridable */
 } model_t;
 
+/* ---------------------------------------------------------------------------
+ * Error contract (R7)
+ *
+ * The CRUD/query functions keep their existing returns (NULL / 0/1): a NULL
+ * object or a 0 still means "did not succeed". To let a caller tell *why*
+ * without changing signatures, each public model operation also records a
+ * thread-local status (errno-style). Read it right after the call:
+ *
+ *   user_t* u = user_get(params);
+ *   if (u == NULL) {
+ *       if (model_last_status() == MODEL_ERR_NOTFOUND) send_default(404);
+ *       else send_default(500); // log model_last_error()
+ *   }
+ *
+ * The status and error text are valid only until the next model operation in
+ * the same thread.
+ * ------------------------------------------------------------------------- */
+typedef enum {
+    MODEL_OK = 0,
+    MODEL_ERR_NOTFOUND,   /* query ran, returned 0 rows */
+    MODEL_ERR_DB,         /* driver/query error (see model_last_error) */
+    MODEL_ERR_PARAM,      /* invalid arguments (NULL dbid/arg, empty params) */
+    MODEL_ERR_ALLOC       /* out of memory / value conversion failure */
+} model_status_e;
+
+model_status_e model_last_status(void);  /* status of the last op in this thread */
+const char*    model_last_error(void);   /* DB error text for MODEL_ERR_DB, else NULL */
+
 /* Initialize an embedded record: allocates and default-inits the cell array
    from the schema. The record must be the first member of the concrete model
    struct, so a concrete pointer can be passed wherever `void* arg` is taken. */
