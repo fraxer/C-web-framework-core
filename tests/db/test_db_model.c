@@ -786,3 +786,238 @@ TEST_DB(test_model_status_db_error_on_create) {
 
     test_item_free(item);
 }
+
+// ============================================================================
+// model_find_one / model_find_list tests (R4 typed query builder)
+// ============================================================================
+
+// A bare, stack-allocated int cell usable as a condition value. Used to build
+// contiguous IN-lists; the lazily formatted _string buffer is freed by hand.
+static mfield_t __cond_int(int v) {
+    mfield_t f;
+    memset(&f, 0, sizeof(f));
+    f.type = MODEL_INT;
+    f.value._int = v;
+    return f;
+}
+
+TEST_DB(test_model_find_one_eq) {
+    TEST_SUITE("model_find_one");
+    TEST_CASE("single EQ condition returns the matching row");
+
+    const char* dbid = testdb_dbid();
+    int id = __insert_test_row("Gamma", 7, "g-desc");
+    TEST_ASSERT(id > 0, "insert should succeed");
+
+    mfield_t* val = field_create_int("status", 7);
+    mcond_t conds[] = { { .column = TEST_ITEM_COL_STATUS, .op = MOP_EQ, .value = val } };
+    mquery_t q = { .conds = conds, .conds_count = 1, .order_column = -1, .limit = -1, .offset = -1 };
+
+    test_item_t* item = model_find_one(dbid, test_item_instance, &q);
+    model_param_free(val);
+
+    TEST_ASSERT_NOT_NULL(item, "model_find_one should return a row");
+    if (item == NULL) return;
+
+    TEST_ASSERT_EQUAL(id, model_int(model_field(&item->record, TEST_ITEM_COL_ID)), "id should match");
+    TEST_ASSERT_STR_EQUAL("Gamma", str_get(model_text(model_field(&item->record, TEST_ITEM_COL_NAME))), "name should match");
+
+    test_item_free(item);
+}
+
+TEST_DB(test_model_find_one_not_found) {
+    TEST_SUITE("model_find_one");
+    TEST_CASE("no match returns NULL + MODEL_ERR_NOTFOUND");
+
+    const char* dbid = testdb_dbid();
+
+    mfield_t* val = field_create_int("status", 999999);
+    mcond_t conds[] = { { .column = TEST_ITEM_COL_STATUS, .op = MOP_EQ, .value = val } };
+    mquery_t q = { .conds = conds, .conds_count = 1, .order_column = -1, .limit = -1, .offset = -1 };
+
+    test_item_t* item = model_find_one(dbid, test_item_instance, &q);
+    model_param_free(val);
+
+    TEST_ASSERT_NULL(item, "model_find_one should return NULL for no match");
+    TEST_ASSERT_EQUAL(MODEL_ERR_NOTFOUND, model_last_status(), "status should be NOTFOUND");
+}
+
+TEST_DB(test_model_find_list_range_order_limit) {
+    TEST_SUITE("model_find_list");
+    TEST_CASE("GT condition with ORDER BY DESC and LIMIT/OFFSET");
+
+    const char* dbid = testdb_dbid();
+    int id1 = __insert_test_row("R1", 10, NULL);
+    int id2 = __insert_test_row("R2", 20, NULL);
+    int id3 = __insert_test_row("R3", 30, NULL);
+    int id4 = __insert_test_row("R4", 40, NULL);
+    TEST_ASSERT(id1 > 0 && id2 > 0 && id3 > 0 && id4 > 0, "inserts should succeed");
+
+    // status > 15 -> {20,30,40}; ORDER BY status DESC -> [40,30,20];
+    // LIMIT 2 OFFSET 1 -> [30,20].
+    mfield_t* val = field_create_int("status", 15);
+    mcond_t conds[] = { { .column = TEST_ITEM_COL_STATUS, .op = MOP_GT, .value = val } };
+    mquery_t q = {
+        .conds = conds, .conds_count = 1,
+        .order_column = TEST_ITEM_COL_STATUS, .order_dir = MORDER_DESC,
+        .limit = 2, .offset = 1
+    };
+
+    array_t* list = model_find_list(dbid, test_item_instance, &q);
+    model_param_free(val);
+
+    TEST_ASSERT_NOT_NULL(list, "model_find_list should return matches");
+    if (list == NULL) return;
+
+    TEST_ASSERT_EQUAL_SIZE(2, array_size(list), "LIMIT 2 OFFSET 1 yields two rows");
+    test_item_t* a = array_get(list, 0);
+    test_item_t* b = array_get(list, 1);
+    TEST_ASSERT_EQUAL(30, model_int(model_field(&a->record, TEST_ITEM_COL_STATUS)), "first is status=30");
+    TEST_ASSERT_EQUAL(20, model_int(model_field(&b->record, TEST_ITEM_COL_STATUS)), "second is status=20");
+
+    array_free(list);
+}
+
+TEST_DB(test_model_find_list_ne_order_asc) {
+    TEST_SUITE("model_find_list");
+    TEST_CASE("NE condition with ORDER BY ASC");
+
+    const char* dbid = testdb_dbid();
+    __insert_test_row("N1", 1, NULL);
+    __insert_test_row("N2", 2, NULL);
+    __insert_test_row("N3", 1, NULL);
+
+    // status != 2 -> the two status=1 rows; ORDER BY id ASC.
+    mfield_t* val = field_create_int("status", 2);
+    mcond_t conds[] = { { .column = TEST_ITEM_COL_STATUS, .op = MOP_NE, .value = val } };
+    mquery_t q = {
+        .conds = conds, .conds_count = 1,
+        .order_column = TEST_ITEM_COL_ID, .order_dir = MORDER_ASC,
+        .limit = -1, .offset = -1
+    };
+
+    array_t* list = model_find_list(dbid, test_item_instance, &q);
+    model_param_free(val);
+
+    TEST_ASSERT_NOT_NULL(list, "model_find_list should return matches");
+    if (list == NULL) return;
+    TEST_ASSERT_EQUAL_SIZE(2, array_size(list), "two rows have status != 2");
+    array_free(list);
+}
+
+TEST_DB(test_model_find_list_in) {
+    TEST_SUITE("model_find_list");
+    TEST_CASE("IN condition binds each value");
+
+    const char* dbid = testdb_dbid();
+    int id1 = __insert_test_row("I1", 1, NULL);
+    int id2 = __insert_test_row("I2", 1, NULL);
+    int id3 = __insert_test_row("I3", 1, NULL);
+    TEST_ASSERT(id1 > 0 && id2 > 0 && id3 > 0, "inserts should succeed");
+
+    mfield_t in_vals[] = { __cond_int(id1), __cond_int(id3) };
+    mcond_t conds[] = { { .column = TEST_ITEM_COL_ID, .op = MOP_IN, .value = in_vals, .value_count = 2 } };
+    mquery_t q = {
+        .conds = conds, .conds_count = 1,
+        .order_column = TEST_ITEM_COL_ID, .order_dir = MORDER_ASC,
+        .limit = -1, .offset = -1
+    };
+
+    array_t* list = model_find_list(dbid, test_item_instance, &q);
+    str_free(in_vals[0].value._string);
+    str_free(in_vals[1].value._string);
+
+    TEST_ASSERT_NOT_NULL(list, "model_find_list should return matches");
+    if (list == NULL) return;
+
+    TEST_ASSERT_EQUAL_SIZE(2, array_size(list), "IN matches id1 and id3");
+    test_item_t* a = array_get(list, 0);
+    test_item_t* b = array_get(list, 1);
+    TEST_ASSERT_EQUAL(id1, model_int(model_field(&a->record, TEST_ITEM_COL_ID)), "first is id1");
+    TEST_ASSERT_EQUAL(id3, model_int(model_field(&b->record, TEST_ITEM_COL_ID)), "second is id3");
+
+    array_free(list);
+}
+
+TEST_DB(test_model_find_list_is_null) {
+    TEST_SUITE("model_find_list");
+    TEST_CASE("IS NULL condition takes no bound value");
+
+    const char* dbid = testdb_dbid();
+    __insert_test_row("HasDesc", 1, "present");
+    __insert_test_row("NoDesc1", 1, NULL);
+    __insert_test_row("NoDesc2", 1, NULL);
+
+    mcond_t conds[] = { { .column = TEST_ITEM_COL_DESCRIPTION, .op = MOP_IS_NULL } };
+    mquery_t q = { .conds = conds, .conds_count = 1, .order_column = -1, .limit = -1, .offset = -1 };
+
+    array_t* list = model_find_list(dbid, test_item_instance, &q);
+
+    TEST_ASSERT_NOT_NULL(list, "model_find_list should return matches");
+    if (list == NULL) return;
+    TEST_ASSERT_EQUAL_SIZE(2, array_size(list), "two rows have NULL description");
+    array_free(list);
+}
+
+TEST_DB(test_model_find_list_like) {
+    TEST_SUITE("model_find_list");
+    TEST_CASE("LIKE condition with bound pattern");
+
+    const char* dbid = testdb_dbid();
+    __insert_test_row("apple", 1, NULL);
+    __insert_test_row("apricot", 1, NULL);
+    __insert_test_row("banana", 1, NULL);
+
+    mfield_t* val = field_create_text("name", "ap%");
+    mcond_t conds[] = { { .column = TEST_ITEM_COL_NAME, .op = MOP_LIKE, .value = val } };
+    mquery_t q = {
+        .conds = conds, .conds_count = 1,
+        .order_column = TEST_ITEM_COL_NAME, .order_dir = MORDER_ASC,
+        .limit = -1, .offset = -1
+    };
+
+    array_t* list = model_find_list(dbid, test_item_instance, &q);
+    model_param_free(val);
+
+    TEST_ASSERT_NOT_NULL(list, "model_find_list should return matches");
+    if (list == NULL) return;
+    TEST_ASSERT_EQUAL_SIZE(2, array_size(list), "two names match 'ap%'");
+    array_free(list);
+}
+
+TEST_DB(test_model_find_one_injection) {
+    TEST_SUITE("model_find_one");
+    TEST_CASE("malicious condition value is bound, not interpolated");
+
+    const char* dbid = testdb_dbid();
+    const char* evil = "x' OR '1'='1";
+    __insert_test_row("legit", 1, NULL);
+
+    // The payload is bound as a name; it matches no row and cannot alter the query.
+    mfield_t* val = field_create_text("name", evil);
+    mcond_t conds[] = { { .column = TEST_ITEM_COL_NAME, .op = MOP_EQ, .value = val } };
+    mquery_t q = { .conds = conds, .conds_count = 1, .order_column = -1, .limit = -1, .offset = -1 };
+
+    test_item_t* item = model_find_one(dbid, test_item_instance, &q);
+    model_param_free(val);
+
+    TEST_ASSERT_NULL(item, "injection payload must match nothing, not bypass the filter");
+    TEST_ASSERT_EQUAL(MODEL_ERR_NOTFOUND, model_last_status(), "status should be NOTFOUND");
+
+    // Table must still exist.
+    dbresult_t* r = dbqueryf(dbid,
+        "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'test_items')");
+    TEST_ASSERT_STR_EQUAL("t", dbresult_field(r, "exists")->value, "test_items table must still exist");
+    dbresult_free(r);
+}
+
+TEST_DB(test_model_find_one_null_query_param) {
+    TEST_SUITE("model_find_one");
+    TEST_CASE("NULL query -> NULL + MODEL_ERR_PARAM");
+
+    const char* dbid = testdb_dbid();
+
+    test_item_t* item = model_find_one(dbid, test_item_instance, NULL);
+    TEST_ASSERT_NULL(item, "NULL query should return NULL");
+    TEST_ASSERT_EQUAL(MODEL_ERR_PARAM, model_last_status(), "status should be PARAM");
+}
