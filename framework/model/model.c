@@ -1140,7 +1140,10 @@ void __model_value_clear(mvalue_t* value, mtype_e type) {
     case MODEL_DOUBLE:
     case MODEL_DECIMAL:
     case MODEL_MONEY:
-        value->_short = 0;
+        /* Zero the largest numeric scalar in the union so every narrower member
+           (_short/_int/_bigint/_float/_double/_ldouble) is fully cleared, not
+           just its first two bytes. */
+        memset(&value->_short, 0, sizeof(value->_ldouble));
         break;
 
     case MODEL_DATE:
@@ -1215,7 +1218,11 @@ int __model_fill(const int row, const int fields_count, mfield_t* first_field, d
             if (modelfield == NULL)
                 return 0;
 
-            if (strcmp(modelfield->name, result->current->fields[col].value) == 0) {
+            const char* col_name = dbresult_col_name(result, col);
+            if (col_name == NULL)
+                return 0;
+
+            if (strcmp(modelfield->name, col_name) == 0) {
                 switch (modelfield->type) {
                 case MODEL_BOOL:
                     if (!model_set_bool_from_str(modelfield, field->value))
@@ -2374,7 +2381,13 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
         if (i > 0)
             str_append(sql, " AND ", 5);
 
-        str_append(sql, param->name, strlen(param->name));
+        str_t* escaped = conn->escape_identifier(conn, param->name);
+        if (escaped == NULL) {
+            __model_set_status(MODEL_ERR_ALLOC);
+            goto failed;
+        }
+        str_append(sql, str_get(escaped), str_size(escaped));
+        str_free(escaped);
 
         if (param->is_null) {
             str_append(sql, " IS NULL", 8);
@@ -2613,7 +2626,13 @@ int model_update(const char* dbid, void* arg) {
         if (iter_set > 0)
             str_appendc(set_params, ',');
 
-        str_append(set_params, field->name, strlen(field->name));
+        str_t* escaped = conn->escape_identifier(conn, field->name);
+        if (escaped == NULL) {
+            __model_set_status(MODEL_ERR_ALLOC);
+            goto failed;
+        }
+        str_append(set_params, str_get(escaped), str_size(escaped));
+        str_free(escaped);
         str_appendc(set_params, '=');
 
         if (!__model_append_bind(conn, set_params, field, bind, &idx)) {
@@ -2740,7 +2759,13 @@ int model_delete(const char* dbid, void* arg) {
         if (iter_where > 0)
             str_append(where_params, " AND ", 5);
 
-        str_append(where_params, field->name, strlen(field->name));
+        str_t* escaped = conn->escape_identifier(conn, field->name);
+        if (escaped == NULL) {
+            __model_set_status(MODEL_ERR_ALLOC);
+            goto failed;
+        }
+        str_append(where_params, str_get(escaped), str_size(escaped));
+        str_free(escaped);
         str_appendc(where_params, '=');
 
         if (!__model_append_bind(conn, where_params, field, bind, &idx)) {
@@ -2826,7 +2851,13 @@ int model_delete_by_params(const char* dbid, void* arg, array_t* params) {
             if (iter_where > 0)
                 str_append(where_params, " AND ", 5);
 
-            str_append(where_params, field->name, strlen(field->name));
+            str_t* escaped = conn->escape_identifier(conn, field->name);
+            if (escaped == NULL) {
+                __model_set_status(MODEL_ERR_ALLOC);
+                goto failed;
+            }
+            str_append(where_params, str_get(escaped), str_size(escaped));
+            str_free(escaped);
 
             if (field->is_null) {
                 str_append(where_params, " IS NULL", 8);

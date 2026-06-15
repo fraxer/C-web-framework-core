@@ -208,6 +208,14 @@ int dbresult_query_cols(dbresult_t* result) {
     return result->current->cols;
 }
 
+const char* dbresult_col_name(dbresult_t* result, int col) {
+    if (result == NULL || result->current == NULL) return NULL;
+    if (result->current->fields == NULL) return NULL;
+    if (col < 0 || col >= result->current->cols) return NULL;
+
+    return result->current->fields[col].value;
+}
+
 db_table_cell_t* dbresult_field(dbresult_t* result, const char* field) {
     if (field == NULL) return dbresult_cell(result, result->current->current_row, result->current->current_col);
 

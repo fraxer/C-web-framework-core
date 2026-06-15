@@ -40,6 +40,11 @@ int dbresult_query_rows(dbresult_t*);
 
 int dbresult_query_cols(dbresult_t*);
 
+// Name of result column `col` (the field header), or NULL if out of range /
+// when the result has no field headers. Wraps the driver-specific header
+// layout so callers need not reach into dbresult internals.
+const char* dbresult_col_name(dbresult_t*, int col);
+
 db_table_cell_t* dbresult_field(dbresult_t*, const char*);
 
 db_table_cell_t* dbresult_cell(dbresult_t*, int, int);

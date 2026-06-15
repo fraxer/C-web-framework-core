@@ -1048,3 +1048,113 @@ TEST_DB(test_model_find_one_null_query_param) {
     TEST_ASSERT_NULL(item, "NULL query should return NULL");
     TEST_ASSERT_EQUAL(MODEL_ERR_PARAM, model_last_status(), "status should be PARAM");
 }
+
+// ============================================================================
+// Identifier escaping: a column whose name is a SQL reserved word.
+//
+// Schema-path (model_create / model_find_one) has always escaped column names
+// via escape_identifier. The params-path (model_get / model_update /
+// model_delete_by_params) previously inlined field->name verbatim, so a
+// reserved word like "order" produced `WHERE order = $1` — a syntax error.
+// This test pins escaping parity across every CRUD path.
+// ============================================================================
+
+enum test_reserved_column {
+    TEST_RESERVED_COL_ID = 0,
+    TEST_RESERVED_COL_ORDER,
+    TEST_RESERVED_COL_COLUMNS_COUNT
+};
+
+typedef struct {
+    model_t record;
+} test_reserved_t;
+
+static const mcolumn_t __test_reserved_columns[TEST_RESERVED_COL_COLUMNS_COUNT] = {
+    [TEST_RESERVED_COL_ID]    = { .name = "id",    .type = MODEL_INT, .is_primary = 1, .auto_increment = 1 },
+    [TEST_RESERVED_COL_ORDER] = { .name = "order", .type = MODEL_INT },
+};
+
+static const int __test_reserved_primary_keys[] = { TEST_RESERVED_COL_ID };
+
+static const mschema_t __test_reserved_schema = {
+    .table = "test_reserved",
+    .columns = __test_reserved_columns,
+    .columns_count = TEST_RESERVED_COL_COLUMNS_COUNT,
+    .primary_keys = __test_reserved_primary_keys,
+    .primary_keys_count = 1,
+};
+
+static void* test_reserved_instance(void) {
+    test_reserved_t* item = calloc(1, sizeof * item);
+    if (item == NULL) return NULL;
+    if (!model_init(&item->record, &__test_reserved_schema)) {
+        free(item);
+        return NULL;
+    }
+    return item;
+}
+
+static void test_reserved_free(test_reserved_t* item) {
+    model_free(item);
+}
+
+static void __ensure_reserved_table(void) {
+    const char* dbid = testdb_dbid();
+    // "order" is a SQL reserved word and must be quoted in DDL too.
+    dbresult_t* r = dbquery(dbid,
+        "CREATE TABLE IF NOT EXISTS test_reserved ("
+            "id SERIAL PRIMARY KEY,"
+            "\"order\" INT NOT NULL"
+        ")",
+        NULL);
+    dbresult_free(r);
+    // Start each run from a clean table so assertions are deterministic.
+    r = dbquery(dbid, "DELETE FROM test_reserved", NULL);
+    dbresult_free(r);
+}
+
+TEST_DB(test_model_reserved_word_column) {
+    TEST_SUITE("model identifier escaping");
+    TEST_CASE("SQL reserved word 'order' works across every CRUD path");
+
+    const char* dbid = testdb_dbid();
+    __ensure_reserved_table();
+
+    // model_create — schema-path escaping (control).
+    test_reserved_t* item = test_reserved_instance();
+    TEST_ASSERT_NOT_NULL(item, "instance should be created");
+    model_set_int(model_field(&item->record, TEST_RESERVED_COL_ORDER), 42);
+    TEST_ASSERT_EQUAL(1, model_create(dbid, item), "model_create should return 1");
+    const int created_id = model_int(model_field(&item->record, TEST_RESERVED_COL_ID));
+    TEST_ASSERT(created_id > 0, "generated id should be read back");
+    test_reserved_free(item);
+
+    // model_get — params-path escaping. Without it, `WHERE order = $1` is a
+    // SQL syntax error because "order" is reserved.
+    array_t* params = array_create();
+    mparams_fill_array(params, mparam_int(order, 42));
+    test_reserved_t* got = model_get(dbid, test_reserved_instance, params);
+    array_free(params);
+    TEST_ASSERT_NOT_NULL(got, "model_get by reserved-word column must succeed");
+    TEST_ASSERT_EQUAL(42, model_int(model_field(&got->record, TEST_RESERVED_COL_ORDER)), "order round-trips");
+
+    // model_find_one — schema-path escaping (control).
+    mfield_t* val = field_create_int("order", 42);
+    mcond_t conds[] = { { .column = TEST_RESERVED_COL_ORDER, .op = MOP_EQ, .value = val } };
+    mquery_t q = { .conds = conds, .conds_count = 1, .order_column = -1, .limit = -1, .offset = -1 };
+    test_reserved_t* found = model_find_one(dbid, test_reserved_instance, &q);
+    model_param_free(val);
+    TEST_ASSERT_NOT_NULL(found, "model_find_one on reserved-word column must succeed");
+    test_reserved_free(found);
+
+    // model_update — params-path escaping in SET ("order" = $1).
+    model_set_int(model_field(&got->record, TEST_RESERVED_COL_ORDER), 99);
+    TEST_ASSERT_EQUAL(1, model_update(dbid, got), "model_update should return 1");
+    test_reserved_free(got);
+
+    // model_delete — cleanup by PK.
+    test_reserved_t* del = test_reserved_instance();
+    model_set_int(model_field(&del->record, TEST_RESERVED_COL_ID), created_id);
+    TEST_ASSERT_EQUAL(1, model_delete(dbid, del), "model_delete should return 1");
+    test_reserved_free(del);
+}
