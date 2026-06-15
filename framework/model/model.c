@@ -19,7 +19,6 @@ static int __model_fill(const int row, const int fields_count, mfield_t* first_f
 static int __model_set_binary(mfield_t* field, const char* value, const size_t size);
 static int __model_set_date(mfield_t* field, tm_t* value);
 static int __model_allow_field_in_json(const char* field_name, char** display_fields);
-static mfield_t __model_tmpfield_create(mfield_t* source_field);
 static int __str_modify_add_symbols_before(str_t* str, char add_symbol, char before_symbol);
 static json_token_t* __model_json_object_fields(mfield_t* first_field, int fields_count, char** display_fields);
 static json_token_t* __json_clone(const json_token_t* src);
@@ -70,6 +69,18 @@ const char* model_last_error(void) {
     return NULL;
 }
 
+/* Borrow a pooled connection for `dbid` and release the instance handle.
+   Returns NULL when the pool has no connection; the caller reports it as
+   MODEL_ERR_DB. Centralizes the acquire/free dance repeated in every CRUD
+   and query function. */
+static dbconnection_t* __model_acquire_conn(const char* dbid) {
+    dbinstance_t* dbinst = dbinstance(dbid);
+    if (dbinst == NULL) return NULL;
+    dbconnection_t* conn = dbinst->connection;
+    dbinstance_free(dbinst);
+    return conn;
+}
+
 /* Locale-independent numeric formatting.
    Numeric SQL literals and JSON numbers must always use '.' as the decimal
    separator. Under a locale such as ru_RU (LC_NUMERIC with ',') snprintf("%f")
@@ -100,6 +111,81 @@ static ssize_t __snprintf_c(char* buf, size_t n, const char* fmt, ...) {
 
     return size;
 }
+
+/* ---------------------------------------------------------------------------
+ * Type dispatch table (B1)
+ *
+ * One table indexed by mtype_e collapses the per-type switches in
+ * __model_fill, model_field_to_string, __model_value_clear and
+ * __model_value_free into a single indirect call each. Adding a type becomes
+ * one row instead of edits in four switches.
+ *
+ * from_str is normalized to (mfield_t*, const char*, size_t): 2-argument
+ * parsers (numeric, temporal, json, array) get a wrapper that ignores size;
+ * the 3-argument string/binary parsers are bound directly.
+ * ------------------------------------------------------------------------- */
+typedef int    (*__from_str_fn)(mfield_t*, const char*, size_t);
+typedef str_t* (*__to_str_fn)(mfield_t*);
+typedef void   (*__value_fn)(mvalue_t*);
+
+#define __FROM_STR_IGNORE_SIZE(NAME) \
+    static int __from_str_##NAME(mfield_t* f, const char* v, size_t n) { \
+        (void)n; \
+        return model_set_##NAME##_from_str(f, v); \
+    }
+
+__FROM_STR_IGNORE_SIZE(bool)
+__FROM_STR_IGNORE_SIZE(smallint)
+__FROM_STR_IGNORE_SIZE(int)
+__FROM_STR_IGNORE_SIZE(bigint)
+__FROM_STR_IGNORE_SIZE(float)
+__FROM_STR_IGNORE_SIZE(double)
+__FROM_STR_IGNORE_SIZE(decimal)
+__FROM_STR_IGNORE_SIZE(money)
+__FROM_STR_IGNORE_SIZE(timestamp)
+__FROM_STR_IGNORE_SIZE(timestamptz)
+__FROM_STR_IGNORE_SIZE(date)
+__FROM_STR_IGNORE_SIZE(time)
+__FROM_STR_IGNORE_SIZE(timetz)
+__FROM_STR_IGNORE_SIZE(json)
+__FROM_STR_IGNORE_SIZE(array)
+
+static void __value_clear_numeric(mvalue_t* v)  { memset(&v->_short, 0, sizeof(v->_ldouble)); }
+static void __value_clear_temporal(mvalue_t* v) { memset(&v->_tm, 0, sizeof(tm_t)); }
+static void __value_clear_json(mvalue_t* v)     { json_clear(v->_jsondoc); }
+static void __value_noop(mvalue_t* v)           { (void)v; }
+
+static void __value_free_json(mvalue_t* v)      { json_free(v->_jsondoc); }
+static void __value_free_enum(mvalue_t* v)      { enums_free(v->_enum); }
+static void __value_free_array(mvalue_t* v)     { array_free(v->_array); }
+
+static const struct {
+    __from_str_fn from_str;
+    __to_str_fn   to_str;
+    __value_fn    value_clear;
+    __value_fn    value_free;
+} __type_ops[MTYPE_COUNT] = {
+    [MODEL_BOOL]        = { __from_str_bool,        model_bool_to_str,        __value_clear_numeric,  __value_noop        },
+    [MODEL_SMALLINT]    = { __from_str_smallint,    model_smallint_to_str,    __value_clear_numeric,  __value_noop        },
+    [MODEL_INT]         = { __from_str_int,         model_int_to_str,         __value_clear_numeric,  __value_noop        },
+    [MODEL_BIGINT]      = { __from_str_bigint,      model_bigint_to_str,      __value_clear_numeric,  __value_noop        },
+    [MODEL_FLOAT]       = { __from_str_float,       model_float_to_str,       __value_clear_numeric,  __value_noop        },
+    [MODEL_DOUBLE]      = { __from_str_double,      model_double_to_str,      __value_clear_numeric,  __value_noop        },
+    [MODEL_DECIMAL]     = { __from_str_decimal,     model_decimal_to_str,     __value_clear_numeric,  __value_noop        },
+    [MODEL_MONEY]       = { __from_str_money,       model_money_to_str,       __value_clear_numeric,  __value_noop        },
+    [MODEL_DATE]        = { __from_str_date,        model_date_to_str,        __value_clear_temporal, __value_noop        },
+    [MODEL_TIME]        = { __from_str_time,        model_time_to_str,        __value_clear_temporal, __value_noop        },
+    [MODEL_TIMETZ]      = { __from_str_timetz,      model_timetz_to_str,      __value_clear_temporal, __value_noop        },
+    [MODEL_TIMESTAMP]   = { __from_str_timestamp,   model_timestamp_to_str,   __value_clear_temporal, __value_noop        },
+    [MODEL_TIMESTAMPTZ] = { __from_str_timestamptz, model_timestamptz_to_str, __value_clear_temporal, __value_noop        },
+    [MODEL_JSON]        = { __from_str_json,        model_json_to_str,        __value_clear_json,     __value_free_json   },
+    [MODEL_BINARY]      = { model_set_binary_from_str, model_binary,          __value_noop,           __value_noop        },
+    [MODEL_VARCHAR]     = { model_set_varchar_from_str, model_varchar,       __value_noop,           __value_noop        },
+    [MODEL_CHAR]        = { model_set_char_from_str,   model_char,           __value_noop,           __value_noop        },
+    [MODEL_TEXT]        = { model_set_text_from_str,   model_text,           __value_noop,           __value_noop        },
+    [MODEL_ENUM]        = { model_set_enum_from_str,   model_enum,           __value_noop,           __value_free_enum   },
+    [MODEL_ARRAY]       = { __from_str_array,       model_array_to_str,       __value_noop,           __value_free_array  },
+};
 
 /* Convert tm_t to struct tm for strftime/strptime calls */
 struct tm tm_to_strtm(const tm_t* src) {
@@ -1082,236 +1168,52 @@ str_t* model_field_to_string(mfield_t* field) {
         return field->value._string;
     }
 
-    switch (field->type) {
-    case MODEL_BOOL:
-        return model_bool_to_str(field);
-    case MODEL_SMALLINT:
-        return model_smallint_to_str(field);
-    case MODEL_INT:
-        return model_int_to_str(field);
-    case MODEL_BIGINT:
-        return model_bigint_to_str(field);
-    case MODEL_FLOAT:
-        return model_float_to_str(field);
-    case MODEL_DOUBLE:
-        return model_double_to_str(field);
-    case MODEL_DECIMAL:
-        return model_decimal_to_str(field);
-    case MODEL_MONEY:
-        return model_money_to_str(field);
-    case MODEL_DATE:
-        return model_date_to_str(field);
-    case MODEL_TIME:
-        return model_time_to_str(field);
-    case MODEL_TIMETZ:
-        return model_timetz_to_str(field);
-    case MODEL_TIMESTAMP:
-        return model_timestamp_to_str(field);
-    case MODEL_TIMESTAMPTZ:
-        return model_timestamptz_to_str(field);
-    case MODEL_JSON:
-        return model_json_to_str(field);
-    case MODEL_BINARY:
-        return model_binary(field);
-    case MODEL_VARCHAR:
-        return model_varchar(field);
-    case MODEL_CHAR:
-        return model_char(field);
-    case MODEL_TEXT:
-        return model_text(field);
-    case MODEL_ENUM:
-        return model_enum(field);
-    case MODEL_ARRAY:
-        return model_array_to_str(field);
-    }
+    if (field->type < 0 || field->type >= MTYPE_COUNT)
+        return NULL;
 
-    return NULL;
+    return __type_ops[field->type].to_str(field);
 }
 
 void __model_value_clear(mvalue_t* value, mtype_e type) {
     if (value == NULL) return;
+    if (type < 0 || type >= MTYPE_COUNT) return;
 
-    switch (type) {
-    case MODEL_BOOL:
-    case MODEL_SMALLINT:
-    case MODEL_INT:
-    case MODEL_BIGINT:
-    case MODEL_FLOAT:
-    case MODEL_DOUBLE:
-    case MODEL_DECIMAL:
-    case MODEL_MONEY:
-        /* Zero the largest numeric scalar in the union so every narrower member
-           (_short/_int/_bigint/_float/_double/_ldouble) is fully cleared, not
-           just its first two bytes. */
-        memset(&value->_short, 0, sizeof(value->_ldouble));
-        break;
-
-    case MODEL_DATE:
-    case MODEL_TIME:
-    case MODEL_TIMETZ:
-    case MODEL_TIMESTAMP:
-    case MODEL_TIMESTAMPTZ:
-        memset(&value->_tm, 0, sizeof(tm_t));
-        break;
-
-    case MODEL_JSON:
-        json_clear(value->_jsondoc);
-        break;
-
-    case MODEL_ARRAY:
-        break;
-
-    default:
-        break;
-    }
-
+    __type_ops[type].value_clear(value);
     str_clear(value->_string);
 }
 
 void __model_value_free(mvalue_t* value, mtype_e type) {
     if (value == NULL) return;
+    if (type < 0 || type >= MTYPE_COUNT) return;
 
-    switch (type) {
-    case MODEL_BOOL:
-    case MODEL_SMALLINT:
-    case MODEL_INT:
-    case MODEL_BIGINT:
-    case MODEL_FLOAT:
-    case MODEL_DOUBLE:
-    case MODEL_DECIMAL:
-    case MODEL_MONEY:
-        break;
-
-    case MODEL_DATE:
-    case MODEL_TIME:
-    case MODEL_TIMETZ:
-    case MODEL_TIMESTAMP:
-    case MODEL_TIMESTAMPTZ:
-        break;
-
-    case MODEL_JSON:
-        json_free(value->_jsondoc);
-        break;
-
-    case MODEL_ENUM:
-        enums_free(value->_enum);
-        break;
-
-    case MODEL_ARRAY:
-        array_free(value->_array);
-        break;
-
-    default:
-        break;
-    }
-
+    __type_ops[type].value_free(value);
     str_free(value->_string);
     explicit_bzero(value, sizeof(mvalue_t));
 }
 
 int __model_fill(const int row, const int fields_count, mfield_t* first_field, dbresult_t* result) {
     for (int col = 0; col < dbresult_query_cols(result); col++) {
-        const db_table_cell_t* field = dbresult_cell(result, row, col);
+        const char* col_name = dbresult_col_name(result, col);
+        if (col_name == NULL)
+            return 0;
 
         for (int i = 0; i < fields_count; i++) {
             mfield_t* modelfield = first_field + i;
-            if (modelfield == NULL)
+
+            if (strcmp(modelfield->name, col_name) != 0)
+                continue;
+
+            const db_table_cell_t* cell = dbresult_cell(result, row, col);
+            if (cell == NULL)
                 return 0;
 
-            const char* col_name = dbresult_col_name(result, col);
-            if (col_name == NULL)
+            if (modelfield->type < 0 || modelfield->type >= MTYPE_COUNT)
+                return 0;
+            if (!__type_ops[modelfield->type].from_str(modelfield, cell->value, cell->length))
                 return 0;
 
-            if (strcmp(modelfield->name, col_name) == 0) {
-                switch (modelfield->type) {
-                case MODEL_BOOL:
-                    if (!model_set_bool_from_str(modelfield, field->value))
-                        return 0;
-                    break;
-                case MODEL_SMALLINT:
-                    if (!model_set_smallint_from_str(modelfield, field->value))
-                        return 0;
-                    break;
-                case MODEL_INT:
-                    if (!model_set_int_from_str(modelfield, field->value))
-                        return 0;
-                    break;
-                case MODEL_BIGINT:
-                    if (!model_set_bigint_from_str(modelfield, field->value))
-                        return 0;
-                    break;
-                case MODEL_FLOAT:
-                    if (!model_set_float_from_str(modelfield, field->value))
-                        return 0;
-                    break;
-                case MODEL_DOUBLE:
-                    if (!model_set_double_from_str(modelfield, field->value))
-                        return 0;
-                    break;
-                case MODEL_DECIMAL:
-                    if (!model_set_decimal_from_str(modelfield, field->value))
-                        return 0;
-                    break;
-                case MODEL_MONEY:
-                    if (!model_set_money_from_str(modelfield, field->value))
-                        return 0;
-                    break;
-                case MODEL_DATE:
-                    if (!model_set_date_from_str(modelfield, field->value))
-                        return 0;
-                    break;
-                case MODEL_TIME:
-                    if (!model_set_time_from_str(modelfield, field->value))
-                        return 0;
-                    break;
-                case MODEL_TIMETZ:
-                    if (!model_set_timetz_from_str(modelfield, field->value))
-                        return 0;
-                    break;
-                case MODEL_TIMESTAMP:
-                    if (!model_set_timestamp_from_str(modelfield, field->value))
-                        return 0;
-                    break;
-                case MODEL_TIMESTAMPTZ:
-                    if (!model_set_timestamptz_from_str(modelfield, field->value))
-                        return 0;
-                    break;
-                case MODEL_JSON:
-                    if (!model_set_json_from_str(modelfield, field->value))
-                        return 0;
-                    break;
-                case MODEL_BINARY:
-                    if (!model_set_binary_from_str(modelfield, field->value, field->length))
-                        return 0;
-                    break;
-                case MODEL_VARCHAR:
-                    if (!model_set_varchar_from_str(modelfield, field->value, field->length))
-                        return 0;
-                    break;
-                case MODEL_CHAR:
-                    if (!model_set_char_from_str(modelfield, field->value, field->length))
-                        return 0;
-                    break;
-                case MODEL_TEXT:
-                    if (!model_set_text_from_str(modelfield, field->value, field->length))
-                        return 0;
-                    break;
-                case MODEL_ENUM:
-                    if (!model_set_enum_from_str(modelfield, field->value, field->length))
-                        return 0;
-                    break;
-                case MODEL_ARRAY:
-                    if (!model_set_array_from_str(modelfield, field->value))
-                        return 0;
-                    break;
-                default:
-                    return 0;
-                }
-
-                modelfield->dirty = 0;
-                
-                break;
-            }
+            modelfield->dirty = 0;
+            break;
         }
     }
 
@@ -2077,6 +1979,8 @@ static json_token_t* __model_json_object_fields(mfield_t* first_field, int field
         case MODEL_ARRAY:
             token_value = __model_array_to_json(field->value._array);
             break;
+        default:
+            break;   /* MTYPE_COUNT sentinel / unknown type: token_value stays NULL -> goto failed */
         }
 
         if (token_value == NULL) goto failed;
@@ -2107,18 +2011,6 @@ int __model_allow_field_in_json(const char* field_name, char** display_fields) {
     }
 
     return 0;
-}
-
-mfield_t __model_tmpfield_create(mfield_t* source_field) {
-    mfield_t tmpfield = {
-        .type = source_field->type,
-        .dirty = source_field->dirty,
-        .name = source_field->name,
-        .value = source_field->value,
-        .oldvalue = source_field->oldvalue
-    };
-
-    return tmpfield;
 }
 
 int __str_modify_add_symbols_before(str_t* str, char add_symbol, char before_symbol) {
@@ -2333,15 +2225,12 @@ void* model_get(const char* dbid, void*(create_instance)(void), array_t* params)
 
     const mschema_t* schema = record->schema;
 
-    dbinstance_t* dbinst = dbinstance(dbid);
-    if (dbinst == NULL) {
+    dbconnection_t* conn = __model_acquire_conn(dbid);
+    if (conn == NULL) {
         __model_set_status(MODEL_ERR_DB);
         model_free(record);
         return NULL;
     }
-
-    dbconnection_t* conn = dbinst->connection;
-    dbinstance_free(dbinst);
 
     str_t* fields = str_create_empty(256);
     str_t* sql = str_create_empty(256);
@@ -2448,14 +2337,11 @@ int model_create(const char* dbid, void* arg) {
         return 0;
     }
 
-    dbinstance_t* dbinst = dbinstance(dbid);
-    if (dbinst == NULL) {
+    dbconnection_t* conn = __model_acquire_conn(dbid);
+    if (conn == NULL) {
         __model_set_status(MODEL_ERR_DB);
         return 0;
     }
-
-    dbconnection_t* conn = dbinst->connection;
-    dbinstance_free(dbinst);
 
     int res = 0;
     dbresult_t* result = NULL;
@@ -2589,14 +2475,11 @@ int model_update(const char* dbid, void* arg) {
     model_t* record = arg;
     const mschema_t* schema = record->schema;
 
-    dbinstance_t* dbinst = dbinstance(dbid);
-    if (dbinst == NULL) {
+    dbconnection_t* conn = __model_acquire_conn(dbid);
+    if (conn == NULL) {
         __model_set_status(MODEL_ERR_DB);
         return 0;
     }
-
-    dbconnection_t* conn = dbinst->connection;
-    dbinstance_free(dbinst);
 
     int res = 0;
     dbresult_t* result = NULL;
@@ -2729,14 +2612,11 @@ int model_delete(const char* dbid, void* arg) {
         return 0;
     }
 
-    dbinstance_t* dbinst = dbinstance(dbid);
-    if (dbinst == NULL) {
+    dbconnection_t* conn = __model_acquire_conn(dbid);
+    if (conn == NULL) {
         __model_set_status(MODEL_ERR_DB);
         return 0;
     }
-
-    dbconnection_t* conn = dbinst->connection;
-    dbinstance_free(dbinst);
 
     int res = 0;
     dbresult_t* result = NULL;
@@ -2819,14 +2699,11 @@ int model_delete_by_params(const char* dbid, void* arg, array_t* params) {
         return 0;
     }
 
-    dbinstance_t* dbinst = dbinstance(dbid);
-    if (dbinst == NULL) {
+    dbconnection_t* conn = __model_acquire_conn(dbid);
+    if (conn == NULL) {
         __model_set_status(MODEL_ERR_DB);
         return 0;
     }
-
-    dbconnection_t* conn = dbinst->connection;
-    dbinstance_free(dbinst);
 
     int res = 0;
     dbresult_t* result = NULL;
@@ -3029,15 +2906,12 @@ void* model_find_one(const char* dbid, void*(create_instance)(void), const mquer
 
     const mschema_t* schema = record->schema;
 
-    dbinstance_t* dbinst = dbinstance(dbid);
-    if (dbinst == NULL) {
+    dbconnection_t* conn = __model_acquire_conn(dbid);
+    if (conn == NULL) {
         __model_set_status(MODEL_ERR_DB);
         model_free(record);
         return NULL;
     }
-
-    dbconnection_t* conn = dbinst->connection;
-    dbinstance_free(dbinst);
 
     str_t* sql = str_create_empty(256);
     array_t* bind = array_create();
