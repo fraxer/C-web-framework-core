@@ -2803,9 +2803,27 @@ static int __model_append_column(dbconnection_t* conn, str_t* sql, const mschema
     return 1;
 }
 
-// Render a single condition ("<col> <op> <bound>") into `sql`.
+// Render a single condition into `sql` — either "<col> <op> <bound>" or, for
+// MOP_GROUP, a parenthesized sub-expression joined by its own combinator.
 // Returns 1 on success, 0 on invalid condition or allocation failure.
 static int __model_append_cond(dbconnection_t* conn, str_t* sql, const mschema_t* schema, const mcond_t* cond, array_t* bind, int* idx) {
+    // MOP_GROUP has no column of its own — render "(<sub> <comb> <sub> ...)".
+    if (cond->op == MOP_GROUP) {
+        if (cond->group == NULL || cond->group_count <= 0)
+            return 0;
+
+        str_appendc(sql, '(');
+        for (int i = 0; i < cond->group_count; i++) {
+            if (i > 0)
+                str_append(sql, cond->group_combine == MCOMBINE_OR ? " OR " : " AND ",
+                           cond->group_combine == MCOMBINE_OR ? 4 : 5);
+            if (!__model_append_cond(conn, sql, schema, &cond->group[i], bind, idx))
+                return 0;
+        }
+        str_appendc(sql, ')');
+        return 1;
+    }
+
     if (!__model_append_column(conn, sql, schema, cond->column))
         return 0;
 
@@ -2860,7 +2878,8 @@ static int __model_build_find(dbconnection_t* conn, const mschema_t* schema, con
         int idx = 0;
         for (int i = 0; i < query->conds_count; i++) {
             if (i > 0)
-                str_append(sql, " AND ", 5);
+                str_append(sql, query->combine == MCOMBINE_OR ? " OR " : " AND ",
+                           query->combine == MCOMBINE_OR ? 4 : 5);
             if (!__model_append_cond(conn, sql, schema, &query->conds[i], bind, &idx))
                 return 0;
         }

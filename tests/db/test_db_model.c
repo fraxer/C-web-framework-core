@@ -1158,3 +1158,77 @@ TEST_DB(test_model_reserved_word_column) {
     TEST_ASSERT_EQUAL(1, model_delete(dbid, del), "model_delete should return 1");
     test_reserved_free(del);
 }
+
+// ============================================================================
+// Query builder v2: OR / grouping (Plan D1)
+// ============================================================================
+
+TEST_DB(test_model_find_or_combine) {
+    TEST_SUITE("model_find_one");
+    TEST_CASE("top-level OR joins conditions");
+
+    const char* dbid = testdb_dbid();
+
+    TEST_ASSERT(__insert_test_row("alpha", 1, NULL) > 0, "insert alpha");
+    TEST_ASSERT(__insert_test_row("beta", 2, NULL) > 0, "insert beta");
+    TEST_ASSERT(__insert_test_row("gamma", 3, NULL) > 0, "insert gamma");
+
+    // WHERE status = 1 OR status = 2  ->  alpha + beta = 2 rows
+    mfield_t* v1 = field_create_int("status", 1);
+    mfield_t* v2 = field_create_int("status", 2);
+    mcond_t conds[] = {
+        { .column = TEST_ITEM_COL_STATUS, .op = MOP_EQ, .value = v1 },
+        { .column = TEST_ITEM_COL_STATUS, .op = MOP_EQ, .value = v2 },
+    };
+    mquery_t q = {
+        .conds = conds, .conds_count = 2, .combine = MCOMBINE_OR,
+        .order_column = TEST_ITEM_COL_STATUS, .order_dir = MORDER_ASC,
+        .limit = -1, .offset = -1,
+    };
+    array_t* list = model_find_list(dbid, test_item_instance, &q);
+    model_param_free(v1);
+    model_param_free(v2);
+
+    TEST_ASSERT_NOT_NULL(list, "model_find_list should succeed");
+    TEST_ASSERT_EQUAL_SIZE(2, array_size(list), "OR should match status 1 and 2");
+    array_free(list);
+}
+
+TEST_DB(test_model_find_group) {
+    TEST_SUITE("model_find_one");
+    TEST_CASE("MOP_GROUP renders a parenthesized sub-expression");
+
+    const char* dbid = testdb_dbid();
+
+    TEST_ASSERT(__insert_test_row("alpha", 1, NULL) > 0, "insert alpha");
+    TEST_ASSERT(__insert_test_row("alphaX", 1, NULL) > 0, "insert alphaX");
+    TEST_ASSERT(__insert_test_row("beta", 2, NULL) > 0, "insert beta");
+    TEST_ASSERT(__insert_test_row("gamma", 3, NULL) > 0, "insert gamma");
+
+    // WHERE (name LIKE 'alpha%' AND status = 1) OR status = 2
+    //   matches: alpha, alphaX (group) + beta (OR status=2) = 3 rows
+    mfield_t* vlike  = field_create_text("name", "alpha%");
+    mfield_t* vstat1 = field_create_int("status", 1);
+    mfield_t* vstat2 = field_create_int("status", 2);
+    mcond_t inner[] = {
+        { .column = TEST_ITEM_COL_NAME,   .op = MOP_LIKE, .value = vlike },
+        { .column = TEST_ITEM_COL_STATUS, .op = MOP_EQ,   .value = vstat1 },
+    };
+    mcond_t conds[] = {
+        { .op = MOP_GROUP, .group = inner, .group_count = 2, .group_combine = MCOMBINE_AND },
+        { .column = TEST_ITEM_COL_STATUS, .op = MOP_EQ, .value = vstat2 },
+    };
+    mquery_t q = {
+        .conds = conds, .conds_count = 2, .combine = MCOMBINE_OR,
+        .order_column = TEST_ITEM_COL_NAME, .order_dir = MORDER_ASC,
+        .limit = -1, .offset = -1,
+    };
+    array_t* list = model_find_list(dbid, test_item_instance, &q);
+    model_param_free(vlike);
+    model_param_free(vstat1);
+    model_param_free(vstat2);
+
+    TEST_ASSERT_NOT_NULL(list, "model_find_list should succeed");
+    TEST_ASSERT_EQUAL_SIZE(3, array_size(list), "group OR status=2 should match 3 rows");
+    array_free(list);
+}
