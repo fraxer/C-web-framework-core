@@ -41,6 +41,9 @@
 #ifdef Redis_FOUND
     #include "redis.h"
 #endif
+#ifdef SQLite_FOUND
+    #include "sqlite.h"
+#endif
 
 #include "moduleloader.h"
 
@@ -965,6 +968,11 @@ int __module_loader_databases_load(appconfig_t* config, const json_token_t* toke
         #ifdef Redis_FOUND
         if (strcmp(driver, "redis") == 0)
             database = redis_load(driver, token_array);
+        #endif
+
+        #ifdef SQLite_FOUND
+        if (strcmp(driver, "sqlite") == 0)
+            database = sqlite_load(driver, token_array);
         #endif
 
         if (database == NULL) {

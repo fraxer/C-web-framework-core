@@ -4,6 +4,7 @@
 #define POSTGRESQL "postgresql"
 #define MYSQL "mysql"
 #define REDIS "redis"
+#define SQLITE "sqlite"
 
 #include "dbquery.h"
 #include "dbresult.h"

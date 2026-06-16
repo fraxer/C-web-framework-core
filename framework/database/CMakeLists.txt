@@ -28,6 +28,15 @@ if(Redis_FOUND AND INCLUDE_REDIS STREQUAL yes)
 	include_directories(${REDIS_INCLUDE_DIRS})
 endif()
 
+if(INCLUDE_SQLITE STREQUAL yes)
+	#sudo apt-get install -y libsqlite3-dev
+	message(STATUS "Include Sqlite: ${INCLUDE_SQLITE}")
+endif()
+
+if(SQLite_FOUND AND INCLUDE_SQLITE STREQUAL yes)
+	include_directories(${SQLite_INCLUDE_DIRS})
+endif()
+
 
 set(SOURCES "")
 set(LIBS "")
@@ -54,6 +63,11 @@ endif()
 if(Redis_FOUND AND INCLUDE_REDIS STREQUAL yes)
 	list(APPEND SOURCES redis.c redis.h)
 	list(APPEND LIBS ${Redis_LIBRARY})
+endif()
+
+if(SQLite_FOUND AND INCLUDE_SQLITE STREQUAL yes)
+	list(APPEND SOURCES sqlite.c sqlite.h)
+	list(APPEND LIBS ${SQLite_LIBRARY})
 endif()
 
 add_library(${LIB_NAME} STATIC ${SOURCES})

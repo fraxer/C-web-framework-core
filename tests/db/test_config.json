@@ -53,6 +53,14 @@
                 "port": 6379,
                 "dbindex": 0
             }
+        ],
+        "sqlite": [
+            {
+                "host_id": "test",
+                "path": ":memory:",
+                "journal_mode": "WAL",
+                "busy_timeout": 5000
+            }
         ]
     },
     "storages": {
