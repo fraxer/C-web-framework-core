@@ -42,7 +42,6 @@ typedef enum {
 model_status_e model_last_status(void);  /* status of the last op in this thread */
 const char*    model_last_error(void);   /* DB error text for MODEL_ERR_DB, else NULL */
 
-void* model_get(const char* dbid, void*(create_instance)(void), array_t* params);
 int model_create(const char* dbid, void* arg);
 int model_update(const char* dbid, void* arg);
 int model_delete(const char* dbid, void* arg);

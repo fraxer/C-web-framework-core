@@ -8,7 +8,7 @@
  *
  * Variadic X-macro machinery that turns a `mparams_fill_array(arr, mparam_int(id, x), ...)`
  * call into a sequence of array_push_back calls. Serves the legacy
- * array_t* params API of model_get / model_delete_by_params / model_one/list,
+ * array_t* params API of model_delete_by_params / model_one/list,
  * which the R1 schema path (model_find_*) and Plan C migration are replacing.
  * Kept here so model.h remains an umbrella; slated for deletion once no
  * production caller remains.

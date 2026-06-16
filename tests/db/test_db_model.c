@@ -189,7 +189,7 @@ TEST_DB(test_model_create_sql_injection) {
     TEST_ASSERT_STR_EQUAL("t", dbresult_field(r, "exists")->value, "test_items table must still exist");
     dbresult_free(r);
 
-    // The payload must be stored verbatim. Read it back via model_get and via a
+    // The payload must be stored verbatim. Read it back via a
     // parameterized control query, then verify the value round-trips.
     r = dbquery(dbid, "SELECT COUNT(*) AS c FROM test_items", NULL);
     TEST_ASSERT_NOT_NULL(r, "count query should succeed");
@@ -215,23 +215,29 @@ TEST_DB(test_model_create_sql_injection) {
 }
 
 // ============================================================================
-// model_get tests
+// model_find_one tests
 // ============================================================================
 
-TEST_DB(test_model_get_by_id) {
-    TEST_SUITE("model_get");
+TEST_DB(test_model_find_one_by_id) {
+    TEST_SUITE("model_find_one");
     TEST_CASE("retrieve inserted row by id");
 
     const char* dbid = testdb_dbid();
     int id = __insert_test_row("Alpha", 5, "desc");
     TEST_ASSERT(id > 0, "insert should return valid id");
 
-    array_t* params = array_create();
-    mparams_fill_array(params, mparam_int(id, id));
+    mfield_t* val = field_create_int("id", id);
+    mcond_t conds[] = {
+        { .column = TEST_ITEM_COL_ID, .op = MOP_EQ, .value = val },
+    };
+    mquery_t query = {
+        .conds = conds, .conds_count = 1,
+        .order_column = -1, .limit = -1, .offset = -1,
+    };
 
-    test_item_t* item = model_get(dbid, test_item_instance, params);
-    array_free(params);
-    TEST_ASSERT_NOT_NULL(item, "model_get should return item");
+    test_item_t* item = model_find_one(dbid, test_item_instance, &query);
+    model_param_free(val);
+    TEST_ASSERT_NOT_NULL(item, "model_find_one should return item");
     if (item == NULL) return;
 
     TEST_ASSERT_EQUAL(id, model_int(model_field(&item->record, TEST_ITEM_COL_ID)), "id should match");
@@ -242,35 +248,26 @@ TEST_DB(test_model_get_by_id) {
     test_item_free(item);
 }
 
-TEST_DB(test_model_get_not_found) {
-    TEST_SUITE("model_get");
-    TEST_CASE("return NULL for non-existent id");
-
-    const char* dbid = testdb_dbid();
-
-    array_t* params = array_create();
-    mparams_fill_array(params, mparam_int(id, 99999));
-
-    test_item_t* item = model_get(dbid, test_item_instance, params);
-    TEST_ASSERT_NULL(item, "model_get should return NULL for missing row");
-
-    array_free(params);
-}
-
-TEST_DB(test_model_get_null_field) {
-    TEST_SUITE("model_get");
+TEST_DB(test_model_find_one_null_field) {
+    TEST_SUITE("model_find_one");
     TEST_CASE("retrieve row with NULL description");
 
     const char* dbid = testdb_dbid();
     int id = __insert_test_row("Beta", 0, NULL);
     TEST_ASSERT(id > 0, "insert should return valid id");
 
-    array_t* params = array_create();
-    mparams_fill_array(params, mparam_int(id, id));
+    mfield_t* val = field_create_int("id", id);
+    mcond_t conds[] = {
+        { .column = TEST_ITEM_COL_ID, .op = MOP_EQ, .value = val },
+    };
+    mquery_t query = {
+        .conds = conds, .conds_count = 1,
+        .order_column = -1, .limit = -1, .offset = -1,
+    };
 
-    test_item_t* item = model_get(dbid, test_item_instance, params);
-    array_free(params);
-    TEST_ASSERT_NOT_NULL(item, "model_get should return item");
+    test_item_t* item = model_find_one(dbid, test_item_instance, &query);
+    model_param_free(val);
+    TEST_ASSERT_NOT_NULL(item, "model_find_one should return item");
     if (item == NULL) return;
 
     TEST_ASSERT_EQUAL(1, model_field(&item->record, TEST_ITEM_COL_DESCRIPTION)->is_null, "description should be null");
@@ -290,12 +287,18 @@ TEST_DB(test_model_update_basic) {
     int id = __insert_test_row("OldName", 1, NULL);
     TEST_ASSERT(id > 0, "insert should return valid id");
 
-    // Fetch via model_get to get a fully populated instance
-    array_t* params = array_create();
-    mparams_fill_array(params, mparam_int(id, id));
-    test_item_t* item = model_get(dbid, test_item_instance, params);
-    array_free(params);
-    TEST_ASSERT_NOT_NULL(item, "model_get should return item");
+    // Fetch via model_find_one to get a fully populated instance
+    mfield_t* val = field_create_int("id", id);
+    mcond_t conds[] = {
+        { .column = TEST_ITEM_COL_ID, .op = MOP_EQ, .value = val },
+    };
+    mquery_t query = {
+        .conds = conds, .conds_count = 1,
+        .order_column = -1, .limit = -1, .offset = -1,
+    };
+    test_item_t* item = model_find_one(dbid, test_item_instance, &query);
+    model_param_free(val);
+    TEST_ASSERT_NOT_NULL(item, "model_find_one should return item");
     if (item == NULL) return;
 
     // Modify and update
@@ -333,11 +336,17 @@ TEST_DB(test_model_update_dirty_tracking) {
     int id = __insert_test_row("KeepName", 3, "KeepDesc");
     TEST_ASSERT(id > 0, "insert should return valid id");
 
-    array_t* params = array_create();
-    mparams_fill_array(params, mparam_int(id, id));
-    test_item_t* item = model_get(dbid, test_item_instance, params);
-    array_free(params);
-    TEST_ASSERT_NOT_NULL(item, "model_get should return item");
+    mfield_t* val = field_create_int("id", id);
+    mcond_t conds[] = {
+        { .column = TEST_ITEM_COL_ID, .op = MOP_EQ, .value = val },
+    };
+    mquery_t query = {
+        .conds = conds, .conds_count = 1,
+        .order_column = -1, .limit = -1, .offset = -1,
+    };
+    test_item_t* item = model_find_one(dbid, test_item_instance, &query);
+    model_param_free(val);
+    TEST_ASSERT_NOT_NULL(item, "model_find_one should return item");
     if (item == NULL) return;
 
     // Only update status
@@ -724,39 +733,51 @@ TEST_DB(test_dbprepared_prepare_and_reuse) {
 // Error contract (R7): model_last_status() / model_last_error()
 // ============================================================================
 
-TEST_DB(test_model_status_ok_on_get) {
+TEST_DB(test_model_status_ok_on_find_one) {
     TEST_SUITE("error_contract");
-    TEST_CASE("successful model_get sets MODEL_OK");
+    TEST_CASE("successful model_find_one sets MODEL_OK");
 
     const char* dbid = testdb_dbid();
     int id = __insert_test_row("OkStatus", 3, NULL);
     TEST_ASSERT(id > 0, "insert should return valid id");
 
-    array_t* params = array_create();
-    mparams_fill_array(params, mparam_int(id, id));
+    mfield_t* val = field_create_int("id", id);
+    mcond_t conds[] = {
+        { .column = TEST_ITEM_COL_ID, .op = MOP_EQ, .value = val },
+    };
+    mquery_t query = {
+        .conds = conds, .conds_count = 1,
+        .order_column = -1, .limit = -1, .offset = -1,
+    };
 
-    test_item_t* item = model_get(dbid, test_item_instance, params);
-    array_free(params);
-    TEST_ASSERT_NOT_NULL(item, "model_get should return item");
+    test_item_t* item = model_find_one(dbid, test_item_instance, &query);
+    model_param_free(val);
+    TEST_ASSERT_NOT_NULL(item, "model_find_one should return item");
     TEST_ASSERT_EQUAL(MODEL_OK, model_last_status(), "status should be MODEL_OK");
     TEST_ASSERT_NULL((void*)model_last_error(), "no error text on success");
 
     if (item != NULL) test_item_free(item);
 }
 
-TEST_DB(test_model_status_notfound_on_get) {
+TEST_DB(test_model_status_notfound_on_find_one) {
     TEST_SUITE("error_contract");
     TEST_CASE("missing row -> NULL + MODEL_ERR_NOTFOUND");
 
     const char* dbid = testdb_dbid();
 
-    array_t* params = array_create();
-    mparams_fill_array(params, mparam_int(id, 99999));
+    mfield_t* val = field_create_int("id", 99999);
+    mcond_t conds[] = {
+        { .column = TEST_ITEM_COL_ID, .op = MOP_EQ, .value = val },
+    };
+    mquery_t query = {
+        .conds = conds, .conds_count = 1,
+        .order_column = -1, .limit = -1, .offset = -1,
+    };
 
-    test_item_t* item = model_get(dbid, test_item_instance, params);
-    array_free(params);
+    test_item_t* item = model_find_one(dbid, test_item_instance, &query);
+    model_param_free(val);
 
-    TEST_ASSERT_NULL(item, "model_get should return NULL for missing row");
+    TEST_ASSERT_NULL(item, "model_find_one should return NULL for missing row");
     TEST_ASSERT_EQUAL(MODEL_ERR_NOTFOUND, model_last_status(), "status should be NOTFOUND");
     TEST_ASSERT_NULL((void*)model_last_error(), "not-found is not a DB error");
 }
@@ -1053,9 +1074,9 @@ TEST_DB(test_model_find_one_null_query_param) {
 // Identifier escaping: a column whose name is a SQL reserved word.
 //
 // Schema-path (model_create / model_find_one) has always escaped column names
-// via escape_identifier. The params-path (model_get / model_update /
-// model_delete_by_params) previously inlined field->name verbatim, so a
-// reserved word like "order" produced `WHERE order = $1` — a syntax error.
+// via escape_identifier. The params-path (model_update / model_delete_by_params)
+// previously inlined field->name verbatim, so a reserved word like "order"
+// produced `WHERE order = $1` — a syntax error.
 // This test pins escaping parity across every CRUD path.
 // ============================================================================
 
@@ -1129,23 +1150,14 @@ TEST_DB(test_model_reserved_word_column) {
     TEST_ASSERT(created_id > 0, "generated id should be read back");
     test_reserved_free(item);
 
-    // model_get — params-path escaping. Without it, `WHERE order = $1` is a
-    // SQL syntax error because "order" is reserved.
-    array_t* params = array_create();
-    mparams_fill_array(params, mparam_int(order, 42));
-    test_reserved_t* got = model_get(dbid, test_reserved_instance, params);
-    array_free(params);
-    TEST_ASSERT_NOT_NULL(got, "model_get by reserved-word column must succeed");
-    TEST_ASSERT_EQUAL(42, model_int(model_field(&got->record, TEST_RESERVED_COL_ORDER)), "order round-trips");
-
-    // model_find_one — schema-path escaping (control).
+    // model_find_one — schema-path escaping on the reserved-word column.
     mfield_t* val = field_create_int("order", 42);
     mcond_t conds[] = { { .column = TEST_RESERVED_COL_ORDER, .op = MOP_EQ, .value = val } };
     mquery_t q = { .conds = conds, .conds_count = 1, .order_column = -1, .limit = -1, .offset = -1 };
-    test_reserved_t* found = model_find_one(dbid, test_reserved_instance, &q);
+    test_reserved_t* got = model_find_one(dbid, test_reserved_instance, &q);
     model_param_free(val);
-    TEST_ASSERT_NOT_NULL(found, "model_find_one on reserved-word column must succeed");
-    test_reserved_free(found);
+    TEST_ASSERT_NOT_NULL(got, "model_find_one by reserved-word column must succeed");
+    TEST_ASSERT_EQUAL(42, model_int(model_field(&got->record, TEST_RESERVED_COL_ORDER)), "order round-trips");
 
     // model_update — params-path escaping in SET ("order" = $1).
     model_set_int(model_field(&got->record, TEST_RESERVED_COL_ORDER), 99);
