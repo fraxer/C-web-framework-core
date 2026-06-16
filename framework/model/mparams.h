@@ -1,10 +1,10 @@
-#ifndef __MODEL_LEGACY__
-#define __MODEL_LEGACY__
+#ifndef __MPARAMS__
+#define __MPARAMS__
 
 #include "mfield.h"
 
 /* ---------------------------------------------------------------------------
- * model_legacy.h — params-path helpers
+ * mparams.h — params-path helpers
  *
  * mparams_fill_array pushes each named parameter (produced by the mparam_*
  * macros, which expand to field_create_* calls) into an array_t*, wrapping
@@ -17,9 +17,9 @@
  * ------------------------------------------------------------------------- */
 
 #define mparams_fill_array(ARRAY, ...) do { \
-    void* __mdl_fields[] = { __VA_ARGS__ }; \
-    for (size_t __mdl_i = 0; __mdl_i < sizeof(__mdl_fields) / sizeof(__mdl_fields[0]); __mdl_i++) \
-        array_push_back(ARRAY, array_create_pointer(__mdl_fields[__mdl_i], NULL, model_param_free)); \
+    void* __mp_fields[] = { __VA_ARGS__ }; \
+    for (size_t __mp_i = 0; __mp_i < sizeof(__mp_fields) / sizeof(__mp_fields[0]); __mp_i++) \
+        array_push_back(ARRAY, array_create_pointer(__mp_fields[__mp_i], NULL, model_param_free)); \
 } while (0);
 
 /* Build a NULL-terminated char*[] of field names for model_to_json /
@@ -27,4 +27,4 @@
    initializer, so no argument-counting macro is needed. */
 #define display_fields(...) (char*[]){ __VA_ARGS__, NULL }
 
-#endif /* __MODEL_LEGACY__ */
+#endif /* __MPARAMS__ */

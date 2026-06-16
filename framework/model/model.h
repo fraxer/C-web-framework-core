@@ -4,7 +4,7 @@
 #include "mfield.h"
 #include "mschema.h"
 #include "mquery.h"
-#include "model_legacy.h"
+#include "mparams.h"
 
 /* ---------------------------------------------------------------------------
  * model.h — umbrella header for the model framework
