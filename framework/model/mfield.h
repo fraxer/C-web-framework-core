@@ -18,7 +18,7 @@
  * Core value/field types, the per-type constructor macros (legacy field
  * initializers + param builders), and the per-type accessor declarations
  * (get / set / set_from_str / to_str). No dependency on schema, query or
- * CRUD layers; mschema.h, mquery.h and model.h build on top of this.
+ * CRUD layers; mschema.h and model.h build on top of this.
  * ------------------------------------------------------------------------- */
 
 #define mparam_bool(NAME, VALUE) field_create_bool(#NAME, VALUE)

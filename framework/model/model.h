@@ -3,15 +3,14 @@
 
 #include "mfield.h"
 #include "mschema.h"
-#include "mquery.h"
 #include "mparams.h"
 
 /* ---------------------------------------------------------------------------
  * model.h — umbrella header for the model framework
  *
- * Pulls in the four layers (mfield / mschema / mquery / legacy) plus the
- * public CRUD and error contract. Existing `#include "model.h"` sites keep
- * working unchanged; new code may include the specific layer it needs.
+ * Pulls in the model layers (mfield / mschema / mparams) plus the public CRUD
+ * and error contract. Existing `#include "model.h"` sites keep working
+ * unchanged; new code may include the specific layer it needs.
  * ------------------------------------------------------------------------- */
 
 /* ---------------------------------------------------------------------------
