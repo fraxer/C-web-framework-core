@@ -25,6 +25,9 @@
 #ifdef Redis_FOUND
     #include "redis.h"
 #endif
+#ifdef SQLite_FOUND
+    #include "sqlite.h"
+#endif
 
 
 typedef enum mgactions {
