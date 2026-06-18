@@ -47,6 +47,16 @@ int socket_set_keepalive(int socket) {
     return 0;
 }
 
+int socket_set_nodelay(int socket) {
+    int nodelay = 1;
+    if (setsockopt(socket, SOL_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) == -1) {
+        log_error("Socket error: Failed to set TCP_NODELAY\n");
+        return -1;
+    }
+
+    return 0;
+}
+
 int socket_set_timeouts(int socket) {
     struct timeval timeout;
 
@@ -75,7 +85,12 @@ int socket_listen_create(in_addr_t ip, unsigned short int port) {
     sa.sin_port = htons(port);
     sa.sin_addr.s_addr = ip;
 
-    const char* ip_str = inet_ntoa(sa.sin_addr);
+    char ip_str[INET_ADDRSTRLEN];
+    if (inet_ntop(AF_INET, &sa.sin_addr, ip_str, sizeof(ip_str)) == NULL) {
+        log_error("Socket error: Can't resolve ip address\n");
+        return -1;
+    }
+
     const int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (fd == -1) {
         log_error("Socket error: Can't create socket on %s:%d\n", ip_str, port);
@@ -113,18 +128,13 @@ int socket_listen_create(in_addr_t ip, unsigned short int port) {
     return result;
 }
 
-int __socket_set_options(int socket) {
-    int nodelay = 1;
-    if (setsockopt(socket, SOL_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) == -1) return -1;
-
+static int __socket_set_options(int socket) {
     int enableaddr = 1;
     if (setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, &enableaddr, sizeof(enableaddr)) == -1) return -1;
 
     int enableport = 1;
-    if (setsockopt(socket, SOL_SOCKET, SO_REUSEPORT, &enableport, sizeof(enableport)) == -1) return -1;
-
-    int enablecpu = 1;
-    if (setsockopt(socket, SOL_SOCKET, SO_INCOMING_CPU, &enablecpu, sizeof(enablecpu)) == -1) return -1;
+    if (setsockopt(socket, SOL_SOCKET, SO_REUSEPORT, &enableport, sizeof(enableport)) == -1)
+        log_error("Socket error: Failed to set SO_REUSEPORT\n");
 
     return 0;
 }

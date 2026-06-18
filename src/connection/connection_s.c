@@ -37,8 +37,8 @@ connection_t* connection_s_create(int fd, in_addr_t ip, unsigned short int port,
         goto failed;
     }
 
-    if (socket_set_timeouts(connfd) == -1) {
-        log_error("Connection error: Error set timeouts\n");
+    if (socket_set_nodelay(connfd) == -1) {
+        log_error("Connection error: Error set TCP_NODELAY\n");
         goto failed;
     }
 
