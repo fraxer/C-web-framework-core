@@ -42,7 +42,6 @@ websocketsparser_t* websocketsparser_create(connection_t* connection, websockets
 void websocketsparser_init(websocketsparser_t* parser) {
     parser->base.free = websocketsparser_free;
     parser->stage = WSPARSER_FIRST_BYTE;
-    parser->mask_index = 0;
     parser->bytes_readed = 0;
     parser->pos_start = 0;
     parser->pos = 0;
@@ -51,6 +50,9 @@ void websocketsparser_init(websocketsparser_t* parser) {
     parser->message_fragmented = 0;
     parser->request = NULL;
     bufo_init(&parser->compressed_buf);
+    parser->compressed_buffered = 0;
+    parser->compressed_consumed = 0;
+    parser->decompressed_total = 0;
 
     websockets_frame_init(&parser->frame);
     bufferdata_init(&parser->buf);
@@ -61,6 +63,7 @@ void websocketsparser_free(void* arg) {
 
     __clear(parser);
     ws_deflate_free(&parser->ws_deflate);
+    bufo_clear(&parser->compressed_buf);
     free(parser);
 }
 
@@ -91,7 +94,6 @@ void websocketsparser_flush(websocketsparser_t* parser) {
     parser->buf.dynamic_buffer = NULL;
 
     parser->stage = WSPARSER_FIRST_BYTE;
-    parser->mask_index = 0;
     parser->bytes_readed = 0;
     parser->pos_start = 0;
     parser->pos = 0;
@@ -102,6 +104,9 @@ void websocketsparser_flush(websocketsparser_t* parser) {
 
     websockets_frame_init(&parser->frame);
     bufo_flush(&parser->compressed_buf);
+    parser->compressed_buffered = 0;
+    parser->compressed_consumed = 0;
+    parser->decompressed_total = 0;
     bufferdata_reset(&parser->buf);
 }
 
@@ -268,7 +273,6 @@ void websocketsparser_prepare_remains(websocketsparser_t* parser) {
 
     parser->stage = WSPARSER_FIRST_BYTE;
     parser->pos_start = parser->pos;
-    parser->mask_index = 0;
     parser->payload_index = 0;
     parser->payload_saved_length = 0;
 
@@ -330,6 +334,8 @@ int websocketsparser_parse_first_byte(websocketsparser_t* parser) {
     if (parser->frame.opcode == WSOPCODE_CONTINUE) {
         if (!parser->message_fragmented)
             return 0; /* continuation without an initial data frame */
+        if (parser->frame.rsv1)
+            return 0; /* RSV1 (permessage-deflate) is valid only on the first frame of a message (RFC 7692 §7.2) */
     }
     else if (parser->message_fragmented) {
         return 0; /* new data frame while a fragmented message is unfinished */
@@ -477,66 +483,104 @@ int websocketsparser_is_control_frame(websockets_frame_t* frame) {
 
 /**
  * Streaming decompress: unmask, decompress, and pass to payload_parse in chunks.
- * Per RFC 7692: append 0x00 0x00 0xff 0xff trailer on final chunk.
+ *
+ * The inflate stream is stateful across reads and fragments within a message, so
+ * any bytes inflate could not yet decode (a partial deflate code straddling a
+ * chunk or fragment boundary) must be retained at the front of compressed_buf and
+ * re-fed together with the next chunk. compressed_buffered/compressed_consumed
+ * track that input window; they reset only between messages (flush), never between
+ * fragments (prepare_remains), because one message is exactly one deflate stream.
+ *
+ * Per RFC 7692 the 0x00 0x00 0xff 0xff trailer is appended once, on the final chunk.
+ *
  * @param parser Parser context
- * @param data Masked compressed data
+ * @param data Masked compressed data (this chunk only)
  * @param size Data size
- * @param is_final Whether this is the final chunk of the message (fin=1 and last frame data)
+ * @param is_final Final chunk of the message (fin=1 and last frame data)
  * @return 1 on success, 0 on failure
  */
 int websocketsparser_decompress_chunk(websocketsparser_t* parser, const char* data, size_t size, int is_final) {
     ws_deflate_t* deflate = &parser->ws_deflate;
     websocketsrequest_t* request = parser->request;
     bufo_t* buf = &parser->compressed_buf;
+    z_stream* stream = &deflate->inflate_stream;
 
-    /* Prepare input: unmask data + optional trailer */
-    size_t input_size = size + (is_final ? 4 : 0);
+    /* Bytes inflate could not consume last time (a partial deflate code). They
+     * stay at the front of the buffer so the stream resumes seamlessly. */
+    size_t backlog = parser->compressed_buffered - parser->compressed_consumed;
+    const size_t trailer = is_final ? 4 : 0;
 
-    /* Buffer layout: [input data + trailer] [decompression output area]
-     * Decompression output starts after input to avoid overwriting */
-    const size_t decomp_buf_size = WS_DEFLATE_BUFFER_SIZE;
-    size_t total_needed = input_size + decomp_buf_size;
-
-    if (!bufo_ensure_capacity(buf, total_needed))
+    /* Layout for this call: [backlog + new chunk + trailer][inflate output].
+     * ensure_capacity may realloc, so every buf->data pointer is derived below
+     * rather than held across the call. */
+    if (!bufo_ensure_capacity(buf, backlog + size + trailer + WS_DEFLATE_BUFFER_SIZE))
         return 0;
 
-    /* Unmask data into buffer */
-    for (size_t i = 0; i < size; i++)
-        buf->data[i] = data[i] ^ parser->frame.mask[parser->payload_index++ % 4];
-
-    /* Append deflate trailer on final chunk per RFC 7692 */
-    if (is_final) {
-        buf->data[size] = 0x00;
-        buf->data[size + 1] = 0x00;
-        buf->data[size + 2] = (char)0xff;
-        buf->data[size + 3] = (char)0xff;
+    /* Drop the already-consumed prefix; inflate has folded those bytes into its
+     * window, so the buffer must not grow unbounded across a large message. */
+    if (parser->compressed_consumed > 0) {
+        memmove(buf->data, buf->data + parser->compressed_consumed, backlog);
+        parser->compressed_consumed = 0;
+        parser->compressed_buffered = backlog;
     }
 
-    /* Decompress and pass to payload_parse in chunks */
-    z_stream* stream = &deflate->inflate_stream;
-    stream->next_in = (Bytef*)buf->data;
-    stream->avail_in = (uInt)input_size;
+    /* Append the new chunk, unmasking into place. The mask keystream is
+     * continuous across the whole frame's payload (payload_index is per-frame). */
+    char* in = buf->data + parser->compressed_buffered;
+    for (size_t i = 0; i < size; i++)
+        in[i] = data[i] ^ parser->frame.mask[parser->payload_index++ % 4];
+    parser->compressed_buffered += size;
 
-    char* decomp_area = buf->data + input_size;
-    const int unmasking = 0;
+    /* Append the deflate flush trailer on the final chunk (RFC 7692). */
+    if (is_final) {
+        buf->data[parser->compressed_buffered + 0] = 0x00;
+        buf->data[parser->compressed_buffered + 1] = 0x00;
+        buf->data[parser->compressed_buffered + 2] = (char)0xff;
+        buf->data[parser->compressed_buffered + 3] = (char)0xff;
+        parser->compressed_buffered += 4;
+    }
+
+    /* Output area follows the input; inflate reads input and writes output
+     * concurrently with no overlap. */
+    char* decomp_area = buf->data + parser->compressed_buffered;
+    stream->next_in = (Bytef*)(buf->data + parser->compressed_consumed);
+    stream->avail_in = (uInt)(parser->compressed_buffered - parser->compressed_consumed);
+
     while (stream->avail_in > 0) {
         stream->next_out = (Bytef*)decomp_area;
-        stream->avail_out = (uInt)decomp_buf_size;
+        stream->avail_out = (uInt)WS_DEFLATE_BUFFER_SIZE;
 
+        const uInt in_before = stream->avail_in;
         int status = inflate(stream, Z_SYNC_FLUSH);
         if (status != Z_OK && status != Z_STREAM_END && status != Z_BUF_ERROR)
             return 0;
 
-        size_t decompressed_size = decomp_buf_size - stream->avail_out;
-        if (decompressed_size > 0)
-            if (!request->protocol->payload_parse(parser, decomp_area, decompressed_size, unmasking))
+        size_t decompressed_size = WS_DEFLATE_BUFFER_SIZE - stream->avail_out;
+        if (decompressed_size > 0) {
+            /* A compressed payload must not bypass the body limit by expanding
+             * server-side; bound the decompressed size, not just the wire size. */
+            if (parser->decompressed_total + decompressed_size > env()->main.client_max_body_size)
                 return 0;
+            parser->decompressed_total += decompressed_size;
+
+            if (!request->protocol->payload_parse(parser, decomp_area, decompressed_size, 0))
+                return 0;
+        }
+
+        /* Record what inflate actually swallowed. */
+        parser->compressed_consumed += (size_t)(in_before - stream->avail_in);
 
         if (status == Z_STREAM_END)
             break;
+
+        /* No input consumed and no output produced: the remainder is a partial
+         * code that needs more input from the next read/fragment. Stop here
+         * rather than spinning (Z_BUF_ERROR is tolerated above). */
+        if (stream->avail_in == in_before)
+            break;
     }
 
-    /* Reset inflate stream if client_no_context_takeover */
+    /* Reset the inflate stream only when context takeover is disabled. */
     if (is_final)
         ws_deflate_reset_inflate(deflate);
 

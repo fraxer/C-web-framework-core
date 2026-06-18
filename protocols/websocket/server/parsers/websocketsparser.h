@@ -51,8 +51,6 @@ typedef struct websocketsparser {
     websockets_frame_t frame;
     bufferdata_t buf;
 
-    int mask_index;
-
     size_t bytes_readed;
     size_t pos_start;
     size_t pos;
@@ -78,6 +76,14 @@ typedef struct websocketsparser {
 
     /** Buffer for compressed payload data (before decompression) */
     bufo_t compressed_buf;
+
+    /** Valid bytes accumulated in compressed_buf. Spans reads and fragments
+     *  within one message (one inflate stream); reset only between messages. */
+    size_t compressed_buffered;
+    /** Bytes at the front of compressed_buffered already consumed by inflate. */
+    size_t compressed_consumed;
+    /** Total decompressed bytes delivered for the current message (bomb guard). */
+    size_t decompressed_total;
 } websocketsparser_t;
 
 websocketsparser_t* websocketsparser_create(connection_t* connection, websockets_protocol_t*(*protocol_create)(void));

@@ -51,7 +51,7 @@ int __read(connection_t* connection) {
     websocketsparser_t* parser = ctx->parser;
 
     while (1) {
-        int bytes_readed = 0;
+        ssize_t bytes_readed = 0;
         read_data:
 
         bytes_readed = connection_data_read(connection);
