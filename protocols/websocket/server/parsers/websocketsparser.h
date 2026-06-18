@@ -8,6 +8,7 @@
 #include "websocketsrequest.h"
 #include "websocketscommon.h"
 #include "ws_deflate.h"
+#include "ws_utf8.h"
 
 enum websocketsparser_status {
     WSPARSER_ERROR = 0,
@@ -16,7 +17,8 @@ enum websocketsparser_status {
     WSPARSER_BAD_REQUEST,
     WSPARSER_HOST_NOT_FOUND,
     WSPARSER_PAYLOAD_LARGE,
-    WSPARSER_HANDLE_AND_CONTINUE
+    WSPARSER_HANDLE_AND_CONTINUE,
+    WSPARSER_COMPLETE
 };
 
 enum websocketsparser_opcode {
@@ -29,14 +31,13 @@ enum websocketsparser_opcode {
 };
 
 typedef enum websockets_request_stage {
-    WSPARSER_FIRST_BYTE = 0,
-    WSPARSER_SECOND_BYTE,
-    WSPARSER_PAYLOAD_LEN_126,
-    WSPARSER_PAYLOAD_LEN_127,
-    WSPARSER_MASK_KEY,
-    WSPARSER_PAYLOAD,
-    WSPARSER_CONTROL_PAYLOAD,
-    WSPARSER_COMPLETE
+    WSPARSER_STAGE_FIRST_BYTE = 0,
+    WSPARSER_STAGE_SECOND_BYTE,
+    WSPARSER_STAGE_PAYLOAD_LEN_126,
+    WSPARSER_STAGE_PAYLOAD_LEN_127,
+    WSPARSER_STAGE_MASK_KEY,
+    WSPARSER_STAGE_PAYLOAD,
+    WSPARSER_STAGE_CONTROL_PAYLOAD
 } websockets_request_stage_e;
 
 typedef enum websockets_payload_stage {
@@ -84,6 +85,9 @@ typedef struct websocketsparser {
     size_t compressed_consumed;
     /** Total decompressed bytes delivered for the current message (bomb guard). */
     size_t decompressed_total;
+
+    /** Streaming UTF-8 validator for TEXT messages (RFC 6455 §8.1). */
+    ws_utf8_validator_t utf8_validator;
 } websocketsparser_t;
 
 websocketsparser_t* websocketsparser_create(connection_t* connection, websockets_protocol_t*(*protocol_create)(void));

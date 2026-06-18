@@ -25,6 +25,20 @@ static void __clear(websocketsparser_t* parser);
 static int __clear_and_return(websocketsparser_t* parser, int error);
 static int __frame_end(websocketsparser_t* parser);
 
+/* UTF-8 validation for TEXT messages (RFC 6455 §8.1). Both are no-ops for
+ * non-text messages and assume parser->request is set (data-frame path). */
+static int websocketsparser_text_feed_ok(websocketsparser_t* parser, const char* data, size_t size) {
+    if (parser->request->type != WEBSOCKETS_TEXT)
+        return 1;
+    return ws_utf8_validator_feed(&parser->utf8_validator, (const unsigned char*)data, size);
+}
+
+static int websocketsparser_text_finish_ok(websocketsparser_t* parser) {
+    if (parser->request == NULL || parser->request->type != WEBSOCKETS_TEXT)
+        return 1;
+    return ws_utf8_validator_finish(&parser->utf8_validator);
+}
+
 websocketsparser_t* websocketsparser_create(connection_t* connection, websockets_protocol_t*(*protocol_create)(void)) {
     websocketsparser_t* parser = malloc(sizeof * parser);
     if (parser == NULL) return NULL;
@@ -41,7 +55,7 @@ websocketsparser_t* websocketsparser_create(connection_t* connection, websockets
 
 void websocketsparser_init(websocketsparser_t* parser) {
     parser->base.free = websocketsparser_free;
-    parser->stage = WSPARSER_FIRST_BYTE;
+    parser->stage = WSPARSER_STAGE_FIRST_BYTE;
     parser->bytes_readed = 0;
     parser->pos_start = 0;
     parser->pos = 0;
@@ -53,6 +67,7 @@ void websocketsparser_init(websocketsparser_t* parser) {
     parser->compressed_buffered = 0;
     parser->compressed_consumed = 0;
     parser->decompressed_total = 0;
+    ws_utf8_validator_reset(&parser->utf8_validator);
 
     websockets_frame_init(&parser->frame);
     bufferdata_init(&parser->buf);
@@ -93,7 +108,7 @@ void websocketsparser_flush(websocketsparser_t* parser) {
     if (parser->buf.dynamic_buffer) free(parser->buf.dynamic_buffer);
     parser->buf.dynamic_buffer = NULL;
 
-    parser->stage = WSPARSER_FIRST_BYTE;
+    parser->stage = WSPARSER_STAGE_FIRST_BYTE;
     parser->bytes_readed = 0;
     parser->pos_start = 0;
     parser->pos = 0;
@@ -137,21 +152,21 @@ int __frame_end(websocketsparser_t* parser) {
 }
 
 int websocketsparser_run(websocketsparser_t* parser) {
-    if (parser->stage == WSPARSER_PAYLOAD)
+    if (parser->stage == WSPARSER_STAGE_PAYLOAD)
         return websocketsparser_parse_payload(parser);
 
     for (parser->pos = parser->pos_start; parser->pos < parser->bytes_readed; parser->pos++) {
         char ch = parser->buffer[parser->pos];
 
         switch (parser->stage) {
-        case WSPARSER_FIRST_BYTE:
+        case WSPARSER_STAGE_FIRST_BYTE:
         {
             /* The request is created lazily for data frames inside
              * websocketsparser_parse_first_byte. Control frames carry no
              * request and must not disturb an in-progress fragmented message. */
             bufferdata_push(&parser->buf, ch);
 
-            parser->stage = WSPARSER_SECOND_BYTE;
+            parser->stage = WSPARSER_STAGE_SECOND_BYTE;
 
             bufferdata_complete(&parser->buf);
             if (!websocketsparser_parse_first_byte(parser))
@@ -161,7 +176,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
 
             break;
         }
-        case WSPARSER_SECOND_BYTE:
+        case WSPARSER_STAGE_SECOND_BYTE:
         {
             bufferdata_push(&parser->buf, ch);
 
@@ -170,20 +185,20 @@ int websocketsparser_run(websocketsparser_t* parser) {
                 return __clear_and_return(parser, WSPARSER_BAD_REQUEST);
 
             else if (parser->frame.payload_length == 126) {
-                parser->stage = WSPARSER_PAYLOAD_LEN_126;
+                parser->stage = WSPARSER_STAGE_PAYLOAD_LEN_126;
             }
             else if (parser->frame.payload_length == 127) {
-                parser->stage = WSPARSER_PAYLOAD_LEN_127;
+                parser->stage = WSPARSER_STAGE_PAYLOAD_LEN_127;
             }
             else {
-                parser->stage = WSPARSER_MASK_KEY;
+                parser->stage = WSPARSER_STAGE_MASK_KEY;
             }
 
             bufferdata_reset(&parser->buf);
 
             break;
         }
-        case WSPARSER_PAYLOAD_LEN_126:
+        case WSPARSER_STAGE_PAYLOAD_LEN_126:
         {
             if (websocketsparser_is_control_frame(&parser->frame))
                 return __clear_and_return(parser, WSPARSER_BAD_REQUEST);
@@ -193,7 +208,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
             if (bufferdata_writed(&parser->buf) < 2)
                 break;
 
-            parser->stage = WSPARSER_MASK_KEY;
+            parser->stage = WSPARSER_STAGE_MASK_KEY;
 
             bufferdata_complete(&parser->buf);
             if (!websocketsparser_parse_payload_length_126(parser))
@@ -203,7 +218,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
 
             break;
         }
-        case WSPARSER_PAYLOAD_LEN_127:
+        case WSPARSER_STAGE_PAYLOAD_LEN_127:
         {
             if (websocketsparser_is_control_frame(&parser->frame))
                 return __clear_and_return(parser, WSPARSER_BAD_REQUEST);
@@ -213,7 +228,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
             if (bufferdata_writed(&parser->buf) < 8)
                 break;
 
-            parser->stage = WSPARSER_MASK_KEY;
+            parser->stage = WSPARSER_STAGE_MASK_KEY;
 
             bufferdata_complete(&parser->buf);
             if (!websocketsparser_parse_payload_length_127(parser))
@@ -223,7 +238,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
 
             break;
         }
-        case WSPARSER_MASK_KEY:
+        case WSPARSER_STAGE_MASK_KEY:
         {
             bufferdata_push(&parser->buf, ch);
 
@@ -241,7 +256,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
 
             break;
         }
-        case WSPARSER_CONTROL_PAYLOAD:
+        case WSPARSER_STAGE_CONTROL_PAYLOAD:
         {
             parser->payload_saved_length++;
             const int end = parser->payload_saved_length == parser->frame.payload_length;
@@ -257,7 +272,7 @@ int websocketsparser_run(websocketsparser_t* parser) {
 
             break;
         }
-        case WSPARSER_PAYLOAD:
+        case WSPARSER_STAGE_PAYLOAD:
             return websocketsparser_parse_payload(parser);
         default:
             break;
@@ -268,10 +283,22 @@ int websocketsparser_run(websocketsparser_t* parser) {
 }
 
 void websocketsparser_prepare_remains(websocketsparser_t* parser) {
+    /* A non-control final data frame closes its message: drop the per-message
+     * streaming state (inflate backlog, decompressed total, UTF-8 validator) so
+     * a pipelined following message starts clean. Control frames are fin=1 but
+     * never close a data message, and non-final fragments keep the message open,
+     * so neither resets here. Checked before websockets_frame_init zeroes frame. */
+    if (!websocketsparser_is_control_frame(&parser->frame) && parser->frame.fin) {
+        parser->compressed_buffered = 0;
+        parser->compressed_consumed = 0;
+        parser->decompressed_total = 0;
+        ws_utf8_validator_reset(&parser->utf8_validator);
+    }
+
     bufferdata_clear(&parser->buf);
     websockets_frame_init(&parser->frame);
 
-    parser->stage = WSPARSER_FIRST_BYTE;
+    parser->stage = WSPARSER_STAGE_FIRST_BYTE;
     parser->pos_start = parser->pos;
     parser->payload_index = 0;
     parser->payload_saved_length = 0;
@@ -413,9 +440,9 @@ int websocketsparser_parse_mask(websocketsparser_t* parser) {
         parser->frame.mask[i] = string[i];
 
     if (websocketsparser_is_control_frame(&parser->frame))
-        parser->stage = WSPARSER_CONTROL_PAYLOAD;
+        parser->stage = WSPARSER_STAGE_CONTROL_PAYLOAD;
     else
-        parser->stage = WSPARSER_PAYLOAD;
+        parser->stage = WSPARSER_STAGE_PAYLOAD;
 
     return 1;
 }
@@ -447,13 +474,20 @@ int websocketsparser_parse_payload(websocketsparser_t* parser) {
             return __clear_and_return(parser, WSPARSER_ERROR);
     } else {
         const int unmasking = 1;
-        /* Uncompressed: pass directly to payload_parse */
+        /* Uncompressed: pass directly to payload_parse (unmasks in place). */
         if (!request->protocol->payload_parse(parser, payload_data, payload_size, unmasking))
+            return __clear_and_return(parser, WSPARSER_ERROR);
+        /* payload_data now holds the unmasked bytes; validate TEXT (RFC 6455 §8.1). */
+        if (!websocketsparser_text_feed_ok(parser, payload_data, payload_size))
             return __clear_and_return(parser, WSPARSER_ERROR);
     }
 
     if (has_data_for_next_request) {
         parser->pos += size;
+        /* A final frame with pipelined data behind it closes its message here
+         * (no COMPLETE return), so finish the UTF-8 validator explicitly. */
+        if (parser->frame.fin && !websocketsparser_text_finish_ok(parser))
+            return __clear_and_return(parser, WSPARSER_ERROR);
         return WSPARSER_HANDLE_AND_CONTINUE;
     }
 
@@ -464,8 +498,11 @@ int websocketsparser_parse_payload(websocketsparser_t* parser) {
     /* The frame is complete. Only a final (fin=1) frame finishes the message;
      * a non-final fragment must keep the request alive for the continuation
      * frames that follow (handled via prepare_remains). */
-    if (parser->frame.fin)
+    if (parser->frame.fin) {
+        if (!websocketsparser_text_finish_ok(parser))
+            return __clear_and_return(parser, WSPARSER_ERROR);
         return WSPARSER_COMPLETE;
+    }
 
     return WSPARSER_HANDLE_AND_CONTINUE;
 }
@@ -562,6 +599,10 @@ int websocketsparser_decompress_chunk(websocketsparser_t* parser, const char* da
             if (parser->decompressed_total + decompressed_size > env()->main.client_max_body_size)
                 return 0;
             parser->decompressed_total += decompressed_size;
+
+            /* Validate decompressed TEXT before dispatch (RFC 6455 §8.1). */
+            if (!websocketsparser_text_feed_ok(parser, decomp_area, decompressed_size))
+                return 0;
 
             if (!request->protocol->payload_parse(parser, decomp_area, decompressed_size, 0))
                 return 0;
