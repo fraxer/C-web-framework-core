@@ -17,7 +17,7 @@ static int __listeners_listen(listener_t* listener);
 static void __listeners_unlisten(listener_t* listener);
 static void __listener_unlisten(listener_t* listener);
 static int __listener_read(connection_t* listener_connection);
-static int __set_protocol(connection_t* connection);
+static void __set_protocol(connection_t* connection);
 
 int mpxserver_run(appconfig_t* appconfig) {
     int result = 0;
@@ -42,7 +42,7 @@ int mpxserver_run(appconfig_t* appconfig) {
             if (appconfig->env.main.reload != APPCONFIG_RELOAD_HARD)
                 __listeners_unlisten(listeners);
 
-            if (api->connection_count == 0)
+            if (atomic_load(&api->connection_count) == 0)
                 break;
         }
     }
@@ -63,14 +63,23 @@ int mpxserver_run(appconfig_t* appconfig) {
 
 int __listener_connection_close(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
+    listener_t* listener = ctx->listener;
 
     connection_s_lock(connection);
+
+    // Отсоединяем соединение от listener до освобождения: цикл может закрыть
+    // listener-сокет напрямую (config_shutdown/ошибка сокета), и без отсоединения
+    // указатель listener->connection стал бы висячим к моменту __listener_free.
+    if (listener != NULL && listener->connection == connection)
+        listener->connection = NULL;
 
     if (!ctx->listener->api->control_del(connection))
         log_error("Connection not removed from api\n");
 
     shutdown(connection->fd, SHUT_RDWR);
     close(connection->fd);
+
+    atomic_store(&ctx->destroyed, 1);
 
     if (connection_s_dec(connection) == CONNECTION_DEC_RESULT_DECREMENT)
         connection_s_unlock(connection);
@@ -174,6 +183,14 @@ void __listeners_free(listener_t* listener) {
 void __listener_free(listener_t* listener) {
     if (listener == NULL) return;
 
+    // На путях ошибок соединение могло быть не закрыто циклом — освобождаем здесь.
+    // Если уже закрыто (циклом или __listener_unlisten), listener->connection == NULL
+    // благодаря отсоединению в __listener_connection_close.
+    if (listener->connection != NULL) {
+        listener->connection->close(listener->connection);
+        listener->connection = NULL;
+    }
+
     cqueue_clear(&listener->servers);
     free(listener);
 }
@@ -212,14 +229,20 @@ int __listener_read(connection_t* listener_connection) {
     char* buffer = listener_connection->buffer;
     const size_t buffer_size = listener_connection->buffer_size;
 
-    // TODO: make multi accept
+    // Всегда возвращаем 1: listener не должен закрываться из-за сбоя accept()
+    // одного соединения (EAGAIN/EWOULDBLOCK при SO_REUSEPORT, ECONNABORTED,
+    // EMFILE/ENFILE и т.п.) — возврат 0 приводил к закрытию самого слушающего
+    // сокета. Очередь разбирается по соединению за итерацию; level-triggered
+    // epoll снова сообщит EPOLLIN, пока accept-очередь не опустеет.
     connection_t* connection = connection_s_create(fd, ip, port, ctx, buffer, buffer_size);
-    if (connection == NULL) return 0;
+    if (connection == NULL)
+        return 1;
 
-    return __set_protocol(connection);
+    __set_protocol(connection);
+    return 1;
 }
 
-int __set_protocol(connection_t* connection) {
+void __set_protocol(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
 
     int r = 0;
@@ -230,8 +253,11 @@ int __set_protocol(connection_t* connection) {
 
     if (!r) {
         connection_free(connection);
-        return 0;
+        return;
     }
 
-    return ctx->listener->api->control_add(connection, MPXIN | MPXRDHUP);
+    // control_add может провалиться (epoll_ctl) — соединение не попало в epoll,
+    // поэтому его нужно освободить явно, иначе утечка.
+    if (!ctx->listener->api->control_add(connection, MPXIN | MPXRDHUP))
+        connection_free(connection);
 }

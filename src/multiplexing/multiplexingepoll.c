@@ -19,14 +19,17 @@ int __mpx_epoll_control(connection_t*, int, uint32_t);
 void __mpx_epoll_config_free(epoll_config_t*);
 
 void* mpx_epoll_init() {
-    mpxapi_epoll_t* result = NULL;
     mpxapi_epoll_t* api = malloc(sizeof * api);
     if (api == NULL) {
         log_error("Epoll error: Epoll api alloc failed\n");
-        return result;
+        return NULL;
     }
 
     const int fd = __mpx_epoll_init();
+    if (fd == -1) {
+        free(api);
+        return NULL;
+    }
 
     api->base.connection_count = 0;
     api->base.config = __mpx_epoll_config_init(fd);
@@ -37,17 +40,12 @@ void* mpx_epoll_init() {
     api->base.process_events = __mpx_epoll_process_events;
     api->fd = fd;
 
-    if (api->base.config == NULL) goto failed;
-
-    result = api;
-
-    failed:
-
-    if (result == NULL) {
+    if (api->base.config == NULL) {
         api->base.free(api);
+        return NULL;
     }
 
-    return result;
+    return api;
 }
 
 int __mpx_epoll_init() {
@@ -109,6 +107,12 @@ void __mpx_epoll_process_events(appconfig_t* appconfig, void* arg) {
     const int config_shutdown = atomic_load(&appconfig->shutdown) && appconfig->env.main.reload == APPCONFIG_RELOAD_HARD;
 
     int n = epoll_wait(apiconfig->basefd, events, EPOLL_MAX_EVENTS, apiconfig->timeout);
+    if (n == -1) {
+        if (errno != EINTR)
+            log_error("Epoll error: epoll_wait failed (errno %d)\n", errno);
+        return;
+    }
+
     while (--n >= 0) {
         epoll_event_t* ev = &events[n];
         connection_t* connection = ev->data.ptr;
@@ -121,7 +125,7 @@ void __mpx_epoll_process_events(appconfig_t* appconfig, void* arg) {
             if (!connection->read(connection))
                 goto close;
 
-        if (ev->events & EPOLLOUT || ctx->need_write)
+        if ((ev->events & EPOLLOUT || ctx->need_write) && connection->write != NULL)
             if (!connection->write(connection))
                 goto close;
 
