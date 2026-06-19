@@ -14,7 +14,7 @@ static connection_pool_t* global_pool = NULL;
 static pthread_once_t global_pool_once = PTHREAD_ONCE_INIT;
 
 static void __global_pool_init_once(void);
-static char* __make_host_key(const char* host, short port);
+static char* __make_host_key(const char* host, unsigned short port);
 static void __host_connections_free(void* arg);
 static void __close_pooled_connection(pooled_connection_t* pc);
 static int __is_connection_alive(connection_t* connection);
@@ -52,7 +52,7 @@ void httpclientpool_free(connection_pool_t* pool) {
     free(pool);
 }
 
-connection_t* httpclientpool_acquire(connection_pool_t* pool, const char* host, short port, int use_ssl) {
+connection_t* httpclientpool_acquire(connection_pool_t* pool, const char* host, unsigned short port, int use_ssl) {
     if (pool == NULL || host == NULL) return NULL;
 
     char* key = __make_host_key(host, port);
@@ -106,7 +106,7 @@ connection_t* httpclientpool_acquire(connection_pool_t* pool, const char* host, 
     return result;
 }
 
-void httpclientpool_release(connection_pool_t* pool, const char* host, short port, connection_t* connection, int use_ssl) {
+void httpclientpool_release(connection_pool_t* pool, const char* host, unsigned short port, connection_t* connection, int use_ssl) {
     if (pool == NULL || host == NULL || connection == NULL) return;
 
     char* key = __make_host_key(host, port);
@@ -172,7 +172,7 @@ void httpclientpool_release(connection_pool_t* pool, const char* host, short por
     free(key);
 }
 
-void httpclientpool_discard(connection_pool_t* pool, const char* host, short port, connection_t* connection) {
+void httpclientpool_discard(connection_pool_t* pool, const char* host, unsigned short port, connection_t* connection) {
     if (pool == NULL || host == NULL || connection == NULL) return;
 
     char* key = __make_host_key(host, port);
@@ -274,7 +274,7 @@ static void __global_pool_init_once(void) {
     global_pool = httpclientpool_create();
 }
 
-static char* __make_host_key(const char* host, short port) {
+static char* __make_host_key(const char* host, unsigned short port) {
     size_t len = strlen(host) + 8;  // :port + null
     char* key = malloc(len);
     if (key == NULL) return NULL;

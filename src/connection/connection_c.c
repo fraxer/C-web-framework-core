@@ -5,7 +5,7 @@ static connection_client_ctx_t* __ctx_create(void);
 static void __ctx_reset(void* arg);
 static void __ctx_free(void* arg);
 
-connection_t* connection_c_create(const int fd, const in_addr_t ip, const short port) {
+connection_t* connection_c_create(const int fd, const in_addr_t ip, const unsigned short port) {
     return __connection_c_alloc(fd, ip, port);
 }
 

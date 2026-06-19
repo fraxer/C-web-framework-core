@@ -32,9 +32,9 @@ connection_pool_t* httpclientpool_create(void);
 void httpclientpool_free(connection_pool_t* pool);
 
 // Connection management
-connection_t* httpclientpool_acquire(connection_pool_t* pool, const char* host, short port, int use_ssl);
-void httpclientpool_release(connection_pool_t* pool, const char* host, short port, connection_t* connection, int use_ssl);
-void httpclientpool_discard(connection_pool_t* pool, const char* host, short port, connection_t* connection);
+connection_t* httpclientpool_acquire(connection_pool_t* pool, const char* host, unsigned short port, int use_ssl);
+void httpclientpool_release(connection_pool_t* pool, const char* host, unsigned short port, connection_t* connection, int use_ssl);
+void httpclientpool_discard(connection_pool_t* pool, const char* host, unsigned short port, connection_t* connection);
 
 // Maintenance
 void httpclientpool_cleanup_expired(connection_pool_t* pool);

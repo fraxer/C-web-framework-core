@@ -27,7 +27,7 @@ void __httpclient_set_method(httpclient_t*, route_methods_e);
 int __httpclient_set_url(httpclient_t*, const char*);
 httpresponse_t* __httpclient_send(httpclient_t*);
 int __httpclient_create_connection(httpclient_t*);
-connection_t* __httpclient_resolve(const char*, const short);
+connection_t* __httpclient_resolve(const char*, const unsigned short);
 int __httpclient_establish_connection(httpclient_t*);
 int __httpclient_connect(httpclient_t*);
 int __httpclient_set_socket_keepalive(int fd);
@@ -180,7 +180,7 @@ int __httpclient_set_url(httpclient_t* client, const char* url) {
 
     client->use_ssl = httpclientparser_move_use_ssl(client->parser);
 
-    if (client->parser->port > 0)
+    if (client->parser->port != 0)
         client->port = httpclientparser_move_port(client->parser);
 
     if (client->parser->host)
@@ -310,7 +310,7 @@ int __httpclient_create_connection(httpclient_t* client) {
     return 1;
 }
 
-connection_t* __httpclient_resolve(const char* host, const short port) {
+connection_t* __httpclient_resolve(const char* host, const unsigned short port) {
     if (host == NULL) {
         log_error("__httpclient_resolve: host is NULL\n");
         return NULL;

@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -9,7 +10,6 @@
 
 void __httpclientparser_flush(httpclientparser_t* parser);
 int __httpclientparser_set_query(httpclientparser_t* parser, const char* string, size_t length, size_t pos);
-void __httpclientparser_append_query(httpclientparser_t* parser, query_t* query);
 int __httpclientparser_set_path(httpclientparser_t* parser, const char* string, size_t length);
 int __httpclientparser_set_protocol(httpclientparser_t* parser);
 int __httpclientparser_set_host(httpclientparser_t* parser);
@@ -21,6 +21,7 @@ void httpclientparser_init(httpclientparser_t* parser) {
     parser->bytes_readed = 0;
     parser->pos_start = 0;
     parser->pos = 0;
+    parser->path_length = 0;
     parser->use_ssl = 0;
     parser->port = 0;
     parser->host = NULL;
@@ -44,7 +45,7 @@ char* httpclientparser_move_host(httpclientparser_t* parser) {
     return host;
 }
 
-short int httpclientparser_move_port(httpclientparser_t* parser) {
+unsigned short httpclientparser_move_port(httpclientparser_t* parser) {
     return parser->port;
 }
 
@@ -88,10 +89,20 @@ void httpclientparser_reset(httpclientparser_t* parser) {
 }
 
 int httpclientparser_parse(httpclientparser_t* parser, const char* url) {
+    if (url == NULL)
+        return CLIENTPARSER_BAD_PROTOCOL;
+
     parser->buffer = (char*)url;
     parser->bytes_readed = strlen(url);
+    if (parser->bytes_readed == 0)
+        return CLIENTPARSER_BAD_PROTOCOL;
+
     parser->pos_start = 0;
     parser->pos = 0;
+
+    // Самодостаточность: parse начинает с чистой стадии и буфера, даже без предшествующего reset().
+    parser->stage = CLIENTPARSER_PROTOCOL;
+    bufferdata_reset(&parser->buf);
 
     for (parser->pos = parser->pos_start; parser->pos < parser->bytes_readed; parser->pos++) {
         char ch = parser->buffer[parser->pos];
@@ -120,10 +131,10 @@ int httpclientparser_parse(httpclientparser_t* parser, const char* url) {
                 bufferdata_reset(&parser->buf);
                 break;
             }
-            else if (end) 
+            else if (end)
                 return CLIENTPARSER_BAD_PROTOCOL;
             else {
-                if (bufferdata_writed(&parser->buf) > 5)
+                if (bufferdata_writed(&parser->buf) >= 5)
                     return CLIENTPARSER_BAD_PROTOCOL;
 
                 bufferdata_push(&parser->buf, ch);
@@ -151,7 +162,7 @@ int httpclientparser_parse(httpclientparser_t* parser, const char* url) {
         {
             if (ch == ':')
                 parser->stage = CLIENTPARSER_PORT;
-            else if (ch == '/')
+            else if (ch == '/' || ch == '?' || ch == '#')
                 parser->stage = CLIENTPARSER_URI;
             else if (end) {
                 parser->stage = CLIENTPARSER_URI;
@@ -168,7 +179,7 @@ int httpclientparser_parse(httpclientparser_t* parser, const char* url) {
 
             bufferdata_reset(&parser->buf);
 
-            if (ch == '/') {
+            if (ch == '/' || ch == '?' || ch == '#') {
                 parser->pos--;
                 break;
             }
@@ -180,13 +191,18 @@ int httpclientparser_parse(httpclientparser_t* parser, const char* url) {
         }
         case CLIENTPARSER_PORT:
         {
-            if (ch == '/')
+            if (ch == '/' || ch == '?' || ch == '#')
                 parser->stage = CLIENTPARSER_URI;
             else if (end) {
                 parser->stage = CLIENTPARSER_URI;
                 bufferdata_push(&parser->buf, ch);
             }
             else {
+                // Ограничиваем длину порта: защищаем и от atoi-подобного переполнения,
+                // и от неограниченного роста буфера на гигантских числовых строках.
+                if (bufferdata_writed(&parser->buf) >= 5)
+                    return CLIENTPARSER_BAD_PORT;
+
                 bufferdata_push(&parser->buf, ch);
                 break;
             }
@@ -197,7 +213,7 @@ int httpclientparser_parse(httpclientparser_t* parser, const char* url) {
 
             bufferdata_reset(&parser->buf);
 
-            if (ch == '/') {
+            if (ch == '/' || ch == '?' || ch == '#') {
                 parser->pos--;
                 break;
             }
@@ -242,6 +258,7 @@ void __httpclientparser_flush(httpclientparser_t* parser) {
 
     if (parser->path) free(parser->path);
     parser->path = NULL;
+    parser->path_length = 0;
 
     queries_free(parser->query);
     parser->query = NULL;
@@ -277,15 +294,21 @@ int __httpclientparser_set_host(httpclientparser_t* parser) {
 
 int __httpclientparser_set_port(httpclientparser_t* parser) {
     const char* port = bufferdata_get(&parser->buf);
+    const size_t length = bufferdata_writed(&parser->buf);
 
-    if (strspn(port, "0123456789") != bufferdata_writed(&parser->buf))
+    if (length == 0 || strspn(port, "0123456789") != length)
         return 0;
 
-    int port_number = atoi(port);
-    if (port_number == 0 || port_number > 65535)
+    // strtol с проверкой переполнения/диапазона вместо atoi (atoi даёт UB на больших значениях).
+    errno = 0;
+    char* end = NULL;
+    long port_number = strtol(port, &end, 10);
+    if (errno != 0 || end == port || *end != '\0')
+        return 0;
+    if (port_number <= 0 || port_number > 65535)
         return 0;
 
-    parser->port = port_number;
+    parser->port = (unsigned short)port_number;
 
     return 1;
 }
@@ -298,7 +321,9 @@ int __httpclientparser_set_uri(httpclientparser_t* parser) {
         length = 1;
     }
 
-    size_t path_point_end = 0;
+    // Путь заканчивается на первом '?' (запускает разбор query) или '#' (фрагмент).
+    // (size_t)-1 означает, что разделителя в строке не было.
+    size_t path_point_end = (size_t)-1;
     for (size_t pos = 0; pos < length; pos++) {
         switch (string[pos]) {
         case '?':
@@ -316,11 +341,21 @@ int __httpclientparser_set_uri(httpclientparser_t* parser) {
 
     next:
 
-    if (path_point_end == 0) path_point_end = length;
-    if (!__httpclientparser_set_path(parser, string, path_point_end))
-        return 0;
+    if (path_point_end == (size_t)-1)
+        path_point_end = length;
 
-    str_t* uri = str_createn(parser->path, path_point_end);
+    // Пустой путь (например "http://host?x=1" или "http://host#frag") нормализуем в "/".
+    if (path_point_end == 0) {
+        if (!__httpclientparser_set_path(parser, "/", 1))
+            return 0;
+    }
+    else if (!__httpclientparser_set_path(parser, string, path_point_end)) {
+        return 0;
+    }
+
+    // uri строится из ДЕКОДИРОВАННОГО пути по его реальной длине;
+    // иначе для %-encoded путей в uri попадают встроенный '\0' и хвостовой мусор.
+    str_t* uri = str_createn(parser->path, parser->path_length);
     if (uri == NULL) return 0;
 
     query_t* query = parser->query;
@@ -338,28 +373,23 @@ int __httpclientparser_set_uri(httpclientparser_t* parser) {
     return 1;
 }
 
-static void __httpclientparser_append_query_callback(void* context, query_t* query) {
-    httpclientparser_t* parser = (httpclientparser_t*)context;
-    __httpclientparser_append_query(parser, query);
-}
-
 int __httpclientparser_set_query(httpclientparser_t* parser, const char* string, size_t length, size_t pos) {
     query_t* first_query = NULL;
     query_t* last_query = NULL;
 
+    // Колбэк не нужен: queryparser_parse сам собирает и возвращает голову/хвост списка.
     queryparser_result_t result = queryparser_parse(
         string,
         length,
         pos + 1,  // Start after '?'
-        parser,
-        __httpclientparser_append_query_callback,
+        NULL,
+        NULL,
         &first_query,
         &last_query
     );
 
-    if (result != QUERYPARSER_OK) {
+    if (result != QUERYPARSER_OK)
         return 0;
-    }
 
     parser->query = first_query;
     parser->last_query = last_query;
@@ -367,20 +397,12 @@ int __httpclientparser_set_query(httpclientparser_t* parser, const char* string,
     return 1;
 }
 
-void __httpclientparser_append_query(httpclientparser_t* parser, query_t* query) {
-    if (parser->query == NULL)
-        parser->query = query;
-
-    if (parser->last_query)
-        parser->last_query->next = query;
-
-    parser->last_query = query;
-}
-
 int __httpclientparser_set_path(httpclientparser_t* parser, const char* string, size_t length) {
     size_t decoded_length = length;
     parser->path = urldecodel(string, length, &decoded_length);
     if (parser->path == NULL) return 0;
+
+    parser->path_length = decoded_length;
 
     if (is_path_traversal(parser->path, decoded_length))
         return 0;

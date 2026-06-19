@@ -24,7 +24,7 @@ typedef struct httpclient {
     route_methods_e method;
     unsigned int use_ssl : 1;
     short int redirect_count;
-    short int port;
+    unsigned short port;
     int timeout;
     char* host;
     SSL_CTX* ssl_ctx;
