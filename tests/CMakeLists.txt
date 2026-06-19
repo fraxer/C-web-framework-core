@@ -28,6 +28,7 @@ target_link_libraries(runner PRIVATE
     misc
     http_server_parsers
     http_server
+    http_client_parsers
     http
     connection
     domain

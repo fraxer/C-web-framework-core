@@ -38,7 +38,7 @@ int http_client_read(connection_t* connection) {
     httpresponseparser_set_buffer(parser, connection->buffer);
 
     while (1) {
-        int bytes_readed = connection_data_read(connection);
+        ssize_t bytes_readed = connection_data_read(connection);
 
         switch (bytes_readed) {
         case -1:

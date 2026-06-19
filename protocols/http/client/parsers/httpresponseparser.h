@@ -43,7 +43,7 @@ void httpresponseparser_set_buffer(httpresponseparser_t*, char*);
 void httpresponseparser_free(httpresponseparser_t*);
 void httpresponseparser_reset(httpresponseparser_t*);
 int httpresponseparser_run(httpresponseparser_t*);
-void httpresponseparser_set_bytes_readed(httpresponseparser_t*, int);
+void httpresponseparser_set_bytes_readed(httpresponseparser_t*, ssize_t);
 void httpresponseparser_append_query(httpresponse_t*, query_t*);
 
 #endif

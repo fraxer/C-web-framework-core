@@ -2,6 +2,7 @@
 #include <ctype.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 #include "httprequest.h"
 #include "httpresponse.h"
@@ -45,7 +46,8 @@ void httpresponseparser_init(httpresponseparser_t* parser) {
 
 void httpresponseparser_set_connection(httpresponseparser_t* parser, connection_t* connection) {
     parser->connection = connection;
-    parser->teparser->connection = connection;
+    if (parser->teparser)
+        parser->teparser->connection = connection;
 }
 
 void httpresponseparser_set_buffer(httpresponseparser_t* parser, char* buffer) {
@@ -65,6 +67,12 @@ void httpresponseparser_reset(httpresponseparser_t* parser) {
 void __httpresponseparser_flush(httpresponseparser_t* parser) {
     if (parser->buf.dynamic_buffer) free(parser->buf.dynamic_buffer);
     parser->buf.dynamic_buffer = NULL;
+
+    /*
+     * Завершаем zlib-поток: иначе последующий httpresponseparser_init()
+     * обнулит z_stream через memset без inflateEnd/deflateEnd — утечка.
+     */
+    gzip_free(&parser->gzip);
 
     httpteparser_free(parser->teparser);
 }
@@ -223,15 +231,23 @@ int httpresponseparser_run(httpresponseparser_t* parser) {
     return HTTP1PARSER_CONTINUE;
 }
 
-void httpresponseparser_set_bytes_readed(httpresponseparser_t* parser, int readed) {
-    parser->bytes_readed = readed;
+void httpresponseparser_set_bytes_readed(httpresponseparser_t* parser, ssize_t readed) {
+    parser->bytes_readed = readed > 0 ? (size_t)readed : 0;
 }
 
 int __httpresponseparser_set_protocol(httpresponse_t* response, httpresponseparser_t* parser) {
     char* s = bufferdata_get(&parser->buf);
+    size_t length = bufferdata_writed(&parser->buf);
 
-    if (s[0] == 'H' && s[1] == 'T' && s[2] == 'T' && s[3] == 'P' && s[4] == '/'  && s[5] == '1' && s[6] == '.' && s[7] == '1') {
+    if (length < 8 || memcmp(s, "HTTP/1.", 7) != 0)
+        return 0;
+
+    if (s[7] == '1') {
         response->version = HTTP1_VER_1_1;
+        return 1;
+    }
+    if (s[7] == '0') {
+        response->version = HTTP1_VER_1_0;
         return 1;
     }
 
@@ -272,25 +288,32 @@ int __httpresponseparser_parse_payload(httpresponseparser_t* parser) {
     const size_t string_len = parser->pos - parser->pos_start;
     const size_t client_max_body_size = env()->main.client_max_body_size;
 
-    if (parser->content_saved_length + string_len > client_max_body_size)
-        return HTTP1PARSER_PAYLOAD_LARGE;
-
+    /*
+     * Лимит размера тела считаем по фактически записанным в файл байтам
+     * (response->payload_.file.size обновляется внутри append_content):
+     * для gzip это декомпрессированный объём, для raw — исходный.
+     * Так client_max_body_size единообразно защищает и zip-бомбы.
+     */
     if (response->transfer_encoding == TE_CHUNKED) {
         int ret = __transfer_decoding(response, &parser->buffer[parser->pos_start], string_len);
-        switch (ret) {
-            case HTTP1TEPARSER_ERROR:
-                return HTTP1PARSER_ERROR;
-            case HTTP1TEPARSER_CONTINUE:
-                break;
-            case HTTP1TEPARSER_COMPLETE:
-                return HTTP1RESPONSEPARSER_COMPLETE;
-        }
+        if (ret == HTTP1TEPARSER_ERROR)
+            return HTTP1PARSER_ERROR;
+
+        /*
+         * Лимит проверяем до возврата COMPLETE: терминатор чанков ("0\r\n\r\n")
+         * может прийти в том же буфере, что и избыточные данные, и тогда teparser
+         * уже отрапортует COMPLETE. Без этой проверки размер не контролируется.
+         */
+        if (response->payload_.file.size > client_max_body_size)
+            return HTTP1PARSER_PAYLOAD_LARGE;
+
+        if (ret == HTTP1TEPARSER_COMPLETE)
+            return HTTP1RESPONSEPARSER_COMPLETE;
     }
     else {
         if (response->content_encoding == CE_GZIP) {
             gzip_t* gzip = &parser->gzip;
             char buffer[GZIP_BUFFER];
-            size_t decompressed_total = 0;
 
             if (!gzip_inflate_init(gzip, &parser->buffer[parser->pos_start], string_len))
                 return HTTP1PARSER_ERROR;
@@ -301,23 +324,30 @@ int __httpresponseparser_parse_payload(httpresponseparser_t* parser) {
                     return HTTP1PARSER_ERROR;
 
                 if (writed > 0) {
-                    response->payload_.file.append_content(&response->payload_.file, buffer, writed);
-                    decompressed_total += writed;
+                    if (response->payload_.file.size + writed > client_max_body_size)
+                        return HTTP1PARSER_PAYLOAD_LARGE;
+                    if (!response->payload_.file.append_content(&response->payload_.file, buffer, writed))
+                        return HTTP1PARSER_ERROR;
                 }
             } while (gzip_want_continue(gzip));
 
             if (gzip_is_end(gzip))
                 if (!gzip_inflate_free(gzip))
                     return HTTP1PARSER_ERROR;
-
-            parser->content_saved_length += decompressed_total;
         }
         else {
+            if (response->payload_.file.size + string_len > client_max_body_size)
+                return HTTP1PARSER_PAYLOAD_LARGE;
             if (!response->payload_.file.append_content(&response->payload_.file, &parser->buffer[parser->pos_start], string_len))
                 return HTTP1PARSER_ERROR;
-
-            parser->content_saved_length += string_len;
         }
+
+        /*
+         * content_saved_length — байты по проводу (для gzip — сжатые),
+         * в тех же единицах, что и content_length из заголовка. Сравнение
+         * корректно и больше не обрывает gzip-ответ преждевременно.
+         */
+        parser->content_saved_length += string_len;
 
         if (parser->content_saved_length >= parser->content_length)
             return HTTP1RESPONSEPARSER_COMPLETE;
@@ -353,8 +383,28 @@ void __try_set_content_length(httpresponseparser_t* parser) {
     if (header->key_length != key_length) return;
     if (!cmpstrn_lower(header->key, header->key_length, key, key_length)) return;
 
-    parser->content_length = atoll(header->value); // TODO: Проверить на переполнение
-    response->content_length = parser->content_length;
+    /*
+     * Строгий разбор неотрицательного десятичного значения: мусор,
+     * отрицательные числа и переполнение игнорируем (content_length
+     * остаётся 0). Раньше atoll("-1") превращалось в огромное size_t.
+     */
+    const char* value = header->value;
+    const size_t value_length = header->value_length;
+
+    size_t result = 0;
+    for (size_t i = 0; i < value_length; i++) {
+        if (value[i] < '0' || value[i] > '9')
+            return;
+
+        const size_t digit = (size_t)(value[i] - '0');
+        if (result > (SIZE_MAX - digit) / 10)
+            return;
+
+        result = result * 10 + digit;
+    }
+
+    parser->content_length = result;
+    response->content_length = result;
 }
 
 void __try_set_transfer_encoding(httpresponseparser_t* parser) {
@@ -368,16 +418,38 @@ void __try_set_transfer_encoding(httpresponseparser_t* parser) {
     if (header->key_length != key_length) return;
     if (!cmpstrn_lower(header->key, header->key_length, key, key_length)) return;
 
-    const char* value_chunked = "chunked";
-    const size_t value_chunked_length = 7;
+    /*
+     * Значение — список кодирований через запятую (RFC 7230 §4),
+     * например "gzip, chunked". "chunked" — это framing (TE_CHUNKED),
+     * а "gzip" на транспортном уровне декодируется так же, как
+     * Content-Encoding: gzip, поэтому фиксируем его в content_encoding,
+     * чтобы общий декодер его разжал. TE_GZIP намеренно не ставим —
+     * это значение нигде не декодировалось (мёртвая ветка).
+     */
+    const char* value = header->value;
+    const size_t value_length = header->value_length;
 
-    const char* value_gzip = "gzip";
-    const size_t value_gzip_length = 4;
+    size_t start = 0;
+    while (start < value_length) {
+        while (start < value_length && (value[start] == ' ' || value[start] == '\t'))
+            start++;
 
-    if (cmpstrn_lower(header->value, header->value_length, value_chunked, value_chunked_length))
-        response->transfer_encoding = TE_CHUNKED;
-    else if (cmpstrn_lower(header->value, header->value_length, value_gzip, value_gzip_length))
-        response->transfer_encoding = TE_GZIP;
+        size_t end = start;
+        while (end < value_length && value[end] != ',' && value[end] != ';')
+            end++;
+
+        size_t tok_end = end;
+        while (tok_end > start && (value[tok_end - 1] == ' ' || value[tok_end - 1] == '\t'))
+            tok_end--;
+
+        const size_t tok_length = tok_end - start;
+        if (tok_length == 7 && cmpstrn_lower(&value[start], tok_length, "chunked", 7))
+            response->transfer_encoding = TE_CHUNKED;
+        else if (tok_length == 4 && cmpstrn_lower(&value[start], tok_length, "gzip", 4))
+            response->content_encoding = CE_GZIP;
+
+        start = (end < value_length) ? end + 1 : value_length;
+    }
 }
 
 void __try_set_content_encoding(httpresponseparser_t* parser) {
@@ -425,22 +497,30 @@ int __httpresponseparser_set_header_value(httpresponse_t* response, httpresponse
     char* string = bufferdata_get(&parser->buf);
     size_t length = bufferdata_writed(&parser->buf);
 
+    /*
+     * http_header_create() уже выделил value как пустую строку-заглушку.
+     * Освобождаем её перед перезаписью, иначе перезапись указателя утечёт
+     * (по 1 байту на каждый заголовок ответа).
+     */
+    free(response->last_header->value);
+
     response->last_header->value = copy_cstringn(string, length);
     response->last_header->value_length = length;
 
     if (response->last_header->value == NULL)
-        return HTTP1PARSER_OUT_OF_MEMORY;
+        return 0;
 
     __try_set_keepalive(parser);
     __try_set_content_length(parser);
     __try_set_transfer_encoding(parser);
     __try_set_content_encoding(parser);
 
-    return HTTP1PARSER_CONTINUE;
+    return 1;
 }
 
 int __transfer_decoding(httpresponse_t* response, const char* data, size_t size) {
     httpteparser_t* parser = ((httpresponseparser_t*)response->parser)->teparser;
+    if (parser == NULL) return HTTP1TEPARSER_ERROR;
     httpteparser_set_buffer(parser, (char*)data, size);
 
     return httpteparser_run(parser);
