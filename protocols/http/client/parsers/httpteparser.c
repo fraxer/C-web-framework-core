@@ -42,6 +42,14 @@ void httpteparser_free(httpteparser_t* parser) {
     if (parser->buf.dynamic_buffer) free(parser->buf.dynamic_buffer);
     parser->buf.dynamic_buffer = NULL;
 
+    /*
+     * inflateInit2() вызывается лениво при первом gzip-чанке, а inflateEnd() —
+     * только по достижении Z_STREAM_END. На любом досрочном завершении
+     * (ошибка/обрыв соединения) внутренние буферы zlib иначе утекают.
+     * gzip_free() безопасна, если inflate уже освобождён (is_deflate_init == -1).
+     */
+    gzip_free(&parser->gzip);
+
     free(parser);
 }
 
@@ -70,10 +78,19 @@ int httpteparser_run(httpteparser_t* parser) {
                 if (!__set_chunk_size(parser))
                     return HTTP1TEPARSER_ERROR;
 
-                if (parser->chunk_size == 0)
-                    return HTTP1TEPARSER_COMPLETE;
+                bufferdata_reset(&parser->buf);
+            }
+            else if (ch == ';') {
+                /*
+                 * chunk-ext (";token=value..."), RFC 7230 §4.1.1. Hex-размер уже
+                 * накоплен — парсим его сейчас, а байты расширения пропускаем до CRLF.
+                 */
+                bufferdata_complete(&parser->buf);
+                if (!__set_chunk_size(parser))
+                    return HTTP1TEPARSER_ERROR;
 
                 bufferdata_reset(&parser->buf);
+                parser->stage = HTTP1TEPARSER_CHUNKSIZE_EXT;
             }
             else {
                 if (bufferdata_writed(&parser->buf) > 8)
@@ -84,17 +101,35 @@ int httpteparser_run(httpteparser_t* parser) {
             break;
         case HTTP1TEPARSER_CHUNKSIZE_NEWLINE:
             if (ch == '\n') {
-                parser->stage = HTTP1TEPARSER_CHUNK;
+                /*
+                 * Последний чанк (chunk_size == 0): за размерной строкой идёт
+                 * trailer-part и финальный CRLF, а не данные чанка.
+                 */
+                parser->stage = (parser->chunk_size == 0)
+                    ? HTTP1TEPARSER_TRAILER
+                    : HTTP1TEPARSER_CHUNK;
                 break;
             }
             else
                 return HTTP1TEPARSER_ERROR;
+        case HTTP1TEPARSER_CHUNKSIZE_EXT:
+            /* Пропуск байтов chunk-ext до CRLF. */
+            if (ch == '\r')
+                parser->stage = HTTP1TEPARSER_CHUNKSIZE_NEWLINE;
+            break;
         case HTTP1TEPARSER_CHUNK:
             {
                 if (!__read_chunk(parser))
                     return HTTP1TEPARSER_ERROR;
 
-                if (parser->chunk_size_readed >= parser->chunk_size) {
+                if (parser->chunk_size_readed >= parser->chunk_size
+                    && parser->pos < parser->bytes_readed) {
+                    /*
+                     * '\r', завершающий чанк, может приехать в следующем буфере.
+                     * Здесь parser->pos уже сдвинут на temp_chunk_size внутри
+                     * __read_chunk; если данные чанка точно заполнили буфер, pos
+                     * == bytes_readed и чтение buffer[pos] — out-of-bounds.
+                     */
                     ch = parser->buffer[parser->pos];
                     if (ch == '\r')
                         parser->stage = HTTP1TEPARSER_CHUNK_NEWLINE;
@@ -110,9 +145,49 @@ int httpteparser_run(httpteparser_t* parser) {
             }
             else
                 return HTTP1TEPARSER_ERROR;
+        case HTTP1TEPARSER_TRAILER:
+            /*
+             * trailer-part = *( header-field CRLF ) (RFC 7230 §4.1.2). Пустая
+             * строка (текущая строка не содержит байтов) — это финальный CRLF.
+             * Содержимое trailer-строк не используем, только отличаем пустую
+             * строку от непустой, поэтому копим байты ради счётчика.
+             */
+            if (ch == '\r') {
+                if (bufferdata_writed(&parser->buf) == 0)
+                    parser->stage = HTTP1TEPARSER_TRAILER_FINAL_NEWLINE;
+                else {
+                    bufferdata_reset(&parser->buf);
+                    parser->stage = HTTP1TEPARSER_TRAILER_NEWLINE;
+                }
+            }
+            else {
+                if (bufferdata_writed(&parser->buf) > 8192)
+                    return HTTP1TEPARSER_ERROR;
+                bufferdata_push(&parser->buf, ch);
+            }
+            break;
+        case HTTP1TEPARSER_TRAILER_NEWLINE:
+            if (ch == '\n') {
+                parser->stage = HTTP1TEPARSER_TRAILER;
+                break;
+            }
+            else
+                return HTTP1TEPARSER_ERROR;
+        case HTTP1TEPARSER_TRAILER_FINAL_NEWLINE:
+            if (ch == '\n')
+                return HTTP1TEPARSER_COMPLETE;
+            else
+                return HTTP1TEPARSER_ERROR;
         }
     }
 
+    /*
+     * Строгое завершение: финальный CRLF должен быть прочитан, иначе оставшиеся
+     * байты терминатора останутся в сокете и испортят следующий ответ на
+     * keep-alive соединении. Ждём их в следующем буфере (CONTINUE). Если сервер
+     * оборвёт поток без финального CRLF, клиент увидит EOF и использует уже
+     * полностью записанное тело — см. http_client_read (case 0).
+     */
     return HTTP1TEPARSER_CONTINUE;
 }
 
@@ -144,6 +219,14 @@ int __read_chunk(httpteparser_t* parser) {
     size_t temp_chunk_size = parser->chunk_size - parser->chunk_size_readed > parser->bytes_readed - parser->pos
         ? parser->bytes_readed - parser->pos
         : parser->chunk_size - parser->chunk_size_readed;
+
+    /*
+     * Чанк уже прочитан целиком в предыдущем буфере (temp_chunk_size == 0):
+     * данных для записи нет. Пропускаем append_content/inflate — иначе вызов
+     * записи нуля байт трактуется как ошибка (см. __file_append_content).
+     */
+    if (temp_chunk_size == 0)
+        return 1;
 
     connection_client_ctx_t* ctx = parser->connection->ctx;
     httpresponse_t* response = ctx->response;

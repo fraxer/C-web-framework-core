@@ -273,6 +273,245 @@ TEST(test_httpresponseparser_chunked_size_limit) {
 }
 
 // ============================================================================
+// Test Suite 2b: Chunked transfer-encoding robustness
+// ============================================================================
+
+// Feed a chunked response in tiny fixed-size slices, crossing size lines, chunk
+// data and CRLF terminators at arbitrary offsets. Exercises the parser's ability
+// to carry state (chunk_size, chunk_size_readed, the size-line buffer) across
+// reads — the case the single-read test does not cover.
+TEST(test_httpresponseparser_chunked_multi_read) {
+    TEST_SUITE("HTTP Response Parser - Chunked Robustness");
+    TEST_CASE("Reassemble chunked body delivered in tiny slices");
+
+    response_harness_t h;
+    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+
+    const char* full =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+    const size_t len = strlen(full);
+    const size_t step = 7;
+
+    size_t off = 0;
+    int result = HTTP1PARSER_CONTINUE;
+    while (off < len && result == HTTP1PARSER_CONTINUE) {
+        size_t slice = (len - off < step) ? (len - off) : step;
+        result = harness_feed(&h, full + off, slice);
+        off += slice;
+    }
+
+    TEST_ASSERT_EQUAL(HTTP1RESPONSEPARSER_COMPLETE, result, "Sliced chunked body should complete");
+
+    char* body = harness_read_body(&h);
+    TEST_ASSERT_NOT_NULL(body, "Body should be present");
+    if (body) TEST_ASSERT_STR_EQUAL("hello world", body, "Reassembled body should match");
+    free(body);
+
+    harness_free(&h);
+}
+
+// Regression for the out-of-bounds read in httpteparser. When a chunk's data
+// fills the receive buffer exactly (no trailing CRLF in this read), the parser
+// used to read parser->buffer[bytes_readed] — one byte past the valid region.
+// Under ASan (Debug builds) the buggy code aborts the runner here; with the
+// guard the chunk completes cleanly across the boundary.
+TEST(test_httpresponseparser_chunked_chunk_at_buffer_end) {
+    TEST_CASE("Chunk ending exactly at buffer boundary (no over-read)");
+
+    response_harness_t h;
+    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+
+    // Headers + one chunk laid out so the chunk DATA ends on the last byte of
+    // the 16 KiB receive buffer (no trailing CRLF in this read).
+    static const char header[] = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    const size_t H = sizeof(header) - 1;
+    const size_t remaining = HARNESS_BUFFER_SIZE - H;
+
+    // Solve D + strlen(hex(D)) + 2 (CRLF after the size line) == remaining.
+    char sizeline[16];
+    size_t D = remaining - 2;
+    int sl = snprintf(sizeline, sizeof(sizeline), "%zx", D);
+    D = remaining - 2 - (size_t)sl;
+    sl = snprintf(sizeline, sizeof(sizeline), "%zx", D);
+    TEST_ASSERT_EQUAL_SIZE(remaining, (size_t)sl + 2 + D, "Size-line math must fill the buffer");
+
+    char feed1[HARNESS_BUFFER_SIZE];
+    memcpy(feed1, header, H);
+    memcpy(feed1 + H, sizeline, (size_t)sl);
+    memcpy(feed1 + H + sl, "\r\n", 2);          // CRLF terminating the size line
+    memset(feed1 + H + sl + 2, 'A', D);         // chunk DATA ends on the last byte
+    const size_t feed1_len = H + (size_t)sl + 2 + D;
+    TEST_ASSERT_EQUAL_SIZE(HARNESS_BUFFER_SIZE, feed1_len, "First feed must fill the buffer exactly");
+
+    int r1 = harness_feed(&h, feed1, feed1_len);
+    TEST_ASSERT_EQUAL(HTTP1PARSER_CONTINUE, r1, "Chunk ending at buffer end should continue, not error");
+
+    // Deliver the chunk's CRLF and the terminating last-chunk.
+    static const char term[] = "\r\n0\r\n\r\n";
+    int r2 = harness_feed(&h, term, sizeof(term) - 1);
+    TEST_ASSERT_EQUAL(HTTP1RESPONSEPARSER_COMPLETE, r2, "Terminator should complete the response");
+
+    char* body = harness_read_body(&h);
+    TEST_ASSERT_NOT_NULL(body, "Body should be present");
+    if (body) TEST_ASSERT_EQUAL_SIZE(D, strlen(body), "Body length should equal the chunk size");
+    free(body);
+
+    harness_free(&h);
+}
+
+// RFC 7230 §4.1.1 permits chunk extensions (";token=value") on the size line.
+// Any non-hex byte there used to abort parsing.
+TEST(test_httpresponseparser_chunked_extensions) {
+    TEST_CASE("Ignore chunk extensions on the size line");
+
+    response_harness_t h;
+    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+
+    const char* resp =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "5;name=value\r\nhello\r\n"
+        "6;sep\r\n world\r\n"
+        "0\r\n\r\n";
+    int result = harness_feed(&h, resp, strlen(resp));
+    TEST_ASSERT_EQUAL(HTTP1RESPONSEPARSER_COMPLETE, result, "Chunked response with extensions should complete");
+
+    char* body = harness_read_body(&h);
+    TEST_ASSERT_NOT_NULL(body, "Body should be present");
+    if (body) TEST_ASSERT_STR_EQUAL("hello world", body, "Body should ignore extensions");
+    free(body);
+
+    harness_free(&h);
+}
+
+TEST(test_httpresponseparser_chunked_empty_body) {
+    TEST_CASE("Chunked response with empty body completes");
+
+    response_harness_t h;
+    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+
+    const char* resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+    int result = harness_feed(&h, resp, strlen(resp));
+    TEST_ASSERT_EQUAL(HTTP1RESPONSEPARSER_COMPLETE, result, "Empty chunked body should complete");
+
+    char* body = harness_read_body(&h);
+    TEST_ASSERT(body == NULL || strlen(body) == 0, "Empty chunked body should have no content");
+    if (body) free(body);
+
+    harness_free(&h);
+}
+
+// RFC 7230 §4.1.2: a chunked body may carry a trailer-part after the last
+// chunk, terminated by a final CRLF. The parser consumes trailers and the
+// final CRLF before completing — so no terminator bytes are left in the socket
+// to corrupt the next response on a keep-alive connection.
+TEST(test_httpresponseparser_chunked_trailers) {
+    TEST_CASE("Consume trailer headers and the final CRLF");
+
+    response_harness_t h;
+    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+
+    const char* resp =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "5\r\nhello\r\n"
+        "6\r\n world\r\n"
+        "0\r\n"
+        "X-Checksum: deadbeef\r\n"
+        "Expires: soon\r\n"
+        "\r\n";
+    int result = harness_feed(&h, resp, strlen(resp));
+    TEST_ASSERT_EQUAL(HTTP1RESPONSEPARSER_COMPLETE, result, "Chunked response with trailers should complete");
+
+    char* body = harness_read_body(&h);
+    TEST_ASSERT_NOT_NULL(body, "Body should be present");
+    if (body) TEST_ASSERT_STR_EQUAL("hello world", body, "Body should exclude trailers");
+    free(body);
+
+    harness_free(&h);
+}
+
+// The trailer section may arrive in a separate read than "0\r\n". The parser
+// must keep waiting (CONTINUE) until the final CRLF is consumed.
+TEST(test_httpresponseparser_chunked_trailer_split) {
+    TEST_CASE("Trailer section split across reads still completes");
+
+    response_harness_t h;
+    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+
+    const char* part1 =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "5\r\nhello\r\n0\r\nX-Checksum: dead";
+    const char* part2 = "beef\r\n\r\n";
+
+    int r1 = harness_feed(&h, part1, strlen(part1));
+    TEST_ASSERT_EQUAL(HTTP1PARSER_CONTINUE, r1, "Should keep waiting for the final CRLF");
+    int r2 = harness_feed(&h, part2, strlen(part2));
+    TEST_ASSERT_EQUAL(HTTP1RESPONSEPARSER_COMPLETE, r2, "Should complete after the final CRLF");
+
+    char* body = harness_read_body(&h);
+    TEST_ASSERT_NOT_NULL(body, "Body should be present");
+    if (body) TEST_ASSERT_STR_EQUAL("hello", body, "Body should be 'hello'");
+    free(body);
+
+    harness_free(&h);
+}
+
+// Strictness: without the final CRLF the parser must NOT report COMPLETE —
+// otherwise the missing terminator bytes stay in the socket and corrupt the
+// next keep-alive response. (On a real connection EOF then resolves the body.)
+TEST(test_httpresponseparser_chunked_requires_final_crlf) {
+    TEST_CASE("Do not complete without the final CRLF");
+
+    response_harness_t h;
+    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+
+    // Last-chunk size line present, but no final CRLF.
+    const char* resp =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        "5\r\nhello\r\n0\r\n";
+    int result = harness_feed(&h, resp, strlen(resp));
+    TEST_ASSERT_EQUAL(HTTP1PARSER_CONTINUE, result, "Should await the final CRLF, not complete early");
+
+    harness_free(&h);
+}
+
+// Regression for the gzip z_stream leak: feed a gzip chunk whose stream is NOT
+// finished, then free the parser. inflateInit2() ran on the first chunk but
+// inflateEnd() never did (no Z_STREAM_END), so httpteparser_free() must release
+// the zlib state via gzip_free(). Under LSan/ASan the unfixed code leaks at exit.
+TEST(test_httpresponseparser_chunked_gzip_aborted_no_leak) {
+    TEST_CASE("Aborted gzip chunked response frees inflate state");
+
+    response_harness_t h;
+    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+
+    const char* original = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    size_t glen = 0;
+    char* gz = gzip_compress(original, strlen(original), &glen);
+    TEST_ASSERT_NOT_NULL(gz, "Test gzip data should be produced");
+    TEST_ASSERT(glen > 2, "Compressed stream should have bytes");
+
+    // Deliver only the first half of the gzip member as a single chunk, then
+    // abandon the response — the inflate stream never reaches Z_STREAM_END.
+    size_t half = glen / 2;
+    if (half < 1) half = 1;
+
+    char header[256];
+    int hl = snprintf(header, sizeof(header),
+                      "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n%zx\r\n", half);
+    char feed[HARNESS_BUFFER_SIZE];
+    memcpy(feed, header, (size_t)hl);
+    memcpy(feed + hl, gz, half);
+
+    int result = harness_feed(&h, feed, (size_t)hl + half);
+    TEST_ASSERT_EQUAL(HTTP1PARSER_CONTINUE, result, "Partial gzip chunk should continue, not complete or error");
+
+    free(gz);
+    // harness_free() tears down the teparser; gzip_free() must release zlib state.
+    harness_free(&h);
+}
+
+// ============================================================================
 // Test Suite 3: Content-Encoding: gzip
 // ============================================================================
 

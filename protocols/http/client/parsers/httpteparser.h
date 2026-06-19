@@ -16,8 +16,12 @@ typedef enum httpteparser_status {
 typedef enum httpteparser_stage {
     HTTP1TEPARSER_CHUNKSIZE = 0,
     HTTP1TEPARSER_CHUNKSIZE_NEWLINE,
+    HTTP1TEPARSER_CHUNKSIZE_EXT,
     HTTP1TEPARSER_CHUNK,
-    HTTP1TEPARSER_CHUNK_NEWLINE
+    HTTP1TEPARSER_CHUNK_NEWLINE,
+    HTTP1TEPARSER_TRAILER,               // trailer-part: читаем строку trailer
+    HTTP1TEPARSER_TRAILER_NEWLINE,       // \r в конце непустой trailer-строки, ждём \n
+    HTTP1TEPARSER_TRAILER_FINAL_NEWLINE  // \r пустой строки = финальный CRLF, ждём \n
 } httpteparser_stage_e;
 
 typedef struct httpteparser {
