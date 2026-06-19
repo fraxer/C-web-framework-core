@@ -241,6 +241,23 @@ int httpclientparser_parse(httpclientparser_t* parser, const char* url) {
         }
     }
 
+    // URL закончился до того, как был сформирован URI. Это неполные абсолютные
+    // адреса вида "http:", "http:/", "http://", "http://host:" — стадии-обработчики
+    // таких хвостов не имеют явной проверки end, т.к. разделитель (':','//') уже
+    // поглощён на предыдущей итерации. Корректный разбор (относительный "/" или
+    // абсолютный с host) всегда завершается в стадии URI.
+    switch (parser->stage) {
+    case CLIENTPARSER_PROTOCOL_SLASH1:
+    case CLIENTPARSER_PROTOCOL_SLASH2:
+        return CLIENTPARSER_BAD_PROTOCOL_SEPARATOR;
+    case CLIENTPARSER_HOST:
+        return CLIENTPARSER_BAD_HOST;
+    case CLIENTPARSER_PORT:
+        return CLIENTPARSER_BAD_PORT;
+    default:
+        break;
+    }
+
     return CLIENTPARSER_OK;
 }
 
@@ -274,6 +291,9 @@ int __httpclientparser_set_protocol(httpclientparser_t* parser) {
         return 1;
     }
     else if (protocol[0] == 'h' && protocol[1] == 't' && protocol[2] == 't' && protocol[3] == 'p') {
+        // Явно сбрасываем use_ssl: иначе повторное использование парсера для "http://"
+        // после "https://" оставляет stale-флаг шифрования от предыдущего разбора.
+        parser->use_ssl = 0;
         parser->port = 80;
         return 1;
     }
@@ -283,6 +303,10 @@ int __httpclientparser_set_protocol(httpclientparser_t* parser) {
 
 int __httpclientparser_set_host(httpclientparser_t* parser) {
     const size_t length = bufferdata_writed(&parser->buf);
+
+    // Пустая authority ("http://:80", "http://?x", "http://#frag") недопустима.
+    if (length == 0) return 0;
+
     parser->host = malloc(sizeof(char) * (length + 1));
     if (parser->host == NULL) return 0;
 
