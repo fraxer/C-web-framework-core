@@ -252,6 +252,8 @@ typedef struct httprequest {
 
 httprequest_t* httprequest_create(connection_t*);
 void httprequest_free(void* arg);
+void httprequest_init_payload(httprequest_t* request);
+void httprequest_payload_free(http_payload_t* payload);
 char* httprequest_payload(httprequest_t*);
 char* httprequest_payloadf(httprequest_t*, const char*);
 file_content_t httprequest_payload_file(httprequest_t*);

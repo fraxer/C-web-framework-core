@@ -18,7 +18,7 @@ add_executable(
     runner
     unit/runner.c
     ${UNIT_TEST_FILES}
-    unit/httprequestparser_stubs.c
+    unit/httpclient_stubs.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../framework/taskmanager/taskmanager_calc.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../framework/session/session.c
 )
@@ -29,6 +29,7 @@ target_link_libraries(runner PRIVATE
     http_server_parsers
     http_server
     http_client_parsers
+    http_client
     http
     connection
     domain

@@ -184,6 +184,7 @@ void httpclientpool_discard(connection_pool_t* pool, const char* host, unsigned 
 
     pthread_mutex_lock(&pool->mutex);
 
+    int found = 0;
     host_connections_t* hc = map_find(pool->hosts, key);
     if (hc != NULL) {
         pooled_connection_t* prev = NULL;
@@ -198,8 +199,12 @@ void httpclientpool_discard(connection_pool_t* pool, const char* host, unsigned 
                 }
                 hc->count--;
 
+                // __close_pooled_connection frees the connection, so the
+                // fallback close below must NOT run when the connection was
+                // found in the pool (otherwise: use-after-free / double-free).
                 __close_pooled_connection(pc);
                 free(pc);
+                found = 1;
                 break;
             }
             prev = pc;
@@ -210,9 +215,12 @@ void httpclientpool_discard(connection_pool_t* pool, const char* host, unsigned 
     pthread_mutex_unlock(&pool->mutex);
     free(key);
 
-    // If not found in pool, just close it
-    connection->close(connection);
-    connection_free(connection);
+    // Only close+free when the connection was NOT pooled (otherwise it was
+    // already freed inside __close_pooled_connection above).
+    if (!found) {
+        connection->close(connection);
+        connection_free(connection);
+    }
 }
 
 void httpclientpool_cleanup_expired(connection_pool_t* pool) {

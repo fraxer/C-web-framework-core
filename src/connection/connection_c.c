@@ -75,4 +75,6 @@ void __ctx_free(void* arg) {
         response->free(response);
 
     gzip_free(&ctx->gzip);
+
+    free(ctx);
 }

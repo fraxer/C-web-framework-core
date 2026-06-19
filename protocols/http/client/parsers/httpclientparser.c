@@ -79,6 +79,8 @@ query_t* httpclientparser_move_last_query(httpclientparser_t* parser) {
 
 
 void httpclientparser_free(httpclientparser_t* parser) {
+    if (parser == NULL) return;
+
     __httpclientparser_flush(parser);
     free(parser);
 }

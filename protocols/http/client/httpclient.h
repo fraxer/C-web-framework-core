@@ -23,10 +23,12 @@ typedef enum client_redirect {
 typedef struct httpclient {
     route_methods_e method;
     unsigned int use_ssl : 1;
+    unsigned int verify_peer : 1;
     short int redirect_count;
     unsigned short port;
     int timeout;
     char* host;
+    char* ca_path;
     SSL_CTX* ssl_ctx;
     connection_t* connection;
     httprequest_t* request;
@@ -37,6 +39,7 @@ typedef struct httpclient {
     void(*set_method)(struct httpclient*, route_methods_e);
     int(*set_url)(struct httpclient*, const char*);
     void(*set_timeout)(struct httpclient*, int);
+    void(*set_verify)(struct httpclient*, int verify, const char* ca_path);
     void(*free)(struct httpclient*);
 
     char* buffer;

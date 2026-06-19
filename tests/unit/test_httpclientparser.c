@@ -79,6 +79,16 @@ TEST(test_reset_clears_previous_result) {
     httpclientparser_free(parser);
 }
 
+TEST(test_free_null_is_safe) {
+    TEST_SUITE("init / free / reset");
+    TEST_CASE("httpclientparser_free(NULL) does not crash");
+
+    // Regression: при отказе malloc в __httpclient_init_parser client->parser
+    // остаётся NULL, и httpclient_free звал httpclientparser_free(NULL), что
+    // приводило к NULL-deref в __httpclientparser_flush. free обязан быть null-safe.
+    httpclientparser_free(NULL);
+}
+
 // ============================================================================
 // Schemes
 // ============================================================================

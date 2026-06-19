@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <string.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <sys/types.h>
 #include <netinet/tcp.h>
 #include <netdb.h>
@@ -25,6 +26,8 @@ int __httpclient_connection_close(connection_t*);
 void __httpclient_free(httpclient_t*);
 void __httpclient_set_method(httpclient_t*, route_methods_e);
 int __httpclient_set_url(httpclient_t*, const char*);
+int __httpclient_configure_ssl_ctx(httpclient_t*);
+void __httpclient_set_verify(httpclient_t*, int verify, const char* ca_path);
 httpresponse_t* __httpclient_send(httpclient_t*);
 int __httpclient_create_connection(httpclient_t*);
 connection_t* __httpclient_resolve(const char*, const unsigned short);
@@ -59,6 +62,9 @@ httpclient_t* httpclient_init(route_methods_e method, const char* url, int timeo
     client->ssl_ctx = SSL_CTX_new(TLS_method());
     if (client->ssl_ctx == NULL) goto failed;
 
+    if (!__httpclient_configure_ssl_ctx(client))
+        goto failed;
+
     if (timeout > 0)
         client->timeout = timeout;
 
@@ -88,10 +94,12 @@ httpclient_t* __httpclient_create() {
 
     client->method = ROUTE_NONE;
     client->use_ssl = 0;
+    client->verify_peer = 1;
     client->redirect_count = 0;
     client->port = 0;
     client->timeout = 10;
     client->host = NULL;
+    client->ca_path = NULL;
     client->ssl_ctx = NULL;
     client->connection = NULL;
     client->request = NULL;
@@ -101,6 +109,7 @@ httpclient_t* __httpclient_create() {
     client->error = NULL;
     client->set_method = __httpclient_set_method;
     client->set_url = __httpclient_set_url;
+    client->set_verify = __httpclient_set_verify;
     client->free = __httpclient_free;
     client->buffer_size = BUF_SIZE;
     client->buffer = malloc(sizeof(char) * client->buffer_size);
@@ -158,6 +167,11 @@ void __httpclient_free(httpclient_t* client) {
         client->host = NULL;
     }
 
+    if (client->ca_path != NULL) {
+        free(client->ca_path);
+        client->ca_path = NULL;
+    }
+
     if (client->buffer != NULL) {
         free(client->buffer);
         client->buffer = NULL;
@@ -183,29 +197,78 @@ int __httpclient_set_url(httpclient_t* client, const char* url) {
     if (client->parser->port != 0)
         client->port = httpclientparser_move_port(client->parser);
 
-    if (client->parser->host)
+    if (client->parser->host) {
+        // Re-parsing a url replaces host; free the previous one to avoid leak.
+        free(client->host);
         client->host = httpclientparser_move_host(client->parser);
+    }
 
     return 1;
 }
 
+int __httpclient_configure_ssl_ctx(httpclient_t* client) {
+    SSL_CTX* ctx = client->ssl_ctx;
+    if (ctx == NULL) return 1;
+
+    SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_RENEGOTIATION);
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+
+    if (client->verify_peer) {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+
+        if (client->ca_path != NULL) {
+            if (SSL_CTX_load_verify_locations(ctx, client->ca_path, NULL) != 1) {
+                log_error("httpclient: failed to load CA from %s\n", client->ca_path);
+                return 0;
+            }
+        } else {
+            if (SSL_CTX_set_default_verify_paths(ctx) != 1) {
+                log_error("httpclient: failed to load default CA paths\n");
+                return 0;
+            }
+        }
+    } else {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    }
+
+    return 1;
+}
+
+void __httpclient_set_verify(httpclient_t* client, int verify, const char* ca_path) {
+    client->verify_peer = verify ? 1 : 0;
+
+    if (client->ca_path != NULL) {
+        free(client->ca_path);
+        client->ca_path = NULL;
+    }
+
+    if (ca_path != NULL)
+        client->ca_path = strdup(ca_path);
+
+    if (client->ssl_ctx != NULL)
+        __httpclient_configure_ssl_ctx(client);
+}
+
 httpresponse_t* __httpclient_send(httpclient_t* client) {
-    static int request_count = 0;
+    static _Atomic int request_count = 0;
 
     int result = 0;
 
     client->redirect_count = 0;
 
-    // Cleanup expired connections every 100 requests
-    if (++request_count >= 10) {
-        request_count = 0;
+    // Cleanup expired connections periodically (thread-safe counter).
+    const int count = atomic_fetch_add_explicit(&request_count, 1, memory_order_relaxed) + 1;
+    if (count >= 10) {
+        atomic_store_explicit(&request_count, 0, memory_order_relaxed);
         httpclientpool_cleanup_expired(httpclientpool_global());
     }
 
+    start:
+
+    // Recomputed on every iteration: body may be dropped when a redirect
+    // switches the method to GET (RFC 7231).
     if (!__httpclient_try_set_content_length(client))
         goto failed;
-
-    start:
 
     if (!__httpclient_set_header_host(client))
         goto failed;
@@ -232,6 +295,19 @@ httpresponse_t* __httpclient_send(httpclient_t* client) {
             http_header_t* header = client->response->get_header(client->response, "Location");
             if (!(header && header->value_length > 0) || !client->set_url(client, header->value))
                 goto failed;
+
+            // RFC 7231 §6.4: 301/302/303 change a non-safe method to GET and
+            // drop the request body. HEAD is preserved; GET/HEAD keep their body.
+            const int status = client->response->status_code;
+            if ((status == 301 || status == 302 || status == 303) &&
+                client->method != ROUTE_GET && client->method != ROUTE_HEAD) {
+                client->set_method(client, ROUTE_GET);
+                httprequest_t* request = (httprequest_t*)client->request;
+                httprequest_payload_free(&request->payload_);
+                httprequest_init_payload(request);
+                request->transfer_encoding = TE_NONE;
+                request->remove_header(request, "Content-Type");
+            }
 
             client->redirect_count++;
             client->response->base.reset(client->response);
@@ -467,7 +543,7 @@ int __httpclient_handshake(httpclient_t* client) {
     client->connection->write(client->connection);
 
     connection_client_ctx_t* ctx = client->connection->ctx;
-    if (ctx->request == NULL || client->connection->fd == 0)
+    if (ctx->request == NULL || client->connection->fd <= 0)
         return 0;
 
     return 1;
@@ -496,13 +572,23 @@ int __httpclient_set_header_host(httpclient_t* client) {
     httprequest_t* request = (httprequest_t*)client->request;
     request->remove_header(request, "Host");
 
-    char host[128];
-    if (client->port == 80 || client->port == 443)
-        snprintf(host, sizeof(host), "%s", client->host);
-    else
-        snprintf(host, sizeof(host), "%s:%d", client->host, client->port);
+    // Heap-allocated: host may be arbitrarily long (punycode IDN), and the
+    // previous fixed 128-byte stack buffer silently truncated it.
+    const char* format = (client->port == 80 || client->port == 443)
+        ? "%s" : "%s:%d";
 
+    const int length = snprintf(NULL, 0, format, client->host, client->port);
+    if (length < 0)
+        return 0;
+
+    char* host = malloc((size_t)length + 1);
+    if (host == NULL)
+        return 0;
+
+    snprintf(host, (size_t)length + 1, format, client->host, client->port);
     request->add_header(request, "Host", host);
+
+    free(host);
 
     return 1;
 }
@@ -514,7 +600,7 @@ int __httpclient_try_set_content_length(httpclient_t* client) {
     client->request->remove_header(client->request, "Content-Length");
     const size_t file_size = client->request->payload_.file.size;
 
-    if (file_size == 0 && client->request->transfer_encoding != TE_CHUNKED) {
+    if (file_size == 0) {
         client->request->add_header(client->request, "Content-Length", "0");
         return 1;
     }
