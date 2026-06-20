@@ -16,8 +16,12 @@
 /* Run relaxed canonicalization on `body` (NUL-terminated) and return a freshly
  * malloc'd result the caller frees. Records the byte length in *out_len. */
 static char* canon_run(const char* body, size_t* out_len) {
+    /* Non-void helper: a plain NULL check, not TEST_REQUIRE_* (which aborts with
+     * a bare `return;` — -Wreturn-type here, and the analyzer then treats the
+     * result as uninitialized at every call site). Callers guard the result. */
     dkimcanonparser_t* p = dkimcanonparser_alloc();
-    TEST_REQUIRE_NOT_NULL(p, "alloc should succeed");
+    if (p == NULL)
+        return NULL;
 
     dkimcanonparser_init(p);
     dkimcanonparser_set_buffer(p, body, strlen(body));
@@ -205,17 +209,19 @@ TEST(test_dkimcanonparser_large_body_dynamic_path) {
 
     size_t len = 0;
     char* out = canon_run(body, &len);
-    TEST_REQUIRE_NOT_NULL(out, "large body canonicalized");
-
-    /* n 'a's, the two trailing spaces stripped, terminated with one CRLF. */
-    TEST_ASSERT_EQUAL(n + 2, len, "large body length = a's + CRLF");
-    TEST_ASSERT_EQUAL('a', out[n - 1], "last content byte is 'a'");
-    TEST_ASSERT_EQUAL('\r', out[n], "CRLF CR at offset n");
-    TEST_ASSERT_EQUAL('\n', out[n + 1], "CRLF LF at offset n+1");
-    TEST_ASSERT(strchr(out, ' ') == NULL, "no space remains in canonical body");
-    TEST_ASSERT(strchr(out, '\t') == NULL, "no tab remains in canonical body");
-
-    free(out);
+    /* Non-aborting check + guard: an early-return TEST_REQUIRE here would leak
+     * `body` on the NULL path (the analyzer flags it as CWE-401). */
+    TEST_ASSERT_NOT_NULL(out, "large body canonicalized");
+    if (out != NULL) {
+        /* n 'a's, the two trailing spaces stripped, terminated with one CRLF. */
+        TEST_ASSERT_EQUAL(n + 2, len, "large body length = a's + CRLF");
+        TEST_ASSERT_EQUAL('a', out[n - 1], "last content byte is 'a'");
+        TEST_ASSERT_EQUAL('\r', out[n], "CRLF CR at offset n");
+        TEST_ASSERT_EQUAL('\n', out[n + 1], "CRLF LF at offset n+1");
+        TEST_ASSERT(strchr(out, ' ') == NULL, "no space remains in canonical body");
+        TEST_ASSERT(strchr(out, '\t') == NULL, "no tab remains in canonical body");
+        free(out);
+    }
     free(body);
 }
 

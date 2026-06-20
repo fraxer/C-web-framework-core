@@ -176,12 +176,18 @@ static inline void register_test_suite(test_suite_fn suite) {
 
 #define TEST_ASSERT_STR_EQUAL(expected, actual, message) do { \
     stats.total++; \
-    if (strcmp((expected), (actual)) == 0) { \
+    const char* __str_expected = (expected); \
+    const char* __str_actual = (actual); \
+    /* Null-safe: a NULL actual (e.g. a failed canonicalization) must be a \
+     * clean FAIL, never strcmp/printf UB — matches gtest EXPECT_STREQ. */ \
+    if (__str_actual != NULL && strcmp(__str_expected, __str_actual) == 0) { \
         stats.passed++; \
     } else { \
         PRINT_TEST_CONTEXT(); \
         stats.failed++; \
-        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: expected '%s', got '%s' (line %d)\n", message, expected, actual, __LINE__); \
+        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: expected '%s', got '%s' (line %d)\n", \
+               message, __str_expected ? __str_expected : "(null)", \
+               __str_actual ? __str_actual : "(null)", __LINE__); \
     } \
 } while(0)
 

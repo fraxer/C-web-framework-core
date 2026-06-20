@@ -15,8 +15,12 @@
 /* Canonicalize `value` (NUL-terminated) with a FRESH parser. Returns a malloc'd
  * result the caller frees; records its byte length in *out_len (may be NULL). */
 static char* hdr_run(const char* value, size_t* out_len) {
+    /* Non-void helper: a plain NULL check, not TEST_REQUIRE_* (which aborts with
+     * a bare `return;` — -Wreturn-type here, and the analyzer then treats the
+     * result as uninitialized at every call site). Callers guard the result. */
     dkimheaderparser_t* p = dkimheaderparser_alloc();
-    TEST_REQUIRE_NOT_NULL(p, "alloc should succeed");
+    if (p == NULL)
+        return NULL;
 
     dkimheaderparser_init(p);
     dkimheaderparser_set_buffer(p, value, strlen(value));
@@ -219,13 +223,15 @@ TEST(test_dkimheaderparser_large_value_dynamic_path) {
 
     size_t len = 0;
     char* out = hdr_run(value, &len);
-    TEST_REQUIRE_NOT_NULL(out, "large value canonicalized");
-
-    TEST_ASSERT_EQUAL(n, len, "large value length = a's only (trailing WSP stripped)");
-    TEST_ASSERT_EQUAL('a', out[n - 1], "last content byte is 'a'");
-    TEST_ASSERT_EQUAL('\0', out[n], "NUL terminator right after content");
-    TEST_ASSERT(strchr(out, ' ') == NULL, "no space remains");
-
-    free(out);
+    /* Non-aborting check + guard: an early-return TEST_REQUIRE here would leak
+     * `value` on the NULL path (the analyzer flags it as CWE-401). */
+    TEST_ASSERT_NOT_NULL(out, "large value canonicalized");
+    if (out != NULL) {
+        TEST_ASSERT_EQUAL(n, len, "large value length = a's only (trailing WSP stripped)");
+        TEST_ASSERT_EQUAL('a', out[n - 1], "last content byte is 'a'");
+        TEST_ASSERT_EQUAL('\0', out[n], "NUL terminator right after content");
+        TEST_ASSERT(strchr(out, ' ') == NULL, "no space remains");
+        free(out);
+    }
     free(value);
 }
