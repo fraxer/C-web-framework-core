@@ -50,8 +50,14 @@ void __smtpresponseparser_flush(smtpresponseparser_t* parser) {
 }
 
 int smtpresponseparser_run(smtpresponseparser_t* parser) {
+    if (parser->connection == NULL || parser->connection->ctx == NULL)
+        return SMTPRESPONSEPARSER_ERROR;
+
     connection_client_ctx_t* ctx = parser->connection->ctx;
     smtpresponse_t* response = ctx->response;
+    if (response == NULL)
+        return SMTPRESPONSEPARSER_ERROR;
+
     parser->pos_start = 0;
     parser->pos = 0;
 
@@ -61,6 +67,9 @@ int smtpresponseparser_run(smtpresponseparser_t* parser) {
         switch (parser->stage)
         {
         case SMTPRESPONSEPARSER_STATUS:
+            if (ch == '\0')
+                return SMTPRESPONSEPARSER_ERROR;
+
             if (ch == ' ' || ch == '-') {
                 bufferdata_complete(&parser->buf);
                 if (!__smtpresponseparser_set_status(response, parser))
@@ -88,7 +97,11 @@ int smtpresponseparser_run(smtpresponseparser_t* parser) {
             if (ch == '\n') {
                 parser->stage = SMTPRESPONSEPARSER_STATUS;
 
-                bufferdata_push(&parser->buf, ch);
+                /* A continuation line ("NNN-...") has ended. Drop it so the
+                 * next line is parsed from a clean buffer — otherwise every
+                 * continuation line piles into the buffer (leaking into
+                 * response->message and obscuring the next status read). */
+                bufferdata_reset(&parser->buf);
                 parser->line_size = 0;
                 break;
             }
@@ -141,9 +154,22 @@ void smtpresponseparser_set_bytes_readed(smtpresponseparser_t* parser, int reade
 
 int __smtpresponseparser_set_status(smtpresponse_t* response, smtpresponseparser_t* parser) {
     char* string = bufferdata_get(&parser->buf);
-    int status = atoi(string);
-    if (status == 0)
+    if (string == NULL)
         return 0;
+
+    /* An SMTP reply code is exactly three decimal digits (RFC 5321 §4.2).
+     * Reject anything shorter, longer, or non-numeric instead of trusting
+     * atoi(), which silently truncates ("25abc" -> 25). */
+    if (!isdigit((unsigned char)string[0]) ||
+        !isdigit((unsigned char)string[1]) ||
+        !isdigit((unsigned char)string[2]) ||
+        string[3] != '\0') {
+        return 0;
+    }
+
+    int status = (string[0] - '0') * 100 +
+                 (string[1] - '0') * 10 +
+                 (string[2] - '0');
 
     response->status = status;
 
@@ -152,7 +178,12 @@ int __smtpresponseparser_set_status(smtpresponse_t* response, smtpresponseparser
 
 int __smtpresponseparser_set_message(smtpresponse_t* response, smtpresponseparser_t* parser) {
     size_t writed = bufferdata_writed(&parser->buf);
+    if (writed < 2)
+        return 0;
+
     char* string = bufferdata_get(&parser->buf);
+    if (string == NULL)
+        return 0;
 
     if (string[writed - 2] != '\r' || string[writed - 1] != '\n')
         return 0;
