@@ -32,8 +32,14 @@ void dkimcanonparser_free(dkimcanonparser_t* parser) {
 }
 
 int dkimcanonparser_run(dkimcanonparser_t* parser) {
+    /* run() resets its own cursors, so reset the output buffer and stage too;
+     * otherwise a second run() on the same parser accumulates onto the previous
+     * canonical form. bufferdata_reset() keeps any dynamic allocation for reuse
+     * and is freed by dkimcanonparser_free(). */
+    parser->stage = DKIMCANONPARSER_SYMBOL;
     parser->pos_start = 0;
     parser->pos = 0;
+    bufferdata_reset(&parser->buf);
 
     for (parser->pos = parser->pos_start; parser->pos < parser->buffer_size; parser->pos++) {
         char ch = parser->buffer[parser->pos];
@@ -59,7 +65,10 @@ int dkimcanonparser_run(dkimcanonparser_t* parser) {
             while (1) {
                 char c = bufferdata_back(&parser->buf);
 
-                if (c == ' ' || c == '\t')
+                /* Strip trailing WSP on the line (RFC 6376 §3.4.4(b)) and also a
+                 * preceding '\r', so a CRLF-terminated input line does not end up
+                 * as "\r\r\n" — the '\r' is re-added by the push below. */
+                if (c == ' ' || c == '\t' || c == '\r')
                     bufferdata_pop_back(&parser->buf);
                 else
                     break;
@@ -85,8 +94,13 @@ int dkimcanonparser_run(dkimcanonparser_t* parser) {
             break;
     }
 
-    bufferdata_push(&parser->buf, '\r');
-    bufferdata_push(&parser->buf, '\n');
+    /* RFC 6376 §3.4.4: a CRLF is appended only when the body is non-empty.
+     * An empty body, or one made up solely of blank/WSP lines, canonicalizes
+     * to a zero-length string — not to "\r\n". */
+    if (bufferdata_writed(&parser->buf) > 0) {
+        bufferdata_push(&parser->buf, '\r');
+        bufferdata_push(&parser->buf, '\n');
+    }
     bufferdata_complete(&parser->buf);
 
     return 1;

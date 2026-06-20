@@ -27,6 +27,8 @@ smtpresponse_t* smtpresponse_create(connection_t* connection) {
 }
 
 void __smtpresponse_reset(void* arg) {
+    if (arg == NULL) return;
+
     smtpresponse_t* response = (smtpresponse_t*)arg;
 
     response->status = 0;
@@ -36,6 +38,8 @@ void __smtpresponse_reset(void* arg) {
 }
 
 void __smtpresponse_free(void* arg) {
+    if (arg == NULL) return;
+
     smtpresponse_t* response = (smtpresponse_t*)arg;
 
     __smtpresponse_reset(response);
@@ -45,6 +49,8 @@ void __smtpresponse_free(void* arg) {
 }
 
 int __smtpresponse_init_parser(smtpresponse_t* response) {
+    if (response == NULL) return 0;
+
     response->parser = malloc(sizeof(smtpresponseparser_t));
     if (response->parser == NULL) return 0;
 

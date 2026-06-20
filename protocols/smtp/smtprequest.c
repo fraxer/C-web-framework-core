@@ -34,12 +34,16 @@ smtprequest_data_t* smtprequest_data_create(connection_t* connection) {
 }
 
 void __smtprequest_reset(void* arg) {
+    if (arg == NULL) return;
+
     smtprequest_t* request = (smtprequest_t*)arg;
 
     memset(request->command, 0, SMTPREQUEST_COMMAND_SIZE);
 }
 
 void __smtprequest_free(void* arg) {
+    if (arg == NULL) return;
+
     smtprequest_t* request = (smtprequest_t*)arg;
 
     __smtprequest_reset(request);
@@ -48,6 +52,8 @@ void __smtprequest_free(void* arg) {
 }
 
 void __smtprequest_data_reset(void* arg) {
+    if (arg == NULL) return;
+
     smtprequest_data_t* request = (smtprequest_data_t*)arg;
 
     if (request->content != NULL) {
@@ -59,6 +65,8 @@ void __smtprequest_data_reset(void* arg) {
 }
 
 void __smtprequest_data_free(void* arg) {
+    if (arg == NULL) return;
+
     smtprequest_data_t* request = (smtprequest_data_t*)arg;
 
     __smtprequest_data_reset(request);

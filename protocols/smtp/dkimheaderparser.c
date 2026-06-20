@@ -1,5 +1,4 @@
 #include <stdlib.h>
-#include <ctype.h>
 
 #include "dkimheaderparser.h"
 
@@ -33,6 +32,11 @@ void dkimheaderparser_free(dkimheaderparser_t* parser) {
 }
 
 int dkimheaderparser_run(dkimheaderparser_t* parser) {
+    /* run() must reset stage too, not just the buffer: the parser is reused
+     * across headers in __dkim_relaxed_header_canon, and the leading-WSP strip
+     * relies on stage starting at SPACE. A leaked SYMBOL stage would keep a
+     * leading space on the second and later headers, corrupting the signature. */
+    parser->stage = DKIMHEADERPARSER_SPACE;
     bufferdata_reset(&parser->buf);
     parser->pos_start = 0;
     parser->pos = 0;
@@ -40,7 +44,11 @@ int dkimheaderparser_run(dkimheaderparser_t* parser) {
     for (parser->pos = parser->pos_start; parser->pos < parser->buffer_size; parser->pos++) {
         char ch = parser->buffer[parser->pos];
 
-        if (isspace(ch)) {
+        /* RFC 5234 WSP is SP and TAB; CR/LF are folded in as collapsible
+         * whitespace so a folded header value (CRLF + WSP) unfolds to a single
+         * SP. isspace() is intentionally avoided — it is locale-dependent and
+         * undefined for negative (high-bit) char arguments. */
+        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') {
             if (parser->stage != DKIMHEADERPARSER_SPACE)
                 bufferdata_push(&parser->buf, ' ');
 
@@ -52,6 +60,8 @@ int dkimheaderparser_run(dkimheaderparser_t* parser) {
         }
     }
 
+    /* Strip the single trailing WSP that a run of trailing whitespace collapsed
+     * to (RFC 6376 §3.4.2(d)). */
     if (bufferdata_back(&parser->buf) == ' ')
         bufferdata_pop_back(&parser->buf);
 
