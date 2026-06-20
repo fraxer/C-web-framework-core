@@ -70,6 +70,9 @@ mail_t* mail_create() {
 
     instance->ssl_ctx = NULL;
     instance->connection = NULL;
+    instance->request = NULL;
+    instance->request_data = NULL;
+    instance->response = NULL;
     instance->buffer_size = BUF_SIZE;
     instance->buffer = malloc(sizeof(char) * instance->buffer_size);
     if (instance->buffer == NULL) {
@@ -532,13 +535,18 @@ int __mail_set_subject(mail_t* instance, const char* subject) {
 
 int __mail_set_date(mail_t* instance, time_t* rawtime) {
     if (instance == NULL) return 0;
+    if (rawtime == NULL) return 0;
 
     char timezone[7];
     {
+        /* timezone_offset() returns a signed hour difference (e.g. -5 for EST).
+         * The numeric part must use the absolute value so the sign is emitted
+         * only once; otherwise -5 would render as "-0-500" instead of "-0500". */
         const int tz = timezone_offset();
-        const char* sign = tz >= 0 ? "+" : "-";
-        const char* zero = tz < 10 ? "0" : "";
-        const int r = snprintf(timezone, sizeof(timezone), "%s%s%d00", sign, zero, tz);
+        const int tz_abs = tz < 0 ? -tz : tz;
+        const char* sign = tz < 0 ? "-" : "+";
+        const char* zero = tz_abs < 10 ? "0" : "";
+        const int r = snprintf(timezone, sizeof(timezone), "%s%s%d00", sign, zero, tz_abs);
         if (r <= 0) return 0;
     }
 
@@ -547,6 +555,7 @@ int __mail_set_date(mail_t* instance, time_t* rawtime) {
     if (r <= 0) return 0;
 
     struct tm* timeinfo = localtime(rawtime);
+    if (timeinfo == NULL) return 0;
 
     instance->date.value = malloc(80);
     if (instance->date.value == NULL)
@@ -560,12 +569,14 @@ int __mail_set_date(mail_t* instance, time_t* rawtime) {
 
 int __mail_set_message_id(mail_t* instance, time_t* rawtime) {
     if (instance == NULL) return 0;
+    if (rawtime == NULL) return 0;
 
     char template[80];
     const int r = snprintf(template, sizeof(template), "<%%Y%%m%%d%%H%%M%%S@%s>", env()->mail.host);
     if (r <= 0) return 0;
 
     struct tm* timeinfo = localtime(rawtime);
+    if (timeinfo == NULL) return 0;
 
     instance->message_id.value = malloc(80);
     if (instance->message_id.value == NULL)
@@ -579,6 +590,7 @@ int __mail_set_message_id(mail_t* instance, time_t* rawtime) {
 
 int __mail_set_content(mail_t* instance, const char* body) {
     if (instance == NULL) return 0;
+    if (body == NULL) return 0;
     if (instance->data != NULL)
         free(instance->data);
 
@@ -755,6 +767,8 @@ void __mail_free(mail_t* instance) {
 }
 
 const char* __mail_domain_from_email(const char* email) {
+    if (email == NULL) return NULL;
+
     const char* domain = strchr(email, '@');
     if (domain == NULL)
         return NULL;

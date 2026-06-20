@@ -8,6 +8,7 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/../framework
     ${CMAKE_CURRENT_SOURCE_DIR}/../framework/session
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocols
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp
     ${CMAKE_CURRENT_SOURCE_DIR}/core
 )
 
@@ -19,8 +20,18 @@ add_executable(
     unit/runner.c
     ${UNIT_TEST_FILES}
     unit/httpclient_stubs.c
+    unit/mail_stubs.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../framework/taskmanager/taskmanager_calc.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../framework/session/session.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/dkim.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/mailheader.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/dkimcanonparser.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/dkimheaderparser.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/mail.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/smtprequest.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/smtpresponse.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/client/smtpclienthandlers.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/client/parsers/smtpresponseparser.c
 )
 
 target_link_libraries(runner PRIVATE
@@ -42,6 +53,8 @@ target_link_libraries(runner PRIVATE
     ${PCRE_LIBRARIES}
     ${ZLIB_LIBRARIES}
     ${OPENSSL_LIBRARIES}
+    idn2
+    resolv
     ${CMAKE_DL_LIBS}
     Threads::Threads
 )

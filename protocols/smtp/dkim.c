@@ -5,14 +5,10 @@
 #include <time.h>
 #include <ctype.h>
 
-#include <openssl/rand.h>
-#include <openssl/engine.h>
 #include <openssl/sha.h>
-#include <openssl/hmac.h>
 #include <openssl/evp.h>
 #include <openssl/bio.h>
 #include <openssl/pem.h>
-#include <openssl/buffer.h>
 #include <openssl/err.h>
 
 #include "log.h"
@@ -29,7 +25,10 @@ char* __dkim_header_list_create(dkim_t* dkim, int* header_list_length);
 int __dkim_header_count(mail_header_t* header);
 int __dkim_header_keys_length(mail_header_t* header);
 char* __dkim_base64_encode_sha1(const char* body, int* canon_body_length);
-char* __dkim_sign_create(unsigned char* hash, const char* private_key, int* sign64_length);
+/* Signs `data` with RSA-SHA1 (sha1 is applied once, internally) and returns
+ * the base64-encoded signature. Feeding a precomputed digest here would hash
+ * it a second time and produce a signature no RFC 4871 verifier accepts. */
+char* __dkim_sign_create(const unsigned char* data, int data_length, const char* private_key, int* sign64_length);
 char* __dkim_make_headers_string(dkim_t* dkim, int* headers_string_length);
 char* __dkim_add_sign_to_dkim(const char* dkim, size_t dkim_length, const char* sign, size_t sign_length);
 
@@ -50,7 +49,7 @@ int __dkim_relaxed_header_canon(dkim_t* dkim) {
     mail_header_t* header = dkim->header;
     while (header) {
         for (size_t e = 0; e < header->key_length; ++e)
-            header->key[e] = tolower(header->key[e]);
+            header->key[e] = (char)tolower((unsigned char)header->key[e]);
 
         dkimheaderparser_set_buffer(parser, header->value, header->value_length);
         if (!dkimheaderparser_run(parser))
@@ -139,7 +138,13 @@ EVP_PKEY* __dkim_rsa_read_pem(const char* buffer) {
 
 /* h1:h2:h3 */
 char* __dkim_header_list_create(dkim_t* dkim, int* header_list_length) {
-    *header_list_length = __dkim_header_keys_length(dkim->header) + __dkim_header_count(dkim->header) - 1;
+    const int count = __dkim_header_count(dkim->header);
+    const int keys_length = __dkim_header_keys_length(dkim->header);
+
+    /* With zero headers the naive "keys + count - 1" underflows to -1; guard
+     * it so we never hand a wrapped size_t to malloc. */
+    *header_list_length = count > 0 ? keys_length + count - 1 : 0;
+
     char* header_list = malloc(sizeof(char) * ((*header_list_length) + 1));
     if (header_list == NULL) {
         *header_list_length = 0;
@@ -156,6 +161,9 @@ char* __dkim_header_list_create(dkim_t* dkim, int* header_list_length) {
 
         header = header->next;
     }
+
+    /* Always terminate: the loop body never runs when there are no headers. */
+    header_list[pos] = '\0';
 
     return header_list;
 }
@@ -203,7 +211,9 @@ char* __dkim_base64_encode_sha1(const char* body, int* canon_body_length) {
     return base64string;
 }
 
-char* __dkim_sign_create(unsigned char* hash, const char* private_key, int* sign64_length) {
+char* __dkim_sign_create(const unsigned char* data, int data_length, const char* private_key, int* sign64_length) {
+    *sign64_length = 0;
+
     EVP_PKEY* pkey = __dkim_rsa_read_pem(private_key);
     if (pkey == NULL) {
         log_error("DKIM error loading rsa key\n");
@@ -224,7 +234,7 @@ char* __dkim_sign_create(unsigned char* hash, const char* private_key, int* sign
         goto failed;
     }
 
-    if (EVP_DigestSignUpdate(md_ctx, hash, SHA_DIGEST_LENGTH) != 1) {
+    if (EVP_DigestSignUpdate(md_ctx, data, (size_t)data_length) != 1) {
         log_error("DKIM error rsa sign update: %s\n", ERR_error_string(ERR_get_error(), NULL));
         goto failed;
     }
@@ -288,7 +298,8 @@ char* __dkim_make_headers_string(dkim_t* dkim, int* headers_string_length) {
     header = dkim->header;
     while (header) {
         const char* template = header->next != NULL ? "%s:%s\r\n" : "%s:%s";
-        offset += snprintf(string + offset, *headers_string_length, template, header->key, header->value);
+        /* Cap by the remaining space from `offset`, not the whole buffer. */
+        offset += snprintf(string + offset, (size_t)(*headers_string_length) + 1 - offset, template, header->key, header->value);
 
         header = header->next;
     }
@@ -371,6 +382,11 @@ void dkim_set_timestamp(dkim_t* dkim, const time_t timestamp) {
  * http://tools.ietf.org/html/rfc4871
  */
 char* dkim_create_sign(dkim_t* dkim, const char* body) {
+    if (dkim == NULL || body == NULL)
+        return NULL;
+    if (dkim->private_key == NULL || dkim->selector == NULL || dkim->domain == NULL)
+        return NULL;
+
     if (!__dkim_relaxed_header_canon(dkim))
         return NULL;
 
@@ -389,12 +405,12 @@ char* dkim_create_sign(dkim_t* dkim, const char* body) {
         goto failed;
 
     /* create DKIM header */
-    const char* template = "v=1; a=rsa-sha1; s=%s; d=%s; l=%d; t=%d; c=relaxed/relaxed; h=%s; bh=%s; b=";
+    const char* template = "v=1; a=rsa-sha1; s=%s; d=%s; l=%d; t=%lld; c=relaxed/relaxed; h=%s; bh=%s; b=";
     data = malloc(strlen(template) + strlen(dkim->selector) + strlen(dkim->domain) + 16 + 16 + header_list_length + strlen(base64_hash) + 1);
     if (data == NULL)
         goto failed;
 
-    const size_t data_length = sprintf(data, template, dkim->selector, dkim->domain, canon_body_length, dkim->timestamp, header_list, base64_hash);
+    const size_t data_length = sprintf(data, template, dkim->selector, dkim->domain, canon_body_length, (long long)dkim->timestamp, header_list, base64_hash);
 
     const char* h_dkim_sign = "dkim-signature";
     dkim_header_add(dkim, h_dkim_sign, strlen(h_dkim_sign), data, data_length);
@@ -404,11 +420,11 @@ char* dkim_create_sign(dkim_t* dkim, const char* body) {
     if (headers_string == NULL)
         goto failed;
 
-    unsigned char hash[SHA_DIGEST_LENGTH];
-    SHA1((unsigned char*)headers_string, headers_string_length, hash);
-
+    /* RSA-SHA1 over the canonicalized headers (sha1 applied once, inside the
+     * signer). Do NOT pre-hash: feeding a digest to EVP_DigestSign* hashes it
+     * a second time and yields an unverifiable signature. */
     int sign_length = 0;
-    sign = __dkim_sign_create(hash, dkim->private_key, &sign_length);
+    sign = __dkim_sign_create((const unsigned char*)headers_string, headers_string_length, dkim->private_key, &sign_length);
     if (sign == NULL)
         goto failed;
 
