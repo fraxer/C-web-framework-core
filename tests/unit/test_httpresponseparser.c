@@ -136,7 +136,7 @@ TEST(test_httpresponseparser_simple_200) {
     TEST_CASE("Parse simple 200 response with body");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     const char* resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
     int result = harness_feed(&h, resp, strlen(resp));
@@ -158,7 +158,7 @@ TEST(test_httpresponseparser_http10) {
     TEST_CASE("Accept HTTP/1.0 response");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     const char* resp = "HTTP/1.0 200 OK\r\n\r\n";
     int result = harness_feed(&h, resp, strlen(resp));
@@ -173,7 +173,7 @@ TEST(test_httpresponseparser_invalid_protocol) {
     TEST_CASE("Reject unsupported protocol version");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     const char* resp = "HTTP/2.0 200 OK\r\n\r\n";
     int result = harness_feed(&h, resp, strlen(resp));
@@ -195,7 +195,7 @@ TEST(test_httpresponseparser_status_codes) {
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         response_harness_t h;
-        TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+        TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
         int result = harness_feed(&h, cases[i], strlen(cases[i]));
         TEST_ASSERT_EQUAL(HTTP1RESPONSEPARSER_COMPLETE, result, "Should complete");
         TEST_ASSERT_EQUAL(expected[i], h.response->status_code, "Status should match");
@@ -207,7 +207,7 @@ TEST(test_httpresponseparser_head_no_body) {
     TEST_CASE("HEAD response completes without reading body");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_HEAD), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_HEAD), "Harness should initialize");
 
     // Content-Length claims 100 bytes, but HEAD must not read a body.
     const char* resp = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n";
@@ -227,7 +227,7 @@ TEST(test_httpresponseparser_chunked) {
     TEST_CASE("Reassemble chunked body");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     const char* resp =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
@@ -250,7 +250,7 @@ TEST(test_httpresponseparser_chunked_size_limit) {
     TEST_CASE("Chunked body exceeding client_max_body_size is rejected");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     // Temporarily shrink the limit so we don't have to send megabytes.
     const size_t saved_limit = env()->main.client_max_body_size;
@@ -285,7 +285,7 @@ TEST(test_httpresponseparser_chunked_multi_read) {
     TEST_CASE("Reassemble chunked body delivered in tiny slices");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     const char* full =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
@@ -320,7 +320,7 @@ TEST(test_httpresponseparser_chunked_chunk_at_buffer_end) {
     TEST_CASE("Chunk ending exactly at buffer boundary (no over-read)");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     // Headers + one chunk laid out so the chunk DATA ends on the last byte of
     // the 16 KiB receive buffer (no trailing CRLF in this read).
@@ -366,7 +366,7 @@ TEST(test_httpresponseparser_chunked_extensions) {
     TEST_CASE("Ignore chunk extensions on the size line");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     const char* resp =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
@@ -388,7 +388,7 @@ TEST(test_httpresponseparser_chunked_empty_body) {
     TEST_CASE("Chunked response with empty body completes");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     const char* resp = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
     int result = harness_feed(&h, resp, strlen(resp));
@@ -409,7 +409,7 @@ TEST(test_httpresponseparser_chunked_trailers) {
     TEST_CASE("Consume trailer headers and the final CRLF");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     const char* resp =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
@@ -436,7 +436,7 @@ TEST(test_httpresponseparser_chunked_trailer_split) {
     TEST_CASE("Trailer section split across reads still completes");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     const char* part1 =
         "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
@@ -463,7 +463,7 @@ TEST(test_httpresponseparser_chunked_requires_final_crlf) {
     TEST_CASE("Do not complete without the final CRLF");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     // Last-chunk size line present, but no final CRLF.
     const char* resp =
@@ -483,12 +483,12 @@ TEST(test_httpresponseparser_chunked_gzip_aborted_no_leak) {
     TEST_CASE("Aborted gzip chunked response frees inflate state");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     const char* original = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     size_t glen = 0;
     char* gz = gzip_compress(original, strlen(original), &glen);
-    TEST_ASSERT_NOT_NULL(gz, "Test gzip data should be produced");
+    TEST_REQUIRE_NOT_NULL(gz, "Test gzip data should be produced");
     TEST_ASSERT(glen > 2, "Compressed stream should have bytes");
 
     // Deliver only the first half of the gzip member as a single chunk, then
@@ -520,12 +520,12 @@ TEST(test_httpresponseparser_gzip_single_read) {
     TEST_CASE("Decompress gzip body delivered in one read");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     const char* original = "hello world hello world hello world";
     size_t clen = 0;
     char* gz = gzip_compress(original, strlen(original), &clen);
-    TEST_ASSERT_NOT_NULL(gz, "Test gzip data should be produced");
+    TEST_REQUIRE_NOT_NULL(gz, "Test gzip data should be produced");
 
     char header[256];
     int hlen = snprintf(header, sizeof(header),
@@ -552,7 +552,7 @@ TEST(test_httpresponseparser_gzip_multi_read_not_truncated) {
     TEST_CASE("Gzip body split across reads is not truncated");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     // Highly compressible payload: decompresses to far more bytes than it
     // occupies on the wire. This is exactly the case where comparing
@@ -560,13 +560,13 @@ TEST(test_httpresponseparser_gzip_multi_read_not_truncated) {
     // complete the response prematurely.
     const size_t original_len = 5000;
     char* original = malloc(original_len + 1);
-    TEST_ASSERT_NOT_NULL(original, "Original buffer should allocate");
+    TEST_REQUIRE_NOT_NULL(original, "Original buffer should allocate");
     memset(original, 'A', original_len);
     original[original_len] = 0;
 
     size_t clen = 0;
     char* gz = gzip_compress(original, original_len, &clen);
-    TEST_ASSERT_NOT_NULL(gz, "Test gzip data should be produced");
+    TEST_REQUIRE_NOT_NULL(gz, "Test gzip data should be produced");
     TEST_ASSERT(clen < original_len, "Compressed form should be smaller");
 
     char header[256];
@@ -610,12 +610,12 @@ TEST(test_httpresponseparser_transfer_encoding_gzip_chunked) {
     TEST_CASE("Decode 'Transfer-Encoding: gzip, chunked'");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     const char* original = "combined transfer encoding payload payload payload";
     size_t glen = 0;
     char* gz = gzip_compress(original, strlen(original), &glen);
-    TEST_ASSERT_NOT_NULL(gz, "Test gzip data should be produced");
+    TEST_REQUIRE_NOT_NULL(gz, "Test gzip data should be produced");
 
     // Chunk-encode the gzip bytes as a single chunk.
     char resp[HARNESS_BUFFER_SIZE];
@@ -648,7 +648,7 @@ TEST(test_httpresponseparser_content_length_negative) {
     TEST_CASE("Negative Content-Length is ignored (no huge size_t)");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     const char* resp = "HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n";
     int result = harness_feed(&h, resp, strlen(resp));
@@ -665,7 +665,7 @@ TEST(test_httpresponseparser_content_length_overflow) {
     TEST_CASE("Overflowing Content-Length is ignored");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     const char* resp = "HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999999999\r\n\r\n";
     int result = harness_feed(&h, resp, strlen(resp));
@@ -680,7 +680,7 @@ TEST(test_httpresponseparser_multiple_headers) {
     TEST_CASE("Parse and expose multiple headers");
 
     response_harness_t h;
-    TEST_ASSERT(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
 
     const char* resp =
         "HTTP/1.1 200 OK\r\n"

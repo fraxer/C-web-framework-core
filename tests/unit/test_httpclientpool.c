@@ -203,7 +203,9 @@ TEST(test_cleanup_expired_removes_stale) {
 
     httpclientpool_cleanup_expired(pool);
 
-    TEST_ASSERT_EQUAL(0, hc->count, "expired connection should be removed");
+    // hc is freed once the last connection expires (cleanup reaps the now-empty
+    // host entry), so re-resolve instead of dereferencing the stale pointer.
+    TEST_ASSERT_NULL(pool_find_host(pool, "h", 80), "expired connection removed and empty host reaped");
 
     httpclientpool_free(pool);
     if (peer >= 0) close(peer);
@@ -222,7 +224,7 @@ TEST(test_acquire_drops_dead_connection) {
     connection_t* conn = make_connection(80, &peer);
     httpclientpool_release(pool, "h", 80, conn, 0);
 
-    // Close the peer end: recv(MSG_PEEK) on conn->fd will return 0 → reported dead.
+    // Close the peer end: poll(fd) reports POLLHUP → reported dead.
     close(peer);
     peer = -1;
 
@@ -234,3 +236,76 @@ TEST(test_acquire_drops_dead_connection) {
 
     httpclientpool_free(pool);
 }
+
+// ============================================================================
+// Per-host cap
+// ============================================================================
+
+TEST(test_pool_max_per_host_cap) {
+    TEST_SUITE("per-host cap");
+    TEST_CASE("release beyond POOL_MAX_CONNECTIONS_PER_HOST closes the excess");
+
+    connection_pool_t* pool = httpclientpool_create();
+
+    enum { N = POOL_MAX_CONNECTIONS_PER_HOST + 1 };
+    int peers[N];
+    for (int i = 0; i < N; i++) {
+        connection_t* conn = make_connection(80, &peers[i]);
+        TEST_ASSERT_NOT_NULL(conn, "connection created");
+        httpclientpool_release(pool, "host", 80, conn, 0);
+    }
+
+    host_connections_t* hc = pool_find_host(pool, "host", 80);
+    TEST_ASSERT_NOT_NULL(hc, "host entry exists");
+    TEST_ASSERT_EQUAL(POOL_MAX_CONNECTIONS_PER_HOST, hc->count, "pool capped at POOL_MAX");
+
+    for (int i = 0; i < N; i++)
+        if (peers[i] >= 0) close(peers[i]);
+
+    httpclientpool_free(pool);
+}
+
+// ============================================================================
+// SSL liveness (Bug C: must not corrupt the SSL state machine)
+// ============================================================================
+
+TEST(test_acquire_drops_dead_ssl_connection) {
+    TEST_SUITE("ssl liveness");
+    TEST_CASE("an ssl-flagged pooled connection whose peer closed is not reused");
+
+    connection_pool_t* pool = httpclientpool_create();
+    int peer = -1;
+    connection_t* conn = make_connection(443, &peer);
+    // use_ssl=1, ssl=NULL: poll-based liveness never dereferences ssl. Ставить
+    // dummy ssl нельзя — __close_pooled_connection звал бы SSL_*(ssl) и упал.
+    httpclientpool_release(pool, "h", 443, conn, 1);
+
+    close(peer);
+    peer = -1;
+
+    connection_t* got = httpclientpool_acquire(pool, "h", 443, 1);
+    TEST_ASSERT_NULL(got, "dead ssl-flagged connection must not be returned");
+
+    host_connections_t* hc = pool_find_host(pool, "h", 443);
+    TEST_ASSERT(hc == NULL || hc->count == 0, "dead ssl connection removed by acquire");
+
+    httpclientpool_free(pool);
+}
+
+TEST(test_release_then_acquire_reuses_ssl) {
+    TEST_SUITE("ssl liveness");
+    TEST_CASE("a live ssl-flagged connection is reused");
+
+    connection_pool_t* pool = httpclientpool_create();
+    int peer = -1;
+    connection_t* conn = make_connection(443, &peer);
+    httpclientpool_release(pool, "h", 443, conn, 1);
+
+    connection_t* got = httpclientpool_acquire(pool, "h", 443, 1);
+    TEST_ASSERT_NOT_NULL(got, "live ssl connection reused");
+    TEST_ASSERT_EQUAL((intptr_t)conn, (intptr_t)got, "same connection reused");
+
+    httpclientpool_free(pool);
+    if (peer >= 0) close(peer);
+}
+

@@ -3,6 +3,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/poll.h>
 #include <sys/socket.h>
 #include <openssl/ssl.h>
 
@@ -150,6 +151,17 @@ void httpclientpool_release(connection_pool_t* pool, const char* host, unsigned 
         pc = pc->next;
     }
 
+    // Cap per-host cached connections so a burst of outbound requests to one
+    // host cannot grow fds without bound. If the host is already at the cap,
+    // close the incoming connection instead of pooling it.
+    if (hc->count >= POOL_MAX_CONNECTIONS_PER_HOST) {
+        pthread_mutex_unlock(&pool->mutex);
+        free(key);
+        connection->close(connection);
+        connection_free(connection);
+        return;
+    }
+
     // Add new pooled connection
     pooled_connection_t* new_pc = malloc(sizeof * new_pc);
     if (new_pc == NULL) {
@@ -228,6 +240,14 @@ void httpclientpool_cleanup_expired(connection_pool_t* pool) {
 
     time_t now = time(NULL);
 
+    // Host entries that become empty during the scan are erased after the
+    // iteration completes — erasing while iterating would invalidate the map
+    // iterator. Keys are strdup'd because the map owns (and frees) the stored
+    // key on erase.
+    char** empty_keys = NULL;
+    size_t empty_count = 0;
+    size_t empty_cap = 0;
+
     pthread_mutex_lock(&pool->mutex);
 
     map_iterator_t it = map_begin(pool->hosts);
@@ -256,8 +276,35 @@ void httpclientpool_cleanup_expired(connection_pool_t* pool) {
             }
         }
 
+        // Every connection for this host expired: schedule the now-empty host
+        // entry for removal so the map does not leak a node per host ever seen.
+        if (hc->count == 0) {
+            char* key_copy = strdup((const char*)map_iterator_key(it));
+            if (key_copy != NULL) {
+                if (empty_count == empty_cap) {
+                    const size_t new_cap = empty_cap ? empty_cap * 2 : 4;
+                    char** grown = realloc(empty_keys, new_cap * sizeof(*empty_keys));
+                    if (grown != NULL) {
+                        empty_keys = grown;
+                        empty_cap = new_cap;
+                    } else {
+                        free(key_copy);   // can't grow the list; leave this host
+                        key_copy = NULL;
+                    }
+                }
+                if (key_copy != NULL)
+                    empty_keys[empty_count++] = key_copy;
+            }
+        }
+
         it = map_next(it);
     }
+
+    for (size_t i = 0; i < empty_count; i++) {
+        map_erase(pool->hosts, empty_keys[i]);
+        free(empty_keys[i]);
+    }
+    free(empty_keys);
 
     pthread_mutex_unlock(&pool->mutex);
 }
@@ -328,26 +375,33 @@ static void __close_pooled_connection(pooled_connection_t* pc) {
 static int __is_connection_alive(connection_t* connection) {
     if (connection == NULL || connection->fd <= 0) return 0;
 
-    // Check if socket is still valid using non-blocking peek
-    char buf;
-    int flags = MSG_PEEK | MSG_DONTWAIT;
+    // Probe the socket state without reading any bytes. This is safe for BOTH
+    // plain and TLS connections: requesting no events (events=0) means poll only
+    // reports the exceptional conditions (POLLERR/POLLHUP/POLLNVAL), which are
+    // always filled in revents regardless of events. Reading bytes here (the old
+    // recv(MSG_PEEK)) would corrupt the SSL state machine for HTTPS connections,
+    // and would also block on a live idle connection.
+    struct pollfd pfd = { .fd = connection->fd, .events = 0 };
+    const int rc = poll(&pfd, 1, 0);
 
-    ssize_t result = recv(connection->fd, &buf, 1, flags);
-
-    if (result == 0) {
-        // Connection closed by peer
-        return 0;
+    if (rc < 0) {
+        // EINTR is transient — treat the connection as still alive; anything
+        // else means the fd is bad.
+        return (errno == EINTR) ? 1 : 0;
     }
 
-    if (result < 0) {
-        // EAGAIN/EWOULDBLOCK means socket is alive but no data
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return 1;
-        }
-        // Other errors mean connection is dead
-        return 0;
+    if (rc == 0) {
+        // No events pending: idle and alive.
+        return 1;
     }
 
-    // Data available - connection is alive
+    if (pfd.revents & POLLNVAL) return 0;            // invalid fd
+    if (pfd.revents & (POLLERR | POLLHUP)) return 0; // peer closed / error
+#ifdef POLLRDHUP
+    if (pfd.revents & POLLRDHUP) return 0;           // peer half-closed (Linux)
+#endif
+
+    // Only ordinary data events remain (e.g. unsolicited bytes the server
+    // pushed): the connection is still alive.
     return 1;
 }

@@ -8,6 +8,7 @@
 #include "map.h"
 
 #define POOL_CONNECTION_TTL 300  // 5 minutes in seconds
+#define POOL_MAX_CONNECTIONS_PER_HOST 8  // cap to bound fd usage under burst load
 
 typedef struct pooled_connection {
     connection_t* connection;

@@ -116,6 +116,23 @@ static inline void register_test_suite(test_suite_fn suite) {
     } \
 } while(0)
 
+/* Precondition assertion: like TEST_ASSERT but aborts the current test on
+ * failure (return). Use for setup/allocation guards so a failed precondition
+ * does not cascade into NULL dereferences — which under ASan abort the whole
+ * runner — and so the static analyzer can see the condition holds past here. */
+#define TEST_REQUIRE(condition, message) do { \
+    stats.total++; \
+    if (!(condition)) { \
+        PRINT_TEST_CONTEXT(); \
+        stats.failed++; \
+        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s (line %d)\n", message, __LINE__); \
+        return; \
+    } \
+    stats.passed++; \
+} while(0)
+
+#define TEST_REQUIRE_NOT_NULL(ptr, message) TEST_REQUIRE((ptr) != NULL, message)
+
 /* Assertion macros */
 #define TEST_FAIL(message) do { \
     stats.total++; \

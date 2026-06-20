@@ -8,8 +8,25 @@ static int __tls_read(connection_t* connection);
 static int __tls_write(connection_t* connection);
 static int __write_request_head(connection_t*);
 static ssize_t __write_chunked(connection_t*, const char*, size_t, int);
-static int __write_body(connection_t*, char*, size_t, size_t);
+static ssize_t __write_body(connection_t*, char*, size_t, size_t);
+static ssize_t __write_all(connection_t*, const char*, size_t);
 static int __handshake(connection_t* connection);
+
+// Writes the full buffer, looping over partial sends. Returns the number of
+// bytes written (== size on success) or -1 on error / peer-closed (0 from the
+// underlying write is treated as failure to avoid an infinite loop). Used for
+// data that is not re-readable from a file, where a partial send would corrupt
+// the request (head) or the transfer framing (chunk).
+ssize_t __write_all(connection_t* connection, const char* data, size_t size) {
+    size_t offset = 0;
+    while (offset < size) {
+        const ssize_t writed = connection_data_write(connection, data + offset, size - offset);
+        if (writed <= 0)
+            return -1;
+        offset += (size_t)writed;
+    }
+    return (ssize_t)offset;
+}
 
 int __tls_read(connection_t* connection) {
     (void)connection;
@@ -50,23 +67,18 @@ int http_client_read(connection_t* connection) {
             httpresponseparser_set_bytes_readed(parser, bytes_readed);
 
             switch (httpresponseparser_run(parser)) {
-            case HTTP1PARSER_ERROR:
-            case HTTP1PARSER_OUT_OF_MEMORY:
-                return 0;
-            case HTTP1PARSER_PAYLOAD_LARGE:
-                response->send_default(response, 413);
-                return 1;
-            case HTTP1PARSER_BAD_REQUEST:
-                response->send_default(response, 400);
-                return 1;
-            case HTTP1PARSER_HOST_NOT_FOUND:
-                response->send_default(response, 404);
-                return 1;
             case HTTP1PARSER_CONTINUE:
                 break;
             case HTTP1RESPONSEPARSER_COMPLETE:
                 httpresponseparser_reset(parser);
                 return 1;
+            default:
+                // Malformed / oversized / unreadable server response. This is a
+                // client reading a server reply, so we must NOT call
+                // send_default here — that writes an HTML error page back to the
+                // server (server-side semantics). Treat any parse failure as a
+                // read error; the caller turns it into a 500.
+                return 0;
             }
         }
     }
@@ -118,7 +130,9 @@ ssize_t __write_chunked(connection_t* connection, const char* data, size_t lengt
         memcpy(buf + pos, "0\r\n\r\n", 5); pos += 5;
     }
 
-    const ssize_t writed = connection_data_write(connection, buf, pos);
+    // A partial chunk-frame write would desync the chunked transfer encoding,
+    // so flush the whole frame (looping over partial sends).
+    const ssize_t writed = __write_all(connection, buf, (size_t)pos);
 
     free(buf);
 
@@ -132,14 +146,16 @@ int __write_request_head(connection_t* connection) {
     httprequest_head_t head = httprequest_create_head(request);
     if (head.data == NULL) return -1;
 
-    ssize_t writed = connection_data_write(connection, head.data, head.size);
+    // A partial head write would corrupt the request irrecoverably, so flush it
+    // in full (looping over partial sends) before freeing the buffer.
+    ssize_t writed = __write_all(connection, head.data, head.size);
 
     free(head.data);
 
-    return writed;
+    return (int)writed;
 }
 
-int __write_body(connection_t* connection, char* buffer, size_t payload_size, size_t size) {
+ssize_t __write_body(connection_t* connection, char* buffer, size_t payload_size, size_t size) {
     connection_client_ctx_t* ctx = connection->ctx;
     httpresponse_t* response = ctx->response;
     ssize_t writed = -1;
@@ -175,9 +191,15 @@ int __write_body(connection_t* connection, char* buffer, size_t payload_size, si
             if (end && !gzip_deflate_free(gzip))
                 return -1;
 
-            writed = size;
+            // Return the number of file bytes consumed, not the chunked wire
+            // bytes (frame headers/CRLF are not file data) — the caller advances
+            // the payload file position by this value.
+            writed = (ssize_t)size;
         } else {
             writed = __write_chunked(connection, buffer, size, end);
+            if (writed < 0)
+                return writed;
+            writed = (ssize_t)size;
         }
     }
     else {
