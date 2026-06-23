@@ -71,9 +71,10 @@ typedef struct websockets_protocol_resource {
      * Get query parameter or route parameter by key.
      * @param protocol Pointer to this protocol instance
      * @param key Parameter name to look up
+     * @param ok Pointer to status flag: set to 1 on success, 0 if not found or error (may be NULL)
      * @return Parameter value or NULL if not found
      */
-    const char*(*get_query)(struct websockets_protocol_resource* protocol, const char* key);
+    const char*(*get_query)(struct websockets_protocol_resource* protocol, const char* key, int* ok);
 } websockets_protocol_resource_t;
 
 /**

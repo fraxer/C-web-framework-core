@@ -14,7 +14,7 @@ int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t
 void websockets_protocol_resource_reset(void*);
 void websockets_protocol_resource_free(void*);
 int websockets_protocol_resource_payload_parse(websocketsparser_t* parser, char* data, size_t size, int unmasking);
-const char* websocketsrequest_query(websockets_protocol_resource_t*, const char*);
+const char* websocketsrequest_query(websockets_protocol_resource_t*, const char*, int* ok);
 query_t* websocketsrequest_last_query_item(websockets_protocol_resource_t*);
 void websocketsrequest_query_free(query_t*);
 int websocketsrequest_has_payload(websockets_protocol_resource_t*);
@@ -239,14 +239,20 @@ int websockets_protocol_resource_payload_parse(websocketsparser_t* parser, char*
     return 1;
 }
 
-const char* websocketsrequest_query(websockets_protocol_resource_t* protocol, const char* key) {
+const char* websocketsrequest_query(websockets_protocol_resource_t* protocol, const char* key, int* ok) {
+    if (ok != NULL)
+        *ok = 0;
+
     if (key == NULL) return NULL;
 
     query_t* query = protocol->query_;
 
     while (query) {
-        if (strcmp(key, query->key) == 0)
+        if (strcmp(key, query->key) == 0) {
+            if (ok != NULL)
+                *ok = 1;
             return query->value;
+        }
 
         query = query->next;
     }
