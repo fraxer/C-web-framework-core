@@ -18,7 +18,7 @@ typedef struct redirect_parser {
     redirect_param_t* last_param;
 } redirect_parser_t;
 
-redirect_t* redirect_init();
+redirect_t* redirect_init(const char* template);
 int redirect_init_parser(redirect_parser_t*, const char*);
 int redirect_parse_destination(redirect_parser_t*);
 int redirect_check_params(redirect_t*);

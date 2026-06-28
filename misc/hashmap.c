@@ -238,7 +238,24 @@ int hashmap_reserve(hashmap_t* map, size_t count) {
     if (map == NULL)
         return -1;
 
-    size_t required_capacity = (size_t)((float)count / map->load_factor) + 1;
+    // Grow capacity by powers of two until `count` entries fit below the
+    // load-factor threshold. The capacity is produced by integer arithmetic
+    // only; floating point is confined to the loop guard (as in hashmap_insert)
+    // so it can never introduce imprecision into the allocation size. This also
+    // avoids the precision loss that casting size_t -> float would cause for
+    // large counts.
+    size_t required_capacity = map->capacity;
+    if (required_capacity < HASHMAP_DEFAULT_CAPACITY)
+        required_capacity = HASHMAP_DEFAULT_CAPACITY;
+
+    while ((double)count > (double)required_capacity * (double)map->load_factor) {
+        if (required_capacity > SIZE_MAX / 2) {
+            required_capacity = SIZE_MAX;
+            break;
+        }
+        required_capacity *= 2;
+    }
+
     if (required_capacity > map->capacity)
         return __hashmap_resize(map, required_capacity);
 

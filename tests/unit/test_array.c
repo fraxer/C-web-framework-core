@@ -1279,6 +1279,28 @@ TEST(test_copy_with_valid_copy_function) {
     array_free(copy);
 }
 
+TEST(test_copy_owning_pointer_without_copy_fn) {
+    TEST_CASE("array_copy refuses owning ARRAY_POINTER without a copy function");
+
+    test_obj_t* obj = malloc(sizeof(test_obj_t));
+    if (!obj) return;
+    obj->id = 7;
+    strcpy(obj->name, "own");
+
+    array_t* arr = array_create();
+    /* _copy=NULL (array_nocopy), _free=test_obj_free: owning, non-copyable. */
+    array_push_back(arr, array_create_pointer(obj, array_nocopy, test_obj_free));
+
+    array_t* copy = array_copy(arr);
+    TEST_ASSERT_NULL(copy, "Copy must be refused for owning ptr without a copy fn");
+
+    /* Source array must remain intact and still own the object. */
+    TEST_ASSERT_EQUAL_SIZE(1, array_size(arr), "Source array unchanged after refused copy");
+    TEST_ASSERT_EQUAL(obj, (test_obj_t*)array_get_pointer(arr, 0), "Source still owns the pointer");
+
+    array_free(arr); /* frees obj exactly once — no double-free */
+}
+
 TEST(test_ldouble_in_mixed_array) {
     TEST_CASE("Long double works correctly in mixed-type array");
 

@@ -622,7 +622,7 @@ void __httpresponse_model(httpresponse_t* response, void* model, ...) {
     }
 
     va_list va_args;
-    va_start(va_args, 0);
+    va_start(va_args, model);
 
     char** display_fields = va_arg(va_args, char**);
 
@@ -670,7 +670,7 @@ void __httpresponse_models(httpresponse_t* response, array_t* models, ...) {
     }
 
     va_list va_args;
-    va_start(va_args, 0);
+    va_start(va_args, models);
 
     char** display_fields = va_arg(va_args, char**);
 

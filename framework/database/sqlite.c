@@ -1063,6 +1063,7 @@ db_t* sqlite_load(const char* database_id, const json_token_t* token_array) {
 
         // Defaults for optional fields.
         if (finded_fields[JOURNAL_MODE] == 0) {
+            if (host->journal_mode != NULL) free(host->journal_mode);
             host->journal_mode = strdup("WAL");
             if (host->journal_mode == NULL) {
                 log_error("sqlite_load: alloc memory for journal_mode failed\n");

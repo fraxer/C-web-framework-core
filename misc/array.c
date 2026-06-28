@@ -6,8 +6,8 @@
 
 #define INITIAL_CAPACITY 10
 
-void __array_resize(array_t* array, size_t new_capacity);
-void __array_free_value(avalue_t* value);
+static int __array_resize(array_t* array, size_t new_capacity);
+static void __array_free_value(avalue_t* value);
 
 int array_init(array_t* array) {
     if (array == NULL)
@@ -99,8 +99,23 @@ array_t* array_copy(array_t* array) {
         else if (element->type == ARRAY_STRING)
             array_push_back(copy_array, array_create_stringn(element->_string, element->_length));
         else if (element->type == ARRAY_POINTER) {
-            void* copied_ptr = (element->_copy != NULL) ? element->_copy(element->_pointer) : element->_pointer;
-            array_push_back(copy_array, array_create_pointer(copied_ptr, element->_copy, element->_free));
+            if (element->_copy != NULL) {
+                /* Deep copy: duplicate the object via its copy fn. */
+                void* copied_ptr = element->_copy(element->_pointer);
+                array_push_back(copy_array, array_create_pointer(copied_ptr, element->_copy, element->_free));
+            }
+            else if (element->_free == NULL) {
+                /* Non-owning pointer: shallow alias is safe (no destructor). */
+                array_push_back(copy_array, array_create_pointer(element->_pointer, NULL, NULL));
+            }
+            else {
+                /* Owning pointer without a copy fn cannot be duplicated: aliasing
+                   would make both arrays own the same object, so destroying either
+                   after the other is a double-free/use-after-free. Refuse the copy. */
+                log_error("array_copy: Cannot copy owning ARRAY_POINTER without a copy function\n");
+                array_free(copy_array);
+                return NULL;
+            }
         }
     }
 
@@ -124,35 +139,61 @@ void array_free(void* arg) {
 }
 
 void array_insert(array_t* array, size_t index, avalue_t value) {
-    if (array == NULL) return;
-    if (array->elements == NULL) return;
+    if (array == NULL) {
+        __array_free_value(&value);
+        return;
+    }
+    if (array->elements == NULL) {
+        __array_free_value(&value);
+        return;
+    }
     if (index > array->size) {
         log_error("array_insert: Index out of bounds\n");
+        __array_free_value(&value);
         return;
     }
     if (index > array->capacity) {
         log_error("array_insert: Index out of bounds\n");
+        __array_free_value(&value);
         return;
     }
 
-    if (array->size >= array->capacity)
-        __array_resize(array, array->capacity + INITIAL_CAPACITY);
+    if (array->size >= array->capacity) {
+        if (!__array_resize(array, array->capacity + INITIAL_CAPACITY)) {
+            log_error("array_insert: Out of memory\n");
+            __array_free_value(&value);
+            return;
+        }
+    }
 
     if (index < array->size)
         memmove(&array->elements[index + 1], &array->elements[index], (array->size - index) * sizeof(avalue_t));
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wanalyzer-malloc-leak"
+    /* Ownership of value (incl. its heap _string/_pointer) transfers into the
+       array here; array_destroy()/array_clear() free it via __array_free_value().
+       -fanalyzer cannot track ownership through the tagged-union container, so
+       this is a known false positive. */
     array->elements[index] = value;
     array->size++;
+#pragma GCC diagnostic pop
 }
 
 void array_push_front(array_t* array, avalue_t value) {
-    if (array == NULL) return;
+    if (array == NULL) {
+        __array_free_value(&value);
+        return;
+    }
 
     array_insert(array, 0, value);
 }
 
 void array_push_back(array_t* array, avalue_t value) {
-    if (array == NULL) return;
+    if (array == NULL) {
+        __array_free_value(&value);
+        return;
+    }
 
     array_insert(array, array->size, value);
 }
@@ -202,7 +243,8 @@ void array_delete(array_t* array, size_t index) {
     array->size--;
 
     if (array->size <= array->capacity - INITIAL_CAPACITY && array->capacity > INITIAL_CAPACITY)
-        __array_resize(array, array->capacity - INITIAL_CAPACITY);
+        if (!__array_resize(array, array->capacity - INITIAL_CAPACITY))
+            log_error("array_delete: Out of memory\n");
 }
 
 size_t array_size(array_t* array) {
@@ -450,12 +492,14 @@ avalue_t array_create_pointer(void* pointer, void*(*oncopy)(void*), void(*onfree
     return v;
 }
 
-void __array_resize(array_t* array, size_t new_capacity) {
+int __array_resize(array_t* array, size_t new_capacity) {
     void* data = realloc(array->elements, new_capacity * sizeof(avalue_t));
-    if (data == NULL) return;
+    if (data == NULL) return 0;
 
     array->elements = data;
     array->capacity = new_capacity;
+
+    return 1;
 }
 
 void __array_free_value(avalue_t* value) {

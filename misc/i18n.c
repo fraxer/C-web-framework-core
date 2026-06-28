@@ -86,6 +86,12 @@ i18n_t* i18n_create(const char* locale_dir, const char* domain, const char* defa
     i18n_t* i18n = calloc(1, sizeof(i18n_t));
     if (i18n == NULL) return NULL;
 
+    size_t default_lang_len = strlen(default_lang);
+    if (default_lang_len >= sizeof(i18n->default_lang)) {
+        free(i18n);
+        return NULL;
+    }
+
     i18n->domain = strdup(domain);
     if (i18n->domain == NULL) {
         free(i18n);
@@ -104,8 +110,8 @@ i18n_t* i18n_create(const char* locale_dir, const char* domain, const char* defa
         bind_textdomain_codeset(domain, "UTF-8");
     }
 
-    strncpy(i18n->default_lang, default_lang, sizeof(i18n->default_lang) - 1);
-    i18n->default_lang[sizeof(i18n->default_lang) - 1] = '\0';
+    memcpy(i18n->default_lang, default_lang, default_lang_len);
+    i18n->default_lang[default_lang_len - 1] = '\0';
 
     return i18n;
 }

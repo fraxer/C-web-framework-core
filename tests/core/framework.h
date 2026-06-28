@@ -133,6 +133,23 @@ static inline void register_test_suite(test_suite_fn suite) {
 
 #define TEST_REQUIRE_NOT_NULL(ptr, message) TEST_REQUIRE((ptr) != NULL, message)
 
+/* Like TEST_REQUIRE but jumps to a cleanup label instead of returning. Use in
+ * tests that hold several heap resources: a failed setup guard releases the
+ * already-allocated ones via the label instead of leaking them. The label must
+ * exist in the enclosing function. */
+#define TEST_REQUIRE_GOTO(condition, message, label) do { \
+    stats.total++; \
+    if (!(condition)) { \
+        PRINT_TEST_CONTEXT(); \
+        stats.failed++; \
+        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s (line %d)\n", message, __LINE__); \
+        goto label; \
+    } \
+    stats.passed++; \
+} while(0)
+
+#define TEST_REQUIRE_NOT_NULL_GOTO(ptr, message, label) TEST_REQUIRE_GOTO((ptr) != NULL, message, label)
+
 /* Assertion macros */
 #define TEST_FAIL(message) do { \
     stats.total++; \

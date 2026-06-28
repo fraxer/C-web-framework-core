@@ -20,6 +20,9 @@
 #ifdef MySQL_FOUND
     #include "mysql.h"
 #endif
+#ifdef SQLite_FOUND
+    #include "sqlite.h"
+#endif
 
 static char __temp_name[128] = {0};
 static const char* __dbid = NULL;
@@ -139,6 +142,13 @@ int testdb_setup(const char* dbid, const char* config_path, const char* migratio
         fprintf(stderr, "testdb: MySQL support not compiled\n");
         return 0;
 #endif
+    } else if (strncmp(dbid, "sqlite", 6) == 0) {
+#ifdef SQLite_FOUND
+        __driver = TESTDB_DRIVER_SQLITE;
+#else
+        fprintf(stderr, "testdb: SQLite support not compiled\n");
+        return 0;
+#endif
     } else {
         fprintf(stderr, "testdb: unknown database driver in dbid: %s\n", dbid);
         return 0;
@@ -236,6 +246,34 @@ int testdb_setup(const char* dbid, const char* config_path, const char* migratio
     }
 #endif
 
+#ifdef SQLite_FOUND
+    if (__driver == TESTDB_DRIVER_SQLITE) {
+        sqlitehost_t* host = (sqlitehost_t*)dbhost(dbid);
+        if (host == NULL) {
+            fprintf(stderr, "testdb: cannot find host for %s\n", dbid);
+            return 0;
+        }
+
+        /* SQLite has no schemas/databases to create: an in-memory (":memory:")
+           or file path is a fresh, self-contained database opened lazily on the
+           first query. The single-threaded runner reuses one cached connection
+           per thread (db_connection_find by thread_id), so an in-memory DB is
+           shared across the whole run. No DDL is needed here; verify the host
+           is reachable so failures surface at setup, not mid-test. */
+        result = dbquery(dbid, "SELECT 1", NULL);
+        if (!dbresult_ok(result)) {
+            fprintf(stderr, "testdb: cannot reach SQLite host %s (%s)\n",
+                    dbid, host->path ? host->path : ":memory:");
+            dbresult_free(result);
+            return 0;
+        }
+        dbresult_free(result);
+
+        printf("testdb: using SQLite database: %s (%s)\n", __temp_name,
+               host->path ? host->path : ":memory:");
+    }
+#endif
+
     /* Register cleanup on exit */
     if (!__teardown_registered) {
         atexit(testdb_teardown);
@@ -281,6 +319,15 @@ void testdb_teardown(void) {
                 printf("testdb: dropped database %s\n", __temp_name);
             dbresult_free(result);
         }
+    }
+#endif
+
+#ifdef SQLite_FOUND
+    if (__driver == TESTDB_DRIVER_SQLITE) {
+        /* Nothing to drop: an in-memory DB is released when the connection is
+           closed by appconfig_free below; a file-backed DB is left in place
+           (the configured path is the user's own). */
+        printf("testdb: released SQLite database %s\n", __temp_name);
     }
 #endif
 

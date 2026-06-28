@@ -172,6 +172,8 @@ static int __urlencodedparser_set_field_value(urlencodedparser_t* parser) {
         return 0;
     }
 
+    part->offset = parser->offset;
+    part->size = parser->size;
     part->field->value = result.value;
     part->field->value_length = result.size;
 

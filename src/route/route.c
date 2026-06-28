@@ -119,8 +119,8 @@ int route_init_parser(route_parser_t* parser, const char* dirty_location) {
     parser->dirty_pos = 0;
     parser->pos = 0;
     parser->dirty_location = dirty_location;
-    parser->path = malloc(strlen(dirty_location) + 3); // +1 for ^, +1 for $, +1 for \0
-    parser->location = malloc(strlen(dirty_location) + 3); // +1 for ^, +1 for $, +1 for \0
+    parser->path = calloc(strlen(dirty_location) + 3, 1); // +1 for ^, +1 for $, +1 for \0
+    parser->location = calloc(strlen(dirty_location) + 3, 1); // +1 for ^, +1 for $, +1 for \0
     parser->first_param = NULL;
     parser->last_param = NULL;
 

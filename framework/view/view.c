@@ -490,6 +490,11 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
 
             break;
         }
+        default:
+            // Unknown/corrupt tag type: advance past this node instead of
+            // spinning on it forever (CWE-835).
+            child = child->next;
+            break;
         }
     }
 }

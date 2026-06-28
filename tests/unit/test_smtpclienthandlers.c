@@ -194,7 +194,8 @@ TEST(test_smtpclient_read_greeting_220) {
     TEST_REQUIRE(client_harness_init(&h), "harness should initialize");
 
     const char reply[] = "220 mail.example.com ESMTP\r\n";
-    write(h.peer_fd, reply, sizeof(reply) - 1);
+    ssize_t seed = write(h.peer_fd, reply, sizeof(reply) - 1);
+    TEST_REQUIRE(seed == (ssize_t)(sizeof(reply) - 1), "seed the reply onto the socket");
 
     int r = smtp_client_read(h.conn);
 
@@ -211,7 +212,8 @@ TEST(test_smtpclient_read_multiline_keeps_final_line) {
     TEST_REQUIRE(client_harness_init(&h), "harness should initialize");
 
     const char reply[] = "250-PIPELINING\r\n250-SIZE 10240000\r\n250 OK\r\n";
-    write(h.peer_fd, reply, sizeof(reply) - 1);
+    ssize_t seed = write(h.peer_fd, reply, sizeof(reply) - 1);
+    TEST_REQUIRE(seed == (ssize_t)(sizeof(reply) - 1), "seed the reply onto the socket");
 
     int r = smtp_client_read(h.conn);
 
@@ -268,7 +270,8 @@ TEST(test_smtpclient_read_malformed_returns_zero) {
 
     /* Non-numeric status code -> parser ERROR -> handler returns 0. */
     const char reply[] = "xyz bad\r\n";
-    write(h.peer_fd, reply, sizeof(reply) - 1);
+    ssize_t seed = write(h.peer_fd, reply, sizeof(reply) - 1);
+    TEST_REQUIRE(seed == (ssize_t)(sizeof(reply) - 1), "seed the reply onto the socket");
 
     int r = smtp_client_read(h.conn);
 

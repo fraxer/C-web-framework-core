@@ -65,6 +65,7 @@ TEST(test_cookie_single_pair) {
 
     cookieparser_t parser;
     http_cookie_t* c = parse(&parser, "session=abc123");
+    TEST_REQUIRE_NOT_NULL(c, "parse should return a cookie");
 
     TEST_ASSERT_EQUAL(1, list_length(c), "should have 1 cookie");
     check_invariants(c);
@@ -82,6 +83,7 @@ TEST(test_cookie_multiple_pairs) {
 
     cookieparser_t parser;
     http_cookie_t* c = parse(&parser, "a=1; b=2; c=3");
+    TEST_REQUIRE_NOT_NULL(c, "parse should return a cookie");
 
     TEST_ASSERT_EQUAL(3, list_length(c), "should have 3 cookies");
     check_invariants(c);
@@ -105,6 +107,7 @@ TEST(test_cookie_no_space_after_semicolon) {
 
     cookieparser_t parser;
     http_cookie_t* c = parse(&parser, "a=1;b=2");
+    TEST_REQUIRE_NOT_NULL(c, "parse should return a cookie");
 
     TEST_ASSERT_EQUAL(2, list_length(c), "should have 2 cookies");
     check_invariants(c);
@@ -120,6 +123,7 @@ TEST(test_cookie_multiple_spaces) {
 
     cookieparser_t parser;
     http_cookie_t* c = parse(&parser, "a=1;   b=2");
+    TEST_REQUIRE_NOT_NULL(c, "parse should return a cookie");
 
     TEST_ASSERT_EQUAL(2, list_length(c), "should have 2 cookies");
     check_invariants(c);
@@ -134,6 +138,7 @@ TEST(test_cookie_leading_spaces) {
 
     cookieparser_t parser;
     http_cookie_t* c = parse(&parser, "  a=1");
+    TEST_REQUIRE_NOT_NULL(c, "parse should return a cookie");
 
     TEST_ASSERT_EQUAL(1, list_length(c), "should have 1 cookie");
     check_invariants(c);
@@ -153,6 +158,7 @@ TEST(test_cookie_empty_value) {
 
     cookieparser_t parser;
     http_cookie_t* c = parse(&parser, "a=");
+    TEST_REQUIRE_NOT_NULL(c, "parse should return a cookie");
 
     TEST_ASSERT_EQUAL(1, list_length(c), "should have 1 cookie");
     check_invariants(c);
@@ -169,6 +175,7 @@ TEST(test_cookie_value_contains_equals) {
 
     cookieparser_t parser;
     http_cookie_t* c = parse(&parser, "token=a=b=c");
+    TEST_REQUIRE_NOT_NULL(c, "parse should return a cookie");
 
     TEST_ASSERT_EQUAL(1, list_length(c), "should have 1 cookie");
     check_invariants(c);
@@ -188,6 +195,7 @@ TEST(test_cookie_token_without_equals_is_skipped) {
 
     cookieparser_t parser;
     http_cookie_t* c = parse(&parser, "garbage; a=1; morejunk; b=2");
+    TEST_REQUIRE_NOT_NULL(c, "parse should return a cookie");
 
     TEST_ASSERT_EQUAL(2, list_length(c), "should have 2 valid cookies");
     check_invariants(c);
@@ -215,6 +223,7 @@ TEST(test_cookie_empty_key_is_skipped) {
 
     cookieparser_t parser;
     http_cookie_t* c = parse(&parser, "=oops; a=1");
+    TEST_REQUIRE_NOT_NULL(c, "parse should return a cookie");
 
     TEST_ASSERT_EQUAL(1, list_length(c), "should have 1 cookie");
     check_invariants(c);
@@ -233,6 +242,7 @@ TEST(test_cookie_trailing_semicolon) {
 
     cookieparser_t parser;
     http_cookie_t* c = parse(&parser, "a=1;");
+    TEST_REQUIRE_NOT_NULL(c, "parse should return a cookie");
 
     TEST_ASSERT_EQUAL(1, list_length(c), "should have 1 cookie");
     check_invariants(c);
@@ -246,6 +256,7 @@ TEST(test_cookie_trailing_semicolon_and_space) {
 
     cookieparser_t parser;
     http_cookie_t* c = parse(&parser, "a=1; ");
+    TEST_REQUIRE_NOT_NULL(c, "parse should return a cookie");
 
     TEST_ASSERT_EQUAL(1, list_length(c), "should have 1 cookie");
     check_invariants(c);
@@ -378,6 +389,7 @@ TEST(test_cookie_realistic_header) {
     cookieparser_t parser;
     http_cookie_t* c = parse(&parser,
         "_ga=GA1.2.12345; sessionid=eyJhbGciOiJIUzI1NiJ9; csrftoken=Zm9vYmFy; theme=dark");
+    TEST_REQUIRE_NOT_NULL(c, "parse should return a cookie");
 
     TEST_ASSERT_EQUAL(4, list_length(c), "should have 4 cookies");
     check_invariants(c);
@@ -442,6 +454,7 @@ TEST(test_cookie_value_with_spaces) {
 
     cookieparser_t parser;
     http_cookie_t* c = parse(&parser, "name=hello world");
+    TEST_REQUIRE_NOT_NULL(c, "parse should return a cookie");
 
     TEST_ASSERT_EQUAL(1, list_length(c), "should have 1 cookie");
     check_invariants(c);
@@ -484,6 +497,7 @@ TEST(test_cookie_value_with_url_encoded) {
 
     cookieparser_t parser;
     http_cookie_t* c = parse(&parser, "search=%22hello%22");
+    TEST_REQUIRE_NOT_NULL(c, "parse should return a cookie");
 
     TEST_ASSERT_EQUAL(1, list_length(c), "should have 1 cookie");
     check_invariants(c);

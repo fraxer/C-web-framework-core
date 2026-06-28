@@ -350,10 +350,10 @@ TEST(test_dkim_wrap_roundtrips) {
     TEST_ASSERT_EQUAL('\0', wrapped[strlen(wrapped)], "wrapped output is NUL-terminated");
 
     char* unfolded = dkim_test_unfold(wrapped);
+    free(wrapped);
     TEST_REQUIRE_NOT_NULL(unfolded, "unfold should succeed");
     TEST_ASSERT_STR_EQUAL(input, unfolded, "unfolding reconstructs the original");
 
-    free(wrapped);
     free(unfolded);
 }
 
@@ -369,10 +369,10 @@ TEST(test_dkim_wrap_no_overflow) {
     TEST_ASSERT_EQUAL('\0', wrapped[strlen(wrapped)], "NUL-terminated");
 
     char* unfolded = dkim_test_unfold(wrapped);
+    free(wrapped);
     TEST_REQUIRE_NOT_NULL(unfolded, "unfold should succeed");
     TEST_ASSERT_STR_EQUAL(input, unfolded, "long input round-trips through folding");
 
-    free(wrapped);
     free(unfolded);
 }
 
@@ -501,31 +501,40 @@ TEST(test_dkim_signature_verifies_with_public_key) {
 
     EVP_PKEY* pkey = dkim_test_generate_keypair();
     TEST_REQUIRE_NOT_NULL(pkey, "keypair generation should succeed");
-    char* pem = dkim_test_private_pem(pkey);
-    TEST_REQUIRE_NOT_NULL(pem, "private PEM extraction should succeed");
+    char* pem = NULL;
+    EVP_PKEY* pub = NULL;
+    dkim_t* dkim = NULL;
+    char* sign = NULL;
+    char* headers_string = NULL;
+    char* unfolded = NULL;
+    unsigned char* raw = NULL;
+    EVP_MD_CTX* vctx = NULL;
+
+    pem = dkim_test_private_pem(pkey);
+    TEST_REQUIRE_NOT_NULL_GOTO(pem, "private PEM extraction should succeed", cleanup);
 
     /* Public-only key, as a real verifier would have it. */
-    EVP_PKEY* pub = dkim_test_public_key(pkey);
-    TEST_REQUIRE_NOT_NULL(pub, "public key extraction should succeed");
+    pub = dkim_test_public_key(pkey);
+    TEST_REQUIRE_NOT_NULL_GOTO(pub, "public key extraction should succeed", cleanup);
 
-    dkim_t* dkim = dkim_test_build(pem);
-    TEST_REQUIRE_NOT_NULL(dkim, "build should succeed");
+    dkim = dkim_test_build(pem);
+    TEST_REQUIRE_NOT_NULL_GOTO(dkim, "build should succeed", cleanup);
 
     const char* body = "Hello, DKIM!\r\nThis is a signed test body.\r\n";
-    char* sign = dkim_create_sign(dkim, body);
-    TEST_REQUIRE_NOT_NULL(sign, "create_sign should succeed");
+    sign = dkim_create_sign(dkim, body);
+    TEST_REQUIRE_NOT_NULL_GOTO(sign, "create_sign should succeed", cleanup);
 
     /* Reconstruct the exact bytes that were signed. dkim_create_sign leaves
      * the (already canonicalized) headers on the object, so make_headers_string
      * reproduces the signing input verbatim, including the DKIM-Signature
      * header with an empty b= tag. */
     int headers_len = 0;
-    char* headers_string = __dkim_make_headers_string(dkim, &headers_len);
-    TEST_REQUIRE_NOT_NULL(headers_string, "reconstruct headers string");
+    headers_string = __dkim_make_headers_string(dkim, &headers_len);
+    TEST_REQUIRE_NOT_NULL_GOTO(headers_string, "reconstruct headers string", cleanup);
 
     /* Extract the base64 b= value and decode it to raw signature bytes. */
-    char* unfolded = dkim_test_unfold(sign);
-    TEST_REQUIRE_NOT_NULL(unfolded, "unfold should succeed");
+    unfolded = dkim_test_unfold(sign);
+    TEST_REQUIRE_NOT_NULL_GOTO(unfolded, "unfold should succeed", cleanup);
 
     int b_len = 0;
     const char* b_value = dkim_test_tag_value(unfolded, "b=", &b_len);
@@ -536,16 +545,16 @@ TEST(test_dkim_signature_verifies_with_public_key) {
 
     int raw_cap = base64_decode_len(b_buf);
     TEST_ASSERT(raw_cap > 0, "decoded signature length positive");
-    unsigned char* raw = malloc(raw_cap);
-    TEST_REQUIRE_NOT_NULL(raw, "allocate raw signature");
+    raw = malloc(raw_cap);
+    TEST_REQUIRE_NOT_NULL_GOTO(raw, "allocate raw signature", cleanup);
     int raw_len = base64_decode((char*)raw, b_buf);
     TEST_ASSERT(raw_len > 0, "base64 decode of signature succeeded");
 
     /* Verify: RSA-SHA1 over the canonical headers, hashing once. The previous
      * implementation fed a precomputed digest into the signing context, which
      * hashed it a second time; such a signature would FAIL this check. */
-    EVP_MD_CTX* vctx = EVP_MD_CTX_new();
-    TEST_REQUIRE_NOT_NULL(vctx, "verify context");
+    vctx = EVP_MD_CTX_new();
+    TEST_REQUIRE_NOT_NULL_GOTO(vctx, "verify context", cleanup);
 
     int ok = 0;
     if (EVP_DigestVerifyInit(vctx, NULL, EVP_sha1(), NULL, pub) == 1 &&
@@ -555,12 +564,13 @@ TEST(test_dkim_signature_verifies_with_public_key) {
 
     TEST_ASSERT(ok, "signature verifies with public key over SHA1(canonical headers)");
 
+cleanup:
     EVP_MD_CTX_free(vctx);
     free(raw);
     free(unfolded);
     free(headers_string);
     free(sign);
-    dkim_free(dkim);
+    if (dkim) dkim_free(dkim);
     free(pem);
     EVP_PKEY_free(pub);
     EVP_PKEY_free(pkey);

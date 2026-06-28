@@ -236,13 +236,15 @@ TEST(test_write_post_plain_preserves_body) {
     TEST_REQUIRE(handler_harness_init(&h, 80), "harness init");
 
     const size_t PAYLOAD = 40960;
-    char* pattern = malloc(PAYLOAD);
-    TEST_REQUIRE_NOT_NULL(pattern, "pattern buffer");
-    for (size_t i = 0; i < PAYLOAD; i++) pattern[i] = (char)(i % 256);
 
     char tmppath[] = "/tmp/handler_plain_XXXXXX";
     int tmpfd = mkstemp(tmppath);
     TEST_REQUIRE(tmpfd >= 0, "mkstemp");
+
+    char* pattern = malloc(PAYLOAD);
+    TEST_REQUIRE_NOT_NULL(pattern, "pattern buffer");
+    for (size_t i = 0; i < PAYLOAD; i++) pattern[i] = (char)(i % 256);
+
     ssize_t wr = write(tmpfd, pattern, PAYLOAD);
     TEST_ASSERT_EQUAL_SIZE(PAYLOAD, (size_t)wr, "wrote payload file");
 
@@ -284,13 +286,15 @@ TEST(test_write_post_chunked_preserves_body) {
     TEST_REQUIRE(handler_harness_init(&h, 80), "harness init");
 
     const size_t PAYLOAD = 40960;  // > 16384 → более одного chunk'а
-    char* pattern = malloc(PAYLOAD);
-    TEST_REQUIRE_NOT_NULL(pattern, "pattern buffer");
-    for (size_t i = 0; i < PAYLOAD; i++) pattern[i] = (char)(i % 256);
 
     char tmppath[] = "/tmp/handler_chunk_XXXXXX";
     int tmpfd = mkstemp(tmppath);
     TEST_REQUIRE(tmpfd >= 0, "mkstemp");
+
+    char* pattern = malloc(PAYLOAD);
+    TEST_REQUIRE_NOT_NULL(pattern, "pattern buffer");
+    for (size_t i = 0; i < PAYLOAD; i++) pattern[i] = (char)(i % 256);
+
     ssize_t wr = write(tmpfd, pattern, PAYLOAD);
     TEST_ASSERT_EQUAL_SIZE(PAYLOAD, (size_t)wr, "wrote payload file");
 

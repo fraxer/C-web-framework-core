@@ -6,7 +6,8 @@
 typedef enum {
     TESTDB_DRIVER_NONE = 0,
     TESTDB_DRIVER_POSTGRESQL,
-    TESTDB_DRIVER_MYSQL
+    TESTDB_DRIVER_MYSQL,
+    TESTDB_DRIVER_SQLITE
 } testdb_driver_e;
 
 int testdb_setup(const char* dbid, const char* config_path, const char* migrations_dir);

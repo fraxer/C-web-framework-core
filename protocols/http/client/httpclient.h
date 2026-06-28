@@ -34,7 +34,7 @@ typedef struct httpclient {
     httprequest_t* request;
     httpresponse_t* response;
     httpclientparser_t* parser;
-    httpresponse_t*(*send)();
+    httpresponse_t*(*send)(struct httpclient*);
     const char*(*error)(struct httpclient*);
     void(*set_method)(struct httpclient*, route_methods_e);
     int(*set_url)(struct httpclient*, const char*);

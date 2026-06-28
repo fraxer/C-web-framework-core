@@ -60,7 +60,7 @@
         log_error(fmt, ##__VA_ARGS__); \
     } while (0)
 
-static atomic_bool __module_loader_wait_signal = ATOMIC_VAR_INIT(0);
+static atomic_bool __module_loader_wait_signal = 0;
 
 static void __free_gzip_list(env_gzip_str_t* item) {
     while (item != NULL) {
