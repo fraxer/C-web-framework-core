@@ -1,11 +1,3 @@
 cmake_minimum_required(VERSION 3.12.4)
 
-FILE(GLOB SOURCES *.c *.h)
-
-set(LIB_NAME taskmanager)
-
-add_library(${LIB_NAME} STATIC ${SOURCES})
-
-target_include_directories(${LIB_NAME} PUBLIC .)
-
-target_link_libraries(${LIB_NAME} config misc signal)
+cpdy_add_lib(taskmanager LINK_LIBS config misc signal)

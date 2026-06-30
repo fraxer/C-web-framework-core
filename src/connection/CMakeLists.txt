@@ -1,11 +1,3 @@
 cmake_minimum_required(VERSION 3.12.4)
 
-FILE(GLOB SOURCES *.c *.h)
-
-set(LIB_NAME connection)
-
-add_library(${LIB_NAME} STATIC ${SOURCES})
-
-target_include_directories(${LIB_NAME} PUBLIC .)
-
-target_link_libraries(${LIB_NAME} socket openssl misc multiplexing broadcast)
+cpdy_add_lib(connection LINK_LIBS socket openssl misc multiplexing broadcast)
