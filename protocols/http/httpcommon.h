@@ -12,7 +12,7 @@ typedef struct http_header {
     size_t key_length;
     size_t value_length;
     struct http_header* next;
-} http_header_t, http_cookie_t;
+} http_header_t, http_cookie_t, http_payloadfield_t;
 
 typedef enum http_version {
     HTTP1_VER_NONE = 0,
@@ -37,14 +37,6 @@ typedef struct http_ranges {
     struct http_ranges* next;
 } http_ranges_t;
 
-typedef struct http_payloadfield {
-    char* key;
-    char* value;
-    size_t key_length;
-    size_t value_length;
-    struct http_payloadfield* next;
-} http_payloadfield_t;
-
 typedef struct http_payloadpart {
     size_t offset;
     size_t size;
@@ -66,7 +58,10 @@ typedef struct http_payload {
     file_t file;
     char* path;
     char* boundary;
-    http_payloadpart_t* part;
+    union {
+        http_payloadpart_t* part;
+        http_payloadfield_t* field;
+    };
     http_payload_type_e type;
 } http_payload_t;
 

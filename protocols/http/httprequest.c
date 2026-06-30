@@ -31,8 +31,11 @@ int httprequest_header_del(httprequest_t*, const char*);
 const char* httprequest_cookie(httprequest_t*, const char*);
 void httprequest_payload_free(http_payload_t*);
 int httprequest_payload_parse(httprequest_t*);
+char* httprequest_plain_get_data(httprequest_t*);
 http_payloadpart_t* httprequest_multipart_part(httprequest_t*, const char*);
-http_payloadpart_t* httprequest_urlencoded_part(httprequest_t*, const char*);
+char* httprequest_multipart_get_data(httprequest_t*, const char*);
+char* httprequest_payload_part_read(httprequest_t* request, const http_payloadpart_t* part);
+char* httprequest_urlencoded_get_data(httprequest_t*, const char*);
 int httprequest_append_urlencoded(httprequest_t*, const char*, const char*);
 int httprequest_append_formdata_raw(httprequest_t*, const char*, const char*, const char*);
 int httprequest_append_formdata_text(httprequest_t*, const char*, const char*);
@@ -209,7 +212,12 @@ void httprequest_payload_free(http_payload_t* payload) {
     free(payload->boundary);
     payload->boundary = NULL;
 
-    http_payloadpart_free(payload->part);
+    if (payload->type == MULTIPART)
+        http_payloadpart_free(payload->part);
+    if (payload->type == URLENCODED)
+        http_payloadfield_free(payload->field);
+
+    payload->type = NONE;
     payload->part = NULL;
 }
 
@@ -220,32 +228,40 @@ char* httprequest_payload(httprequest_t* request) {
 char* httprequest_payloadf(httprequest_t* request, const char* field) {
     if (!httprequest_payload_parse(request)) return NULL;
 
-    http_payloadpart_t* part = NULL;
-
-    if (request->payload_.type == PLAIN || request->payload_.type == MULTIPART)
-        part = httprequest_multipart_part(request, field);
+    if (request->payload_.type == PLAIN && field == NULL)
+        return httprequest_plain_get_data(request);
+    else if (request->payload_.type == MULTIPART)
+        return httprequest_multipart_get_data(request, field);
     else if (request->payload_.type == URLENCODED)
-        part = httprequest_urlencoded_part(request, field);
-    else
-        return NULL;
+        return httprequest_urlencoded_get_data(request, field);
 
-    if (part == NULL) return NULL;
+    return NULL;
+}
 
-    char* buffer = malloc(part->size + 1);
-    if (buffer == NULL) return NULL;
+char* httprequest_plain_get_data(httprequest_t* request) {
+    char* content = malloc(request->payload_.file.size + 1);
+    if (content == NULL) return 0;
 
-    lseek(request->payload_.file.fd, part->offset, SEEK_SET);
-    int r = read(request->payload_.file.fd, buffer, part->size);
-    lseek(request->payload_.file.fd, 0, SEEK_SET);
-
-    buffer[part->size] = 0;
-
-    if (r < 0) {
-        free(buffer);
-        return NULL;
+    size_t total = 0;
+    while (total < request->payload_.file.size) {
+        ssize_t r = pread(request->payload_.file.fd, content + total, request->payload_.file.size - total,
+                          (off_t)total);
+        if (r < 0) {
+            log_error("httprequest: payload read error: %s\n", strerror(errno));
+            free(content);
+            return 0;
+        }
+        if (r == 0) {
+            log_error("httprequest: payload truncated (%zu of %zu bytes)\n", total, request->payload_.file.size);
+            free(content);
+            return 0;
+        }
+        total += (size_t)r;
     }
 
-    return buffer;
+    content[total] = 0;
+
+    return content;
 }
 
 http_payloadpart_t* httprequest_multipart_part(httprequest_t* request, const char* field) {
@@ -266,16 +282,54 @@ http_payloadpart_t* httprequest_multipart_part(httprequest_t* request, const cha
     return part;
 }
 
-http_payloadpart_t* httprequest_urlencoded_part(httprequest_t* request, const char* field) {
-    http_payloadpart_t* part = request->payload_.part;
+char* httprequest_multipart_get_data(httprequest_t* request, const char* field) {
+    http_payloadpart_t* part = httprequest_multipart_part(request, field);
     if (part == NULL) return NULL;
-    if (field == NULL) return NULL;
 
-    while (part) {
-        if (part->field && part->field->key && strcmp(part->field->key, field) == 0)
-            return part;
+    return httprequest_payload_part_read(request, part);
+}
 
-        part = part->next;
+char* httprequest_payload_part_read(httprequest_t* request, const http_payloadpart_t* part) {
+    char* buffer = malloc(part->size + 1);
+    if (buffer == NULL) return NULL;
+
+    size_t total = 0;
+    while (total < part->size) {
+        ssize_t r = pread(request->payload_.file.fd, buffer + total, part->size - total,
+                          (off_t)part->offset + (off_t)total);
+        if (r < 0) {
+            log_error("httprequest: payload read error: %s\n", strerror(errno));
+            free(buffer);
+            return NULL;
+        }
+        if (r == 0) {
+            log_error("httprequest: payload part truncated (%zu of %zu bytes)\n", total, part->size);
+            free(buffer);
+            return NULL;
+        }
+        total += (size_t)r;
+    }
+
+    buffer[part->size] = 0;
+    return buffer;
+}
+
+char* httprequest_urlencoded_get_data(httprequest_t* request, const char* field) {
+    http_payloadfield_t* f = request->payload_.field;
+    if (f == NULL) return NULL;
+
+    while (f) {
+        if (field == NULL || (f->key != NULL && strcmp(f->key, field) == 0)) {
+            char* buffer = malloc(f->value_length + 1);
+            if (buffer == NULL) return NULL;
+
+            memcpy(buffer, f->value, f->value_length);
+            buffer[f->value_length] = 0;
+
+            return buffer;
+        }
+
+        f = f->next;
     }
 
     return NULL;
@@ -439,29 +493,24 @@ int httprequest_payload_parse_urlencoded(httprequest_t* request) {
     }
 
     request->payload_.type = URLENCODED;
-    request->payload_.part = urlencodedparser_part(&parser);
+    request->payload_.field = urlencodedparser_field(&parser);
 
     return 1;
 }
 
 int httprequest_payload_parse_plain(httprequest_t* request) {
-    http_payloadpart_t* part = http_payloadpart_create();
-    if (part == NULL) return 0;
-
-    part->size = request->payload_.file.size;
-
     request->payload_.type = PLAIN;
-    request->payload_.part = part;
 
     return 1;
 }
 
 int httprequest_payload_parse(httprequest_t* request) {
     if (request->payload_.file.fd < 0) return 0;
-    if (request->payload_.part != NULL) return 0;
+    if (request->payload_.type == MULTIPART && request->payload_.part != NULL) return 1;
+    if (request->payload_.type == URLENCODED && request->payload_.field != NULL) return 1;
+    if (request->payload_.type == PLAIN) return 1;
 
     http_header_t* header = request->header_;
-
     while (header) {
         if (cmpstr_lower(header->key, "content-type"))
             break;
@@ -476,8 +525,8 @@ int httprequest_payload_parse(httprequest_t* request) {
         return httprequest_payload_parse_multipart(request, header->value, header->value_length);
     else if (cmpstr_lower(header->value, "application/x-www-form-urlencoded"))
         return httprequest_payload_parse_urlencoded(request);
-    else
-        return httprequest_payload_parse_plain(request);
+
+    return httprequest_payload_parse_plain(request);
 }
 
 int httprequest_header_add(httprequest_t* request, const char* key, const char* value) {

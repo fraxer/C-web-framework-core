@@ -7,7 +7,7 @@ typedef struct urlencoded_value {
     size_t size;
 } urlencoded_value_t;
 
-static int __urlencodedparser_add_part(urlencodedparser_t* parser);
+static int __urlencodedparser_add_field(urlencodedparser_t* parser);
 static int __urlencodedparser_set_field_key(urlencodedparser_t* parser);
 static int __urlencodedparser_set_field_value(urlencodedparser_t* parser);
 static int __urlencodedparser_set_empty_value(urlencodedparser_t* parser);
@@ -19,10 +19,10 @@ void urlencodedparser_init(urlencodedparser_t* parser, int payload_fd, size_t pa
     parser->payload_offset = 0;
     parser->offset = 0;
     parser->size = 0;
-    parser->part = NULL;
-    parser->last_part = NULL;
+    parser->field = NULL;
+    parser->last_field = NULL;
     parser->find_amp = 1;
-    parser->part_count = 0;
+    parser->field_count = 0;
     parser->limit_reached = 0;
     parser->payload_fd = payload_fd;
     parser->error = NULL;
@@ -30,7 +30,7 @@ void urlencodedparser_init(urlencodedparser_t* parser, int payload_fd, size_t pa
 
 int urlencodedparser_parse(urlencodedparser_t* parser, char* buffer, size_t buffer_size) {
     if (parser->limit_reached) {
-        parser->error = "urlencoded parser: part limit already reached";
+        parser->error = "urlencoded parser: field limit already reached";
         return 0;
     }
 
@@ -45,13 +45,13 @@ int urlencodedparser_parse(urlencodedparser_t* parser, char* buffer, size_t buff
             }
             parser->find_amp = 0;
 
-            if (parser->part_count >= URLENCODEDPARSER_MAX_PARTS) {
+            if (parser->field_count >= URLENCODEDPARSER_MAX_PARTS) {
                 parser->limit_reached = 1;
-                parser->error = "urlencoded parser: maximum number of parts exceeded";
+                parser->error = "urlencoded parser: maximum number of fields exceeded";
                 return 0;
             }
 
-            if (!__urlencodedparser_add_part(parser)) return 0;
+            if (!__urlencodedparser_add_field(parser)) return 0;
             if (!__urlencodedparser_set_field_key(parser)) return 0;
 
             break;
@@ -74,12 +74,12 @@ int urlencodedparser_parse(urlencodedparser_t* parser, char* buffer, size_t buff
     return 1;
 }
 
-http_payloadpart_t* urlencodedparser_part(urlencodedparser_t* parser) {
-    return parser->part;
+http_payloadfield_t* urlencodedparser_field(urlencodedparser_t* parser) {
+    return parser->field;
 }
 
 void urlencodedparser_clear(urlencodedparser_t* parser) {
-    http_payloadpart_free(parser->part);
+    http_payloadfield_free(parser->field);
     urlencodedparser_init(parser, 0, 0);
 }
 
@@ -94,18 +94,18 @@ static int __urlencodedparser_flush(urlencodedparser_t* parser) {
             return 1;
         }
 
-        if (parser->part_count >= URLENCODEDPARSER_MAX_PARTS) {
+        if (parser->field_count >= URLENCODEDPARSER_MAX_PARTS) {
             parser->limit_reached = 1;
-            parser->error = "urlencoded parser: maximum number of parts exceeded";
+            parser->error = "urlencoded parser: maximum number of fields exceeded";
             return 0;
         }
 
-        if (!__urlencodedparser_add_part(parser)) return 0;
+        if (!__urlencodedparser_add_field(parser)) return 0;
         if (!__urlencodedparser_set_field_key(parser)) return 0;
         if (!__urlencodedparser_set_empty_value(parser)) return 0;
     } else {
-        /* Значение для ключа, part которого уже создан на '='.
-           last_part здесь гарантированно != NULL. */
+        /* Значение для ключа, field которого уже создан на '='.
+           last_field здесь гарантированно != NULL. */
         if (!__urlencodedparser_set_field_value(parser))
             return 0;
 
@@ -117,79 +117,68 @@ static int __urlencodedparser_flush(urlencodedparser_t* parser) {
     return 1;
 }
 
-static int __urlencodedparser_add_part(urlencodedparser_t* parser) {
-    http_payloadpart_t* part = http_payloadpart_create();
-    if (part == NULL) {
-        parser->error = "urlencoded parser: failed to allocate payload part";
-        return 0;
-    }
-
+static int __urlencodedparser_add_field(urlencodedparser_t* parser) {
     http_payloadfield_t* field = http_payloadfield_create();
     if (field == NULL) {
         parser->error = "urlencoded parser: failed to allocate payload field";
-        http_payloadpart_free(part);
         return 0;
     }
 
-    if (parser->part == NULL)
-        parser->part = part;
+    if (parser->field == NULL)
+        parser->field = field;
 
-    if (parser->last_part != NULL)
-        parser->last_part->next = part;
+    if (parser->last_field != NULL)
+        parser->last_field->next = field;
 
-    parser->last_part = part;
+    parser->last_field = field;
+    parser->field_count++;
 
-    part->offset = parser->offset;
-    part->size = parser->size;
-    part->field = field;
-
-    parser->offset = parser->payload_offset + 1;
-    parser->size = 0;
-    parser->part_count++;
-
+    /* offset/size указывают на ключ; читаются в __urlencodedparser_set_field_key. */
     return 1;
 }
 
 static int __urlencodedparser_set_field_key(urlencodedparser_t* parser) {
-    http_payloadpart_t* part = parser->last_part;
-    urlencoded_value_t result = {NULL, 0};
-
-    if (!__urlencodedparser_set_field(parser, part->offset, part->size, &result)) {
-        return 0;
-    }
-
-    part->field->key = result.value;
-    part->field->key_length = result.size;
-
-    return 1;
-}
-
-static int __urlencodedparser_set_field_value(urlencodedparser_t* parser) {
-    http_payloadpart_t* part = parser->last_part;
+    http_payloadfield_t* field = parser->last_field;
     urlencoded_value_t result = {NULL, 0};
 
     if (!__urlencodedparser_set_field(parser, parser->offset, parser->size, &result)) {
         return 0;
     }
 
-    part->offset = parser->offset;
-    part->size = parser->size;
-    part->field->value = result.value;
-    part->field->value_length = result.size;
+    field->key = result.value;
+    field->key_length = result.size;
+
+    /* Сдвиг к началу значения (первый байт после '='). */
+    parser->offset = parser->payload_offset + 1;
+    parser->size = 0;
+
+    return 1;
+}
+
+static int __urlencodedparser_set_field_value(urlencodedparser_t* parser) {
+    http_payloadfield_t* field = parser->last_field;
+    urlencoded_value_t result = {NULL, 0};
+
+    if (!__urlencodedparser_set_field(parser, parser->offset, parser->size, &result)) {
+        return 0;
+    }
+
+    field->value = result.value;
+    field->value_length = result.size;
 
     return 1;
 }
 
 static int __urlencodedparser_set_empty_value(urlencodedparser_t* parser) {
-    http_payloadpart_t* part = parser->last_part;
+    http_payloadfield_t* field = parser->last_field;
     char* value = copy_cstringn(NULL, 0);
     if (value == NULL) {
         parser->error = "urlencoded parser: failed to allocate empty field value";
         return 0;
     }
 
-    part->field->value = value;
-    part->field->value_length = 0;
+    field->value = value;
+    field->value_length = 0;
 
     return 1;
 }

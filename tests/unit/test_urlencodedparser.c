@@ -20,22 +20,13 @@ static int make_payload(const char* data, size_t len) {
     return fd;
 }
 
-/* Освобождает односвязный список частей. */
-static void free_parts(http_payloadpart_t* part) {
-    while (part) {
-        http_payloadpart_t* next = part->next;
-        if (part->field) {
-            free(part->field->key);
-            free(part->field->value);
-            free(part->field);
-        }
-        free(part);
-        part = next;
-    }
+/* Освобождает односвязный список полей. */
+static void free_fields(http_payloadfield_t* field) {
+    http_payloadfield_free(field);
 }
 
-/* Считает количество частей (пар) в связном списке. */
-static int count_parts(http_payloadpart_t* head) {
+/* Считает количество полей (пар) в связном списке. */
+static int count_fields(http_payloadfield_t* head) {
     int n = 0;
     while (head) {
         n++;
@@ -46,24 +37,24 @@ static int count_parts(http_payloadpart_t* head) {
 
 /*
  * Сверяет ключ и значение пары по индексу.
- * Структура списка: [pair0] -> [pair1] -> ...
- * Каждая пара имеет field->key и field->value (декодированные строки).
+ * Структура списка: [field0] -> [field1] -> ...
+ * Каждое поле содержит декодированные key/value.
  */
-static int verify_pair(http_payloadpart_t* head, int idx,
-                       const char* exp_key, const char* exp_val) {
-    http_payloadpart_t* p = head;
-    for (int i = 0; i < idx && p; i++)
-        p = p->next;
+static int verify_field(http_payloadfield_t* head, int idx,
+                        const char* exp_key, const char* exp_val) {
+    http_payloadfield_t* f = head;
+    for (int i = 0; i < idx && f; i++)
+        f = f->next;
 
-    if (!p || !p->field) return 0;
+    if (!f) return 0;
 
     /* Проверяем ключ */
-    if (!p->field->key) return 0;
-    if (strcmp(p->field->key, exp_key) != 0) return 0;
+    if (!f->key) return 0;
+    if (strcmp(f->key, exp_key) != 0) return 0;
 
     /* Проверяем значение */
-    if (!p->field->value) return 0;
-    if (strcmp(p->field->value, exp_val) != 0) return 0;
+    if (!f->value) return 0;
+    if (strcmp(f->value, exp_val) != 0) return 0;
 
     return 1;
 }
@@ -122,11 +113,11 @@ TEST(test_basic_single_pair) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(1, count_parts(head), "Должна быть 1 пара");
-    TEST_ASSERT(verify_pair(head, 0, "a", "b"), "Пара a=b");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(1, count_fields(head), "Должна быть 1 пара");
+    TEST_ASSERT(verify_field(head, 0, "a", "b"), "Пара a=b");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -140,12 +131,12 @@ TEST(test_basic_two_pairs) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(2, count_parts(head), "Должно быть 2 пары");
-    TEST_ASSERT(verify_pair(head, 0, "a", "b"), "Пара a=b");
-    TEST_ASSERT(verify_pair(head, 1, "c", "d"), "Пара c=d");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(2, count_fields(head), "Должно быть 2 пары");
+    TEST_ASSERT(verify_field(head, 0, "a", "b"), "Пара a=b");
+    TEST_ASSERT(verify_field(head, 1, "c", "d"), "Пара c=d");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -159,12 +150,12 @@ TEST(test_basic_multiletter_keys) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(2, count_parts(head), "Должно быть 2 пары");
-    TEST_ASSERT(verify_pair(head, 0, "name", "John"), "Пара name=John");
-    TEST_ASSERT(verify_pair(head, 1, "city", "Amsterdam"), "Пара city=Amsterdam");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(2, count_fields(head), "Должно быть 2 пары");
+    TEST_ASSERT(verify_field(head, 0, "name", "John"), "Пара name=John");
+    TEST_ASSERT(verify_field(head, 1, "city", "Amsterdam"), "Пара city=Amsterdam");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -178,12 +169,12 @@ TEST(test_basic_many_pairs) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(5, count_parts(head), "Должно быть 5 пар");
-    TEST_ASSERT(verify_pair(head, 0, "a", "1"), "a=1");
-    TEST_ASSERT(verify_pair(head, 4, "e", "5"), "e=5");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(5, count_fields(head), "Должно быть 5 пар");
+    TEST_ASSERT(verify_field(head, 0, "a", "1"), "a=1");
+    TEST_ASSERT(verify_field(head, 4, "e", "5"), "e=5");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -201,11 +192,11 @@ TEST(test_empty_value) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(1, count_parts(head), "1 пара");
-    TEST_ASSERT(verify_pair(head, 0, "a", ""), "a=");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(1, count_fields(head), "1 пара");
+    TEST_ASSERT(verify_field(head, 0, "a", ""), "a=");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -219,11 +210,11 @@ TEST(test_empty_key) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(1, count_parts(head), "1 пара");
-    TEST_ASSERT(verify_pair(head, 0, "", "b"), "=b");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(1, count_fields(head), "1 пара");
+    TEST_ASSERT(verify_field(head, 0, "", "b"), "=b");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -237,11 +228,11 @@ TEST(test_both_empty) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(1, count_parts(head), "1 пара");
-    TEST_ASSERT(verify_pair(head, 0, "", ""), "=");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(1, count_fields(head), "1 пара");
+    TEST_ASSERT(verify_field(head, 0, "", ""), "=");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -255,13 +246,13 @@ TEST(test_empty_value_in_middle) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(3, count_parts(head), "3 пары");
-    TEST_ASSERT(verify_pair(head, 0, "k1", "v1"), "k1=v1");
-    TEST_ASSERT(verify_pair(head, 1, "k2", ""), "k2=");
-    TEST_ASSERT(verify_pair(head, 2, "k3", "v3"), "k3=v3");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(3, count_fields(head), "3 пары");
+    TEST_ASSERT(verify_field(head, 0, "k1", "v1"), "k1=v1");
+    TEST_ASSERT(verify_field(head, 1, "k2", ""), "k2=");
+    TEST_ASSERT(verify_field(head, 2, "k3", "v3"), "k3=v3");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -279,11 +270,11 @@ TEST(test_key_without_equals) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(1, count_parts(head), "1 пара");
-    TEST_ASSERT(verify_pair(head, 0, "a", ""), "a с пустым значением");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(1, count_fields(head), "1 пара");
+    TEST_ASSERT(verify_field(head, 0, "a", ""), "a с пустым значением");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -297,12 +288,12 @@ TEST(test_key_without_equals_mixed) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(2, count_parts(head), "2 пары");
-    TEST_ASSERT(verify_pair(head, 0, "a", ""), "a с пустым значением");
-    TEST_ASSERT(verify_pair(head, 1, "b", "c"), "b=c");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(2, count_fields(head), "2 пары");
+    TEST_ASSERT(verify_field(head, 0, "a", ""), "a с пустым значением");
+    TEST_ASSERT(verify_field(head, 1, "b", "c"), "b=c");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -316,13 +307,13 @@ TEST(test_multiple_keys_without_equals) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(3, count_parts(head), "3 пары");
-    TEST_ASSERT(verify_pair(head, 0, "a", ""), "a пустое");
-    TEST_ASSERT(verify_pair(head, 1, "b", ""), "b пустое");
-    TEST_ASSERT(verify_pair(head, 2, "c", ""), "c пустое");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(3, count_fields(head), "3 пары");
+    TEST_ASSERT(verify_field(head, 0, "a", ""), "a пустое");
+    TEST_ASSERT(verify_field(head, 1, "b", ""), "b пустое");
+    TEST_ASSERT(verify_field(head, 2, "c", ""), "c пустое");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -340,11 +331,11 @@ TEST(test_trailing_ampersand) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(1, count_parts(head), "1 пара, замыкающий & не создаёт фантомную");
-    TEST_ASSERT(verify_pair(head, 0, "a", "b"), "a=b");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(1, count_fields(head), "1 пара, замыкающий & не создаёт фантомную");
+    TEST_ASSERT(verify_field(head, 0, "a", "b"), "a=b");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -358,11 +349,11 @@ TEST(test_leading_ampersand) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(1, count_parts(head), "1 пара, ведущий & не создаёт фантомную");
-    TEST_ASSERT(verify_pair(head, 0, "a", "b"), "a=b");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(1, count_fields(head), "1 пара, ведущий & не создаёт фантомную");
+    TEST_ASSERT(verify_field(head, 0, "a", "b"), "a=b");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -376,12 +367,12 @@ TEST(test_double_ampersand) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(2, count_parts(head), "2 пары, двойной & игнорируется");
-    TEST_ASSERT(verify_pair(head, 0, "a", "1"), "a=1");
-    TEST_ASSERT(verify_pair(head, 1, "b", "2"), "b=2");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(2, count_fields(head), "2 пары, двойной & игнорируется");
+    TEST_ASSERT(verify_field(head, 0, "a", "1"), "a=1");
+    TEST_ASSERT(verify_field(head, 1, "b", "2"), "b=2");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -395,10 +386,10 @@ TEST(test_only_ampersand) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
+    http_payloadfield_t* head = urlencodedparser_field(&p);
     TEST_ASSERT_NULL(head, "Нет частей для одного &");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -412,10 +403,10 @@ TEST(test_multiple_ampersands) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
+    http_payloadfield_t* head = urlencodedparser_field(&p);
     TEST_ASSERT_NULL(head, "Нет частей для множества &");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -429,10 +420,10 @@ TEST(test_empty_body) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
+    http_payloadfield_t* head = urlencodedparser_field(&p);
     TEST_ASSERT_NULL(head, "Нет частей для пустого тела");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -450,11 +441,11 @@ TEST(test_equals_in_value) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(1, count_parts(head), "1 пара");
-    TEST_ASSERT(verify_pair(head, 0, "a", "b=c"), "a=b=c");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(1, count_fields(head), "1 пара");
+    TEST_ASSERT(verify_field(head, 0, "a", "b=c"), "a=b=c");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -468,12 +459,12 @@ TEST(test_multiple_equals_in_value) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(2, count_parts(head), "2 пары");
-    TEST_ASSERT(verify_pair(head, 0, "token", "a=b=c=d"), "token=a=b=c=d");
-    TEST_ASSERT(verify_pair(head, 1, "x", "y"), "x=y");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(2, count_fields(head), "2 пары");
+    TEST_ASSERT(verify_field(head, 0, "token", "a=b=c=d"), "token=a=b=c=d");
+    TEST_ASSERT(verify_field(head, 1, "x", "y"), "x=y");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -491,11 +482,11 @@ TEST(test_url_decode_percent) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(1, count_parts(head), "1 пара");
-    TEST_ASSERT(verify_pair(head, 0, "q", "a b"), "q=a b (декодировано)");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(1, count_fields(head), "1 пара");
+    TEST_ASSERT(verify_field(head, 0, "q", "a b"), "q=a b (декодировано)");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -509,11 +500,11 @@ TEST(test_url_decode_plus) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(1, count_parts(head), "1 пара");
-    TEST_ASSERT(verify_pair(head, 0, "q", "hello world"), "+ декодирован в пробел");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(1, count_fields(head), "1 пара");
+    TEST_ASSERT(verify_field(head, 0, "q", "hello world"), "+ декодирован в пробел");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -527,10 +518,10 @@ TEST(test_url_decode_mixed) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT(verify_pair(head, 0, "q", "a b c"), "%20 и + оба декодированы в пробелы");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT(verify_field(head, 0, "q", "a b c"), "%20 и + оба декодированы в пробелы");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -550,12 +541,12 @@ TEST(test_streaming_byte_by_byte) {
     int fd;
     run_chunked(body, len, chunks, 7, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(2, count_parts(head), "2 пары");
-    TEST_ASSERT(verify_pair(head, 0, "a", "b"), "a=b");
-    TEST_ASSERT(verify_pair(head, 1, "c", "d"), "c=d");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(2, count_fields(head), "2 пары");
+    TEST_ASSERT(verify_field(head, 0, "a", "b"), "a=b");
+    TEST_ASSERT(verify_field(head, 1, "c", "d"), "c=d");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -571,12 +562,12 @@ TEST(test_streaming_split_at_equals) {
     int fd;
     run_chunked(body, len, chunks, 4, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(2, count_parts(head), "2 пары");
-    TEST_ASSERT(verify_pair(head, 0, "name", "John"), "name=John");
-    TEST_ASSERT(verify_pair(head, 1, "city", "Adam"), "city=Adam");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(2, count_fields(head), "2 пары");
+    TEST_ASSERT(verify_field(head, 0, "name", "John"), "name=John");
+    TEST_ASSERT(verify_field(head, 1, "city", "Adam"), "city=Adam");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -592,13 +583,13 @@ TEST(test_streaming_split_at_ampersand) {
     int fd;
     run_chunked(body, len, chunks, 3, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(3, count_parts(head), "3 пары");
-    TEST_ASSERT(verify_pair(head, 0, "a", "1"), "a=1");
-    TEST_ASSERT(verify_pair(head, 1, "b", "2"), "b=2");
-    TEST_ASSERT(verify_pair(head, 2, "c", "3"), "c=3");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(3, count_fields(head), "3 пары");
+    TEST_ASSERT(verify_field(head, 0, "a", "1"), "a=1");
+    TEST_ASSERT(verify_field(head, 1, "b", "2"), "b=2");
+    TEST_ASSERT(verify_field(head, 2, "c", "3"), "c=3");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -627,11 +618,11 @@ TEST(test_oversized_buffer) {
     urlencodedparser_parse(&p, buf, total);
     free(buf);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(1, count_parts(head), "1 пара, хвост игнорируется");
-    TEST_ASSERT(verify_pair(head, 0, "a", "b"), "a=b");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(1, count_fields(head), "1 пара, хвост игнорируется");
+    TEST_ASSERT(verify_field(head, 0, "a", "b"), "a=b");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -656,11 +647,11 @@ TEST(test_oversized_trailing_after_ampersand) {
     urlencodedparser_parse(&p, buf, total);
     free(buf);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(1, count_parts(head), "1 пара, хвост после & игнорируется");
-    TEST_ASSERT(verify_pair(head, 0, "a", "b"), "a=b");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(1, count_fields(head), "1 пара, хвост после & игнорируется");
+    TEST_ASSERT(verify_field(head, 0, "a", "b"), "a=b");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -678,13 +669,13 @@ TEST(test_duplicate_keys) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(3, count_parts(head), "3 пары с одинаковым ключом");
-    TEST_ASSERT(verify_pair(head, 0, "id", "1"), "id=1");
-    TEST_ASSERT(verify_pair(head, 1, "id", "2"), "id=2");
-    TEST_ASSERT(verify_pair(head, 2, "id", "3"), "id=3");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(3, count_fields(head), "3 пары с одинаковым ключом");
+    TEST_ASSERT(verify_field(head, 0, "id", "1"), "id=1");
+    TEST_ASSERT(verify_field(head, 1, "id", "2"), "id=2");
+    TEST_ASSERT(verify_field(head, 2, "id", "3"), "id=3");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -702,10 +693,10 @@ TEST(test_special_chars_in_value) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT(verify_pair(head, 0, "a", "b c@d#e"), "Спецсимволы сохранены, + → пробел");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT(verify_field(head, 0, "a", "b c@d#e"), "Спецсимволы сохранены, + → пробел");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -719,14 +710,14 @@ TEST(test_binary_like_value) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(1, count_parts(head), "1 пара");
-    TEST_ASSERT_NOT_NULL(head->field, "field не NULL");
-    TEST_ASSERT_NOT_NULL(head->field->value, "value не NULL");
-    TEST_ASSERT_EQUAL_SIZE(5, head->field->value_length, "Размер значения 5 байт");
-    TEST_ASSERT_EQUAL(0, memcmp(head->field->value, "\x01\x02\x03\x04\x05", 5), "Бинарные байты сохранены");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(1, count_fields(head), "1 пара");
+    TEST_ASSERT_NOT_NULL(head, "field не NULL");
+    TEST_ASSERT_NOT_NULL(head->value, "value не NULL");
+    TEST_ASSERT_EQUAL_SIZE(5, head->value_length, "Размер значения 5 байт");
+    TEST_ASSERT_EQUAL(0, memcmp(head->value, "\x01\x02\x03\x04\x05", 5), "Бинарные байты сохранены");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -745,14 +736,14 @@ TEST(test_utf8_key_and_value) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(1, count_parts(head), "1 пара");
-    TEST_ASSERT(verify_pair(head, 0,
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(1, count_fields(head), "1 пара");
+    TEST_ASSERT(verify_field(head, 0,
                             "\xd0\xb8\xd0\xbc\xd1\x8f",
                             "\xd0\xb7\xd0\xbd\xd0\xb0\xd1\x87\xd0\xb5\xd0\xbd\xd0\xb8\xd0\xb5"),
                 "UTF-8 ключ и значение");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -771,10 +762,10 @@ TEST(test_init_state) {
     TEST_ASSERT_EQUAL_SIZE(0, p.payload_offset, "payload_offset = 0");
     TEST_ASSERT_EQUAL_SIZE(0, p.offset, "offset = 0");
     TEST_ASSERT_EQUAL_SIZE(0, p.size, "size = 0");
-    TEST_ASSERT_NULL(p.part, "part = NULL");
-    TEST_ASSERT_NULL(p.last_part, "last_part = NULL");
+    TEST_ASSERT_NULL(p.field, "field = NULL");
+    TEST_ASSERT_NULL(p.last_field, "last_field = NULL");
     TEST_ASSERT_EQUAL(1, p.find_amp, "find_amp = 1");
-    TEST_ASSERT_EQUAL(0, p.part_count, "part_count = 0");
+    TEST_ASSERT_EQUAL(0, p.field_count, "field_count = 0");
     TEST_ASSERT_EQUAL(-1, p.payload_fd, "payload_fd = -1");
 }
 
@@ -782,9 +773,9 @@ TEST(test_init_state) {
  * Test Suite 13: Part count
  * ============================================================================ */
 
-TEST(test_part_count_single_pair) {
-    TEST_SUITE("URLEncodedParser — part_count");
-    TEST_CASE("part_count для одной пары");
+TEST(test_field_count_single_pair) {
+    TEST_SUITE("URLEncodedParser — field_count");
+    TEST_CASE("field_count для одной пары");
 
     const char* body = "a=b";
     size_t len = strlen(body);
@@ -792,15 +783,15 @@ TEST(test_part_count_single_pair) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    TEST_ASSERT_EQUAL(1, p.part_count, "1 часть (одна пара)");
+    TEST_ASSERT_EQUAL(1, p.field_count, "1 поле (одна пара)");
 
-    free_parts(urlencodedparser_part(&p));
+    free_fields(urlencodedparser_field(&p));
     close(fd);
 }
 
-TEST(test_part_count_multiple_pairs) {
-    TEST_SUITE("URLEncodedParser — part_count");
-    TEST_CASE("part_count для трёх пар");
+TEST(test_field_count_multiple_pairs) {
+    TEST_SUITE("URLEncodedParser — field_count");
+    TEST_CASE("field_count для трёх пар");
 
     const char* body = "x=1&y=2&z=3";
     size_t len = strlen(body);
@@ -808,9 +799,9 @@ TEST(test_part_count_multiple_pairs) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    TEST_ASSERT_EQUAL(3, p.part_count, "3 части (3 пары)");
+    TEST_ASSERT_EQUAL(3, p.field_count, "3 поля (3 пары)");
 
-    free_parts(urlencodedparser_part(&p));
+    free_fields(urlencodedparser_field(&p));
     close(fd);
 }
 
@@ -828,15 +819,15 @@ TEST(test_list_structure_key_has_field) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
+    http_payloadfield_t* head = urlencodedparser_field(&p);
     TEST_ASSERT_NOT_NULL(head, "head не NULL");
-    TEST_ASSERT_NOT_NULL(head->field, "field != NULL");
-    TEST_ASSERT_NOT_NULL(head->field->key, "field->key != NULL");
-    TEST_ASSERT_STR_EQUAL("a", head->field->key, "field->key = a");
-    TEST_ASSERT_NOT_NULL(head->field->value, "field->value != NULL");
-    TEST_ASSERT_STR_EQUAL("b", head->field->value, "field->value = b");
+    TEST_ASSERT_NOT_NULL(head, "field != NULL");
+    TEST_ASSERT_NOT_NULL(head->key, "field->key != NULL");
+    TEST_ASSERT_STR_EQUAL("a", head->key, "field->key = a");
+    TEST_ASSERT_NOT_NULL(head->value, "field->value != NULL");
+    TEST_ASSERT_STR_EQUAL("b", head->value, "field->value = b");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -850,11 +841,11 @@ TEST(test_list_structure_value_has_length) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL_SIZE(5, head->field->key_length, "key_length = 5");
-    TEST_ASSERT_EQUAL_SIZE(5, head->field->value_length, "value_length = 5");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL_SIZE(5, head->key_length, "key_length = 5");
+    TEST_ASSERT_EQUAL_SIZE(5, head->value_length, "value_length = 5");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -872,14 +863,14 @@ TEST(test_mixed_keys_with_and_without_equals) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(4, count_parts(head), "4 пары");
-    TEST_ASSERT(verify_pair(head, 0, "flag", ""), "flag без значения");
-    TEST_ASSERT(verify_pair(head, 1, "a", "b"), "a=b");
-    TEST_ASSERT(verify_pair(head, 2, "empty", ""), "empty=");
-    TEST_ASSERT(verify_pair(head, 3, "c", ""), "c без значения");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(4, count_fields(head), "4 пары");
+    TEST_ASSERT(verify_field(head, 0, "flag", ""), "flag без значения");
+    TEST_ASSERT(verify_field(head, 1, "a", "b"), "a=b");
+    TEST_ASSERT(verify_field(head, 2, "empty", ""), "empty=");
+    TEST_ASSERT(verify_field(head, 3, "c", ""), "c без значения");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -902,17 +893,17 @@ TEST(test_long_value) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(1, count_parts(head), "1 пара");
-    TEST_ASSERT_EQUAL_SIZE(val_len, head->field->value_length, "Размер значения = 1024");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(1, count_fields(head), "1 пара");
+    TEST_ASSERT_EQUAL_SIZE(val_len, head->value_length, "Размер значения = 1024");
 
     int all_x = 1;
-    for (size_t i = 0; i < head->field->value_length; i++) {
-        if (head->field->value[i] != 'X') { all_x = 0; break; }
+    for (size_t i = 0; i < head->value_length; i++) {
+        if (head->value[i] != 'X') { all_x = 0; break; }
     }
     TEST_ASSERT(all_x, "Все байты значения = 'X'");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -930,12 +921,12 @@ TEST(test_trailing_key_no_equals) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(2, count_parts(head), "2 пары");
-    TEST_ASSERT(verify_pair(head, 0, "a", "1"), "a=1");
-    TEST_ASSERT(verify_pair(head, 1, "flag", ""), "flag с пустым значением");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(2, count_fields(head), "2 пары");
+    TEST_ASSERT(verify_field(head, 0, "a", "1"), "a=1");
+    TEST_ASSERT(verify_field(head, 1, "flag", ""), "flag с пустым значением");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -953,11 +944,11 @@ TEST(test_single_char_key) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(1, count_parts(head), "1 пара");
-    TEST_ASSERT(verify_pair(head, 0, "x", ""), "x с пустым значением");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(1, count_fields(head), "1 пара");
+    TEST_ASSERT(verify_field(head, 0, "x", ""), "x с пустым значением");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -975,13 +966,13 @@ TEST(test_real_world_login_form) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(3, count_parts(head), "3 пары");
-    TEST_ASSERT(verify_pair(head, 0, "username", "admin"), "username=admin");
-    TEST_ASSERT(verify_pair(head, 1, "password", "secret123"), "password=secret123");
-    TEST_ASSERT(verify_pair(head, 2, "remember", "on"), "remember=on");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(3, count_fields(head), "3 пары");
+    TEST_ASSERT(verify_field(head, 0, "username", "admin"), "username=admin");
+    TEST_ASSERT(verify_field(head, 1, "password", "secret123"), "password=secret123");
+    TEST_ASSERT(verify_field(head, 2, "remember", "on"), "remember=on");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
 
@@ -995,13 +986,13 @@ TEST(test_real_world_search_query) {
     int fd;
     run_parse(body, len, &p, &fd);
 
-    http_payloadpart_t* head = urlencodedparser_part(&p);
-    TEST_ASSERT_EQUAL(4, count_parts(head), "4 пары");
-    TEST_ASSERT(verify_pair(head, 0, "q", "hello world"), "q: + декодирован в пробел");
-    TEST_ASSERT(verify_pair(head, 1, "lang", "en"), "lang=en");
-    TEST_ASSERT(verify_pair(head, 2, "page", "1"), "page=1");
-    TEST_ASSERT(verify_pair(head, 3, "sort", "relevance"), "sort=relevance");
+    http_payloadfield_t* head = urlencodedparser_field(&p);
+    TEST_ASSERT_EQUAL(4, count_fields(head), "4 пары");
+    TEST_ASSERT(verify_field(head, 0, "q", "hello world"), "q: + декодирован в пробел");
+    TEST_ASSERT(verify_field(head, 1, "lang", "en"), "lang=en");
+    TEST_ASSERT(verify_field(head, 2, "page", "1"), "page=1");
+    TEST_ASSERT(verify_field(head, 3, "sort", "relevance"), "sort=relevance");
 
-    free_parts(head);
+    free_fields(head);
     close(fd);
 }
