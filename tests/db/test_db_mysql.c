@@ -51,19 +51,19 @@ TEST(test_mysql_ddl_simple_protocol) {
 
     // CREATE TABLE has no bind params: before Phase 1 this hit mysql_stmt_prepare
     // and failed; now it goes through mysql_query.
-    __mysql_exec("DROP TABLE IF EXISTS cpdy_mysql_ddl");
+    __mysql_exec("DROP TABLE IF EXISTS cwfr_mysql_ddl");
     TEST_ASSERT(
         __mysql_exec(
-            "CREATE TABLE cpdy_mysql_ddl ("
+            "CREATE TABLE cwfr_mysql_ddl ("
             "id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255))"),
         "CREATE TABLE should succeed via simple protocol");
 
     // SET and transaction-control statements likewise carry no params.
-    TEST_ASSERT(__mysql_exec("SET @cpdy_x := 1"), "SET should succeed");
+    TEST_ASSERT(__mysql_exec("SET @cwfr_x := 1"), "SET should succeed");
     TEST_ASSERT(__mysql_exec("BEGIN"), "BEGIN should succeed");
     TEST_ASSERT(__mysql_exec("COMMIT"), "COMMIT should succeed");
 
-    __mysql_exec("DROP TABLE IF EXISTS cpdy_mysql_ddl");
+    __mysql_exec("DROP TABLE IF EXISTS cwfr_mysql_ddl");
 }
 
 TEST(test_mysql_crud_and_insert_id) {
@@ -72,10 +72,10 @@ TEST(test_mysql_crud_and_insert_id) {
 
     if (!__mysql_available()) return;
 
-    __mysql_exec("DROP TABLE IF EXISTS cpdy_mysql_crud");
+    __mysql_exec("DROP TABLE IF EXISTS cwfr_mysql_crud");
     TEST_ASSERT(
         __mysql_exec(
-            "CREATE TABLE cpdy_mysql_crud ("
+            "CREATE TABLE cwfr_mysql_crud ("
             "id INT AUTO_INCREMENT PRIMARY KEY,"
             "name VARCHAR(255) NOT NULL,"
             "val INT NOT NULL)"),
@@ -89,7 +89,7 @@ TEST(test_mysql_crud_and_insert_id) {
         mparam_int(val, 42)
     );
     dbresult_t* ins = dbquery(MYSQL_DBID,
-        "INSERT INTO cpdy_mysql_crud (name, val) VALUES (:name, :val)", params);
+        "INSERT INTO cwfr_mysql_crud (name, val) VALUES (:name, :val)", params);
     array_free(params);
 
     TEST_ASSERT(dbresult_ok(ins), "INSERT should succeed");
@@ -102,7 +102,7 @@ TEST(test_mysql_crud_and_insert_id) {
     TEST_ASSERT_NOT_NULL(sel_params, "select params array");
     mparams_fill_array(sel_params, mparam_bigint(id, id));
     dbresult_t* sel = dbquery(MYSQL_DBID,
-        "SELECT name, val FROM cpdy_mysql_crud WHERE id = :id", sel_params);
+        "SELECT name, val FROM cwfr_mysql_crud WHERE id = :id", sel_params);
     array_free(sel_params);
 
     TEST_ASSERT(dbresult_ok(sel), "SELECT should succeed");
@@ -119,7 +119,7 @@ TEST(test_mysql_crud_and_insert_id) {
     }
     dbresult_free(sel);
 
-    __mysql_exec("DROP TABLE IF EXISTS cpdy_mysql_crud");
+    __mysql_exec("DROP TABLE IF EXISTS cwfr_mysql_crud");
 }
 
 TEST(test_mysql_value_binding_verbatim) {
@@ -128,22 +128,22 @@ TEST(test_mysql_value_binding_verbatim) {
 
     if (!__mysql_available()) return;
 
-    __mysql_exec("DROP TABLE IF EXISTS cpdy_mysql_inject");
+    __mysql_exec("DROP TABLE IF EXISTS cwfr_mysql_inject");
     TEST_ASSERT(
         __mysql_exec(
-            "CREATE TABLE cpdy_mysql_inject ("
+            "CREATE TABLE cwfr_mysql_inject ("
             "id INT AUTO_INCREMENT PRIMARY KEY, payload TEXT)"),
         "CREATE TABLE should succeed");
 
     // A hostile value: quotes, a statement terminator and a comment. Bound as a
     // parameter it is a single opaque value; interpolated it could break out.
-    const char* payload = "x'; DROP TABLE cpdy_mysql_inject; -- \"end";
+    const char* payload = "x'; DROP TABLE cwfr_mysql_inject; -- \"end";
 
     array_t* params = array_create();
     TEST_ASSERT_NOT_NULL(params, "params array");
     mparams_fill_array(params, mparam_text(payload, payload));
     dbresult_t* ins = dbquery(MYSQL_DBID,
-        "INSERT INTO cpdy_mysql_inject (payload) VALUES (:payload)", params);
+        "INSERT INTO cwfr_mysql_inject (payload) VALUES (:payload)", params);
     array_free(params);
 
     TEST_ASSERT(dbresult_ok(ins), "INSERT with hostile value should succeed");
@@ -152,7 +152,7 @@ TEST(test_mysql_value_binding_verbatim) {
     // The table must still exist (the embedded DROP never ran) and hold the
     // value verbatim.
     dbresult_t* sel = dbquery(MYSQL_DBID,
-        "SELECT payload FROM cpdy_mysql_inject", NULL);
+        "SELECT payload FROM cwfr_mysql_inject", NULL);
     TEST_ASSERT(dbresult_ok(sel), "SELECT should succeed (table not dropped)");
     TEST_ASSERT_EQUAL(1, dbresult_query_rows(sel), "exactly one row expected");
     if (dbresult_query_rows(sel) == 1) {
@@ -163,5 +163,5 @@ TEST(test_mysql_value_binding_verbatim) {
     }
     dbresult_free(sel);
 
-    __mysql_exec("DROP TABLE IF EXISTS cpdy_mysql_inject");
+    __mysql_exec("DROP TABLE IF EXISTS cwfr_mysql_inject");
 }

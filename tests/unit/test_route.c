@@ -6,7 +6,7 @@
 // Route $-anchor tests — ensures routes with params match exactly,
 // not by prefix (e.g. /users/{id} must NOT match /users/42/extra)
 //
-// In cpdy, named params require a regex alternative: {name|pattern}
+// In cwfr, named params require a regex alternative: {name|pattern}
 // ============================================================================
 
 TEST(test_route_param_exact_match) {

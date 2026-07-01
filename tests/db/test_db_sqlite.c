@@ -36,9 +36,9 @@ static int __sqlite_available(void) {
 
 // Recreate the scratch table; returns 1 on success.
 static int __sqlite_setup_table(void) {
-    if (!__sqlite_exec("DROP TABLE IF EXISTS cpdy_sqlite_test")) return 0;
+    if (!__sqlite_exec("DROP TABLE IF EXISTS cwfr_sqlite_test")) return 0;
     return __sqlite_exec(
-        "CREATE TABLE cpdy_sqlite_test ("
+        "CREATE TABLE cwfr_sqlite_test ("
             "id INTEGER PRIMARY KEY AUTOINCREMENT, "
             "name TEXT NOT NULL, "
             "age INTEGER"
@@ -57,7 +57,7 @@ static long long __sqlite_insert_person(const char* name, int age) {
     );
 
     dbresult_t* r = dbquery(SQLITE_DBID,
-        "INSERT INTO cpdy_sqlite_test (name, age) VALUES (:name, :age)", params);
+        "INSERT INTO cwfr_sqlite_test (name, age) VALUES (:name, :age)", params);
     array_free(params);
 
     long long id = dbresult_ok(r) ? dbresult_insert_id(r) : 0;
@@ -73,7 +73,7 @@ static dbresult_t* __sqlite_select_by_id(long long id) {
     mparams_fill_array(params, mparam_bigint(id, id));
 
     dbresult_t* r = dbquery(SQLITE_DBID,
-        "SELECT name, age FROM cpdy_sqlite_test WHERE id = :id", params);
+        "SELECT name, age FROM cwfr_sqlite_test WHERE id = :id", params);
     array_free(params);
     return r;
 }
@@ -124,7 +124,7 @@ TEST(test_sqlite_returning) {
     );
 
     dbresult_t* r = dbquery(SQLITE_DBID,
-        "INSERT INTO cpdy_sqlite_test (name, age) VALUES (:name, :age) "
+        "INSERT INTO cwfr_sqlite_test (name, age) VALUES (:name, :age) "
         "RETURNING id, name", params);
     array_free(params);
 

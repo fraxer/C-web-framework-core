@@ -35,7 +35,7 @@ add_executable(
 )
 
 target_link_libraries(runner PRIVATE
-    cpdy_framework
+    cwfr_framework
     ${PCRE_LIBRARIES}
     ${ZLIB_LIBRARIES}
     ${OPENSSL_LIBRARIES}
@@ -81,7 +81,7 @@ if(HAS_DB)
     )
 
     target_link_libraries(db_runner PRIVATE
-        cpdy_framework
+        cwfr_framework
         Threads::Threads
         ${CMAKE_DL_LIBS}
     )

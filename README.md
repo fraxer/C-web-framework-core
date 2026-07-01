@@ -354,7 +354,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
 cmake --build . -j4
 
 # Run
-<workspaceFolder>/build/exec/cpdy -c <path_to_config>/config.json
+<workspaceFolder>/build/exec/cwfr -c <path_to_config>/config.json
 ```
 
 ### Build Modes:

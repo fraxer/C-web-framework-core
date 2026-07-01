@@ -1,6 +1,6 @@
 # Tests for backend/core
 
-This directory contains tests for the cpdy project.
+This directory contains tests for the cwfr project.
 
 ## Test Types
 
