@@ -35,21 +35,7 @@ add_executable(
 )
 
 target_link_libraries(runner PRIVATE
-    model
-    misc
-    http_server_parsers
-    http_server
-    http_client_parsers
-    http_client
-    http
-    connection
-    domain
-    socket
-    openssl
-    server
-    route
-    ratelimiter
-    multiplexing
+    cpdy_framework
     ${PCRE_LIBRARIES}
     ${ZLIB_LIBRARIES}
     ${OPENSSL_LIBRARIES}
@@ -95,9 +81,7 @@ if(HAS_DB)
     )
 
     target_link_libraries(db_runner PRIVATE
-        database
-        misc
-        moduleloader
+        cpdy_framework
         Threads::Threads
         ${CMAKE_DL_LIBS}
     )
