@@ -22,7 +22,7 @@ typedef enum {
 typedef struct {
     const char* name;       /* Cookie name (required) */
     const char* value;      /* Cookie value (required) */
-    int seconds;            /* Lifetime in seconds (0 = session cookie) */
+    int seconds;            /* Lifetime in seconds (>0 = Expires, 0 = Max-Age=0 i.e. delete now, <0 = session cookie) */
     const char* path;       /* Cookie path (NULL to skip) */
     const char* domain;     /* Cookie domain (NULL to skip) */
     int secure;             /* 1 = HTTPS only */

@@ -4,8 +4,8 @@
 #include <string.h>
 #include <fcntl.h>
 #include <ctype.h>
-#include <errno.h>
 #include <time.h>
+#include <errno.h>
 #include <sys/stat.h>
 
 #include "log.h"
@@ -110,6 +110,10 @@ httpresponse_t* httpresponse_create(connection_t* connection) {
     response->header_ = NULL;
     response->last_header = NULL;
     response->filter = filters_create();
+    if (response->filter == NULL) {
+        free(response);
+        return NULL;
+    }
     response->cur_filter = response->filter;
     response->event_again = 0;
     response->headers_sended = 0;
@@ -142,6 +146,7 @@ httpresponse_t* httpresponse_create(connection_t* connection) {
     bufo_init(&response->body);
 
     if (!__httpresponse_init_parser(response)) {
+        filters_free(response->filter);
         free(response);
         return NULL;
     }
@@ -151,8 +156,13 @@ httpresponse_t* httpresponse_create(connection_t* connection) {
 
 void __httpresponse_reset(httpresponse_t* response) {
     response->status_code = 200;
+    response->version = HTTP1_VER_NONE;
     response->transfer_encoding = TE_NONE;
     response->content_encoding = CE_NONE;
+    /* Клиентский парсер пишет content_length прямо в response; без обнуления
+     * httpresponse_has_payload() на переиспользованном keep-alive соединении
+     * видит длину предыдущего ответа. */
+    response->content_length = 0;
     response->event_again = 0;
     response->headers_sended = 0;
     response->range = 0;
@@ -233,7 +243,9 @@ file_status_e http_get_file_full_path(server_t* server, char* file_full_path, si
 
     struct stat stat_obj;
     // TODO: Optimize stat. Make cache.
-    if (stat(file_full_path, &stat_obj) == -1 && errno == ENOENT)
+    /* Любая ошибка stat (ENOENT, EACCES, ENOTDIR, ...) — файла нет; иначе
+     * ниже читается неинициализированный stat_obj.st_mode. */
+    if (stat(file_full_path, &stat_obj) == -1)
         return FILE_NOTFOUND;
 
     if (S_ISDIR(stat_obj.st_mode)) {
@@ -250,7 +262,7 @@ file_status_e http_get_file_full_path(server_t* server, char* file_full_path, si
 
         file_full_path[pos] = 0;
 
-        if (stat(file_full_path, &stat_obj) == -1 && errno == ENOENT)
+        if (stat(file_full_path, &stat_obj) == -1)
             return FILE_FORBIDDEN;
 
         if (!S_ISREG(stat_obj.st_mode))
@@ -319,13 +331,14 @@ int __httpresponse_header_add(httpresponse_t* response, const char* key, const c
 }
 
 int __httpresponse_headern_add(httpresponse_t* response, const char* key, size_t key_length, const char* value, size_t value_length) {
+    /* key может быть слайсом без нуль-терминатора — сравниваем по key_length. */
     if (response->range &&
-        (cmpstr_lower(key, "Transfer-Encoding") ||
-         cmpstr_lower(key, "Content-Encoding")
+        (cmpstrn_lower(key, key_length, "Transfer-Encoding", 17) ||
+         cmpstrn_lower(key, key_length, "Content-Encoding", 16)
     )) {
         return 1;
     }
-    
+
     http_header_t* header = http_header_create(key, key_length, value, value_length);
     if (header == NULL) return 0;
     if (header->key == NULL || header->value == NULL) {
@@ -384,21 +397,24 @@ int __httpresponse_header_remove(httpresponse_t* response, const char* key) {
     if (response->header_ == NULL)
         return 0;
 
-    http_header_t* new_head = http_header_delete(response->header_, key);
-
-    if (new_head == response->header_)
+    /* http_header_delete удаляет и не-головной узел — тогда голова не меняется
+     * и по ней нельзя судить об успехе. Проверяем наличие заранее. */
+    if (!__httpresponse_header_exist(response, key))
         return 0;
 
-    response->header_ = new_head;
+    response->header_ = http_header_delete(response->header_, key);
 
-    if (response->header_ == NULL) {
-        response->last_header = NULL;
-    } else {
-        http_header_t* header = response->header_;
-        while (header->next != NULL) {
-            header = header->next;
+    /* http_header_delete мог освободить узел, на который указывал last_header
+     * (хвост списка). Перестраиваем last_header с нуля, иначе следующий
+     * add_header запишет через висячий указатель: last_header->next = new. */
+    response->last_header = NULL;
+    http_header_t* header = response->header_;
+    while (header != NULL) {
+        if (header->next == NULL) {
+            response->last_header = header;
+            break;
         }
-        response->last_header = header;
+        header = header->next;
     }
 
     return 1;
@@ -412,8 +428,8 @@ int __httpresponse_header_add_content_length(httpresponse_t* response, size_t le
     size_t content_length = 0;
     while (value) { content_length++; value /= 10; }
 
-    char content_string[content_length + 1];
-    sprintf(content_string, "%ld", length);
+    char content_string[32];
+    snprintf(content_string, sizeof(content_string), "%zu", length);
 
     return response->add_headern(response, "Content-Length", 14, content_string, content_length);
 }
@@ -563,6 +579,11 @@ const char* __httpresponse_get_mimetype(const char* extension) {
 }
 
 void httpresponse_default(httpresponse_t* response, int status_code) {
+    /* Неизвестный код: status_string == NULL, а status_length() - 2 уходит в
+     * underflow size_t. Отвечаем 500 вместо чтения NULL и гигантского VLA. */
+    if (httpresponse_status_string(status_code) == NULL)
+        status_code = 500;
+
     response->status_code = status_code;
 
     const char* str1 = "<html><head></head><body style=\"text-align:center;margin:20px\"><h1>";
@@ -860,10 +881,13 @@ int httpresponse_has_payload(httpresponse_t* response) {
 }
 
 void __httpresponse_payload_free(http_payload_t* payload) {
-    if (payload->file.fd < 0) return;
-
-    payload->file.close(&payload->file);
-    unlink(payload->path);
+    /* path/boundary/part могли быть выделены и без открытого файла (например,
+     * mkstemp не удался после create_tmppath) — освобождаем их всегда. */
+    if (payload->file.fd > -1) {
+        payload->file.close(&payload->file);
+        if (payload->path != NULL)
+            unlink(payload->path);
+    }
 
     payload->pos = 0;
 
@@ -875,6 +899,8 @@ void __httpresponse_payload_free(http_payload_t* payload) {
 
     http_payloadpart_free(payload->part);
     payload->part = NULL;
+
+    payload->type = NONE;
 }
 
 void __httpresponse_init_payload(httpresponse_t* response) {
@@ -891,8 +917,13 @@ void __httpresponse_init_payload(httpresponse_t* response) {
 }
 
 void __httpresponse_payload_parse_plain(httpresponse_t* response) {
-    http_payloadpart_t* part = http_payloadpart_create();
-    if (part == NULL) return;
+    /* Повторный вызов (get_payload + get_payload_file) не должен терять
+     * уже созданный part — иначе утечка. */
+    http_payloadpart_t* part = response->payload_.part;
+    if (part == NULL) {
+        part = http_payloadpart_create();
+        if (part == NULL) return;
+    }
 
     part->size = response->payload_.file.size;
 
@@ -917,16 +948,24 @@ char* __httpresponse_payload(httpresponse_t* response) {
         buffer = malloc(part->size + 1);
         if (buffer == NULL) return NULL;
 
-        lseek(response->payload_.file.fd, part->offset, SEEK_SET);
-        int r = read(response->payload_.file.fd, buffer, part->size);
-        lseek(response->payload_.file.fd, 0, SEEK_SET);
+        size_t total = 0;
+        while (total < part->size) {
+            ssize_t r = pread(response->payload_.file.fd, buffer + total, part->size - total,
+                              (off_t)part->offset + (off_t)total);
+            if (r < 0) {
+                log_error("httpresponse: payload read error: %s\n", strerror(errno));
+                free(buffer);
+                return NULL;
+            }
+            if (r == 0) {
+                log_error("httpresponse: payload truncated (%zu of %zu bytes)\n", total, part->size);
+                free(buffer);
+                return NULL;
+            }
+            total += (size_t)r;
+        }
 
         buffer[part->size] = 0;
-
-        if (r < 0) {
-            free(buffer);
-            return NULL;
-        }
     }
 
     return buffer;
@@ -950,8 +989,9 @@ file_content_t __httpresponse_payload_file(httpresponse_t* response) {
         pfield = pfield->next;
     }
 
-    const char* field = NULL;
-    file_content.ok = !(field != NULL && filename == NULL);
+    /* Валидность содержимого определяется наличием payload-файла: вызывающие
+     * (например, storages3) по ok решают, можно ли читать из fd. */
+    file_content.ok = response->payload_.file.fd > -1;
     file_content.fd = response->payload_.file.fd;
     file_content.offset = part->offset;
     file_content.size = part->size;

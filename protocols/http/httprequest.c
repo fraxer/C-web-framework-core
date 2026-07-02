@@ -202,7 +202,8 @@ void httprequest_payload_free(http_payload_t* payload) {
     if (payload->file.fd < 0) return;
 
     payload->file.close(&payload->file);
-    unlink(payload->path);
+    if (payload->path != NULL)
+        unlink(payload->path);
 
     payload->pos = 0;
 
@@ -352,8 +353,22 @@ file_content_t httprequest_payload_filef(httprequest_t* request, const char* fie
         return file_content;
     }
     
-    http_payloadpart_t* part = httprequest_multipart_part(request, field);
-    if (part == NULL) return file_content;
+    /* part/field share a union keyed by type; reading part for a non-multipart
+     * payload reinterprets an http_payloadfield_t* as an http_payloadpart_t*
+     * (type confusion → wild dereference). Only multipart has file parts. */
+    http_payloadpart_t* part = NULL;
+    if (request->payload_.type == MULTIPART)
+        part = httprequest_multipart_part(request, field);
+
+    if (part == NULL) {
+        file_content.ok = 0;
+        file_content.fd = -1;
+        file_content.offset = 0;
+        file_content.size = 0;
+        file_content.set_filename(&file_content, "");
+
+        return file_content;
+    }
 
     const char* filename = NULL;
     http_payloadfield_t* pfield = part->field;
@@ -555,6 +570,11 @@ int httprequest_headern_add(httprequest_t* request, const char* key, size_t key_
 int httprequest_header_del(httprequest_t* request, const char* key) {
     request->header_ = http_header_delete(request->header_, key);
 
+    /* http_header_delete may have freed the node last_header pointed at (it is
+     * the tail when a single- or last-header list is emptied/shortened). Rebuild
+     * last_header from scratch so it never dangles — a stale pointer here is
+     * written through by the next add_header(): last_header->next = new. */
+    request->last_header = NULL;
     http_header_t* header = request->header_;
     while (header) {
         if (header->next == NULL) {
@@ -631,10 +651,16 @@ int httprequest_data_append(char* data, size_t* pos, const char* string, size_t 
 httprequest_head_t httprequest_create_head(httprequest_t* request) {
     httprequest_head_t head = {
         .size = httprequest_head_size(request),
-        .data = malloc(head.size)
+        .data = NULL
     };
 
     if (head.size == 0) return head;
+
+    head.data = malloc(head.size);
+    if (head.data == NULL) {
+        head.size = 0;
+        return head;
+    }
 
     size_t pos = 0;
     if (httprequest_data_append(head.data, &pos, httprequest_method_string(request->method), httprequest_method_length(request->method)) == -1) return head;
@@ -936,7 +962,12 @@ int httprequest_set_payload_text(httprequest_t* request, const char* value) {
 }
 
 int httprequest_set_payload_json(httprequest_t* request, json_doc_t* document) {
-    return httprequest_set_payload_raw(request, json_stringify(document), json_stringify_size(document), "application/json");
+    /* json_stringify_size() only reports the length of the buffer that
+     * json_stringify() last produced. Argument evaluation order is unspecified,
+     * so compute the string first and read its size after — otherwise the size
+     * may be sampled before the buffer is filled (0 on a fresh document). */
+    const char* value = json_stringify(document);
+    return httprequest_set_payload_raw(request, value, json_stringify_size(document), "application/json");
 }
 
 int httprequest_set_payload_filepath(httprequest_t* request, const char* filepath) {
