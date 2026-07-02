@@ -7,7 +7,6 @@
 #include "routeloader.h"
 
 routeloader_lib_t* __routeloader_init_container(const char*, void*);
-void* __routeloader_get_handler_internal(routeloader_lib_t*, const char*, const char*, int);
 
 routeloader_lib_t* routeloader_load_lib(const char* filepath) {
     void* shared_lib_p = dlopen(filepath, RTLD_LAZY);
@@ -28,15 +27,7 @@ routeloader_lib_t* routeloader_load_lib(const char* filepath) {
     return routeloader_lib;
 }
 
-void* routeloader_get_handler_silent(routeloader_lib_t* first_lib, const char* filepath, const char* function_name) {
-    return __routeloader_get_handler_internal(first_lib, filepath, function_name, 1);
-}
-
 void* routeloader_get_handler(routeloader_lib_t* first_lib, const char* filepath, const char* function_name) {
-    return __routeloader_get_handler_internal(first_lib, filepath, function_name, 0);
-}
-
-void* __routeloader_get_handler_internal(routeloader_lib_t* first_lib, const char* filepath, const char* function_name, int silent) {
     routeloader_lib_t* lib = first_lib;
 
     while (lib) {
@@ -46,9 +37,7 @@ void* __routeloader_get_handler_internal(routeloader_lib_t* first_lib, const cha
             *(void**)(&function_p) = dlsym(lib->pointer, function_name);
 
             if (function_p == NULL) {
-                if (!silent) 
-                    log_error(ROUTELOADER_FUNCTION_NOT_FOUND, function_name, filepath);
-
+                log_error(ROUTELOADER_FUNCTION_NOT_FOUND, function_name, filepath);
                 return NULL;
             }
 

@@ -85,7 +85,6 @@ static int __module_loader_translations_load(appconfig_t* config, json_token_t* 
 
 static int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config);
 static int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config);
-static void __module_loader_pass_memory_sharedlib(routeloader_lib_t*, const char*);
 static int __module_loader_http_redirects_load(const json_token_t* token_object, redirect_t** redirect);
 static int __module_loader_middlewares_load(const json_token_t* token_object, middleware_item_t** middleware_item);
 static int __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t** first_lib, const json_token_t* token_object, map_t* ratelimiter_config);
@@ -1479,19 +1478,9 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
             log_error("__module_loader_set_http_route: failed to set http handler %s.%s\n", lib_file, lib_handler);
             return 0;
         }
-
-        __module_loader_pass_memory_sharedlib(*first_lib, lib_file);
     }
 
     return 1;
-}
-
-void __module_loader_pass_memory_sharedlib(routeloader_lib_t* first_lib, const char* lib_file) {
-    void(*function)(void*);
-    *(void**)(&function) = routeloader_get_handler_silent(first_lib, lib_file, "appconfig_set");
-
-    if (function != NULL)
-        function(appconfig());
 }
 
 int __module_loader_http_redirects_load(const json_token_t* token_object, redirect_t** redirect) {
@@ -1845,8 +1834,6 @@ int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloa
             log_error("__module_loader_set_websockets_route: failed to set websockets handler\n");
             return 0;
         }
-
-        __module_loader_pass_memory_sharedlib(*first_lib, lib_file);
     }
 
     return 1;
