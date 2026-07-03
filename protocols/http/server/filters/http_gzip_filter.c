@@ -1,5 +1,7 @@
 #include "http_gzip_filter.h"
 
+#include "log.h"
+
 #define BUF_SIZE 16384
 
 static http_module_gzip_t* __create(void);
@@ -89,7 +91,15 @@ int __header(httprequest_t* request, httpresponse_t* response) {
         goto cont;
 
     if (response->get_header(response, "Content-Encoding") == NULL)
-        response->add_header(response, "Content-Encoding", "gzip");
+        if (!response->add_header(response, "Content-Encoding", "gzip"))
+            return CWF_ERROR;
+
+    /* The upstream data filter runs before gzip and already added
+     * Content-Length while transfer_encoding was still TE_NONE.
+     * Content-Length is forbidden alongside Transfer-Encoding (RFC 7232
+     * §3.3.1) and the uncompressed length is wrong for the compressed body,
+     * so drop it before switching to chunked. */
+    response->remove_header(response, "Content-Length");
 
     response->transfer_encoding = TE_CHUNKED;
 
@@ -151,7 +161,7 @@ int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf)
         module->base.cont = 0;
 
         if (r == CWF_DATA_AGAIN) {
-            if (gzip_want_continue(&module->gzip))
+            if (gzip_want_continue(&module->gzip) && !gzip_is_end(&module->gzip))
                 continue;
 
             if (parent_buf->pos < parent_buf->size)
@@ -177,7 +187,7 @@ int __process(http_module_gzip_t* module, bufo_t* buf) {
 
     const size_t compress_writed = gzip_deflate(&module->gzip, bufo_data(buf), buf->capacity, parent_buf->is_last);
     if (gzip_deflate_has_error(&module->gzip)) {
-        printf("compress error\n");
+        log_error("http_gzip_filter: deflate error\n");
         return 0;
     }
 
@@ -187,7 +197,11 @@ int __process(http_module_gzip_t* module, bufo_t* buf) {
 
     bufo_move_front_pos(parent_buf, processed);
 
-    if (gzip_want_continue(&module->gzip))
+    /* A full output buffer normally means more output is pending — but if the
+     * stream already reached Z_STREAM_END there is nothing left to flush.
+     * Asking for another turn would deflate a finished stream (Z_STREAM_ERROR)
+     * and surface a spurious compress error. */
+    if (gzip_want_continue(&module->gzip) && !gzip_is_end(&module->gzip))
         return 1;
 
     module->buf->is_last = parent_buf->is_last;
