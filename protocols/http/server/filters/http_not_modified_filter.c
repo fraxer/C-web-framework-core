@@ -113,6 +113,8 @@ int http_not_modified_header(httprequest_t* request, httpresponse_t* response) {
 
     r = filter_next_handler_header(request, response);
 
+    module->base.cont = 0;
+
     if (r == CWF_EVENT_AGAIN)
         module->base.cont = 1;
 
