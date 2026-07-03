@@ -1,5 +1,8 @@
 #include "http_data_filter.h"
 
+#include <errno.h>
+#include <unistd.h>
+
 #define BUF_SIZE 16384
 
 static http_module_data_t* __create(void);
@@ -8,8 +11,8 @@ static void __reset(void* arg);
 static int __header(httprequest_t* request, httpresponse_t* response);
 static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf);
 static bufo_t* body_next_chunk_data(httpresponse_t* response, bufo_t* proxy_body_buf, int** ok);
-static bufo_t* file_next_chunk_data(httpresponse_t* response, int** ok);
-static bufo_t* next_chunk_data(httpresponse_t* response, bufo_t* proxy_body_buf, int* ok);
+static bufo_t* file_next_chunk_data(httpresponse_t* response, http_module_data_t* module, int** ok);
+static bufo_t* next_chunk_data(httpresponse_t* response, http_module_data_t* module, int* ok);
 
 http_filter_t* http_data_filter_create(void) {
     http_filter_t* filter = malloc(sizeof * filter);
@@ -45,6 +48,7 @@ http_module_data_t* __create(void) {
     }
     module->proxy_body_buf->is_proxy = 1;
     module->proxy_body_buf->capacity = BUF_SIZE;
+    module->file_offset = 0;
 
     return module;
 }
@@ -67,6 +71,12 @@ void __reset(void* arg) {
 
     bufo_clear(module->proxy_body_buf);
     module->proxy_body_buf->is_proxy = 1;
+    /* bufo_clear() on a proxy buffer re-runs bufo_init(), which zeroes
+     * capacity. body_next_chunk_data caps the chunk via bufo_set_size(),
+     * which clamps to capacity — a zero capacity made every reuse produce
+     * size == 0, so __body returned CWF_OK and dropped the body. */
+    module->proxy_body_buf->capacity = BUF_SIZE;
+    module->file_offset = 0;
 }
 
 int __header(httprequest_t* request, httpresponse_t* response) {
@@ -106,7 +116,6 @@ int __header(httprequest_t* request, httpresponse_t* response) {
 int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf) {
     http_filter_t* cur_filter = response->cur_filter;
     http_module_data_t* module = cur_filter->module;
-    module->base.parent_buf = parent_buf;
 
     if (response->range)
         return filter_next_handler_body(request, response, parent_buf);
@@ -121,7 +130,12 @@ int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf)
 
     int r = 0;
     int ok = 0;
-    bufo_t* buf = &response->body;
+    /* On a resume (CWF_EVENT_AGAIN) re-offer the exact buffer that was in
+     * progress, not a freshly fetched one: body_next_chunk_data advances
+     * response->body.pos by the whole chunk up front, so re-fetching would
+     * point the proxy past the bytes the downstream filter still owes and
+     * read out of bounds. parent_buf holds that in-progress buffer. */
+    bufo_t* buf = module->base.parent_buf;
 
     if (module->base.cont)
         goto cont;
@@ -129,11 +143,13 @@ int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf)
     while (1) {
         response->cur_filter = cur_filter;
 
-        buf = next_chunk_data(response, module->proxy_body_buf, &ok);
-        if (!ok) /* alloc error */
+        buf = next_chunk_data(response, module, &ok);
+        if (!ok) /* alloc or read error */
             return CWF_ERROR;
         if (buf != NULL && (buf->pos == buf->size || buf->size == 0)) /* all data has been sent */
             return CWF_OK;
+
+        module->base.parent_buf = buf; /* offer the same buffer again on resume */
 
         cont:
 
@@ -173,20 +189,30 @@ bufo_t* body_next_chunk_data(httpresponse_t* response, bufo_t* proxy_body_buf, i
     return proxy_body_buf;
 }
 
-bufo_t* file_next_chunk_data(httpresponse_t* response, int** ok) {
+bufo_t* file_next_chunk_data(httpresponse_t* response, http_module_data_t* module, int** ok) {
     **ok = 0;
 
     if (!bufo_alloc(&response->body, BUF_SIZE)) return NULL;
 
-    const ssize_t r = read(response->file_.fd, response->body.data, response->body.capacity);
-    if (r < 0) {
-        **ok = 1;
+    /* pread() reads at an explicit offset and leaves the descriptor offset
+     * untouched, so the read position is tracked in module->file_offset
+     * (reset to 0 between responses) and EOF is derived from it instead of
+     * a second lseek(). */
+    ssize_t r;
+    do {
+        r = pread(response->file_.fd, response->body.data, response->body.capacity, module->file_offset);
+    } while (r < 0 && errno == EINTR);
+
+    /* Genuine read failure (EBADF, EIO, ...): leave **ok = 0 so __body maps
+     * it to CWF_ERROR. Returning NULL with ok = 1 (an earlier version) made
+     * __body skip the "all data sent" check and pass NULL to the next
+     * filter — a NULL deref / corrupted stream. */
+    if (r < 0)
         return NULL;
-    }
 
-    size_t offset = lseek(response->file_.fd, 0, SEEK_CUR);
+    module->file_offset += r;
 
-    if (offset == response->file_.size)
+    if (module->file_offset >= (off_t)response->file_.size)
         response->body.is_last = 1;
 
     bufo_reset_pos(&response->body);
@@ -197,9 +223,9 @@ bufo_t* file_next_chunk_data(httpresponse_t* response, int** ok) {
     return &response->body;
 }
 
-bufo_t* next_chunk_data(httpresponse_t* response, bufo_t* proxy_body_buf, int* ok) {
+bufo_t* next_chunk_data(httpresponse_t* response, http_module_data_t* module, int* ok) {
     if (response->file_.fd > -1)
-        return file_next_chunk_data(response, &ok);
+        return file_next_chunk_data(response, module, &ok);
 
-    return body_next_chunk_data(response, proxy_body_buf, &ok);
+    return body_next_chunk_data(response, module->proxy_body_buf, &ok);
 }
