@@ -5,7 +5,7 @@
 
 static int chunk_head_create(http_module_chunked_t* module);
 static int chunk_head_set(http_module_chunked_t* module);
-static void chunked_process(http_module_chunked_t* module, bufo_t* buf);
+static int chunked_process(http_module_chunked_t* module, bufo_t* buf);
 static int chunked_update_state(http_module_chunked_t* module, bufo_t* parent_buf);
 void http_chunked_free(void* arg);
 void http_chunked_reset(void* arg);
@@ -92,7 +92,8 @@ int http_chunked_header(httprequest_t* request, httpresponse_t* response) {
         goto cont;
 
     if (response->get_header(response, "Transfer-Encoding") == NULL)
-        response->add_header(response, "Transfer-Encoding", "chunked");
+        if (!response->add_header(response, "Transfer-Encoding", "chunked"))
+            return CWF_ERROR;
 
     if (!bufo_alloc(module->buf, BUF_SIZE))
         return CWF_ERROR;
@@ -131,7 +132,8 @@ int http_chunked_body(httprequest_t* request, httpresponse_t* response, bufo_t* 
     while (1) {
         response->cur_filter = cur_filter;
 
-        chunked_process(module, buf);
+        if (!chunked_process(module, buf))
+            return CWF_ERROR;
 
         bufo_reset_pos(buf);
 
@@ -143,10 +145,20 @@ int http_chunked_body(httprequest_t* request, httpresponse_t* response, bufo_t* 
 
         if (r == CWF_DATA_AGAIN) {
 
-            if (parent_buf->pos == parent_buf->size)
+            if (module->base.done)
                 return r;
 
-            continue;
+            if (parent_buf->pos < parent_buf->size)
+                continue;
+
+            /* The parent buffer is exhausted, but the trailing "\r\n" or the
+             * terminating "0\r\n\r\n" may not have fit into the output buffer
+             * yet: keep flushing until the state machine reports done,
+             * otherwise the response is truncated. */
+            if (parent_buf->is_last)
+                continue;
+
+            return r;
         }
 
         if (r == CWF_EVENT_AGAIN)
@@ -186,8 +198,13 @@ static int chunk_head_set(http_module_chunked_t* module) {
     return 1;
 }
 
-static void chunked_process(http_module_chunked_t* module, bufo_t* buf) {
+/* Encode data from the parent buffer into `buf`. Returns 1 on success (the
+ * buffer may be full or the parent drained — the caller flushes and calls
+ * again) and 0 on an unrecoverable error. */
+static int chunked_process(http_module_chunked_t* module, bufo_t* buf) {
     bufo_t* parent_buf = module->base.parent_buf;
+    if (parent_buf == NULL)
+        return 0;
 
     bufo_reset_pos(buf);
     bufo_reset_size(buf);
@@ -196,36 +213,66 @@ static void chunked_process(http_module_chunked_t* module, bufo_t* buf) {
         switch (module->state) {
             case HTTP_MODULE_CHUNKED_SIZE:
             {
-                if (module->state_pos == 0)
-                    if (!chunked_update_state(module, parent_buf))
-                        return;
+                if (module->state_pos == 0) {
+                    const size_t parent_size = bufo_size(parent_buf);
+                    if (parent_buf->pos > parent_size)
+                        return 0;
 
-                ssize_t written = bufo_append(buf, module->chunk_head + module->state_pos, module->chunk_head_size - module->state_pos);
+                    /* A "0\r\n" head is the stream terminator, so an empty
+                     * parent buffer must not be framed as a data chunk. */
+                    if (parent_buf->pos == parent_size) {
+                        if (!parent_buf->is_last)
+                            return 1;
+
+                        module->state = HTTP_MODULE_CHUNKED_END;
+                        break;
+                    }
+
+                    if (!chunked_update_state(module, parent_buf))
+                        return 0;
+                }
+
+                const ssize_t written = bufo_append(buf, module->chunk_head + module->state_pos, module->chunk_head_size - module->state_pos);
+                if (written < 0)
+                    return 0;
 
                 module->state_pos += written;
 
                 if (module->state_pos < module->chunk_head_size)
-                    return;
+                    return 1;
 
-                if (module->state_pos == module->chunk_head_size) {
-                    module->state = HTTP_MODULE_CHUNKED_DATA;
-                    module->state_pos = 0;
-                }
+                module->state = HTTP_MODULE_CHUNKED_DATA;
+                module->state_pos = 0;
                 break;
             }
             case HTTP_MODULE_CHUNKED_DATA:
             {
-                ssize_t written = bufo_append(buf, bufo_data(parent_buf), bufo_size(parent_buf) - parent_buf->pos);
+                const size_t parent_size = bufo_size(parent_buf);
+                const size_t parent_remaining = parent_size > parent_buf->pos ? parent_size - parent_buf->pos : 0;
+                const size_t chunk_remaining = module->current_chunk_size - module->state_pos;
+                const size_t size = parent_remaining < chunk_remaining ? parent_remaining : chunk_remaining;
+
+                if (size == 0) {
+                    /* The head already announced current_chunk_size bytes: a
+                     * last parent buffer with nothing left can never complete
+                     * the chunk, that stream is broken. */
+                    if (parent_buf->is_last)
+                        return 0;
+
+                    return 1;
+                }
+
+                const ssize_t written = bufo_append(buf, bufo_data(parent_buf), size);
+                if (written < 0)
+                    return 0;
 
                 module->state_pos += bufo_move_front_pos(parent_buf, written);
 
                 if (module->state_pos < module->current_chunk_size)
-                    return;
+                    return 1;
 
-                if (module->state_pos == module->current_chunk_size) {
-                    module->state = HTTP_MODULE_CHUNKED_SEP;
-                    module->state_pos = 0;
-                }
+                module->state = HTTP_MODULE_CHUNKED_SEP;
+                module->state_pos = 0;
                 break;
             }
             case HTTP_MODULE_CHUNKED_SEP:
@@ -233,47 +280,46 @@ static void chunked_process(http_module_chunked_t* module, bufo_t* buf) {
                 const char* sep = "\r\n";
                 const size_t sep_size = 2;
 
-                ssize_t written = bufo_append(buf, sep + module->state_pos, sep_size - module->state_pos);
+                const ssize_t written = bufo_append(buf, sep + module->state_pos, sep_size - module->state_pos);
+                if (written < 0)
+                    return 0;
 
                 module->state_pos += written;
 
                 if (module->state_pos < sep_size)
-                    return;
+                    return 1;
 
-                if (module->state_pos == sep_size) {
-                    module->state_pos = 0;
+                module->state_pos = 0;
 
-                    if (parent_buf->is_last)
-                        module->state = HTTP_MODULE_CHUNKED_END;
-                    else {
-                        module->state = HTTP_MODULE_CHUNKED_SIZE;
-
-                        if (parent_buf->pos < parent_buf->size)
-                            break;
-
-                        return;
-                    }
+                if (parent_buf->is_last) {
+                    module->state = HTTP_MODULE_CHUNKED_END;
+                    break;
                 }
 
-                break;
+                module->state = HTTP_MODULE_CHUNKED_SIZE;
+
+                if (parent_buf->pos < parent_buf->size)
+                    break;
+
+                return 1;
             }
             case HTTP_MODULE_CHUNKED_END:
             {
                 const char* value = "0\r\n\r\n";
                 const size_t value_size = 5;
 
-                ssize_t written = bufo_append(buf, value + module->state_pos, value_size - module->state_pos);
+                const ssize_t written = bufo_append(buf, value + module->state_pos, value_size - module->state_pos);
+                if (written < 0)
+                    return 0;
 
                 module->state_pos += written;
                 if (module->state_pos < value_size)
-                    return;
+                    return 1;
 
-                if (module->state_pos == value_size) {
-                    module->base.done = 1;
-                    module->state_pos = 0;
-                }
+                module->base.done = 1;
+                module->state_pos = 0;
 
-                return;
+                return 1;
             }
         }
     }
