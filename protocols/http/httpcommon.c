@@ -12,8 +12,15 @@ http_header_t* http_header_create(const char* key, size_t key_length, const char
     if (header == NULL) return NULL;
 
     header->key = copy_cstringn(key, key_length);
-    header->key_length = key_length;
     header->value = copy_cstringn(value, value_length);
+    if (header->key == NULL || header->value == NULL) {
+        free(header->key);
+        free(header->value);
+        free(header);
+        return NULL;
+    }
+
+    header->key_length = key_length;
     header->value_length = value_length;
     header->next = NULL;
 
@@ -21,6 +28,8 @@ http_header_t* http_header_create(const char* key, size_t key_length, const char
 }
 
 void http_header_free(http_header_t* header) {
+    if (header == NULL) return;
+
     free(header->key);
     free(header->value);
     free(header);
@@ -36,8 +45,11 @@ void http_headers_free(http_header_t* header) {
 
 http_header_t* http_header_delete(http_header_t* header, const char* key) {
     if (header == NULL) return NULL;
+    if (key == NULL) return header;
 
-    if (cmpstrn_lower(header->key, header->key_length, key, strlen(key))) {
+    const size_t key_length = strlen(key);
+
+    if (cmpstrn_lower(header->key, header->key_length, key, key_length)) {
         http_header_t* next = header->next;
         http_header_free(header);
         return next;
@@ -51,7 +63,7 @@ http_header_t* http_header_delete(http_header_t* header, const char* key) {
     while (header) {
         http_header_t* next = header->next;
 
-        if (cmpstrn_lower(header->key, header->key_length, key, strlen(key))) {
+        if (cmpstrn_lower(header->key, header->key_length, key, key_length)) {
             prev_header->next = next;
             http_header_free(header);
             break;
