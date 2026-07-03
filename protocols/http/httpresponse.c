@@ -940,6 +940,8 @@ char* __httpresponse_payload(httpresponse_t* response) {
 
         memcpy(buffer, response->body.data, response->body.size + 1);
     } else {
+        if (response->payload_.file.fd < 0) return NULL;
+
         __httpresponse_payload_parse_plain(response);
 
         http_payloadpart_t* part = response->payload_.part;

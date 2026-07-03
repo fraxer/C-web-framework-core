@@ -174,7 +174,7 @@ int __file_append_content(file_t* file, const char* data, const size_t size) {
 
     file->size += total_written;
 
-    return total_written > 0;
+    return total_written == size;
 }
 
 int __file_close(file_t* file) {
