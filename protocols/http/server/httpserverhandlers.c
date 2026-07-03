@@ -396,8 +396,11 @@ int __get_redirect(connection_t* connection, httprequest_t* request) {
     while (redirect) {
         if (loop_cycle >= 10) return REDIRECT_LOOP_CYCLE;
 
-        int vector_size = redirect->params_count * 6;
+        int vector_size = (redirect->params_count + 1) * 3;
         int vector[vector_size];
+        // pcre_exec leaves entries of non-participating capture groups untouched,
+        // so pre-mark all offsets as "unset" for redirect_get_uri
+        memset(vector, -1, sizeof(vector));
         int matches_count = pcre_exec(redirect->location, NULL, request->path, request->path_length, 0, 0, vector, vector_size);
 
         if (matches_count < 0) {

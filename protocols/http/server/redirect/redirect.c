@@ -4,10 +4,11 @@
 #include "log.h"
 #include "redirect.h"
 
-#define REDIRECT_OUT_OF_MEMORY "Redirect error: Out of memory\n"
+#define REDIRECT_ERROR_OUT_OF_MEMORY "Redirect error: Out of memory\n"
 #define REDIRECT_BIG_VALUE_PARAM "Redirect error: Big number in param \"%s\"\n"
 #define REDIRECT_ERROR_VALUE_PARAM "Redirect error: param is not number \"%s\"\n"
 #define REDIRECT_ERROR_CHECK_PARAM "Redirect error: params count is not equal substrings count in location \"%s\"\n"
+#define REDIRECT_ERROR_PARAM_NUMBER "Redirect error: param number exceeds captures count in location \"%s\"\n"
 
 typedef struct redirect_parser {
     int params_count;
@@ -32,13 +33,13 @@ void redirect_append_uri(char*, size_t*, const char*, size_t);
 redirect_t* redirect_create(const char* location, const char* destination) {
     redirect_t* result = NULL;
 
-    redirect_t* redirect = redirect_init(destination);
-
     redirect_parser_t parser;
 
-    if (redirect == NULL) goto failed;
+    if (redirect_init_parser(&parser, destination) == -1) return NULL;
 
-    if (redirect_init_parser(&parser, destination) == -1) goto failed;
+    redirect_t* redirect = redirect_init(destination);
+
+    if (redirect == NULL) goto failed;
 
     if (redirect_parse_destination(&parser) == -1) goto failed;
 
@@ -49,6 +50,8 @@ redirect_t* redirect_create(const char* location, const char* destination) {
 
     redirect->params_count = parser.params_count;
     redirect->param = parser.first_param;
+    parser.first_param = NULL;
+    parser.last_param = NULL;
 
     if (redirect_check_params(redirect) == -1) goto failed;
 
@@ -69,7 +72,7 @@ redirect_t* redirect_init(const char* template) {
     redirect_t* redirect = (redirect_t*)malloc(sizeof(redirect_t));
 
     if (redirect == NULL) {
-        log_error(REDIRECT_OUT_OF_MEMORY);
+        log_error(REDIRECT_ERROR_OUT_OF_MEMORY);
         return NULL;
     }
 
@@ -84,7 +87,7 @@ redirect_t* redirect_init(const char* template) {
     redirect->next = NULL;
 
     if (redirect->template == NULL) {
-        log_error(REDIRECT_OUT_OF_MEMORY);
+        log_error(REDIRECT_ERROR_OUT_OF_MEMORY);
         free(redirect);
         return NULL;
     }
@@ -129,6 +132,13 @@ int redirect_check_params(redirect_t* redirect) {
         return -1;
     }
 
+    for (redirect_param_t* param = redirect->param; param; param = param->next) {
+        if (param->number > where) {
+            log_error(REDIRECT_ERROR_PARAM_NUMBER, redirect->template);
+            return -1;
+        }
+    }
+
     return 0;
 }
 
@@ -140,16 +150,18 @@ int redirect_parse_token(redirect_parser_t* parser) {
         char c = parser->string[parser->pos];
 
         if (c == '}') {
-            int result = redirect_fill_param(parser);
-            if (result == -1) return -1;
-            if (result == -2) parser->pos++;
+            if (redirect_fill_param(parser) == -1) return -1;
             break;
         }
-        if (c == '{' || !isdigit(c)) {
+        if (c == '{' || !isdigit((unsigned char)c)) {
             parser->pos--;
             return 0;
         }
     }
+
+    // unterminated token: pos stopped on the null terminator; step back so the
+    // caller's loop increment lands on the terminator, not past it
+    if (parser->string[parser->pos] == 0) parser->pos--;
 
     return 0;
 }
@@ -158,7 +170,7 @@ int redirect_alloc_param(redirect_parser_t* parser, size_t start, size_t end, in
     redirect_param_t* param = (redirect_param_t*)malloc(sizeof(redirect_param_t));
 
     if (param == NULL) {
-        log_error(REDIRECT_OUT_OF_MEMORY);
+        log_error(REDIRECT_ERROR_OUT_OF_MEMORY);
         return -1;
     }
 
@@ -213,6 +225,18 @@ int redirect_fill_param(redirect_parser_t* parser) {
 }
 
 void redirect_parser_free(redirect_parser_t* parser) {
+    redirect_param_t* param = parser->first_param;
+
+    while (param != NULL) {
+        redirect_param_t* param_next = param->next;
+
+        free(param);
+
+        param = param_next;
+    }
+
+    parser->first_param = NULL;
+    parser->last_param = NULL;
     parser->string = NULL;
 }
 
@@ -239,6 +263,16 @@ void redirect_free(redirect_t* redirect) {
     }
 }
 
+// match length of a capture group; unmatched groups have offsets set to -1
+static size_t redirect_param_string_length(const int* vector, int number) {
+    int match_start = vector[number * 2];
+    int match_end = vector[number * 2 + 1];
+
+    if (match_start < 0 || match_end < match_start) return 0;
+
+    return (size_t)(match_end - match_start);
+}
+
 char* redirect_get_uri(redirect_t* redirect, const char* string, int* vector) {
     char* uri = NULL;
 
@@ -251,27 +285,35 @@ char* redirect_get_uri(redirect_t* redirect, const char* string, int* vector) {
         redirect_param_t* last_param = redirect->param;
 
         for (param = redirect->param; param; param = param->next) {
-            size_t param_string_length = vector[param->number * 2 + 1] - vector[param->number * 2];
+            size_t param_string_length = redirect_param_string_length(vector, param->number);
             size_t substring_length = param->start - start_pos;
 
             uri_length += substring_length;
             uri_length += param_string_length;
+
+            start_pos = param->end;
+            last_param = param;
         }
+
+        if (last_param->end < redirect->template_length)
+            uri_length += redirect->template_length - last_param->end;
 
         uri = (char*)malloc(uri_length + 1);
 
         if (uri == NULL) return NULL;
 
         uri_length = 0;
+        start_pos = 0;
 
         for (param = redirect->param; param; param = param->next) {
-            size_t param_string_length = vector[param->number * 2 + 1] - vector[param->number * 2];
+            size_t param_string_length = redirect_param_string_length(vector, param->number);
 
             size_t substring_length = param->start - start_pos;
 
             redirect_append_uri(uri, &uri_length, &redirect->template[start_pos], substring_length);
 
-            redirect_append_uri(uri, &uri_length, &string[vector[param->number * 2]], param_string_length);
+            if (param_string_length > 0)
+                redirect_append_uri(uri, &uri_length, &string[vector[param->number * 2]], param_string_length);
 
             start_pos = param->end;
 
@@ -283,6 +325,8 @@ char* redirect_get_uri(redirect_t* redirect, const char* string, int* vector) {
 
             redirect_append_uri(uri, &uri_length, &redirect->template[last_param->end], substring_length);
         }
+
+        uri[uri_length] = 0;
     }
     else {
         uri = (char*)malloc(redirect->template_length + 1);
