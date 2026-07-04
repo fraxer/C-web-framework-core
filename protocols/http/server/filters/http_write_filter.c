@@ -1,9 +1,11 @@
+#include <errno.h>
 #include <string.h>
-
-#define BUF_SIZE 16384
+#include <sys/socket.h>
 
 #include "http_write_filter.h"
 #include "log.h"
+
+#define BUF_SIZE 16384
 
 void http_write_free(void* arg);
 void http_write_reset(void* arg);
@@ -37,23 +39,40 @@ size_t __head_size(httpresponse_t* response) {
     return size;
 }
 
+/* bufo_append() возвращает число скопированных байт: 0 — это и «нечего
+ * копировать» (пустое значение заголовка — легально по RFC 7230), и «буфер
+ * полон», а -1 — не выделенный буфер. Ошибкой считается только неполное
+ * копирование, иначе пустой value рвал бы весь ответ. */
+static int __append_full(bufo_t* buf, const char* data, size_t size) {
+    return bufo_append(buf, data, size) == (ssize_t)size;
+}
+
 int __build_head(httpresponse_t* response, bufo_t* buf) {
+    /* Неизвестный код: status_string() == NULL, status_length() == 0 —
+     * без проверки ушла бы стартовая строка без статуса. */
+    const char* status_string = httpresponse_status_string(response->status_code);
+    const size_t status_length = httpresponse_status_length(response->status_code);
+    if (status_string == NULL) {
+        log_error("http_write_filter: unknown status code %d\n", response->status_code);
+        return 0;
+    }
+
     if (!bufo_alloc(buf, __head_size(response))) return 0;
 
-    if (!bufo_append(buf, "HTTP/1.1 ", 9)) return 0;
-    if (!bufo_append(buf, httpresponse_status_string(response->status_code), httpresponse_status_length(response->status_code))) return 0;
+    if (!__append_full(buf, "HTTP/1.1 ", 9)) return 0;
+    if (!__append_full(buf, status_string, status_length)) return 0;
 
     http_header_t* header = response->header_;
     while (header) {
-        if (!bufo_append(buf, header->key, header->key_length)) return 0;
-        if (!bufo_append(buf, ": ", 2)) return 0;
-        if (!bufo_append(buf, header->value, header->value_length)) return 0;
-        if (!bufo_append(buf, "\r\n", 2)) return 0;
+        if (!__append_full(buf, header->key, header->key_length)) return 0;
+        if (!__append_full(buf, ": ", 2)) return 0;
+        if (!__append_full(buf, header->value, header->value_length)) return 0;
+        if (!__append_full(buf, "\r\n", 2)) return 0;
 
         header = header->next;
     }
 
-    if (!bufo_append(buf, "\r\n", 2)) return 0;
+    if (!__append_full(buf, "\r\n", 2)) return 0;
 
     bufo_reset_pos(buf);
 
@@ -115,8 +134,11 @@ void http_write_reset(void* arg) {
 int __wr(httpresponse_t* response, bufo_t* buf) {
     size_t readed = 0;
     while ((readed = bufo_chunk_size(buf, BUF_SIZE)) > 0) {
-        ssize_t writed = __write(response->connection, bufo_data(buf), readed);
-        if (writed == -1) {
+        const ssize_t writed = __write(response->connection, bufo_data(buf), readed);
+        if (writed < 0) {
+            if (errno == EINTR)
+                continue;
+
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 response->event_again = 1;
                 return CWF_EVENT_AGAIN;
@@ -124,6 +146,13 @@ int __wr(httpresponse_t* response, bufo_t* buf) {
 
             log_error("write error: %s\n", strerror(errno));
 
+            return CWF_ERROR;
+        }
+
+        if (writed == 0) {
+            /* send(2) не возвращает 0 при size > 0, а SSL_write() возвращает
+             * на закрытом соединении; сдвиг на 0 байт зациклил бы event-поток. */
+            log_error("write error: connection closed\n");
             return CWF_ERROR;
         }
 
