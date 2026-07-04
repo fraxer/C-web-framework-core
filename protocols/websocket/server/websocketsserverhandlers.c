@@ -132,7 +132,7 @@ int __write(connection_t* connection) {
     }
 
     // file
-    if (response->file_.fd > 0 && response->file_.pos < response->file_.size) {
+    if (response->file_.fd > -1 && response->file_.pos < response->file_.size) {
         lseek(response->file_.fd, response->file_.pos, SEEK_SET);
 
         size_t size = response->file_.size - response->file_.pos;

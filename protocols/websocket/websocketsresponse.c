@@ -3,6 +3,8 @@
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <zlib.h>
 
@@ -17,8 +19,8 @@
 
 typedef enum {
     FILE_OK = 0,
-    FILE_FORBIDDEN = 0,
-    FILE_NOTFOUND = 0,
+    FILE_FORBIDDEN,
+    FILE_NOTFOUND,
 } file_status_e;
 
 void websocketsresponse_text(websocketsresponse_t*, const char*);
@@ -43,15 +45,16 @@ websocketsresponse_t* websocketsresponse_alloc() {
 
 void websocketsresponse_free(void* arg) {
     websocketsresponse_t* response = (websocketsresponse_t*)arg;
+    if (response == NULL) return;
 
     websocketsresponse_reset(response);
 
     free(response);
-
-    response = NULL;
 }
 
 websocketsresponse_t* websocketsresponse_create(connection_t* connection) {
+    if (connection == NULL) return NULL;
+
     websocketsresponse_t* response = websocketsresponse_alloc();
 
     if (response == NULL) return NULL;
@@ -60,7 +63,7 @@ websocketsresponse_t* websocketsresponse_create(connection_t* connection) {
     response->body.data = NULL;
     response->body.pos = 0;
     response->body.size = 0;
-    response->file_.fd = 0;
+    response->file_.fd = -1;
     response->file_.pos = 0;
     response->file_.size = 0;
     response->connection = connection;
@@ -76,8 +79,8 @@ websocketsresponse_t* websocketsresponse_create(connection_t* connection) {
     response->base.free = (void(*)(void*))websocketsresponse_free;
 
     connection_server_ctx_t* ctx = connection->ctx;
-    websocketsparser_t* parser = ctx->parser;
-    response->ws_deflate = parser ? &parser->ws_deflate : NULL;
+    websocketsparser_t* parser = ctx != NULL ? ctx->parser : NULL;
+    response->ws_deflate = parser != NULL ? &parser->ws_deflate : NULL;
 
     return response;
 }
@@ -87,12 +90,10 @@ void websocketsresponse_reset(websocketsresponse_t* response) {
     response->body.pos = 0;
     response->body.size = 0;
 
-    if (response->file_.fd > 0) {
-        lseek(response->file_.fd, 0, SEEK_SET);
+    if (response->file_.fd > -1)
         close(response->file_.fd);
-    }
 
-    response->file_.fd = 0;
+    response->file_.fd = -1;
     response->file_.pos = 0;
     response->file_.size = 0;
 
@@ -146,13 +147,24 @@ int websocketsresponse_prepare(websocketsresponse_t* response, const char* body,
 
     size_t pos = 0;
 
-    if (!data_append(data, &pos, (const char*)&response->frame_code, 1)) return -1;
+    if (!data_append(data, &pos, (const char*)&response->frame_code, 1)) {
+        free(data);
+        return -1;
+    }
 
-    if (websocketsresponse_set_payload_length(data, &pos, length) == -1) return -1;
+    if (websocketsresponse_set_payload_length(data, &pos, length) == -1) {
+        free(data);
+        return -1;
+    }
 
-    if (body != NULL && !data_append(data, &pos, body, length)) return -1;
+    if (body != NULL && !data_append(data, &pos, body, length)) {
+        free(data);
+        return -1;
+    }
 
+    if (response->body.data != NULL) free(response->body.data);
     response->body.data = data;
+    response->body.pos = 0;
 
     return 0;
 }
@@ -169,13 +181,7 @@ int websocketsresponse_set_payload_length(char* data, size_t* pos, size_t payloa
     else { // >2^16-1 (65535)
         data[(*pos)++] = 127; // 64 bit length follows
 
-        // since msg_length is int it can be no longer than 4 bytes = 2^32-1
-        // padd zeroes for the first 4 bytes
-        for (int i = 3; i >= 0; i--) {
-            data[(*pos)++] = 0;
-        }
-        // write the actual 32bit msg_length in the next 4 bytes
-        for (int i = 3; i >= 0; i--) {
+        for (int i = 7; i >= 0; i--) {
             data[(*pos)++] = ((payload_length >> 8*i) & 0xFF);
         }
     }
@@ -184,10 +190,14 @@ int websocketsresponse_set_payload_length(char* data, size_t* pos, size_t payloa
 }
 
 void websocketsresponse_text(websocketsresponse_t* response, const char* data) {
+    if (data == NULL) return;
+
     websocketsresponse_textn(response, data, strlen(data));
 }
 
 void websocketsresponse_textn(websocketsresponse_t* response, const char* data, size_t length) {
+    if (data == NULL && length > 0) return;
+
     /* Try compression if extension is enabled and payload is large enough */
     if (response->ws_deflate && response->ws_deflate->deflate_init && length >= WS_COMPRESS_THRESHOLD) {
         if (__compress_and_send(response, 0x01, data, length))
@@ -201,10 +211,14 @@ void websocketsresponse_textn(websocketsresponse_t* response, const char* data, 
 }
 
 void websocketsresponse_binary(websocketsresponse_t* response, const char* data) {
+    if (data == NULL) return;
+
     websocketsresponse_binaryn(response, data, strlen(data));
 }
 
 void websocketsresponse_binaryn(websocketsresponse_t* response, const char* data, size_t length) {
+    if (data == NULL && length > 0) return;
+
     /* Try compression if extension is enabled and payload is large enough */
     if (response->ws_deflate && response->ws_deflate->deflate_init && length >= WS_COMPRESS_THRESHOLD) {
         if (__compress_and_send(response, 0x02, data, length))
@@ -218,6 +232,8 @@ void websocketsresponse_binaryn(websocketsresponse_t* response, const char* data
 }
 
 void websocketsresponse_data(wsctx_t* ctx, const char* data) {
+    if (data == NULL) return;
+
     websocketsresponse_datan(ctx, data, strlen(data));
 }
 
@@ -231,10 +247,14 @@ void websocketsresponse_datan(wsctx_t* ctx, const char* data, size_t length) {
 }
 
 int websocketsresponse_file(websocketsresponse_t* response, const char* path) {
+    if (path == NULL) return -1;
+
     return websocketsresponse_filen(response, path, strlen(path));
 }
 
 int websocketsresponse_filen(websocketsresponse_t* response, const char* path, size_t length) {
+    if (path == NULL) return -1;
+
     char file_full_path[PATH_MAX];
     connection_t* connection = response->connection;
     connection_server_ctx_t* ctx = connection->ctx;
@@ -248,12 +268,27 @@ int websocketsresponse_filen(websocketsresponse_t* response, const char* path, s
         return -1;
     }
 
-    response->file_.fd = open(file_full_path, O_RDONLY);
-    if (response->file_.fd == -1) return -1;
+    const int fd = open(file_full_path, O_RDONLY);
+    if (fd == -1) {
+        websocketsresponse_default(response, "resource not found");
+        return -1;
+    }
 
-    response->file_.size = (size_t)lseek(response->file_.fd, 0, SEEK_END);
+    const off_t file_size = lseek(fd, 0, SEEK_END);
+    if (file_size == -1) {
+        close(fd);
+        websocketsresponse_default(response, "resource not found");
+        return -1;
+    }
 
-    lseek(response->file_.fd, 0, SEEK_SET);
+    lseek(fd, 0, SEEK_SET);
+
+    if (response->file_.fd > -1)
+        close(response->file_.fd);
+
+    response->file_.fd = fd;
+    response->file_.pos = 0;
+    response->file_.size = (size_t)file_size;
 
     response->frame_code = 0x82;
     response->body.size = websocketsresponse_file_size(response->file_.size);
@@ -265,6 +300,12 @@ int websocketsresponse_filen(websocketsresponse_t* response, const char* path, s
 
 file_status_e __get_file_full_path(server_t* server, char* file_full_path, size_t file_full_path_size, const char* path, size_t length) {
     size_t pos = 0;
+
+    if (length == 0)
+        return FILE_NOTFOUND;
+
+    if (is_path_traversal(path, length))
+        return FILE_FORBIDDEN;
 
     if (!data_appendn(file_full_path, &pos, file_full_path_size, server->root, server->root_length))
         return FILE_NOTFOUND;
@@ -279,8 +320,8 @@ file_status_e __get_file_full_path(server_t* server, char* file_full_path, size_
     file_full_path[pos] = 0;
 
     struct stat stat_obj;
-    if (stat(file_full_path, &stat_obj) == -1 && errno == ENOENT)
-        return FILE_NOTFOUND;
+    if (stat(file_full_path, &stat_obj) == -1)
+        return errno == EACCES ? FILE_FORBIDDEN : FILE_NOTFOUND;
 
     if (S_ISDIR(stat_obj.st_mode))
         return FILE_FORBIDDEN;
@@ -299,6 +340,9 @@ void websocketsresponse_default(websocketsresponse_t* response, const char* text
 void websocketsresponse_pong(websocketsresponse_t* response, const char* data, size_t length) {
     websocketsresponse_reset(response);
 
+    if (data == NULL) length = 0;
+    if (length > 125) length = 125; /* RFC 6455 5.5: control frame payload limit */
+
     response->frame_code = 0x8A;
 
     response->body.size = websocketsresponse_data_size(length);
@@ -308,6 +352,9 @@ void websocketsresponse_pong(websocketsresponse_t* response, const char* data, s
 
 void websocketsresponse_close(websocketsresponse_t* response, const char* data, size_t length) {
     websocketsresponse_reset(response);
+
+    if (data == NULL) length = 0;
+    if (length > 125) length = 125; /* RFC 6455 5.5: control frame payload limit */
 
     response->frame_code = 0x88;
 
@@ -325,8 +372,13 @@ static int __compress_and_send(websocketsresponse_t* response, unsigned char opc
     ws_deflate_t* ws_deflate_ctx = response->ws_deflate;
     z_stream* stream = &ws_deflate_ctx->deflate_stream;
 
-    /* Allocate compression buffer (worst case: slightly larger than input) */
-    size_t comp_capacity = length + 64;
+    /* zlib works with uInt sizes; oversized payloads go uncompressed
+     * (safe: the stream has not consumed anything yet) */
+    if (length > UINT_MAX / 2)
+        return 0;
+
+    /* deflateBound covers worst-case expansion, +8 for the Z_SYNC_FLUSH marker */
+    const uLong comp_capacity = deflateBound(stream, (uLong)length) + 8;
     char* compressed = malloc(comp_capacity);
     if (compressed == NULL)
         return 0;
@@ -336,9 +388,14 @@ static int __compress_and_send(websocketsresponse_t* response, unsigned char opc
     stream->next_out = (Bytef*)compressed;
     stream->avail_out = (uInt)comp_capacity;
 
-    int status = deflate(stream, Z_SYNC_FLUSH);
-    if (status != Z_OK && status != Z_BUF_ERROR) {
+    /* Once deflate consumed input, discarding its output desyncs the client's
+     * inflater under context takeover: every discard path below must
+     * deflateReset unconditionally. A fresh stream at a sync-flush boundary
+     * is a valid continuation for the client. */
+    const int status = deflate(stream, Z_SYNC_FLUSH);
+    if (status != Z_OK || stream->avail_in != 0 || stream->avail_out == 0) {
         free(compressed);
+        deflateReset(stream);
         return 0;
     }
 
@@ -356,7 +413,7 @@ static int __compress_and_send(websocketsresponse_t* response, unsigned char opc
     /* Only use compression if it actually reduces size */
     if (comp_size >= length) {
         free(compressed);
-        ws_deflate_reset_deflate(ws_deflate_ctx);
+        deflateReset(stream);
         return 0;
     }
 
@@ -364,12 +421,17 @@ static int __compress_and_send(websocketsresponse_t* response, unsigned char opc
     response->frame_code = 0x80 | 0x40 | opcode;  /* 0xC1 for text, 0xC2 for binary */
     response->body.size = websocketsresponse_data_size(comp_size);
 
-    int result = websocketsresponse_prepare(response, compressed, comp_size);
+    const int result = websocketsresponse_prepare(response, compressed, comp_size);
 
     free(compressed);
+
+    if (result != 0) {
+        deflateReset(stream);
+        return 0;
+    }
 
     /* Reset deflate stream if server_no_context_takeover */
     ws_deflate_reset_deflate(ws_deflate_ctx);
 
-    return result == 0 ? 1 : 0;
+    return 1;
 }
