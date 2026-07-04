@@ -366,9 +366,17 @@ int websocketsparser_parse_first_byte(websocketsparser_t* parser) {
         return 0; /* new data frame while a fragmented message is unfinished */
     }
 
-    /* Create the request lazily on the first frame of a data message. */
+    /* Create the request lazily on the first frame of a data message. The
+     * protocol is owned by the caller until websocketsrequest_create succeeds
+     * (it does not free it on failure - see its contract), so release it here
+     * when allocation fails to avoid leaking one protocol per attempt. */
     if (parser->request == NULL) {
-        parser->request = websocketsrequest_create(parser->connection, parser->protocol_create());
+        websockets_protocol_t* protocol = parser->protocol_create();
+        if (protocol != NULL) {
+            parser->request = websocketsrequest_create(parser->connection, protocol);
+            if (parser->request == NULL)
+                protocol->free(protocol);
+        }
         if (parser->request == NULL)
             return 0;
     }
