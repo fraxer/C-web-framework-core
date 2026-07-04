@@ -158,36 +158,46 @@ static inline void register_test_suite(test_suite_fn suite) {
     printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s (line %d)\n", message, __LINE__); \
 } while(0)
 
+/* Each argument is evaluated exactly once (like TEST_ASSERT_STR_EQUAL):
+ * re-evaluating it in the failure printf re-ran side-effectful expressions
+ * (e.g. a parser call), so the diagnostic reported a second, different
+ * result - up to "expected 1, got 1" for a failed comparison. */
 #define TEST_ASSERT_EQUAL(expected, actual, message) do { \
     stats.total++; \
-    if ((expected) == (actual)) { \
+    const long long __ll_expected = (long long)(expected); \
+    const long long __ll_actual = (long long)(actual); \
+    if (__ll_expected == __ll_actual) { \
         stats.passed++; \
     } else { \
         PRINT_TEST_CONTEXT(); \
         stats.failed++; \
-        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: expected %lld, got %lld (line %d)\n", message, (long long)(expected), (long long)(actual), __LINE__); \
+        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: expected %lld, got %lld (line %d)\n", message, __ll_expected, __ll_actual, __LINE__); \
     } \
 } while(0)
 
 #define TEST_ASSERT_EQUAL_SIZE(expected, actual, message) do { \
     stats.total++; \
-    if ((expected) == (actual)) { \
+    const size_t __size_expected = (size_t)(expected); \
+    const size_t __size_actual = (size_t)(actual); \
+    if (__size_expected == __size_actual) { \
         stats.passed++; \
     } else { \
         PRINT_TEST_CONTEXT(); \
         stats.failed++; \
-        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: expected %zu, got %zu (line %d)\n", message, (size_t)(expected), (size_t)(actual), __LINE__); \
+        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: expected %zu, got %zu (line %d)\n", message, __size_expected, __size_actual, __LINE__); \
     } \
 } while(0)
 
 #define TEST_ASSERT_EQUAL_UINT(expected, actual, message) do { \
     stats.total++; \
-    if ((expected) == (actual)) { \
+    const unsigned int __uint_expected = (unsigned int)(expected); \
+    const unsigned int __uint_actual = (unsigned int)(actual); \
+    if (__uint_expected == __uint_actual) { \
         stats.passed++; \
     } else { \
         PRINT_TEST_CONTEXT(); \
         stats.failed++; \
-        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: expected %u, got %u (line %d)\n", message, (unsigned int)(expected), (unsigned int)(actual), __LINE__); \
+        printf("  " COLOR_RED "[FAIL]" COLOR_RESET " %s: expected %u, got %u (line %d)\n", message, __uint_expected, __uint_actual, __LINE__); \
     } \
 } while(0)
 

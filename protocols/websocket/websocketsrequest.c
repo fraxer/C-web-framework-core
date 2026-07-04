@@ -10,9 +10,6 @@
 #include "websocketsrequest.h"
 #include "connection_s.h"
 
-int websocketsrequest_get_default(connection_t*);
-int websocketsrequest_get_resource(connection_t*);
-
 static void websocketsrequest_payload_free(websockets_payload_t*);
 static void websocketsrequest_reset(void* arg);
 

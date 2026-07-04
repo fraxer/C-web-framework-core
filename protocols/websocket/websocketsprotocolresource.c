@@ -1,5 +1,8 @@
+#include <errno.h>
 #include <string.h>
+#include <unistd.h>
 
+#include "log.h"
 #include "appconfig.h"
 #include "websocketsserverhandlers.h"
 #include "websocketsprotocolresource.h"
@@ -102,6 +105,12 @@ int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t
         int matches_count = pcre_exec(route->location, NULL, protocol->path, protocol->path_length, 0, 0, vector, vector_size);
 
         if (matches_count > 1) {
+            /* Skip the route before materializing its params: a matching
+             * route without a handler for this method used to append its
+             * params to the chain and then continue to the next route,
+             * polluting the params the dispatched route sees. */
+            if (route->handler[protocol->method] == NULL) continue;
+
             int i = 1; // escape full string match
 
             query_t* last_query = websocketsrequest_last_query_item(protocol);
@@ -111,15 +120,22 @@ int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t
 
                 query_t* query = query_create(param->string, param->string_len, &protocol->path[vector[i * 2]], substring_length);
 
-                if (query == NULL || query->key == NULL || query->value == NULL) return 0;
+                if (query == NULL || query->key == NULL || query->value == NULL) {
+                    query_free(query);
+                    return 0;
+                }
 
+                /* The chain head must land in protocol->query_: with no query
+                 * string in the location last_query starts NULL, and params
+                 * linked only through the local tail were invisible to
+                 * get_query and leaked (reset frees only protocol->query_). */
                 if (last_query)
                     last_query->next = query;
+                else
+                    protocol->query_ = query;
 
                 last_query = query;
             }
-
-            if (route->handler[protocol->method] == NULL) continue;
 
             if (!websockets_deferred_handler(connection, request, websockets_queue_request_handler, route->handler[protocol->method], websockets_queue_data_request_create, ratelimiter))
                 return 0;
@@ -220,20 +236,49 @@ int websockets_protocol_resource_payload_parse(websocketsparser_t* parser, char*
     }
 
     if (protocol->parser_stage == WSPROTRESOURCE_DATA) {
+        /* A chunk that ends exactly at the location-terminating space has no
+         * payload bytes yet: write(fd, p, 0) returns 0, which the write error
+         * check would misread and kill a legitimate fragmented request. */
+        const size_t remaining = length - offset;
+        if (remaining == 0)
+            return 1;
+
         if (!websocketsrequest_has_payload(protocol))
             return 0;
 
         if (!websockets_create_tmpfile(request->protocol, env()->main.tmp))
             return 0;
 
+        /* A failed lseek returns -1, which the unsigned comparison below
+         * would fold into a passing value and wave past the body-size limit. */
         off_t payloadlength = lseek(request->protocol->payload.fd, 0, SEEK_END);
-        if (payloadlength + length > env()->main.client_max_body_size)
+        if (payloadlength < 0)
             return 0;
 
-        int r = write(request->protocol->payload.fd, &string[offset], length - offset);
+        /* Only the payload bytes count against the limit: measuring the whole
+         * chunk also billed the method and location prefix on the first chunk. */
+        if ((size_t)payloadlength + remaining > env()->main.client_max_body_size)
+            return 0;
+
+        /* A single write may legally be short (EINTR, ENOSPC, rlimit);
+         * accepting a partial write here silently truncated the message
+         * handed to the handler, so write until every byte is on disk. */
+        size_t written = 0;
+        while (written < remaining) {
+            const ssize_t r = write(request->protocol->payload.fd, &string[offset + written], remaining - written);
+
+            if (r < 0) {
+                if (errno == EINTR)
+                    continue;
+                return 0;
+            }
+            if (r == 0)
+                return 0;
+
+            written += (size_t)r;
+        }
 
         lseek(request->protocol->payload.fd, 0, SEEK_SET);
-        if (r <= 0) return 0;
     }
 
     return 1;
@@ -307,11 +352,13 @@ int websocketsparser_parse_location(websockets_protocol_resource_t* protocol, ch
         case '?':
             path_point_end = pos;
 
-            int result = websocketsparser_set_query(protocol, string, length, pos);
-            if (result == 0)
-                goto next;
+            /* set_query reports failure as -1; returning it as-is leaked a
+             * truthy value to the caller (which only treats 0 as failure), so
+             * a failed query parse continued with no path set at all. */
+            if (websocketsparser_set_query(protocol, string, length, pos) != 0)
+                return 0;
 
-            return result;
+            goto next;
         case '#':
             path_point_end = pos;
             goto next;
@@ -326,8 +373,10 @@ int websocketsparser_parse_location(websockets_protocol_resource_t* protocol, ch
 }
 
 int websocketsparser_append_uri(websockets_protocol_resource_t* protocol, const char* string, size_t length) {
+    /* The caller treats only -1 as an error, so reporting a failed realloc
+     * as 0 silently dropped this chunk from the middle of the uri. */
     char* data = realloc(protocol->uri, protocol->uri_length + length + 1);
-    if (data == NULL) return 0;
+    if (data == NULL) return -1;
 
     protocol->uri = data;
 
@@ -419,6 +468,11 @@ int set_websockets_resource(connection_t* connection, void* data) {
         if (ws_deflate_start(&parser->ws_deflate)) {
             parser->ws_deflate_enabled = 1;
         }
+        else
+            /* Degrade, but not silently: the 101 response already advertised
+             * permessage-deflate, so every compressed message from this client
+             * will now be rejected as a bad request. */
+            log_error("set_websockets_resource: ws_deflate_start failed, compressed frames will be rejected\n");
     }
 
     return 1;

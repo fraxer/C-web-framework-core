@@ -2,6 +2,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "log.h"
 #include "websocketsserverhandlers.h"
 #include "websocketsprotocoldefault.h"
 #include "websocketsresponse.h"
@@ -124,6 +125,11 @@ int set_websockets_default(connection_t* connection, void* data) {
         if (ws_deflate_start(&parser->ws_deflate)) {
             parser->ws_deflate_enabled = 1;
         }
+        else
+            /* Degrade, but not silently: the 101 response already advertised
+             * permessage-deflate, so every compressed message from this client
+             * will now be rejected as a bad request. */
+            log_error("set_websockets_default: ws_deflate_start failed, compressed frames will be rejected\n");
     }
 
     return 1;

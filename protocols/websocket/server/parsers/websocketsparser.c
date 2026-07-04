@@ -10,8 +10,6 @@ int websocketsparser_parse_second_byte(websocketsparser_t*);
 int websocketsparser_parse_payload_length_126(websocketsparser_t*);
 int websocketsparser_parse_payload_length_127(websocketsparser_t*);
 int websocketsparser_parse_mask(websocketsparser_t*);
-int websocketsparser_parse_method(websocketsparser_t*);
-int websocketsparser_parse_location(websocketsparser_t*);
 int websocketsparser_parse_payload(websocketsparser_t*);
 int websocketsparser_decompress_chunk(websocketsparser_t*, const char*, size_t, int is_final);
 int websocketsparser_string_append(websocketsparser_t*);

@@ -29,10 +29,15 @@ static int __finish_pair(query_t* query, const char* string,
     query->key = urldecode(&string[key_start], key_end - key_start);
     if (!query->key) return 0;
 
-    if (has_value) {
+    /* A key without '=' gets an empty value, never NULL, as the header
+     * contract documents: consumers treat value as a string - query_stringify
+     * ran strlen(NULL) on it and get_query reported ok=1 with a NULL value. */
+    if (has_value)
         query->value = urldecode(&string[value_start], value_end - value_start);
-        if (!query->value) return 0;
-    }
+    else
+        query->value = urldecode("", 0);
+
+    if (!query->value) return 0;
 
     return 1;
 }
