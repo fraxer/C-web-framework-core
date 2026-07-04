@@ -430,9 +430,106 @@ TEST(test_wsresp_double_send_replaces_frame) {
     free_response(response, conn);
 }
 
+TEST(test_wsresp_binary_uses_strlen) {
+    /* websocketsresponse_binary is its own strlen wrapper; only its NULL guard
+     * is exercised elsewhere, so cover the measuring path with real data. */
+    TEST_CASE("send_binary measures the string itself");
+
+    connection_t* conn = NULL;
+    websocketsresponse_t* response = make_response(&conn);
+    TEST_REQUIRE_NOT_NULL(response, "response allocated");
+
+    response->send_binary(response, "abc");
+
+    TEST_ASSERT_EQUAL_UINT(0x82, response->frame_code, "FIN + binary opcode");
+    TEST_ASSERT_EQUAL_SIZE(5, response->body.size, "2-byte header + 3-byte payload");
+    TEST_ASSERT(memcmp(response->body.data + 2, "abc", 3) == 0, "payload copied");
+
+    free_response(response, conn);
+}
+
+TEST(test_wsresp_binaryn_extended_length_header) {
+    TEST_CASE("126-byte binary payload uses the 16-bit header");
+
+    connection_t* conn = NULL;
+    websocketsresponse_t* response = make_response(&conn);
+    TEST_REQUIRE_NOT_NULL(response, "response allocated");
+
+    char payload[126];
+    memset(payload, 0xAB, sizeof(payload));
+
+    response->send_binaryn(response, payload, sizeof(payload));
+
+    TEST_ASSERT_EQUAL_UINT(0x82, response->frame_code, "FIN + binary opcode");
+    TEST_ASSERT_EQUAL_SIZE(130, response->body.size, "4-byte header + 126-byte payload");
+
+    size_t parsed_length = 0;
+    const ssize_t offset = frame_payload_offset(response, &parsed_length);
+    TEST_ASSERT_EQUAL(4, offset, "payload starts after extended header");
+    TEST_ASSERT_EQUAL_SIZE(126, parsed_length, "parsed length matches");
+    TEST_ASSERT(memcmp(response->body.data + offset, payload, sizeof(payload)) == 0, "payload copied");
+
+    free_response(response, conn);
+}
+
+TEST(test_wsresp_null_data_zero_length_is_empty_frame) {
+    /* The textn/binaryn guard rejects only NULL data with a *positive* length;
+     * NULL with length 0 falls through and builds a valid empty frame, unlike
+     * the strlen wrappers (send_text/send_binary) which bail on NULL outright. */
+    TEST_CASE("NULL data with zero length builds an empty frame, not a noop");
+
+    connection_t* conn = NULL;
+    websocketsresponse_t* response = make_response(&conn);
+    TEST_REQUIRE_NOT_NULL(response, "response allocated");
+
+    response->send_textn(response, NULL, 0);
+    TEST_ASSERT_EQUAL_UINT(0x81, response->frame_code, "empty text frame built");
+    TEST_ASSERT_EQUAL_SIZE(2, response->body.size, "header only");
+    TEST_ASSERT_EQUAL_UINT(0, (unsigned char)response->body.data[1], "zero payload length");
+
+    response->send_binaryn(response, NULL, 0);
+    TEST_ASSERT_EQUAL_UINT(0x82, response->frame_code, "empty binary frame built");
+    TEST_ASSERT_EQUAL_SIZE(2, response->body.size, "header only");
+    TEST_ASSERT_EQUAL_UINT(0, (unsigned char)response->body.data[1], "zero payload length");
+
+    free_response(response, conn);
+}
+
 // ============================================================================
 // send_data / send_datan
 // ============================================================================
+
+TEST(test_wsresp_data_strlen_wrapper_and_null_guards) {
+    /* websocketsresponse_data is its own strlen wrapper over send_datan, with a
+     * NULL short-circuit; send_datan has no guard and delegates NULL handling
+     * to textn/binaryn. */
+    TEST_CASE("send_data measures the string; NULL data is a noop on both paths");
+
+    connection_t* conn = NULL;
+    websocketsresponse_t* response = make_response(&conn);
+    TEST_REQUIRE_NOT_NULL(response, "response allocated");
+
+    websocketsrequest_t request;
+    memset(&request, 0, sizeof(request));
+    wsctx_t wsctx = { .request = &request, .response = response, .user_data = NULL };
+
+    /* strlen wrapper: a real payload is measured and dispatched by type. */
+    request.type = WEBSOCKETS_TEXT;
+    response->send_data(&wsctx, "ping");
+    TEST_ASSERT_EQUAL_UINT(0x81, response->frame_code, "strlen text reply");
+    TEST_ASSERT_EQUAL_SIZE(6, response->body.size, "2-byte header + 4-byte payload");
+    TEST_ASSERT(memcmp(response->body.data + 2, "ping", 4) == 0, "strlen payload copied");
+
+    /* NULL short-circuit in websocketsresponse_data: the prior frame is untouched. */
+    response->send_data(&wsctx, NULL);
+    TEST_ASSERT_EQUAL_SIZE(6, response->body.size, "send_data(NULL) leaves the prior frame");
+
+    /* send_datan forwards NULL + positive length to textn, which rejects it. */
+    response->send_datan(&wsctx, NULL, 4);
+    TEST_ASSERT_EQUAL_SIZE(6, response->body.size, "send_datan(NULL, n) leaves the prior frame");
+
+    free_response(response, conn);
+}
 
 TEST(test_wsresp_datan_follows_request_type) {
     TEST_SUITE("websocketsresponse: send_data");
@@ -530,6 +627,54 @@ TEST(test_wsresp_close_frame) {
 
     websocketsresponse_close(response, NULL, 7);
     TEST_ASSERT_EQUAL_UINT(0, (unsigned char)response->body.data[1], "NULL data becomes an empty close");
+
+    free_response(response, conn);
+}
+
+TEST(test_wsresp_close_clamps_control_payload) {
+    /* websocketsresponse_close has its own independent >125 clamp (mirroring
+     * pong); only the pong clamp is exercised elsewhere. */
+    TEST_CASE("close frame payload is clamped to 125 bytes");
+
+    connection_t* conn = NULL;
+    websocketsresponse_t* response = make_response(&conn);
+    TEST_REQUIRE_NOT_NULL(response, "response allocated");
+
+    char payload[200];
+    for (size_t i = 0; i < sizeof(payload); i++)
+        payload[i] = (char)('a' + i % 26);
+
+    websocketsresponse_close(response, payload, sizeof(payload));
+
+    TEST_ASSERT_EQUAL_UINT(0x88, response->frame_code, "FIN + close opcode");
+    TEST_ASSERT_EQUAL_SIZE(127, response->body.size, "2-byte header + 125-byte payload");
+    TEST_ASSERT_EQUAL_UINT(125, (unsigned char)response->body.data[1], "length clamped to 125");
+    TEST_ASSERT(memcmp(response->body.data + 2, payload, 125) == 0, "first 125 bytes kept");
+
+    free_response(response, conn);
+}
+
+TEST(test_wsresp_control_payload_exactly_125) {
+    /* 125 is the RFC 6455 control-frame ceiling and must pass through in full,
+     * not be clipped by the clamp. */
+    TEST_CASE("125-byte control payload is accepted without clamping");
+
+    connection_t* conn = NULL;
+    websocketsresponse_t* response = make_response(&conn);
+    TEST_REQUIRE_NOT_NULL(response, "response allocated");
+
+    char payload[125];
+    memset(payload, 'z', sizeof(payload));
+
+    websocketsresponse_pong(response, payload, sizeof(payload));
+    TEST_ASSERT_EQUAL_UINT(0x8A, response->frame_code, "pong opcode");
+    TEST_ASSERT_EQUAL_SIZE(127, response->body.size, "2-byte header + full 125-byte payload");
+    TEST_ASSERT_EQUAL_UINT(125, (unsigned char)response->body.data[1], "length preserved at 125");
+
+    websocketsresponse_close(response, payload, sizeof(payload));
+    TEST_ASSERT_EQUAL_UINT(0x88, response->frame_code, "close opcode");
+    TEST_ASSERT_EQUAL_SIZE(127, response->body.size, "2-byte header + full 125-byte payload");
+    TEST_ASSERT_EQUAL_UINT(125, (unsigned char)response->body.data[1], "length preserved at 125");
 
     free_response(response, conn);
 }
@@ -841,6 +986,30 @@ TEST(test_wsresp_default_after_file) {
     free_response(response, conn);
     unlink(file_path);
     rmdir(root);
+}
+
+TEST(test_wsresp_default_null_text_resets_only) {
+    /* default(NULL) runs reset and then forwards NULL to send_text, which
+     * short-circuits: the response is cleared but no error/empty frame is
+     * emitted. */
+    TEST_CASE("default(NULL) clears prior state and emits no frame");
+
+    connection_t* conn = NULL;
+    websocketsresponse_t* response = make_response(&conn);
+    TEST_REQUIRE_NOT_NULL(response, "response allocated");
+
+    /* Put the response in a non-clean state first. */
+    response->send_textn(response, "stale", 5);
+    TEST_REQUIRE_NOT_NULL(response->body.data, "prior frame prepared");
+    TEST_REQUIRE(response->body.size == 7, "prior frame sized");
+
+    websocketsresponse_default(response, NULL);
+
+    TEST_ASSERT_EQUAL_UINT(0, response->frame_code, "frame_code cleared by reset");
+    TEST_ASSERT_NULL(response->body.data, "no frame built from NULL text");
+    TEST_ASSERT_EQUAL_SIZE(0, response->body.size, "body cleared by reset");
+
+    free_response(response, conn);
 }
 
 // ============================================================================

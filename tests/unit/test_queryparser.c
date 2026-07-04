@@ -109,7 +109,10 @@ TEST(test_parse_single_key_value) {
 
 TEST(test_parse_key_without_value) {
     TEST_SUITE("queryparser_parse");
-    TEST_CASE("Key without value gets NULL value");
+    /* REGRESSION: a key without '=' left value NULL despite the documented
+     * "key3 becomes {key: "key3", value: ""}" contract; query_stringify ran
+     * strlen(NULL) on it and ws/http get_query reported ok=1 with NULL. */
+    TEST_CASE("Key without value gets an empty value");
 
     query_t* first = NULL;
     query_t* last = NULL;
@@ -119,7 +122,7 @@ TEST(test_parse_key_without_value) {
     TEST_ASSERT_EQUAL(QUERYPARSER_OK, result, "Parse should succeed");
     TEST_ASSERT_NOT_NULL(first, "First query should not be NULL");
     TEST_ASSERT_STR_EQUAL("keyonly", first->key, "Key should match");
-    TEST_ASSERT_NULL(first->value, "Value should be NULL");
+    TEST_ASSERT_STR_EQUAL("", first->value, "Value should be an empty string");
     TEST_ASSERT_NULL(first->next, "Should have only one query");
 
     queries_free(first);
@@ -292,7 +295,7 @@ TEST(test_parse_fragment_after_key) {
     TEST_ASSERT_EQUAL(QUERYPARSER_OK, result, "Parse should succeed");
     TEST_ASSERT_EQUAL_SIZE(1, query_count(first), "Should have 1 param");
     TEST_ASSERT_STR_EQUAL("keyonly", first->key, "Key should match");
-    TEST_ASSERT_NULL(first->value, "Value should be NULL");
+    TEST_ASSERT_STR_EQUAL("", first->value, "Value should be an empty string");
 
     queries_free(first);
 }
@@ -314,7 +317,7 @@ TEST(test_parse_empty_string) {
     TEST_ASSERT_EQUAL_SIZE(1, query_count(first), "Should have 1 query node");
     TEST_ASSERT_NOT_NULL(first->key, "Key should not be NULL");
     TEST_ASSERT_STR_EQUAL("", first->key, "Key should be empty string");
-    TEST_ASSERT_NULL(first->value, "Value should be NULL");
+    TEST_ASSERT_STR_EQUAL("", first->value, "Value should be an empty string");
 
     queries_free(first);
 }
@@ -365,9 +368,9 @@ TEST(test_parse_only_ampersand) {
     TEST_ASSERT_EQUAL(QUERYPARSER_OK, result, "Parse should succeed");
     TEST_ASSERT_EQUAL_SIZE(2, query_count(first), "Should have 2 query nodes");
     TEST_ASSERT_STR_EQUAL("", first->key, "First key should be empty");
-    TEST_ASSERT_NULL(first->value, "First value should be NULL");
+    TEST_ASSERT_STR_EQUAL("", first->value, "First value should be an empty string");
     TEST_ASSERT_STR_EQUAL("", first->next->key, "Second key should be empty");
-    TEST_ASSERT_NULL(first->next->value, "Second value should be NULL");
+    TEST_ASSERT_STR_EQUAL("", first->next->value, "Second value should be an empty string");
 
     queries_free(first);
 }
@@ -385,7 +388,7 @@ TEST(test_parse_trailing_ampersand) {
     TEST_ASSERT_EQUAL_SIZE(2, query_count(first), "Should have 2 queries");
     TEST_ASSERT_STR_EQUAL("a", first->key, "First key");
     TEST_ASSERT_STR_EQUAL("1", first->value, "First value");
-    TEST_ASSERT_NULL(first->next->value, "Second value should be NULL");
+    TEST_ASSERT_STR_EQUAL("", first->next->value, "Second value should be an empty string");
 
     queries_free(first);
 }
@@ -402,7 +405,7 @@ TEST(test_parse_leading_ampersand) {
     TEST_ASSERT_EQUAL(QUERYPARSER_OK, result, "Parse should succeed");
     TEST_ASSERT_EQUAL_SIZE(2, query_count(first), "Should have 2 queries");
     TEST_ASSERT_STR_EQUAL("", first->key, "First key should be empty");
-    TEST_ASSERT_NULL(first->value, "First value should be NULL");
+    TEST_ASSERT_STR_EQUAL("", first->value, "First value should be an empty string");
     TEST_ASSERT_STR_EQUAL("b", first->next->key, "Second key");
     TEST_ASSERT_STR_EQUAL("2", first->next->value, "Second value");
 
