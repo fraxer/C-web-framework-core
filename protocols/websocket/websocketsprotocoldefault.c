@@ -1,4 +1,6 @@
+#include <errno.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "websocketsserverhandlers.h"
 #include "websocketsprotocoldefault.h"
@@ -53,40 +55,71 @@ int websockets_protocol_default_payload_parse(websocketsparser_t* parser, char* 
         for (size_t i = 0; i < length; i++)
             string[i] ^= parser->frame.mask[parser->payload_index++ % 4];
 
+    /* An empty chunk is a valid call: write(fd, p, 0) below returns 0, which
+     * the error check would misread as a failed write and kill the connection. */
+    if (length == 0)
+        return 1;
+
     const char* tmp_dir = env()->main.tmp;
     if (!websockets_create_tmpfile(request->protocol, tmp_dir))
         return 0;
 
+    /* A failed lseek returns -1, which the unsigned comparison below would
+     * fold into length - 1 and wave past the body-size limit. */
     off_t payloadlength = lseek(request->protocol->payload.fd, 0, SEEK_END);
-    if (payloadlength + length > env()->main.client_max_body_size)
+    if (payloadlength < 0)
         return 0;
 
-    int r = write(request->protocol->payload.fd, string, length);
+    if ((size_t)payloadlength + length > env()->main.client_max_body_size)
+        return 0;
+
+    /* A single write may legally be short (EINTR, ENOSPC, rlimit); accepting
+     * a partial write here silently truncated the message handed to the
+     * handler, so write until every byte of the chunk is on disk. */
+    size_t written = 0;
+    while (written < length) {
+        const ssize_t r = write(request->protocol->payload.fd, string + written, length - written);
+
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            return 0;
+        }
+        if (r == 0)
+            return 0;
+
+        written += (size_t)r;
+    }
+
     lseek(request->protocol->payload.fd, 0, SEEK_SET);
-    if (r <= 0) return 0;
-    
+
     return 1;
 }
 
 int set_websockets_default(connection_t* connection, void* data) {
-    connection->read = websockets_guard_read;
-    connection->write = websockets_guard_write;
+    /* Create the replacement parser before touching connection state: the
+     * caller (connection_after_write) ignores this function's result, so
+     * installing the websocket guards or freeing the old parser first left a
+     * connection whose guard read dereferences ctx->parser == NULL. On
+     * failure the connection must keep its previous protocol intact. */
+    websocketsparser_t* parser = websocketsparser_create(connection, websockets_protocol_default_create);
+    if (parser == NULL)
+        return 0;
 
     connection_server_ctx_t* ctx = connection->ctx;
 
     if (ctx->parser != NULL) {
-        requestparser_t* parser = ctx->parser;
-        parser->free(parser);
+        requestparser_t* old_parser = ctx->parser;
+        old_parser->free(old_parser);
     }
 
-    ctx->parser = websocketsparser_create(connection, websockets_protocol_default_create);
-    if (ctx->parser == NULL)
-        return 0;
+    ctx->parser = parser;
+    connection->read = websockets_guard_read;
+    connection->write = websockets_guard_write;
 
     /* Initialize deflate if negotiated during handshake */
     ws_handshake_data_t* handshake_data = data;
     if (handshake_data != NULL && handshake_data->deflate_enabled) {
-        websocketsparser_t* parser = ctx->parser;
         parser->ws_deflate.config = handshake_data->deflate_config;
         if (ws_deflate_start(&parser->ws_deflate)) {
             parser->ws_deflate_enabled = 1;

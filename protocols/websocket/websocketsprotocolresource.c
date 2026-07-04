@@ -392,24 +392,29 @@ int websocketsrequest_has_payload(websockets_protocol_resource_t* protocol) {
 
 
 int set_websockets_resource(connection_t* connection, void* data) {
-    connection->read = websockets_guard_read;
-    connection->write = websockets_guard_write;
+    /* Create the replacement parser before touching connection state: the
+     * caller (connection_after_write) ignores this function's result, so
+     * installing the websocket guards or freeing the old parser first left a
+     * connection whose guard read dereferences ctx->parser == NULL. On
+     * failure the connection must keep its previous protocol intact. */
+    websocketsparser_t* parser = websocketsparser_create(connection, websockets_protocol_resource_create);
+    if (parser == NULL)
+        return 0;
 
     connection_server_ctx_t* ctx = connection->ctx;
 
     if (ctx->parser != NULL) {
-        requestparser_t* parser = ctx->parser;
-        parser->free(parser);
+        requestparser_t* old_parser = ctx->parser;
+        old_parser->free(old_parser);
     }
 
-    ctx->parser = websocketsparser_create(connection, websockets_protocol_resource_create);
-    if (ctx->parser == NULL)
-        return 0;
+    ctx->parser = parser;
+    connection->read = websockets_guard_read;
+    connection->write = websockets_guard_write;
 
     /* Initialize deflate if negotiated during handshake */
     ws_handshake_data_t* handshake_data = data;
     if (handshake_data != NULL && handshake_data->deflate_enabled) {
-        websocketsparser_t* parser = ctx->parser;
         parser->ws_deflate.config = handshake_data->deflate_config;
         if (ws_deflate_start(&parser->ws_deflate)) {
             parser->ws_deflate_enabled = 1;
