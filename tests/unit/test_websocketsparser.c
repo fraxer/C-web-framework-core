@@ -365,13 +365,23 @@ TEST(test_wsp_length_127) {
      * buffer, so it arrives in two reads exactly as in production. This also
      * exercises mask-key continuity over a very large payload. */
     const size_t len = 70000;
+    /* Allocate every scratch buffer up front and guard them with one check so
+     * the test never returns mid-function with a prior allocation still live
+     * (the framework's TEST_REQUIRE* macros return early on failure). */
     unsigned char* payload = malloc(len);
-    TEST_REQUIRE_NOT_NULL(payload, "payload alloc");
+    unsigned char* frame = malloc(len + 32);
+    unsigned char* verify = malloc(len);
+    if (payload == NULL || frame == NULL || verify == NULL) {
+        free(payload);
+        free(frame);
+        free(verify);
+        harness_free(&h);
+        TEST_REQUIRE(0, "payload/frame/verify alloc");
+        return;
+    }
+
     for (size_t i = 0; i < len; i++) payload[i] = (unsigned char)((i * 7) & 0xFF);
 
-    const size_t frame_cap = len + 32;
-    unsigned char* frame = malloc(frame_cap);
-    TEST_REQUIRE_NOT_NULL(frame, "frame alloc");
     size_t frame_size = build_frame(frame, WSOPCODE_BINARY, 1, payload, len);
     TEST_ASSERT_EQUAL_SIZE(10 + 4 + len, frame_size, "127 frame layout (2+8 len, mask, payload)");
 
@@ -382,8 +392,6 @@ TEST(test_wsp_length_127) {
     file_content_t fc = websocketsrequest_payload_file(h.parser->request->protocol);
     TEST_ASSERT_EQUAL(1, fc.ok, "payload file valid");
     TEST_ASSERT_EQUAL_SIZE(len, fc.size, "payload size");
-    unsigned char* verify = malloc(len);
-    TEST_REQUIRE_NOT_NULL(verify, "verify alloc");
     ssize_t total = 0;
     while ((size_t)total < len) {
         ssize_t n = pread(fc.fd, verify + total, len - total, total);
