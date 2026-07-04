@@ -87,12 +87,6 @@ websocketsrequest_t* websocketsrequest_create(connection_t* connection, websocke
 
 
 /**
- * Reset request for continuation frame (preserves fragmented state).
- * @param request Request to reset
- */
-void websocketsrequest_reset_continue(websocketsrequest_t* request);
-
-/**
  * Free request and associated protocol.
  * @param arg Request to free (cast to websocketsrequest_t*)
  */
@@ -120,7 +114,7 @@ file_content_t websocketsrequest_payload_file(websockets_protocol_t* protocol);
 json_doc_t* websocketsrequest_payload_json(websockets_protocol_t* protocol);
 
 /**
- * Initialize protocol payload fields (fd=0, path=NULL).
+ * Initialize protocol payload fields (fd=-1, path=NULL).
  * @param protocol Protocol to initialize
  */
 void websockets_protocol_init_payload(websockets_protocol_t* protocol);
