@@ -237,12 +237,20 @@ int __deferred_handler(connection_t* connection, httprequest_t* request, httpres
 
     connection_server_ctx_t* ctx = connection->ctx;
     const int queue_empty = cqueue_empty(ctx->queue);
-    cqueue_append(ctx->queue, item);
+
+    if (!cqueue_append(ctx->queue, item)) {
+        item->free(item);
+        return 0;
+    }
 
     if (!queue_empty)
         return 1;
 
     if (!connection_queue_append(item)) {
+        /* The item is already in ctx->queue: freeing it in place left a
+         * dangling pointer that the worker thread or __ctx_free freed again.
+         * It was appended to an empty queue, so pop takes this same item. */
+        cqueue_pop(ctx->queue);
         item->free(item);
         return 0;
     }

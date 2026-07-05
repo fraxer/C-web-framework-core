@@ -1,6 +1,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 
 #include "log.h"
 #include "route.h"
@@ -26,7 +27,7 @@ static void __queue_data_request_free(void* arg);
 static void __queue_response_handler(void* arg);
 static void* __queue_data_response_create(connection_t* connection, void* component, ratelimiter_t* ratelimiter);
 static void __queue_data_response_free(void* arg);
-static int __post_response_default(connection_t* connection, const char* status_text);
+static int __post_close_default(connection_t* connection, unsigned short status_code, const char* reason);
 static int __post_response(websocketsresponse_t* response);
 static int __post_deffered_response(websocketsresponse_t* response);
 
@@ -77,9 +78,9 @@ int __read(connection_t* connection) {
                 case WSPARSER_OUT_OF_MEMORY:
                     return 0;
                 case WSPARSER_PAYLOAD_LARGE:
-                    return __post_response_default(connection, "Payload large");
+                    return __post_close_default(connection, 1009, "Payload large");
                 case WSPARSER_BAD_REQUEST:
-                    return __post_response_default(connection, "Bad request");
+                    return __post_close_default(connection, 1002, "Bad request");
                 case WSPARSER_CONTINUE:
                     goto read_data;
                 case WSPARSER_HANDLE_AND_CONTINUE:
@@ -112,8 +113,15 @@ int __write(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
     websocketsresponse_t* response = ctx->response;
 
-    if (response->body.data == NULL)
+    /* A write event with no staged response (spurious EPOLLOUT, a handler
+     * that never called send_*) must not dereference NULL. */
+    if (response == NULL)
         return 0;
+
+    /* A handler is allowed not to reply (push-style flows): finish the write
+     * phase as a no-op — closing here punished every silent handler. */
+    if (response->body.data == NULL)
+        return connection_after_write(connection);
 
     // body
     if (response->body.pos < response->body.size) {
@@ -122,13 +130,18 @@ int __write(connection_t* connection) {
         if (size > connection->buffer_size)
             size = connection->buffer_size;
 
-        ssize_t writed = connection_data_write(connection, &response->body.data[response->body.pos], size);
+        const ssize_t writed = connection_data_write(connection, &response->body.data[response->body.pos], size);
 
-        if (writed == -1) return 0;
+        /* EAGAIN/EINTR are not fatal: the socket buffer is full (the peer is
+         * slow), the event loop will call us again on the next EPOLLOUT. */
+        if (writed < 0)
+            return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
 
         response->body.pos += writed;
 
-        if ((size_t)writed == connection->buffer_size) return 1;
+        /* A short write leaves the tail of the frame unsent: finishing here
+         * (falling through to connection_after_write) would truncate it. */
+        if (response->body.pos < response->body.size) return 1;
     }
 
     // file
@@ -140,11 +153,20 @@ int __write(connection_t* connection) {
         if (size > connection->buffer_size)
             size = connection->buffer_size;
 
-        size_t readed = read(response->file_.fd, connection->buffer, size);
+        const ssize_t readed = read(response->file_.fd, connection->buffer, size);
 
-        ssize_t writed = connection_data_write(connection, connection->buffer, readed);
+        /* read() failure folded into size_t handed send() an SIZE_MAX-sized
+         * buffer; 0 (file truncated behind us) would spin the event loop
+         * forever since pos never advances. */
+        if (readed < 0)
+            return errno == EINTR;
+        if (readed == 0)
+            return 0;
 
-        if (writed == -1) return 0;
+        const ssize_t writed = connection_data_write(connection, connection->buffer, (size_t)readed);
+
+        if (writed < 0)
+            return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
 
         response->file_.pos += writed;
 
@@ -187,6 +209,13 @@ int __handle(websocketsparser_t* parser, deferred_handler handler) {
     if (parser->request->protocol->get_resource(connection, parser->request))
         return 1;
 
+    /* Not dispatched (no matching route or the queue rejected it): ownership
+     * never left the parser, and the parser drops its pointer on reset/
+     * prepare_remains without freeing — so every message to an unknown route
+     * leaked its request. */
+    websocketsrequest_free(parser->request);
+    parser->request = NULL;
+
     websocketsresponse_t* response = websocketsresponse_create(connection);
     if (response == NULL) return 0;
 
@@ -210,7 +239,6 @@ void websockets_queue_request_handler(void* arg) {
     conn_ctx->response = response;
 
     if (!ratelimiter_allow(data->ratelimiter, item->connection->remote_ip, 1)) {
-        websocketsresponse_t* response = conn_ctx->response;
         websocketsresponse_default(response, "Too Many Requests");
         connection_after_read(item->connection);
         return;
@@ -251,11 +279,28 @@ void __queue_data_request_free(void* arg) {
     free(data);
 }
 
-int __post_response_default(connection_t* connection, const char* status_text) {
+/* RFC 6455 §7.1.7: a protocol error fails the connection — reply with a CLOSE
+ * frame carrying the status code and stop reading the (now desynced) stream.
+ * Replying with a text frame kept the connection parsing garbage. */
+int __post_close_default(connection_t* connection, unsigned short status_code, const char* reason) {
     websocketsresponse_t* response = websocketsresponse_create(connection);
     if (response == NULL) return 0;
 
-    websocketsresponse_default(response, status_text);
+    char payload[125]; /* RFC 6455 §5.5: control frame payload limit */
+    size_t length = 0;
+
+    payload[length++] = (char)((status_code >> 8) & 0xFF);
+    payload[length++] = (char)(status_code & 0xFF);
+
+    size_t reason_length = strlen(reason);
+    if (reason_length > sizeof(payload) - length)
+        reason_length = sizeof(payload) - length;
+
+    memcpy(payload + length, reason, reason_length);
+    length += reason_length;
+
+    websocketsresponse_close(response, payload, length);
+    connection->keepalive = 0;
 
     return __post_response(response);
 }
@@ -270,15 +315,29 @@ int __post_response(websocketsresponse_t* response) {
         return connection_after_read(connection);
     }
 
-    return websockets_deferred_handler(connection, response, __queue_response_handler, NULL, __queue_data_response_create, NULL);
+    /* On queueing failure ownership stays here (see websockets_deferred_handler
+     * contract): the caller only sees 0 and closes the connection. */
+    if (!websockets_deferred_handler(connection, response, __queue_response_handler, NULL, __queue_data_response_create, NULL)) {
+        response->base.free(response);
+        return 0;
+    }
+
+    return 1;
 }
 
 int __post_deffered_response(websocketsresponse_t* response) {
     connection_t* connection = response->connection;
 
-    return websockets_deferred_handler(connection, response, __queue_response_handler, NULL, __queue_data_response_create, NULL);
+    if (!websockets_deferred_handler(connection, response, __queue_response_handler, NULL, __queue_data_response_create, NULL)) {
+        response->base.free(response);
+        return 0;
+    }
+
+    return 1;
 }
 
+/* Queues the component for a worker thread. On failure returns 0 and the
+ * component's ownership stays with the caller (nothing here frees it). */
 int websockets_deferred_handler(connection_t* connection, void* component, queue_handler runner, queue_handler handle, queue_data_create data_create, ratelimiter_t* ratelimiter) {
     connection_queue_item_t* item = connection_queue_item_create();
     if (item == NULL) return 0;
@@ -295,12 +354,27 @@ int websockets_deferred_handler(connection_t* connection, void* component, queue
 
     connection_server_ctx_t* ctx = connection->ctx;
     const int queue_empty = cqueue_empty(ctx->queue);
-    cqueue_append(ctx->queue, item);
+
+    if (!cqueue_append(ctx->queue, item)) {
+        connection_queue_websockets_data_t* data = (connection_queue_websockets_data_t*)item->data;
+        data->request = NULL;
+        data->response = NULL;
+        item->free(item);
+        return 0;
+    }
 
     if (!queue_empty)
         return 1;
 
     if (!connection_queue_append(item)) {
+        /* The item is already in ctx->queue: freeing it in place left a
+         * dangling pointer that the worker thread or __ctx_free freed again.
+         * It was appended to an empty queue, so pop takes this same item. */
+        cqueue_pop(ctx->queue);
+
+        connection_queue_websockets_data_t* data = (connection_queue_websockets_data_t*)item->data;
+        data->request = NULL;
+        data->response = NULL;
         item->free(item);
         return 0;
     }
@@ -313,7 +387,10 @@ void __queue_response_handler(void* arg) {
     connection_queue_websockets_data_t* data = (connection_queue_websockets_data_t*)item->data;
     connection_server_ctx_t* conn_ctx = item->connection->ctx;
 
+    /* Ownership moves to the connection ctx; drop it from the item so
+     * __queue_data_response_free does not free what the ctx now owns. */
     conn_ctx->response = data->response;
+    data->response = NULL;
 
     connection_after_read(item->connection);
 }
@@ -338,6 +415,11 @@ void __queue_data_response_free(void* arg) {
     if (arg == NULL) return;
 
     connection_queue_websockets_data_t* data = arg;
+
+    /* Still owned by the item when it is discarded without running (the
+     * connection closed with responses queued): the response leaked. */
+    if (data->response != NULL)
+        data->response->base.free(data->response);
 
     free(data);
 }
