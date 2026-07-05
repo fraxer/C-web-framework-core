@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <limits.h>
 
 #include "storage.h"
 #include "log.h"
@@ -203,6 +204,11 @@ int __viewparser_readfile(viewparser_context_t* context, const char* restrict st
 
     file.close(&file);
 
+    if (context->buffer == NULL && context->bytes_readed > 0) {
+        context->bytes_readed = 0;
+        return 0;
+    }
+
     return 1;
 }
 
@@ -301,10 +307,8 @@ int __viewparser_parse_content(viewparser_t* parser) {
             case '}':
             {
                 if (context->symbol == VIEWPARSER_FIGFIGOPEN) {
-                    context->symbol = VIEWPARSER_FIGFIGCLOSE;
-                    context->stage = VIEWPARSER_TEXT;
-                    bufferdata_push(&parser->current_tag->result_content, ch);
-                    break;
+                    log_error("__viewparser_parse_content: empty variable tag\n");
+                    return 0;
                 }
                 if (context->symbol == VIEWPARSER_FIGFIGCLOSE) {
                     context->stage = VIEWPARSER_TEXT;
@@ -324,7 +328,11 @@ int __viewparser_parse_content(viewparser_t* parser) {
 
                 break;
             }
-            default: __viewparser_variable_write_body(parser, ch);
+            default:
+                if (context->symbol == VIEWPARSER_FIGFIGCLOSE)
+                    return 0;
+                if (!__viewparser_variable_write_body(parser, ch))
+                    return 0;
             }
 
             break;
@@ -362,7 +370,9 @@ int __viewparser_parse_content(viewparser_t* parser) {
                 goto start;
                 break;
             }
-            default: __viewparser_include_write_body(parser, ch);
+            default:
+                if (!__viewparser_include_write_body(parser, ch))
+                    return 0;
             }
 
             break;
@@ -410,6 +420,9 @@ int __viewparser_parse_content(viewparser_t* parser) {
             }
             default:
             {
+                if (context->symbol == VIEWPARSER_FIGPERCENTCLOSE)
+                    return 0;
+
                 bufferdata_push(&parser->variable_buffer, ch);
                 parser->current_context->symbol = VIEWPARSER_DEFAULT;
 
@@ -466,13 +479,24 @@ int __viewparser_parse_content(viewparser_t* parser) {
                 if (!__viewparser_condition_item_complete_name(parser))
                     return 0;
 
+                view_condition_item_t* tag_cond_item = (view_condition_item_t*)parser->current_tag;
+                if (!tag_cond_item->always_true
+                    && (tag_cond_item->base.last_item == NULL || tag_cond_item->base.last_item->name_length == 0)) {
+                    log_error("__viewparser_parse_content: empty condition expression\n");
+                    return 0;
+                }
+
                 context->symbol = VIEWPARSER_FIGFIGCLOSE;
 
                 break;
             }
-            default: __viewparser_variable_write_body(parser, ch);
+            default:
+                if (context->symbol == VIEWPARSER_FIGPERCENTCLOSE)
+                    return 0;
+                if (!__viewparser_variable_write_body(parser, ch))
+                    return 0;
             }
-            
+
             break;
         }
         case VIEWPARSER_LOOP_ITEM:
@@ -486,9 +510,11 @@ int __viewparser_parse_content(viewparser_t* parser) {
             {
                 return 0;
             }
-            default: __viewparser_loop_write_item(parser, ch);
+            default:
+                if (!__viewparser_loop_write_item(parser, ch))
+                    return 0;
             }
-            
+
             break;
         }
         case VIEWPARSER_LOOP_INDEX:
@@ -502,9 +528,11 @@ int __viewparser_parse_content(viewparser_t* parser) {
             {
                 return 0;
             }
-            default: __viewparser_loop_write_index(parser, ch);
+            default:
+                if (!__viewparser_loop_write_index(parser, ch))
+                    return 0;
             }
-            
+
             break;
         }
         case VIEWPARSER_LOOP_IN:
@@ -518,9 +546,11 @@ int __viewparser_parse_content(viewparser_t* parser) {
             {
                 return 0;
             }
-            default: __viewparser_loop_write_in(parser, ch);
+            default:
+                if (!__viewparser_loop_write_in(parser, ch))
+                    return 0;
             }
-            
+
             break;
         }
         case VIEWPARSER_LOOP_VAR:
@@ -554,6 +584,11 @@ int __viewparser_parse_content(viewparser_t* parser) {
                     return 0;
 
                 view_loop_t* tag_for = (view_loop_t*)parser->current_tag;
+                if (tag_for->base.last_item == NULL || tag_for->base.last_item->name_length == 0) {
+                    log_error("__viewparser_parse_content: empty loop collection name\n");
+                    return 0;
+                }
+
                 if (tag_for->key_name[0] == 0) {
                     if (strcmp(tag_for->element_name, "index") == 0)
                         return 0;
@@ -565,14 +600,23 @@ int __viewparser_parse_content(viewparser_t* parser) {
 
                 break;
             }
-            default: __viewparser_variable_write_body(parser, ch);
+            default:
+                if (context->symbol == VIEWPARSER_FIGPERCENTCLOSE)
+                    return 0;
+                if (!__viewparser_variable_write_body(parser, ch))
+                    return 0;
             }
-            
+
             break;
         }
         default:
             break;
         }
+    }
+
+    if (parser->current_context->stage != VIEWPARSER_TEXT) {
+        log_error("__viewparser_parse_content: unexpected end of template\n");
+        return 0;
     }
 
     if (parser->current_context->parent != NULL) {
@@ -581,6 +625,11 @@ int __viewparser_parse_content(viewparser_t* parser) {
         parser->level--;
 
         goto start;
+    }
+
+    if (parser->current_tag != parser->root_tag) {
+        log_error("__viewparser_parse_content: unclosed tag at end of template\n");
+        return 0;
     }
 
     return 1;
@@ -697,7 +746,7 @@ int __viewparser_variable_item_complete_index(viewparser_t* parser) {
 
     if (variable_item_size > 0) {
         const char* value = bufferdata_get(&parser->variable_buffer);
-        int index = 0;
+        long long index = 0;
 
         for (size_t i = 0; i < variable_item_size; i++) {
             if (value[i] < '0' || value[i] > '9') {
@@ -708,8 +757,13 @@ int __viewparser_variable_item_complete_index(viewparser_t* parser) {
             index = index * 10 + (value[i] - '0');
         }
 
+        if (index > INT_MAX) {
+            log_error("__viewparser_variable_item_complete_index: index is greater than INT_MAX");
+            return 0;
+        }
+
         view_tag_t* variable = parser->current_tag;
-        if (!__viewparser_variable_item_index_create(variable->last_item, index)) {
+        if (!__viewparser_variable_item_index_create(variable->last_item, (int)index)) {
             log_error("__viewparser_variable_item_complete_index: __viewparser_variable_item_index_create failed");
             return 0;
         }
@@ -838,6 +892,11 @@ int __viewparser_variable_write_body(viewparser_t* parser, const char ch) {
         break;
     }
     default:
+        // a name character after "name " means a space inside the
+        // variable name — reject instead of silently concatenating
+        if (context->symbol == VIEWPARSER_VARIABLE_SPACE && bufferdata_writed(&parser->variable_buffer) > 0)
+            return 0;
+
         context->symbol = VIEWPARSER_DEFAULT;
         bufferdata_push(&parser->variable_buffer, ch);
         break;
@@ -1056,29 +1115,32 @@ int __viewparser_include_load_content(viewparser_t* parser) {
         return 0;
     }
 
-    if (path_size > 0) {
-        viewparser_context_t* context = __viewparser_context_create();
-        if (context == NULL) {
-            log_error("__viewparser_include_load_content: failed to create context for include");
-            return 0;
-        }
+    if (path_size == 0) {
+        log_error("__viewparser_include_load_content: include path is empty");
+        return 0;
+    }
 
-        context->parent = parser->current_context;
+    viewparser_context_t* context = __viewparser_context_create();
+    if (context == NULL) {
+        log_error("__viewparser_include_load_content: failed to create context for include");
+        return 0;
+    }
 
-        if (parser->current_context->child == NULL)
-            parser->current_context->child = context;
+    context->parent = parser->current_context;
 
-        if (parser->current_context->last_child != NULL)
-            parser->current_context->last_child->next = context;
+    if (parser->current_context->child == NULL)
+        parser->current_context->child = context;
 
-        parser->current_context->last_child = context;
-        parser->current_context = context;
+    if (parser->current_context->last_child != NULL)
+        parser->current_context->last_child->next = context;
 
-        const char* path = bufferdata_get(&parser->variable_buffer);
-        if (!__viewparser_readfile(parser->current_context, parser->storage_name, path)) {
-            log_error("__viewparser_include_load_content: view file not found %s", path);
-            return 0;
-        }
+    parser->current_context->last_child = context;
+    parser->current_context = context;
+
+    const char* path = bufferdata_get(&parser->variable_buffer);
+    if (!__viewparser_readfile(parser->current_context, parser->storage_name, path)) {
+        log_error("__viewparser_include_load_content: view file not found %s", path);
+        return 0;
     }
 
     bufferdata_reset(&parser->variable_buffer);
@@ -1099,55 +1161,65 @@ int __viewparser_branch_write_body(viewparser_t* parser) {
     const size_t tag_name_size = bufferdata_writed(&parser->variable_buffer);
     const char* tag_name = bufferdata_get(&parser->variable_buffer);
 
-    for (size_t i = 0; i < tag_name_size; i++) {
-        const int complete = i + 1 == tag_name_size;
+    // empty buffer: the closing "%}" right after endif/endfor already
+    // processed the word in the space handler, nothing left to do
+    if (tag_name_size == 0)
+        return 1;
 
-        if (tag_name_size == 2 && __word_if[i] == tag_name[i]) {
-            if (complete && !__viewparser_condition_if_create(parser)) {
-                log_error("__viewparser_branch_write_body: failed to create if condition");
-                return 0;
-            }
-
-            parser->current_context->stage = VIEWPARSER_CONDITION_EXPR;
-        }
-        else if (tag_name_size == 6 && __word_elseif[i] == tag_name[i]) {
-            if (complete && !__viewparser_condition_elseif_create(parser)) {
-                log_error("__viewparser_branch_write_body: failed to create elseif condition");
-                return 0;
-            }
-
-            parser->current_context->stage = VIEWPARSER_CONDITION_EXPR;
-        }
-        else if (tag_name_size == 4 && __word_else[i] == tag_name[i]) {
-            if (complete && !__viewparser_condition_else_create(parser)) {
-                log_error("__viewparser_branch_write_body: failed to create else condition");
-                return 0;
-            }
-
-            parser->current_context->stage = VIEWPARSER_CONDITION_EXPR;
-        }
-        else if (tag_name_size == 5 && __word_endif[i] == tag_name[i]) {
-            parser->current_tag = parser->current_tag->parent->parent;
-            parser->current_context->stage = VIEWPARSER_BRANCH;
-            break;
-        }
-        else if (tag_name_size == 3 && __word_for[i] == tag_name[i]) {
-            if (complete && !__viewparser_loop_create(parser)) {
-                log_error("__viewparser_branch_write_body: failed to create loop");
-                return 0;
-            }
-
-            parser->current_context->stage = VIEWPARSER_LOOP_ITEM;
-        }
-        else if (tag_name_size == 6 && __word_endfor[i] == tag_name[i]) {
-            parser->current_tag = parser->current_tag->parent;
-            parser->current_context->stage = VIEWPARSER_BRANCH;
-            break;
-        }
-        else if (complete) {
-            log_error("__viewparser_branch_write_body: branch tag not found\n");
+    if (strcmp(tag_name, __word_if) == 0) {
+        if (!__viewparser_condition_if_create(parser)) {
+            log_error("__viewparser_branch_write_body: failed to create if condition");
             return 0;
         }
+
+        parser->current_context->stage = VIEWPARSER_CONDITION_EXPR;
+    }
+    else if (strcmp(tag_name, __word_elseif) == 0) {
+        if (!__viewparser_condition_elseif_create(parser)) {
+            log_error("__viewparser_branch_write_body: failed to create elseif condition");
+            return 0;
+        }
+
+        parser->current_context->stage = VIEWPARSER_CONDITION_EXPR;
+    }
+    else if (strcmp(tag_name, __word_else) == 0) {
+        if (!__viewparser_condition_else_create(parser)) {
+            log_error("__viewparser_branch_write_body: failed to create else condition");
+            return 0;
+        }
+
+        parser->current_context->stage = VIEWPARSER_CONDITION_EXPR;
+    }
+    else if (strcmp(tag_name, __word_endif) == 0) {
+        const int type = parser->current_tag->type;
+        if (type != VIEW_TAGTYPE_COND_IF && type != VIEW_TAGTYPE_COND_ELSEIF && type != VIEW_TAGTYPE_COND_ELSE) {
+            log_error("__viewparser_branch_write_body: endif without open condition\n");
+            return 0;
+        }
+
+        parser->current_tag = parser->current_tag->parent->parent;
+        parser->current_context->stage = VIEWPARSER_BRANCH;
+    }
+    else if (strcmp(tag_name, __word_for) == 0) {
+        if (!__viewparser_loop_create(parser)) {
+            log_error("__viewparser_branch_write_body: failed to create loop");
+            return 0;
+        }
+
+        parser->current_context->stage = VIEWPARSER_LOOP_ITEM;
+    }
+    else if (strcmp(tag_name, __word_endfor) == 0) {
+        if (parser->current_tag->type != VIEW_TAGTYPE_LOOP) {
+            log_error("__viewparser_branch_write_body: endfor without open loop\n");
+            return 0;
+        }
+
+        parser->current_tag = parser->current_tag->parent;
+        parser->current_context->stage = VIEWPARSER_BRANCH;
+    }
+    else {
+        log_error("__viewparser_branch_write_body: branch tag not found\n");
+        return 0;
     }
 
     bufferdata_reset(&parser->variable_buffer);
@@ -1390,10 +1462,18 @@ int __viewparser_loop_write_item(viewparser_t* parser, char ch) {
     case ',':
     case ' ':
     {
+        // skip repeated spaces before the item name
+        if (ch == ' ' && context->symbol == VIEWPARSER_VARIABLE_SPACE)
+            break;
 
         bufferdata_complete(&parser->variable_buffer);
         const size_t tag_name_size = bufferdata_writed(&parser->variable_buffer);
         const char* tag_name = bufferdata_get(&parser->variable_buffer);
+
+        if (tag_name_size == 0) {
+            log_error("__viewparser_loop_write_item: item name is empty\n");
+            return 0;
+        }
 
         if (tag_name_size > VIEWPARSER_VARIABLE_ITEM_NAME_SIZE - 1) {
             log_error("__viewparser_loop_write_item: tag_name_size > VIEWPARSER_VARIABLE_ITEM_NAME_SIZE - 1\n");
@@ -1470,7 +1550,7 @@ int __viewparser_loop_write_index(viewparser_t* parser, char ch) {
 
         bufferdata_reset(&parser->variable_buffer);
 
-        context->symbol = VIEWPARSER_DEFAULT;
+        context->symbol = VIEWPARSER_VARIABLE_SPACE;
         context->stage = VIEWPARSER_LOOP_IN;
 
         break;
@@ -1498,6 +1578,10 @@ int __viewparser_loop_write_in(viewparser_t* parser, char ch) {
     {
     case ' ':
     {
+        // skip repeated spaces before the "in" word
+        if (context->symbol == VIEWPARSER_VARIABLE_SPACE)
+            break;
+
         bufferdata_complete(&parser->variable_buffer);
         const size_t tag_name_size = bufferdata_writed(&parser->variable_buffer);
         const char* tag_name = bufferdata_get(&parser->variable_buffer);
@@ -1514,7 +1598,7 @@ int __viewparser_loop_write_in(viewparser_t* parser, char ch) {
 
         bufferdata_reset(&parser->variable_buffer);
 
-        context->symbol = VIEWPARSER_DEFAULT;
+        context->symbol = VIEWPARSER_VARIABLE_SPACE;
         context->stage = VIEWPARSER_LOOP_VAR;
 
         break;
