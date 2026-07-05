@@ -1355,6 +1355,7 @@ int __viewparser_loop_create(viewparser_t* parser) {
     __viewparser_tag_set_parent_text_params((view_tag_t*)tag_for, current_tag);
     tag_for->element_name[0] = 0;
     tag_for->key_name[0] = 0;
+    tag_for->key_value[0] = 0;
     tag_for->token = NULL;
     tag_for->base.free = view_tag_loop_free;
 

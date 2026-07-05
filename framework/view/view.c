@@ -34,8 +34,11 @@ char* render(json_doc_t* document, const char* storage_name, const char* path_fo
 
     va_list args;
     va_start(args, path_format);
-    vsnprintf(path, sizeof(path), path_format, args);
+    const int written = vsnprintf(path, sizeof(path), path_format, args);
     va_end(args);
+
+    if (written < 0 || written >= (int)sizeof(path))
+        return NULL;
 
     return __view_render(document, storage_name, path);
 }
@@ -50,11 +53,13 @@ char* render(json_doc_t* document, const char* storage_name, const char* path_fo
  */
 char* __view_render(json_doc_t* document, const char* storage_name, const char* path) {
     viewstore_t* viewstore = appconfig()->viewstore;
+    if (viewstore == NULL) return NULL;
+
     viewstore_lock(viewstore);
     view_t* view = viewstore_get_view(viewstore, path);
-    if (view == NULL) {
-        viewstore_unlock(viewstore);
+    viewstore_unlock(viewstore);
 
+    if (view == NULL) {
         viewparser_t* parser = viewparser_init(storage_name, path);
         if (parser == NULL) return NULL;
 
@@ -63,16 +68,26 @@ char* __view_render(json_doc_t* document, const char* storage_name, const char* 
             return NULL;
         }
 
-        viewstore_lock(viewstore);
-        view = viewstore_add_view(viewstore, viewparser_move_root_tag(parser), path);
-        viewstore_unlock(viewstore);
-
+        view_tag_t* root_tag = viewparser_move_root_tag(parser);
         viewparser_free(parser);
 
-        if (view == NULL) return NULL;
+        viewstore_lock(viewstore);
+        // another thread may have parsed and cached the same path in between
+        view = viewstore_get_view(viewstore, path);
+        if (view != NULL) {
+            viewstore_unlock(viewstore);
+            root_tag->free(root_tag);
+        }
+        else {
+            view = viewstore_add_view(viewstore, root_tag, path);
+            viewstore_unlock(viewstore);
+
+            if (view == NULL) {
+                root_tag->free(root_tag);
+                return NULL;
+            }
+        }
     }
-    else
-        viewstore_unlock(viewstore);
 
     return __view_make_content(view, document);
 }
@@ -118,6 +133,8 @@ char* __view_make_content(view_t* view, json_doc_t* document) {
  */
 int __view_get_condition_value(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag) {
     view_variable_item_t* item = tag->item;
+    if (item == NULL) return 0;
+
     view_loop_t* tag_for = __view_copy_loop_tag_get(copy_tags, tag->data_parent);
     const json_token_t* json_token = json_root(document);
     if (tag_for != NULL) {
@@ -138,6 +155,9 @@ int __view_get_condition_value(view_copy_tags_t* copy_tags, json_doc_t* document
     }
 
     while (item) {
+        // json_token is NULL when the document is NULL or has no root
+        if (json_token == NULL) break;
+
         const json_token_t* token = NULL;
         if (json_token->type == JSON_STRING)
             token = json_token;
@@ -145,7 +165,7 @@ int __view_get_condition_value(view_copy_tags_t* copy_tags, json_doc_t* document
             token = json_object_get(json_token, item->name);
 
         if (token == NULL) break;
-        
+
         if (token->type == JSON_ARRAY) {
             int stop = 0;
             view_variable_index_t* index = item->index;
@@ -184,6 +204,8 @@ int __view_get_condition_value(view_copy_tags_t* copy_tags, json_doc_t* document
  */
 const char* __view_get_tag_value(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag) {
     view_variable_item_t* item = tag->item;
+    if (item == NULL) return NULL;
+
     view_loop_t* tag_for = __view_copy_loop_tag_get(copy_tags, tag->data_parent);
     const json_token_t* json_token = json_root(document);
     if (tag_for != NULL) {
@@ -207,6 +229,9 @@ const char* __view_get_tag_value(view_copy_tags_t* copy_tags, json_doc_t* docume
     }
 
     while (item) {
+        // json_token is NULL when the document is NULL or has no root
+        if (json_token == NULL) break;
+
         const json_token_t* token = NULL;
         if (json_token->type == JSON_STRING)
             token = json_token;
@@ -214,7 +239,7 @@ const char* __view_get_tag_value(view_copy_tags_t* copy_tags, json_doc_t* docume
             token = json_object_get(json_token, item->name);
 
         if (token == NULL) break;
-        
+
         if (token->type == JSON_ARRAY) {
             int stop = 0;
             view_variable_index_t* index = item->index;
@@ -253,6 +278,8 @@ const char* __view_get_tag_value(view_copy_tags_t* copy_tags, json_doc_t* docume
  */
 const json_token_t* __view_get_loop_value(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag) {
     view_variable_item_t* item = tag->item;
+    if (item == NULL) return NULL;
+
     view_loop_t* tag_for = __view_copy_loop_tag_get(copy_tags, tag->data_parent);
     const json_token_t* json_token = json_root(document);
     if (tag_for != NULL) {
@@ -273,6 +300,9 @@ const json_token_t* __view_get_loop_value(view_copy_tags_t* copy_tags, json_doc_
     }
 
     while (item) {
+        // json_token is NULL when the document is NULL or has no root
+        if (json_token == NULL) break;
+
         const json_token_t* token = NULL;
         if (json_token->type == JSON_ARRAY)
             token = json_token;
@@ -381,7 +411,7 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
 
             size_t size = bufferdata_writed(&parent->parent->result_content);
             const char* content = bufferdata_get(&parent->parent->result_content);
-            for (size_t i = parent->parent_text_offset; i < parent->parent_text_offset + parent->parent_text_size; i++)
+            for (size_t i = parent->parent_text_offset; i < parent->parent_text_offset + parent->parent_text_size && i < size; i++)
                 bufferdata_push(&copy_tags->buf, content[i]);
 
             if (istrue) {
@@ -428,10 +458,14 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
             if (token != NULL) {
                 if (token->type == JSON_OBJECT || token->type == JSON_ARRAY) {
                     for (json_it_t it = json_init_it(token); !json_end_it(&it); it = json_next_it(&it)) {
-                        if (token->type == JSON_OBJECT)
-                            sprintf(tag_for->key_value, "%s", (char*)json_it_key(&it));
+                        // key_value is a fixed-size buffer, object keys come
+                        // from the runtime document — never trust their length
+                        if (token->type == JSON_OBJECT) {
+                            const char* key = json_it_key(&it);
+                            snprintf(tag_for->key_value, sizeof(tag_for->key_value), "%s", key != NULL ? key : "");
+                        }
                         else
-                            sprintf(tag_for->key_value, "%d", (*(int*)json_it_key(&it)));
+                            snprintf(tag_for->key_value, sizeof(tag_for->key_value), "%d", (*(int*)json_it_key(&it)));
 
                         tag_for->token = json_it_value(&it);
 
@@ -464,8 +498,9 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
             view_tag_t* parent = child->parent;
 
             if (parent != NULL) {
+                const size_t size = bufferdata_writed(&parent->result_content);
                 const char* content = bufferdata_get(&parent->result_content);
-                for (size_t i = child->parent_text_offset; i < child->parent_text_offset + child->parent_text_size; i++)
+                for (size_t i = child->parent_text_offset; i < child->parent_text_offset + child->parent_text_size && i < size; i++)
                     bufferdata_push(&copy_tags->buf, content[i]);
             }
 
