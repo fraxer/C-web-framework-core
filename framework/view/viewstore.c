@@ -35,6 +35,11 @@ viewstore_t* viewstore_create(void) {
  * @return view_t* The newly added view, or NULL if allocation failed.
  */
 view_t* viewstore_add_view(viewstore_t* viewstore, view_tag_t* tag, const char* path) {
+    if (viewstore == NULL || tag == NULL || path == NULL) {
+        log_error("viewstore_add_view: viewstore, tag and path must not be NULL");
+        return NULL;
+    }
+
     view_t* view = __viewstore_view_create(tag, path);
     if (view == NULL) {
         log_error("viewstore_add_view: failed to allocate memory for view");
@@ -59,6 +64,8 @@ view_t* viewstore_add_view(viewstore_t* viewstore, view_tag_t* tag, const char* 
  * @return view_t* The view, or NULL if not found.
  */
 view_t* viewstore_get_view(viewstore_t* viewstore, const char* path) {
+    if (viewstore == NULL || path == NULL) return NULL;
+
     view_t* view = viewstore->view;
     while (view != NULL) {
         if (strcmp(view->path, path) == 0)
@@ -99,14 +106,14 @@ void viewstore_destroy(viewstore_t* viewstore) {
 view_t* __viewstore_view_create(view_tag_t* tag, const char* path) {
     view_t* view = malloc(sizeof * view);
     if (view == NULL) {
-        log_error("viewstore_create_view: failed to allocate memory for view");
+        log_error("__viewstore_view_create: failed to allocate memory for view");
         return NULL;
     }
 
     view->path = malloc(sizeof(char) * (strlen(path) + 1));
     if (view->path == NULL) {
         free(view);
-        log_error("viewstore_create_view: failed to allocate memory for view path");
+        log_error("__viewstore_view_create: failed to allocate memory for view path");
         return NULL;
     }
 
@@ -129,7 +136,8 @@ void __viewstore_view_free(view_t* view) {
     if (view->path != NULL)
         free(view->path);
 
-    view->root_tag->free(view->root_tag);
+    if (view->root_tag != NULL && view->root_tag->free != NULL)
+        view->root_tag->free(view->root_tag);
 
     free(view);
 }
