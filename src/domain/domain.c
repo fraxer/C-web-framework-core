@@ -10,7 +10,6 @@ typedef struct domain_parser {
     char* template;
     char* prepared_template;
     size_t pos;
-    size_t pcre_pos;
     size_t prepared_pos;
     int brackets_count;
 } domain_parser_t;
@@ -31,7 +30,7 @@ domain_t* domain_create(const char* value) {
     if (domain_parse(domain) == -1) goto failed;
 
     domain->pcre_template = pcre_compile(domain->prepared_template, 0, &domain->pcre_error, &domain->pcre_erroffset, NULL);
-    if (domain->pcre_error != NULL) goto failed;
+    if (domain->pcre_template == NULL) goto failed;
 
     result = domain;
 
@@ -66,6 +65,8 @@ void domains_free(domain_t* domain) {
 }
 
 domain_t* domain_alloc(const char* value) {
+    if (value == NULL) return NULL;
+
     domain_t* result = NULL;
     domain_t* domain = malloc(sizeof * domain);
     if (domain == NULL) return NULL;
@@ -73,6 +74,10 @@ domain_t* domain_alloc(const char* value) {
     domain->template = NULL;
     domain->ascii_template = NULL;
     domain->prepared_template = NULL;
+    domain->pcre_template = NULL;
+    domain->pcre_error = NULL;
+    domain->pcre_erroffset = 0;
+    domain->next = NULL;
 
     domain->template = malloc(strlen(value) + 1);
     if (domain->template == NULL) goto failed;
@@ -90,17 +95,15 @@ domain_t* domain_alloc(const char* value) {
     domain->prepared_template = malloc(pcre_length + 1);
     if (domain->prepared_template == NULL) goto failed;
 
-    domain->pcre_template = NULL;
-    domain->next = NULL;
-
     result = domain;
 
     failed:
 
     if (result == NULL) {
-        if (domain->ascii_template != NULL) free(domain->ascii_template);
-        if (domain->template != NULL) free(domain->template);
-        if (domain != NULL) free(domain);
+        free(domain->prepared_template);
+        free(domain->ascii_template);
+        free(domain->template);
+        free(domain);
     }
 
     return result;
@@ -111,11 +114,17 @@ int domain_parse(domain_t* domain) {
 
     domain_parser_alloc(&parser, domain);
 
-    size_t length = strlen(domain->ascii_template);
-
-    if (domain->ascii_template[0] != '^' && domain->ascii_template[length - 1] != '$') {
-        parser.prepared_pos = 1;
+    const size_t length = strlen(domain->ascii_template);
+    if (length == 0) {
+        log_error("Domain error: Empty domain template\n");
+        return -1;
     }
+
+    const int need_start_anchor = domain->ascii_template[0] != '^';
+    const int need_end_anchor = domain->ascii_template[length - 1] != '$';
+
+    if (need_start_anchor)
+        parser.prepared_pos = 1;
 
     for (; parser.pos < length; parser.pos++) {
         switch (domain->ascii_template[parser.pos]) {
@@ -136,11 +145,7 @@ int domain_parse(domain_t* domain) {
                 break;
             }
 
-            if (parser.pos == 0) {
-                domain_parser_insert_custom_symbol(&parser, '.');
-                domain_parser_insert_symbol(&parser);
-            }
-            else if (parser.pos == parser.pcre_pos - 1) {
+            if (parser.pos == 0 || parser.pos == length - 1) {
                 domain_parser_insert_custom_symbol(&parser, '.');
                 domain_parser_insert_symbol(&parser);
             }
@@ -165,12 +170,11 @@ int domain_parse(domain_t* domain) {
 
     if (parser.brackets_count != 0) return -1;
 
-    if (domain->ascii_template[0] != '^' && domain->ascii_template[length - 1] != '$') {
+    if (need_start_anchor)
         domain->prepared_template[0] = '^';
-        domain->prepared_template[parser.prepared_pos] = '$';
 
-        parser.prepared_pos++;
-    }
+    if (need_end_anchor)
+        domain_parser_insert_custom_symbol(&parser, '$');
 
     domain_parser_insert_custom_symbol(&parser, 0);
 
@@ -178,7 +182,12 @@ int domain_parse(domain_t* domain) {
 }
 
 int domain_estimate_length(const char* domain) {
-    int length = strlen(domain);
+    const int length = strlen(domain);
+    if (length == 0) {
+        log_error("Domain error: Empty domain template\n");
+        return -1;
+    }
+
     int pcre_length = 0;
     int brackets_count = 0;
 
@@ -201,10 +210,7 @@ int domain_estimate_length(const char* domain) {
                 break;
             }
 
-            if (pos == 0) {
-                pcre_length += 2;
-            }
-            else if (pos == pcre_length - 1) {
+            if (pos == 0 || pos == length - 1) {
                 pcre_length += 2;
             }
             else {
@@ -227,9 +233,8 @@ int domain_estimate_length(const char* domain) {
 
     if (brackets_count != 0) return -1;
 
-    if (domain[0] != '^' && domain[length - 1] != '$') {
-        pcre_length += 2;
-    }
+    if (domain[0] != '^') pcre_length++;
+    if (domain[length - 1] != '$') pcre_length++;
 
     return pcre_length;
 }
@@ -238,7 +243,6 @@ void domain_parser_alloc(domain_parser_t* parser, domain_t* domain) {
     parser->template = domain->ascii_template;
     parser->prepared_template = domain->prepared_template;
     parser->pos = 0;
-    parser->pcre_pos = 0;
     parser->prepared_pos = 0;
     parser->brackets_count = 0;
 }
@@ -249,7 +253,6 @@ void domain_parser_insert_symbol(domain_parser_t* parser) {
 
 void domain_parser_insert_custom_symbol(domain_parser_t* parser, char ch) {
     parser->prepared_template[parser->prepared_pos] = ch;
-    parser->pcre_pos++;
     parser->prepared_pos++;
 }
 
