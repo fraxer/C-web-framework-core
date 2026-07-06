@@ -14,10 +14,16 @@ set(FW_LIBS
 	model database http misc protocols view storage session config connection
 	broadcast domain mimetype moduleloader multiplexing openssl ratelimiter
 	redirect route server signal socket thread taskmanager middleware translation
-	models middlewares handler_context
-	identity_models scheduler_models scheduler_misc
 	http_client http_client_parsers http_server http_server_filters http_server_parsers
 	smtp smtp_client smtp_client_parsers websocket websocket_server websocket_server_parsers)
+
+# The embedding application may inject its own static archives (models,
+# middlewares implementing the middlewares_init() hook, contexts, ...) by
+# setting CWFR_EXTRA_FW_LIBS before add_subdirectory(core). They are aggregated
+# whole-archive alongside the framework so handler .so modules resolve their
+# symbols from this single shared instance at runtime. The core itself knows
+# nothing about these targets.
+list(APPEND FW_LIBS ${CWFR_EXTRA_FW_LIBS})
 
 target_link_libraries(cwfr_framework PRIVATE
 	"-Wl,--whole-archive" ${FW_LIBS} "-Wl,--no-whole-archive"
