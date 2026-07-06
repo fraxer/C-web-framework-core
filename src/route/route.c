@@ -37,11 +37,16 @@ void route_parser_free(route_parser_t* parser);
 
 
 route_t* route_create(const char* dirty_location) {
+    if (dirty_location == NULL || dirty_location[0] == 0) {
+        log_error(ROUTE_EMPTY_PATH);
+        return NULL;
+    }
+
     int result = -1;
 
-    route_t* route = route_init_route();
+    route_parser_t parser = {0};
 
-    route_parser_t parser;
+    route_t* route = route_init_route();
 
     if (route == NULL) goto failed;
 
@@ -58,7 +63,8 @@ route_t* route_create(const char* dirty_location) {
     route->path = parser.path;
     route->path_length = strlen(parser.path);
     route->param = parser.first_param;
-    parser.first_param = NULL; // prevent double free
+    parser.path = NULL;
+    parser.first_param = NULL;
 
     result = 0;
 
@@ -124,12 +130,7 @@ int route_init_parser(route_parser_t* parser, const char* dirty_location) {
     parser->first_param = NULL;
     parser->last_param = NULL;
 
-    if (parser->path == NULL) {
-        log_error(ROUTE_OUT_OF_MEMORY);
-        return -1;
-    }
-    if (parser->location == NULL) {
-        free(parser->path);
+    if (parser->path == NULL || parser->location == NULL) {
         log_error(ROUTE_OUT_OF_MEMORY);
         return -1;
     }
@@ -149,6 +150,7 @@ int route_parse_location(route_parser_t* parser) {
             break;
         case '\\':
             switch (parser->dirty_location[parser->dirty_pos + 1]) {
+            case '{':
             case '}':
                 route_insert_symbol(parser);
                 parser->dirty_pos++;
@@ -232,7 +234,7 @@ int route_parse_token(route_parser_t* parser) {
                 log_error(ROUTE_EMPTY_TOKEN, parser->dirty_location);
                 return -1;
             }
-            if (parser->pos - start == 0) {
+            if (parser->pos - start <= 1) { // only "(" emitted, expression is empty
                 log_error(ROUTE_EMPTY_PARAM_EXPRESSION, parser->dirty_location);
                 return -1;
             }
@@ -274,6 +276,10 @@ int route_parse_token(route_parser_t* parser) {
             }
             break;
         case '|':
+            if (separator_found) { // alternation inside the expression
+                route_insert_symbol(parser);
+                break;
+            }
             separator_found = 1;
             symbol_finded = 0;
             if (route_fill_param(parser) == -1) return -1;
@@ -352,6 +358,9 @@ int route_fill_param(route_parser_t* parser) {
 }
 
 void route_parser_free(route_parser_t* parser) {
+    if (parser->path != NULL)
+        free(parser->path);
+
     if (parser->location != NULL)
         free(parser->location);
 
@@ -365,104 +374,95 @@ void route_parser_free(route_parser_t* parser) {
     }
 }
 
+static int route_method_index(const char* method) {
+    if (strcmp(method, "GET") == 0) return ROUTE_GET;
+    if (strcmp(method, "POST") == 0) return ROUTE_POST;
+    if (strcmp(method, "PUT") == 0) return ROUTE_PUT;
+    if (strcmp(method, "DELETE") == 0) return ROUTE_DELETE;
+    if (strcmp(method, "OPTIONS") == 0) return ROUTE_OPTIONS;
+    if (strcmp(method, "PATCH") == 0) return ROUTE_PATCH;
+    if (strcmp(method, "HEAD") == 0) return ROUTE_HEAD;
+    return ROUTE_NONE;
+}
+
+static int route_ws_method_index(const char* method) {
+    if (strcmp(method, "GET") == 0) return ROUTE_GET;
+    if (strcmp(method, "POST") == 0) return ROUTE_POST;
+    if (strcmp(method, "DELETE") == 0) return ROUTE_DELETE;
+    if (strcmp(method, "PATCH") == 0) return ROUTE_PATCH;
+    return ROUTE_NONE;
+}
+
+// The setters take ownership of ratelimiter in every outcome; a limiter that
+// is not stored on the route must be freed here, not leaked.
+static void route_own_ratelimiter(route_t* route, ratelimiter_t* ratelimiter) {
+    if (ratelimiter == NULL || ratelimiter == route->ratelimiter) return;
+    ratelimiter_free(route->ratelimiter);
+    route->ratelimiter = ratelimiter;
+}
+
+static void route_drop_ratelimiter(route_t* route, ratelimiter_t* ratelimiter) {
+    if (ratelimiter == route->ratelimiter) return;
+    ratelimiter_free(ratelimiter);
+}
+
 int route_set_http_handler(route_t* route, const char* method, void(*function)(void*), ratelimiter_t* ratelimiter) {
-    int m = ROUTE_NONE;
-
-    if (strcmp(method, "GET") == 0) {
-        m = ROUTE_GET;
-    }
-    else if (strcmp(method, "POST") == 0) {
-        m = ROUTE_POST;
-    }
-    else if (strcmp(method, "PUT") == 0) {
-        m = ROUTE_PUT;
-    }
-    else if (strcmp(method, "DELETE") == 0) {
-        m = ROUTE_DELETE;
-    }
-    else if (strcmp(method, "OPTIONS") == 0) {
-        m = ROUTE_OPTIONS;
-    }
-    else if (strcmp(method, "PATCH") == 0) {
-        m = ROUTE_PATCH;
-    }
-    else if (strcmp(method, "HEAD") == 0) {
-        m = ROUTE_HEAD;
+    const int m = route_method_index(method);
+    if (m == ROUTE_NONE) {
+        route_drop_ratelimiter(route, ratelimiter);
+        return 0;
     }
 
-    if (m == ROUTE_NONE) return 0;
-
-    if (route->handler[m]) return 1;
+    if (route->handler[m]) {
+        route_drop_ratelimiter(route, ratelimiter);
+        return 1;
+    }
 
     route->handler[m] = function;
-    route->ratelimiter = ratelimiter;
+    route_own_ratelimiter(route, ratelimiter);
 
     return 1;
 }
 
 int route_set_http_static(route_t* route, const char* method, const char* static_file, ratelimiter_t* ratelimiter) {
-    int m = ROUTE_NONE;
-
-    if (strcmp(method, "GET") == 0) {
-        m = ROUTE_GET;
-    }
-    else if (strcmp(method, "POST") == 0) {
-        m = ROUTE_POST;
-    }
-    else if (strcmp(method, "PUT") == 0) {
-        m = ROUTE_PUT;
-    }
-    else if (strcmp(method, "DELETE") == 0) {
-        m = ROUTE_DELETE;
-    }
-    else if (strcmp(method, "OPTIONS") == 0) {
-        m = ROUTE_OPTIONS;
-    }
-    else if (strcmp(method, "PATCH") == 0) {
-        m = ROUTE_PATCH;
-    }
-    else if (strcmp(method, "HEAD") == 0) {
-        m = ROUTE_HEAD;
+    const int m = route_method_index(method);
+    if (m == ROUTE_NONE) {
+        route_drop_ratelimiter(route, ratelimiter);
+        return 0;
     }
 
-    if (m == ROUTE_NONE) return 0;
-
-    if (route->static_file[m]) return 1;
+    if (route->static_file[m]) {
+        route_drop_ratelimiter(route, ratelimiter);
+        return 1;
+    }
 
     size_t len = strlen(static_file);
     route->static_file[m] = malloc(len + 1);
     if (route->static_file[m] == NULL) {
         log_error(ROUTE_OUT_OF_MEMORY);
+        route_drop_ratelimiter(route, ratelimiter);
         return 0;
     }
     memcpy(route->static_file[m], static_file, len + 1);
-    route->ratelimiter = ratelimiter;
+    route_own_ratelimiter(route, ratelimiter);
 
     return 1;
 }
 
 int route_set_websockets_handler(route_t* route, const char* method, void(*function)(void*), ratelimiter_t* ratelimiter) {
-    int m = ROUTE_NONE;
-
-    if (method[0] == 'G' && method[1] == 'E' && method[2] == 'T') {
-        m = ROUTE_GET;
-    }
-    else if (method[0] == 'P' && method[1] == 'O' && method[2] == 'S' && method[3] == 'T') {
-        m = ROUTE_POST;
-    }
-    else if (method[0] == 'D' && method[1] == 'E' && method[2] == 'L' && method[3] == 'E' && method[4] == 'T' && method[5] == 'E') {
-        m = ROUTE_DELETE;
-    }
-    else if (method[0] == 'P' && method[1] == 'A' && method[2] == 'T' && method[3] == 'C' && method[4] == 'H') {
-        m = ROUTE_PATCH;
+    const int m = route_ws_method_index(method);
+    if (m == ROUTE_NONE) {
+        route_drop_ratelimiter(route, ratelimiter);
+        return 0;
     }
 
-    if (m == ROUTE_NONE) return 0;
-
-    if (route->handler[m]) return 1;
+    if (route->handler[m]) {
+        route_drop_ratelimiter(route, ratelimiter);
+        return 1;
+    }
 
     route->handler[m] = function;
-    route->ratelimiter = ratelimiter;
+    route_own_ratelimiter(route, ratelimiter);
 
     return 1;
 }
