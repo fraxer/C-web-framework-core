@@ -3,11 +3,8 @@
 #include "middleware_registry.h"
 #include "log.h"
 
-/* ============= CONFIGURATION ============= */
-#define MAX_MIDDLEWARES 256
-
 /* ============= STATIC REGISTRY DATA ============= */
-static middleware_registry_entry_t __middleware_list[MAX_MIDDLEWARES];
+static middleware_registry_entry_t __middleware_list[MIDDLEWARE_REGISTRY_MAX];
 static int __middleware_count = 0;
 
 /* ============= REGISTRY IMPLEMENTATION ============= */
@@ -18,9 +15,19 @@ int middleware_registry_register(const char* name, middleware_fn_p handler) {
         return 0;
     }
 
+    const size_t name_length = strlen(name);
+    if (name_length == 0) {
+        log_error("middleware_registry_register: name cannot be empty\n");
+        return 0;
+    }
+    if (name_length >= MIDDLEWARE_NAME_MAX) {
+        log_error("middleware_registry_register: name is too long (max %d chars)\n", MIDDLEWARE_NAME_MAX - 1);
+        return 0;
+    }
+
     /* Check for overflow */
-    if (__middleware_count >= MAX_MIDDLEWARES) {
-        log_error("middleware_registry_register: registry is full (max %d middlewares)\n", MAX_MIDDLEWARES);
+    if (__middleware_count >= MIDDLEWARE_REGISTRY_MAX) {
+        log_error("middleware_registry_register: registry is full (max %d middlewares)\n", MIDDLEWARE_REGISTRY_MAX);
         return 0;
     }
 
@@ -32,7 +39,7 @@ int middleware_registry_register(const char* name, middleware_fn_p handler) {
         }
     }
 
-    __middleware_list[__middleware_count].name = name;
+    memcpy(__middleware_list[__middleware_count].name, name, name_length + 1);
     __middleware_list[__middleware_count].handler = handler;
     __middleware_count++;
 

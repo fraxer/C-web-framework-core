@@ -5,7 +5,8 @@
 
 int run_middlewares(middleware_item_t* middleware_item, void* ctx) {
     while (middleware_item != NULL) {
-        if (!middleware_item->fn(ctx))
+        // fail closed: a corrupted chain must not bypass auth-style middlewares
+        if (middleware_item->fn == NULL || !middleware_item->fn(ctx))
             return 0;
 
         middleware_item = middleware_item->next;

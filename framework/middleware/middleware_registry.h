@@ -13,12 +13,15 @@ int middlewares_init(void);
 
 /* ============= REGISTRY ENTRY STRUCTURE ============= */
 
+#define MIDDLEWARE_REGISTRY_MAX 256   /* Registry capacity */
+#define MIDDLEWARE_NAME_MAX     128   /* Max name length including '\0' */
+
 /**
  * Structure for middleware registry entry
  */
 typedef struct {
-    const char* name;           /* Middleware identifier */
-    middleware_fn_p handler;    /* Handler function */
+    char name[MIDDLEWARE_NAME_MAX];   /* Middleware identifier (owned copy) */
+    middleware_fn_p handler;          /* Handler function */
 } middleware_registry_entry_t;
 
 /* ============= CORE REGISTRY INTERFACE ============= */
@@ -38,9 +41,12 @@ middleware_fn_p middleware_by_name(const char* name);
  * Register a middleware
  * Called by application during initialization
  *
- * @param name Unique middleware name
+ * The name is copied into the registry, so the caller's string
+ * does not need to outlive the call.
+ *
+ * @param name Unique non-empty middleware name, shorter than MIDDLEWARE_NAME_MAX
  * @param handler Handler function
- * @return 1 on success, 0 on error (full, duplicate, etc.)
+ * @return 1 on success, 0 on error (full, duplicate, empty or too long name, etc.)
  */
 int middleware_registry_register(const char* name, middleware_fn_p handler);
 
