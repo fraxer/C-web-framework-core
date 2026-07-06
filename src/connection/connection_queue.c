@@ -22,7 +22,8 @@ int __connection_queue_append_item(cqueue_t* queue, void* data);
 void __connection_queue_append(connection_queue_item_t* qitem) {
     connection_s_inc(qitem->connection);
 
-    __connection_queue_append_item(queue, qitem->connection);
+    if (!__connection_queue_append_item(queue, qitem->connection))
+        connection_s_dec(qitem->connection);
 }
 
 
@@ -96,7 +97,8 @@ void connection_queue_guard_append(connection_t* connection) {
     pthread_mutex_lock(&connection_queue_mutex);
 
     connection_s_inc(connection);
-    __connection_queue_append_item(queue, connection);
+    if (!__connection_queue_append_item(queue, connection))
+        connection_s_dec(connection);
 
     pthread_cond_signal(&connection_queue_cond);
     pthread_mutex_unlock(&connection_queue_mutex);

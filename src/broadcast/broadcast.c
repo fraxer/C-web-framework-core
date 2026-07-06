@@ -420,6 +420,14 @@ void broadcast_remove(const char* broadcast_name, connection_t* connection) {
 
 void broadcast_clear(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
+
+    // connection_close вызывает broadcast_clear безусловно: без гардов
+    // соединение сервера без broadcast (server NULL или broadcast NULL)
+    // разыменовывало NULL — __broadcast_lock(NULL) возвращает 0,
+    // но его результат здесь игнорировался
+    if (ctx->server == NULL || ctx->server->broadcast == NULL)
+        return;
+
     broadcast_t* broadcast = ctx->server->broadcast;
 
     __broadcast_lock(broadcast);

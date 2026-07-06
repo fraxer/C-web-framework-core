@@ -83,6 +83,9 @@ connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, uns
     connection->ssl_ctx = NULL;
     connection->buffer = buffer;
     connection->buffer_size = buffer_size;
+    connection->close = NULL;
+    connection->read = NULL;
+    connection->write = NULL;
 
     return connection;
 }
@@ -291,12 +294,9 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
             ctx->server = item->data;
     }
 
-    if (ctx->queue == NULL) {
-        free(ctx);
-        return NULL;
-    }
-    if (ctx->broadcast_queue == NULL) {
+    if (ctx->queue == NULL || ctx->broadcast_queue == NULL) {
         cqueue_free(ctx->queue);
+        cqueue_free(ctx->broadcast_queue);
         free(ctx);
         return NULL;
     }

@@ -30,6 +30,9 @@ connection_t* __connection_c_alloc(int fd, in_addr_t ip, unsigned short int port
     connection->ssl_ctx = NULL;
     connection->buffer = NULL;
     connection->buffer_size = 0;
+    connection->close = NULL;
+    connection->read = NULL;
+    connection->write = NULL;
 
     return connection;
 }
