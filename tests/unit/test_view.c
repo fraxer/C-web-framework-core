@@ -455,8 +455,8 @@ cleanup:
     view_env_free(&env);
 }
 
-TEST(test_view_render_condition_non_bool) {
-    TEST_CASE("Condition on non-bool value is treated as false");
+TEST(test_view_render_condition_truthiness) {
+    TEST_CASE("Non-bool values follow truthiness rules in conditions");
 
     view_env_t env;
     TEST_REQUIRE(view_env_init(&env), "Environment should be initialized");
@@ -464,12 +464,182 @@ TEST(test_view_render_condition_non_bool) {
                                           "{% if name %}YES{% else %}NO{% endif %}"),
                       "Template should be written", cleanup);
 
-    json_doc_t* doc = json_parse("{\"name\":\"bob\"}");
+    json_doc_t* doc = json_parse(
+        "{\"name\":\"bob\",\"empty\":\"\",\"zero\":0,\"num\":5,\"none\":null}");
     TEST_REQUIRE_NOT_NULL_GOTO(doc, "Document should be parsed", cleanup);
 
     char* result = render(doc, VIEW_TEST_STORAGE, "/if_str.html");
     TEST_REQUIRE_NOT_NULL_GOTO(result, "Render should succeed", cleanup_doc);
-    TEST_ASSERT_STR_EQUAL("NO", result, "Non-bool condition should be false");
+    TEST_ASSERT_STR_EQUAL("YES", result, "Non-empty string should be truthy");
+    free(result);
+
+    TEST_REQUIRE_GOTO(view_write_template("if_str2.html",
+                                          "{% if empty %}1{% else %}0{% endif %}"
+                                          "{% if zero %}1{% else %}0{% endif %}"
+                                          "{% if num %}1{% else %}0{% endif %}"
+                                          "{% if none %}1{% else %}0{% endif %}"
+                                          "{% if missing %}1{% else %}0{% endif %}"),
+                      "Template should be written", cleanup_doc);
+
+    result = render(doc, VIEW_TEST_STORAGE, "/if_str2.html");
+    TEST_REQUIRE_NOT_NULL_GOTO(result, "Render should succeed", cleanup_doc);
+    TEST_ASSERT_STR_EQUAL("00100", result,
+                          "Empty string, zero, null and missing should be falsy; non-zero number truthy");
+    free(result);
+
+cleanup_doc:
+    json_free(doc);
+cleanup:
+    view_env_free(&env);
+}
+
+// ============================================================================
+// Нестроковые значения и выражения
+// ============================================================================
+
+TEST(test_view_render_number_and_bool_values) {
+    TEST_CASE("Numbers and booleans render in canonical text form");
+
+    view_env_t env;
+    TEST_REQUIRE(view_env_init(&env), "Environment should be initialized");
+    TEST_REQUIRE_GOTO(view_write_template("values.html",
+                                          "{{ count }}|{{ price }}|{{ flag }}|{{ neg }}|{{ none }}"),
+                      "Template should be written", cleanup);
+
+    json_doc_t* doc = json_parse(
+        "{\"count\":42,\"price\":9.99,\"flag\":true,\"neg\":-3,\"none\":null}");
+    TEST_REQUIRE_NOT_NULL_GOTO(doc, "Document should be parsed", cleanup);
+
+    char* result = render(doc, VIEW_TEST_STORAGE, "/values.html");
+    TEST_REQUIRE_NOT_NULL_GOTO(result, "Render should succeed", cleanup_doc);
+    TEST_ASSERT_STR_EQUAL("42|9.99|true|-3|", result,
+                          "Integral numbers without fraction, floats shortest, bool as word, null empty");
+
+    free(result);
+
+cleanup_doc:
+    json_free(doc);
+cleanup:
+    view_env_free(&env);
+}
+
+TEST(test_view_render_arithmetic_expression) {
+    TEST_CASE("Arithmetic expressions are evaluated with precedence");
+
+    view_env_t env;
+    TEST_REQUIRE(view_env_init(&env), "Environment should be initialized");
+    TEST_REQUIRE_GOTO(view_write_template("arith.html",
+                                          "{{ a + b * 2 }}|{{ (a + b) * 2 }}|{{ b / a }}|{{ b % a }}|{{ -a + 1 }}"),
+                      "Template should be written", cleanup);
+
+    json_doc_t* doc = json_parse("{\"a\":4,\"b\":10}");
+    TEST_REQUIRE_NOT_NULL_GOTO(doc, "Document should be parsed", cleanup);
+
+    char* result = render(doc, VIEW_TEST_STORAGE, "/arith.html");
+    TEST_REQUIRE_NOT_NULL_GOTO(result, "Render should succeed", cleanup_doc);
+    TEST_ASSERT_STR_EQUAL("24|28|2.5|2|-3", result, "Expressions should follow standard precedence");
+
+    free(result);
+
+cleanup_doc:
+    json_free(doc);
+cleanup:
+    view_env_free(&env);
+}
+
+TEST(test_view_render_comparison_and_logic) {
+    TEST_CASE("Comparisons and logical operators drive conditions");
+
+    view_env_t env;
+    TEST_REQUIRE(view_env_init(&env), "Environment should be initialized");
+    TEST_REQUIRE_GOTO(view_write_template("logic.html",
+                                          "{% if age >= 18 %}adult{% else %}minor{% endif %};"
+                                          "{% if role == 'admin' %}admin{% endif %};"
+                                          "{% if active && age < 65 %}working{% endif %};"
+                                          "{% if role != 'guest' || banned %}member{% endif %}"),
+                      "Template should be written", cleanup);
+
+    json_doc_t* doc = json_parse(
+        "{\"age\":30,\"role\":\"admin\",\"active\":true,\"banned\":false}");
+    TEST_REQUIRE_NOT_NULL_GOTO(doc, "Document should be parsed", cleanup);
+
+    char* result = render(doc, VIEW_TEST_STORAGE, "/logic.html");
+    TEST_REQUIRE_NOT_NULL_GOTO(result, "Render should succeed", cleanup_doc);
+    TEST_ASSERT_STR_EQUAL("adult;admin;working;member", result,
+                          "All comparison and logic branches should evaluate");
+
+    free(result);
+
+cleanup_doc:
+    json_free(doc);
+cleanup:
+    view_env_free(&env);
+}
+
+TEST(test_view_render_division_by_zero) {
+    TEST_CASE("Division by zero renders as empty, not a crash");
+
+    view_env_t env;
+    TEST_REQUIRE(view_env_init(&env), "Environment should be initialized");
+    TEST_REQUIRE_GOTO(view_write_template("divzero.html", "[{{ a / b }}][{{ a % b }}]"),
+                      "Template should be written", cleanup);
+
+    json_doc_t* doc = json_parse("{\"a\":5,\"b\":0}");
+    TEST_REQUIRE_NOT_NULL_GOTO(doc, "Document should be parsed", cleanup);
+
+    char* result = render(doc, VIEW_TEST_STORAGE, "/divzero.html");
+    TEST_REQUIRE_NOT_NULL_GOTO(result, "Render should succeed", cleanup_doc);
+    TEST_ASSERT_STR_EQUAL("[][]", result, "Division and modulo by zero should render empty");
+
+    free(result);
+
+cleanup_doc:
+    json_free(doc);
+cleanup:
+    view_env_free(&env);
+}
+
+TEST(test_view_render_string_literal_and_concat_guard) {
+    TEST_CASE("String literals render as is; string arithmetic renders empty");
+
+    view_env_t env;
+    TEST_REQUIRE(view_env_init(&env), "Environment should be initialized");
+    TEST_REQUIRE_GOTO(view_write_template("strlit.html", "[{{ 'a}}b' }}][{{ name + 1 }}]"),
+                      "Template should be written", cleanup);
+
+    json_doc_t* doc = json_parse("{\"name\":\"bob\"}");
+    TEST_REQUIRE_NOT_NULL_GOTO(doc, "Document should be parsed", cleanup);
+
+    char* result = render(doc, VIEW_TEST_STORAGE, "/strlit.html");
+    TEST_REQUIRE_NOT_NULL_GOTO(result, "Render should succeed", cleanup_doc);
+    TEST_ASSERT_STR_EQUAL("[a}}b][]", result,
+                          "Quoted braces should render; string + number should render empty");
+
+    free(result);
+
+cleanup_doc:
+    json_free(doc);
+cleanup:
+    view_env_free(&env);
+}
+
+TEST(test_view_render_dynamic_index_expression) {
+    TEST_CASE("Array index may be a runtime expression");
+
+    view_env_t env;
+    TEST_REQUIRE(view_env_init(&env), "Environment should be initialized");
+    TEST_REQUIRE_GOTO(view_write_template("dynidx.html",
+                                          "{{ items[pos] }}|{{ items[pos + 1] }}|{{ items[99] }}|{{ obj[key] }}"),
+                      "Template should be written", cleanup);
+
+    json_doc_t* doc = json_parse(
+        "{\"items\":[\"a\",\"b\",\"c\"],\"pos\":1,\"obj\":{\"k\":\"v\"},\"key\":\"k\"}");
+    TEST_REQUIRE_NOT_NULL_GOTO(doc, "Document should be parsed", cleanup);
+
+    char* result = render(doc, VIEW_TEST_STORAGE, "/dynidx.html");
+    TEST_REQUIRE_NOT_NULL_GOTO(result, "Render should succeed", cleanup_doc);
+    TEST_ASSERT_STR_EQUAL("b|c||v", result,
+                          "Indexes should evaluate at render time; out of range renders empty");
 
     free(result);
 
@@ -546,6 +716,57 @@ TEST(test_view_render_loop_default_index) {
     char* result = render(doc, VIEW_TEST_STORAGE, "/for_index.html");
     TEST_REQUIRE_NOT_NULL_GOTO(result, "Render should succeed", cleanup_doc);
     TEST_ASSERT_STR_EQUAL("0:a 1:b ", result, "Default index should be rendered per element");
+
+    free(result);
+
+cleanup_doc:
+    json_free(doc);
+cleanup:
+    view_env_free(&env);
+}
+
+TEST(test_view_render_loop_index_arithmetic) {
+    TEST_CASE("Loop index participates in expressions");
+
+    view_env_t env;
+    TEST_REQUIRE(view_env_init(&env), "Environment should be initialized");
+    TEST_REQUIRE_GOTO(view_write_template("for_idx_expr.html",
+                                          "{% for item in items %}{{ index + 1 }}.{{ item }} {% endfor %}"),
+                      "Template should be written", cleanup);
+
+    json_doc_t* doc = json_parse("{\"items\":[\"a\",\"b\"]}");
+    TEST_REQUIRE_NOT_NULL_GOTO(doc, "Document should be parsed", cleanup);
+
+    char* result = render(doc, VIEW_TEST_STORAGE, "/for_idx_expr.html");
+    TEST_REQUIRE_NOT_NULL_GOTO(result, "Render should succeed", cleanup_doc);
+    TEST_ASSERT_STR_EQUAL("1.a 2.b ", result, "Index should be a number usable in arithmetic");
+
+    free(result);
+
+cleanup_doc:
+    json_free(doc);
+cleanup:
+    view_env_free(&env);
+}
+
+TEST(test_view_render_loop_element_expression) {
+    TEST_CASE("Loop element fields work in comparisons");
+
+    view_env_t env;
+    TEST_REQUIRE(view_env_init(&env), "Environment should be initialized");
+    TEST_REQUIRE_GOTO(view_write_template("for_el_expr.html",
+                                          "{% for u in users %}{% if u.age >= 18 %}{{ u.name }};{% endif %}{% endfor %}"),
+                      "Template should be written", cleanup);
+
+    json_doc_t* doc = json_parse(
+        "{\"users\":[{\"name\":\"bob\",\"age\":30},"
+        "{\"name\":\"kid\",\"age\":10},"
+        "{\"name\":\"ann\",\"age\":18}]}");
+    TEST_REQUIRE_NOT_NULL_GOTO(doc, "Document should be parsed", cleanup);
+
+    char* result = render(doc, VIEW_TEST_STORAGE, "/for_el_expr.html");
+    TEST_REQUIRE_NOT_NULL_GOTO(result, "Render should succeed", cleanup_doc);
+    TEST_ASSERT_STR_EQUAL("bob;ann;", result, "Only adults should be rendered");
 
     free(result);
 

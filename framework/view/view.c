@@ -11,9 +11,8 @@
 
 static char* __view_render(json_doc_t* document, const char* storage_name, const char* path);
 static char* __view_make_content(view_t* view, json_doc_t* document);
-static int __view_get_condition_value(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag);
-static const char* __view_get_tag_value(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag);
-static const json_token_t* __view_get_loop_value(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag);
+static viewexpr_value_t __view_eval_tag(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag);
+static void __view_write_value(view_copy_tags_t* copy_tags, const viewexpr_value_t* value);
 static void __view_build_content_recursive(view_t* view, json_doc_t* document, view_copy_tags_t* copy_tags, view_tag_t* tag);
 static void __view_copy_loop_tags_init(view_copy_tags_t* copy_tags);
 static void __view_copy_loop_tags_free(view_copy_tags_t* copy_tags);
@@ -123,223 +122,110 @@ char* __view_make_content(view_t* view, json_doc_t* document) {
     return data;
 }
 
+typedef struct view_scope_data {
+    view_copy_tags_t* copy_tags;
+    json_doc_t* document;
+    view_tag_t* tag;
+} view_scope_data_t;
+
 /**
- * Get the value of a condition tag.
+ * Resolves the leading identifier of an expression variable: loop key and
+ * element names of enclosing loops first, then the document root fields.
  *
- * @param copy_tags The copy tags structure.
- * @param document The JSON document.
- * @param tag The condition tag.
- * @return The value of the condition tag, or 0 if an error occurred.
+ * @param scope The expression scope.
+ * @param name The identifier name.
+ * @return The resolved value, or a null value if the name is unknown.
  */
-int __view_get_condition_value(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag) {
-    view_variable_item_t* item = tag->item;
-    if (item == NULL) return 0;
+static viewexpr_value_t __view_scope_resolve(const viewexpr_scope_t* scope, const char* name) {
+    const view_scope_data_t* data = scope->data;
+    viewexpr_value_t value = { VIEWEXPR_NULL, 0, 0, NULL, NULL };
 
-    view_loop_t* tag_for = __view_copy_loop_tag_get(copy_tags, tag->data_parent);
-    const json_token_t* json_token = json_root(document);
-    if (tag_for != NULL) {
-        view_loop_t* tag_parent = tag_for;
-
-        while (tag_parent != NULL) {
-            if (strcmp(item->name, tag_parent->element_name) == 0) {
-                json_token = tag_parent->token;
-
-                if (item->next != NULL)
-                    item = item->next;
-
-                break;
+    view_loop_t* tag_parent = __view_copy_loop_tag_get(data->copy_tags, data->tag->data_parent);
+    while (tag_parent != NULL) {
+        if (strcmp(name, tag_parent->key_name) == 0) {
+            if (tag_parent->key_is_index) {
+                value.type = VIEWEXPR_NUMBER;
+                value.number = (long double)tag_parent->key_index;
+            }
+            else {
+                value.type = VIEWEXPR_STRING;
+                value.string = tag_parent->key_value;
             }
 
-            tag_parent = __view_copy_loop_tag_get(copy_tags, tag_parent->base.data_parent);
+            return value;
         }
+
+        if (strcmp(name, tag_parent->element_name) == 0)
+            return viewexpr_value_from_token(tag_parent->token);
+
+        tag_parent = __view_copy_loop_tag_get(data->copy_tags, tag_parent->base.data_parent);
     }
 
-    while (item) {
-        // json_token is NULL when the document is NULL or has no root
-        if (json_token == NULL) break;
+    const json_token_t* root = data->document != NULL ? json_root(data->document) : NULL;
+    if (root == NULL || root->type != JSON_OBJECT)
+        return value;
 
-        const json_token_t* token = NULL;
-        if (json_token->type == JSON_STRING)
-            token = json_token;
-        else if (json_token->type == JSON_OBJECT)
-            token = json_object_get(json_token, item->name);
-
-        if (token == NULL) break;
-
-        if (token->type == JSON_ARRAY) {
-            int stop = 0;
-            view_variable_index_t* index = item->index;
-            while (index) {
-                token = json_array_get(token, index->value);
-                stop = token == NULL;
-                if (stop) break;
-
-                index = index->next;
-            }
-
-            if (stop) break;
-        }
-
-        if (item->next == NULL) {
-            if (json_is_bool(token))
-                return json_bool(token);
-        }
-        else {
-            json_token = token;
-        }
-
-        item = item->next;
-    }
-
-    return 0;
+    return viewexpr_value_from_token(json_object_get(root, name));
 }
 
 /**
- * Get the value of a tag.
+ * Evaluates the expression of a tag within the loop scope of the tag.
  *
  * @param copy_tags The copy tags structure.
  * @param document The JSON document.
- * @param tag The tag.
- * @return The value of the tag as a string, or NULL if an error occurred.
+ * @param tag The tag with an expression.
+ * @return The expression value.
  */
-const char* __view_get_tag_value(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag) {
-    view_variable_item_t* item = tag->item;
-    if (item == NULL) return NULL;
+viewexpr_value_t __view_eval_tag(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag) {
+    view_scope_data_t data = { copy_tags, document, tag };
+    const viewexpr_scope_t scope = { __view_scope_resolve, &data };
 
-    view_loop_t* tag_for = __view_copy_loop_tag_get(copy_tags, tag->data_parent);
-    const json_token_t* json_token = json_root(document);
-    if (tag_for != NULL) {
-        view_loop_t* tag_parent = tag_for;
-
-        while (tag_parent != NULL) {
-            if (item->next == NULL && strcmp(item->name, tag_parent->key_name) == 0)
-                return tag_parent->key_value;
-
-            if (strcmp(item->name, tag_parent->element_name) == 0) {
-                json_token = tag_parent->token;
-
-                if (item->next != NULL)
-                    item = item->next;
-
-                break;
-            }
-
-            tag_parent = __view_copy_loop_tag_get(copy_tags, tag_parent->base.data_parent);
-        }
-    }
-
-    while (item) {
-        // json_token is NULL when the document is NULL or has no root
-        if (json_token == NULL) break;
-
-        const json_token_t* token = NULL;
-        if (json_token->type == JSON_STRING)
-            token = json_token;
-        else if (json_token->type == JSON_OBJECT)
-            token = json_object_get(json_token, item->name);
-
-        if (token == NULL) break;
-
-        if (token->type == JSON_ARRAY) {
-            int stop = 0;
-            view_variable_index_t* index = item->index;
-            while (index) {
-                token = json_array_get(token, index->value);
-                stop = token == NULL;
-                if (stop) break;
-
-                index = index->next;
-            }
-
-            if (stop) break;
-        }
-
-        if (item->next == NULL) {
-            if (json_is_string(token))
-                return json_string(token);
-        }
-        else {
-            json_token = token;
-        }
-
-        item = item->next;
-    }
-
-    return NULL;
+    return viewexpr_eval(tag->expr, &scope);
 }
 
 /**
- * Get the value of a loop tag.
+ * Writes an expression value to the output buffer: strings as is, numbers
+ * and booleans in their canonical text form, null and containers as nothing.
  *
- * @param copy_tags The copy tags structure.
- * @param document The JSON document.
- * @param tag The loop tag.
- * @return The value of the loop tag as a json token, or NULL if an error occurred.
+ * @param copy_tags The copy tags structure with the output buffer.
+ * @param value The value to write.
+ * @return void
  */
-const json_token_t* __view_get_loop_value(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag) {
-    view_variable_item_t* item = tag->item;
-    if (item == NULL) return NULL;
+void __view_write_value(view_copy_tags_t* copy_tags, const viewexpr_value_t* value) {
+    switch (value->type)
+    {
+    case VIEWEXPR_STRING:
+    {
+        const char* string = value->string;
+        if (string == NULL) return;
 
-    view_loop_t* tag_for = __view_copy_loop_tag_get(copy_tags, tag->data_parent);
-    const json_token_t* json_token = json_root(document);
-    if (tag_for != NULL) {
-        view_loop_t* tag_parent = tag_for;
+        for (size_t i = 0; string[i] != 0; i++)
+            bufferdata_push(&copy_tags->buf, string[i]);
 
-        while (tag_parent != NULL) {
-            if (strcmp(item->name, tag_parent->element_name) == 0) {
-                json_token = tag_parent->token;
-
-                if (item->next != NULL)
-                    item = item->next;
-
-                break;
-            }
-
-            tag_parent = __view_copy_loop_tag_get(copy_tags, tag_parent->base.data_parent);
-        }
+        break;
     }
+    case VIEWEXPR_NUMBER:
+    {
+        char buffer[64];
+        const size_t size = viewexpr_number_format(value->number, buffer, sizeof(buffer));
 
-    while (item) {
-        // json_token is NULL when the document is NULL or has no root
-        if (json_token == NULL) break;
+        for (size_t i = 0; i < size; i++)
+            bufferdata_push(&copy_tags->buf, buffer[i]);
 
-        const json_token_t* token = NULL;
-        if (json_token->type == JSON_ARRAY)
-            token = json_token;
-        else
-            token = json_object_get(json_token, item->name);
-
-        if (token == NULL) break;
-
-        if (token->type == JSON_ARRAY) {
-            int stop = 0;
-            view_variable_index_t* index = item->index;
-            while (index) {
-                token = json_array_get(token, index->value);
-                stop = token == NULL;
-                if (stop) break;
-
-                index = index->next;
-            }
-
-            if (stop) break;
-        }
-
-        if (item->next == NULL) {
-            // convert token value to string
-            if (json_is_array(token) || json_is_object(token))
-                return token;
-
-            return NULL;
-        }
-        else {
-            json_token = token;
-        }
-
-        item = item->next;
+        break;
     }
+    case VIEWEXPR_BOOL:
+    {
+        const char* string = value->boolean ? "true" : "false";
 
-    return NULL;
+        for (size_t i = 0; string[i] != 0; i++)
+            bufferdata_push(&copy_tags->buf, string[i]);
+
+        break;
+    }
+    default:
+        break;
+    }
 }
 
 /**
@@ -364,12 +250,8 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
             for (size_t i = child->parent_text_offset; i < child->parent_text_offset + child->parent_text_size && i < size; i++)
                 bufferdata_push(&copy_tags->buf, content[i]);
 
-            content = __view_get_tag_value(copy_tags, document, child);
-            if (content != NULL) {
-                size = strlen(content);
-                for (size_t i = 0; i < size; i++)
-                    bufferdata_push(&copy_tags->buf, content[i]);
-            }
+            const viewexpr_value_t value = __view_eval_tag(copy_tags, document, child);
+            __view_write_value(copy_tags, &value);
 
             if (child->next == NULL) {
                 size = bufferdata_writed(&parent->result_content);
@@ -399,8 +281,11 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
             view_tag_t* parent = child->parent;
             view_condition_item_t* tag = (view_condition_item_t*)child;
 
-            const int result = __view_get_condition_value(copy_tags, document, child);
-            const int istrue = tag->always_true || (result && !tag->reverse) || (!result && tag->reverse);
+            int istrue = tag->always_true;
+            if (!istrue) {
+                const viewexpr_value_t value = __view_eval_tag(copy_tags, document, child);
+                istrue = viewexpr_value_istrue(&value);
+            }
 
             if (!istrue) {
                 if (child->next != NULL) {
@@ -454,7 +339,8 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
             for (size_t i = child->parent_text_offset; i < child->parent_text_offset + child->parent_text_size && i < size; i++)
                 bufferdata_push(&copy_tags->buf, content[i]);
 
-            const json_token_t* token = __view_get_loop_value(copy_tags, document, child);
+            const viewexpr_value_t loop_value = __view_eval_tag(copy_tags, document, child);
+            const json_token_t* token = loop_value.type == VIEWEXPR_TOKEN ? loop_value.token : NULL;
             if (token != NULL) {
                 if (token->type == JSON_OBJECT || token->type == JSON_ARRAY) {
                     for (json_it_t it = json_init_it(token); !json_end_it(&it); it = json_next_it(&it)) {
@@ -463,9 +349,15 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
                         if (token->type == JSON_OBJECT) {
                             const char* key = json_it_key(&it);
                             snprintf(tag_for->key_value, sizeof(tag_for->key_value), "%s", key != NULL ? key : "");
+                            tag_for->key_is_index = 0;
+                            tag_for->key_index = 0;
                         }
-                        else
-                            snprintf(tag_for->key_value, sizeof(tag_for->key_value), "%d", (*(int*)json_it_key(&it)));
+                        else {
+                            const int key_index = *(int*)json_it_key(&it);
+                            snprintf(tag_for->key_value, sizeof(tag_for->key_value), "%d", key_index);
+                            tag_for->key_is_index = 1;
+                            tag_for->key_index = key_index;
+                        }
 
                         tag_for->token = json_it_value(&it);
 

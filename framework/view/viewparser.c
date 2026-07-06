@@ -12,12 +12,9 @@ static void __viewparser_context_free(viewparser_context_t* context);
 static int __viewparser_readfile(viewparser_context_t* context, const char* storage_name,const char* path);
 static int __viewparser_parse_content(viewparser_t* parser);
 static int __viewparser_variable_create(viewparser_t* parser);
-static view_variable_item_t* __viewparser_variable_item_create();
-static void __viewparser_variable_item_append(view_variable_item_t* variable_item, view_tag_t* variable);
-static int __viewparser_variable_item_complete_name(viewparser_t* parser);
-static int __viewparser_variable_item_complete_index(viewparser_t* parser);
-static int __viewparser_variable_item_index_create(view_variable_item_t* item, int value);
-static int __viewparser_variable_write_body(viewparser_t* parser, char ch);
+static void __viewparser_expr_begin(viewparser_t* parser);
+static int __viewparser_expr_collect(viewparser_t* parser, char ch, char close_first);
+static int __viewparser_expr_complete(viewparser_t* parser, int forbid_expression);
 static void __viewparser_variable_rtrim(viewparser_t* parser);
 static void __viewparser_tag_append_child_or_sibling(view_tag_t* parent, view_tag_t* child);
 static void __viewparser_tag_set_parent_text_params(view_tag_t* tag, view_tag_t* parent);
@@ -33,8 +30,6 @@ static int __viewparser_branch_write_body(viewparser_t* parser);
 static int __viewparser_condition_if_create(viewparser_t* parser);
 static int __viewparser_condition_elseif_create(viewparser_t* parser);
 static int __viewparser_condition_else_create(viewparser_t* parser);
-static void __viewparser_condition_item_append(view_variable_item_t* variable_item, view_condition_item_t* tag);
-static int __viewparser_condition_item_complete_name(viewparser_t* parser);
 
 static int __viewparser_loop_create(viewparser_t* parser);
 static int __viewparser_loop_write_item(viewparser_t* parser, char ch);
@@ -70,6 +65,8 @@ viewparser_t* viewparser_init(const char* restrict storage_name, const char* res
     parser->root_tag = NULL;
     parser->current_tag = NULL;
     parser->level = 0;
+    parser->expr_quote = 0;
+    parser->expr_escape = 0;
 
     bufferdata_init(&parser->variable_buffer);
 
@@ -240,12 +237,8 @@ int __viewparser_parse_content(viewparser_t* parser) {
                     if (!__viewparser_variable_create(parser))
                         return 0;
 
-                    view_variable_item_t* variable_item = __viewparser_variable_item_create();
-                    if (variable_item == NULL)
-                        return 0;
+                    __viewparser_expr_begin(parser);
 
-                    __viewparser_variable_item_append(variable_item, parser->current_tag);
-                    
                     break;
                 }
 
@@ -295,44 +288,18 @@ int __viewparser_parse_content(viewparser_t* parser) {
         }
         case VIEWPARSER_VARIABLE:
         {
-            switch (ch)
-            {
-            case '{':
-            case '%':
-            {
+            const int collected = __viewparser_expr_collect(parser, ch, '}');
+            if (collected < 0)
                 return 0;
 
-                break;
-            }
-            case '}':
-            {
-                if (context->symbol == VIEWPARSER_FIGFIGOPEN) {
-                    log_error("__viewparser_parse_content: empty variable tag\n");
-                    return 0;
-                }
-                if (context->symbol == VIEWPARSER_FIGFIGCLOSE) {
-                    context->stage = VIEWPARSER_TEXT;
-
-                    if (!__viewparser_variable_item_complete_name(parser))
-                        return 0;
-
-                    parser->current_tag = parser->current_tag->parent;
-
-                    break;
-                }
-
-                if (context->symbol == VIEWPARSER_VARIABLE_DOT)
-                    return 0;
-
+            if (collected > 0) {
+                context->stage = VIEWPARSER_TEXT;
                 context->symbol = VIEWPARSER_FIGFIGCLOSE;
 
-                break;
-            }
-            default:
-                if (context->symbol == VIEWPARSER_FIGFIGCLOSE)
+                if (!__viewparser_expr_complete(parser, 0))
                     return 0;
-                if (!__viewparser_variable_write_body(parser, ch))
-                    return 0;
+
+                parser->current_tag = parser->current_tag->parent;
             }
 
             break;
@@ -434,66 +401,17 @@ int __viewparser_parse_content(viewparser_t* parser) {
         }
         case VIEWPARSER_CONDITION_EXPR:
         {
-            switch (ch)
-            {
-            case '{':
-            case '*':
-            {
+            const int collected = __viewparser_expr_collect(parser, ch, '%');
+            if (collected < 0)
                 return 0;
 
-                break;
-            }
-            case '!':
-            {
-                if (context->symbol != VIEWPARSER_VARIABLE_SPACE)
-                    return 0;
-
-                view_condition_item_t* tag = (view_condition_item_t*)parser->current_tag;
-                if (tag->base.type != VIEW_TAGTYPE_COND_IF && tag->base.type != VIEW_TAGTYPE_COND_ELSEIF) {
-                    log_error("__viewparser_parse_content: inverse should be only in if or elseif tag\n");
-                    return 0;
-                }
-                if (tag->reverse == 1) {
-                    log_error("__viewparser_parse_content: inverse should be appeared only once\n");
-                    return 0;
-                }
-
-                tag->reverse = 1;
-                context->symbol = VIEWPARSER_VARIABLE_INVERSE;
-
-                break;
-            }
-            case '%':
-            {
-                context->symbol = VIEWPARSER_FIGPERCENTCLOSE;
-
-                break;
-            }
-            case '}':
-            {
-                if (context->symbol != VIEWPARSER_FIGPERCENTCLOSE)
-                    return 0;
-
+            if (collected > 0) {
                 context->stage = VIEWPARSER_TEXT;
-
-                if (!__viewparser_condition_item_complete_name(parser))
-                    return 0;
-
-                view_condition_item_t* tag_cond_item = (view_condition_item_t*)parser->current_tag;
-                if (!tag_cond_item->always_true
-                    && (tag_cond_item->base.last_item == NULL || tag_cond_item->base.last_item->name_length == 0)) {
-                    log_error("__viewparser_parse_content: empty condition expression\n");
-                    return 0;
-                }
-
                 context->symbol = VIEWPARSER_FIGFIGCLOSE;
 
-                break;
-            }
-            default:
-                if (context->symbol == VIEWPARSER_FIGPERCENTCLOSE)
-                    return 0;
-                if (!__viewparser_variable_write_body(parser, ch))
+                // else takes no expression, if/elseif require one
+                view_condition_item_t* tag_cond_item = (view_condition_item_t*)parser->current_tag;
+                if (!__viewparser_expr_complete(parser, tag_cond_item->always_true))
                     return 0;
             }
 
@@ -555,56 +473,26 @@ int __viewparser_parse_content(viewparser_t* parser) {
         }
         case VIEWPARSER_LOOP_VAR:
         {
-            switch (ch)
-            {
-            case '{':
-            case '*':
-            {
+            const int collected = __viewparser_expr_collect(parser, ch, '%');
+            if (collected < 0)
                 return 0;
-            }
-            case '!':
-            {
-                log_error("__viewparser_parse_content: inverse should not be in for\n");
-                return 0;
-            }
-            case '%':
-            {
-                context->symbol = VIEWPARSER_FIGPERCENTCLOSE;
 
-                break;
-            }
-            case '}':
-            {
-                if (context->symbol != VIEWPARSER_FIGPERCENTCLOSE)
-                    return 0;
-
+            if (collected > 0) {
                 context->stage = VIEWPARSER_TEXT;
+                context->symbol = VIEWPARSER_FIGFIGCLOSE;
 
-                if (!__viewparser_variable_item_complete_name(parser))
-                    return 0;
-
-                view_loop_t* tag_for = (view_loop_t*)parser->current_tag;
-                if (tag_for->base.last_item == NULL || tag_for->base.last_item->name_length == 0) {
-                    log_error("__viewparser_parse_content: empty loop collection name\n");
+                if (!__viewparser_expr_complete(parser, 0)) {
+                    log_error("__viewparser_parse_content: invalid loop collection expression\n");
                     return 0;
                 }
 
+                view_loop_t* tag_for = (view_loop_t*)parser->current_tag;
                 if (tag_for->key_name[0] == 0) {
                     if (strcmp(tag_for->element_name, "index") == 0)
                         return 0;
 
                     strcpy(tag_for->key_name, "index");
                 }
-
-                context->symbol = VIEWPARSER_FIGFIGCLOSE;
-
-                break;
-            }
-            default:
-                if (context->symbol == VIEWPARSER_FIGPERCENTCLOSE)
-                    return 0;
-                if (!__viewparser_variable_write_body(parser, ch))
-                    return 0;
             }
 
             break;
@@ -661,246 +549,107 @@ int __viewparser_variable_create(viewparser_t* parser) {
 }
 
 /**
- * Creates a new variable item.
+ * Resets the expression collector state before an expression tag body.
  *
- * @return A pointer to the created variable item, or NULL if it failed.
- */
-view_variable_item_t* __viewparser_variable_item_create(void) {
-    view_variable_item_t* item = malloc(sizeof * item);
-    if (item == NULL) {
-        log_error("__viewparser_variable_item_create: malloc failed\n");
-        return NULL;
-    }
-
-    item->index = NULL;
-    item->last_index = NULL;
-    item->next = NULL;
-    item->name[0] = 0;
-    item->name_length = 0;
-
-    return item;
-}
-
-/**
- * Appends a new variable item to a variable tag.
- *
- * @param variable_item The variable item to append.
- * @param variable The variable tag to append the variable item to.
+ * @param parser The view parser.
  * @return void
  */
-#pragma GCC diagnostic push                                                                                                                     
-#pragma GCC diagnostic ignored "-Wanalyzer-malloc-leak"  
-void __viewparser_variable_item_append(view_variable_item_t* variable_item, view_tag_t* variable) {
-    if (variable->item == NULL)
-        variable->item = variable_item;
-
-    if (variable->last_item != NULL)
-        variable->last_item->next = variable_item;
-
-    variable->last_item = variable_item;
+void __viewparser_expr_begin(viewparser_t* parser) {
+    parser->expr_quote = 0;
+    parser->expr_escape = 0;
 }
-#pragma GCC diagnostic pop
 
 /**
- * Completes the name of a variable item.
+ * Collects one raw expression character into the variable buffer.
+ * Tracks string literals so a close character inside quotes does not
+ * terminate the tag. The tag is closed by close_first followed by '}'.
  *
  * @param parser The view parser.
- * @return 1 if the name was successfully completed, 0 otherwise.
+ * @param ch The character to collect.
+ * @param close_first The first character of the closing sequence: '}' for
+ *                    variable tags, '%' for branch tags.
+ * @return 1 if the closing sequence was consumed, 0 to continue, -1 on error.
  */
-int __viewparser_variable_item_complete_name(viewparser_t* parser) {
-    __viewparser_variable_rtrim(parser);
-
-    bufferdata_complete(&parser->variable_buffer);
-    const size_t variable_item_size = bufferdata_writed(&parser->variable_buffer);
-    if (variable_item_size >= VIEWPARSER_VARIABLE_ITEM_NAME_SIZE) {
-        log_error("__viewparser_variable_item_complete_name: name size is greater or equal to %zd", VIEWPARSER_VARIABLE_ITEM_NAME_SIZE);
-        return 0;
-    }
-
-    if (variable_item_size > 0) {
-        view_tag_t* variable = parser->current_tag;
-        strcpy(variable->last_item->name, bufferdata_get(&parser->variable_buffer));
-        variable->last_item->name_length = variable_item_size;
-    }
-
-    bufferdata_reset(&parser->variable_buffer);
-
-    return 1;
-}
-
-/**
- * Completes the index of a variable item.
- *
- * @param parser The view parser.
- * @return 1 if the index was successfully completed, 0 otherwise.
- */
-int __viewparser_variable_item_complete_index(viewparser_t* parser) {
-    __viewparser_variable_rtrim(parser);
-
-    bufferdata_complete(&parser->variable_buffer);
-    const size_t variable_item_size = bufferdata_writed(&parser->variable_buffer);
-    if (variable_item_size > 10) {
-        log_error("__viewparser_variable_item_complete_index: variable_item_size is greater than 10");
-        return 0;
-    }
-
-    if (variable_item_size > 0) {
-        const char* value = bufferdata_get(&parser->variable_buffer);
-        long long index = 0;
-
-        for (size_t i = 0; i < variable_item_size; i++) {
-            if (value[i] < '0' || value[i] > '9') {
-                log_error("__viewparser_variable_item_complete_index: value[i] is not a digit");
-                return 0;
-            }
-
-            index = index * 10 + (value[i] - '0');
-        }
-
-        if (index > INT_MAX) {
-            log_error("__viewparser_variable_item_complete_index: index is greater than INT_MAX");
-            return 0;
-        }
-
-        view_tag_t* variable = parser->current_tag;
-        if (!__viewparser_variable_item_index_create(variable->last_item, (int)index)) {
-            log_error("__viewparser_variable_item_complete_index: __viewparser_variable_item_index_create failed");
-            return 0;
-        }
-    }
-
-    bufferdata_reset(&parser->variable_buffer);
-
-    return 1;
-}
-
-/**
- * Creates a new variable index for a variable item.
- *
- * @param item A pointer to a variable item.
- * @param value The value of the new index.
- * @return 1 if the index was successfully created, 0 otherwise.
- */
-int __viewparser_variable_item_index_create(view_variable_item_t* const item, const int value) {
-    if (item == NULL) {
-        log_error("__viewparser_variable_item_index_create: item is NULL");
-        return 0;
-    }
-
-    view_variable_index_t* index = malloc(sizeof * index);
-    if (index == NULL) {
-        log_error("__viewparser_variable_item_index_create: malloc failed");
-        return 0;
-    }
-
-    index->next = NULL;
-    index->value = value;
-
-    if (item->index == NULL)
-        item->index = index;
-
-    if (item->last_index != NULL)
-        item->last_index->next = index;
-
-    item->last_index = index;
-
-    return 1;
-}
-
-/**
- * Writes a character to the body of a variable in the view parser.
- *
- * @param parser A pointer to a view parser.
- * @param ch The character to write.
- * @return 1 if the character was successfully written, 0 otherwise.
- */
-int __viewparser_variable_write_body(viewparser_t* parser, const char ch) {
+int __viewparser_expr_collect(viewparser_t* parser, char ch, char close_first) {
     viewparser_context_t* const context = parser->current_context;
 
-    switch (ch)
-    {
-    case ' ':
-    {
-        if (context->symbol == VIEWPARSER_VARIABLE_INVERSE)
-            break;
-        if (context->symbol == VIEWPARSER_VARIABLE_SPACE)
-            break;
-        if (context->symbol == VIEWPARSER_FIGFIGOPEN)
-            break;
-        if (context->symbol == VIEWPARSER_VARIABLE_DOT)
-            break;
-        if (context->symbol == VIEWPARSER_VARIABLE_BRACKETOPEN)
-            break;
-
-        context->symbol = VIEWPARSER_VARIABLE_SPACE;
-
-        break;
-    }
-    case '[':
-    {
-        if (context->symbol == VIEWPARSER_DEFAULT || context->symbol == VIEWPARSER_VARIABLE_SPACE) {
-            if (!__viewparser_variable_item_complete_name(parser))
-                return 0;
-        }
-        else if (context->symbol == VIEWPARSER_VARIABLE_BRACKETCLOSE || context->symbol == VIEWPARSER_VARIABLE_SPACE) {
-            if (!__viewparser_variable_item_complete_index(parser))
-                return 0;
-        }
-        else
-            return 0;
-
-        context->symbol = VIEWPARSER_VARIABLE_BRACKETOPEN;
-
-        break;
-    }
-    case ']':
-    {
-        if (context->symbol == VIEWPARSER_VARIABLE_BRACKETOPEN)
-            return 0;
-
-        if (!__viewparser_variable_item_complete_index(parser))
-            return 0;
-
-        context->symbol = VIEWPARSER_VARIABLE_BRACKETCLOSE;
-
-        break;
-    }
-    case '.':
-    {
-        if (context->symbol == VIEWPARSER_FIGFIGOPEN)
-            return 0;
-        if (context->symbol == VIEWPARSER_FIGPERCENTOPEN)
-            return 0;
-        if (context->symbol == VIEWPARSER_FIGASTOPEN)
-            return 0;
-        if (context->symbol == VIEWPARSER_VARIABLE_DOT)
-            return 0;
-        if (context->symbol == VIEWPARSER_VARIABLE_BRACKETOPEN)
-            return 0;
-
-        context->symbol = VIEWPARSER_VARIABLE_DOT;
-
-        if (!__viewparser_variable_item_complete_name(parser))
-            return 0;
-
-        view_variable_item_t* variable_item = __viewparser_variable_item_create();
-        if (variable_item == NULL)
-            return 0;
-
-        __viewparser_variable_item_append(variable_item, parser->current_tag);
-
-        break;
-    }
-    default:
-        // a name character after "name " means a space inside the
-        // variable name — reject instead of silently concatenating
-        if (context->symbol == VIEWPARSER_VARIABLE_SPACE && bufferdata_writed(&parser->variable_buffer) > 0)
-            return 0;
-
-        context->symbol = VIEWPARSER_DEFAULT;
+    if (parser->expr_quote != 0) {
         bufferdata_push(&parser->variable_buffer, ch);
-        break;
+
+        if (ch == parser->expr_quote && !parser->expr_escape)
+            parser->expr_quote = 0;
+
+        parser->expr_escape = ch == '\\' && !parser->expr_escape;
+
+        return 0;
     }
+
+    if (context->symbol == VIEWPARSER_FIGPERCENTCLOSE) {
+        if (ch == '}')
+            return 1;
+
+        // close_first was part of the expression, keep it and reprocess ch
+        bufferdata_push(&parser->variable_buffer, close_first);
+        context->symbol = VIEWPARSER_DEFAULT;
+
+        return __viewparser_expr_collect(parser, ch, close_first);
+    }
+
+    if (ch == close_first) {
+        context->symbol = VIEWPARSER_FIGPERCENTCLOSE;
+        return 0;
+    }
+
+    if (ch == '\'' || ch == '"') {
+        parser->expr_quote = ch;
+        parser->expr_escape = 0;
+    }
+
+    bufferdata_push(&parser->variable_buffer, ch);
+    context->symbol = VIEWPARSER_DEFAULT;
+
+    return 0;
+}
+
+/**
+ * Parses the collected expression text with recursive descent and attaches
+ * the AST to the current tag.
+ *
+ * @param parser The view parser.
+ * @param forbid_expression Non-zero for tags that take no expression (else):
+ *                          any non-space content is an error.
+ * @return 1 on success, 0 otherwise.
+ */
+int __viewparser_expr_complete(viewparser_t* parser, int forbid_expression) {
+    __viewparser_variable_rtrim(parser);
+
+    bufferdata_complete(&parser->variable_buffer);
+    const size_t expression_size = bufferdata_writed(&parser->variable_buffer);
+    const char* expression = bufferdata_get(&parser->variable_buffer);
+
+    if (forbid_expression) {
+        for (size_t i = 0; i < expression_size; i++) {
+            const char ch = expression[i];
+            if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') {
+                log_error("__viewparser_expr_complete: tag takes no expression\n");
+                bufferdata_reset(&parser->variable_buffer);
+                return 0;
+            }
+        }
+
+        bufferdata_reset(&parser->variable_buffer);
+        return 1;
+    }
+
+    viewexpr_node_t* expr = viewexpr_parse(expression, expression_size);
+    bufferdata_reset(&parser->variable_buffer);
+
+    if (expr == NULL) {
+        log_error("__viewparser_expr_complete: invalid expression\n");
+        return 0;
+    }
+
+    parser->current_tag->expr = expr;
 
     return 1;
 }
@@ -990,8 +739,7 @@ void __viewparser_tag_init(view_tag_t* tag, viewparser_tagtype_e type, view_tag_
     tag->child = NULL;
     tag->last_child = NULL;
     tag->next = NULL;
-    tag->item = NULL;
-    tag->last_item = NULL;
+    tag->expr = NULL;
     tag->free = view_tag_free;
 }
 
@@ -1173,6 +921,7 @@ int __viewparser_branch_write_body(viewparser_t* parser) {
         }
 
         parser->current_context->stage = VIEWPARSER_CONDITION_EXPR;
+        __viewparser_expr_begin(parser);
     }
     else if (strcmp(tag_name, __word_elseif) == 0) {
         if (!__viewparser_condition_elseif_create(parser)) {
@@ -1181,6 +930,7 @@ int __viewparser_branch_write_body(viewparser_t* parser) {
         }
 
         parser->current_context->stage = VIEWPARSER_CONDITION_EXPR;
+        __viewparser_expr_begin(parser);
     }
     else if (strcmp(tag_name, __word_else) == 0) {
         if (!__viewparser_condition_else_create(parser)) {
@@ -1189,6 +939,7 @@ int __viewparser_branch_write_body(viewparser_t* parser) {
         }
 
         parser->current_context->stage = VIEWPARSER_CONDITION_EXPR;
+        __viewparser_expr_begin(parser);
     }
     else if (strcmp(tag_name, __word_endif) == 0) {
         const int type = parser->current_tag->type;
@@ -1255,68 +1006,13 @@ int __viewparser_condition_if_create(viewparser_t* parser) {
     }
 
     __viewparser_tag_init((view_tag_t*)tag_if, VIEW_TAGTYPE_COND_IF, data_parent, tag_cond);
-    tag_if->result = 0;
-    tag_if->reverse = 0;
     tag_if->always_true = 0;
     tag_if->base.free = view_tag_condition_free;
 
-    view_variable_item_t* variable_item = __viewparser_variable_item_create();
-    if (variable_item == NULL) {
-        log_error("__viewparser_variable_item_create failed in __viewparser_condition_if_create\n");
-        free(tag_cond);
-        free(tag_if);
-        return 0;
-    }
-
-    __viewparser_condition_item_append(variable_item, tag_if);
     __viewparser_tag_append_child_or_sibling(tag_cond, (view_tag_t*)tag_if);
     __viewparser_tag_append_child_or_sibling(current_tag, tag_cond);
 
     parser->current_tag = (view_tag_t*)tag_if;
-
-    return 1;
-}
-
-/**
- * Appends a new variable item to a condition item.
- *
- * @param variable_item The variable item to append.
- * @param tag The condition item to append the variable item to.
- * @return void
- */
-void __viewparser_condition_item_append(view_variable_item_t* variable_item, view_condition_item_t* tag) {
-    if (tag->base.item == NULL)
-        tag->base.item = variable_item;
-
-    if (tag->base.last_item != NULL)
-        tag->base.last_item->next = variable_item;
-
-    tag->base.last_item = variable_item;
-}
-
-/**
- * Completes the name of a variable item and resets the variable buffer.
- *
- * @param parser The viewparser instance.
- * @return 1 if the name was successfully completed, 0 otherwise.
- */
-int __viewparser_condition_item_complete_name(viewparser_t* parser) {
-    __viewparser_variable_rtrim(parser);
-
-    bufferdata_complete(&parser->variable_buffer);
-    const size_t variable_item_size = bufferdata_writed(&parser->variable_buffer);
-    if (variable_item_size >= VIEWPARSER_VARIABLE_ITEM_NAME_SIZE) {
-        log_error("__viewparser_condition_item_complete_name: name size is greater or equal to %zd", VIEWPARSER_VARIABLE_ITEM_NAME_SIZE);
-        return 0;
-    }
-
-    if (variable_item_size > 0) {
-        view_tag_t* condition_item = parser->current_tag;
-        strcpy(condition_item->last_item->name, bufferdata_get(&parser->variable_buffer));
-        condition_item->last_item->name_length = variable_item_size;
-    }
-
-    bufferdata_reset(&parser->variable_buffer);
 
     return 1;
 }
@@ -1344,19 +1040,9 @@ int __viewparser_condition_elseif_create(viewparser_t* parser) {
     view_tag_t* data_parent = __viewparser_get_dataparent(current_tag);
 
     __viewparser_tag_init((view_tag_t*)tag_elseif, VIEW_TAGTYPE_COND_ELSEIF, data_parent, tag_cond);
-    tag_elseif->result = 0;
-    tag_elseif->reverse = 0;
     tag_elseif->always_true = 0;
     tag_elseif->base.free = view_tag_condition_free;
 
-    view_variable_item_t* variable_item = __viewparser_variable_item_create();
-    if (variable_item == NULL) {
-        log_error("__viewparser_condition_elseif_create: __viewparser_variable_item_create failed");
-        free(tag_elseif);
-        return 0;
-    }
-
-    __viewparser_condition_item_append(variable_item, tag_elseif);
     __viewparser_tag_append_child_or_sibling(tag_cond, (view_tag_t*)tag_elseif);
 
     parser->current_tag = (view_tag_t*)tag_elseif;
@@ -1387,19 +1073,9 @@ int __viewparser_condition_else_create(viewparser_t* parser) {
     view_tag_t* data_parent = __viewparser_get_dataparent(current_tag);
 
     __viewparser_tag_init((view_tag_t*)tag_else, VIEW_TAGTYPE_COND_ELSE, data_parent, tag_cond);
-    tag_else->result = 0;
-    tag_else->reverse = 0;
     tag_else->always_true = 1;
     tag_else->base.free = view_tag_condition_free;
 
-    view_variable_item_t* variable_item = __viewparser_variable_item_create();
-    if (variable_item == NULL) {
-        log_error("__viewparser_condition_else_create: __viewparser_variable_item_create failed");
-        free(tag_else);
-        return 0;
-    }
-
-    __viewparser_condition_item_append(variable_item, tag_else);
     __viewparser_tag_append_child_or_sibling(tag_cond, (view_tag_t*)tag_else);
 
     parser->current_tag = (view_tag_t*)tag_else;
@@ -1428,17 +1104,11 @@ int __viewparser_loop_create(viewparser_t* parser) {
     tag_for->element_name[0] = 0;
     tag_for->key_name[0] = 0;
     tag_for->key_value[0] = 0;
+    tag_for->key_index = 0;
+    tag_for->key_is_index = 0;
     tag_for->token = NULL;
     tag_for->base.free = view_tag_loop_free;
 
-    view_variable_item_t* variable_item = __viewparser_variable_item_create();
-    if (variable_item == NULL) {
-        log_error("__viewparser_loop_create: failed to create variable item");
-        free(tag_for);
-        return 0;
-    }
-
-    __viewparser_variable_item_append(variable_item, (view_tag_t*)tag_for);
     __viewparser_tag_append_child_or_sibling(current_tag, (view_tag_t*)tag_for);
 
     parser->current_tag = (view_tag_t*)tag_for;
@@ -1600,6 +1270,8 @@ int __viewparser_loop_write_in(viewparser_t* parser, char ch) {
 
         context->symbol = VIEWPARSER_VARIABLE_SPACE;
         context->stage = VIEWPARSER_LOOP_VAR;
+
+        __viewparser_expr_begin(parser);
 
         break;
     }

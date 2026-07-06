@@ -49,6 +49,8 @@ typedef struct {
     const char* path;
     bufferdata_t variable_buffer;
     int level;
+    char expr_quote;  // active string literal quote inside an expression tag, 0 if none
+    char expr_escape; // previous expression char was an unconsumed backslash
 
     viewparser_context_t* context;
     viewparser_context_t* current_context;

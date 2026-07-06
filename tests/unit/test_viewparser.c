@@ -119,7 +119,7 @@ cleanup:
 }
 
 TEST(test_viewparser_variable_tree) {
-    TEST_CASE("Variable with dot path builds item chain");
+    TEST_CASE("Variable with dot path builds a variable expression");
 
     storagefs_t* fs = vp_env_init();
     TEST_REQUIRE_NOT_NULL(fs, "Environment should be initialized");
@@ -140,14 +140,17 @@ TEST(test_viewparser_variable_tree) {
     TEST_ASSERT_EQUAL_SIZE(0, var->parent_text_offset, "Variable should start at offset 0");
     TEST_ASSERT_EQUAL_SIZE(1, var->parent_text_size, "Variable should follow one char of text");
 
-    view_variable_item_t* item = var->item;
-    TEST_REQUIRE_NOT_NULL_GOTO(item, "First path item should exist", cleanup_parser);
-    TEST_ASSERT_STR_EQUAL("user", item->name, "First path item should be 'user'");
-    TEST_ASSERT_EQUAL_SIZE(4, item->name_length, "First item length should be set");
+    viewexpr_node_t* expr = var->expr;
+    TEST_REQUIRE_NOT_NULL_GOTO(expr, "Expression should be attached to the tag", cleanup_parser);
+    TEST_ASSERT_EQUAL(VIEWEXPR_NODE_VARIABLE, expr->type, "Expression should be a variable");
 
-    TEST_REQUIRE_NOT_NULL_GOTO(item->next, "Second path item should exist", cleanup_parser);
-    TEST_ASSERT_STR_EQUAL("name", item->next->name, "Second path item should be 'name'");
-    TEST_ASSERT_NULL(item->next->next, "Path should contain exactly two items");
+    viewexpr_segment_t* segment = expr->path;
+    TEST_REQUIRE_NOT_NULL_GOTO(segment, "First path segment should exist", cleanup_parser);
+    TEST_ASSERT_STR_EQUAL("user", segment->name, "First path segment should be 'user'");
+
+    TEST_REQUIRE_NOT_NULL_GOTO(segment->next, "Second path segment should exist", cleanup_parser);
+    TEST_ASSERT_STR_EQUAL("name", segment->next->name, "Second path segment should be 'name'");
+    TEST_ASSERT_NULL(segment->next->next, "Path should contain exactly two segments");
 
 cleanup_parser:
     viewparser_free(parser);
@@ -156,7 +159,7 @@ cleanup:
 }
 
 TEST(test_viewparser_variable_index_tree) {
-    TEST_CASE("Variable with chained indexes builds index list");
+    TEST_CASE("Variable with chained indexes builds index segments");
 
     storagefs_t* fs = vp_env_init();
     TEST_REQUIRE_NOT_NULL(fs, "Environment should be initialized");
@@ -170,18 +173,23 @@ TEST(test_viewparser_variable_index_tree) {
 
     view_tag_t* var = parser->root_tag->child;
     TEST_REQUIRE_NOT_NULL_GOTO(var, "Variable tag should be created", cleanup_parser);
+    TEST_REQUIRE_NOT_NULL_GOTO(var->expr, "Expression should be attached", cleanup_parser);
 
-    view_variable_item_t* item = var->item;
-    TEST_REQUIRE_NOT_NULL_GOTO(item, "Path item should exist", cleanup_parser);
-    TEST_ASSERT_STR_EQUAL("items", item->name, "Item name should be 'items'");
+    viewexpr_segment_t* segment = var->expr->path;
+    TEST_REQUIRE_NOT_NULL_GOTO(segment, "Name segment should exist", cleanup_parser);
+    TEST_ASSERT_STR_EQUAL("items", segment->name, "Name segment should be 'items'");
 
-    view_variable_index_t* index = item->index;
-    TEST_REQUIRE_NOT_NULL_GOTO(index, "First index should exist", cleanup_parser);
-    TEST_ASSERT_EQUAL(10, index->value, "First index should be 10");
+    viewexpr_segment_t* first_index = segment->next;
+    TEST_REQUIRE_NOT_NULL_GOTO(first_index, "First index segment should exist", cleanup_parser);
+    TEST_REQUIRE_NOT_NULL_GOTO(first_index->index, "First index expression should exist", cleanup_parser);
+    TEST_ASSERT_EQUAL(VIEWEXPR_NODE_LITERAL, first_index->index->type, "First index should be a literal");
+    TEST_ASSERT_EQUAL(10, (int)first_index->index->literal.number, "First index should be 10");
 
-    TEST_REQUIRE_NOT_NULL_GOTO(index->next, "Second index should exist", cleanup_parser);
-    TEST_ASSERT_EQUAL(2, index->next->value, "Second index should be 2");
-    TEST_ASSERT_NULL(index->next->next, "There should be exactly two indexes");
+    viewexpr_segment_t* second_index = first_index->next;
+    TEST_REQUIRE_NOT_NULL_GOTO(second_index, "Second index segment should exist", cleanup_parser);
+    TEST_REQUIRE_NOT_NULL_GOTO(second_index->index, "Second index expression should exist", cleanup_parser);
+    TEST_ASSERT_EQUAL(2, (int)second_index->index->literal.number, "Second index should be 2");
+    TEST_ASSERT_NULL(second_index->next, "There should be exactly two index segments");
 
 cleanup_parser:
     viewparser_free(parser);
@@ -213,15 +221,20 @@ TEST(test_viewparser_condition_tree) {
     view_condition_item_t* tag_if = (view_condition_item_t*)cond->child;
     TEST_REQUIRE_NOT_NULL_GOTO(tag_if, "If branch should exist", cleanup_parser);
     TEST_ASSERT_EQUAL(VIEW_TAGTYPE_COND_IF, tag_if->base.type, "First branch should be if");
-    TEST_ASSERT_EQUAL(1, tag_if->reverse, "Inverse flag should be set for !a");
-    TEST_ASSERT_STR_EQUAL("a", tag_if->base.item->name, "If branch should test variable 'a'");
+    TEST_REQUIRE_NOT_NULL_GOTO(tag_if->base.expr, "If branch should have an expression", cleanup_parser);
+    TEST_ASSERT_EQUAL(VIEWEXPR_NODE_UNARY, tag_if->base.expr->type, "!a should parse to a unary node");
+    TEST_ASSERT_EQUAL(VIEWEXPR_OP_NOT, tag_if->base.expr->op, "!a should use the NOT operator");
+    TEST_REQUIRE_NOT_NULL_GOTO(tag_if->base.expr->left, "NOT should have an operand", cleanup_parser);
+    TEST_ASSERT_EQUAL(VIEWEXPR_NODE_VARIABLE, tag_if->base.expr->left->type, "NOT operand should be a variable");
+    TEST_ASSERT_STR_EQUAL("a", tag_if->base.expr->left->path->name, "If branch should test variable 'a'");
     TEST_ASSERT_STR_EQUAL("X", vp_tag_content(&tag_if->base), "If branch body should be 'X'");
 
     view_condition_item_t* tag_elseif = (view_condition_item_t*)tag_if->base.next;
     TEST_REQUIRE_NOT_NULL_GOTO(tag_elseif, "Elseif branch should exist", cleanup_parser);
     TEST_ASSERT_EQUAL(VIEW_TAGTYPE_COND_ELSEIF, tag_elseif->base.type, "Second branch should be elseif");
-    TEST_ASSERT_EQUAL(0, tag_elseif->reverse, "Elseif should not be inverted");
-    TEST_ASSERT_STR_EQUAL("b", tag_elseif->base.item->name, "Elseif branch should test variable 'b'");
+    TEST_REQUIRE_NOT_NULL_GOTO(tag_elseif->base.expr, "Elseif branch should have an expression", cleanup_parser);
+    TEST_ASSERT_EQUAL(VIEWEXPR_NODE_VARIABLE, tag_elseif->base.expr->type, "Elseif expression should be a variable");
+    TEST_ASSERT_STR_EQUAL("b", tag_elseif->base.expr->path->name, "Elseif branch should test variable 'b'");
     TEST_ASSERT_STR_EQUAL("Y", vp_tag_content(&tag_elseif->base), "Elseif branch body should be 'Y'");
 
     view_condition_item_t* tag_else = (view_condition_item_t*)tag_elseif->base.next;
@@ -257,11 +270,14 @@ TEST(test_viewparser_loop_tree) {
     TEST_ASSERT_STR_EQUAL("item", loop->element_name, "Element name should be 'item'");
     TEST_ASSERT_STR_EQUAL("index", loop->key_name, "Default key name should be 'index'");
 
-    view_variable_item_t* item = loop->base.item;
-    TEST_REQUIRE_NOT_NULL_GOTO(item, "Collection path should exist", cleanup_parser);
-    TEST_ASSERT_STR_EQUAL("data", item->name, "Collection path should start with 'data'");
-    TEST_REQUIRE_NOT_NULL_GOTO(item->next, "Second path item should exist", cleanup_parser);
-    TEST_ASSERT_STR_EQUAL("items", item->next->name, "Collection path should end with 'items'");
+    TEST_REQUIRE_NOT_NULL_GOTO(loop->base.expr, "Collection expression should exist", cleanup_parser);
+    TEST_ASSERT_EQUAL(VIEWEXPR_NODE_VARIABLE, loop->base.expr->type, "Collection should be a variable");
+
+    viewexpr_segment_t* segment = loop->base.expr->path;
+    TEST_REQUIRE_NOT_NULL_GOTO(segment, "Collection path should exist", cleanup_parser);
+    TEST_ASSERT_STR_EQUAL("data", segment->name, "Collection path should start with 'data'");
+    TEST_REQUIRE_NOT_NULL_GOTO(segment->next, "Second path segment should exist", cleanup_parser);
+    TEST_ASSERT_STR_EQUAL("items", segment->next->name, "Collection path should end with 'items'");
 
     view_tag_t* var = loop->base.child;
     TEST_REQUIRE_NOT_NULL_GOTO(var, "Loop body variable should exist", cleanup_parser);
@@ -293,7 +309,8 @@ TEST(test_viewparser_loop_explicit_key) {
     TEST_REQUIRE_NOT_NULL_GOTO(loop, "Loop tag should be created", cleanup_parser);
     TEST_ASSERT_STR_EQUAL("v", loop->element_name, "Element name should be 'v'");
     TEST_ASSERT_STR_EQUAL("k", loop->key_name, "Key name should be 'k'");
-    TEST_ASSERT_STR_EQUAL("obj", loop->base.item->name, "Collection should be 'obj'");
+    TEST_REQUIRE_NOT_NULL_GOTO(loop->base.expr, "Collection expression should exist", cleanup_parser);
+    TEST_ASSERT_STR_EQUAL("obj", loop->base.expr->path->name, "Collection should be 'obj'");
 
 cleanup_parser:
     viewparser_free(parser);
@@ -321,7 +338,8 @@ TEST(test_viewparser_loop_extra_spaces) {
     TEST_REQUIRE_NOT_NULL_GOTO(loop, "Loop tag should be created", cleanup_parser);
     TEST_ASSERT_STR_EQUAL("item", loop->element_name, "Element name should survive extra spaces");
     TEST_ASSERT_STR_EQUAL("index", loop->key_name, "Default key should be set");
-    TEST_ASSERT_STR_EQUAL("items", loop->base.item->name, "Collection should survive extra spaces");
+    TEST_REQUIRE_NOT_NULL_GOTO(loop->base.expr, "Collection expression should exist", cleanup_parser);
+    TEST_ASSERT_STR_EQUAL("items", loop->base.expr->path->name, "Collection should survive extra spaces");
 
 cleanup_parser:
     viewparser_free(parser);
@@ -356,7 +374,8 @@ TEST(test_viewparser_include_tree) {
     view_tag_t* var = inc->child;
     TEST_REQUIRE_NOT_NULL_GOTO(var, "Partial variable should exist", cleanup_parser);
     TEST_ASSERT_EQUAL(VIEW_TAGTYPE_VAR, var->type, "Partial child should be a variable");
-    TEST_ASSERT_STR_EQUAL("x", var->item->name, "Partial variable should be 'x'");
+    TEST_REQUIRE_NOT_NULL_GOTO(var->expr, "Partial variable expression should exist", cleanup_parser);
+    TEST_ASSERT_STR_EQUAL("x", var->expr->path->name, "Partial variable should be 'x'");
 
 cleanup_parser:
     viewparser_free(parser);
@@ -509,24 +528,60 @@ TEST(test_viewparser_reject_empty_and_broken_variables) {
 }
 
 TEST(test_viewparser_reject_bad_indexes) {
-    TEST_CASE("Malformed and overflowing indexes are rejected");
+    TEST_CASE("Malformed indexes are rejected");
 
     storagefs_t* fs = vp_env_init();
     TEST_REQUIRE_NOT_NULL(fs, "Environment should be initialized");
 
-    // до фикса ошибка индекса игнорировалась, а "1x" затирал имя переменной
     TEST_ASSERT_EQUAL(0, vp_parse("vp_i1.html", "{{ items[1x] }}"),
                       "Non-digit index should be a parse error");
     TEST_ASSERT_EQUAL(0, vp_parse("vp_i2.html", "{{ items[] }}"),
                       "Empty index should be a parse error");
-    // до фикса 10 цифр переполняли int (UB)
-    TEST_ASSERT_EQUAL(0, vp_parse("vp_i3.html", "{{ items[9999999999] }}"),
-                      "Index above INT_MAX should be a parse error");
-    TEST_ASSERT_EQUAL(0, vp_parse("vp_i4.html", "{{ items[12345678901] }}"),
-                      "Index longer than 10 digits should be a parse error");
+    TEST_ASSERT_EQUAL(0, vp_parse("vp_i3.html", "{{ items[2 }}"),
+                      "Unclosed index should be a parse error");
 
+    // границы индексов теперь проверяются при рендере, а не при парсинге
+    TEST_ASSERT_EQUAL(1, vp_parse("vp_i4.html", "{{ items[9999999999] }}"),
+                      "Index above INT_MAX should parse and resolve to nothing at render");
     TEST_ASSERT_EQUAL(1, vp_parse("vp_i5.html", "{{ items[2147483647] }}"),
                       "INT_MAX index should still be accepted");
+    TEST_ASSERT_EQUAL(1, vp_parse("vp_i6.html", "{{ items[i + 1] }}"),
+                      "Index may be an arbitrary expression");
+
+    vp_env_free(fs);
+}
+
+TEST(test_viewparser_expression_tags) {
+    TEST_CASE("Recursive descent expressions parse in variable and branch tags");
+
+    storagefs_t* fs = vp_env_init();
+    TEST_REQUIRE_NOT_NULL(fs, "Environment should be initialized");
+
+    TEST_ASSERT_EQUAL(1, vp_parse("vp_x1.html", "{{ a + b * 2 }}"),
+                      "Arithmetic expression should parse");
+    TEST_ASSERT_EQUAL(1, vp_parse("vp_x2.html", "{{ (a + b) * (c - d) }}"),
+                      "Parenthesized expression should parse");
+    TEST_ASSERT_EQUAL(1, vp_parse("vp_x3.html", "{% if a && (b || !c) %}X{% endif %}"),
+                      "Logical expression should parse");
+    TEST_ASSERT_EQUAL(1, vp_parse("vp_x4.html", "{% if role == 'admin' %}X{% endif %}"),
+                      "String comparison should parse");
+    TEST_ASSERT_EQUAL(1, vp_parse("vp_x5.html", "{% if count % 2 == 0 %}X{% endif %}"),
+                      "Modulo in condition should not close the branch tag");
+    TEST_ASSERT_EQUAL(1, vp_parse("vp_x6.html", "{{ 'literal }} braces' }}"),
+                      "Close braces inside a string literal should not close the tag");
+    TEST_ASSERT_EQUAL(1, vp_parse("vp_x7.html", "{% if price >= 10.5 %}X{% endif %}"),
+                      "Float literal should parse");
+    TEST_ASSERT_EQUAL(1, vp_parse("vp_x8.html", "{% for x in list[2].items %}{{ x }}{% endfor %}"),
+                      "Collection may be a path expression");
+
+    TEST_ASSERT_EQUAL(0, vp_parse("vp_x9.html", "{{ a + }}"),
+                      "Dangling operator should be a parse error");
+    TEST_ASSERT_EQUAL(0, vp_parse("vp_x10.html", "{{ (a }}"),
+                      "Unbalanced paren should be a parse error");
+    TEST_ASSERT_EQUAL(0, vp_parse("vp_x11.html", "{{ a = b }}"),
+                      "Single '=' should be a parse error");
+    TEST_ASSERT_EQUAL(0, vp_parse("vp_x12.html", "{{ 'unterminated }}"),
+                      "Unterminated string literal should be a parse error");
 
     vp_env_free(fs);
 }

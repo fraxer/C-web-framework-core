@@ -5,6 +5,7 @@
 
 #include "json.h"
 #include "bufferdata.h"
+#include "viewexpr.h"
 
 #define VIEWPARSER_VARIABLE_ITEM_NAME_SIZE 80
 
@@ -18,19 +19,6 @@ typedef enum {
     VIEW_TAGTYPE_INC
 } viewparser_tagtype_e;
 
-typedef struct view_variable_index {
-    int value;
-    struct view_variable_index* next;
-} view_variable_index_t;
-
-typedef struct view_variable_item {
-    view_variable_index_t* index;
-    view_variable_index_t* last_index;
-    char name[VIEWPARSER_VARIABLE_ITEM_NAME_SIZE];
-    size_t name_length;
-    struct view_variable_item* next;
-} view_variable_item_t;
-
 typedef struct view_tag {
     int type; // var, cond, loop, inc
     size_t parent_text_offset;
@@ -42,8 +30,7 @@ typedef struct view_tag {
     struct view_tag* last_child;
     struct view_tag* next;
 
-    view_variable_item_t* item;
-    view_variable_item_t* last_item;
+    viewexpr_node_t* expr;
 
     void(*free)(struct view_tag* tag);
 } view_tag_t;
@@ -51,8 +38,6 @@ typedef struct view_tag {
 // конкретное условие в условном блоке
 typedef struct view_condition_item {
     view_tag_t base;
-    int result;
-    int reverse;
     int always_true;
 } view_condition_item_t;
 
@@ -62,6 +47,8 @@ typedef struct view_loop {
     char element_name[VIEWPARSER_VARIABLE_ITEM_NAME_SIZE];
     char key_name[VIEWPARSER_VARIABLE_ITEM_NAME_SIZE];
     char key_value[VIEWPARSER_VARIABLE_ITEM_NAME_SIZE];
+    long long key_index;
+    int key_is_index;
 
     json_token_t* token;
 } view_loop_t;
