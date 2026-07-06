@@ -332,29 +332,42 @@ void send_email(httpctx_t* ctx) {
 * **Zlib** 1.2.11 (data compression library)
 * **OpenSSL** 1.1.1k or higher
 * **LibXml2** 2.9.13
+* **libidn2** (internationalized domain names)
+* **libunistring** (Unicode string handling)
+* **Argon2** (password hashing)
 
 ### Optional Dependencies:
 * **PostgreSQL** development libraries (for PostgreSQL support)
 * **MySQL/MariaDB** development libraries (for MySQL support)
-* **Redis** (for Redis sessions and caching)
+* **hiredis** (for Redis sessions and caching)
+* **SQLite 3** development libraries (for SQLite support)
 
 ## Building the Project
 
-```bash
-# Create build directory
-mkdir build && cd build
+The framework is not built standalone: it is embedded into a host project as a
+git submodule (conventionally at `core/`) and pulled in with
+`add_subdirectory(core)`. The host project calls `find_package()` for the
+dependencies, sets compile options, and defines the `install()` rules. See
+[INSTALL.md](INSTALL.md) for the full guide, including a minimal host
+`CMakeLists.txt`.
 
+From the host project root:
+
+```bash
 # Configure with CMake
-cmake .. -DCMAKE_BUILD_TYPE=Release \
-         -DINCLUDE_POSTGRESQL=yes \
-         -DINCLUDE_MYSQL=yes \
-         -DINCLUDE_REDIS=yes
+cmake -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DINCLUDE_POSTGRESQL=yes \
+      -DINCLUDE_MYSQL=yes \
+      -DINCLUDE_REDIS=yes \
+      -DINCLUDE_SQLITE=yes \
+      -B build .
 
 # Build
-cmake --build . -j4
+ninja -C build
 
 # Run
-<workspaceFolder>/build/exec/cwfr -c <path_to_config>/config.json
+build/exec/cwfr -c <path_to_config>/config.json
 ```
 
 ### Build Modes:
