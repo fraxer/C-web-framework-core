@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <sched.h>
 #include <stdatomic.h>
+#include <stdint.h>
 
 #include "log.h"
 #include "broadcast.h"
@@ -35,6 +36,18 @@ typedef struct connection_queue_broadcast_data {
 void __broadcast_queue_request_handler(void*);
 connection_queue_broadcast_data_t* __broadcast_queue_data_create(broadcast_payload_t* payload, void(*handle)(response_t*, const char*, size_t));
 void __broadcast_queue_data_free(void*);
+
+/*
+ * Дренаж пачкой: обработчик соединения снимает из broadcast_queue не одно, а
+ * до BROADCAST_BATCH_MESSAGES сообщений (или пока не наберётся
+ * BROADCAST_BATCH_BYTES), склеивает их кадры в один буфер тела и отправляет
+ * одним проходом записи. Это убирает per-сообщение alloc ответа, два
+ * epoll control_mod и лишние проходы event loop. Пачка ограничена, чтобы не
+ * раздувать задержку и память при заваленной очереди — остаток заберёт
+ * следующий цикл через connection_after_write.
+ */
+#define BROADCAST_BATCH_MESSAGES 64
+#define BROADCAST_BATCH_BYTES (256 * 1024)
 
 // broadcast_add и broadcast_send всегда забирают владение id:
 // вызывающий не может знать, была ли подписка отклонена
@@ -289,24 +302,97 @@ void __broadcast_queue_add(connection_t* connection, broadcast_payload_t* payloa
     }
 }
 
-void __broadcast_queue_request_handler(void* arg) {
-    connection_queue_item_t* item = arg;
-    connection_queue_broadcast_data_t* data = (connection_queue_broadcast_data_t*)item->data;
-    connection_server_ctx_t* conn_ctx = item->connection->ctx;
+// склеивает готовый кадр в накопительный буфер, растя его геометрически;
+// 0 при нехватке памяти — тогда уже накопленное всё равно отправляется
+int __broadcast_batch_append(char** buffer, size_t* size, size_t* capacity, const char* frame, size_t frame_size) {
+    if (frame == NULL || frame_size == 0) return 1;
 
-    websocketsresponse_t* response = websocketsresponse_create(item->connection);
+    if (*size + frame_size > *capacity) {
+        size_t new_capacity = *capacity == 0 ? frame_size : *capacity;
+        while (new_capacity < *size + frame_size) {
+            // защита от переполнения size_t на патологических размерах
+            if (new_capacity > (SIZE_MAX / 2)) {
+                new_capacity = *size + frame_size;
+                break;
+            }
+            new_capacity *= 2;
+        }
+
+        char* grown = realloc(*buffer, new_capacity);
+        if (grown == NULL) return 0;
+
+        *buffer = grown;
+        *capacity = new_capacity;
+    }
+
+    memcpy(*buffer + *size, frame, frame_size);
+    *size += frame_size;
+
+    return 1;
+}
+
+void __broadcast_queue_request_handler(void* arg) {
+    connection_queue_item_t* first_item = arg;
+    connection_t* connection = first_item->connection;
+    connection_server_ctx_t* conn_ctx = connection->ctx;
+
+    websocketsresponse_t* response = websocketsresponse_create(connection);
     if (response == NULL) {
         // TODO: close connection, return error
         atomic_store(&conn_ctx->destroyed, 1);
-        connection_after_read(item->connection);
+        connection_after_read(connection);
         return;
     }
 
     conn_ctx->response = response;
 
-    data->handler(conn_ctx->response, data->payload->data, data->payload->size);
+    char* batch = NULL;
+    size_t batch_size = 0;
+    size_t batch_capacity = 0;
+    int processed = 0;
 
-    connection_after_read(item->connection);
+    // первый элемент передан воркером и освобождается им после return;
+    // остальные снимаем из очереди и освобождаем здесь
+    connection_queue_item_t* item = first_item;
+
+    for (;;) {
+        connection_queue_broadcast_data_t* data = (connection_queue_broadcast_data_t*)item->data;
+
+        // обработчик строит один кадр в теле response
+        data->handler(conn_ctx->response, data->payload->data, data->payload->size);
+
+        size_t frame_size = 0;
+        char* frame = websocketsresponse_detach_body(response, &frame_size);
+        const int appended = __broadcast_batch_append(&batch, &batch_size, &batch_capacity, frame, frame_size);
+        free(frame);
+
+        if (item != first_item)
+            item->free(item);
+
+        processed++;
+
+        // при нехватке памяти под накопитель дальше не жадничаем — шлём собранное
+        if (!appended)
+            break;
+
+        if (processed >= BROADCAST_BATCH_MESSAGES || batch_size >= BROADCAST_BATCH_BYTES)
+            break;
+
+        // соединение залочено воркером, продюсеры пишут под cqueue_lock —
+        // снимать под тем же локом безопасно
+        cqueue_lock(conn_ctx->broadcast_queue);
+        connection_queue_item_t* next = cqueue_pop(conn_ctx->broadcast_queue);
+        cqueue_unlock(conn_ctx->broadcast_queue);
+
+        if (next == NULL)
+            break;
+
+        item = next;
+    }
+
+    websocketsresponse_set_body(response, batch, batch_size);
+
+    connection_after_read(connection);
 }
 
 connection_queue_broadcast_data_t* __broadcast_queue_data_create(broadcast_payload_t* payload, void(*handle)(response_t*, const char*, size_t)) {

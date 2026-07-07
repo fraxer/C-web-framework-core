@@ -1,7 +1,8 @@
 /*
  * Unit tests for src/broadcast/broadcast.c: channel registry (add/remove/
  * clear), message fan-out through the per-connection broadcast queue,
- * subscriber filtering and the shared refcounted payload.
+ * subscriber filtering, the shared refcounted payload, and the batch drain
+ * that coalesces several queued frames into one response body per worker run.
  *
  * The epoll api is replaced by stub control_mod/control_del (as in
  * test_connection.c) so the queue scheduling protocol runs without an event
@@ -35,6 +36,7 @@
 #include "cqueue.h"
 #include "multiplexing.h"
 #include "server.h"
+#include "websocketsresponse.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
@@ -231,12 +233,28 @@ static void bc_capture_handler(response_t* response, const char* payload, size_t
         memcpy(bc_handler_payload, payload, size);
 }
 
+/* Builds a real WebSocket text frame into the response body (like the
+ * scheduler's mybroadcast_send_data), so tests can inspect how the batch
+ * drain coalesces several frames into one body buffer. */
+static void bc_frame_handler(response_t* response, const char* payload, size_t size) {
+    bc_handler_calls++;
+
+    websocketsresponse_t* wsresponse = (websocketsresponse_t*)response;
+    wsresponse->send_textn(wsresponse, payload, size);
+}
+
 static void bc_stubs_reset(void) {
     bc_id_free_calls = 0;
     bc_handler_calls = 0;
     bc_handler_size = 0;
     bc_handler_response = NULL;
     memset(bc_handler_payload, 0, sizeof bc_handler_payload);
+}
+
+/* Expected on-wire size of an unmasked server text frame with a short
+ * (<=125 byte) payload: 1 byte frame code + 1 byte length + payload. */
+static size_t bc_text_frame_size(size_t payload_len) {
+    return 2 + payload_len;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -716,6 +734,126 @@ TEST(test_broadcast_send_queue_overflow_drops_message) {
     TEST_ASSERT_EQUAL(3001, bc_broadcast_queue_size(receiver), "overflowing message dropped");
 
     TEST_ASSERT_EQUAL(3001, bc_drain_broadcast_queue(receiver, 0), "prefilled stubs drained");
+
+    cleanup:
+
+    bc_harness_free(&h);
+    bc_conn_free(sender);
+    bc_conn_free(receiver);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Batch drain                                                                 */
+/* -------------------------------------------------------------------------- */
+
+/* Pops one item from the connection's broadcast_queue and runs it. With batch
+ * drain the item's run handler pulls and processes the remaining queued items
+ * itself, coalescing their frames into conn_ctx->response->body. */
+static void bc_run_one_broadcast_item(connection_t* conn) {
+    connection_server_ctx_t* ctx = conn->ctx;
+
+    cqueue_lock(ctx->broadcast_queue);
+    connection_queue_item_t* item = cqueue_pop(ctx->broadcast_queue);
+    cqueue_unlock(ctx->broadcast_queue);
+
+    if (item == NULL) return;
+
+    item->run(item);
+    item->free(item);
+}
+
+TEST(test_broadcast_batch_coalesces_frames) {
+    TEST_CASE("one worker run drains the queue and concatenates all frames into one body");
+
+    bc_stubs_reset();
+
+    bc_harness_t h;
+    TEST_REQUIRE(bc_harness_init(&h, 1), "harness init");
+
+    connection_t* sender = bc_conn_create(&h);
+    connection_t* receiver = bc_conn_create(&h);
+    TEST_REQUIRE_NOT_NULL_GOTO(sender, "sender connection alloc", cleanup);
+    TEST_REQUIRE_NOT_NULL_GOTO(receiver, "receiver connection alloc", cleanup);
+
+    TEST_ASSERT_EQUAL(1, broadcast_add("room", receiver, NULL, bc_frame_handler), "receiver subscribed");
+
+    broadcast_send_all("room", sender, "a", 1);
+    broadcast_send_all("room", sender, "bb", 2);
+    broadcast_send_all("room", sender, "ccc", 3);
+    TEST_ASSERT_EQUAL(3, bc_broadcast_queue_size(receiver), "three messages queued");
+
+    /* the three sends scheduled the receiver into the global queue exactly
+     * once (CAS 1->2); drain that entry to keep the connection refcount balanced */
+    TEST_ASSERT_NOT_NULL(bc_worker_queue_pop(), "receiver scheduled once");
+
+    bc_run_one_broadcast_item(receiver);
+
+    TEST_ASSERT_EQUAL(3, bc_handler_calls, "all three frames built in one run");
+    TEST_ASSERT_EQUAL(0, bc_broadcast_queue_size(receiver), "queue fully drained by the batch");
+
+    connection_server_ctx_t* rctx = receiver->ctx;
+    websocketsresponse_t* response = rctx->response;
+    TEST_REQUIRE_NOT_NULL_GOTO(response, "response staged", cleanup);
+    TEST_REQUIRE_NOT_NULL_GOTO(response->body.data, "coalesced body present", cleanup);
+
+    const size_t expected = bc_text_frame_size(1) + bc_text_frame_size(2) + bc_text_frame_size(3);
+    TEST_ASSERT_EQUAL_SIZE(expected, response->body.size, "body holds all three frames");
+    TEST_ASSERT_EQUAL_SIZE(0, response->body.pos, "body positioned at start for the write");
+
+    /* verify the three frames sit back-to-back, in send order */
+    const unsigned char* b = (const unsigned char*)response->body.data;
+    TEST_ASSERT_EQUAL(0x81, b[0], "frame 1 text opcode");
+    TEST_ASSERT_EQUAL(1, b[1], "frame 1 length");
+    TEST_ASSERT_EQUAL('a', b[2], "frame 1 payload");
+    TEST_ASSERT_EQUAL(0x81, b[3], "frame 2 text opcode");
+    TEST_ASSERT_EQUAL(2, b[4], "frame 2 length");
+    TEST_ASSERT_EQUAL('b', b[5], "frame 2 payload byte 0");
+    TEST_ASSERT_EQUAL('b', b[6], "frame 2 payload byte 1");
+    TEST_ASSERT_EQUAL(0x81, b[7], "frame 3 text opcode");
+    TEST_ASSERT_EQUAL(3, b[8], "frame 3 length");
+    TEST_ASSERT_EQUAL('c', b[9], "frame 3 payload byte 0");
+
+    cleanup:
+
+    bc_harness_free(&h);
+    bc_conn_free(sender);
+    bc_conn_free(receiver);
+}
+
+TEST(test_broadcast_batch_is_bounded) {
+    TEST_CASE("a single run processes at most BROADCAST_BATCH_MESSAGES, leaving the rest queued");
+
+    bc_stubs_reset();
+
+    bc_harness_t h;
+    TEST_REQUIRE(bc_harness_init(&h, 1), "harness init");
+
+    connection_t* sender = bc_conn_create(&h);
+    connection_t* receiver = bc_conn_create(&h);
+    TEST_REQUIRE_NOT_NULL_GOTO(sender, "sender connection alloc", cleanup);
+    TEST_REQUIRE_NOT_NULL_GOTO(receiver, "receiver connection alloc", cleanup);
+
+    TEST_ASSERT_EQUAL(1, broadcast_add("room", receiver, NULL, bc_frame_handler), "receiver subscribed");
+
+    /* BROADCAST_BATCH_MESSAGES is 64; queue more so a remainder stays behind */
+    enum { QUEUED = 70, BATCH = 64 };
+    for (int i = 0; i < QUEUED; i++)
+        broadcast_send_all("room", sender, "m", 1);
+    TEST_ASSERT_EQUAL(QUEUED, bc_broadcast_queue_size(receiver), "all messages queued");
+
+    TEST_ASSERT_NOT_NULL(bc_worker_queue_pop(), "receiver scheduled once");
+
+    bc_run_one_broadcast_item(receiver);
+
+    TEST_ASSERT_EQUAL(BATCH, bc_handler_calls, "batch capped at BROADCAST_BATCH_MESSAGES");
+    TEST_ASSERT_EQUAL(QUEUED - BATCH, bc_broadcast_queue_size(receiver), "remainder left for the next cycle");
+
+    connection_server_ctx_t* rctx = receiver->ctx;
+    websocketsresponse_t* response = rctx->response;
+    TEST_REQUIRE_NOT_NULL_GOTO(response, "response staged", cleanup);
+    TEST_ASSERT_EQUAL_SIZE(BATCH * bc_text_frame_size(1), response->body.size, "body holds exactly the batch");
+
+    /* leftover items are released by __ctx_free at connection teardown */
 
     cleanup:
 

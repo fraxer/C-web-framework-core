@@ -124,4 +124,25 @@ void websocketsresponse_pong(websocketsresponse_t* response, const char* data, s
  */
 void websocketsresponse_close(websocketsresponse_t* response, const char* data, size_t length);
 
+/**
+ * Detach the currently-prepared frame from the response body, transferring
+ * ownership of the buffer to the caller. The response body is left empty so a
+ * new frame can be built into it. Used to coalesce several broadcast frames
+ * into one write.
+ * @param response Response holding a prepared frame (may be empty)
+ * @param size     Out: byte length of the returned buffer (0 if none)
+ * @return Malloc'd frame buffer (caller frees), or NULL if the body was empty
+ */
+char* websocketsresponse_detach_body(websocketsresponse_t* response, size_t* size);
+
+/**
+ * Install a pre-built body buffer containing one or more complete WebSocket
+ * frames. Ownership of data transfers to the response; any previous body is
+ * freed. The write handler then flushes the whole buffer in one pass.
+ * @param response Response instance
+ * @param data     Malloc'd buffer of concatenated frames (may be NULL)
+ * @param size     Byte length of data
+ */
+void websocketsresponse_set_body(websocketsresponse_t* response, char* data, size_t size);
+
 #endif

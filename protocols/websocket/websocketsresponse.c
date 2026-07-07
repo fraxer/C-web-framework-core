@@ -332,6 +332,29 @@ file_status_e __get_file_full_path(server_t* server, char* file_full_path, size_
     return FILE_OK;
 }
 
+char* websocketsresponse_detach_body(websocketsresponse_t* response, size_t* size) {
+    char* data = response->body.data;
+
+    if (size != NULL)
+        *size = response->body.size;
+
+    response->body.data = NULL;
+    response->body.size = 0;
+    response->body.pos = 0;
+    response->frame_code = 0;
+
+    return data;
+}
+
+void websocketsresponse_set_body(websocketsresponse_t* response, char* data, size_t size) {
+    if (response->body.data != NULL)
+        free(response->body.data);
+
+    response->body.data = data;
+    response->body.size = size;
+    response->body.pos = 0;
+}
+
 void websocketsresponse_default(websocketsresponse_t* response, const char* text) {
     websocketsresponse_reset(response);
     websocketsresponse_text(response, text);
