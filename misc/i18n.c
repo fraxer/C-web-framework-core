@@ -52,8 +52,10 @@ static const char* get_country_code(const char* lang) {
 static void set_thread_locale(const char* lang) {
     if (lang == NULL || *lang == '\0') return;
 
-    // Free previous locale if exists
+    // Free previous locale if exists; detach it first — freeing the locale
+    // currently installed by uselocale() is undefined behavior
     if (thread_locale != (locale_t)0) {
+        uselocale(LC_GLOBAL_LOCALE);
         freelocale(thread_locale);
         thread_locale = (locale_t)0;
     }
@@ -87,7 +89,7 @@ i18n_t* i18n_create(const char* locale_dir, const char* domain, const char* defa
     if (i18n == NULL) return NULL;
 
     size_t default_lang_len = strlen(default_lang);
-    if (default_lang_len >= sizeof(i18n->default_lang)) {
+    if (default_lang_len == 0 || default_lang_len >= sizeof(i18n->default_lang)) {
         free(i18n);
         return NULL;
     }
@@ -111,7 +113,7 @@ i18n_t* i18n_create(const char* locale_dir, const char* domain, const char* defa
     }
 
     memcpy(i18n->default_lang, default_lang, default_lang_len);
-    i18n->default_lang[default_lang_len - 1] = '\0';
+    i18n->default_lang[default_lang_len] = '\0';
 
     return i18n;
 }

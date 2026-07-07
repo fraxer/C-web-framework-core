@@ -9,24 +9,20 @@
 
 // Get language from request (query param > Accept-Language > default)
 static char* get_lang(httpctx_t* ctx) {
+    if (ctx == NULL || ctx->request == NULL)
+        return strdup("en");
+
     int ok = 0;
     const char* lang = query_param_char(ctx->request->query_, "lang", &ok);
-    if (ok && lang != NULL) {
-        char* result = strdup(lang);
-        if (result == NULL) return NULL;
-        return result;
-    }
+    if (ok && lang != NULL)
+        // normalize like the header path: "ru-RU" -> "ru", "" -> "en"
+        return i18n_parse_accept_language(lang);
 
     http_header_t* header = ctx->request->get_header(ctx->request, "Accept-Language");
-    if (header != NULL) {
-        char* result = i18n_parse_accept_language(header->value);
-        if (result == NULL) return NULL;
-        return result;
-    }
+    if (header != NULL)
+        return i18n_parse_accept_language(header->value);
 
-    char* result = strdup("en");
-    if (result == NULL) return NULL;
-    return result;
+    return strdup("en");
 }
 
 // Find i18n instance by domain name
