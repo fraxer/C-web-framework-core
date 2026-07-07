@@ -30,12 +30,21 @@ typedef struct connection_queue_broadcast_data {
     connection_queue_item_data_t base;
     broadcast_payload_t* payload;
     void(*handler)(response_t*, const char*, size_t);
-    connection_t* connection;
 } connection_queue_broadcast_data_t;
 
 void __broadcast_queue_request_handler(void*);
-connection_queue_broadcast_data_t* __broadcast_queue_data_create(connection_t* connection, broadcast_payload_t* payload, void(*handle)(response_t*, const char*, size_t));
+connection_queue_broadcast_data_t* __broadcast_queue_data_create(broadcast_payload_t* payload, void(*handle)(response_t*, const char*, size_t));
 void __broadcast_queue_data_free(void*);
+
+// broadcast_add и broadcast_send всегда забирают владение id:
+// вызывающий не может знать, была ли подписка отклонена
+void __broadcast_id_free(void* id) {
+    if (id == NULL) return;
+
+    broadcast_id_t* base = id;
+    if (base->free != NULL)
+        base->free(base);
+}
 
 void __broadcast_spin_lock(atomic_bool* locked) {
     _Bool expected = 0;
@@ -77,6 +86,8 @@ void __broadcast_unlock_list(broadcast_list_t* list) {
 }
 
 broadcast_payload_t* __broadcast_payload_create(const char* payload, size_t size) {
+    if (payload == NULL && size > 0) return NULL;
+
     broadcast_payload_t* shared_payload = malloc(sizeof * shared_payload + size);
     if (shared_payload == NULL) return NULL;
 
@@ -243,15 +254,18 @@ void __broadcast_queue_add(connection_t* connection, broadcast_payload_t* payloa
     item->run = __broadcast_queue_request_handler;
     item->handle = NULL;
     item->connection = connection;
-    item->data = (connection_queue_item_data_t*)__broadcast_queue_data_create(connection, payload, handle);
+    item->data = (connection_queue_item_data_t*)__broadcast_queue_data_create(payload, handle);
 
     if (item->data == NULL) {
         item->free(item);
         return;
     }
 
-    // Добавляем сообщение в broadcast_queue
-    cqueue_incrementlock(ctx->broadcast_queue);
+    // Добавляем сообщение в broadcast_queue.
+    // Только cqueue_lock: отправители из разных каналов и поток-обработчик
+    // пишут в одну очередь соединения, cqueue_incrementlock взаимоисключения
+    // не даёт — параллельные append/pop рвали связный список
+    cqueue_lock(ctx->broadcast_queue);
 
     if (cqueue_size(ctx->broadcast_queue) > 3000) {
         cqueue_unlock(ctx->broadcast_queue);
@@ -260,8 +274,14 @@ void __broadcast_queue_add(connection_t* connection, broadcast_payload_t* payloa
         return;
     }
 
-    cqueue_append(ctx->broadcast_queue, item);
+    const int appended = cqueue_append(ctx->broadcast_queue, item);
     cqueue_unlock(ctx->broadcast_queue);
+
+    if (!appended) {
+        item->free(item);
+        log_error("Broadcast error: unable to enqueue message, message dropped\n");
+        return;
+    }
 
     int expected = 1;
     if (atomic_compare_exchange_strong(&ctx->broadcast_ref_count, &expected, 2)) {
@@ -289,14 +309,13 @@ void __broadcast_queue_request_handler(void* arg) {
     connection_after_read(item->connection);
 }
 
-connection_queue_broadcast_data_t* __broadcast_queue_data_create(connection_t* connection, broadcast_payload_t* payload, void(*handle)(response_t*, const char*, size_t)) {
+connection_queue_broadcast_data_t* __broadcast_queue_data_create(broadcast_payload_t* payload, void(*handle)(response_t*, const char*, size_t)) {
     connection_queue_broadcast_data_t* data = malloc(sizeof * data);
     if (data == NULL) return NULL;
 
     data->base.free = __broadcast_queue_data_free;
     data->payload = __broadcast_payload_acquire(payload);
     data->handler = handle;
-    data->connection = connection;
 
     return data;
 }
@@ -345,10 +364,17 @@ void broadcast_free(broadcast_t* broadcast) {
 }
 
 int broadcast_add(const char* broadcast_name, connection_t* connection, void* id, void(*response_handler)(response_t* response, const char* payload, size_t size)) {
-    if (broadcast_name == NULL || connection == NULL || response_handler == NULL)
+    if (broadcast_name == NULL || connection == NULL || response_handler == NULL) {
+        __broadcast_id_free(id);
         return 0;
+    }
 
     connection_server_ctx_t* ctx = connection->ctx;
+    if (ctx->server == NULL || ctx->server->broadcast == NULL) {
+        __broadcast_id_free(id);
+        return 0;
+    }
+
     broadcast_t* broadcast = ctx->server->broadcast;
 
     int result = 0;
@@ -386,11 +412,22 @@ int broadcast_add(const char* broadcast_name, connection_t* connection, void* id
 
     __broadcast_unlock(broadcast);
 
+    // при успехе id принадлежит item и освобождается при отписке;
+    // при отказе (повторная подписка, нехватка памяти) — здесь
+    if (!result)
+        __broadcast_id_free(id);
+
     return result;
 }
 
 void broadcast_remove(const char* broadcast_name, connection_t* connection) {
+    if (broadcast_name == NULL || connection == NULL)
+        return;
+
     connection_server_ctx_t* ctx = connection->ctx;
+    if (ctx->server == NULL || ctx->server->broadcast == NULL)
+        return;
+
     broadcast_t* broadcast = ctx->server->broadcast;
 
     __broadcast_lock(broadcast);
@@ -460,8 +497,16 @@ void broadcast_send_all(const char* broadcast_name, connection_t* connection, co
 }
 
 void broadcast_send(const char* broadcast_name, connection_t* connection, const char* payload, size_t size, void* id, int(*compare_handler)(void* st1, void* st2)) {
-    connection_server_ctx_t* ctx = connection->ctx;
-    broadcast_t* broadcast = ctx->server->broadcast;
+    broadcast_t* broadcast = NULL;
+
+    if (broadcast_name != NULL && connection != NULL) {
+        connection_server_ctx_t* ctx = connection->ctx;
+        if (ctx->server != NULL)
+            broadcast = ctx->server->broadcast;
+    }
+
+    // id освобождается и на невалидных аргументах: владение забрано всегда
+    if (broadcast == NULL) goto done;
 
     __broadcast_lock(broadcast);
     broadcast_list_t* list = __broadcast_find_list(broadcast, broadcast_name);
@@ -492,6 +537,5 @@ void broadcast_send(const char* broadcast_name, connection_t* connection, const 
 
     done:
 
-    if (id != NULL && ((broadcast_id_t*)id)->free)
-        ((broadcast_id_t*)id)->free(id);
+    __broadcast_id_free(id);
 }

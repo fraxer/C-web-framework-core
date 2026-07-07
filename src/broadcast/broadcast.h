@@ -88,6 +88,10 @@ void broadcast_free(broadcast_t* broadcast);
  * Subscribes connection to a broadcast channel.
  * If channel does not exist, it will be created automatically.
  * One connection can subscribe to a channel only once.
+ * Ownership of id is always taken: on success it is stored in the
+ * subscriber item and freed on unsubscribe; on failure (including
+ * duplicate subscription) it is freed via its broadcast_id_t free handler
+ * before returning. Do not reuse id after the call.
  * @param broadcast_name   Channel name to subscribe to
  * @param connection       WebSocket connection of subscriber
  * @param id               Custom identifier (must inherit broadcast_id_t). May be NULL
