@@ -1,5 +1,7 @@
 #include <stdlib.h>
 #include <stddef.h>
+#include <errno.h>
+#include <limits.h>
 
 #include "log.h"
 #include "openssl.h"
@@ -8,32 +10,33 @@
 #define OPENSSL_ERROR_PRIVATE_FILE "Openssl error: can't load private file\n"
 #define OPENSSL_ERROR_CHECK_PRIVATE_FILE "Openssl error: private file check failed\n"
 #define OPENSSL_ERROR_CIPHER_LIST "Openssl error: cipher list is invalid\n"
-#define OPENSSL_ERROR_BIO_NEW_FILE "Openssl error: can't create new bio\n"
-#define OPENSSL_ERROR_SSL "Openssl error: ssl error\n"
-#define OPENSSL_ERROR_WANT_READ "Openssl error: ssl want read\n"
-#define OPENSSL_ERROR_WANT_WRITE "Openssl error: ssl want write\n"
-#define OPENSSL_ERROR_WANT_ACCEPT "Openssl error: ssl want accept\n"
-#define OPENSSL_ERROR_WANT_CONNECT "Openssl error: ssl want connect\n"
-#define OPENSSL_ERROR_ZERO_RETURN "Openssl error: ssl zero return\n"
+#define OPENSSL_ERROR_MIN_PROTO "Openssl error: can't set minimum protocol version\n"
+#define OPENSSL_ERROR_CONFIG "Openssl error: fullchain, private or ciphers not set\n"
 
-int openssl_context_init(openssl_t*);
-static int lib_init = 0;
+static int openssl_context_init(openssl_t*);
 
+/* No manual library init: TLS_server_method() already requires
+ * OpenSSL >= 1.1.0, which self-initializes thread-safely on first use. */
 int openssl_init(openssl_t* openssl) {
-    if (!lib_init) {
-        SSL_library_init();
-        SSL_load_error_strings();
-        OpenSSL_add_all_algorithms();
-    }
-    lib_init = 1;
+    if (openssl == NULL) return 0;
 
     if (openssl_context_init(openssl) == -1) return 0;
 
     return 1;
 }
 
-int openssl_context_init(openssl_t* openssl) {
+static int openssl_context_init(openssl_t* openssl) {
     int result = -1;
+
+    if (openssl->fullchain == NULL || openssl->private == NULL || openssl->ciphers == NULL) {
+        log_error(OPENSSL_ERROR_CONFIG);
+        return -1;
+    }
+
+    if (openssl->ctx != NULL) {
+        SSL_CTX_free(openssl->ctx);
+        openssl->ctx = NULL;
+    }
 
     openssl->ctx = SSL_CTX_new(TLS_server_method());
     if (openssl->ctx == NULL) return -1;
@@ -56,6 +59,11 @@ int openssl_context_init(openssl_t* openssl) {
     SSL_CTX_set_options(openssl->ctx, SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_RENEGOTIATION);
     SSL_CTX_set_quiet_shutdown(openssl->ctx, 1);
 
+    if (SSL_CTX_set_min_proto_version(openssl->ctx, TLS1_2_VERSION) != 1) {
+        log_error(OPENSSL_ERROR_MIN_PROTO);
+        goto failed;
+    }
+
     if (SSL_CTX_set_cipher_list(openssl->ctx, openssl->ciphers) != 1) {
         log_error(OPENSSL_ERROR_CIPHER_LIST);
         goto failed;
@@ -64,6 +72,11 @@ int openssl_context_init(openssl_t* openssl) {
     result = 0;
 
     failed:
+
+    if (result == -1 && openssl->ctx != NULL) {
+        SSL_CTX_free(openssl->ctx);
+        openssl->ctx = NULL;
+    }
 
     return result;
 }
@@ -104,12 +117,21 @@ void openssl_set_sni_callback(openssl_t* openssl, int (*callback)(SSL*, int*, vo
     SSL_CTX_set_tlsext_servername_callback(openssl->ctx, callback);
 }
 
-int openssl_read(SSL* ssl, void* buffer, int num) {
-    return SSL_read(ssl, buffer, num);
+/* SSL_read/SSL_write take int and their behavior with num=0 is undefined,
+ * so clamp oversized buffers to INT_MAX (callers handle partial I/O) and
+ * short-circuit empty ones. */
+int openssl_read(SSL* ssl, void* buffer, size_t num) {
+    if (num == 0) return 0;
+    if (num > INT_MAX) num = INT_MAX;
+
+    return SSL_read(ssl, buffer, (int)num);
 }
 
 int openssl_write(SSL* ssl, const void* buffer, size_t num) {
-    const int result = SSL_write(ssl, buffer, num);
+    if (num == 0) return 0;
+    if (num > INT_MAX) num = INT_MAX;
+
+    const int result = SSL_write(ssl, buffer, (int)num);
 
 #ifdef DEBUG
     if (result < 0)
