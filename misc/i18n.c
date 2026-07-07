@@ -1,7 +1,9 @@
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #include "i18n.h"
 
@@ -27,10 +29,12 @@ static const locale_entry_t locale_map[] = {
     {NULL, NULL, NULL}  // terminator
 };
 
-// Find locale entry by language code
+// Find locale entry by language code.
+// Case-insensitive: Accept-Language tags are case-insensitive (RFC 5646),
+// so "RU" and "en-US" must resolve the same locale as "ru"/"en".
 static const locale_entry_t* find_locale_entry(const char* lang) {
     for (const locale_entry_t* entry = locale_map; entry->lang != NULL; entry++) {
-        if (strcmp(entry->lang, lang) == 0) {
+        if (strcasecmp(entry->lang, lang) == 0) {
             return entry;
         }
     }
@@ -83,7 +87,8 @@ static void set_thread_locale(const char* lang) {
 }
 
 i18n_t* i18n_create(const char* locale_dir, const char* domain, const char* default_lang) {
-    if (domain == NULL || default_lang == NULL) return NULL;
+    // dgettext("") behavior is unspecified — an empty domain must be rejected
+    if (domain == NULL || *domain == '\0' || default_lang == NULL) return NULL;
 
     i18n_t* i18n = calloc(1, sizeof(i18n_t));
     if (i18n == NULL) return NULL;
@@ -121,14 +126,17 @@ i18n_t* i18n_create(const char* locale_dir, const char* domain, const char* defa
 const char* i18n_get(i18n_t* i18n, const char* msgid, const char* lang) {
     if (i18n == NULL || msgid == NULL) return msgid;
 
-    const char* effective_lang = lang ? lang : i18n->default_lang;
+    // An empty lang must resolve to the default language: set_thread_locale("")
+    // is a no-op, so passing it through would silently reuse whatever locale the
+    // previous call on this thread installed.
+    const char* effective_lang = (lang != NULL && *lang != '\0') ? lang : i18n->default_lang;
 
     set_thread_locale(effective_lang);
 
     const char* result = dgettext(i18n->domain, msgid);
 
     // if translation not found (returns msgid) and lang != default, try default
-    if (result == msgid && lang != NULL && strcmp(lang, i18n->default_lang) != 0) {
+    if (result == msgid && strcasecmp(effective_lang, i18n->default_lang) != 0) {
         set_thread_locale(i18n->default_lang);
         result = dgettext(i18n->domain, msgid);
     }
@@ -142,7 +150,8 @@ const char* i18n_nget(i18n_t* i18n, const char* singular, const char* plural,
         return n == 1 ? singular : plural;
     }
 
-    const char* effective_lang = lang ? lang : i18n->default_lang;
+    // see i18n_get: empty lang must not reuse the previous thread locale
+    const char* effective_lang = (lang != NULL && *lang != '\0') ? lang : i18n->default_lang;
 
     set_thread_locale(effective_lang);
 
@@ -150,7 +159,7 @@ const char* i18n_nget(i18n_t* i18n, const char* singular, const char* plural,
 
     // if not translated, try default language
     if ((result == singular || result == plural) &&
-        lang != NULL && strcmp(lang, i18n->default_lang) != 0) {
+        strcasecmp(effective_lang, i18n->default_lang) != 0) {
         set_thread_locale(i18n->default_lang);
         result = dngettext(i18n->domain, singular, plural, n);
     }
@@ -158,24 +167,76 @@ const char* i18n_nget(i18n_t* i18n, const char* singular, const char* plural,
     return result;
 }
 
+// Parse a q=... parameter value; p points just past "q=".
+// Returns q in [0,1]; a malformed value is treated as 1.0 (parameter ignored).
+static double parse_qvalue(const char* p) {
+    if (*p != '0' && *p != '1') return 1.0;
+
+    double q = *p - '0';
+    p++;
+    if (*p == '.') {
+        p++;
+        double scale = 0.1;
+        while (*p >= '0' && *p <= '9') {
+            q += (*p - '0') * scale;
+            scale /= 10.0;
+            p++;
+        }
+    }
+
+    return q > 1.0 ? 1.0 : q;
+}
+
 char* i18n_parse_accept_language(const char* header) {
-    if (header == NULL || *header == '\0') return strdup("en");
+    const char* best = NULL;
+    size_t best_len = 0;
+    // q=0 means "not acceptable" (RFC 7231), so entries only win with q > 0;
+    // ties keep the earlier entry (client's listing order)
+    double best_q = 0.0;
 
-    const char* p = header;
+    if (header != NULL) {
+        const char* p = header;
+        while (*p != '\0') {
+            while (*p == ' ' || *p == '\t' || *p == ',') p++;
+            if (*p == '\0') break;
 
-    while (*p == ' ') p++;
+            // primary language subtag ("ru-RU" -> "ru")
+            const char* start = p;
+            while (*p != '\0' && *p != '-' && *p != ',' && *p != ';' && *p != ' ' && *p != '\t') p++;
+            const size_t len = p - start;
 
-    const char* start = p;
-    while (*p && *p != '-' && *p != ',' && *p != ';' && *p != ' ') p++;
+            // skip the rest of the language-range up to parameters / next entry
+            while (*p != '\0' && *p != ';' && *p != ',') p++;
 
-    size_t len = p - start;
-    if (len == 0) return strdup("en");
+            double q = 1.0;
+            while (*p == ';') {
+                p++;
+                while (*p == ' ' || *p == '\t') p++;
+                if ((*p == 'q' || *p == 'Q') && *(p + 1) == '=')
+                    q = parse_qvalue(p + 2);
+                while (*p != '\0' && *p != ';' && *p != ',') p++;
+            }
 
-    char* result = malloc(len + 1);
+            // "*" is a wildcard, not a concrete language — let it fall through
+            // to the default
+            if (len > 0 && !(len == 1 && *start == '*') && q > best_q) {
+                best = start;
+                best_len = len;
+                best_q = q;
+            }
+        }
+    }
+
+    if (best == NULL) return strdup("en");
+
+    char* result = malloc(best_len + 1);
     if (result == NULL) return NULL;
 
-    memcpy(result, start, len);
-    result[len] = '\0';
+    // language tags are case-insensitive (RFC 5646): normalize for callers
+    // that compare lang codes directly
+    for (size_t i = 0; i < best_len; i++)
+        result[i] = (char)tolower((unsigned char)best[i]);
+    result[best_len] = '\0';
 
     return result;
 }

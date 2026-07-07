@@ -51,7 +51,10 @@ const char* i18n_nget(i18n_t* i18n, const char* singular, const char* plural,
                       unsigned long n, const char* lang);
 
 /**
- * Parse Accept-Language header and return primary language code.
+ * Parse Accept-Language header and return the preferred language code:
+ * the primary subtag of the entry with the highest q-value (ties keep the
+ * earlier entry), lowercased. Entries with q=0 and the "*" wildcard are
+ * skipped; "en" is returned when nothing usable remains.
  * Example: "ru-RU,ru;q=0.9,en-US;q=0.8" -> "ru"
  * @param header Accept-Language header value
  * @return Language code (caller must free) or NULL on allocation failure
