@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <errno.h>
 #include <limits.h>
+#include <string.h>
 
 #include "log.h"
 #include "openssl.h"
@@ -14,6 +15,44 @@
 #define OPENSSL_ERROR_CONFIG "Openssl error: fullchain, private or ciphers not set\n"
 
 static int openssl_context_init(openssl_t*);
+
+/* ALPN (RFC 7301): клиент присылает список {len, proto}*; сервер выбирает один.
+ * Приоритет сервера — h2 предпочтительнее http/1.1 (см. docs/http2/04 §2). */
+static int __openssl_alpn_select_cb(SSL* ssl, const unsigned char** out,
+                                    unsigned char* outlen,
+                                    const unsigned char* in, unsigned int inlen,
+                                    void* arg) {
+    (void)ssl;
+    (void)arg;
+
+    static const unsigned char h2_proto[] = { 'h', '2' };
+    static const unsigned char http11_proto[] = { 'h','t','t','p','/','1','.','1' };
+
+    for (unsigned int i = 0; i + 1 <= inlen; ) {
+        const unsigned int len = in[i];
+        if (len == 0 || i + 1 + len > inlen) break;
+        if (len == sizeof h2_proto && memcmp(in + i + 1, h2_proto, len) == 0) {
+            *out = in + i + 1;
+            *outlen = (unsigned char)len;
+            return SSL_TLSEXT_ERR_OK;
+        }
+        i += 1 + len;
+    }
+
+    for (unsigned int i = 0; i + 1 <= inlen; ) {
+        const unsigned int len = in[i];
+        if (len == 0 || i + 1 + len > inlen) break;
+        if (len == sizeof http11_proto && memcmp(in + i + 1, http11_proto, len) == 0) {
+            *out = in + i + 1;
+            *outlen = (unsigned char)len;
+            return SSL_TLSEXT_ERR_OK;
+        }
+        i += 1 + len;
+    }
+
+    /* Нет пересечения — ALPN не выбирается, соединение продолжается как h1.1. */
+    return SSL_TLSEXT_ERR_NOACK;
+}
 
 /* No manual library init: TLS_server_method() already requires
  * OpenSSL >= 1.1.0, which self-initializes thread-safely on first use. */
@@ -68,6 +107,10 @@ static int openssl_context_init(openssl_t* openssl) {
         log_error(OPENSSL_ERROR_CIPHER_LIST);
         goto failed;
     }
+
+    /* ALPN: рекламируем h2 и http/1.1 на каждом серверном контексте. SNI меняет
+     * ssl_ctx до выбора ALPN, поэтому callback срабатывает уже для нужного vhost. */
+    SSL_CTX_set_alpn_select_cb(openssl->ctx, __openssl_alpn_select_cb, NULL);
 
     result = 0;
 
@@ -139,4 +182,28 @@ int openssl_write(SSL* ssl, const void* buffer, size_t num) {
 #endif
 
     return result;
+}
+
+/* Классификация возврата SSL_read/SSL_write для неблокирующего I/O.
+ * Вызывающий код передаёт ret (≤ 0 при ошибке); причина — через SSL_get_error,
+ * поскольку errno для SSL_ERROR_WANT_READ/WANT_WRITE не определён. */
+openssl_io_status_e openssl_io_status(SSL* ssl, int ret) {
+    if (ret > 0)
+        return OPENSSL_IO_OK;
+
+    switch (SSL_get_error(ssl, ret)) {
+    case SSL_ERROR_WANT_READ:
+        return OPENSSL_IO_WANT_READ;
+    case SSL_ERROR_WANT_WRITE:
+        return OPENSSL_IO_WANT_WRITE;
+    case SSL_ERROR_ZERO_RETURN:
+        /* peer послал close_notify — корректное закрытие. */
+        return OPENSSL_IO_CLOSED;
+    case SSL_ERROR_SYSCALL:
+        /* ret == 0 → чистый EOF; ret < 0 → I/O-ошибка (см. errno). */
+        return ret == 0 ? OPENSSL_IO_CLOSED : OPENSSL_IO_ERROR;
+    case SSL_ERROR_SSL:
+    default:
+        return OPENSSL_IO_ERROR;
+    }
 }

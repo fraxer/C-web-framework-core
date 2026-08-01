@@ -4,6 +4,7 @@
 
 #include "http_write_filter.h"
 #include "log.h"
+#include "openssl.h"
 
 #define BUF_SIZE 16384
 
@@ -136,6 +137,25 @@ int __wr(httpresponse_t* response, bufo_t* buf) {
     while ((readed = bufo_chunk_size(buf, BUF_SIZE)) > 0) {
         const ssize_t writed = __write(response->connection, bufo_data(buf), readed);
         if (writed < 0) {
+            connection_t* connection = response->connection;
+
+            if (connection->ssl != NULL) {
+                /* Для SSL errno неприменим — причина через SSL_get_error.
+                 * WANT_READ/WANT_WRITE → отложить запись (event_again), как и
+                 * EAGAIN для открытого сокета. */
+                switch (openssl_io_status(connection->ssl, (int)writed)) {
+                case OPENSSL_IO_WANT_READ:
+                case OPENSSL_IO_WANT_WRITE:
+                    response->event_again = 1;
+                    return CWF_EVENT_AGAIN;
+                case OPENSSL_IO_CLOSED:
+                case OPENSSL_IO_ERROR:
+                default:
+                    log_error("write error: ssl failure\n");
+                    return CWF_ERROR;
+                }
+            }
+
             if (errno == EINTR)
                 continue;
 

@@ -87,6 +87,36 @@ int set_http(connection_t* connection) {
     return 1;
 }
 
+int set_http2(connection_t* connection) {
+    /* ФАЗА 0 (заглушка). ALPN выбрал h2, но HTTP/2-уровень появится в фазе 2+.
+     * Отправляем обязательный серверный SETTINGS + GOAWAY(NO_ERROR) и закрываем
+     * соединение. Возврат 0 — это контракт read-функции («закрыть соединение»),
+     * а не ошибка: диспетчер вызовет connection->close(), который корректно
+     * завершит TLS (close_notify после отправленных фреймов). Реальная фаза 3
+     * заменит это установкой h2-ридера/райтера и вернёт 1. */
+    static const unsigned char settings_frame[9] = {
+        0x00, 0x00, 0x00,             /* Length = 0        */
+        0x04,                         /* Type   = SETTINGS */
+        0x00,                         /* Flags  = 0        */
+        0x00, 0x00, 0x00, 0x00        /* Stream ID = 0     */
+    };
+    static const unsigned char goaway_frame[17] = {
+        0x00, 0x00, 0x08,             /* Length = 8        */
+        0x07,                         /* Type   = GOAWAY   */
+        0x00,                         /* Flags  = 0        */
+        0x00, 0x00, 0x00, 0x00,       /* Stream ID = 0     */
+        0x00, 0x00, 0x00, 0x00,       /* Last-Stream-ID = 0 */
+        0x00, 0x00, 0x00, 0x00        /* Error = NO_ERROR (0) */
+    };
+
+    (void)connection_data_write(connection, (const char*)settings_frame, sizeof settings_frame);
+    (void)connection_data_write(connection, (const char*)goaway_frame, sizeof goaway_frame);
+
+    log_info("HTTP/2 negotiated (fd %d): not implemented, sent SETTINGS + GOAWAY(NO_ERROR)\n", connection->fd);
+
+    return 0;
+}
+
 int http_server_guard_read(connection_t* connection) {
     connection_s_lock(connection);
     const int r = __read(connection);
@@ -135,6 +165,22 @@ int __read(connection_t* connection) {
         switch (bytes_readed) {
         case -1:
         {
+            if (connection->ssl != NULL) {
+                /* Для SSL errno не определён при WANT_READ/WANT_WRITE — причина
+                 * читается только через SSL_get_error. WANT_* — это «подожди», а
+                 * не ошибка: соединение остаётся живым, LT-epoll снова разбудит
+                 * по готовности сокета. Раньше WANT_READ ронял соединение. */
+                switch (openssl_io_status(connection->ssl, (int)bytes_readed)) {
+                case OPENSSL_IO_WANT_READ:
+                case OPENSSL_IO_WANT_WRITE:
+                    return 1;
+                case OPENSSL_IO_CLOSED:
+                case OPENSSL_IO_ERROR:
+                default:
+                    return 0;
+                }
+            }
+
             if (errno == EAGAIN || errno == EWOULDBLOCK)
                 return 1;
 
@@ -679,8 +725,20 @@ int __handshake(connection_t* connection) {
 
     const int result = SSL_do_handshake(connection->ssl);
     if (result == 1) {
-        if (!set_http(connection))
-            return 0;
+        /* Выбор протокола приложения по ALPN: h2 → HTTP/2-уровень (фаза 0 —
+         * заглушка), иначе HTTP/1.1 как раньше. SNI уже отработал выше и
+         * подменил ssl_ctx, так что ALPN-выбор корректен для выбранного vhost. */
+        const unsigned char* alpn = NULL;
+        unsigned int alpn_len = 0;
+        SSL_get0_alpn_selected(connection->ssl, &alpn, &alpn_len);
+
+        if (alpn != NULL && alpn_len == 2 && memcmp(alpn, "h2", 2) == 0) {
+            if (!set_http2(connection))
+                return 0;
+        } else {
+            if (!set_http(connection))
+                return 0;
+        }
 
         return 1;
     }
@@ -694,6 +752,10 @@ int __handshake(connection_t* connection) {
             log_error("__handshake: error %d, %d\n", connection->fd, errno);
         return 0;
     case SSL_ERROR_WANT_READ:
+    case SSL_ERROR_WANT_WRITE:
+        /* WANT_WRITE при хендшейке требует EPOLLOUT; возвращаем 1, чтобы
+         * остаться в живых. Полная реарм-логика IN|OUT — вместе с h2-состоянием
+         * соединения в фазе 4. */
         return 1;
     default:
         return 0;
