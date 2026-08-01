@@ -44,6 +44,29 @@ int main(int argc, char* argv[]) {
     int sig;
     sigwait(&mask, &sig);
 
+    /* Phase 5 — graceful drain. SIGTERM/SIGINT no longer hard-exit: the app is
+     * marked for shutdown, handler threads are released from the queue condvar,
+     * and workers are given a best-effort window. On their next timer tick
+     * (~500 ms) each worker sends GOAWAY(NO_ERROR) to its h2 peers and lets
+     * in-flight streams finish (h2_on_headers refuses new streams once the
+     * GOAWAY is out). Workers and handlers decrement appconfig->threads_count
+     * as they exit; once it reaches zero — or the grace window elapses — we
+     * fall through to the existing terminate. Bounded by design: a slow client
+     * cannot stall shutdown indefinitely. */
+    {
+        appconfig_t* cfg = appconfig();
+        const int grace_ms = env_get_int("http2_shutdown_grace_sec", 5) * 1000;
+        log_info("shutdown: signal %d received, draining (grace %d ms)\n", sig, grace_ms);
+        atomic_store(&cfg->shutdown, 1);
+        module_loader_wakeup_all_threads();
+
+        for (int ms = 0; ms < grace_ms; ms += 100) {
+            if (atomic_load(&cfg->threads_count) == 0)
+                break;
+            usleep(100000);
+        }
+    }
+
     failed:
 
     signal_before_terminate(0);

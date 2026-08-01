@@ -91,6 +91,15 @@ typedef struct h2session {
     /* Error code to report in GOAWAY once a connection error is raised. */
     uint32_t error_code;
     int      goaway_sent;
+
+    /* Lifecycle (Phase 5). last_activity_ms advances on every byte received
+     * from the peer (a frame read or a PING ACK) — never on our own writes, so
+     * that a server-side response cannot mask a silent client. CLOCK_MONOTONIC.
+     * All touched under the connection lock, like the rest of the session. */
+    uint64_t last_activity_ms;
+    uint64_t ping_sent_ms;      /* 0 = no watchdog PING outstanding */
+    uint8_t  ping_payload[8];   /* opaque data of the outstanding PING (for ACK) */
+    int      draining;          /* GOAWAY(NO_ERROR) sent on shutdown; close once idle */
 } h2session_t;
 
 /* Entry point called from __handshake once ALPN selects h2. Returns 1 on
@@ -123,5 +132,14 @@ int h2_server_response_ready(connection_t* connection, httpresponse_t* response)
  * does that, so a partial write never splits a frame across event loops. */
 int h2_session_queue_frame(h2session_t* s, uint8_t type, uint8_t flags,
                            uint32_t stream_id, const uint8_t* payload, size_t len);
+
+/* Worker-timer entry point (Phase 5). Called once per h2 connection on each tick
+ * of the multiplexing sweep. Owns the whole lock lifecycle: it trylocks, and
+ * every path out releases the lock (a close frees/unlocks via
+ * connection_close_locked, otherwise it unlocks explicitly). Because a close
+ * may free the connection, the caller MUST NOT touch it after this returns —
+ * it should capture connection->next beforehand. shutdown_now is
+ * appconfig->shutdown. */
+void h2_server_tick(connection_t* connection, int shutdown_now);
 
 #endif

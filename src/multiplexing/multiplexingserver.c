@@ -5,6 +5,7 @@
 #include "multiplexingserver.h"
 #include "server.h"
 #include "httpserverhandlers.h"
+#include "h2session.h"
 
 static int BUFFER_SIZE = 16384;
 
@@ -18,6 +19,7 @@ static void __listeners_unlisten(listener_t* listener);
 static void __listener_unlisten(listener_t* listener);
 static int __listener_read(connection_t* listener_connection);
 static void __set_protocol(connection_t* connection);
+static void __mpx_on_tick(mpxapi_t* api);
 
 int mpxserver_run(appconfig_t* appconfig) {
     int result = 0;
@@ -31,6 +33,9 @@ int mpxserver_run(appconfig_t* appconfig) {
     listeners = __listeners_create(api, buffer, appconfig->server_chain->server);
     if (listeners == NULL)
         goto failed;
+
+    /* Wire the worker timer sweep (idle/PING timeouts, graceful shutdown). */
+    api->on_tick = __mpx_on_tick;
 
     if (!__listeners_listen(listeners))
         goto failed;
@@ -260,4 +265,23 @@ void __set_protocol(connection_t* connection) {
     // поэтому его нужно освободить явно, иначе утечка.
     if (!ctx->listener->api->control_add(connection, MPXIN | MPXRDHUP))
         connection_free(connection);
+}
+
+/* Worker-timer sweep: runs every tick (Phase 5) over this worker's connections.
+ * Only h2 connections carry timeout state — h1.1 keep-alive is handled by the
+ * HTTP layer, and the listener is never h2. h2_server_tick owns the lock
+ * lifecycle and may close (and free) the connection, so next is captured first
+ * and the connection is not touched after the call. */
+static void __mpx_on_tick(mpxapi_t* api) {
+    const int shutdown_now = atomic_load(&appconfig()->shutdown);
+
+    connection_t* connection = api->conns;
+    while (connection != NULL) {
+        connection_t* next = connection->next;
+
+        if (((connection_server_ctx_t*)connection->ctx)->is_http2)
+            h2_server_tick(connection, shutdown_now);
+
+        connection = next;
+    }
 }
