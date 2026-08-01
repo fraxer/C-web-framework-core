@@ -11,6 +11,7 @@
 #define OPENSSL_ERROR_PRIVATE_FILE "Openssl error: can't load private file\n"
 #define OPENSSL_ERROR_CHECK_PRIVATE_FILE "Openssl error: private file check failed\n"
 #define OPENSSL_ERROR_CIPHER_LIST "Openssl error: cipher list is invalid\n"
+#define OPENSSL_ERROR_CIPHERSUITES "Openssl error: TLS 1.3 ciphersuites are invalid\n"
 #define OPENSSL_ERROR_MIN_PROTO "Openssl error: can't set minimum protocol version\n"
 #define OPENSSL_ERROR_CONFIG "Openssl error: fullchain, private or ciphers not set\n"
 
@@ -52,6 +53,107 @@ static int __openssl_alpn_select_cb(SSL* ssl, const unsigned char** out,
 
     /* Нет пересечения — ALPN не выбирается, соединение продолжается как h1.1. */
     return SSL_TLSEXT_ERR_NOACK;
+}
+
+/* A cipher token belongs to TLS 1.3 iff it is one of the suite names the
+ * standard defines, and those all start with "TLS_" — no cipher name from 1.2
+ * or below does. */
+static int __is_tls13_suite(const char* token, size_t len) {
+    return len > 4 && memcmp(token, "TLS_", 4) == 0;
+}
+
+/* See openssl.h. ciphers(1) accepts ':', ',' and whitespace as separators, so
+ * tokenizing on all three is lossless: the TLS 1.2 control syntax (!aNULL,
+ * @STRENGTH, -MD5, ALL) is copied through untouched and order is preserved
+ * within each group. */
+int openssl_split_ciphers(const char* ciphers, char** out_tls12, char** out_tls13) {
+    *out_tls12 = NULL;
+    *out_tls13 = NULL;
+
+    if (ciphers == NULL) return 1;
+
+    /* Each token costs its own length plus one joining ':', and the input
+     * already spends at least one byte separating them, so neither group can
+     * outgrow the input. */
+    const size_t len = strlen(ciphers);
+    char* tls12 = malloc(len + 1);
+    char* tls13 = malloc(len + 1);
+    if (tls12 == NULL || tls13 == NULL) {
+        free(tls12);
+        free(tls13);
+        return 0;
+    }
+
+    size_t len12 = 0;
+    size_t len13 = 0;
+
+    for (const char* p = ciphers; *p != '\0'; ) {
+        while (*p == ':' || *p == ',' || *p == ' ' || *p == '\t') p++;
+
+        const char* token = p;
+        while (*p != '\0' && *p != ':' && *p != ',' && *p != ' ' && *p != '\t') p++;
+
+        const size_t token_len = (size_t)(p - token);
+        if (token_len == 0) continue; /* trailing separators */
+
+        const int tls13_suite = __is_tls13_suite(token, token_len);
+        char* dst = tls13_suite ? tls13 : tls12;
+        size_t* dst_len = tls13_suite ? &len13 : &len12;
+
+        if (*dst_len > 0) dst[(*dst_len)++] = ':';
+
+        memcpy(dst + *dst_len, token, token_len);
+        *dst_len += token_len;
+    }
+
+    tls12[len12] = '\0';
+    tls13[len13] = '\0';
+
+    if (len12 > 0) *out_tls12 = tls12; else free(tls12);
+    if (len13 > 0) *out_tls13 = tls13; else free(tls13);
+
+    return 1;
+}
+
+/* Install the configured ciphers, routing each group to its own OpenSSL API.
+ * A group with no tokens is left at OpenSSL's defaults: a config that names
+ * only 1.2 ciphers must not disable TLS 1.3, and vice versa. */
+static int openssl_apply_ciphers(openssl_t* openssl) {
+    char* tls12 = NULL;
+    char* tls13 = NULL;
+
+    if (!openssl_split_ciphers(openssl->ciphers, &tls12, &tls13)) {
+        log_error(OPENSSL_ERROR_CIPHER_LIST);
+        return 0;
+    }
+
+    /* Nothing usable at all (empty string, or only separators) — the same
+     * failure an empty list gave before. */
+    if (tls12 == NULL && tls13 == NULL) {
+        log_error(OPENSSL_ERROR_CIPHER_LIST);
+        return 0;
+    }
+
+    const int ok12 = tls12 == NULL || SSL_CTX_set_cipher_list(openssl->ctx, tls12) == 1;
+
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+    const int ok13 = tls13 == NULL || SSL_CTX_set_ciphersuites(openssl->ctx, tls13) == 1;
+#else
+    /* TLS 1.3 itself arrived in 1.1.1; naming its suites on an older library
+     * cannot be honoured, and silently dropping them is the bug this function
+     * exists to fix. */
+    const int ok13 = tls13 == NULL;
+    if (tls13 != NULL)
+        log_error("Openssl error: TLS 1.3 ciphersuites need OpenSSL 1.1.1 or newer\n");
+#endif
+
+    free(tls12);
+    free(tls13);
+
+    if (!ok12) log_error(OPENSSL_ERROR_CIPHER_LIST);
+    if (!ok13) log_error(OPENSSL_ERROR_CIPHERSUITES);
+
+    return ok12 && ok13;
 }
 
 /* No manual library init: TLS_server_method() already requires
@@ -103,10 +205,7 @@ static int openssl_context_init(openssl_t* openssl) {
         goto failed;
     }
 
-    if (SSL_CTX_set_cipher_list(openssl->ctx, openssl->ciphers) != 1) {
-        log_error(OPENSSL_ERROR_CIPHER_LIST);
-        goto failed;
-    }
+    if (!openssl_apply_ciphers(openssl)) goto failed;
 
     /* ALPN: рекламируем h2 и http/1.1 на каждом серверном контексте. SNI меняет
      * ssl_ctx до выбора ALPN, поэтому callback срабатывает уже для нужного vhost. */

@@ -24,6 +24,18 @@ typedef struct openssl {
     SSL_CTX* ctx;
 } openssl_t;
 
+/* Split a configured cipher string into the TLS 1.2-and-below list and the
+ * TLS 1.3 suite list. OpenSSL keeps the two apart — SSL_CTX_set_cipher_list has
+ * no effect on TLS 1.3 and SSL_CTX_set_ciphersuites none below it — so one
+ * config field has to be routed to both. TLS 1.3 suite names are exactly those
+ * starting with "TLS_".
+ *
+ * Both outputs are malloc'd ':'-joined lists, or NULL when that group has no
+ * tokens: the caller must then leave OpenSSL's defaults for that version alone
+ * rather than install an empty list, which would turn the version off outright.
+ * Returns 0 only on allocation failure. Exposed for unit tests. */
+int openssl_split_ciphers(const char* ciphers, char** out_tls12, char** out_tls13);
+
 int openssl_init(openssl_t* openssl);
 openssl_t* openssl_create(void);
 void openssl_free(openssl_t* openssl);
