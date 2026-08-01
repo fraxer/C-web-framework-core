@@ -110,4 +110,11 @@ void h2frame_parser_get(const h2frame_parser_t* p, h2_frame_t* out);
 size_t h2frame_encode(uint8_t* dst, size_t cap, uint8_t type, uint8_t flags,
                       uint32_t stream_id, const uint8_t* payload, size_t payload_len);
 
+/* Write just the 9-byte frame header, announcing payload_len bytes that the
+ * caller streams out separately. Lets a DATA frame carry a body straight from
+ * an upstream buffer with no intermediate copy. Returns H2_FRAME_HEADER_LEN, or
+ * 0 if payload_len exceeds the absolute frame-size limit. */
+size_t h2frame_encode_header(uint8_t dst[H2_FRAME_HEADER_LEN], uint8_t type, uint8_t flags,
+                             uint32_t stream_id, size_t payload_len);
+
 #endif

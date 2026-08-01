@@ -55,6 +55,7 @@ static json_doc_t* __httpresponse_payload_json(httpresponse_t* response);
 
 static int __httpresponse_init_parser(httpresponse_t* response);
 static void __httpresponse_reset(httpresponse_t* response);
+static httpresponse_t* __httpresponse_create(connection_t* connection, int http2);
 
 void __httpresponse_view(httpresponse_t* response, json_doc_t* document, const char* storage_name, const char* path_format, ...);
 
@@ -98,6 +99,14 @@ void __httpresponse_view(httpresponse_t* response, json_doc_t* document, const c
 }
 
 httpresponse_t* httpresponse_create(connection_t* connection) {
+    return __httpresponse_create(connection, 0);
+}
+
+httpresponse_t* httpresponse_create_h2(connection_t* connection) {
+    return __httpresponse_create(connection, 1);
+}
+
+static httpresponse_t* __httpresponse_create(connection_t* connection, int http2) {
     httpresponse_t* response = malloc(sizeof * response);
     if (response == NULL) return NULL;
 
@@ -109,7 +118,7 @@ httpresponse_t* httpresponse_create(connection_t* connection) {
     response->file_ = file_alloc();
     response->header_ = NULL;
     response->last_header = NULL;
-    response->filter = filters_create();
+    response->filter = http2 ? filters_create_h2() : filters_create();
     if (response->filter == NULL) {
         free(response);
         return NULL;

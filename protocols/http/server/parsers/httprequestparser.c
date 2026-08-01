@@ -602,14 +602,25 @@ int __try_set_server(httprequestparser_t* parser, http_header_t* header) {
 
     parser->host_header_seen = 1;
 
-    if (header->value_length == 0 || header->value_length >= MAX_HOST_SIZE) {
-        log_error("HTTP error: invalid Host header length %zu\n", header->value_length);
+    const int r = httpparser_select_server(parser->connection, header->value, header->value_length);
+    if (r == HTTP1PARSER_CONTINUE)
+        parser->host_found = 1;
+
+    return r;
+}
+
+/* Resolve the virtual server for an authority, shared with HTTP/2 (where the
+ * authority arrives as the :authority pseudo-header rather than a Host field).
+ * On success ctx->server points at the matching server. */
+int httpparser_select_server(connection_t* connection, const char* host, size_t host_length) {
+    if (host_length == 0 || host_length >= MAX_HOST_SIZE) {
+        log_error("HTTP error: invalid Host header length %zu\n", host_length);
         return HTTP1PARSER_BAD_REQUEST;
     }
 
     char domain[MAX_HOST_SIZE];
-    memcpy(domain, header->value, header->value_length);
-    domain[header->value_length] = '\0';
+    memcpy(domain, host, host_length);
+    domain[host_length] = '\0';
 
     // Отрезаем опциональный порт; в IPv6-литерале двоеточия находятся
     // внутри квадратных скобок (RFC 3986), порт идет после ']'
@@ -638,14 +649,13 @@ int __try_set_server(httprequestparser_t* parser, http_header_t* header) {
     }
 
     const size_t ascii_length = strlen(ascii_domain);
-    connection_server_ctx_t* ctx = parser->connection->ctx;
+    connection_server_ctx_t* ctx = connection->ctx;
 
     // RFC 9110 (7.4): на TLS-соединении с SNI заголовок Host обязан
     // соответствовать серверу, выбранному по SNI, иначе запрос misdirected
-    if (parser->connection->ssl != NULL &&
-        SSL_get_servername(parser->connection->ssl, TLSEXT_NAMETYPE_host_name) != NULL) {
+    if (connection->ssl != NULL &&
+        SSL_get_servername(connection->ssl, TLSEXT_NAMETYPE_host_name) != NULL) {
         if (ctx->server != NULL && __server_matches_host(ctx->server, ascii_domain, ascii_length)) {
-            parser->host_found = 1;
             free(ascii_domain);
             return HTTP1PARSER_CONTINUE;
         }
@@ -660,10 +670,9 @@ int __try_set_server(httprequestparser_t* parser, http_header_t* header) {
     while (item) {
         server_t* server = item->data;
 
-        if (server->ip == parser->connection->ip && server->port == parser->connection->port &&
+        if (server->ip == connection->ip && server->port == connection->port &&
             __server_matches_host(server, ascii_domain, ascii_length)) {
             ctx->server = server;
-            parser->host_found = 1;
             free(ascii_domain);
             return HTTP1PARSER_CONTINUE;
         }

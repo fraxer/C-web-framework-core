@@ -261,3 +261,64 @@ TEST(test_h2frame_valid_frames_pass) {
     TEST_ASSERT_EQUAL(3, n, "three valid frames decoded");
     frame_list_free(&out);
 }
+
+/* h2frame_encode_header writes only the 9-byte header, announcing a payload the
+ * caller streams separately — the h2 write filter frames DATA that way to avoid
+ * copying the response body. It must agree byte-for-byte with h2frame_encode. */
+TEST(test_h2frame_encode_header_matches_full_encode) {
+    TEST_CASE("header-only encode matches the header of a full encode");
+
+    static const struct { uint8_t type; uint8_t flags; uint32_t sid; size_t len; } cases[] = {
+        {H2_FRAME_DATA, H2_FLAG_END_STREAM, 1, 0},
+        {H2_FRAME_DATA, 0, 1, 16384},
+        {H2_FRAME_DATA, H2_FLAG_END_STREAM, 0x7fffffff, 255},
+        {H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, 3, 1},
+        {H2_FRAME_CONTINUATION, 0, 65535, 0xfffe},
+    };
+
+    /* Static: the largest case carries ~64 KiB of payload, too much for the stack. */
+    static uint8_t payload[0xfffe];
+    static uint8_t full[H2_FRAME_HEADER_LEN + sizeof(payload)];
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint8_t only[H2_FRAME_HEADER_LEN];
+
+        const size_t n = h2frame_encode_header(only, cases[i].type, cases[i].flags,
+                                               cases[i].sid, cases[i].len);
+        TEST_ASSERT_EQUAL((int)H2_FRAME_HEADER_LEN, (int)n, "header-only encode is 9 bytes");
+
+        const size_t m = h2frame_encode(full, sizeof(full), cases[i].type, cases[i].flags,
+                                        cases[i].sid, payload, cases[i].len);
+        TEST_ASSERT_EQUAL((int)(H2_FRAME_HEADER_LEN + cases[i].len), (int)m, "full encode length");
+        TEST_ASSERT(memcmp(only, full, H2_FRAME_HEADER_LEN) == 0, "headers identical");
+    }
+
+    /* The reserved R bit is cleared and an oversize payload is refused. */
+    uint8_t only[H2_FRAME_HEADER_LEN];
+    h2frame_encode_header(only, H2_FRAME_DATA, 0, 0xffffffffu, 0);
+    TEST_ASSERT_EQUAL(0x7f, only[5], "reserved bit cleared from stream id");
+    TEST_ASSERT_EQUAL(0, (int)h2frame_encode_header(only, H2_FRAME_DATA, 0, 1,
+                                                    (size_t)H2_MAX_FRAME_SIZE_LIMIT + 1),
+                      "payload beyond the absolute frame-size limit is rejected");
+}
+
+/* A header written by h2frame_encode_header must be parsed back identically. */
+TEST(test_h2frame_encode_header_roundtrip) {
+    TEST_CASE("header-only encode round-trips through the parser");
+
+    uint8_t buf[H2_FRAME_HEADER_LEN + 4];
+    h2frame_encode_header(buf, H2_FRAME_DATA, H2_FLAG_END_STREAM, 5, 4);
+    memcpy(buf + H2_FRAME_HEADER_LEN, "body", 4);
+
+    frame_list_t out = {0};
+    const int n = feed_chunked(0, buf, sizeof(buf), 0, &out);
+
+    TEST_ASSERT_EQUAL(1, n, "one frame decoded");
+    TEST_ASSERT_EQUAL(H2_FRAME_DATA, out.f[0].type, "type preserved");
+    TEST_ASSERT_EQUAL(H2_FLAG_END_STREAM, out.f[0].flags, "flags preserved");
+    TEST_ASSERT_EQUAL(5, (int)out.f[0].stream_id, "stream id preserved");
+    TEST_ASSERT_EQUAL(4, (int)out.f[0].payload_len, "payload length preserved");
+    TEST_ASSERT(memcmp(out.f[0].payload, "body", 4) == 0, "payload preserved");
+
+    frame_list_free(&out);
+}

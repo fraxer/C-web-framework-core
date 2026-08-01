@@ -22,12 +22,13 @@ static int h2frame_header_invalid(const h2frame_parser_t* p) {
                    p->type == H2_FRAME_GOAWAY);
     if (is_conn && p->stream_id != 0) return 1;
 
+    /* Frames that MUST carry a non-zero stream id. WINDOW_UPDATE is excluded:
+     * it may target stream 0 (connection-level flow control) or a stream. */
     int is_stream = (p->type == H2_FRAME_DATA ||
                      p->type == H2_FRAME_HEADERS ||
                      p->type == H2_FRAME_PRIORITY ||
                      p->type == H2_FRAME_RST_STREAM ||
                      p->type == H2_FRAME_PUSH_PROMISE ||
-                     p->type == H2_FRAME_WINDOW_UPDATE ||
                      p->type == H2_FRAME_CONTINUATION);
     if (is_stream && p->stream_id == 0) return 1;
 
@@ -146,10 +147,9 @@ h2parse_status_e h2frame_parser_feed(h2frame_parser_t* p, const uint8_t** pp, co
     return H2PARSE_CONTINUE;
 }
 
-size_t h2frame_encode(uint8_t* dst, size_t cap, uint8_t type, uint8_t flags,
-                      uint32_t stream_id, const uint8_t* payload, size_t payload_len) {
+size_t h2frame_encode_header(uint8_t dst[H2_FRAME_HEADER_LEN], uint8_t type, uint8_t flags,
+                             uint32_t stream_id, size_t payload_len) {
     if (payload_len > H2_MAX_FRAME_SIZE_LIMIT) return 0;
-    if (cap < (size_t)H2_FRAME_HEADER_LEN + payload_len) return 0;
 
     dst[0] = (uint8_t)((payload_len >> 16) & 0xff);
     dst[1] = (uint8_t)((payload_len >> 8) & 0xff);
@@ -160,7 +160,19 @@ size_t h2frame_encode(uint8_t* dst, size_t cap, uint8_t type, uint8_t flags,
     dst[6] = (uint8_t)((stream_id >> 16) & 0xff);
     dst[7] = (uint8_t)((stream_id >> 8) & 0xff);
     dst[8] = (uint8_t)(stream_id & 0xff);
+
+    return (size_t)H2_FRAME_HEADER_LEN;
+}
+
+size_t h2frame_encode(uint8_t* dst, size_t cap, uint8_t type, uint8_t flags,
+                      uint32_t stream_id, const uint8_t* payload, size_t payload_len) {
+    if (payload_len > H2_MAX_FRAME_SIZE_LIMIT) return 0;
+    if (cap < (size_t)H2_FRAME_HEADER_LEN + payload_len) return 0;
+
+    h2frame_encode_header(dst, type, flags, stream_id, payload_len);
+
     if (payload_len > 0 && payload != NULL)
         memcpy(dst + H2_FRAME_HEADER_LEN, payload, payload_len);
+
     return (size_t)H2_FRAME_HEADER_LEN + payload_len;
 }

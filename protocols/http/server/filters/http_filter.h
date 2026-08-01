@@ -29,6 +29,11 @@ typedef struct http_filter {
 } http_filter_t;
 
 http_filter_t* filters_create(void);
+/* Filter chain for an HTTP/2 connection: same not_modified/range/data/gzip
+ * stages, but the chunked stage is dropped (h2 frames the body in DATA frames,
+ * chunked transfer-encoding is forbidden by RFC 9113 §8.2.2) and the terminal
+ * write stage emits HEADERS/DATA frames instead of a status line + raw bytes. */
+http_filter_t* filters_create_h2(void);
 void filters_reset(http_filter_t* filter);
 void filters_free(http_filter_t* filter);
 int filter_next_handler_header(struct httprequest* request, struct httpresponse* response);
