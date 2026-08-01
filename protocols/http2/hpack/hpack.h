@@ -80,10 +80,19 @@ void hpack_headers_free(hpack_header_t* headers, size_t count);
 /* ---- Encoder ---- */
 typedef struct hpack_encoder {
     hpack_dynamic_table_t table;
+    /* Pending dynamic table size update (RFC §6.3), emitted at the head of the
+     * next block. SIZE_MAX = none pending. */
+    size_t pending_size_update;
 } hpack_encoder_t;
 
 hpack_encoder_t* hpack_encoder_create(size_t max_table_size);
 void hpack_encoder_free(hpack_encoder_t* e);
+/* Resize the encoder's dynamic table after the peer changed
+ * SETTINGS_HEADER_TABLE_SIZE. The new size is clamped to the ceiling the
+ * encoder was created with, and the change is announced to the peer's decoder
+ * by the size-update instruction at the start of the next encoded block —
+ * resizing the table silently would desync the two tables. */
+void hpack_encoder_set_max_table_size(hpack_encoder_t* e, size_t max_table_size);
 /* Encode headers into a malloc'd buffer. If use_huffman != 0, string literals
  * are Huffman-encoded when it shortens them. *out is owned by the caller. */
 hpack_status_e hpack_encoder_encode(hpack_encoder_t* e,

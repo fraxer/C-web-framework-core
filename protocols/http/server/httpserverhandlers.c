@@ -8,6 +8,7 @@
 #include "connection_queue.h"
 #include "openssl.h"
 #include "idn_utils.h"
+#include "h2session.h"
 
 typedef struct {
     connection_queue_item_data_t base;
@@ -38,8 +39,6 @@ static void __queue_request_handler(void* arg);
 static void __queue_response_handler(void* arg);
 static void* __queue_data_request_create(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter);
 static void __queue_data_request_free(void* arg);
-static int __run_header_filters(httprequest_t* request, httpresponse_t* response);
-static int __run_body_filters(httprequest_t* request, httpresponse_t* response);
 static int __handshake(connection_t* connection);
 static int __sni_callback(SSL* ssl, int* ad, void* arg);
 static void* __queue_data_response_create(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter);
@@ -85,36 +84,6 @@ int set_http(connection_t* connection) {
         return 0;
 
     return 1;
-}
-
-int set_http2(connection_t* connection) {
-    /* ФАЗА 0 (заглушка). ALPN выбрал h2, но HTTP/2-уровень появится в фазе 2+.
-     * Отправляем обязательный серверный SETTINGS + GOAWAY(NO_ERROR) и закрываем
-     * соединение. Возврат 0 — это контракт read-функции («закрыть соединение»),
-     * а не ошибка: диспетчер вызовет connection->close(), который корректно
-     * завершит TLS (close_notify после отправленных фреймов). Реальная фаза 3
-     * заменит это установкой h2-ридера/райтера и вернёт 1. */
-    static const unsigned char settings_frame[9] = {
-        0x00, 0x00, 0x00,             /* Length = 0        */
-        0x04,                         /* Type   = SETTINGS */
-        0x00,                         /* Flags  = 0        */
-        0x00, 0x00, 0x00, 0x00        /* Stream ID = 0     */
-    };
-    static const unsigned char goaway_frame[17] = {
-        0x00, 0x00, 0x08,             /* Length = 8        */
-        0x07,                         /* Type   = GOAWAY   */
-        0x00,                         /* Flags  = 0        */
-        0x00, 0x00, 0x00, 0x00,       /* Stream ID = 0     */
-        0x00, 0x00, 0x00, 0x00,       /* Last-Stream-ID = 0 */
-        0x00, 0x00, 0x00, 0x00        /* Error = NO_ERROR (0) */
-    };
-
-    (void)connection_data_write(connection, (const char*)settings_frame, sizeof settings_frame);
-    (void)connection_data_write(connection, (const char*)goaway_frame, sizeof goaway_frame);
-
-    log_info("HTTP/2 negotiated (fd %d): not implemented, sent SETTINGS + GOAWAY(NO_ERROR)\n", connection->fd);
-
-    return 0;
 }
 
 int http_server_guard_read(connection_t* connection) {
@@ -304,8 +273,14 @@ int __deferred_handler(connection_t* connection, httprequest_t* request, httpres
     return 1;
 }
 
+int http_server_dispatch(connection_t* connection, httprequest_t* request) {
+    return __handle(connection, request, __post_response);
+}
+
 int __handle(connection_t* connection, httprequest_t* request, deferred_handler handler) {
-    httpresponse_t* response = httpresponse_create(connection);
+    connection_server_ctx_t* conn_ctx = connection->ctx;
+    httpresponse_t* response = conn_ctx->is_http2 ?
+        httpresponse_create_h2(connection) : httpresponse_create(connection);
     if (response == NULL) return 0;
 
     switch (__apply_redirect(request, response, handler)) {
@@ -733,7 +708,7 @@ int __handshake(connection_t* connection) {
         SSL_get0_alpn_selected(connection->ssl, &alpn, &alpn_len);
 
         if (alpn != NULL && alpn_len == 2 && memcmp(alpn, "h2", 2) == 0) {
-            if (!set_http2(connection))
+            if (!h2_server_set_http2(connection))
                 return 0;
         } else {
             if (!set_http(connection))
@@ -838,7 +813,9 @@ int __sni_callback(SSL* ssl, int* ad, void* arg) {
 }
 
 int __post_response_default(connection_t* connection, int status_code) {
-    httpresponse_t* response = httpresponse_create(connection);
+    connection_server_ctx_t* conn_ctx = connection->ctx;
+    httpresponse_t* response = conn_ctx->is_http2 ?
+        httpresponse_create_h2(connection) : httpresponse_create(connection);
     if (response == NULL) return 0;
 
     httpresponse_default(response, status_code);

@@ -335,3 +335,93 @@ TEST(test_hpack_fuzz_no_crash) {
     }
     TEST_ASSERT(1, "fuzz completed without crash");
 }
+
+/* ===================================================================== *
+ *  Dynamic table size update (RFC 7541 §4.2 / §6.3)
+ * ===================================================================== */
+
+/* SETTINGS_HEADER_TABLE_SIZE bounds the *peer's decoder* table, so it resizes
+ * our encoder. Shrinking silently would desync the two tables — the encoder has
+ * to announce it with a size-update instruction leading the next block. */
+TEST(test_hpack_encoder_emits_size_update) {
+    TEST_CASE("a shrink is announced and honoured by the decoder");
+
+    hpack_encoder_t* e = hpack_encoder_create(4096);
+    hpack_decoder_t* d = hpack_decoder_create(4096);
+    TEST_REQUIRE(e != NULL && d != NULL, "codecs created");
+
+    hpack_encoder_set_max_table_size(e, 256);
+
+    hpack_header_t in[] = {
+        {":status", 7, "200", 3},
+        {"content-type", 12, "text/html", 9},
+    };
+
+    uint8_t* block = NULL; size_t block_len = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_encoder_encode(e, in, 2, 1, &block, &block_len),
+                      "encode succeeds");
+    TEST_REQUIRE(block != NULL && block_len > 0, "block produced");
+
+    /* 001xxxxx with a 5-bit prefix carrying 256 → 0x3f then the continuation. */
+    TEST_ASSERT_EQUAL(0x3f, block[0], "block starts with a size-update instruction");
+    TEST_ASSERT_EQUAL(256, (int)e->table.max, "encoder table resized");
+
+    hpack_header_t* out = NULL; size_t n = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, block, block_len, &out, &n),
+                      "decoder accepts the block");
+    TEST_ASSERT_EQUAL(2, (int)n, "both headers decoded");
+    TEST_ASSERT_EQUAL(256, (int)d->table.max, "decoder table followed the update");
+
+    hpack_headers_free(out, n);
+    free(block);
+    hpack_encoder_free(e);
+    hpack_decoder_free(d);
+}
+
+/* The update is emitted once, not on every subsequent block. */
+TEST(test_hpack_encoder_size_update_emitted_once) {
+    TEST_CASE("only the first block after a resize carries the update");
+
+    hpack_encoder_t* e = hpack_encoder_create(4096);
+    TEST_REQUIRE(e != NULL, "encoder created");
+
+    hpack_encoder_set_max_table_size(e, 512);
+
+    hpack_header_t in[] = {{":status", 7, "200", 3}};
+
+    uint8_t* first = NULL; size_t first_len = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_encoder_encode(e, in, 1, 1, &first, &first_len), "first block");
+    TEST_REQUIRE(first != NULL && first_len > 0, "first block produced");
+    TEST_ASSERT_EQUAL(0x20, first[0] & 0xe0, "first block leads with the size update");
+
+    uint8_t* second = NULL; size_t second_len = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_encoder_encode(e, in, 1, 1, &second, &second_len), "second block");
+    TEST_REQUIRE(second != NULL && second_len > 0, "second block produced");
+    TEST_ASSERT(( second[0] & 0xe0) != 0x20, "second block carries no size update");
+
+    free(first);
+    free(second);
+    hpack_encoder_free(e);
+}
+
+/* A peer allowing a bigger table than we were built for must not grow us past
+ * the configured ceiling, and must not emit a spurious update. */
+TEST(test_hpack_encoder_size_update_clamped_to_ceiling) {
+    TEST_CASE("a grow beyond the configured ceiling is clamped and silent");
+
+    hpack_encoder_t* e = hpack_encoder_create(4096);
+    TEST_REQUIRE(e != NULL, "encoder created");
+
+    hpack_encoder_set_max_table_size(e, 65536);
+
+    hpack_header_t in[] = {{":status", 7, "200", 3}};
+    uint8_t* block = NULL; size_t block_len = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_encoder_encode(e, in, 1, 1, &block, &block_len), "encode");
+    TEST_REQUIRE(block != NULL && block_len > 0, "block produced");
+
+    TEST_ASSERT_EQUAL(4096, (int)e->table.max, "table stays at the ceiling");
+    TEST_ASSERT((block[0] & 0xe0) != 0x20, "no size update emitted");
+
+    free(block);
+    hpack_encoder_free(e);
+}

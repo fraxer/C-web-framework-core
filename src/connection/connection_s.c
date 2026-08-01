@@ -273,6 +273,7 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
     ctx->base.reset = __ctx_reset;
     ctx->base.free = __ctx_free;
     ctx->need_write = 0;
+    ctx->is_http2 = 0;
     atomic_store(&ctx->destroyed, 0);
     atomic_store(&ctx->ref_count, 1);
     atomic_store(&ctx->broadcast_ref_count, 1);

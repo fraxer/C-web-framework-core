@@ -241,6 +241,9 @@ typedef struct httpresponse {
 } httpresponse_t;
 
 httpresponse_t* httpresponse_create(connection_t* connection);
+/* Same, but wired with the HTTP/2 filter chain (see filters_create_h2). Called
+ * instead of httpresponse_create when the connection negotiated h2. */
+httpresponse_t* httpresponse_create_h2(connection_t* connection);
 void httpresponse_free(void* arg);
 void httpresponse_redirect(httpresponse_t* response, const char* path, int status_code);
 http_ranges_t* httpresponse_init_ranges(void);

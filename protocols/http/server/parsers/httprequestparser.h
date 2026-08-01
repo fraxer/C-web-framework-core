@@ -48,5 +48,9 @@ void httpparser_prepare_continue(httprequestparser_t* parser);
 int httpparser_set_uri(httprequest_t*, const char*, size_t);
 void httpparser_append_query(httprequest_t*, query_t*);
 http_ranges_t* httpparser_parse_range(char*, size_t);
+/* Pick the virtual server matching an authority (Host in h1.1, :authority in
+ * h2) and store it on the connection context. Returns HTTP1PARSER_CONTINUE on
+ * success, HTTP1PARSER_BAD_REQUEST / HTTP1PARSER_HOST_NOT_FOUND otherwise. */
+int httpparser_select_server(connection_t* connection, const char* host, size_t host_length);
 
 #endif

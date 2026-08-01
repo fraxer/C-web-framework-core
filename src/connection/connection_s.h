@@ -52,6 +52,10 @@ typedef struct {
     atomic_bool destroyed;
     atomic_bool locked;
     unsigned need_write: 1;
+    /* The connection speaks HTTP/2: ctx->parser is an h2session_t and responses
+     * must be built with the h2 filter chain (frames instead of a status line +
+     * chunked encoding). Set by h2_server_set_http2. */
+    unsigned is_http2: 1;
 } connection_server_ctx_t;
 
 typedef struct connection_queue_item_data {

@@ -253,6 +253,10 @@ typedef struct httprequest {
 httprequest_t* httprequest_create(connection_t*);
 void httprequest_free(void* arg);
 void httprequest_init_payload(httprequest_t* request);
+/* Open the temp file a request body is spooled into. Used by the protocol
+ * parsers (h1.1 and h2) as body bytes arrive; the payload type is decided
+ * lazily from Content-Type by httprequest_payload_parse(). */
+int httprequest_create_payload_file(http_payload_t* payload);
 void httprequest_payload_free(http_payload_t* payload);
 char* httprequest_payload(httprequest_t*);
 char* httprequest_payloadf(httprequest_t*, const char*);
