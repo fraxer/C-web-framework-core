@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 
 #include "appconfig.h"
+#include "connection_queue.h"
 #include "connection_s.h"
 #include "cookieparser.h"
 #include "httpcommon.h"
@@ -14,6 +15,7 @@
 #include "httprequest.h"
 #include "httprequestparser.h"
 #include "httpresponse.h"
+#include "h2stream.h"
 #include "httpserverhandlers.h"
 #include "log.h"
 #include "multiplexing.h"
@@ -54,7 +56,7 @@ typedef enum {
 } h2_frame_result_e;
 
 static int h2_flush_out(h2session_t* s);
-static void h2_stream_close(h2session_t* s);
+static void h2_session_drop_stream(h2session_t* s, h2stream_t* stream);
 
 /* ======================================================================= *
  *  Outbound frame buffer
@@ -178,8 +180,17 @@ static h2_frame_result_e h2_conn_error(h2session_t* s, uint32_t error_code) {
     return H2_FRAME_ERROR;
 }
 
-/* Stream error: only the stream dies, the connection carries on. Any half-built
- * request for that stream is dropped. */
+/* Retire a stream, keeping the session's write cursor consistent. h2stream_close
+ * keeps the stream alive when a handler still holds its request/response. */
+static void h2_session_drop_stream(h2session_t* s, h2stream_t* stream) {
+    if (stream == NULL) return;
+
+    if (s->writing == stream) s->writing = NULL;
+
+    h2stream_close(s, stream);
+}
+
+/* Stream error: only the stream dies, the connection carries on. */
 static h2_frame_result_e h2_stream_error(h2session_t* s, uint32_t stream_id, uint32_t error_code) {
     const uint8_t payload[4] = {
         (uint8_t)((error_code >> 24) & 0xff),
@@ -191,21 +202,23 @@ static h2_frame_result_e h2_stream_error(h2session_t* s, uint32_t stream_id, uin
     if (!h2_session_queue_frame(s, H2_FRAME_RST_STREAM, 0, stream_id, payload, sizeof(payload)))
         return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
 
-    if (stream_id == s->stream_id) {
-        connection_reset(s->connection); /* frees any in-flight request/response */
-        h2_stream_close(s);
+    h2stream_t* stream = h2stream_find(s, stream_id);
+    if (stream != NULL) {
+        stream->state = H2_STREAM_CLOSED;
+        h2_session_drop_stream(s, stream);
     }
 
     return H2_FRAME_OK;
 }
 
-/* State of an arbitrary stream id. Only one stream is tracked in detail; ids
- * above the highest one we ever opened are idle, the rest are closed. */
-static h2_stream_state_e h2_stream_state(const h2session_t* s, uint32_t stream_id) {
+/* State of an arbitrary stream id. Ids above the highest one we ever accepted
+ * are idle; ones no longer in the table have been closed. */
+static h2stream_state_e h2_stream_state_of(h2session_t* s, uint32_t stream_id) {
     if (stream_id > s->last_stream_id) return H2_STREAM_IDLE;
-    if (stream_id != 0 && stream_id == s->stream_id) return s->stream_state;
 
-    return H2_STREAM_CLOSED;
+    const h2stream_t* stream = h2stream_find(s, stream_id);
+
+    return stream != NULL ? stream->state : H2_STREAM_CLOSED;
 }
 
 h2session_t* h2_session_of(connection_t* connection) {
@@ -358,8 +371,9 @@ typedef enum {
 /* Fill an httprequest_t from a decoded HPACK block, applying the request
  * validity rules of RFC 9113 §8.3 / §8.2 on the way. Everything the h1.1 parser
  * derives from headers is derived here too. */
-static h2_request_status_e h2_build_request(h2session_t* s, httprequest_t* request,
+static h2_request_status_e h2_build_request(h2session_t* s, h2stream_t* stream,
                                             const uint8_t* block, size_t len) {
+    httprequest_t* request = stream->request;
     hpack_header_t* headers = NULL;
     size_t count = 0;
     if (hpack_decoder_decode(s->decoder, block, len, &headers, &count) != HPACK_OK)
@@ -372,7 +386,7 @@ static h2_request_status_e h2_build_request(h2session_t* s, httprequest_t* reque
     int authority_seen = 0;
     int regular_seen = 0;
 
-    s->content_length = -1;
+    stream->content_length = -1;
 
     for (size_t i = 0; i < count && status == H2_REQUEST_OK; i++) {
         const char* name = headers[i].name;
@@ -466,11 +480,11 @@ static h2_request_status_e h2_build_request(h2session_t* s, httprequest_t* reque
             int64_t declared = 0;
             /* A second content-length is only tolerable if it agrees. */
             if (!h2_parse_content_length(value, value_len, &declared) ||
-                (s->content_length >= 0 && s->content_length != declared)) {
+                (stream->content_length >= 0 && stream->content_length != declared)) {
                 status = H2_REQUEST_MALFORMED;
                 break;
             }
-            s->content_length = declared;
+            stream->content_length = declared;
         }
 
         if (request->add_headern(request, name, name_len, value, value_len) != 0)
@@ -542,14 +556,13 @@ static h2_request_status_e h2_consume_trailers(h2session_t* s, const uint8_t* bl
  * (httprequestparser.c __parse_payload): the payload type is then derived from
  * Content-Type on demand, so get_payload/get_payload_json/multipart accessors
  * behave identically under h2. */
-static int h2_body_append(h2session_t* s, httprequest_t* request,
-                          const uint8_t* data, size_t len) {
+static int h2_body_append(h2stream_t* stream, const uint8_t* data, size_t len) {
     if (len == 0) return 1;
 
-    if (len > SIZE_MAX - s->req_body_len) return 0;
-    if (s->req_body_len + len > env()->main.client_max_body_size) return 0;
+    if (len > SIZE_MAX - stream->req_body_len) return 0;
+    if (stream->req_body_len + len > env()->main.client_max_body_size) return 0;
 
-    http_payload_t* payload = &request->payload_;
+    http_payload_t* payload = &stream->request->payload_;
     if (payload->file.fd < 0)
         if (!httprequest_create_payload_file(payload))
             return 0;
@@ -557,53 +570,33 @@ static int h2_body_append(h2session_t* s, httprequest_t* request,
     if (!payload->file.append_content(&payload->file, (const char*)data, len))
         return 0;
 
-    s->req_body_len += len;
+    stream->req_body_len += len;
 
     return 1;
 }
 
-static void h2_stream_close(h2session_t* s) {
-    s->stream_id = 0;
-    s->stream_state = H2_STREAM_CLOSED;
-    s->req_body_len = 0;
-    s->content_length = -1;
-    s->end_stream_sent = 0;
-    s->window_blocked = 0;
-    s->stream_recv_pending = 0;
-    s->stream_send_window = s->peer_initial_window;
-}
-
-static void h2_stream_open(h2session_t* s, uint32_t stream_id) {
-    s->stream_id = stream_id;
-    s->last_stream_id = stream_id;
-    s->stream_state = H2_STREAM_OPEN;
-    s->req_body_len = 0;
-    s->content_length = -1;
-    s->end_stream_sent = 0;
-    s->window_blocked = 0;
-    s->stream_recv_pending = 0;
-    s->stream_send_window = s->peer_initial_window;
-}
-
 /* The request is complete: validate what could only be checked once the body
  * was fully received, then hand it to the shared handler pipeline. */
-static h2_frame_result_e h2_dispatch(h2session_t* s) {
-    connection_t* conn = s->connection;
-    connection_server_ctx_t* ctx = conn->ctx;
-
+static h2_frame_result_e h2_dispatch(h2session_t* s, h2stream_t* stream) {
     /* RFC 9113 §8.1.1: a content-length that disagrees with the DATA total
      * makes the request malformed. */
-    if (s->content_length >= 0 && (uint64_t)s->content_length != (uint64_t)s->req_body_len)
-        return h2_stream_error(s, s->stream_id, H2_ERR_PROTOCOL_ERROR);
+    if (stream->content_length >= 0 &&
+        (uint64_t)stream->content_length != (uint64_t)stream->req_body_len)
+        return h2_stream_error(s, stream->id, H2_ERR_PROTOCOL_ERROR);
 
-    s->stream_state = H2_STREAM_HALF_CLOSED_REMOTE;
+    stream->state = H2_STREAM_HALF_CLOSED_REMOTE;
 
-    /* Ownership of ctx->request passes to the connection context / queue item,
-     * exactly as in h1.1 after httpparser_reset(). */
-    if (!http_server_dispatch(conn, ctx->request))
+    /* The handler may run on another thread, or inline on this one for a static
+     * file. Either way the stream must survive until it reports back, so a
+     * RST_STREAM arriving meanwhile only marks it cancelled. */
+    stream->handler_pending = 1;
+
+    if (!http_server_dispatch(s->connection, stream->request)) {
+        stream->handler_pending = 0;
         return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
+    }
 
-    return H2_FRAME_DISPATCHED;
+    return H2_FRAME_OK;
 }
 
 /* ======================================================================= *
@@ -628,20 +621,22 @@ static h2_frame_result_e h2_on_settings(h2session_t* s, const h2_frame_t* frame)
             break;
         case H2_SETTINGS_ENABLE_PUSH:
             /* §6.5.2: the only legal values are 0 and 1, even though we never
-             * push. A client may not enable push on us either, but 1 is only
-             * meaningless here, not illegal. */
+             * push. */
             if (value > 1) return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
             break;
         case H2_SETTINGS_INITIAL_WINDOW_SIZE: {
             if (value > (uint32_t)H2_MAX_WINDOW)
                 return h2_conn_error(s, H2_ERR_FLOW_CONTROL_ERROR);
 
-            /* §6.9.2: the change applies as a delta to every open stream's send
-             * window, not as an assignment. */
+            /* §6.9.2: the change applies as a delta to *every* open stream's
+             * send window, not as an assignment. */
             const int64_t delta = (int64_t)value - (int64_t)s->peer_initial_window;
             s->peer_initial_window = value;
-            if (s->stream_id != 0) s->stream_send_window += delta;
-            if (s->stream_send_window > 0) s->window_blocked = 0;
+
+            for (h2stream_t* stream = s->streams; stream != NULL; stream = stream->next) {
+                stream->send_window += delta;
+                if (stream->send_window > 0) stream->window_blocked = 0;
+            }
             break;
         }
         case H2_SETTINGS_MAX_FRAME_SIZE:
@@ -671,25 +666,28 @@ static h2_frame_result_e h2_on_window_update(h2session_t* s, const h2_frame_t* f
         s->send_window += increment;
         if (s->send_window > H2_MAX_WINDOW)
             return h2_conn_error(s, H2_ERR_FLOW_CONTROL_ERROR);
-    }
-    else {
-        /* §5.1: a frame for a stream that was never opened is a connection
-         * error, while one for a stream we already finished is harmless. */
-        if (h2_stream_state(s, frame->stream_id) == H2_STREAM_IDLE)
-            return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
 
-        if (increment == 0)
-            return h2_stream_error(s, frame->stream_id, H2_ERR_PROTOCOL_ERROR);
+        if (s->send_window > 0) s->window_blocked = 0;
 
-        if (frame->stream_id != s->stream_id) return H2_FRAME_OK;
-
-        s->stream_send_window += increment;
-        if (s->stream_send_window > H2_MAX_WINDOW)
-            return h2_stream_error(s, frame->stream_id, H2_ERR_FLOW_CONTROL_ERROR);
+        return H2_FRAME_OK;
     }
 
-    if (s->send_window > 0 && s->stream_send_window > 0)
-        s->window_blocked = 0;
+    /* §5.1: a frame for a stream that was never opened is a connection error,
+     * while one for a stream we already finished is harmless. */
+    if (h2_stream_state_of(s, frame->stream_id) == H2_STREAM_IDLE)
+        return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
+
+    if (increment == 0)
+        return h2_stream_error(s, frame->stream_id, H2_ERR_PROTOCOL_ERROR);
+
+    h2stream_t* stream = h2stream_find(s, frame->stream_id);
+    if (stream == NULL) return H2_FRAME_OK;
+
+    stream->send_window += increment;
+    if (stream->send_window > H2_MAX_WINDOW)
+        return h2_stream_error(s, frame->stream_id, H2_ERR_FLOW_CONTROL_ERROR);
+
+    if (stream->send_window > 0) stream->window_blocked = 0;
 
     return H2_FRAME_OK;
 }
@@ -713,39 +711,32 @@ static h2_frame_result_e h2_on_priority(h2session_t* s, const h2_frame_t* frame)
 
 static h2_frame_result_e h2_on_rst_stream(h2session_t* s, const h2_frame_t* frame) {
     /* §6.4: RST_STREAM on an idle stream is a connection error. */
-    if (h2_stream_state(s, frame->stream_id) == H2_STREAM_IDLE)
+    if (h2_stream_state_of(s, frame->stream_id) == H2_STREAM_IDLE)
         return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
 
-    if (frame->stream_id == s->stream_id) {
-        connection_reset(s->connection); /* drops the in-flight request/response */
-        h2_stream_close(s);
+    h2stream_t* stream = h2stream_find(s, frame->stream_id);
+    if (stream != NULL) {
+        stream->state = H2_STREAM_CLOSED;
+        h2_session_drop_stream(s, stream);
     }
 
     return H2_FRAME_OK;
 }
 
 /* Map a request-construction outcome onto the wire. */
-static h2_frame_result_e h2_request_failed(h2session_t* s, uint32_t stream_id,
+static h2_frame_result_e h2_request_failed(h2session_t* s, h2stream_t* stream,
                                            h2_request_status_e status) {
-    connection_server_ctx_t* ctx = s->connection->ctx;
-
-    /* Release the half-built request here rather than leaving it for
-     * __ctx_free, so nothing downstream can observe it. */
-    if (ctx->request != NULL) {
-        httprequest_free(ctx->request);
-        ctx->request = NULL;
-    }
+    const uint32_t stream_id = stream->id;
 
     /* A bad HPACK block leaves the shared decoder unusable, so the connection
      * has to go; a merely malformed request only costs the stream. */
-    if (status == H2_REQUEST_COMPRESSION) {
-        h2_stream_close(s);
-        return h2_conn_error(s, H2_ERR_COMPRESSION_ERROR);
+    if (status == H2_REQUEST_COMPRESSION || status == H2_REQUEST_INTERNAL) {
+        h2_session_drop_stream(s, stream);
+        return h2_conn_error(s, status == H2_REQUEST_COMPRESSION ?
+                             H2_ERR_COMPRESSION_ERROR : H2_ERR_INTERNAL_ERROR);
     }
-    if (status == H2_REQUEST_INTERNAL) {
-        h2_stream_close(s);
-        return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
-    }
+
+    h2_session_drop_stream(s, stream);
 
     return h2_stream_error(s, stream_id, H2_ERR_PROTOCOL_ERROR);
 }
@@ -753,48 +744,47 @@ static h2_frame_result_e h2_request_failed(h2session_t* s, uint32_t stream_id,
 static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
                                             const uint8_t* block, size_t len,
                                             int end_stream) {
-    connection_t* conn = s->connection;
-    connection_server_ctx_t* ctx = conn->ctx;
+    h2stream_t* stream = h2stream_find(s, stream_id);
 
-    /* A HEADERS block on a stream that is already open is trailers, not a new
+    /* A header block on a stream that is already open is trailers, not a new
      * request (§8.1). */
-    if (stream_id == s->stream_id && s->stream_state == H2_STREAM_OPEN) {
+    if (stream != NULL && stream->state == H2_STREAM_OPEN && stream->headers_done) {
         /* The block must still be decoded to keep the HPACK context in sync,
          * even when the stream is about to be reset. */
         const h2_request_status_e status = h2_consume_trailers(s, block, len);
         if (status != H2_REQUEST_OK)
-            return h2_request_failed(s, stream_id, status);
+            return h2_request_failed(s, stream, status);
 
         /* §8.1: trailers terminate the request; without END_STREAM this is a
          * second header block in mid-stream. */
         if (!end_stream)
             return h2_stream_error(s, stream_id, H2_ERR_PROTOCOL_ERROR);
 
-        return h2_dispatch(s);
+        return h2_dispatch(s, stream);
     }
 
-    h2_stream_open(s, stream_id);
+    stream = h2stream_create(s, stream_id);
+    if (stream == NULL) return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
 
-    ctx->request = httprequest_create(conn);
-    if (ctx->request == NULL) return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
+    if (stream_id > s->last_stream_id) s->last_stream_id = stream_id;
 
-    const h2_request_status_e status = h2_build_request(s, ctx->request, block, len);
+    const h2_request_status_e status = h2_build_request(s, stream, block, len);
     if (status != H2_REQUEST_OK)
-        return h2_request_failed(s, stream_id, status);
+        return h2_request_failed(s, stream, status);
+
+    stream->headers_done = 1;
 
     if (!end_stream) return H2_FRAME_OK;
 
-    return h2_dispatch(s);
+    return h2_dispatch(s, stream);
 }
 
 static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) {
-    connection_server_ctx_t* ctx = s->connection->ctx;
-
     /* §5.1.1: client-initiated streams are odd-numbered, and ids only ever
      * increase — reusing a closed one is a connection error. */
     if ((frame->stream_id & 1) == 0) return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
 
-    const h2_stream_state_e state = h2_stream_state(s, frame->stream_id);
+    const h2stream_state_e state = h2_stream_state_of(s, frame->stream_id);
     if (state == H2_STREAM_CLOSED || state == H2_STREAM_HALF_CLOSED_REMOTE)
         return h2_conn_error(s, H2_ERR_STREAM_CLOSED);
 
@@ -824,7 +814,7 @@ static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) 
 
     /* Reasons to reject the stream outright. The block is still decoded first,
      * to keep the connection-wide HPACK context usable for later streams. */
-    const int refused = !trailers && (ctx->request != NULL || s->stream_id != 0);
+    const int refused = !trailers && h2stream_active_count(s) >= H2_MAX_CONCURRENT_STREAMS;
     if (self_dependent || refused) {
         if (frame->flags & H2_FLAG_END_HEADERS) {
             const h2_request_status_e status = h2_discard_header_block(s, block, block_len);
@@ -832,15 +822,10 @@ static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) 
                 return h2_conn_error(s, H2_ERR_COMPRESSION_ERROR);
         }
 
-        if (refused) {
-            /* Phase 3 serves one stream at a time; SETTINGS_MAX_CONCURRENT_STREAMS
-             * tells conforming peers not to do this, so refuse the extra stream
-             * instead of failing the connection. */
-            s->last_stream_id = frame->stream_id;
-            return h2_stream_error(s, frame->stream_id, H2_ERR_REFUSED_STREAM);
-        }
+        if (frame->stream_id > s->last_stream_id) s->last_stream_id = frame->stream_id;
 
-        return h2_stream_error(s, frame->stream_id, H2_ERR_PROTOCOL_ERROR);
+        return h2_stream_error(s, frame->stream_id,
+                               refused ? H2_ERR_REFUSED_STREAM : H2_ERR_PROTOCOL_ERROR);
     }
 
     if (!(frame->flags & H2_FLAG_END_HEADERS)) {
@@ -884,8 +869,6 @@ static h2_frame_result_e h2_on_continuation(h2session_t* s, const h2_frame_t* fr
 }
 
 static h2_frame_result_e h2_on_data(h2session_t* s, const h2_frame_t* frame) {
-    connection_server_ctx_t* ctx = s->connection->ctx;
-
     /* Credit the connection window back regardless of what happens to the
      * payload: the peer counted it against our window either way. */
     s->recv_pending += frame->payload_len;
@@ -896,10 +879,12 @@ static h2_frame_result_e h2_on_data(h2session_t* s, const h2_frame_t* frame) {
 
     /* §5.1: DATA on a stream that was never opened is a connection error; on
      * one that no longer accepts data it is a stream error. */
-    const h2_stream_state_e state = h2_stream_state(s, frame->stream_id);
+    const h2stream_state_e state = h2_stream_state_of(s, frame->stream_id);
     if (state == H2_STREAM_IDLE)
         return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
-    if (state != H2_STREAM_OPEN || ctx->request == NULL)
+
+    h2stream_t* stream = h2stream_find(s, frame->stream_id);
+    if (state != H2_STREAM_OPEN || stream == NULL)
         return h2_stream_error(s, frame->stream_id, H2_ERR_STREAM_CLOSED);
 
     const uint8_t* data = frame->payload;
@@ -914,18 +899,18 @@ static h2_frame_result_e h2_on_data(h2session_t* s, const h2_frame_t* frame) {
         data_len -= pad_len;
     }
 
-    s->stream_recv_pending += frame->payload_len;
-    if (s->stream_recv_pending >= H2_WINDOW_UPDATE_THRESHOLD) {
-        h2_queue_window_update(s, s->stream_id, (uint32_t)s->stream_recv_pending);
-        s->stream_recv_pending = 0;
+    stream->recv_pending += frame->payload_len;
+    if (stream->recv_pending >= H2_WINDOW_UPDATE_THRESHOLD) {
+        h2_queue_window_update(s, stream->id, (uint32_t)stream->recv_pending);
+        stream->recv_pending = 0;
     }
 
-    if (!h2_body_append(s, ctx->request, data, data_len))
-        return h2_stream_error(s, s->stream_id, H2_ERR_INTERNAL_ERROR);
+    if (!h2_body_append(stream, data, data_len))
+        return h2_stream_error(s, stream->id, H2_ERR_INTERNAL_ERROR);
 
     if (!(frame->flags & H2_FLAG_END_STREAM)) return H2_FRAME_OK;
 
-    return h2_dispatch(s);
+    return h2_dispatch(s, stream);
 }
 
 static h2_frame_result_e h2_handle_frame(h2session_t* s, const h2_frame_t* frame) {
@@ -978,14 +963,12 @@ static h2_frame_result_e h2_handle_frame(h2session_t* s, const h2_frame_t* frame
  * ======================================================================= */
 
 /* Parse and handle whole frames sitting in the session buffer. Returns 1 to
- * keep going, 0 to close, and sets *dispatched when a request was handed off
- * (further frames stay buffered until the response has been written). */
-static int h2_process_buffer(h2session_t* s, int* dispatched) {
+ * keep going, 0 to close. Unlike Phase 3 this does not stop at the first
+ * dispatched request — several streams may be accepted from one read. */
+static int h2_process_buffer(h2session_t* s) {
     const uint8_t* p = s->read_buf;
     const uint8_t* end = s->read_buf + s->read_len;
     int result = 1;
-
-    *dispatched = 0;
 
     while (p < end) {
         const h2parse_status_e st = h2frame_parser_feed(&s->frame, &p, end);
@@ -1010,10 +993,6 @@ static int h2_process_buffer(h2session_t* s, int* dispatched) {
             result = 0;
             break;
         }
-        if (r == H2_FRAME_DISPATCHED) {
-            *dispatched = 1;
-            break;
-        }
     }
 
     const size_t consumed = (size_t)(p - s->read_buf);
@@ -1025,20 +1004,19 @@ static int h2_process_buffer(h2session_t* s, int* dispatched) {
     return result;
 }
 
+/* A stream is waiting for the write path. */
+static int h2_has_writable(const h2session_t* s) {
+    for (const h2stream_t* stream = s->streams; stream != NULL; stream = stream->next)
+        if (stream->response_ready) return 1;
+
+    return 0;
+}
+
 static int h2_read(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
     h2session_t* s = ctx->parser;
 
     for (;;) {
-        /* Frames left over from the previous wakeup (a pipelined request that
-         * arrived in the same segment) come first — no new readable event will
-         * announce bytes that are already in our buffer. */
-        if (s->read_len > 0 && ctx->request == NULL) {
-            int dispatched = 0;
-            if (!h2_process_buffer(s, &dispatched)) return 0;
-            if (dispatched) break;
-        }
-
         const ssize_t n = connection_data_read(connection);
         if (n < 0) {
             if (connection->ssl != NULL) {
@@ -1066,28 +1044,18 @@ static int h2_read(connection_t* connection) {
         memcpy(s->read_buf + s->read_len, connection->buffer, (size_t)n);
         s->read_len += (size_t)n;
 
-        /* Unlike the leftover branch above, freshly read bytes are always
-         * parsed, even while a request is in flight: they usually carry the
-         * WINDOW_UPDATE or RST_STREAM that the response in progress is waiting
-         * on. A HEADERS frame for a second stream is refused there
-         * (REFUSED_STREAM) rather than deferred — conforming peers do not send
-         * one, since we advertise SETTINGS_MAX_CONCURRENT_STREAMS=1. */
-        int dispatched = 0;
-        if (!h2_process_buffer(s, &dispatched)) return 0;
-        if (dispatched) break;
+        if (!h2_process_buffer(s)) return 0;
     }
 
     /* Acks and window updates produced while parsing. */
     if (h2_flush_out(s) == 0) return 0;
 
-    if (s->out_len > s->out_pos) {
+    /* Anything left to write — pending frames, or a response that the frames we
+     * just consumed unblocked — needs an EPOLLOUT turn. */
+    if (s->out_len > s->out_pos || h2_has_writable(s)) {
         ctx->need_write = 1;
         return rearm(connection, MPXOUT | MPXRDHUP);
     }
-
-    /* A window-blocked response resumes on the WINDOW_UPDATE we just consumed. */
-    if (s->window_blocked && ctx->response != NULL)
-        ctx->need_write = 1;
 
     return 1;
 }
@@ -1095,6 +1063,39 @@ static int h2_read(connection_t* connection) {
 /* ======================================================================= *
  *  Write path
  * ======================================================================= */
+
+typedef enum {
+    H2_WRITE_DONE = 0,    /* the stream's response is fully on the wire */
+    H2_WRITE_SOCKET,      /* socket saturated mid-frame — resume this stream first */
+    H2_WRITE_WINDOW,      /* out of flow-control window — try other streams */
+    H2_WRITE_FAILED,
+} h2_write_status_e;
+
+static h2_write_status_e h2_write_stream(h2session_t* s, h2stream_t* stream) {
+    stream->window_blocked = 0;
+
+    int r = __run_header_filters(stream->request, stream->response);
+    if (r == CWF_ERROR) return H2_WRITE_FAILED;
+    if (r == CWF_EVENT_AGAIN)
+        return stream->window_blocked ? H2_WRITE_WINDOW : H2_WRITE_SOCKET;
+
+    r = __run_body_filters(stream->request, stream->response);
+    if (r == CWF_ERROR) return H2_WRITE_FAILED;
+    if (r == CWF_EVENT_AGAIN)
+        return stream->window_blocked ? H2_WRITE_WINDOW : H2_WRITE_SOCKET;
+
+    /* The filter chain emits no buffer at all for an empty body (and the
+     * HEADERS frame only carries END_STREAM when we could prove up front that
+     * no body follows), so close the stream explicitly when it is still open. */
+    if (!stream->end_stream_sent) {
+        if (!h2_session_queue_frame(s, H2_FRAME_DATA, H2_FLAG_END_STREAM, stream->id, NULL, 0))
+            return H2_WRITE_FAILED;
+
+        stream->end_stream_sent = 1;
+    }
+
+    return H2_WRITE_DONE;
+}
 
 static int h2_write(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
@@ -1104,56 +1105,146 @@ static int h2_write(connection_t* connection) {
     if (flushed == 0) return 0;
     if (flushed < 0) return rearm(connection, MPXOUT | MPXRDHUP);
 
-    httpresponse_t* response = ctx->response;
-    if (response == NULL) {
-        /* EPOLLOUT with nothing to send (control frames just drained). */
-        return rearm(connection, MPXIN | MPXRDHUP);
-    }
+    int socket_full = 0;
+    int window_stalled = 0;
 
-    s->window_blocked = 0;
+    /* A stream that stopped mid-frame owns the socket until it finishes:
+     * starting another one would splice its bytes into the unfinished frame. */
+    if (s->writing != NULL) {
+        h2stream_t* stream = s->writing;
+        const h2_write_status_e status = h2_write_stream(s, stream);
 
-    int r = __run_header_filters(ctx->request, response);
-    if (r == CWF_ERROR) return h2_fail(s, H2_ERR_INTERNAL_ERROR);
-    if (r == CWF_EVENT_AGAIN)
-        return s->window_blocked ? rearm(connection, MPXIN | MPXRDHUP) : 1;
-
-    r = __run_body_filters(ctx->request, response);
-    if (r == CWF_ERROR) return h2_fail(s, H2_ERR_INTERNAL_ERROR);
-    if (r == CWF_EVENT_AGAIN)
-        return s->window_blocked ? rearm(connection, MPXIN | MPXRDHUP) : 1;
-
-    /* The filter chain emits no buffer at all for an empty body (and the
-     * HEADERS frame only carries END_STREAM when we could prove up front that
-     * no body follows), so close the stream explicitly when it is still open. */
-    if (!s->end_stream_sent) {
-        if (!h2_session_queue_frame(s, H2_FRAME_DATA, H2_FLAG_END_STREAM, s->stream_id, NULL, 0))
+        switch (status) {
+        case H2_WRITE_FAILED:
+            s->writing = NULL;
             return h2_fail(s, H2_ERR_INTERNAL_ERROR);
-
-        s->end_stream_sent = 1;
-
-        const int tail = h2_flush_out(s);
-        if (tail == 0) return 0;
-        if (tail < 0) return rearm(connection, MPXOUT | MPXRDHUP);
-    }
-
-    h2_stream_close(s);
-
-    /* Same teardown as h1.1 __write: resets the context (freeing request and
-     * response), drains any queued handler and re-arms reading. */
-    if (!connection_after_write(connection)) return 0;
-
-    /* Frames that arrived while the response was being written. */
-    if (s->read_len > 0 && ctx->request == NULL) {
-        int dispatched = 0;
-        if (!h2_process_buffer(s, &dispatched)) return 0;
-        if (h2_flush_out(s) == 0) return 0;
-        if (dispatched || s->out_len > s->out_pos) {
+        case H2_WRITE_SOCKET:
+        case H2_WRITE_WINDOW:
+            /* Still mid-frame either way — the window ran out with a partially
+             * written frame, so no other stream may take over yet. */
+            if (h2_flush_out(s) == 0) return 0;
             ctx->need_write = 1;
-            return rearm(connection, MPXOUT | MPXRDHUP);
+            return rearm(connection, status == H2_WRITE_SOCKET ?
+                         (MPXOUT | MPXRDHUP) : (MPXIN | MPXRDHUP));
+        case H2_WRITE_DONE:
+            s->writing = NULL;
+            stream->state = H2_STREAM_CLOSED;
+            h2_session_drop_stream(s, stream);
+            break;
         }
     }
 
-    return 1;
+    /* Then serve every stream whose handler has come back, in table order. */
+    h2stream_t* stream = s->streams;
+    while (stream != NULL) {
+        h2stream_t* next = stream->next;
+
+        if (!stream->response_ready || stream->response == NULL) {
+            stream = next;
+            continue;
+        }
+
+        const h2_write_status_e status = h2_write_stream(s, stream);
+
+        if (status == H2_WRITE_FAILED)
+            return h2_fail(s, H2_ERR_INTERNAL_ERROR);
+
+        if (status == H2_WRITE_SOCKET) {
+            s->writing = stream;
+            socket_full = 1;
+            break;
+        }
+
+        if (status == H2_WRITE_WINDOW) {
+            /* Stalled before any byte of the next frame went out, so another
+             * stream may safely take the socket. */
+            window_stalled = 1;
+            stream = next;
+            continue;
+        }
+
+        stream->state = H2_STREAM_CLOSED;
+        h2_session_drop_stream(s, stream);
+
+        stream = next;
+    }
+
+    if (h2_flush_out(s) == 0) return 0;
+
+    if (socket_full || s->out_len > s->out_pos) {
+        ctx->need_write = 1;
+        return rearm(connection, MPXOUT | MPXRDHUP);
+    }
+
+    /* Every stream that could make progress has; the rest wait on a
+     * WINDOW_UPDATE, which arrives on the read path. */
+    if (window_stalled) {
+        ctx->need_write = 1;
+        return rearm(connection, MPXIN | MPXRDHUP);
+    }
+
+    /* Same teardown as h1.1 __write: drains any queued handler and re-arms
+     * reading. ctx->request/response are NULL on an h2 connection — every
+     * request lives on its stream — so the reset it performs is a no-op. */
+    return connection_after_write(connection);
+}
+
+/* ======================================================================= *
+ *  Handler hand-off
+ * ======================================================================= */
+
+void h2_server_attach_response(connection_t* connection, httprequest_t* request,
+                               httpresponse_t* response) {
+    h2session_t* s = h2_session_of(connection);
+    if (s == NULL) return;
+
+    for (h2stream_t* stream = s->streams; stream != NULL; stream = stream->next) {
+        if (stream->request != request) continue;
+
+        /* __handle may be re-entered for the same request (redirects); the
+         * stream owns whichever response is current. */
+        if (stream->response != NULL && stream->response != response)
+            httpresponse_free(stream->response);
+
+        stream->response = response;
+        return;
+    }
+}
+
+int h2_server_response_ready(connection_t* connection, httpresponse_t* response) {
+    connection_server_ctx_t* ctx = connection->ctx;
+    h2session_t* s = h2_session_of(connection);
+    if (s == NULL) return 0;
+
+    h2stream_t* stream = h2stream_find_by_response(s, response);
+    if (stream == NULL) {
+        /* The stream went away before its response was ready and nothing else
+         * owns it now. */
+        httpresponse_free(response);
+        return connection_after_read(connection);
+    }
+
+    stream->handler_pending = 0;
+
+    if (stream->cancelled) {
+        h2_session_drop_stream(s, stream);
+        return connection_after_read(connection);
+    }
+
+    stream->response_ready = 1;
+    ctx->need_write = 1;
+
+    /* More handlers are queued for this connection. Hand the worker slot on so
+     * they run without waiting for this response to reach the socket — the
+     * chain that connection_after_write drives for h1.1, which the h2 write
+     * path cannot drive because it may stop early on a saturated socket or an
+     * exhausted flow-control window. */
+    if (!cqueue_empty(ctx->queue)) {
+        connection_queue_guard_append(connection);
+        return rearm(connection, MPXONESHOT);
+    }
+
+    return connection_after_read(connection);
 }
 
 /* ======================================================================= *
@@ -1178,13 +1269,15 @@ int h2_server_guard_write(connection_t* connection) {
     return r;
 }
 
-/* Server connection preface (§3.4): SETTINGS must be the first frame we send.
- * MAX_CONCURRENT_STREAMS = 1 makes the Phase 3 single-stream limit explicit, so
- * conforming clients queue requests instead of getting REFUSED_STREAM. */
+/* Server connection preface (§3.4): SETTINGS must be the first frame we send. */
 static int h2_send_preface(h2session_t* s) {
     const uint8_t settings[] = {
         0x00, H2_SETTINGS_ENABLE_PUSH,            0x00, 0x00, 0x00, 0x00,
-        0x00, H2_SETTINGS_MAX_CONCURRENT_STREAMS, 0x00, 0x00, 0x00, 0x01,
+        0x00, H2_SETTINGS_MAX_CONCURRENT_STREAMS,
+            (uint8_t)((H2_MAX_CONCURRENT_STREAMS >> 24) & 0xff),
+            (uint8_t)((H2_MAX_CONCURRENT_STREAMS >> 16) & 0xff),
+            (uint8_t)((H2_MAX_CONCURRENT_STREAMS >> 8) & 0xff),
+            (uint8_t)(H2_MAX_CONCURRENT_STREAMS & 0xff),
     };
 
     return h2_session_queue_frame(s, H2_FRAME_SETTINGS, 0, 0, settings, sizeof(settings));
@@ -1212,9 +1305,6 @@ int h2_server_set_http2(connection_t* connection) {
     s->peer_initial_window = H2_DEFAULT_WINDOW;
     s->peer_header_table_size = 4096;
     s->send_window = H2_DEFAULT_WINDOW;
-    s->stream_send_window = H2_DEFAULT_WINDOW;
-    s->stream_state = H2_STREAM_IDLE;
-    s->content_length = -1;
     s->error_code = H2_ERR_PROTOCOL_ERROR;
 
     if (!h2_send_preface(s)) {
@@ -1244,6 +1334,8 @@ void h2_session_free(void* arg) {
     if (arg == NULL) return;
 
     h2session_t* s = arg;
+
+    h2stream_free_all(s);
 
     free(s->read_buf);
     free(s->cont);
