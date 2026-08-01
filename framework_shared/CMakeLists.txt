@@ -15,7 +15,8 @@ set(FW_LIBS
 	broadcast domain mimetype moduleloader multiplexing openssl ratelimiter
 	redirect route server signal socket thread taskmanager middleware translation
 	http_client http_client_parsers http_server http_server_filters http_server_parsers
-	smtp smtp_client smtp_client_parsers websocket websocket_server websocket_server_parsers)
+	smtp smtp_client smtp_client_parsers websocket websocket_server websocket_server_parsers
+	hpack)
 
 # The embedding application may inject its own static archives (models,
 # middlewares implementing the middlewares_init() hook, contexts, ...) by
