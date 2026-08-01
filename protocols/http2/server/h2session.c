@@ -320,9 +320,17 @@ static void h2_apply_range(httprequest_t* request) {
 
 /* Copy the :path slice and hand it to the request. The HPACK slice belongs to
  * the decoded header array, while request->uri must be a heap buffer the
- * request owns — httprequest_reset() frees it. httpparser_set_uri stores the
- * buffer before it validates, so the request owns it on either outcome and it
- * must never be freed here. */
+ * request owns — httprequest_reset() frees it exactly once. httpparser_set_uri
+ * stores the buffer before it validates, so the request owns it on either
+ * outcome and it must never be freed here.
+ *
+ * -fanalyzer reports the hand-off as a leak: httpparser_set_uri takes the
+ * buffer as const char* yet retains it, and the owning httprequest_t is freed
+ * from another translation unit, so the analyzer cannot follow it. Assigning
+ * request->uri here as well makes the escape explicit to a reader but does not
+ * convince the analyzer, hence the scoped suppression. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wanalyzer-malloc-leak"
 static int h2_set_path(httprequest_t* request, const char* value, size_t len) {
     char* uri = malloc(len + 1);
     if (uri == NULL) return 0;
@@ -330,15 +338,12 @@ static int h2_set_path(httprequest_t* request, const char* value, size_t len) {
     memcpy(uri, value, len);
     uri[len] = '\0';
 
-    /* httpparser_set_uri makes this same assignment, but declares the buffer
-     * const char* even though the request takes ownership of it. Stating the
-     * hand-off here keeps it visible to readers and to static analysis, which
-     * otherwise reads the buffer as leaked. */
     request->uri = uri;
     request->uri_length = len;
 
     return httpparser_set_uri(request, uri, len) == HTTP1PARSER_CONTINUE;
 }
+#pragma GCC diagnostic pop
 
 /* RFC 9113 §8.2.2 allows exactly one TE value: "trailers". */
 static int h2_te_is_valid(const char* value, size_t len) {
