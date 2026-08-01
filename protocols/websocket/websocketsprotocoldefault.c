@@ -109,6 +109,14 @@ int set_websockets_default(connection_t* connection, void* data) {
 
     connection_server_ctx_t* ctx = connection->ctx;
 
+    /* __ctx_reset leaves ctx->request for a pending protocol switch (the h2c
+     * upgrade adopts it as stream 1); websocket does not, so free the HTTP/1.1
+     * upgrade request here, exactly as reset used to. */
+    if (ctx->request != NULL) {
+        httprequest_free(ctx->request);
+        ctx->request = NULL;
+    }
+
     if (ctx->parser != NULL) {
         requestparser_t* old_parser = ctx->parser;
         old_parser->free(old_parser);

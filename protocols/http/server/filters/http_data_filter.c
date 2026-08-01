@@ -91,8 +91,15 @@ int __header(httprequest_t* request, httpresponse_t* response) {
         if (!response->add_header(response, "Cache-Control", "no-cache"))
             return CWF_ERROR;
 
-    // RFC 7232: 304 response MUST NOT contain Content-Length for body
-    if (!response->range && response->transfer_encoding == TE_NONE && response->status_code != 304) {
+    /* RFC 7232: 304 response MUST NOT contain Content-Length for body.
+     * RFC 9110 §8.6 likewise forbids it on 1xx and 204 — both are terminated by
+     * the end of the header section and cannot carry content. This covers the
+     * 101 Switching Protocols of an h2c or websocket upgrade. */
+    const int bodiless_status = response->status_code == 304 ||
+                                response->status_code == 204 ||
+                                (response->status_code >= 100 && response->status_code < 200);
+
+    if (!response->range && response->transfer_encoding == TE_NONE && !bodiless_status) {
         size_t data_size = response->body.size;
         if (response->file_.fd > -1)
             data_size = response->file_.size;

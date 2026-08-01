@@ -253,8 +253,16 @@ void __set_protocol(connection_t* connection) {
     int r = 0;
     if (ctx->server->openssl)
         r = set_tls(connection);
-    else
+    else {
         r = set_http(connection);
+        /* h2c prior-knowledge (RFC 9113 §3.4): a plaintext client may open the
+         * connection with the 24-byte HTTP/2 preface instead of an HTTP/1.1
+         * request line. The first read sniffs for it (one-shot, one memcmp)
+         * before the connection is committed to h1.1. TLS skips this — ALPN has
+         * already negotiated the protocol. */
+        if (r)
+            ctx->h2c_preface = 1;
+    }
 
     if (!r) {
         connection_free(connection);

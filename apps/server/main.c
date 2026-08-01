@@ -60,8 +60,11 @@ int main(int argc, char* argv[]) {
         atomic_store(&cfg->shutdown, 1);
         module_loader_wakeup_all_threads();
 
+        /* Poll appconfig_threads_alive(), not cfg->threads_count: the thread that
+         * takes the count to zero frees cfg on its way out, so reading the
+         * in-config counter here is a use-after-free. */
         for (int ms = 0; ms < grace_ms; ms += 100) {
-            if (atomic_load(&cfg->threads_count) == 0)
+            if (appconfig_threads_alive() == 0)
                 break;
             usleep(100000);
         }

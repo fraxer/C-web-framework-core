@@ -12,6 +12,12 @@ void taskmanager_free(taskmanager_t* manager);
 static char* __appconfig_path = NULL;
 static appconfig_t* __appconfig = NULL;
 
+/* Mirror of config->threads_count with process lifetime. The counter inside the
+ * config cannot be polled by an observer: the thread that drops it to zero frees
+ * the config in the same breath, so the next read of config->threads_count is a
+ * use-after-free. The shutdown drain in main() watches this copy instead. */
+static atomic_int __appconfig_threads_alive = 0;
+
 static const char* __appconfig_get_path(int argc, char* argv[]);
 static void __appconfig_env_init(env_t* env);
 static void __appconfig_env_free(env_t* env);
@@ -142,14 +148,25 @@ char* appconfig_path(void) {
 }
 
 void appconfg_threads_increment(appconfig_t* config) {
+    atomic_fetch_add(&__appconfig_threads_alive, 1);
     atomic_fetch_add(&config->threads_count, 1);
 }
 
 void appconfg_threads_decrement(appconfig_t* config) {
-    atomic_fetch_sub(&config->threads_count, 1);
+    /* Decide on the value fetch_sub returned, not on a re-read: two threads
+     * could otherwise both observe zero and free the config twice. The mirror is
+     * lowered after the free so an observer never sees zero while the config is
+     * still being torn down. */
+    const int was = atomic_fetch_sub(&config->threads_count, 1);
 
-    if (atomic_load(&config->threads_count) == 0)
+    if (was == 1)
         appconfig_free(config);
+
+    atomic_fetch_sub(&__appconfig_threads_alive, 1);
+}
+
+int appconfig_threads_alive(void) {
+    return atomic_load(&__appconfig_threads_alive);
 }
 
 void __appconfig_env_init(env_t* env) {

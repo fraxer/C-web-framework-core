@@ -82,6 +82,12 @@ char* appconfig_path(void);
 void appconfg_threads_increment(appconfig_t* config);
 void appconfg_threads_decrement(appconfig_t* config);
 
+/* How many worker/handler/task threads are still running, tracked in a
+ * process-lifetime counter rather than in the config — the last thread out frees
+ * the config, so config->threads_count cannot be safely polled from outside.
+ * Used by the shutdown drain to tell when the workers have finished. */
+int appconfig_threads_alive(void);
+
 const char* env_get_string(const char* key, const char* default_value);
 int env_get_int(const char* key, int default_value);
 long long env_get_llong(const char* key, long long default_value);

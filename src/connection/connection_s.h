@@ -56,6 +56,16 @@ typedef struct {
      * must be built with the h2 filter chain (frames instead of a status line +
      * chunked encoding). Set by h2_server_set_http2. */
     unsigned is_http2: 1;
+    /* Plaintext connection whose first bytes have not yet been inspected for the
+     * h2c connection preface (RFC 9113 §3.4). Set once at plaintext accept;
+     * cleared as soon as the protocol is settled, so the h1.1 hot path pays a
+     * single memcmp per connection. Always 0 for TLS, where ALPN has already
+     * settled the protocol. */
+    unsigned h2c_preface: 1;
+    /* How many bytes of a partially received preface are staged at the front of
+     * connection->buffer, when the 24 bytes arrived split across TCP segments.
+     * Always < 24, so 5 bits are enough. Meaningful only while h2c_preface. */
+    unsigned h2c_peeked: 5;
 } connection_server_ctx_t;
 
 typedef struct connection_queue_item_data {

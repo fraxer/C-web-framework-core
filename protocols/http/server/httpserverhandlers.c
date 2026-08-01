@@ -1,5 +1,8 @@
 #include "httpserverhandlers.h"
 
+#include <string.h>
+#include <sys/socket.h>
+
 #include "httpcontext.h"
 #include "httprequest.h"
 #include "httpresponse.h"
@@ -25,6 +28,15 @@ typedef void(*queue_handler)(void*);
 typedef void*(*queue_data_create)(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter);
 
 int run_middlewares(struct middleware_item* middleware_item, void* ctx);
+
+typedef enum {
+    H2C_SNIFF_NO,         /* not the h2 preface — continue as HTTP/1.1 */
+    H2C_SNIFF_YES,        /* the h2 preface — switch to HTTP/2 */
+    H2C_SNIFF_INCOMPLETE, /* a prefix so far — wait for more bytes, decide later */
+    H2C_SNIFF_ERROR       /* peer closed or the socket failed */
+} h2c_sniff_e;
+
+static h2c_sniff_e __h2c_sniff_preface(connection_t* connection, size_t* len);
 
 static int __tls_read(connection_t* connection);
 static int __tls_write(connection_t* connection);
@@ -108,6 +120,48 @@ int http_server_guard_write(connection_t* connection) {
     return r;
 }
 
+/* Read the first bytes of a plaintext connection and tell an HTTP/2 connection
+ * preface from an HTTP/1.1 request line. On return `*len` is how many bytes are
+ * staged at the front of connection->buffer for the winning protocol to consume.
+ *
+ * The preface can be split across TCP segments, so one read is not always enough
+ * to decide. Bytes accumulate at the front of connection->buffer across calls
+ * (ctx->h2c_peeked counts them) and the next read appends after them, which
+ * keeps the undecided bytes owned by us: whichever protocol wins gets the whole
+ * prefix back. MSG_PEEK would be simpler, but leaving the bytes unread on a
+ * level-triggered epoll makes EPOLLIN refire immediately — a client that stalls
+ * mid-preface would spin a worker at 100%.
+ *
+ * A short prefix is never resolved early: "P"/"PR" also start POST, PUT and
+ * PROPFIND, so only the full 24 bytes decide. TLS connections never get here —
+ * ALPN has already settled the protocol. */
+static h2c_sniff_e __h2c_sniff_preface(connection_t* connection, size_t* len) {
+    connection_server_ctx_t* ctx = connection->ctx;
+    const size_t have = ctx->h2c_peeked;
+
+    const ssize_t n = recv(connection->fd, connection->buffer + have,
+                           connection->buffer_size - have, 0);
+    if (n < 0)
+        return (errno == EAGAIN || errno == EWOULDBLOCK) ? H2C_SNIFF_INCOMPLETE : H2C_SNIFF_ERROR;
+    if (n == 0)
+        return H2C_SNIFF_ERROR;
+
+    const size_t total = have + (size_t)n;
+    const size_t cmp = total < H2_CONNECTION_PREFACE_LEN ? total : H2_CONNECTION_PREFACE_LEN;
+
+    *len = total;
+
+    if (memcmp(connection->buffer, H2_CONNECTION_PREFACE, cmp) != 0)
+        return H2C_SNIFF_NO;
+
+    if (total < H2_CONNECTION_PREFACE_LEN) {
+        ctx->h2c_peeked = total & 0x1f; /* < 24, fits the bitfield */
+        return H2C_SNIFF_INCOMPLETE;
+    }
+
+    return H2C_SNIFF_YES;
+}
+
 int __read(connection_t* connection) {
     if (connection == NULL) {
         log_error("__read: connection is NULL\n");
@@ -126,11 +180,41 @@ int __read(connection_t* connection) {
         return 0;
     }
 
+    /* h2c prior-knowledge (RFC 9113 §3.4): a plaintext client may open with the
+     * 24-byte HTTP/2 connection preface instead of an HTTP/1.1 request line.
+     * Settled once per connection, before any byte reaches the h1.1 parser, so
+     * from the second read on h1.1 keeps its untouched fast path. */
+    size_t sniffed = 0; /* bytes the sniff already staged in connection->buffer */
+    if (ctx->h2c_preface) {
+        switch (__h2c_sniff_preface(connection, &sniffed)) {
+        case H2C_SNIFF_INCOMPLETE:
+            return 1; /* still a prefix — held in the buffer until the next read */
+        case H2C_SNIFF_ERROR:
+            return 0;
+        case H2C_SNIFF_YES:
+            ctx->h2c_preface = 0;
+            ctx->h2c_peeked = 0;
+            return h2_server_set_http2_prior_knowledge(connection, sniffed);
+        case H2C_SNIFF_NO:
+        default:
+            /* An ordinary HTTP/1.1 request: hand the sniffed bytes straight to
+             * the parser below instead of re-reading the socket. */
+            ctx->h2c_preface = 0;
+            ctx->h2c_peeked = 0;
+            break;
+        }
+    }
+
     while (1) {
         ssize_t bytes_readed = 0;
         read_data:
 
-        bytes_readed = connection_data_read(connection);
+        if (sniffed > 0) {
+            bytes_readed = (ssize_t)sniffed;
+            sniffed = 0;
+        }
+        else
+            bytes_readed = connection_data_read(connection);
 
         switch (bytes_readed) {
         case -1:

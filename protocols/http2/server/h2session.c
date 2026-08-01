@@ -4,11 +4,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdatomic.h>
 #include <sys/socket.h>
 #include <time.h>
 
 #include "appconfig.h"
+#include "base64.h"
 #include "connection_queue.h"
 #include "connection_s.h"
 #include "cookieparser.h"
@@ -647,11 +649,14 @@ static h2_frame_result_e h2_dispatch(h2session_t* s, h2stream_t* stream) {
  *  Frame handling
  * ======================================================================= */
 
-static h2_frame_result_e h2_on_settings(h2session_t* s, const h2_frame_t* frame) {
-    if (frame->flags & H2_FLAG_ACK) return H2_FRAME_OK;
-
-    for (size_t off = 0; off + 6 <= frame->payload_len; off += 6) {
-        const uint8_t* p = frame->payload + off;
+/* Apply a SETTINGS frame payload (6-byte id/value tuples) to the peer settings.
+ * Shared by h2_on_settings (a real SETTINGS frame, which then acks) and the h2c
+ * Upgrade path (the HTTP2-Settings header, which is not acked — RFC 7540 §3.2.1).
+ * Returns H2_FRAME_OK or a connection-error result. */
+static h2_frame_result_e h2_apply_settings_payload(h2session_t* s,
+                                                   const uint8_t* payload, size_t len) {
+    for (size_t off = 0; off + 6 <= len; off += 6) {
+        const uint8_t* p = payload + off;
         const uint16_t id = (uint16_t)((p[0] << 8) | p[1]);
         const uint32_t value = ((uint32_t)p[2] << 24) | ((uint32_t)p[3] << 16) |
                                ((uint32_t)p[4] << 8) | p[5];
@@ -692,6 +697,15 @@ static h2_frame_result_e h2_on_settings(h2session_t* s, const h2_frame_t* frame)
             break; /* unknown settings must be ignored (§6.5.2) */
         }
     }
+
+    return H2_FRAME_OK;
+}
+
+static h2_frame_result_e h2_on_settings(h2session_t* s, const h2_frame_t* frame) {
+    if (frame->flags & H2_FLAG_ACK) return H2_FRAME_OK;
+
+    const h2_frame_result_e r = h2_apply_settings_payload(s, frame->payload, frame->payload_len);
+    if (r != H2_FRAME_OK) return r;
 
     if (!h2_session_queue_frame(s, H2_FRAME_SETTINGS, H2_FLAG_ACK, 0, NULL, 0))
         return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
@@ -1073,6 +1087,45 @@ static int h2_has_writable(const h2session_t* s) {
     return 0;
 }
 
+/* Stage bytes that arrived outside the h2 read loop — the h2c prior-knowledge
+ * bootstrap, where __read had already recv'd the preface into connection->buffer
+ * — and run the frame parser over them. On a connection error h2_fail() will have
+ * queued a GOAWAY; the caller flushes it. Returns 0 on a connection error. */
+static int h2_session_feed(h2session_t* s, const uint8_t* data, size_t len) {
+    if (s->read_len + len > s->read_cap) {
+        size_t cap = s->read_cap ? s->read_cap : 16384;
+        while (cap < s->read_len + len) cap *= 2;
+        uint8_t* buf = realloc(s->read_buf, cap);
+        if (buf == NULL) return 0;
+        s->read_buf = buf;
+        s->read_cap = cap;
+    }
+
+    memcpy(s->read_buf + s->read_len, data, len);
+    s->read_len += len;
+    s->last_activity_ms = h2_now_ms();
+
+    return h2_process_buffer(s);
+}
+
+/* Flush pending outbound frames and re-arm epoll for the next event: EPOLLOUT if
+ * there is still data to send or a stream waiting on the write path, otherwise
+ * EPOLLIN. The shared tail of the read loop and the h2c bootstrap. */
+static int h2_drain_and_rearm(h2session_t* s, connection_t* connection) {
+    connection_server_ctx_t* ctx = connection->ctx;
+
+    if (h2_flush_out(s) == 0) return 0;
+
+    /* Anything left to write — pending frames, or a response that the frames we
+     * just consumed unblocked — needs an EPOLLOUT turn. */
+    if (s->out_len > s->out_pos || h2_has_writable(s)) {
+        ctx->need_write = 1;
+        return rearm(connection, MPXOUT | MPXRDHUP);
+    }
+
+    return 1;
+}
+
 static int h2_read(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
     h2session_t* s = ctx->parser;
@@ -1114,16 +1167,7 @@ static int h2_read(connection_t* connection) {
     }
 
     /* Acks and window updates produced while parsing. */
-    if (h2_flush_out(s) == 0) return 0;
-
-    /* Anything left to write — pending frames, or a response that the frames we
-     * just consumed unblocked — needs an EPOLLOUT turn. */
-    if (s->out_len > s->out_pos || h2_has_writable(s)) {
-        ctx->need_write = 1;
-        return rearm(connection, MPXOUT | MPXRDHUP);
-    }
-
-    return 1;
+    return h2_drain_and_rearm(s, connection);
 }
 
 /* ======================================================================= *
@@ -1442,13 +1486,21 @@ static int h2_send_preface(h2session_t* s) {
     return h2_session_queue_frame(s, H2_FRAME_SETTINGS, 0, 0, settings, sizeof(settings));
 }
 
-int h2_server_set_http2(connection_t* connection) {
+/* Build an h2 session on `connection` and install its read/write guards. The
+ * shared core of every entry point — TLS ALPN, h2c prior-knowledge, h2c Upgrade.
+ * All three expect the 24-byte client connection preface: the Upgrade path too,
+ * because §3.2 has the client send it immediately upon receiving the 101 (the
+ * HTTP2-Settings header carries the settings *values* early, it does not replace
+ * the preface or the SETTINGS frame that follows it). Queues (but does not
+ * flush) the server connection preface; the caller drains as appropriate.
+ * Returns the session or NULL on allocation failure. */
+static h2session_t* h2_session_begin(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
 
     h2_load_policy();
 
     h2session_t* s = calloc(1, sizeof(*s));
-    if (s == NULL) return 0;
+    if (s == NULL) return NULL;
 
     s->free = h2_session_free;
     s->connection = connection;
@@ -1458,7 +1510,7 @@ int h2_server_set_http2(connection_t* connection) {
     s->encoder = hpack_encoder_create(4096);
     if (s->read_buf == NULL || s->decoder == NULL || s->encoder == NULL) {
         h2_session_free(s);
-        return 0;
+        return NULL;
     }
 
     h2frame_parser_init(&s->frame, 1, H2_MAX_FRAME_SIZE_DEFAULT); /* expect the client preface */
@@ -1469,9 +1521,10 @@ int h2_server_set_http2(connection_t* connection) {
     s->error_code = H2_ERR_PROTOCOL_ERROR;
     s->last_activity_ms = h2_now_ms();
 
+    /* Server connection preface (§3.4): SETTINGS must be the first frame we send. */
     if (!h2_send_preface(s)) {
         h2_session_free(s);
-        return 0;
+        return NULL;
     }
 
     if (ctx->parser != NULL)
@@ -1485,9 +1538,183 @@ int h2_server_set_http2(connection_t* connection) {
     connection->read = h2_server_guard_read;
     connection->write = h2_server_guard_write;
 
+    return s;
+}
+
+int h2_server_set_http2(connection_t* connection) {
+    h2session_t* s = h2_session_begin(connection);
+    if (s == NULL) return 0;
+
     if (h2_flush_out(s) == 0) return 0;
 
     log_info("HTTP/2 session established (fd %d)\n", connection->fd);
+
+    return 1;
+}
+
+int h2_server_set_http2_prior_knowledge(connection_t* connection, size_t len) {
+    /* Called from __read under http_server_guard_read's lock. __read already
+     * recv'd the client preface (and possibly the first SETTINGS/HEADERS in the
+     * same packet) into connection->buffer; the session's frame parser expects
+     * the 24-byte preface, so feeding those bytes consumes it and parses
+     * whatever followed. */
+    h2session_t* s = h2_session_begin(connection);
+    if (s == NULL) return 0;
+
+    if (!h2_session_feed(s, (const uint8_t*)connection->buffer, len)) {
+        h2_flush_out(s); /* push any GOAWAY queued by the failure */
+        return 0;
+    }
+
+    log_info("HTTP/2 (h2c prior-knowledge) session established (fd %d)\n", connection->fd);
+
+    return h2_drain_and_rearm(s, connection);
+}
+
+void h2_upgrade_settings_free(void* data) {
+    if (data == NULL) return;
+    h2_upgrade_settings_t* ud = data;
+    free(ud->payload);
+    free(ud);
+}
+
+int h2_server_set_http2_upgrade(connection_t* connection, void* data) {
+    /* switch_to_protocol callback (RFC 9113 §3.2): runs from
+     * connection_after_write() under the connection lock, after the 101
+     * Switching Protocols response is on the wire. The 101 was the HTTP/1.1
+     * bridge; from here the connection speaks HTTP/2. */
+    connection_server_ctx_t* ctx = connection->ctx;
+    h2_upgrade_settings_t* ud = data;
+
+    /* §3.2: upon receiving the 101 the client sends the connection preface —
+     * magic + SETTINGS — exactly as on any other h2 connection, so the session
+     * expects it. HTTP2-Settings only front-loads the settings values (applied
+     * below) so the server can act on them while the 101 is still in flight. */
+    h2session_t* s = h2_session_begin(connection);
+    if (s == NULL)
+        return 0;
+
+    if (ud != NULL && ud->len > 0) {
+        if (h2_apply_settings_payload(s, ud->payload, ud->len) != H2_FRAME_OK) {
+            h2_fail(s, s->error_code); /* a bad setting is a connection error */
+            h2_flush_out(s);
+            return 0;
+        }
+    }
+
+    /* Stream 1 is the upgraded request (RFC 7540 §3.2): its headers arrived as
+     * HTTP/1.1 and are already parsed, so reuse that request rather than
+     * decoding an HPACK block. __ctx_reset left ctx->request in place because a
+     * protocol switch was pending; the stream owns it from here. */
+    h2stream_t* stream = h2stream_create(s, 1);
+    if (stream == NULL) {
+        h2_fail(s, H2_ERR_INTERNAL_ERROR);
+        h2_flush_out(s);
+        return 0;
+    }
+    if (s->last_stream_id < 1) s->last_stream_id = 1;
+
+    httprequest_free(stream->request); /* drop the empty one h2stream_create made */
+    stream->request = ctx->request;
+    ctx->request = NULL;
+    stream->headers_done = 1;
+    stream->content_length = -1;
+
+    /* Run stream 1 through the same dispatch path as a fresh HEADERS frame; it
+     * sets the half-closed-remote state, marks the handler pending, and queues
+     * it. The response comes back as HEADERS/DATA frames on stream 1. */
+    const h2_frame_result_e r = h2_dispatch(s, stream);
+    if (r == H2_FRAME_ERROR) {
+        h2_fail(s, s->error_code);
+        h2_flush_out(s);
+        return 0;
+    }
+    if (r == H2_FRAME_CLOSE) return 0;
+
+    log_info("HTTP/2 (h2c upgrade) session established (fd %d)\n", connection->fd);
+
+    return h2_drain_and_rearm(s, connection);
+}
+
+/* Case-insensitive "is `token` one of the comma-separated values in `list`"
+ * (HTTP header lists — Upgrade, Connection — are token lists, §3.2.6). */
+static int h2c_list_has_token(const char* list, const char* token) {
+    const size_t tlen = strlen(token);
+    const char* p = list;
+
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t' || *p == ',') p++;
+
+        const char* start = p;
+        while (*p != '\0' && *p != ',') p++;
+        const char* end = p;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+
+        if ((size_t)(end - start) == tlen && strncasecmp(start, token, tlen) == 0)
+            return 1;
+
+        if (*p == ',') p++;
+    }
+
+    return 0;
+}
+
+int h2c_upgrade(httpctx_t* ctx) {
+    httprequest_t* request = ctx->request;
+    httpresponse_t* response = ctx->response;
+
+    /* The upgrade applies only to an HTTP/1.1 request. Stream 1 of an h2c
+     * upgrade is dispatched through the same middleware chain as any h2 request,
+     * and the upgraded HTTP/1.1 request still carries its Upgrade/HTTP2-Settings
+     * headers — without this guard the middleware would re-stage a 101 onto the
+     * h2 response (and :status would come back as 101). */
+    connection_t* connection = response->connection;
+    if (connection == NULL || connection->ctx == NULL) return 0;
+
+    connection_server_ctx_t* conn_ctx = connection->ctx;
+    if (conn_ctx->is_http2) return 0;
+
+    const http_header_t* upgrade = request->get_headern(request, "Upgrade", 7);
+    if (upgrade == NULL || !h2c_list_has_token(upgrade->value, "h2c"))
+        return 0; /* not an h2c upgrade — handle as an ordinary request */
+
+    /* RFC 7540 §3.2: the upgrade request MUST carry HTTP2-Settings, and the
+     * Connection header MUST list it as connection-specific. */
+    const http_header_t* h2settings = request->get_headern(request, "HTTP2-Settings", 14);
+    if (h2settings == NULL)
+        return 0;
+
+    const http_header_t* connhdr = request->get_headern(request, "Connection", 10);
+    if (connhdr == NULL || !h2c_list_has_token(connhdr->value, "HTTP2-Settings"))
+        return 0;
+
+    /* Decode the SETTINGS payload the peer folded into the header (base64url,
+     * no padding — RFC 7540 §3.2.1). */
+    h2_upgrade_settings_t* ud = NULL;
+    if (h2settings->value_length > 0) {
+        const int declen = base64url_decode_len(h2settings->value);
+        uint8_t* buf = malloc(declen > 0 ? (size_t)declen : 1);
+        if (buf == NULL) return 0;
+
+        const int n = base64url_decode((char*)buf, h2settings->value);
+        if (n < 0) { free(buf); return 0; } /* malformed → not an upgrade */
+
+        ud = malloc(sizeof(*ud));
+        if (ud == NULL) { free(buf); return 0; }
+        ud->payload = buf;
+        ud->len = (size_t)n;
+    }
+
+    /* Stage the 101 Switching Protocols response. The framework writes it, then
+     * connection_after_write() runs the switch callback that builds the session. */
+    response->add_headern(response, "Connection", 10, "Upgrade", 7);
+    response->add_headern(response, "Upgrade", 7, "h2c", 3);
+    response->status_code = 101;
+
+    conn_ctx->switch_to_protocol.fn = h2_server_set_http2_upgrade;
+    conn_ctx->switch_to_protocol.data = ud;
+    conn_ctx->switch_to_protocol.data_free = h2_upgrade_settings_free;
+    connection->keepalive = 1;
 
     return 1;
 }

@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <string.h>
 
 #include "base64.h"
@@ -23,6 +24,42 @@ static const unsigned char pr2six[256] = {
 };
 
 static const char basis_64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+int base64url_decode_len(const char* bufcoded) {
+    /* base64url carries no '=' padding, so the decoded length is just the input
+     * length scaled by 3/4. +1 for the trailing NUL the caller's buffer needs. */
+    size_t len = 0;
+    while (bufcoded[len] != '\0') len++;
+
+    return (int)((len * 3) / 4) + 1;
+}
+
+int base64url_decode(char* bufplain, const char* bufcoded) {
+    /* Translate to the standard alphabet and re-add the '=' padding that
+     * base64_decode expects, then reuse it. The input is short (an HTTP2-Settings
+     * payload is a handful of 6-byte settings), so a small heap buffer is fine. */
+    size_t len = 0;
+    while (bufcoded[len] != '\0') len++;
+
+    char* tmp = malloc(len + 4); /* up to 2 '=' + NUL + slack */
+    if (tmp == NULL) return -1;
+
+    for (size_t i = 0; i < len; i++) {
+        char c = bufcoded[i];
+        if (c == '-') tmp[i] = '+';
+        else if (c == '_') tmp[i] = '/';
+        else tmp[i] = c;
+    }
+
+    const size_t pad = (4 - (len % 4)) % 4;
+    for (size_t i = 0; i < pad; i++)
+        tmp[len + i] = '=';
+    tmp[len + pad] = '\0';
+
+    const int n = base64_decode(bufplain, tmp);
+    free(tmp);
+    return n;
+}
 
 int __base64_encode_intenal_len(const int len, const int wrap);
 int __base64_encode_internal(char* encoded, const char* string, const int string_len, const int wrap);

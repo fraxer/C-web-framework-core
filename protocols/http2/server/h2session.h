@@ -6,6 +6,7 @@
 #include "h2frame.h"
 #include "h2stream.h"
 #include "hpack.h"
+#include "httpcontext.h"  /* httpctx_t — h2c_upgrade() entry point */
 
 /* Per-connection HTTP/2 session.
  *
@@ -105,6 +106,39 @@ typedef struct h2session {
 /* Entry point called from __handshake once ALPN selects h2. Returns 1 on
  * success (connection->read/write installed), 0 on allocation failure. */
 int h2_server_set_http2(connection_t* connection);
+
+/* h2c prior-knowledge (RFC 9113 §3.4): the first bytes read off a plaintext
+ * connection were the 24-byte client preface, possibly followed by more frames
+ * in the same packet. Called from __read with the connection lock already held;
+ * `len` is how many bytes connection_data_read() already staged in
+ * connection->buffer. Builds the session (which expects the client preface),
+ * feeds those bytes through the frame parser, and drains pending writes.
+ * Returns 1 to keep the connection, 0 to close it. */
+int h2_server_set_http2_prior_knowledge(connection_t* connection, size_t len);
+
+/* h2c Upgrade (RFC 9113 §3.2): the decoded HTTP2-Settings header payload, handed
+ * to the switch callback after the 101 Switching Protocols response is flushed. */
+typedef struct h2_upgrade_settings {
+    uint8_t* payload;   /* decoded SETTINGS frame payload (6 bytes per setting) */
+    size_t   len;
+} h2_upgrade_settings_t;
+
+/* switch_to_protocol callback for the h2c Upgrade path. Called from
+ * connection_after_write() under the connection lock, after the 101 is on the
+ * wire. `data` is an h2_upgrade_settings_t* (may be NULL if no HTTP2-Settings
+ * header was sent). Builds the session (which still expects the client preface —
+ * §3.2 has the client send it on seeing the 101), applies the peer settings from
+ * the header, makes stream 1 out of the upgraded HTTP/1.1 request, and
+ * dispatches it. Returns 1 to keep the connection. */
+int h2_server_set_http2_upgrade(connection_t* connection, void* data);
+void h2_upgrade_settings_free(void* data);
+
+/* HTTP/1.1 → HTTP/2 cleartext upgrade helper (RFC 9113 §3.2). Detects an
+ * `Upgrade: h2c` request, decodes its HTTP2-Settings header, stages a 101
+ * Switching Protocols response, and arranges the protocol switch. Returns 1 if
+ * the request was an upgrade it handled (the caller must stop processing — the
+ * 101 is staged and the handler must not run), or 0 for an ordinary request. */
+int h2c_upgrade(httpctx_t* ctx);
 
 int h2_server_guard_read(connection_t* connection);
 int h2_server_guard_write(connection_t* connection);

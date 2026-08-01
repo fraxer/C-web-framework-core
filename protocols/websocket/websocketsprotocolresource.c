@@ -452,6 +452,13 @@ int set_websockets_resource(connection_t* connection, void* data) {
 
     connection_server_ctx_t* ctx = connection->ctx;
 
+    /* See set_websockets_default: free the HTTP/1.1 upgrade request that
+     * __ctx_reset deferred to the switch callback. */
+    if (ctx->request != NULL) {
+        httprequest_free(ctx->request);
+        ctx->request = NULL;
+    }
+
     if (ctx->parser != NULL) {
         requestparser_t* old_parser = ctx->parser;
         old_parser->free(old_parser);

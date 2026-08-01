@@ -293,6 +293,8 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
     ctx->base.free = __ctx_free;
     ctx->need_write = 0;
     ctx->is_http2 = 0;
+    ctx->h2c_preface = 0;
+    ctx->h2c_peeked = 0;
     atomic_store(&ctx->destroyed, 0);
     atomic_store(&ctx->ref_count, 1);
     atomic_store(&ctx->broadcast_ref_count, 1);
@@ -329,10 +331,17 @@ void __ctx_reset(void* arg) {
 
     ctx->need_write = 0;
 
-    request_t* request = ctx->request;
-    if (request != NULL) {
-        request->free(request);
-        ctx->request = NULL;
+    /* When a protocol switch is pending (h2c Upgrade — see connection_after_write),
+     * the switch callback adopts the request: the upgraded HTTP/1.1 request
+     * becomes stream 1. Freeing it here would leave the callback a dangling
+     * pointer, so it owns the request instead. (Websocket switches free it
+     * themselves once their replacement parser is in place.) */
+    if (ctx->switch_to_protocol.fn == NULL) {
+        request_t* request = ctx->request;
+        if (request != NULL) {
+            request->free(request);
+            ctx->request = NULL;
+        }
     }
 
     response_t* response = ctx->response;
