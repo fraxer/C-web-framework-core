@@ -7,10 +7,11 @@
  * Returns 0 if valid, non-zero if the frame is malformed (caller maps to
  * H2PARSE_BAD_FRAME). RFC 9113 §8 checks. */
 static int h2frame_header_invalid(const h2frame_parser_t* p) {
-    /* Reserved bit (R) of the stream identifier MUST be 0 (RFC §4.1). It lives
-     * in the high bit of header[5]; stream_id is decoded with that bit masked
-     * off, so check the raw byte here. */
-    if (p->header[5] & 0x80) return 1;
+    /* The reserved bit (R) of the stream identifier is left undefined by
+     * RFC §4.1 and MUST be ignored when receiving — a sender may set it. It is
+     * masked off while decoding stream_id, which is all that is required; it is
+     * deliberately NOT an error (h2spec 4.1/3 sends a PING with the bit set and
+     * expects a normal PING ACK back). */
 
     /* Frame size limits (RFC §4.2). */
     if (p->length > p->max_frame_size) return 1;

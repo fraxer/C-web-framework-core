@@ -425,3 +425,55 @@ TEST(test_hpack_encoder_size_update_clamped_to_ceiling) {
     free(block);
     hpack_encoder_free(e);
 }
+
+/* RFC 7541 §4.2: a dynamic table size update may only appear at the very start
+ * of a header block. Accepting one later is a decoding error (h2spec HPACK
+ * 4.2/1) — and would leave the two tables disagreeing about evictions. */
+TEST(test_hpack_size_update_must_lead_block) {
+    TEST_CASE("a size update after a header field is a compression error");
+
+    hpack_decoder_t* d = hpack_decoder_create(4096);
+    TEST_REQUIRE(d != NULL, "decoder created");
+
+    /* 0x82 = indexed field (:method GET), then 0x20 = size update to 0. */
+    const uint8_t trailing[] = {0x82, 0x20};
+    hpack_header_t* out = NULL; size_t n = 0;
+    TEST_ASSERT_EQUAL(HPACK_ERR_COMPRESSION,
+                      hpack_decoder_decode(d, trailing, sizeof(trailing), &out, &n),
+                      "size update after a field is rejected");
+    hpack_headers_free(out, n);
+    hpack_decoder_free(d);
+
+    /* The same instructions in the legal order decode cleanly. */
+    d = hpack_decoder_create(4096);
+    TEST_REQUIRE(d != NULL, "decoder recreated");
+
+    const uint8_t leading[] = {0x20, 0x82};
+    out = NULL; n = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, leading, sizeof(leading), &out, &n),
+                      "size update before any field is accepted");
+    TEST_ASSERT_EQUAL(1, (int)n, "the indexed field still decodes");
+    TEST_ASSERT_EQUAL(0, (int)d->table.max, "table resized to 0");
+
+    hpack_headers_free(out, n);
+    hpack_decoder_free(d);
+}
+
+/* Several updates may lead a block (the RFC allows at most two); only a field
+ * in between makes them illegal. */
+TEST(test_hpack_consecutive_size_updates_allowed) {
+    TEST_CASE("back-to-back size updates at the head of a block are fine");
+
+    hpack_decoder_t* d = hpack_decoder_create(4096);
+    TEST_REQUIRE(d != NULL, "decoder created");
+
+    const uint8_t block[] = {0x20, 0x3f, 0xe1, 0x1f, 0x82}; /* →0, →4096, :method GET */
+    hpack_header_t* out = NULL; size_t n = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, block, sizeof(block), &out, &n),
+                      "two leading size updates accepted");
+    TEST_ASSERT_EQUAL(1, (int)n, "one header decoded");
+    TEST_ASSERT_EQUAL(4096, (int)d->table.max, "final size applied");
+
+    hpack_headers_free(out, n);
+    hpack_decoder_free(d);
+}

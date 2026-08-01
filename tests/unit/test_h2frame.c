@@ -225,17 +225,39 @@ static void expect_bad(const char* label, uint32_t len, uint8_t type, uint8_t fl
     free(buf);
 }
 
+/* RFC 9113 §4.1 leaves the reserved bit undefined and requires receivers to
+ * ignore it — rejecting the frame breaks senders that set it (h2spec 4.1/3). */
+TEST(test_h2frame_reserved_bit_ignored) {
+    TEST_CASE("reserved R bit is ignored, not rejected");
+
+    uint8_t buf[H2_FRAME_HEADER_LEN + 8];
+    put_header(buf, 8, H2_FRAME_PING, 0, 0);
+    buf[5] |= 0x80; /* set reserved R bit (put_header always clears it) */
+    memcpy(buf + H2_FRAME_HEADER_LEN, "12345678", 8);
+
+    frame_list_t out = {0};
+    const int n = feed_chunked(0, buf, sizeof(buf), 0, &out);
+
+    TEST_ASSERT_EQUAL(1, n, "frame accepted");
+    TEST_ASSERT_EQUAL(H2_FRAME_PING, out.f[0].type, "type decoded");
+    TEST_ASSERT_EQUAL(0, (int)out.f[0].stream_id, "reserved bit masked out of the stream id");
+
+    frame_list_free(&out);
+
+    /* Same for a stream frame: the id keeps its 31 bits, the R bit vanishes. */
+    uint8_t data[H2_FRAME_HEADER_LEN];
+    put_header(data, 0, H2_FRAME_DATA, 0, 1);
+    data[5] |= 0x80;
+
+    frame_list_t out2 = {0};
+    TEST_ASSERT_EQUAL(1, feed_chunked(0, data, sizeof(data), 0, &out2), "DATA accepted");
+    TEST_ASSERT_EQUAL(1, (int)out2.f[0].stream_id, "stream id unaffected");
+
+    frame_list_free(&out2);
+}
+
 TEST(test_h2frame_validation) {
     TEST_CASE("header-level rejections (§8)");
-    uint8_t bad_sid_hdr[H2_FRAME_HEADER_LEN];
-    put_header(bad_sid_hdr, 0, H2_FRAME_DATA, 0, 1);
-    bad_sid_hdr[5] |= 0x80; /* set reserved R bit (put_header always clears it) */
-    h2frame_parser_t p;
-    h2frame_parser_init(&p, 0, H2_MAX_FRAME_SIZE_DEFAULT);
-    const uint8_t* pp = bad_sid_hdr;
-    TEST_ASSERT_EQUAL(H2PARSE_BAD_FRAME, h2frame_parser_feed(&p, &pp, bad_sid_hdr + sizeof(bad_sid_hdr)),
-                      "reserved R bit set");
-    h2frame_parser_free(&p);
 
     expect_bad("DATA with stream id 0", 0, H2_FRAME_DATA, 0, 0);
     expect_bad("SETTINGS with stream id != 0", 0, H2_FRAME_SETTINGS, 0, 1);

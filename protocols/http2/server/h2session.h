@@ -21,6 +21,18 @@
 
 #define H2_DEFAULT_WINDOW 65535
 
+/* Stream lifecycle (RFC 9113 §5.1), trimmed to the states a server reaches for
+ * a client-initiated stream. Phase 3 tracks it for the single active stream;
+ * every other id is derived — above last_stream_id it is idle, at or below it
+ * is closed. Frames arriving in the wrong state are protocol errors, so this is
+ * not bookkeeping we can skip. */
+typedef enum {
+    H2_STREAM_IDLE = 0,
+    H2_STREAM_OPEN,               /* HEADERS received, END_STREAM not yet */
+    H2_STREAM_HALF_CLOSED_REMOTE, /* request complete, response still owed */
+    H2_STREAM_CLOSED,
+} h2_stream_state_e;
+
 typedef struct h2session {
     void (*free)(void*);            /* requestparser_t.base — must be first */
 
@@ -39,8 +51,15 @@ typedef struct h2session {
     /* Current stream (single in-flight for Phase 3). */
     uint32_t stream_id;         /* 0 = none */
     uint32_t last_stream_id;    /* highest stream id accepted, reported in GOAWAY */
+    h2_stream_state_e stream_state;
     size_t   req_body_len;      /* DATA bytes spooled into request->payload_.file */
+    /* Declared content-length, or -1 when the request carried none. RFC 9113
+     * §8.1.1 makes a mismatch with the DATA total a malformed request. */
+    int64_t  content_length;
     int      end_stream_sent;   /* the response already carried END_STREAM */
+
+    /* Error code to report in GOAWAY once a connection error is raised. */
+    uint32_t error_code;
 
     /* CONTINUATION accumulation (HEADERS without END_HEADERS + CONTINUATION*). */
     uint8_t* cont;
