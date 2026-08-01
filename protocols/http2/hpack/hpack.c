@@ -365,6 +365,9 @@ hpack_status_e hpack_decoder_decode(hpack_decoder_t* d,
     hpack_header_t* arr = NULL;
     size_t cnt = 0, cap = 0;
     hpack_status_e st = HPACK_OK;
+    /* RFC 7541 §4.2: dynamic table size updates MUST occur at the beginning of
+     * a header block, before any header field representation. */
+    int field_seen = 0;
 
     while (p < end) {
         uint8_t b = *p;
@@ -378,8 +381,10 @@ hpack_status_e hpack_decoder_decode(hpack_decoder_t* d,
             st = hpack_resolve_index(&d->table, idx, &name, &nl, &value, &vl);
             if (st) goto done;
             if (!out_push(&arr, &cnt, &cap, name, nl, value, vl)) { st = HPACK_ERR_MEMORY; goto done; }
+            field_seen = 1;
         } else if ((b & 0xe0) == 0x20) {
             /* Dynamic Table Size Update (§6.3) */
+            if (field_seen) { st = HPACK_ERR_COMPRESSION; goto done; }
             st = HPACK_OK;
             uint32_t new_max = hpack_decode_int(&p, end, 5, &st);
             if (st) goto done;
@@ -421,6 +426,8 @@ hpack_status_e hpack_decoder_decode(hpack_decoder_t* d,
             free(owned_name);
             free(value);
             if (st) goto done;
+
+            field_seen = 1;
         }
     }
 
