@@ -28,6 +28,13 @@ typedef struct connection {
     int(*close)(struct connection* connection);
     int(*read)(struct connection* connection);
     int(*write)(struct connection* connection);
+
+    /* Intrusive links in the owning worker's connection list (multiplexing.h
+     * mpxapi_t::conns). Maintained by the epoll layer on control_add/del, which
+     * both run on the worker thread that owns the epoll, so no lock is needed.
+     * The timer sweep walks this list to apply idle/PING/shutdown policy. */
+    struct connection* prev;
+    struct connection* next;
 } connection_t;
 
 void connection_reset(connection_t* connection);

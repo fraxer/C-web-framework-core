@@ -4,7 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
+#include <time.h>
 
 #include "appconfig.h"
 #include "connection_queue.h"
@@ -47,6 +49,43 @@
 /* Cap on a single header block (HEADERS + CONTINUATION*). Bounds the
  * CONTINUATION-flood attack noted in docs/http2/07. */
 #define H2_MAX_HEADER_BLOCK (1u << 20)
+
+/* ======================================================================= *
+ *  Lifecycle policy (Phase 5): idle timeout, PING watchdog
+ * ======================================================================= *
+ * Process-global, read once from config.json main.env (env_get_int). Seconds;
+ * 0 disables that check. Defaults: idle 120 s; PING watchdog off (a healthy
+ * connection needs no keep-alive traffic, and idle timeout already reaps silent
+ * peers). Operators enable PING to detect half-dead clients faster than the
+ * idle timeout on links where the server otherwise has nothing to send. */
+#define H2_DEFAULT_IDLE_TIMEOUT_SEC 120
+#define H2_DEFAULT_PING_ACK_TIMEOUT_SEC 15
+
+static uint32_t h2_idle_timeout_sec;
+static uint32_t h2_ping_interval_sec;
+static uint32_t h2_ping_ack_timeout_sec;
+static int h2_policy_loaded;
+
+static void h2_load_policy(void) {
+    if (h2_policy_loaded) return;
+    h2_policy_loaded = 1;
+
+    h2_idle_timeout_sec = (uint32_t)env_get_int("http2_idle_timeout_sec", H2_DEFAULT_IDLE_TIMEOUT_SEC);
+    h2_ping_interval_sec = (uint32_t)env_get_int("http2_ping_interval_sec", 0);
+    /* Default ack grace: the interval itself, capped so a stuck peer is caught
+     * in bounded time even with long intervals. */
+    uint32_t ack_default = h2_ping_interval_sec ? h2_ping_interval_sec : H2_DEFAULT_PING_ACK_TIMEOUT_SEC;
+    if (ack_default > H2_DEFAULT_PING_ACK_TIMEOUT_SEC) ack_default = H2_DEFAULT_PING_ACK_TIMEOUT_SEC;
+    h2_ping_ack_timeout_sec = (uint32_t)env_get_int("http2_ping_ack_timeout_sec", (int)ack_default);
+}
+
+/* CLOCK_MONOTONIC milliseconds — immune to wall-clock jumps, so deadlines never
+ * shift under NTP. */
+static uint64_t h2_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
 
 typedef enum {
     H2_FRAME_ERROR = 0,      /* connection error — GOAWAY(s->error_code) and close */
@@ -819,7 +858,12 @@ static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) 
 
     /* Reasons to reject the stream outright. The block is still decoded first,
      * to keep the connection-wide HPACK context usable for later streams. */
-    const int refused = !trailers && h2stream_active_count(s) >= H2_MAX_CONCURRENT_STREAMS;
+    const int refused = !trailers &&
+        (h2stream_active_count(s) >= H2_MAX_CONCURRENT_STREAMS ||
+         /* RFC 9113 §6.8: once GOAWAY(last_stream_id) is out, streams with a
+          * higher id are out of bounds. Streams at or below the boundary that
+          * the peer had in flight before seeing our GOAWAY are still served. */
+         (s->goaway_sent && frame->stream_id > s->last_stream_id));
     if (self_dependent || refused) {
         if (frame->flags & H2_FLAG_END_HEADERS) {
             const h2_request_status_e status = h2_discard_header_block(s, block, block_len);
@@ -928,7 +972,19 @@ static h2_frame_result_e h2_handle_frame(h2session_t* s, const h2_frame_t* frame
         return h2_on_settings(s, frame);
 
     case H2_FRAME_PING:
-        if (frame->flags & H2_FLAG_ACK) return H2_FRAME_OK;
+        if (frame->flags & H2_FLAG_ACK) {
+            /* An ACK for our watchdog PING: clear it and refresh the idle
+             * clock (hearing from the peer is activity). The opaque 8 bytes are
+             * echoed verbatim, so a mismatched ACK is simply ignored — only the
+             * one we actually sent retires the watchdog. */
+            if (s->ping_sent_ms != 0 &&
+                frame->payload_len == sizeof(s->ping_payload) &&
+                memcmp(frame->payload, s->ping_payload, sizeof(s->ping_payload)) == 0) {
+                s->ping_sent_ms = 0;
+            }
+            s->last_activity_ms = h2_now_ms();
+            return H2_FRAME_OK;
+        }
         if (!h2_session_queue_frame(s, H2_FRAME_PING, H2_FLAG_ACK, 0,
                                     frame->payload, frame->payload_len))
             return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
@@ -1048,6 +1104,11 @@ static int h2_read(connection_t* connection) {
 
         memcpy(s->read_buf + s->read_len, connection->buffer, (size_t)n);
         s->read_len += (size_t)n;
+
+        /* Any byte from the peer resets the idle/PING clocks (Phase 5). Writes
+         * deliberately do not: a server-side response must not mask a client
+         * that has gone silent. */
+        s->last_activity_ms = h2_now_ms();
 
         if (!h2_process_buffer(s)) return 0;
     }
@@ -1274,6 +1335,99 @@ int h2_server_guard_write(connection_t* connection) {
     return r;
 }
 
+/* ======================================================================= *
+ *  Lifecycle: idle timeout, PING watchdog, graceful shutdown (Phase 5)
+ * ======================================================================= */
+
+/* Process-wide, monotonically increasing. Makes every watchdog PING's opaque
+ * 8-byte payload unique so only its own ACK retires it. */
+static _Atomic uint64_t h2_ping_seq = 1;
+
+static void h2_send_watchdog_ping(h2session_t* s) {
+    uint64_t seq = atomic_fetch_add(&h2_ping_seq, 1);
+
+    uint8_t payload[8];
+    for (int i = 7; i >= 0; i--) {
+        payload[i] = (uint8_t)(seq & 0xff);
+        seq >>= 8;
+    }
+
+    memcpy(s->ping_payload, payload, sizeof payload);
+    s->ping_sent_ms = h2_now_ms();
+
+    (void)h2_session_queue_frame(s, H2_FRAME_PING, 0, 0, payload, sizeof payload);
+}
+
+/* Send GOAWAY(NO_ERROR) best-effort and close. Used for idle timeout, an
+ * unanswered watchdog PING, and the tail of the shutdown drain. The caller
+ * (h2_server_tick) already holds the connection lock, so the _locked close
+ * variant avoids re-entering the non-recursive spinlock. */
+static void h2_graceful_close_locked(h2session_t* s) {
+    h2_queue_goaway(s, H2_ERR_NO_ERROR);
+    (void)h2_flush_out(s);
+    connection_close_locked(s->connection);
+}
+
+void h2_server_tick(connection_t* connection, int shutdown_now) {
+    /* Owns the full lock lifecycle: a connection busy with a handler or I/O is
+     * skipped this tick and revisited on the next one. Every exit path releases
+     * the lock — either by closing (connection_close_locked frees/unlocks) or by
+     * the explicit unlock at the end — so the caller must not touch the
+     * connection afterwards (it may have been freed). */
+    if (!connection_s_trylock(connection)) return;
+
+    connection_server_ctx_t* ctx = connection->ctx;
+    h2session_t* s = ctx->parser;
+    const uint64_t now = h2_now_ms();
+
+    if (shutdown_now) {
+        /* Tell the peer we will accept no new streams, then let the ones in
+         * flight finish (the worker keeps servicing events between ticks). Once
+         * the table is empty the connection is torn down. h2_on_headers refuses
+         * streams with id > last_stream_id once goaway_sent is set. */
+        if (!s->goaway_sent) {
+            h2_queue_goaway(s, H2_ERR_NO_ERROR);
+            s->draining = 1;
+            (void)h2_flush_out(s);
+        }
+
+        if (s->draining && s->stream_count == 0) {
+            h2_graceful_close_locked(s);   /* releases the lock / frees */
+            return;
+        }
+
+        connection_s_unlock(connection);
+        return;
+    }
+
+    /* Idle timeout — only when nothing is in flight: a connection mid-request
+     * or mid-response is not idle even if the peer has gone quiet (the PING
+     * watchdog covers that case). */
+    if (h2_idle_timeout_sec != 0 && s->stream_count == 0 &&
+        now - s->last_activity_ms >= (uint64_t)h2_idle_timeout_sec * 1000u) {
+        h2_graceful_close_locked(s);
+        return;
+    }
+
+    if (h2_ping_interval_sec != 0) {
+        /* Probe a peer that has been silent for the interval, then wait for the
+         * ACK within its own (shorter) grace window. Only one PING outstanding. */
+        if (s->ping_sent_ms == 0) {
+            if (now - s->last_activity_ms >= (uint64_t)h2_ping_interval_sec * 1000u) {
+                h2_send_watchdog_ping(s);
+                (void)h2_flush_out(s);
+            }
+        }
+        else if (now - s->ping_sent_ms >= (uint64_t)h2_ping_ack_timeout_sec * 1000u) {
+            /* No ACK in time — the peer is gone. */
+            h2_graceful_close_locked(s);
+            return;
+        }
+    }
+
+    connection_s_unlock(connection);
+}
+
 /* Server connection preface (§3.4): SETTINGS must be the first frame we send. */
 static int h2_send_preface(h2session_t* s) {
     const uint8_t settings[] = {
@@ -1290,6 +1444,8 @@ static int h2_send_preface(h2session_t* s) {
 
 int h2_server_set_http2(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
+
+    h2_load_policy();
 
     h2session_t* s = calloc(1, sizeof(*s));
     if (s == NULL) return 0;
@@ -1311,6 +1467,7 @@ int h2_server_set_http2(connection_t* connection) {
     s->peer_header_table_size = 4096;
     s->send_window = H2_DEFAULT_WINDOW;
     s->error_code = H2_ERR_PROTOCOL_ERROR;
+    s->last_activity_ms = h2_now_ms();
 
     if (!h2_send_preface(s)) {
         h2_session_free(s);

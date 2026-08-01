@@ -86,6 +86,8 @@ connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, uns
     connection->close = NULL;
     connection->read = NULL;
     connection->write = NULL;
+    connection->prev = NULL;
+    connection->next = NULL;
 
     return connection;
 }
@@ -134,6 +136,17 @@ int connection_s_unlock(connection_t* connection) {
     atomic_store(&ctx->locked, 0);
 
     return 1;
+}
+
+/* Non-blocking trylock for the timer sweep: a connection currently busy with a
+ * handler or I/O is skipped this tick and revisited on the next one. */
+int connection_s_trylock(connection_t* connection) {
+    if (connection == NULL) return 0;
+
+    connection_server_ctx_t* ctx = connection->ctx;
+
+    _Bool expected = 0;
+    return atomic_compare_exchange_strong(&ctx->locked, &expected, 1);
 }
 
 void connection_s_inc(connection_t* connection) {
@@ -242,9 +255,15 @@ int connection_after_read(connection_t* connection) {
 }
 
 int connection_close(connection_t* connection) {
-    connection_server_ctx_t* ctx = connection->ctx;
-
     connection_s_lock(connection);
+    return connection_close_locked(connection);
+}
+
+/* The teardown work, assuming the caller already holds connection_s_lock(). The
+ * timer sweep and shutdown path take the lock themselves (via trylock/lock) and
+ * must not re-enter connection_s_lock(), which is a non-recursive spinlock. */
+int connection_close_locked(connection_t* connection) {
+    connection_server_ctx_t* ctx = connection->ctx;
 
     if (!ctx->listener->api->control_del(connection))
         log_error("Connection not removed from api\n");
