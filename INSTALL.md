@@ -186,6 +186,31 @@ and `migrations/` subdirectories with the compiled `.so` modules.
   deploy sanitized builds to production.
 * **RelWithDebInfo** — optimized build with debug information.
 
+#### Profiling memory under AddressSanitizer
+
+Always export `detect_stack_use_after_return=0` before measuring memory on a
+sanitized build:
+
+```bash
+ASAN_OPTIONS=detect_stack_use_after_return=0 ./exec/cwfr -c ../config.json
+```
+
+Recent AddressSanitizer runtimes enable use-after-return detection by default.
+It gives every thread a private *fake stack* region (~11 MB) and hands out
+frames round-robin, so its pages fault in gradually — a completely idle server
+shows a steady RSS climb of roughly 4.5 KB/s (~16 MB/h) that looks exactly like
+a leak. Growth is bounded by the fake-stack regions (≈11 MB per thread, plus
+1/8 for shadow memory), and Release builds are unaffected.
+
+Telling the artifact apart from a real leak:
+
+* `ASAN_OPTIONS=print_stats=1` reports **identical** malloc/free counters at
+  15 s and 150 s of idle — a real leak allocates.
+* LeakSanitizer stays silent at exit.
+* `strace -c` shows no new `mmap`/`brk`; only already-mapped anonymous regions
+  grow.
+* Setting `detect_stack_use_after_return=0` makes the growth disappear.
+
 ## 5. Running the tests
 
 Configure with tests enabled, build, then run through CTest:
