@@ -9,6 +9,7 @@
 #include "connection_s.h"
 #include "h2frame.h"
 #include "h2session.h"
+#include "h2stream.h"
 #include "hpack.h"
 #include "httprequest.h"
 #include "httpresponse.h"
@@ -169,7 +170,7 @@ static int __has_body(httprequest_t* request, httpresponse_t* response) {
 /* Build the HEADERS frame (plus CONTINUATION frames when the HPACK block
  * exceeds the peer's max frame size) into `out`. */
 static int __build_headers(httprequest_t* request, httpresponse_t* response,
-                           h2session_t* s, bufo_t* out) {
+                           h2session_t* s, h2stream_t* stream, bufo_t* out) {
     size_t count = 1; /* :status */
     size_t names_size = 0;
     for (http_header_t* h = response->header_; h != NULL; h = h->next) {
@@ -248,7 +249,7 @@ static int __build_headers(httprequest_t* request, httpresponse_t* response,
         if (i == 0 && !has_body) flags |= H2_FLAG_END_STREAM;
 
         const size_t got = h2frame_encode((uint8_t*)out->data + written, total - written,
-                                          type, flags, s->stream_id, block + off, chunk);
+                                          type, flags, stream->id, block + off, chunk);
         if (got == 0) {
             free(block);
             return 0;
@@ -264,7 +265,7 @@ static int __build_headers(httprequest_t* request, httpresponse_t* response,
     bufo_reset_pos(out);
 
     if (!has_body)
-        s->end_stream_sent = 1;
+        stream->end_stream_sent = 1;
 
     return 1;
 }
@@ -272,13 +273,14 @@ static int __build_headers(httprequest_t* request, httpresponse_t* response,
 static int __header(httprequest_t* request, httpresponse_t* response) {
     h2_module_write_t* module = response->cur_filter->module;
     h2session_t* s = h2_session_of(response->connection);
-    if (s == NULL) {
-        log_error("h2_write_filter: response is not on an HTTP/2 connection\n");
+    h2stream_t* stream = s != NULL ? h2stream_find_by_response(s, response) : NULL;
+    if (stream == NULL) {
+        log_error("h2_write_filter: no HTTP/2 stream owns this response\n");
         return CWF_ERROR;
     }
 
     if (module->buf->size == 0)
-        if (!__build_headers(request, response, s, module->buf))
+        if (!__build_headers(request, response, s, stream, module->buf))
             return CWF_ERROR;
 
     return __write_bufo(response, module->buf);
@@ -293,7 +295,8 @@ static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* pare
 
     h2_module_write_t* module = response->cur_filter->module;
     h2session_t* s = h2_session_of(response->connection);
-    if (s == NULL) return CWF_ERROR;
+    h2stream_t* stream = s != NULL ? h2stream_find_by_response(s, response) : NULL;
+    if (stream == NULL) return CWF_ERROR;
 
     module->base.parent_buf = parent_buf;
     if (parent_buf == NULL) return CWF_ERROR;
@@ -314,12 +317,13 @@ static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* pare
             if (chunk > s->peer_max_frame_size)
                 chunk = s->peer_max_frame_size;
 
-            const int64_t window = s->send_window < s->stream_send_window ?
-                s->send_window : s->stream_send_window;
+            const int64_t window = s->send_window < stream->send_window ?
+                s->send_window : stream->send_window;
             if (window <= 0) {
                 /* Nothing may be sent until the peer enlarges a window. Waiting
                  * on EPOLLOUT would spin: the socket is writable already. */
-                s->window_blocked = 1;
+                stream->window_blocked = 1;
+                if (s->send_window <= 0) s->window_blocked = 1;
                 response->event_again = 1;
                 return CWF_EVENT_AGAIN;
             }
@@ -331,7 +335,7 @@ static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* pare
             module->fh_pos = 0;
             module->fh_len = h2frame_encode_header(module->fh, H2_FRAME_DATA,
                                                    module->frame_end_stream ? H2_FLAG_END_STREAM : 0,
-                                                   s->stream_id, chunk);
+                                                   stream->id, chunk);
             if (module->fh_len == 0) return CWF_ERROR;
         }
 
@@ -360,11 +364,11 @@ static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* pare
             bufo_move_front_pos(parent_buf, (size_t)written);
             module->frame_remaining -= (size_t)written;
             s->send_window -= written;
-            s->stream_send_window -= written;
+            stream->send_window -= written;
         }
 
         if (module->frame_end_stream)
-            s->end_stream_sent = 1;
+            stream->end_stream_sent = 1;
 
         module->fh_len = 0;
         module->fh_pos = 0;

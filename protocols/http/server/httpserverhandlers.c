@@ -44,6 +44,7 @@ static int __sni_callback(SSL* ssl, int* ad, void* arg);
 static void* __queue_data_response_create(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter);
 static void __queue_data_response_free(void* arg);
 static int __post_response_default(connection_t* connection, int status_code);
+static int __handler_finished(connection_t* connection, httprequest_t* request, httpresponse_t* response);
 static int __post_response(httprequest_t* request, httpresponse_t* response);
 static int __post_deffered_response(httprequest_t* request, httpresponse_t* response);
 static ratelimiter_t* __ratelimiter_find(server_http_t* http_config, route_t* route);
@@ -273,6 +274,21 @@ int __deferred_handler(connection_t* connection, httprequest_t* request, httpres
     return 1;
 }
 
+/* A handler (or the inline dispatch path) has finished filling a response. h1.1
+ * has exactly one in flight and lets __write pick it up off the connection
+ * context; h2 must tell the owning stream, since the write path serves whichever
+ * streams are ready. */
+int __handler_finished(connection_t* connection, httprequest_t* request, httpresponse_t* response) {
+    connection_server_ctx_t* ctx = connection->ctx;
+
+    if (ctx->is_http2)
+        return h2_server_response_ready(connection, response);
+
+    (void)request;
+
+    return connection_after_read(connection);
+}
+
 int http_server_dispatch(connection_t* connection, httprequest_t* request) {
     return __handle(connection, request, __post_response);
 }
@@ -282,6 +298,12 @@ int __handle(connection_t* connection, httprequest_t* request, deferred_handler 
     httpresponse_t* response = conn_ctx->is_http2 ?
         httpresponse_create_h2(connection) : httpresponse_create(connection);
     if (response == NULL) return 0;
+
+    /* Under h2 the response belongs to a stream, not to the connection: bind it
+     * now so the write path and the write filter can reach it from the response
+     * alone, and so it is freed with the stream. */
+    if (conn_ctx->is_http2)
+        h2_server_attach_response(connection, request, response);
 
     switch (__apply_redirect(request, response, handler)) {
     case -1:
@@ -540,28 +562,32 @@ void __queue_request_handler(void* arg) {
         return;
     }
 
-    conn_ctx->request = data->request;
-    conn_ctx->response = data->response;
+    /* h2 keeps request and response on the stream: several may be in flight, so
+     * the single pair on the connection context would be clobbered. The item
+     * already carries the right pair either way. */
+    if (!conn_ctx->is_http2) {
+        conn_ctx->request = data->request;
+        conn_ctx->response = data->response;
+    }
 
     if (!ratelimiter_allow(data->ratelimiter, item->connection->remote_ip, 1)) {
-        httpresponse_t* response = conn_ctx->response;
-        if (response != NULL) {
-            httpresponse_default(response, 429);
-            response->add_header(response, "Retry-After", "1");
+        if (data->response != NULL) {
+            httpresponse_default(data->response, 429);
+            data->response->add_header(data->response, "Retry-After", "1");
         }
-        connection_after_read(item->connection);
+        __handler_finished(item->connection, data->request, data->response);
         return;
     }
 
     httpctx_t ctx;
-    httpctx_init(&ctx, conn_ctx->request, conn_ctx->response);
+    httpctx_init(&ctx, data->request, data->response);
 
     if (run_middlewares(conn_ctx->server->http.middleware, &ctx))
         item->handle(&ctx);
 
     httpctx_clear(&ctx);
 
-    connection_after_read(item->connection);
+    __handler_finished(item->connection, data->request, data->response);
 }
 
 void __queue_response_handler(void* arg) {
@@ -583,10 +609,12 @@ void __queue_response_handler(void* arg) {
         return;
     }
 
-    conn_ctx->request = data->request;
-    conn_ctx->response = data->response;
+    if (!conn_ctx->is_http2) {
+        conn_ctx->request = data->request;
+        conn_ctx->response = data->response;
+    }
 
-    connection_after_read(item->connection);
+    __handler_finished(item->connection, data->request, data->response);
 }
 
 int __run_header_filters(httprequest_t* request, httpresponse_t* response) {
@@ -840,6 +868,11 @@ int __post_response(httprequest_t* request, httpresponse_t* response) {
         log_error("__post_response: ctx is NULL\n");
         return 0;
     }
+
+    /* h2 responses are per-stream and may complete in any order, so there is no
+     * queue to wait behind — hand the response straight to the stream. */
+    if (ctx->is_http2)
+        return h2_server_response_ready(connection, response);
 
     if (cqueue_empty(ctx->queue)) {
         ctx->request = request;
