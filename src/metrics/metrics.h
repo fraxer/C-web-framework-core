@@ -48,6 +48,7 @@ typedef enum {
     LOCK_SITE_H2_READ,          /* h2_server_guard_read  — recv + frame parse + dispatch */
     LOCK_SITE_H2_WRITE,         /* h2_server_guard_write — framing + send */
     LOCK_SITE_H2_PUBLISH,       /* handler thread publishing an h2 response */
+    LOCK_SITE_H2_REARM,         /* handler thread re-arming epoll after pushing an h2 response */
     LOCK_SITE_HTTP_READ,        /* http_server_guard_read */
     LOCK_SITE_HTTP_WRITE,       /* http_server_guard_write */
     LOCK_SITE_HTTP_DISPATCH,    /* binding request/response before user code runs */
