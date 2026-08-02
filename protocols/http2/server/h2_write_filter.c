@@ -43,6 +43,7 @@ static void __reset(void* arg);
  *  Socket I/O (mirrors http_write_filter's __wr error handling)
  * ======================================================================= */
 
+/* Worker thread only — see the invariant on connection_data_write(). */
 static ssize_t __raw_write(connection_t* connection, const char* data, size_t size) {
     return connection->ssl ?
         openssl_write(connection->ssl, data, size) :

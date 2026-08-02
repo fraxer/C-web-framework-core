@@ -24,6 +24,12 @@ h2stream_t* h2stream_create(h2session_t* session, uint32_t id) {
         return NULL;
     }
 
+    /* calloc already zeroed the storage, but an atomic wants an explicit
+     * initialisation to have a well-defined value to the memory model. */
+    atomic_init(&stream->handler_pending, 0);
+    atomic_init(&stream->response_ready, 0);
+    atomic_init(&stream->cancelled, 0);
+
     stream->id = id;
     stream->state = H2_STREAM_OPEN;
     stream->send_window = session->peer_initial_window;
@@ -67,9 +73,9 @@ void h2stream_close(h2session_t* session, h2stream_t* stream) {
     /* A handler thread is about to touch this request/response, or is touching
      * it right now. Keep the stream alive and let the post-handler hook free it;
      * unlinking here would leave the queued item holding dangling pointers. */
-    if (stream->handler_pending) {
+    if (atomic_load_explicit(&stream->handler_pending, memory_order_acquire)) {
         stream->state = H2_STREAM_CLOSED;
-        stream->cancelled = 1;
+        atomic_store_explicit(&stream->cancelled, 1, memory_order_release);
         return;
     }
 

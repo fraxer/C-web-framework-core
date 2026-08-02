@@ -961,7 +961,7 @@ int __post_response(httprequest_t* request, httpresponse_t* response) {
     if (cqueue_empty(ctx->queue)) {
         ctx->request = request;
         ctx->response = response;
-        ctx->need_write = 1;
+        atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
         return connection_after_read(connection);
     }
 

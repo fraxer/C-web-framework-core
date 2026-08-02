@@ -1,6 +1,7 @@
 #ifndef __H2STREAM__
 #define __H2STREAM__
 
+#include <stdatomic.h>
 #include <stdint.h>
 
 #include "httprequest.h"
@@ -9,13 +10,21 @@
 /* One HTTP/2 stream (RFC 9113 §5). Phase 4 keeps several of these alive at once
  * on a connection; the session owns the table.
  *
- * Concurrency: every field is touched only while connection_s_lock() is held.
- * That covers all three visitors — the worker's read path, its write path, and
- * a handler thread (connection_queue_guard_pop hands the connection over with
- * the lock already taken and holds it for the whole handler run). So the fields
- * below need no atomics, and a stream cannot be destroyed underneath a handler.
- * The one thing that ordering does NOT rule out is a RST_STREAM arriving while
- * a handler is still queued, which is what `cancelled` is for. */
+ * Concurrency: three visitors touch a stream — the worker's read path, its write
+ * path, and a handler thread. Today connection_s_lock() serialises all three
+ * (connection_queue_guard_pop hands the connection over already locked and holds
+ * it for the whole handler run), so a stream cannot be destroyed underneath a
+ * handler. The plain fields below rely on that.
+ *
+ * The three flags on the handler/worker seam are atomic anyway
+ * (docs/concurrency/00, phase A): they are the handshake that survives the lock
+ * being narrowed, and keeping them in a bitfield would make every write to a
+ * neighbouring flag a read-modify-write of them too. The publication itself —
+ * handler fills the response, then announces it — is a release store paired with
+ * an acquire load on the write path; without that pairing the worker may see
+ * `response_ready` before the body that it announces. What none of this rules
+ * out is a RST_STREAM arriving while a handler is still queued, which is what
+ * `cancelled` is for. */
 
 /* Receive-side flow-control state of one flow — a stream, or the connection
  * itself (RFC 9113 §6.9). Shared shape so one tuner serves both; see
@@ -59,9 +68,12 @@ typedef struct h2stream {
      * the frame that empties it overshoots, and the deficit is not carried. */
     int64_t write_credit;
 
-    unsigned handler_pending : 1; /* queued for, or running in, a handler thread */
-    unsigned response_ready  : 1; /* handler returned; the response may be sent */
-    unsigned cancelled       : 1; /* reset by the peer — discard the response */
+    /* The handler/worker seam — atomic, see the note at the top of the file. */
+    atomic_bool handler_pending; /* queued for, or running in, a handler thread */
+    atomic_bool response_ready;  /* handler returned; the response may be sent */
+    atomic_bool cancelled;       /* reset by the peer — discard the response */
+
+    /* Worker-only, both paths under the connection lock. */
     unsigned headers_done    : 1; /* the request header block is complete */
     unsigned end_stream_sent : 1; /* the response already carried END_STREAM */
     unsigned window_blocked  : 1; /* body stalled waiting on a WINDOW_UPDATE */

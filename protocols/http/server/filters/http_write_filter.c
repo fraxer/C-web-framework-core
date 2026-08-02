@@ -11,6 +11,7 @@
 void http_write_free(void* arg);
 void http_write_reset(void* arg);
 
+/* Worker thread only — see the invariant on connection_data_write(). */
 ssize_t __write(connection_t* connection, const char* data, size_t size) {
     return connection->ssl ?
         openssl_write(connection->ssl, data, size) :
