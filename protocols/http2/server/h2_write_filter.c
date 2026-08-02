@@ -313,6 +313,19 @@ static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* pare
             if (remaining == 0)
                 return CWF_DATA_AGAIN;
 
+            /* Quantum spent, and we are between frames — hand the socket back so
+             * the other streams on this connection get a turn. Only ever here:
+             * yielding mid-frame would splice another stream's bytes into ours,
+             * and yielding during the header phase would let a second stream
+             * encode a header block while this one's is still unsent, which
+             * desyncs the peer's HPACK decoder (blocks must arrive in the order
+             * they were encoded, RFC 9113 §4.3). */
+            if (stream->write_credit <= 0) {
+                stream->yielded = 1;
+                response->event_again = 1;
+                return CWF_EVENT_AGAIN;
+            }
+
             size_t chunk = remaining;
             if (chunk > s->peer_max_frame_size)
                 chunk = s->peer_max_frame_size;
@@ -365,6 +378,7 @@ static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* pare
             module->frame_remaining -= (size_t)written;
             s->send_window -= written;
             stream->send_window -= written;
+            stream->write_credit -= written;
         }
 
         if (module->frame_end_stream)

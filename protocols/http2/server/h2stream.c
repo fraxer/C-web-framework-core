@@ -4,9 +4,15 @@
 
 #include "h2session.h"
 
-/* The table is a plain singly-linked list. SETTINGS_MAX_CONCURRENT_STREAMS caps
- * it at a low hundred, so a linear scan costs far less than the hashing plus key
- * allocation a map would need, and there is nothing to keep in sync. */
+/* The table is a plain singly-linked list, kept in arrival order with a tail
+ * pointer. SETTINGS_MAX_CONCURRENT_STREAMS caps it at a low hundred, so a linear
+ * scan costs far less than the hashing plus key allocation a map would need, and
+ * there is nothing to keep in sync.
+ *
+ * The order is not incidental: the write path walks the table front to back and
+ * the scheduler rotates a stream to the tail when it stops short, so list
+ * position *is* the round-robin cursor. Anything that unlinks a stream must keep
+ * `streams_tail` correct or the rotation quietly turns back into a stack. */
 
 h2stream_t* h2stream_create(h2session_t* session, uint32_t id) {
     h2stream_t* stream = calloc(1, sizeof(*stream));
@@ -24,8 +30,9 @@ h2stream_t* h2stream_create(h2session_t* session, uint32_t id) {
     stream->recv.size = session->stream_recv_learned;
     stream->content_length = -1;
 
-    stream->next = session->streams;
-    session->streams = stream;
+    if (session->streams_tail != NULL) session->streams_tail->next = stream;
+    else session->streams = stream;
+    session->streams_tail = stream;
     session->stream_count++;
 
     return stream;
@@ -66,15 +73,36 @@ void h2stream_close(h2session_t* session, h2stream_t* stream) {
         return;
     }
 
+    h2stream_t*  prev = NULL;
     h2stream_t** link = &session->streams;
-    while (*link != NULL && *link != stream) link = &(*link)->next;
+    while (*link != NULL && *link != stream) {
+        prev = *link;
+        link = &(*link)->next;
+    }
 
     if (*link == stream) {
         *link = stream->next;
+        if (session->streams_tail == stream) session->streams_tail = prev;
         session->stream_count--;
     }
 
     h2stream_destroy(stream);
+}
+
+void h2stream_rotate(h2session_t* session, h2stream_t* stream) {
+    if (stream == NULL || session->streams_tail == stream) return;
+
+    h2stream_t** link = &session->streams;
+    while (*link != NULL && *link != stream) link = &(*link)->next;
+    if (*link != stream) return; /* already off the table */
+
+    *link = stream->next;
+    stream->next = NULL;
+
+    /* streams_tail is non-NULL here: the table still holds whatever was tail,
+     * since it is not this stream. */
+    session->streams_tail->next = stream;
+    session->streams_tail = stream;
 }
 
 void h2stream_free_all(h2session_t* session) {
@@ -87,6 +115,7 @@ void h2stream_free_all(h2session_t* session) {
     }
 
     session->streams = NULL;
+    session->streams_tail = NULL;
     session->stream_count = 0;
 }
 

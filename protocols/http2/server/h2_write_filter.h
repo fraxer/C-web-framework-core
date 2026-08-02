@@ -10,7 +10,10 @@
  * when it exceeds the peer's max frame size) followed by DATA frames carrying
  * whatever the upstream stages (range, data, gzip) produced. Send-side flow
  * control is honoured here: the body is chopped to the smaller of the peer's
- * max frame size and the connection/stream send windows.
+ * max frame size and the connection/stream send windows. So is the scheduler's
+ * write quantum — once a stream has spent it, this stage stops at the next DATA
+ * frame boundary and reports CWF_EVENT_AGAIN, which is how a large response is
+ * kept from monopolising the connection.
  *
  * Every earlier stage is shared with HTTP/1.1 verbatim — this is the only
  * protocol-specific stage. */
