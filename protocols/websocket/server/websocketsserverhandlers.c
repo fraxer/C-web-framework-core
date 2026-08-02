@@ -138,7 +138,7 @@ void __out_finish_current(connection_t* connection) {
 int __out_publish(connection_t* connection, connection_out_slot_t* slot, websocketsresponse_t* response) {
     connection_server_ctx_t* ctx = connection->ctx;
 
-    connection_s_lock(connection);
+    connection_s_lock(connection, LOCK_SITE_WS_PUBLISH);
 
     slot->response = &response->base;
 
@@ -166,7 +166,7 @@ int __out_publish(connection_t* connection, connection_out_slot_t* slot, websock
 int websockets_response_post(websocketsresponse_t* response) {
     connection_t* connection = response->connection;
 
-    connection_s_lock(connection);
+    connection_s_lock(connection, LOCK_SITE_WS_RESERVE);
     connection_out_slot_t* slot = __out_reserve(connection);
     connection_s_unlock(connection);
 
@@ -179,7 +179,7 @@ int websockets_response_post(websocketsresponse_t* response) {
 }
 
 int websockets_guard_read(connection_t* connection) {
-    connection_s_lock(connection);
+    connection_s_lock(connection, LOCK_SITE_WS_READ);
     const int r = __read(connection);
     connection_s_unlock(connection);
 
@@ -187,7 +187,7 @@ int websockets_guard_read(connection_t* connection) {
 }
 
 int websockets_guard_write(connection_t* connection) {
-    connection_s_lock(connection);
+    connection_s_lock(connection, LOCK_SITE_WS_WRITE);
     const int r = __write(connection);
     connection_s_unlock(connection);
 
@@ -427,7 +427,7 @@ void websockets_queue_request_handler(void* arg) {
         connection_server_ctx_t* conn_ctx = connection->ctx;
         atomic_store(&conn_ctx->destroyed, 1);
 
-        connection_s_lock(connection);
+        connection_s_lock(connection, LOCK_SITE_WS_PUBLISH);
         connection_after_read(connection);
         connection_s_unlock(connection);
         return;

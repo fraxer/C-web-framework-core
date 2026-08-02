@@ -347,7 +347,7 @@ void __broadcast_queue_request_handler(void* arg) {
         // TODO: close connection, return error
         atomic_store(&conn_ctx->destroyed, 1);
 
-        connection_s_lock(connection);
+        connection_s_lock(connection, LOCK_SITE_BROADCAST);
         connection_after_read(connection);
         connection_s_unlock(connection);
         return;

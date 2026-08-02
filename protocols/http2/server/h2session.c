@@ -1601,7 +1601,7 @@ int h2_server_response_ready(connection_t* connection, httpresponse_t* response)
  * ======================================================================= */
 
 int h2_server_guard_read(connection_t* connection) {
-    connection_s_lock(connection);
+    connection_s_lock(connection, LOCK_SITE_H2_READ);
     const int r = h2_read(connection);
     connection_s_unlock(connection);
 
@@ -1611,7 +1611,7 @@ int h2_server_guard_read(connection_t* connection) {
 int h2_server_guard_write(connection_t* connection) {
     if (connection == NULL) return 0;
 
-    connection_s_lock(connection);
+    connection_s_lock(connection, LOCK_SITE_H2_WRITE);
     const int r = h2_write(connection);
     connection_s_unlock(connection);
 

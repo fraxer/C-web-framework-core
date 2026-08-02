@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 
 #include "connection.h"
+#include "metrics.h"
 #include "multiplexingserver.h"
 #include "server.h"
 #include "request.h"
@@ -82,6 +83,12 @@ typedef struct {
      * reaped. */
     atomic_bool detached;
     atomic_bool locked;
+    /* Call site of the current holder of `locked`, for the lock metrics only
+     * (docs/concurrency/01 §6, phase A): a waiter samples it to report what it
+     * is waiting behind. Written only while metrics are on, and never read for
+     * anything the connection does — a stale or torn value costs a misattributed
+     * statistic, nothing more. */
+    atomic_int lock_site;
     /* How many handlers of this connection are running right now. Maintained by
      * thread_handler and read by nothing else — it exists so the metrics can
      * answer "did the fan-out actually fan out on THIS connection", which a
@@ -137,7 +144,11 @@ connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, uns
 connection_t* connection_s_create_local(server_t* server);
 void connection_s_free_local(connection_t* connection);
 
-int connection_s_lock(connection_t*);
+/* `site` tags the acquisition for the lock metrics (docs/concurrency/01 §6,
+ * phase A) and has no effect on locking itself. It is mandatory so that a new
+ * call site is a decision rather than an omission; LOCK_SITE_OTHER is the honest
+ * answer where the path has not been classified. */
+int connection_s_lock(connection_t*, metrics_lock_site_t site);
 int connection_s_trylock(connection_t*);
 int connection_s_unlock(connection_t*);
 void connection_s_inc(connection_t*);

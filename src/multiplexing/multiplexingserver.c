@@ -70,7 +70,7 @@ int __listener_connection_close(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
     listener_t* listener = ctx->listener;
 
-    connection_s_lock(connection);
+    connection_s_lock(connection, LOCK_SITE_CLOSE);
 
     // Отсоединяем соединение от listener до освобождения: цикл может закрыть
     // listener-сокет напрямую (config_shutdown/ошибка сокета), и без отсоединения

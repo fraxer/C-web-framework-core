@@ -109,7 +109,7 @@ int set_http(connection_t* connection) {
 }
 
 int http_server_guard_read(connection_t* connection) {
-    connection_s_lock(connection);
+    connection_s_lock(connection, LOCK_SITE_HTTP_READ);
     const int r = __read(connection);
     connection_s_unlock(connection);
 
@@ -122,7 +122,7 @@ int http_server_guard_write(connection_t* connection) {
         return 0;
     }
 
-    connection_s_lock(connection);
+    connection_s_lock(connection, LOCK_SITE_HTTP_WRITE);
     const int r = __write(connection);
     connection_s_unlock(connection);
 
@@ -380,6 +380,14 @@ int __deferred_handler(connection_t* connection, httprequest_t* request, httpres
     }
 
     return 1;
+}
+
+/* Publication runs through the same code for both protocols, but the two are
+ * measured apart: docs/concurrency/01 accepts phase B on the h2 publish tag
+ * specifically, and h1.1 — one request in flight — has nothing to contend with
+ * there. Hence a runtime tag instead of a constant one. */
+static metrics_lock_site_t __publish_site(connection_server_ctx_t* ctx) {
+    return ctx->is_http2 ? LOCK_SITE_H2_PUBLISH : LOCK_SITE_HTTP_PUBLISH;
 }
 
 /* A handler (or the inline dispatch path) has finished filling a response. h1.1
@@ -678,7 +686,7 @@ void __queue_request_handler(void* arg) {
      * this same connection — for h2 that is the point of the exercise; for h1.1
      * it cannot happen anyway, since only one item at a time is ever dispatched
      * (connection_queue_append, the serialized variant). */
-    connection_s_lock(item->connection);
+    connection_s_lock(item->connection, LOCK_SITE_HTTP_DISPATCH);
 
     /* h2 keeps request and response on the stream: several may be in flight, so
      * the single pair on the connection context would be clobbered. The item
@@ -696,7 +704,7 @@ void __queue_request_handler(void* arg) {
             data->response->add_header(data->response, "Retry-After", "1");
         }
 
-        connection_s_lock(item->connection);
+        connection_s_lock(item->connection, __publish_site(conn_ctx));
         __handler_finished(item->connection, data->request, data->response);
         connection_s_unlock(item->connection);
         return;
@@ -713,7 +721,7 @@ void __queue_request_handler(void* arg) {
 
     /* Publishing the response walks the session's stream table and re-arms
      * epoll, so it goes back under the lock. */
-    connection_s_lock(item->connection);
+    connection_s_lock(item->connection, __publish_site(conn_ctx));
     __handler_finished(item->connection, data->request, data->response);
     connection_s_unlock(item->connection);
 }
@@ -739,7 +747,7 @@ void __queue_response_handler(void* arg) {
 
     /* No user code here — the response is already built (a static file, or a
      * handler that finished earlier), so the whole runner stays under the lock. */
-    connection_s_lock(item->connection);
+    connection_s_lock(item->connection, __publish_site(conn_ctx));
 
     if (!conn_ctx->is_http2) {
         conn_ctx->request = data->request;
