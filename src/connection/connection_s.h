@@ -51,10 +51,25 @@ typedef struct {
     atomic_int broadcast_ref_count;
     atomic_bool destroyed;
     atomic_bool locked;
-    unsigned need_write: 1;
+    /* A response is staged and needs an EPOLLOUT turn. Atomic, and deliberately
+     * not a bitfield: it is set by whichever thread finished the response
+     * (a handler thread, via __post_response / h2_server_response_ready) and
+     * read by the worker in the event loop *outside* connection_s_lock
+     * (multiplexingepoll.c). Sharing a machine word with the bitfields below
+     * would make every write to them a read-modify-write of this flag too.
+     * Store with release / load with acquire: seeing the flag must imply seeing
+     * the response it announces. */
+    atomic_bool need_write;
     /* The connection speaks HTTP/2: ctx->parser is an h2session_t and responses
      * must be built with the h2 filter chain (frames instead of a status line +
-     * chunked encoding). Set by h2_server_set_http2. */
+     * chunked encoding). Set by h2_server_set_http2.
+     *
+     * Handler threads read this, so it crosses the thread boundary — but it is
+     * only ever written before the first handler on the connection can run: at
+     * ALPN time, or from connection_after_write on the h2c upgrade path, where
+     * h1.1 guarantees no handler is in flight. Once set it never clears. That
+     * write-once ordering is what makes a plain bitfield safe here; anything
+     * that starts flipping it later must move it out of the word. */
     unsigned is_http2: 1;
     /* Plaintext connection whose first bytes have not yet been inspected for the
      * h2c connection preface (RFC 9113 §3.4). Set once at plaintext accept;

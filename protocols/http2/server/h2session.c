@@ -820,10 +820,10 @@ static h2_frame_result_e h2_dispatch(h2session_t* s, h2stream_t* stream) {
     /* The handler may run on another thread, or inline on this one for a static
      * file. Either way the stream must survive until it reports back, so a
      * RST_STREAM arriving meanwhile only marks it cancelled. */
-    stream->handler_pending = 1;
+    atomic_store_explicit(&stream->handler_pending, 1, memory_order_release);
 
     if (!http_server_dispatch(s->connection, stream->request)) {
-        stream->handler_pending = 0;
+        atomic_store_explicit(&stream->handler_pending, 0, memory_order_release);
         return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
     }
 
@@ -1275,7 +1275,7 @@ static int h2_process_buffer(h2session_t* s) {
 /* A stream is waiting for the write path. */
 static int h2_has_writable(const h2session_t* s) {
     for (const h2stream_t* stream = s->streams; stream != NULL; stream = stream->next)
-        if (stream->response_ready) return 1;
+        if (atomic_load_explicit(&stream->response_ready, memory_order_acquire)) return 1;
 
     return 0;
 }
@@ -1312,7 +1312,7 @@ static int h2_drain_and_rearm(h2session_t* s, connection_t* connection) {
     /* Anything left to write — pending frames, or a response that the frames we
      * just consumed unblocked — needs an EPOLLOUT turn. */
     if (s->out_len > s->out_pos || h2_has_writable(s)) {
-        ctx->need_write = 1;
+        atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
         return rearm(connection, MPXOUT | MPXRDHUP);
     }
 
@@ -1449,7 +1449,7 @@ static int h2_write(connection_t* connection) {
         case H2_WRITE_SOCKET:
             /* Still mid-frame: nobody else may touch the socket. */
             if (h2_flush_out(s) == 0) return 0;
-            ctx->need_write = 1;
+            atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
             return rearm(connection, MPXOUT | MPXRDHUP);
         case H2_WRITE_WINDOW:
         case H2_WRITE_YIELD:
@@ -1473,7 +1473,8 @@ static int h2_write(connection_t* connection) {
     while (stream != NULL) {
         h2stream_t* next = stream->next;
 
-        if (stream->served || !stream->response_ready || stream->response == NULL) {
+        if (stream->served || stream->response == NULL ||
+            !atomic_load_explicit(&stream->response_ready, memory_order_acquire)) {
             stream = next;
             continue;
         }
@@ -1509,21 +1510,21 @@ static int h2_write(connection_t* connection) {
     if (h2_flush_out(s) == 0) return 0;
 
     if (socket_full || s->out_len > s->out_pos) {
-        ctx->need_write = 1;
+        atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
         return rearm(connection, MPXOUT | MPXRDHUP);
     }
 
     /* Somebody spent their quantum with body left over: the socket still has
      * room, so come straight back for the next round. */
     if (yielded) {
-        ctx->need_write = 1;
+        atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
         return rearm(connection, MPXOUT | MPXRDHUP);
     }
 
     /* Every stream that could make progress has; the rest wait on a
      * WINDOW_UPDATE, which arrives on the read path. */
     if (window_stalled) {
-        ctx->need_write = 1;
+        atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
         return rearm(connection, MPXIN | MPXRDHUP);
     }
 
@@ -1568,15 +1569,18 @@ int h2_server_response_ready(connection_t* connection, httpresponse_t* response)
         return connection_after_read(connection);
     }
 
-    stream->handler_pending = 0;
+    atomic_store_explicit(&stream->handler_pending, 0, memory_order_release);
 
-    if (stream->cancelled) {
+    if (atomic_load_explicit(&stream->cancelled, memory_order_acquire)) {
         h2_session_drop_stream(s, stream);
         return connection_after_read(connection);
     }
 
-    stream->response_ready = 1;
-    ctx->need_write = 1;
+    /* The publication (docs/concurrency/00 §4.2): release-store so that the
+     * write path, which loads this with acquire, cannot observe the flag
+     * before the response body and headers the handler just wrote. */
+    atomic_store_explicit(&stream->response_ready, 1, memory_order_release);
+    atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
 
     /* More handlers are queued for this connection. Hand the worker slot on so
      * they run without waiting for this response to reach the socket — the

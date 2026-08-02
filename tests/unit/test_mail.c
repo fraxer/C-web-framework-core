@@ -401,10 +401,21 @@ TEST(test_mail_set_content_replaces_previous) {
     TEST_REQUIRE_NOT_NULL(m, "mail_create should succeed");
 
     TEST_ASSERT_EQUAL(1, __mail_set_content(m, "first body"), "first set");
-    char* first = m->data;
     TEST_ASSERT_EQUAL(1, __mail_set_content(m, "second body, longer"), "second set");
-    /* ASan's leak detector catches a double allocation that was never freed. */
-    TEST_ASSERT(m->data != first, "buffer replaced");
+
+    /* That the *old* buffer is gone is the leak detector's job (ASan/LSan), not
+     * an assertion we can make here: comparing the new pointer against the freed
+     * one reads a dangling value and assumes the allocator will not hand the
+     * same address back — which it does under TSan's allocator. What is
+     * actually guaranteed is that the second body replaced the first. */
+    const char* expected = "second body, longer";
+    char* plain = malloc(strlen(expected) + 4);
+    TEST_REQUIRE_NOT_NULL(plain, "decode buffer");
+
+    const int n = base64_decode(plain, m->data);
+    plain[n > 0 ? n : 0] = '\0';
+    TEST_ASSERT_STR_EQUAL(expected, plain, "buffer holds the second body");
+    free(plain);
 
     __mail_free(m);
 }

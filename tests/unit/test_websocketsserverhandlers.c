@@ -108,7 +108,7 @@ static void safe_close(int* fd) {
 static void wsh_ctx_reset(void* arg) {
     connection_server_ctx_t* ctx = arg;
 
-    ctx->need_write = 0;
+    atomic_store(&ctx->need_write, 0);
 
     request_t* request = ctx->request;
     if (request != NULL) {
@@ -650,7 +650,7 @@ TEST(test_wsh_read_ping_stages_pong) {
 
     TEST_ASSERT_EQUAL(1, websockets_guard_read(h.conn), "read keeps the connection");
     TEST_ASSERT_NOT_NULL(h.ctx.response, "pong staged for writing");
-    TEST_ASSERT_EQUAL(1, h.ctx.need_write, "need_write raised for the same epoll iteration");
+    TEST_ASSERT_EQUAL(1, atomic_load(&h.ctx.need_write), "need_write raised for the same epoll iteration");
     TEST_ASSERT(stub_control_mod_last_events == (MPXOUT | MPXRDHUP), "armed for writing");
 
     TEST_ASSERT_EQUAL(1, websockets_guard_write(h.conn), "pong written");

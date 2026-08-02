@@ -1,5 +1,6 @@
 #include <unistd.h>
 #include <errno.h>
+#include <sched.h>
 
 #include "log.h"
 #include "openssl.h"
@@ -113,19 +114,51 @@ void connection_s_free_local(connection_t* connection) {
     free(connection);
 }
 
+/* Hint to the core that it is in a spin-wait: on x86 PAUSE drains the pipeline
+ * and cuts the memory-order-violation penalty on lock release, on ARM YIELD
+ * hands the SMT sibling a turn. A no-op elsewhere — correctness never depends
+ * on it. */
+static inline void __cpu_relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield" ::: "memory");
+#endif
+}
+
+/* How long to spin before handing the CPU to the scheduler. The lock protects
+ * short state updates, so the holder normally releases within a few hundred
+ * cycles and spinning wins; anything longer means the holder was preempted (or
+ * is running a handler, which is what docs/concurrency/00 is about), and then
+ * burning a core is pure waste. */
+#define CONNECTION_LOCK_SPINS 128
+
 int connection_s_lock(connection_t* connection) {
     if (connection == NULL) return 0;
 
     connection_server_ctx_t* ctx = connection->ctx;
 
-    _Bool expected = 0;
-    _Bool desired = 1;
+    unsigned spins = 0;
 
-    do {
-        expected = 0;
-    } while (!atomic_compare_exchange_strong(&ctx->locked, &expected, desired));
+    for (;;) {
+        _Bool expected = 0;
+        if (atomic_compare_exchange_weak(&ctx->locked, &expected, 1))
+            return 1;
 
-    return 1;
+        /* Re-test with a plain load before trying the CAS again: the CAS writes
+         * to the cache line whether or not it succeeds, so a crowd of waiters
+         * looping on it ping-pongs the line between cores and starves the
+         * holder. Reading a shared line costs nothing by comparison. */
+        while (atomic_load_explicit(&ctx->locked, memory_order_relaxed)) {
+            if (++spins < CONNECTION_LOCK_SPINS) {
+                __cpu_relax();
+                continue;
+            }
+
+            spins = 0;
+            sched_yield();
+        }
+    }
 }
 
 int connection_s_unlock(connection_t* connection) {
@@ -291,7 +324,7 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
 
     ctx->base.reset = __ctx_reset;
     ctx->base.free = __ctx_free;
-    ctx->need_write = 0;
+    atomic_store(&ctx->need_write, 0);
     ctx->is_http2 = 0;
     ctx->h2c_preface = 0;
     ctx->h2c_peeked = 0;
@@ -329,7 +362,7 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
 void __ctx_reset(void* arg) {
     connection_server_ctx_t* ctx = arg;
 
-    ctx->need_write = 0;
+    atomic_store_explicit(&ctx->need_write, 0, memory_order_relaxed);
 
     /* When a protocol switch is pending (h2c Upgrade — see connection_after_write),
      * the switch callback adopts the request: the upgraded HTTP/1.1 request

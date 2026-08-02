@@ -206,7 +206,10 @@ void __mpx_epoll_process_events(appconfig_t* appconfig, void* arg) {
             if (!connection->read(connection))
                 goto close;
 
-        if ((ev->events & EPOLLOUT || ctx->need_write) && connection->write != NULL)
+        /* Acquire: a handler thread set need_write after filling the response,
+         * and everything it wrote must be visible here before write() reads it. */
+        if ((ev->events & EPOLLOUT || atomic_load_explicit(&ctx->need_write, memory_order_acquire))
+            && connection->write != NULL)
             if (!connection->write(connection))
                 goto close;
 
