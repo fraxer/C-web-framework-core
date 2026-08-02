@@ -46,8 +46,10 @@ typedef struct h2session {
     hpack_decoder_t* decoder;
     hpack_encoder_t* encoder;
 
-    /* Stream table (see h2stream.c) and the ids bounding it. */
+    /* Stream table (see h2stream.c) and the ids bounding it. Kept in arrival
+     * order; the tail pointer makes append and the scheduler's rotate O(1). */
     h2stream_t* streams;
+    h2stream_t* streams_tail;
     size_t      stream_count;
     uint32_t    last_stream_id; /* highest id accepted, reported in GOAWAY */
 
@@ -81,7 +83,11 @@ typedef struct h2session {
 
     /* The stream that stopped mid-frame and must finish before any other may
      * use the socket — otherwise its bytes would be spliced into an unfinished
-     * DATA frame. NULL when no frame is in progress. */
+     * DATA frame. NULL when no frame is in progress.
+     *
+     * "Mid-frame" is meant literally: a stream that stops on a frame boundary
+     * (out of window, or out of write quantum) does NOT get pinned here, because
+     * letting somebody else write is exactly the point. See h2_write(). */
     h2stream_t* writing;
 
     /* Pending outbound frames that did not fit the socket (control frames, the

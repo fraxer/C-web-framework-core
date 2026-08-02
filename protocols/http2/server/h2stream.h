@@ -53,20 +53,30 @@ typedef struct h2stream {
     size_t  req_body_len;   /* DATA bytes spooled into request->payload_.file */
     int64_t content_length; /* declared, or -1 when the request carried none */
 
+    /* Scheduling: bytes this stream may still put on the wire during the current
+     * write turn. Refilled per turn by the write path, spent by the write filter,
+     * which yields at the next DATA frame boundary once it runs out. Signed —
+     * the frame that empties it overshoots, and the deficit is not carried. */
+    int64_t write_credit;
+
     unsigned handler_pending : 1; /* queued for, or running in, a handler thread */
     unsigned response_ready  : 1; /* handler returned; the response may be sent */
     unsigned cancelled       : 1; /* reset by the peer — discard the response */
     unsigned headers_done    : 1; /* the request header block is complete */
     unsigned end_stream_sent : 1; /* the response already carried END_STREAM */
     unsigned window_blocked  : 1; /* body stalled waiting on a WINDOW_UPDATE */
+    unsigned yielded         : 1; /* quantum spent; more body still to send */
+    unsigned served          : 1; /* already had its turn in this write pass */
 
     struct h2stream* next;        /* session stream list */
 } h2stream_t;
 
 struct h2session;
 
-/* Create a stream and add it to the session table. Returns NULL on allocation
- * failure. The request is created here too, since every stream has one. */
+/* Create a stream and append it to the session table. Returns NULL on allocation
+ * failure. The request is created here too, since every stream has one.
+ * Appending (rather than prepending) makes the table's order the order requests
+ * arrived in, which is what the round-robin write scheduler walks. */
 h2stream_t* h2stream_create(struct h2session* session, uint32_t id);
 
 h2stream_t* h2stream_find(struct h2session* session, uint32_t id);
@@ -78,6 +88,12 @@ h2stream_t* h2stream_find_by_response(struct h2session* session, const httprespo
  * stream with a handler still pending is kept alive and marked cancelled
  * instead; it is freed once the handler comes back. */
 void h2stream_close(struct h2session* session, h2stream_t* stream);
+
+/* Move a stream to the end of the table. The write scheduler calls this on a
+ * stream that stopped before finishing its response, so the next write turn
+ * starts with somebody else — this is what makes the walk round-robin rather
+ * than "whoever is nearest the head wins". */
+void h2stream_rotate(struct h2session* session, h2stream_t* stream);
 
 /* Free every stream in the table (session teardown). */
 void h2stream_free_all(struct h2session* session);

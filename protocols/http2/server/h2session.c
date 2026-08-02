@@ -78,11 +78,27 @@
  * take, and the body is spooled to a tmp file rather than held in memory. */
 #define H2_DEFAULT_RECV_WINDOW_MAX (4 * 1024 * 1024)
 
+/* Write scheduling (Phase 4 tail). How many body bytes one stream may put on the
+ * wire before the write path moves on to the next ready stream. Without a bound
+ * a large response runs to completion — it holds the socket through every
+ * EPOLLOUT until its last byte — and the small requests sharing the connection
+ * wait for the whole file, which is the head-of-line blocking multiplexing is
+ * supposed to remove.
+ *
+ * 64 KB is four DATA frames at the default max frame size: large enough that the
+ * extra epoll turn per quantum is noise against the copy, small enough that a
+ * request queued behind a big download waits milliseconds rather than the length
+ * of the download. RFC 9113 has nothing to say here — stream priorities are
+ * deprecated (§5.3), so scheduling between ready streams is entirely ours. */
+#define H2_DEFAULT_WRITE_QUANTUM (64 * 1024)
+#define H2_MIN_WRITE_QUANTUM 1024
+
 static uint32_t h2_idle_timeout_sec;
 static uint32_t h2_ping_interval_sec;
 static uint32_t h2_ping_ack_timeout_sec;
 static int64_t  h2_recv_window_initial;
 static int64_t  h2_recv_window_max;
+static int64_t  h2_write_quantum;
 static int      h2_policy_loaded;
 
 static void h2_load_policy(void) {
@@ -106,6 +122,11 @@ static void h2_load_policy(void) {
     h2_recv_window_max = env_get_int("http2_recv_window_max", H2_DEFAULT_RECV_WINDOW_MAX);
     if (h2_recv_window_max > H2_MAX_WINDOW) h2_recv_window_max = H2_MAX_WINDOW;
     if (h2_recv_window_max < h2_recv_window_initial) h2_recv_window_max = h2_recv_window_initial;
+
+    /* Raise for throughput on connections that carry one big transfer at a time,
+     * lower for latency when many small responses share a connection. */
+    h2_write_quantum = env_get_int("http2_write_quantum", H2_DEFAULT_WRITE_QUANTUM);
+    if (h2_write_quantum < H2_MIN_WRITE_QUANTUM) h2_write_quantum = H2_MIN_WRITE_QUANTUM;
 }
 
 /* CLOCK_MONOTONIC milliseconds — immune to wall-clock jumps, so deadlines never
@@ -1350,11 +1371,26 @@ typedef enum {
     H2_WRITE_DONE = 0,    /* the stream's response is fully on the wire */
     H2_WRITE_SOCKET,      /* socket saturated mid-frame — resume this stream first */
     H2_WRITE_WINDOW,      /* out of flow-control window — try other streams */
+    H2_WRITE_YIELD,       /* quantum spent on a frame boundary — try other streams */
     H2_WRITE_FAILED,
 } h2_write_status_e;
 
+/* Give one stream its turn: refill its quantum and run the filter chain until it
+ * finishes, blocks, or spends the quantum.
+ *
+ * The three non-terminal outcomes differ in whether the socket is left mid-frame,
+ * which is what decides if another stream may take over (see h2_write):
+ *   SOCKET — stopped anywhere, possibly with half a frame written;
+ *   WINDOW — stopped at a frame boundary, waiting on a WINDOW_UPDATE;
+ *   YIELD  — stopped at a frame boundary with bytes still to send.
+ * Only the header phase can report SOCKET without a frame boundary being
+ * possible, and the two frame-boundary flags are set exclusively by the write
+ * filter's DATA loop, so the mapping below is not ambiguous. */
 static h2_write_status_e h2_write_stream(h2session_t* s, h2stream_t* stream) {
     stream->window_blocked = 0;
+    stream->yielded = 0;
+    stream->served = 1;
+    stream->write_credit = h2_write_quantum;
 
     int r = __run_header_filters(stream->request, stream->response);
     if (r == CWF_ERROR) return H2_WRITE_FAILED;
@@ -1363,8 +1399,10 @@ static h2_write_status_e h2_write_stream(h2session_t* s, h2stream_t* stream) {
 
     r = __run_body_filters(stream->request, stream->response);
     if (r == CWF_ERROR) return H2_WRITE_FAILED;
-    if (r == CWF_EVENT_AGAIN)
+    if (r == CWF_EVENT_AGAIN) {
+        if (stream->yielded) return H2_WRITE_YIELD;
         return stream->window_blocked ? H2_WRITE_WINDOW : H2_WRITE_SOCKET;
+    }
 
     /* The filter chain emits no buffer at all for an empty body (and the
      * HEADERS frame only carries END_STREAM when we could prove up front that
@@ -1389,9 +1427,17 @@ static int h2_write(connection_t* connection) {
 
     int socket_full = 0;
     int window_stalled = 0;
+    int yielded = 0;
 
-    /* A stream that stopped mid-frame owns the socket until it finishes:
-     * starting another one would splice its bytes into the unfinished frame. */
+    /* One turn per ready stream. The flag is cleared up front rather than after
+     * each turn because the rotation below appends served streams behind the
+     * cursor, so the walk would otherwise reach them a second time. */
+    for (h2stream_t* st = s->streams; st != NULL; st = st->next) st->served = 0;
+
+    /* A stream that stopped *mid-frame* owns the socket until it finishes:
+     * starting another one would splice its bytes into the unfinished frame.
+     * Stopping on a frame boundary is a different matter — it releases the pin
+     * and takes its place at the back of the rotation. */
     if (s->writing != NULL) {
         h2stream_t* stream = s->writing;
         const h2_write_status_e status = h2_write_stream(s, stream);
@@ -1401,13 +1447,17 @@ static int h2_write(connection_t* connection) {
             s->writing = NULL;
             return h2_fail(s, H2_ERR_INTERNAL_ERROR);
         case H2_WRITE_SOCKET:
-        case H2_WRITE_WINDOW:
-            /* Still mid-frame either way — the window ran out with a partially
-             * written frame, so no other stream may take over yet. */
+            /* Still mid-frame: nobody else may touch the socket. */
             if (h2_flush_out(s) == 0) return 0;
             ctx->need_write = 1;
-            return rearm(connection, status == H2_WRITE_SOCKET ?
-                         (MPXOUT | MPXRDHUP) : (MPXIN | MPXRDHUP));
+            return rearm(connection, MPXOUT | MPXRDHUP);
+        case H2_WRITE_WINDOW:
+        case H2_WRITE_YIELD:
+            s->writing = NULL;
+            if (status == H2_WRITE_WINDOW) window_stalled = 1;
+            else yielded = 1;
+            h2stream_rotate(s, stream);
+            break;
         case H2_WRITE_DONE:
             s->writing = NULL;
             stream->state = H2_STREAM_CLOSED;
@@ -1416,12 +1466,14 @@ static int h2_write(connection_t* connection) {
         }
     }
 
-    /* Then serve every stream whose handler has come back, in table order. */
+    /* Then serve every other stream whose handler has come back, in table order
+     * — which is round-robin order, since a stream that stops short goes to the
+     * back. Each gets at most one quantum per turn. */
     h2stream_t* stream = s->streams;
     while (stream != NULL) {
         h2stream_t* next = stream->next;
 
-        if (!stream->response_ready || stream->response == NULL) {
+        if (stream->served || !stream->response_ready || stream->response == NULL) {
             stream = next;
             continue;
         }
@@ -1437,10 +1489,13 @@ static int h2_write(connection_t* connection) {
             break;
         }
 
-        if (status == H2_WRITE_WINDOW) {
-            /* Stalled before any byte of the next frame went out, so another
-             * stream may safely take the socket. */
-            window_stalled = 1;
+        if (status == H2_WRITE_WINDOW || status == H2_WRITE_YIELD) {
+            /* Stopped before any byte of the next frame went out, so another
+             * stream may safely take the socket. Back of the queue. */
+            if (status == H2_WRITE_WINDOW) window_stalled = 1;
+            else yielded = 1;
+
+            h2stream_rotate(s, stream);
             stream = next;
             continue;
         }
@@ -1454,6 +1509,13 @@ static int h2_write(connection_t* connection) {
     if (h2_flush_out(s) == 0) return 0;
 
     if (socket_full || s->out_len > s->out_pos) {
+        ctx->need_write = 1;
+        return rearm(connection, MPXOUT | MPXRDHUP);
+    }
+
+    /* Somebody spent their quantum with body left over: the socket still has
+     * room, so come straight back for the next round. */
+    if (yielded) {
         ctx->need_write = 1;
         return rearm(connection, MPXOUT | MPXRDHUP);
     }
