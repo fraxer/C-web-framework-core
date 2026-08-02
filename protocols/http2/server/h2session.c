@@ -391,6 +391,11 @@ static void h2_stream_recv_init(h2session_t* s, h2stream_t* stream) {
 static int rearm(connection_t* conn, int events) {
     connection_server_ctx_t* ctx = conn->ctx;
 
+    /* Same guard as connection_after_read: never epoll_ctl a connection whose fd
+     * has already been closed and whose number may now belong to somebody else. */
+    if (atomic_load(&ctx->detached))
+        return 1;
+
     return ctx->listener->api->control_mod(conn, events);
 }
 
@@ -1582,16 +1587,12 @@ int h2_server_response_ready(connection_t* connection, httpresponse_t* response)
     atomic_store_explicit(&stream->response_ready, 1, memory_order_release);
     atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
 
-    /* More handlers are queued for this connection. Hand the worker slot on so
-     * they run without waiting for this response to reach the socket — the
-     * chain that connection_after_write drives for h1.1, which the h2 write
-     * path cannot drive because it may stop early on a saturated socket or an
-     * exhausted flow-control window. */
-    if (!cqueue_empty(ctx->queue)) {
-        connection_queue_guard_append(connection);
-        return rearm(connection, MPXONESHOT);
-    }
-
+    /* No chain to drive any more. This used to hand the worker slot on to the
+     * next queued handler, because a connection sat in the global queue only
+     * once and its items had to be walked one after another. With fan-out
+     * dispatch (connection_queue_append_parallel) every item already has its own
+     * queue entry and its own worker, so re-queueing here would only add a
+     * spurious wake-up. docs/concurrency/00 §5.2. */
     return connection_after_read(connection);
 }
 

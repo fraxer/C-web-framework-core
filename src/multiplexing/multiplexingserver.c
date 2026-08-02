@@ -81,6 +81,8 @@ int __listener_connection_close(connection_t* connection) {
     if (!ctx->listener->api->control_del(connection))
         log_error("Connection not removed from api\n");
 
+    atomic_store(&ctx->detached, 1);
+
     shutdown(connection->fd, SHUT_RDWR);
     close(connection->fd);
 

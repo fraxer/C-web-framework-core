@@ -865,7 +865,7 @@ TEST(test_connection_queue_item_create_and_free) {
 }
 
 TEST(test_connection_queue_guard_append_pop_roundtrip) {
-    TEST_CASE("guard_append/guard_pop transfer a reference and return the connection locked");
+    TEST_CASE("guard_append/guard_pop transfer a reference and leave the connection unlocked");
 
     conn_harness_t h;
     TEST_REQUIRE(conn_harness_init(&h, 0), "harness init");
@@ -877,13 +877,51 @@ TEST(test_connection_queue_guard_append_pop_roundtrip) {
 
     connection_t* popped = connection_queue_guard_pop();
     TEST_ASSERT(popped == h.conn, "pop returns the appended connection");
-    TEST_ASSERT_EQUAL(1, atomic_load(&ctx->locked), "connection returned locked");
+    /* Handing the connection over locked is what serialized every handler on it
+     * (docs/concurrency/00 §2.1). Taking the lock is now the runner's job, so a
+     * second worker can pop the same connection for a second queued item. */
+    TEST_ASSERT_EQUAL(0, atomic_load(&ctx->locked), "connection returned unlocked");
     TEST_ASSERT_EQUAL(2, atomic_load(&ctx->ref_count), "reference still held by the worker");
 
-    connection_s_unlock(h.conn);
     connection_s_dec(h.conn);
     TEST_ASSERT_EQUAL(1, atomic_load(&ctx->ref_count), "worker released its reference");
 
+    conn_harness_free(&h);
+}
+
+TEST(test_connection_queue_append_parallel_fans_out) {
+    TEST_CASE("append_parallel queues one entry per item; append serializes to one");
+
+    conn_harness_t h;
+    TEST_REQUIRE(conn_harness_init(&h, 0), "harness init");
+
+    connection_server_ctx_t* ctx = h.conn->ctx;
+
+    connection_queue_item_t* first = connection_queue_item_create();
+    connection_queue_item_t* second = connection_queue_item_create();
+    TEST_REQUIRE_NOT_NULL_GOTO(first, "first item created", cleanup);
+    TEST_REQUIRE_NOT_NULL_GOTO(second, "second item created", cleanup);
+    first->connection = h.conn;
+    second->connection = h.conn;
+
+    TEST_ASSERT_EQUAL(1, connection_queue_append_parallel(first), "first append succeeds");
+    TEST_ASSERT_EQUAL(2, atomic_load(&ctx->broadcast_ref_count), "connection parked");
+    TEST_ASSERT_EQUAL(1, connection_queue_append_parallel(second), "second append succeeds");
+
+    /* The fan-out: both items are queued, so both reach a worker. The serialized
+     * variant would have dropped the second on the floor and left the chain to
+     * pick it up (docs/concurrency/00 §5.2). */
+    TEST_ASSERT_EQUAL(3, atomic_load(&ctx->ref_count), "two queue entries, two references");
+
+    TEST_ASSERT(connection_queue_guard_pop() == h.conn, "first pop");
+    connection_s_dec(h.conn);
+    TEST_ASSERT(connection_queue_guard_pop() == h.conn, "second pop");
+    connection_s_dec(h.conn);
+    TEST_ASSERT_EQUAL(1, atomic_load(&ctx->ref_count), "both references released");
+
+    cleanup:
+    if (first != NULL) first->free(first);
+    if (second != NULL) second->free(second);
     conn_harness_free(&h);
 }
 

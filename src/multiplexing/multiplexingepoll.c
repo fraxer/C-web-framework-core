@@ -178,6 +178,28 @@ void __mpx_epoll_process_events(appconfig_t* appconfig, void* arg) {
         return;
     }
 
+    /* Pin every connection in the batch before touching any of them.
+     *
+     * Handling one event can close a *different* connection in the same batch:
+     * the timer sweep (__mpx_on_tick) walks the whole worker list and closes on
+     * idle timeout, PING timeout or shutdown. Closing drops the base reference,
+     * and if a handler thread finishing on another core then drops the last one,
+     * the connection is freed while its event is still sitting in this array —
+     * every later `ev->data.ptr` for it is dangling.
+     *
+     * This could not happen while handlers were serialized: a connection with
+     * queued work was parked out of epoll (MPXONESHOT), so it had no event to be
+     * in a batch with. Concurrent handlers re-arm it while other handlers are
+     * still running, which is what opens the window. docs/concurrency/00 §4.6.
+     *
+     * Doing it up front is safe: the base reference is dropped only by a close,
+     * and every close runs on this thread, so nothing in the array can be stale
+     * before the loop starts. */
+    for (int i = 0; i < n; i++) {
+        if (events[i].data.ptr != &epi->timer_tag)
+            connection_s_inc(events[i].data.ptr);
+    }
+
     for (int i = 0; i < n; i++) {
         epoll_event_t* ev = &events[i];
 
@@ -213,11 +235,20 @@ void __mpx_epoll_process_events(appconfig_t* appconfig, void* arg) {
             if (!connection->write(connection))
                 goto close;
 
-        continue;
+        goto next;
 
         close:
 
         connection->close(connection);
+
+        next:
+
+        /* Drop the batch pin. This may well be the last reference — the
+         * connection was closed just above, or by the sweep earlier in this
+         * batch — in which case the free happens here rather than inside
+         * close(), which is exactly the point: nothing reads the pointer after
+         * this line. */
+        connection_s_dec(connection);
     }
 }
 
