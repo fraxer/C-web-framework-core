@@ -31,6 +31,7 @@
 #include "connection_queue.h"
 #include "middleware_registry.h"
 #include "httpserverhandlers.h"
+#include "h2session.h"
 #include "taskmanager.h"
 #include "metrics.h"
 #include "i18n.h"
@@ -201,9 +202,12 @@ int __module_loader_init_modules(appconfig_t* config, json_doc_t* document) {
         goto failed;
 
     /* After the config is loaded (env is only readable now) and before any
-     * worker or handler thread exists, so the flag never changes under a
-     * running thread except across a reload. */
+     * worker or handler thread exists, so these never change under a running
+     * thread except across a reload. The h2 policy used to load itself lazily on
+     * the first h2 session instead, which raced between workers and never
+     * survived a reload. */
     metrics_init(env_get_bool("metrics", 0));
+    h2_policy_init();
 
     if (config->server_chain && config->server_chain->server)
         http_server_init_sni_callbacks(config->server_chain->server);

@@ -93,18 +93,23 @@
 #define H2_DEFAULT_WRITE_QUANTUM (64 * 1024)
 #define H2_MIN_WRITE_QUANTUM 1024
 
-static uint32_t h2_idle_timeout_sec;
-static uint32_t h2_ping_interval_sec;
-static uint32_t h2_ping_ack_timeout_sec;
-static int64_t  h2_recv_window_initial;
-static int64_t  h2_recv_window_max;
-static int64_t  h2_write_quantum;
-static int      h2_policy_loaded;
+/* Set once per config load by h2_policy_init(), read by every worker and handler
+ * thread afterwards. Plain (non-atomic) variables are safe only because of that
+ * ordering: the write happens before any thread that reads them exists.
+ *
+ * This used to be a lazy first-session load, which was wrong on both counts —
+ * two workers opening their first h2 connection at the same instant raced on the
+ * guard flag and on the values, so the loser could start a session with a zero
+ * receive window; and a config reload never re-read them. Defaults below are the
+ * ones that apply when h2_policy_init() has not run at all. */
+static uint32_t h2_idle_timeout_sec = H2_DEFAULT_IDLE_TIMEOUT_SEC;
+static uint32_t h2_ping_interval_sec = 0;
+static uint32_t h2_ping_ack_timeout_sec = H2_DEFAULT_PING_ACK_TIMEOUT_SEC;
+static int64_t  h2_recv_window_initial = H2_DEFAULT_WINDOW;
+static int64_t  h2_recv_window_max = H2_DEFAULT_RECV_WINDOW_MAX;
+static int64_t  h2_write_quantum = H2_DEFAULT_WRITE_QUANTUM;
 
-static void h2_load_policy(void) {
-    if (h2_policy_loaded) return;
-    h2_policy_loaded = 1;
-
+void h2_policy_init(void) {
     h2_idle_timeout_sec = (uint32_t)env_get_int("http2_idle_timeout_sec", H2_DEFAULT_IDLE_TIMEOUT_SEC);
     h2_ping_interval_sec = (uint32_t)env_get_int("http2_ping_interval_sec", 0);
     /* Default ack grace: the interval itself, capped so a stuck peer is caught
@@ -1740,8 +1745,6 @@ static int h2_send_preface(h2session_t* s) {
  * Returns the session or NULL on allocation failure. */
 static h2session_t* h2_session_begin(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
-
-    h2_load_policy();
 
     h2session_t* s = calloc(1, sizeof(*s));
     if (s == NULL) return NULL;
