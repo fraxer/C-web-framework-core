@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "h2session.h"
 
 #include <errno.h>
@@ -6,6 +7,8 @@
 #include <string.h>
 #include <strings.h>
 #include <stdatomic.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <time.h>
 
@@ -45,8 +48,11 @@
 #define H2_MAX_WINDOW 2147483647LL /* 2^31 - 1 */
 
 /* Give receive-window credit back once this much has been consumed, rather than
- * emitting a WINDOW_UPDATE per DATA frame. */
-#define H2_WINDOW_UPDATE_THRESHOLD 16384
+ * emitting a WINDOW_UPDATE per DATA frame. Scales with the window (an 8 MB
+ * window returning credit every 16 KB would cost 512 frames per window), with
+ * this as the floor. */
+#define H2_WINDOW_UPDATE_MIN 16384
+#define H2_WINDOW_UPDATE_DIVISOR 8
 
 /* Cap on a single header block (HEADERS + CONTINUATION*). Bounds the
  * CONTINUATION-flood attack noted in docs/http2/07. */
@@ -63,10 +69,21 @@
 #define H2_DEFAULT_IDLE_TIMEOUT_SEC 120
 #define H2_DEFAULT_PING_ACK_TIMEOUT_SEC 15
 
+/* Receive-window policy (Phase 4 tail, RFC §6.9.1). The RFC default of 65535
+ * caps inbound throughput at window/RTT whatever the bandwidth — 0.6 MB/s over
+ * a 100 ms link, per connection, however many streams are uploading. So the
+ * window starts at the default and grows towards the measured bandwidth-delay
+ * product, up to `max`. Only peers that actually sustain the rate get the big
+ * window, and only on the receive side: what we advertise is our own risk to
+ * take, and the body is spooled to a tmp file rather than held in memory. */
+#define H2_DEFAULT_RECV_WINDOW_MAX (4 * 1024 * 1024)
+
 static uint32_t h2_idle_timeout_sec;
 static uint32_t h2_ping_interval_sec;
 static uint32_t h2_ping_ack_timeout_sec;
-static int h2_policy_loaded;
+static int64_t  h2_recv_window_initial;
+static int64_t  h2_recv_window_max;
+static int      h2_policy_loaded;
 
 static void h2_load_policy(void) {
     if (h2_policy_loaded) return;
@@ -79,6 +96,16 @@ static void h2_load_policy(void) {
     uint32_t ack_default = h2_ping_interval_sec ? h2_ping_interval_sec : H2_DEFAULT_PING_ACK_TIMEOUT_SEC;
     if (ack_default > H2_DEFAULT_PING_ACK_TIMEOUT_SEC) ack_default = H2_DEFAULT_PING_ACK_TIMEOUT_SEC;
     h2_ping_ack_timeout_sec = (uint32_t)env_get_int("http2_ping_ack_timeout_sec", (int)ack_default);
+
+    /* Window we open with, advertised in the preface; the auto-scaler takes it
+     * from there. Set max == initial to pin the window and disable scaling. */
+    h2_recv_window_initial = env_get_int("http2_recv_window_initial", H2_DEFAULT_WINDOW);
+    if (h2_recv_window_initial < H2_DEFAULT_WINDOW) h2_recv_window_initial = H2_DEFAULT_WINDOW;
+    if (h2_recv_window_initial > H2_MAX_WINDOW) h2_recv_window_initial = H2_MAX_WINDOW;
+
+    h2_recv_window_max = env_get_int("http2_recv_window_max", H2_DEFAULT_RECV_WINDOW_MAX);
+    if (h2_recv_window_max > H2_MAX_WINDOW) h2_recv_window_max = H2_MAX_WINDOW;
+    if (h2_recv_window_max < h2_recv_window_initial) h2_recv_window_max = h2_recv_window_initial;
 }
 
 /* CLOCK_MONOTONIC milliseconds — immune to wall-clock jumps, so deadlines never
@@ -201,6 +228,143 @@ static void h2_queue_window_update(h2session_t* s, uint32_t stream_id, uint32_t 
     };
 
     (void)h2_session_queue_frame(s, H2_FRAME_WINDOW_UPDATE, 0, stream_id, payload, sizeof(payload));
+}
+
+/* Process-wide, monotonically increasing. Makes every PING's opaque 8-byte
+ * payload unique so only its own ACK retires it. */
+static _Atomic uint64_t h2_ping_seq = 1;
+
+static void h2_fill_ping_payload(uint8_t payload[8]) {
+    uint64_t seq = atomic_fetch_add(&h2_ping_seq, 1);
+
+    for (int i = 7; i >= 0; i--) {
+        payload[i] = (uint8_t)(seq & 0xff);
+        seq >>= 8;
+    }
+}
+
+/* Smoothed RTT of the underlying TCP connection in microseconds, 0 when the
+ * kernel has no estimate yet. Free next to a probe of our own: it is the same
+ * number congestion control keeps, refreshed on every ACK, and it works
+ * identically under TLS. What it cannot see past is a proxy — it reports the
+ * RTT to whatever terminates the TCP connection, so behind a TCP load balancer
+ * it measures the hop to the balancer, not to the client. */
+static uint32_t h2_conn_rtt_us(const h2session_t* s) {
+    struct tcp_info info;
+    socklen_t len = sizeof(info);
+
+    if (getsockopt(s->connection->fd, IPPROTO_TCP, TCP_INFO, &info, &len) == -1)
+        return 0;
+
+    return info.tcpi_rtt;
+}
+
+/* RTT to the peer for window tuning: the larger of the kernel's estimate and
+ * the last PING round trip. Taking the larger one is what makes a proxied
+ * deployment work — the PING crosses the whole path, so it is the honest number
+ * whenever the two disagree. 0 when neither is known yet. */
+static uint32_t h2_peer_rtt_us(const h2session_t* s) {
+    const uint32_t tcp_us = h2_conn_rtt_us(s);
+
+    return s->rtt_us > tcp_us ? s->rtt_us : tcp_us;
+}
+
+/* Re-probe a stalled tuning PING after this long, so a peer that drops one does
+ * not wedge the tuner. Liveness is not this PING's job — the idle timeout and
+ * the optional watchdog own that. */
+#define H2_TUNE_PING_TIMEOUT_MS 5000
+
+/* Floor on the gap between tuning PINGs. One per round trip is all the tuner
+ * can use (it grows a window at most once per RTT), and on a fast link the ACK
+ * comes back instantly — without a floor that would mean a PING per credit
+ * cycle for a transfer that never needed tuning at all. */
+#define H2_TUNE_PING_MIN_INTERVAL_MS 50
+
+/* Measure the path RTT with a PING (§6.7). Sent only while a receive window is
+ * still growing, one at a time, so the ramp costs at most one PING per round
+ * trip and stops as soon as the window settles. */
+static void h2_send_tune_ping(h2session_t* s) {
+    const uint64_t now = h2_now_ms();
+
+    if (s->tune_ping_sent_ms != 0 && now - s->tune_ping_sent_ms < H2_TUNE_PING_TIMEOUT_MS)
+        return;
+
+    uint64_t interval_ms = s->rtt_us / 1000;
+    if (interval_ms < H2_TUNE_PING_MIN_INTERVAL_MS) interval_ms = H2_TUNE_PING_MIN_INTERVAL_MS;
+    if (s->tune_ping_done_ms != 0 && now - s->tune_ping_done_ms < interval_ms)
+        return;
+
+    uint8_t payload[8];
+    h2_fill_ping_payload(payload);
+
+    memcpy(s->tune_ping_payload, payload, sizeof payload);
+    s->tune_ping_sent_ms = now;
+
+    (void)h2_session_queue_frame(s, H2_FRAME_PING, 0, 0, payload, sizeof payload);
+}
+
+/* Count `len` bytes received on one flow (a stream, or the connection when
+ * stream_id is 0) and give the credit back once enough has piled up — growing
+ * the window first if the peer looks limited by it (§6.9.1).
+ *
+ * Target is two bandwidth-delay products: one keeps the peer sending while our
+ * WINDOW_UPDATE is still in flight, the second absorbs a stale sample. The rate
+ * sample is only trusted once it spans a round trip (below that a single burst
+ * reads as infinite bandwidth), and one step may at most double the window, so
+ * a noisy sample cannot jump straight to the cap. On a fast link the measured
+ * BDP stays under 65535 and the window never moves — loopback and LAN keep the
+ * exact frame pattern they had before. */
+static void h2_recv_credit(h2session_t* s, uint32_t stream_id, h2_recv_window_t* w, uint32_t len) {
+    w->pending += len;
+    w->bytes += len;
+
+    int64_t threshold = w->size / H2_WINDOW_UPDATE_DIVISOR;
+    if (threshold < H2_WINDOW_UPDATE_MIN) threshold = H2_WINDOW_UPDATE_MIN;
+    if (w->pending < threshold) return;
+
+    int64_t increment = w->pending;
+    w->pending = 0;
+
+    if (w->size < h2_recv_window_max) {
+        const uint64_t now = h2_now_ms();
+        const uint64_t elapsed_us = (now - w->epoch_ms) * 1000;
+        const uint32_t rtt_us = h2_peer_rtt_us(s);
+
+        /* Keep a fresh RTT sample coming while there is still room to grow. */
+        h2_send_tune_ping(s);
+
+        /* elapsed_us >= rtt_us > 0 also keeps the division below safe. */
+        if (rtt_us > 0 && elapsed_us >= rtt_us) {
+            int64_t target = 2 * w->bytes * (int64_t)rtt_us / (int64_t)elapsed_us;
+
+            if (target > w->size * 2) target = w->size * 2;
+            if (target > h2_recv_window_max) target = h2_recv_window_max;
+
+            if (target > w->size) {
+                increment += target - w->size;
+                w->size = target;
+
+                /* Streams opened later start from what this connection already
+                 * learned, instead of re-paying the ramp per request. */
+                if (stream_id != 0 && w->size > s->stream_recv_learned)
+                    s->stream_recv_learned = w->size;
+            }
+
+            w->epoch_ms = now;
+            w->bytes = 0;
+        }
+    }
+
+    h2_queue_window_update(s, stream_id, (uint32_t)increment);
+}
+
+/* A fresh stream is credited up to the learned window (§6.9.2 lets SETTINGS set
+ * only the initial value, so the difference has to go out as a WINDOW_UPDATE). */
+static void h2_stream_recv_init(h2session_t* s, h2stream_t* stream) {
+    stream->recv.epoch_ms = h2_now_ms();
+
+    if (stream->recv.size > h2_recv_window_initial)
+        h2_queue_window_update(s, stream->id, (uint32_t)(stream->recv.size - h2_recv_window_initial));
 }
 
 static int rearm(connection_t* conn, int events) {
@@ -824,6 +988,8 @@ static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
     stream = h2stream_create(s, stream_id);
     if (stream == NULL) return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
 
+    h2_stream_recv_init(s, stream);
+
     if (stream_id > s->last_stream_id) s->last_stream_id = stream_id;
 
     const h2_request_status_e status = h2_build_request(s, stream, block, len);
@@ -934,11 +1100,7 @@ static h2_frame_result_e h2_on_continuation(h2session_t* s, const h2_frame_t* fr
 static h2_frame_result_e h2_on_data(h2session_t* s, const h2_frame_t* frame) {
     /* Credit the connection window back regardless of what happens to the
      * payload: the peer counted it against our window either way. */
-    s->recv_pending += frame->payload_len;
-    if (s->recv_pending >= H2_WINDOW_UPDATE_THRESHOLD) {
-        h2_queue_window_update(s, 0, (uint32_t)s->recv_pending);
-        s->recv_pending = 0;
-    }
+    h2_recv_credit(s, 0, &s->recv, frame->payload_len);
 
     /* §5.1: DATA on a stream that was never opened is a connection error; on
      * one that no longer accepts data it is a stream error. */
@@ -962,11 +1124,7 @@ static h2_frame_result_e h2_on_data(h2session_t* s, const h2_frame_t* frame) {
         data_len -= pad_len;
     }
 
-    stream->recv_pending += frame->payload_len;
-    if (stream->recv_pending >= H2_WINDOW_UPDATE_THRESHOLD) {
-        h2_queue_window_update(s, stream->id, (uint32_t)stream->recv_pending);
-        stream->recv_pending = 0;
-    }
+    h2_recv_credit(s, stream->id, &stream->recv, frame->payload_len);
 
     if (!h2_body_append(stream, data, data_len))
         return h2_stream_error(s, stream->id, H2_ERR_INTERNAL_ERROR);
@@ -995,6 +1153,20 @@ static h2_frame_result_e h2_handle_frame(h2session_t* s, const h2_frame_t* frame
                 frame->payload_len == sizeof(s->ping_payload) &&
                 memcmp(frame->payload, s->ping_payload, sizeof(s->ping_payload)) == 0) {
                 s->ping_sent_ms = 0;
+            }
+            /* A tuning PING's ACK carries the path RTT the window tuner needs.
+             * Millisecond resolution: a sub-millisecond round trip reads as 0
+             * and leaves the kernel estimate in charge, which is right — at
+             * that RTT there is no bandwidth-delay product to chase. */
+            if (s->tune_ping_sent_ms != 0 &&
+                frame->payload_len == sizeof(s->tune_ping_payload) &&
+                memcmp(frame->payload, s->tune_ping_payload, sizeof(s->tune_ping_payload)) == 0) {
+                const uint64_t now_ms = h2_now_ms();
+                const uint64_t rtt_ms = now_ms - s->tune_ping_sent_ms;
+                s->tune_ping_sent_ms = 0;
+                s->tune_ping_done_ms = now_ms;
+                if (rtt_ms > 0 && rtt_ms <= H2_TUNE_PING_TIMEOUT_MS)
+                    s->rtt_us = (uint32_t)(rtt_ms * 1000);
             }
             s->last_activity_ms = h2_now_ms();
             return H2_FRAME_OK;
@@ -1383,18 +1555,9 @@ int h2_server_guard_write(connection_t* connection) {
  *  Lifecycle: idle timeout, PING watchdog, graceful shutdown (Phase 5)
  * ======================================================================= */
 
-/* Process-wide, monotonically increasing. Makes every watchdog PING's opaque
- * 8-byte payload unique so only its own ACK retires it. */
-static _Atomic uint64_t h2_ping_seq = 1;
-
 static void h2_send_watchdog_ping(h2session_t* s) {
-    uint64_t seq = atomic_fetch_add(&h2_ping_seq, 1);
-
     uint8_t payload[8];
-    for (int i = 7; i >= 0; i--) {
-        payload[i] = (uint8_t)(seq & 0xff);
-        seq >>= 8;
-    }
+    h2_fill_ping_payload(payload);
 
     memcpy(s->ping_payload, payload, sizeof payload);
     s->ping_sent_ms = h2_now_ms();
@@ -1474,6 +1637,7 @@ void h2_server_tick(connection_t* connection, int shutdown_now) {
 
 /* Server connection preface (§3.4): SETTINGS must be the first frame we send. */
 static int h2_send_preface(h2session_t* s) {
+    const uint32_t window = (uint32_t)h2_recv_window_initial;
     const uint8_t settings[] = {
         0x00, H2_SETTINGS_ENABLE_PUSH,            0x00, 0x00, 0x00, 0x00,
         0x00, H2_SETTINGS_MAX_CONCURRENT_STREAMS,
@@ -1481,9 +1645,22 @@ static int h2_send_preface(h2session_t* s) {
             (uint8_t)((H2_MAX_CONCURRENT_STREAMS >> 16) & 0xff),
             (uint8_t)((H2_MAX_CONCURRENT_STREAMS >> 8) & 0xff),
             (uint8_t)(H2_MAX_CONCURRENT_STREAMS & 0xff),
+        0x00, H2_SETTINGS_INITIAL_WINDOW_SIZE,
+            (uint8_t)((window >> 24) & 0xff),
+            (uint8_t)((window >> 16) & 0xff),
+            (uint8_t)((window >> 8) & 0xff),
+            (uint8_t)(window & 0xff),
     };
 
-    return h2_session_queue_frame(s, H2_FRAME_SETTINGS, 0, 0, settings, sizeof(settings));
+    if (!h2_session_queue_frame(s, H2_FRAME_SETTINGS, 0, 0, settings, sizeof(settings)))
+        return 0;
+
+    /* SETTINGS_INITIAL_WINDOW_SIZE governs streams only (§6.9.2); the
+     * connection window moves by WINDOW_UPDATE alone. */
+    if (h2_recv_window_initial > H2_DEFAULT_WINDOW)
+        h2_queue_window_update(s, 0, (uint32_t)(h2_recv_window_initial - H2_DEFAULT_WINDOW));
+
+    return 1;
 }
 
 /* Build an h2 session on `connection` and install its read/write guards. The
@@ -1518,6 +1695,9 @@ static h2session_t* h2_session_begin(connection_t* connection) {
     s->peer_initial_window = H2_DEFAULT_WINDOW;
     s->peer_header_table_size = 4096;
     s->send_window = H2_DEFAULT_WINDOW;
+    s->recv.size = h2_recv_window_initial;
+    s->recv.epoch_ms = h2_now_ms();
+    s->stream_recv_learned = h2_recv_window_initial;
     s->error_code = H2_ERR_PROTOCOL_ERROR;
     s->last_activity_ms = h2_now_ms();
 
@@ -1612,6 +1792,8 @@ int h2_server_set_http2_upgrade(connection_t* connection, void* data) {
         h2_flush_out(s);
         return 0;
     }
+    h2_stream_recv_init(s, stream);
+
     if (s->last_stream_id < 1) s->last_stream_id = 1;
 
     httprequest_free(stream->request); /* drop the empty one h2stream_create made */

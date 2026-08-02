@@ -21,6 +21,7 @@ h2stream_t* h2stream_create(h2session_t* session, uint32_t id) {
     stream->id = id;
     stream->state = H2_STREAM_OPEN;
     stream->send_window = session->peer_initial_window;
+    stream->recv.size = session->stream_recv_learned;
     stream->content_length = -1;
 
     stream->next = session->streams;

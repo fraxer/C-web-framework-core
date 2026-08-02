@@ -72,9 +72,12 @@ typedef struct h2session {
      * for a WINDOW_UPDATE. */
     int      window_blocked;
 
-    /* Receive side: bytes of our advertised connection window the peer has
-     * consumed and that we have not yet given back. */
-    int64_t  recv_pending;
+    /* Receive side: the connection window we advertise, plus the counters that
+     * auto-scale it (§6.9.1). Streams carry the same state of their own. */
+    h2_recv_window_t recv;
+    /* Receive window a stream on this connection has grown to; new streams open
+     * there rather than ramping again from the advertised initial value. */
+    int64_t  stream_recv_learned;
 
     /* The stream that stopped mid-frame and must finish before any other may
      * use the socket — otherwise its bytes would be spliced into an unfinished
@@ -100,6 +103,14 @@ typedef struct h2session {
     uint64_t last_activity_ms;
     uint64_t ping_sent_ms;      /* 0 = no watchdog PING outstanding */
     uint8_t  ping_payload[8];   /* opaque data of the outstanding PING (for ACK) */
+
+    /* Window tuning (§6.9.1): path RTT measured by our own PING, and the probe
+     * currently outstanding. Separate from the watchdog above — this one only
+     * measures, it never declares the peer dead. */
+    uint32_t rtt_us;
+    uint64_t tune_ping_sent_ms; /* 0 = no tuning PING outstanding */
+    uint64_t tune_ping_done_ms; /* when the last one was answered (rate limit) */
+    uint8_t  tune_ping_payload[8];
     int      draining;          /* GOAWAY(NO_ERROR) sent on shutdown; close once idle */
 } h2session_t;
 
