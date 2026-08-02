@@ -2,11 +2,17 @@
  * Unit tests for protocols/websocket/server/websocketsserverhandlers.c
  *
  * Covers the epoll-facing guard handlers (websockets_guard_read/write), the
- * control/data frame dispatch (__handle), the direct and queued response
- * posting paths, websockets_deferred_handler and the worker-side
+ * control/data frame dispatch (__handle), the output order (ctx->write_queue),
+ * websockets_deferred_handler and the worker-side
  * websockets_queue_request_handler. The handlers run end-to-end over a real
  * AF_UNIX socketpair (recv/send paths included); the epoll api is replaced by
  * a stub control_mod so connection_after_read/write can run.
+ *
+ * Since phase C of docs/concurrency/00 a reply no longer goes straight onto
+ * conn_ctx->response: it takes a slot in ctx->write_queue, reserved in dispatch
+ * order, and ctx->response is only the one currently being written. That is
+ * what lets handlers of one connection run in parallel without reordering the
+ * message stream — and what several assertions below are about.
  *
  * The epoll-loop contract (multiplexingepoll.c): a handler returning 0 closes
  * the connection, non-zero keeps it alive.
@@ -31,9 +37,9 @@
  *   - websockets_deferred_handler freed the queue item on a
  *     connection_queue_append failure while the item was still linked in
  *     ctx->queue: the worker thread or __ctx_free then freed it again.
- *   - __queue_data_response_free did not free the staged response, so
- *     responses queued behind an in-flight one leaked whenever the item was
- *     discarded without running (connection closed with a non-empty queue).
+ *   - the staged response behind an in-flight one leaked whenever it was
+ *     discarded without being written (connection closed with output pending);
+ *     the owner is now the output slot, so the guard moved with it.
  *   - protocol errors (bad frame, oversized payload) were answered with a
  *     TEXT frame and the connection kept reading the desynced stream; per
  *     RFC 6455 §7.1.7 they now fail the connection with CLOSE 1002/1009.
@@ -165,6 +171,7 @@ static int wsh_harness_init_sized(wsh_harness_t* h, size_t buffer_size) {
     h->ctx.server = &h->server;
     h->ctx.queue = cqueue_create();
     h->ctx.broadcast_queue = cqueue_create();
+    h->ctx.write_queue = cqueue_create();
     atomic_store(&h->ctx.ref_count, 1);
     atomic_store(&h->ctx.broadcast_ref_count, 1);
     atomic_store(&h->ctx.destroyed, 0);
@@ -177,7 +184,7 @@ static int wsh_harness_init_sized(wsh_harness_t* h, size_t buffer_size) {
     h->conn->ctx = &h->ctx;
     h->conn->keepalive = 1;
 
-    if (h->ctx.queue == NULL || h->ctx.broadcast_queue == NULL) {
+    if (h->ctx.queue == NULL || h->ctx.broadcast_queue == NULL || h->ctx.write_queue == NULL) {
         wsh_harness_free(h);
         return 0;
     }
@@ -204,6 +211,33 @@ static void wsh_queue_item_free_cb(void* data) {
     item->free(item);
 }
 
+/* Mirrors __ctx_out_slot_free_callback in connection_s.c: output slots left
+ * behind when the connection dies own whatever response they hold. */
+static void wsh_out_slot_free_cb(void* data) {
+    if (data == NULL) return;
+    connection_out_slot_t* slot = data;
+    if (slot->response != NULL)
+        slot->response->free(slot->response);
+    free(slot);
+}
+
+/* Take the response the connection has staged for writing: ctx->response once
+ * the head of the output order has been promoted into it. */
+static websocketsresponse_t* wsh_staged(const wsh_harness_t* h) {
+    return h->ctx.response;
+}
+
+/* How many replies are waiting behind the staged one. */
+static int wsh_pending(const wsh_harness_t* h) {
+    if (h->ctx.write_queue == NULL) return 0;
+
+    cqueue_lock(h->ctx.write_queue);
+    const int size = cqueue_size(h->ctx.write_queue);
+    cqueue_unlock(h->ctx.write_queue);
+
+    return size;
+}
+
 static void wsh_harness_free(wsh_harness_t* h) {
     if (h->ctx.parser != NULL) {
         requestparser_t* parser = h->ctx.parser;
@@ -215,8 +249,10 @@ static void wsh_harness_free(wsh_harness_t* h) {
 
     if (h->ctx.queue != NULL) cqueue_freecb(h->ctx.queue, wsh_queue_item_free_cb);
     if (h->ctx.broadcast_queue != NULL) cqueue_freecb(h->ctx.broadcast_queue, wsh_queue_item_free_cb);
+    if (h->ctx.write_queue != NULL) cqueue_freecb(h->ctx.write_queue, wsh_out_slot_free_cb);
     h->ctx.queue = NULL;
     h->ctx.broadcast_queue = NULL;
+    h->ctx.write_queue = NULL;
 
     safe_close(&h->conn_fd);
     safe_close(&h->peer_fd);
@@ -831,21 +867,14 @@ TEST(test_wsh_read_unknown_route_frees_request_regression) {
 }
 
 /* ==========================================================================
- * Pipelined control frames: the queued (deferred) response path
+ * Output order: ctx->write_queue (docs/concurrency/00 §4.4)
  * ========================================================================== */
 
-/* Run one queue item the way threadhandler.c does. */
-static void wsh_run_queue_item(wsh_harness_t* h) {
-    connection_queue_item_t* item = cqueue_pop(h->ctx.queue);
-    if (item == NULL) return;
+static void wsh_noop_handle(void* arg);
 
-    item->run(item);
-    item->free(item);
-}
-
-TEST(test_wsh_read_pipelined_pings_queue_in_order) {
-    TEST_SUITE("websocketsserverhandlers: deferred responses");
-    TEST_CASE("two pipelined PINGs queue both pongs and deliver them in order");
+TEST(test_wsh_read_pipelined_pings_leave_in_order) {
+    TEST_SUITE("websocketsserverhandlers: output order");
+    TEST_CASE("two pipelined PINGs take two output slots and leave in one pass");
 
     wsh_harness_t h;
     TEST_REQUIRE(wsh_harness_init(&h), "harness init");
@@ -857,43 +886,40 @@ TEST(test_wsh_read_pipelined_pings_queue_in_order) {
     TEST_REQUIRE_GOTO(send(h.peer_fd, frames, pos, 0) == (ssize_t)pos, "pings sent", teardown);
 
     TEST_ASSERT_EQUAL(1, websockets_guard_read(h.conn), "read keeps the connection");
-    TEST_ASSERT_NULL(h.ctx.response, "responses went through the queue, not the direct path");
-    TEST_ASSERT_EQUAL(0, cqueue_empty(h.ctx.queue), "queue holds the deferred responses");
-    TEST_ASSERT_EQUAL(2, atomic_load(&h.ctx.broadcast_ref_count), "connection scheduled on the worker queue");
+
+    /* The first reply is promoted to the write stage; the second waits its
+     * turn in the output order instead of clobbering it. Neither needs a
+     * worker: replies built on the read path are already finished. */
+    TEST_ASSERT_NOT_NULL(wsh_staged(&h), "first pong staged");
+    TEST_ASSERT_EQUAL(1, wsh_pending(&h), "second pong waiting behind it");
+    TEST_ASSERT_EQUAL(1, cqueue_empty(h.ctx.queue), "no worker item needed for a control frame");
+    TEST_ASSERT_EQUAL(1, atomic_load(&h.ctx.need_write), "need_write raised");
+
+    /* One write pass drains the whole order. */
+    TEST_ASSERT_EQUAL(1, websockets_guard_write(h.conn), "both pongs written");
+    TEST_ASSERT_NULL(wsh_staged(&h), "nothing left staged");
+    TEST_ASSERT_EQUAL(0, wsh_pending(&h), "output order drained");
 
     unsigned char wire[64];
-
-    /* Worker runs item 1: pong "a" is staged, then written. */
-    wsh_run_queue_item(&h);
-    TEST_ASSERT_NOT_NULL(h.ctx.response, "first pong staged");
-    TEST_ASSERT_EQUAL(1, websockets_guard_write(h.conn), "first pong written");
-
-    size_t received = wsh_drain(h.peer_fd, wire, sizeof(wire), 0);
-    TEST_ASSERT_EQUAL_SIZE(3, received, "first pong frame size");
+    const size_t received = wsh_drain(h.peer_fd, wire, sizeof(wire), 0);
+    TEST_ASSERT_EQUAL_SIZE(6, received, "both pong frames arrived");
     TEST_ASSERT_EQUAL(0x8A, wire[0], "first reply is a PONG");
     TEST_ASSERT_EQUAL('a', wire[2], "first ping answered first");
-
-    /* Worker runs item 2. */
-    wsh_run_queue_item(&h);
-    TEST_ASSERT_NOT_NULL(h.ctx.response, "second pong staged");
-    TEST_ASSERT_EQUAL(1, websockets_guard_write(h.conn), "second pong written");
-
-    received = wsh_drain(h.peer_fd, wire, sizeof(wire), 0);
-    TEST_ASSERT_EQUAL_SIZE(3, received, "second pong frame size");
-    TEST_ASSERT_EQUAL('b', wire[2], "second ping answered second");
-
-    TEST_ASSERT_EQUAL(1, cqueue_empty(h.ctx.queue), "queue drained");
+    TEST_ASSERT_EQUAL(0x8A, wire[3], "second reply is a PONG");
+    TEST_ASSERT_EQUAL('b', wire[5], "second ping answered second");
 
     teardown:
     wsh_harness_free(&h);
 }
 
-TEST(test_wsh_discarded_queued_response_freed_regression) {
-    TEST_SUITE("websocketsserverhandlers: deferred responses");
-    /* REGRESSION: __queue_data_response_free did not free the staged
-     * response, so a connection closed with queued responses leaked them
-     * (visible to LeakSanitizer here: the items are freed without running). */
-    TEST_CASE("queued responses discarded without running do not leak");
+TEST(test_wsh_discarded_pending_response_freed_regression) {
+    TEST_SUITE("websocketsserverhandlers: output order");
+    /* REGRESSION (phase B era: __queue_data_response_free did not free the
+     * staged response). The pending replies moved from ctx->queue into
+     * ctx->write_queue, so the owner of the leak moved with them: the slots
+     * left in the output order have to release what they hold. Visible to
+     * LeakSanitizer here - teardown drops them without ever writing. */
+    TEST_CASE("replies left in the output order when the connection dies do not leak");
 
     wsh_harness_t h;
     TEST_REQUIRE(wsh_harness_init(&h), "harness init");
@@ -905,35 +931,59 @@ TEST(test_wsh_discarded_queued_response_freed_regression) {
     TEST_REQUIRE_GOTO(send(h.peer_fd, frames, pos, 0) == (ssize_t)pos, "pings sent", teardown);
 
     TEST_ASSERT_EQUAL(1, websockets_guard_read(h.conn), "read keeps the connection");
-    TEST_ASSERT_EQUAL(0, cqueue_empty(h.ctx.queue), "responses queued");
+    TEST_ASSERT_EQUAL(1, wsh_pending(&h), "a reply is waiting in the output order");
 
-    /* Teardown frees the queue items without running them - as __ctx_free
-     * does when the connection dies with work pending. */
+    /* Teardown drops the slot without writing it - as __ctx_free does when
+     * the connection dies with output pending. */
     teardown:
     wsh_harness_free(&h);
 }
 
-TEST(test_wsh_read_queue_schedule_failure_closes_cleanly_regression) {
-    TEST_SUITE("websocketsserverhandlers: deferred responses");
-    /* REGRESSION: when connection_queue_append failed, the item was freed
-     * while still linked in ctx->queue; the next queue consumer (or ctx
-     * teardown, as here) freed it a second time. */
-    TEST_CASE("a failed worker-queue schedule closes without double-freeing the item");
+TEST(test_wsh_read_rearm_failure_closes) {
+    TEST_SUITE("websocketsserverhandlers: output order");
+    TEST_CASE("a reply that cannot ask for its write turn closes the connection");
 
     wsh_harness_t h;
     TEST_REQUIRE(wsh_harness_init(&h), "harness init");
     TEST_REQUIRE_GOTO(wsh_attach_parser(&h, websockets_protocol_default_create), "parser attach", teardown);
 
-    unsigned char frames[64];
-    size_t pos = wsh_build_frame(frames, 0x09, 1, (const unsigned char*)"a", 1);
-    pos += wsh_build_frame(frames + pos, 0x09, 1, (const unsigned char*)"b", 1);
-    TEST_REQUIRE_GOTO(send(h.peer_fd, frames, pos, 0) == (ssize_t)pos, "pings sent", teardown);
+    unsigned char frame[64];
+    const size_t frame_size = wsh_build_frame(frame, 0x09, 1, (const unsigned char*)"a", 1);
+    TEST_REQUIRE_GOTO(send(h.peer_fd, frame, frame_size, 0) == (ssize_t)frame_size, "ping sent", teardown);
 
-    stub_control_mod_result = 0; /* connection_queue_append fails */
+    stub_control_mod_result = 0; /* connection_after_read fails */
+
+    TEST_ASSERT_EQUAL(0, websockets_guard_read(h.conn), "re-arm failure closes the connection");
+    TEST_ASSERT_NOT_NULL(wsh_staged(&h), "the reply is still owned by the connection");
+
+    teardown:
+    wsh_harness_free(&h);
+}
+
+TEST(test_wsh_dispatch_schedule_failure_closes_cleanly_regression) {
+    TEST_SUITE("websocketsserverhandlers: output order");
+    /* REGRESSION: when connection_queue_append failed, the item was freed
+     * while still linked in ctx->queue; the next queue consumer (or ctx
+     * teardown, as here) freed it a second time. Under fan-out the item
+     * cannot be unlinked at all, so the request is disowned instead and the
+     * connection is marked destroyed - either way exactly one owner is left. */
+    TEST_CASE("a failed worker-queue schedule closes without double-freeing the request");
+
+    wsh_harness_t h;
+    TEST_REQUIRE(wsh_harness_init(&h), "harness init");
+    TEST_REQUIRE_GOTO(wsh_attach_parser(&h, websockets_protocol_default_create), "parser attach", teardown);
+
+    /* A default handler makes a data frame reach websockets_deferred_handler. */
+    h.server.websockets.default_handler = wsh_noop_handle;
+
+    unsigned char frame[64];
+    const size_t frame_size = wsh_build_frame(frame, 0x01, 1, (const unsigned char*)"hello", 5);
+    TEST_REQUIRE_GOTO(send(h.peer_fd, frame, frame_size, 0) == (ssize_t)frame_size, "message sent", teardown);
+
+    stub_control_mod_result = 0; /* the worker-queue schedule fails */
 
     TEST_ASSERT_EQUAL(0, websockets_guard_read(h.conn), "scheduling failure closes the connection");
-    TEST_ASSERT_EQUAL(1, cqueue_empty(h.ctx.queue), "failed item was unlinked from the queue");
-    TEST_ASSERT_EQUAL(1, atomic_load(&h.ctx.broadcast_ref_count), "scheduling flag rolled back");
+    TEST_ASSERT_EQUAL(1, atomic_load(&h.ctx.destroyed), "connection marked destroyed");
 
     teardown:
     wsh_harness_free(&h);
@@ -951,6 +1001,7 @@ TEST(test_wsh_deferred_handler_queues_and_schedules) {
 
     wsh_harness_t h;
     TEST_REQUIRE(wsh_harness_init(&h), "harness init");
+    TEST_REQUIRE_GOTO(wsh_attach_parser(&h, websockets_protocol_default_create), "parser attach", teardown);
 
     websockets_protocol_t* protocol = websockets_protocol_default_create();
     TEST_REQUIRE_NOT_NULL_GOTO(protocol, "protocol allocation", teardown);
@@ -980,14 +1031,64 @@ TEST(test_wsh_deferred_handler_queues_and_schedules) {
     wsh_harness_free(&h);
 }
 
-TEST(test_wsh_deferred_handler_second_item_not_rescheduled) {
+TEST(test_wsh_deferred_handler_second_item_gets_its_own_worker) {
     TEST_SUITE("websocketsserverhandlers: deferred_handler");
-    TEST_CASE("an item behind a non-empty queue does not reschedule the connection");
+    /* Phase C: an item behind a busy queue used to wait for the chain to pass
+     * it the turn. It now gets its own worker entry, which is what lets two
+     * messages of one connection run at the same time. */
+    TEST_CASE("an item behind a non-empty queue still gets its own worker entry");
 
     wsh_harness_t h;
     TEST_REQUIRE(wsh_harness_init(&h), "harness init");
+    TEST_REQUIRE_GOTO(wsh_attach_parser(&h, websockets_protocol_default_create), "parser attach", teardown);
 
     /* A sentinel keeps the queue non-empty, as if a worker were busy. */
+    int sentinel = 0;
+    TEST_REQUIRE_GOTO(cqueue_append(h.ctx.queue, &sentinel), "sentinel appended", teardown);
+
+    /* The connection is already parked, as it would be with a worker on it. */
+    atomic_store(&h.ctx.broadcast_ref_count, 2);
+
+    websockets_protocol_t* protocol = websockets_protocol_default_create();
+    TEST_REQUIRE_NOT_NULL_GOTO(protocol, "protocol allocation", teardown_sentinel);
+
+    websocketsrequest_t* request = websocketsrequest_create(h.conn, protocol);
+    if (request == NULL) protocol->free(protocol);
+    TEST_REQUIRE_NOT_NULL_GOTO(request, "request allocation", teardown_sentinel);
+
+    const int r = websockets_deferred_handler(h.conn, request, websockets_queue_request_handler,
+                                              wsh_noop_handle, websockets_queue_data_request_create, NULL);
+
+    TEST_ASSERT_EQUAL(1, r, "request queued");
+    TEST_ASSERT_EQUAL(2, atomic_load(&h.ctx.ref_count), "a second worker holds a reference");
+    TEST_ASSERT_EQUAL(0, stub_control_mod_calls, "already parked: no second epoll call");
+    TEST_ASSERT_EQUAL(1, wsh_pending(&h), "the message took its place in the output order");
+
+    teardown_sentinel:
+    TEST_ASSERT(cqueue_pop(h.ctx.queue) == &sentinel, "sentinel still first in the queue");
+
+    connection_queue_item_t* item = cqueue_pop(h.ctx.queue);
+    if (item != NULL) item->free(item);
+
+    teardown:
+    wsh_harness_free(&h);
+}
+
+TEST(test_wsh_deferred_handler_serializes_when_compressed) {
+    TEST_SUITE("websocketsserverhandlers: deferred_handler");
+    /* permessage-deflate compresses every message against one shared z_stream,
+     * in the order the frames reach the wire - neither survives parallel
+     * handlers. Compressed connections keep the old one-item-at-a-time
+     * dispatch (docs/concurrency/00, phase C). */
+    TEST_CASE("a permessage-deflate connection keeps the serialized dispatch");
+
+    wsh_harness_t h;
+    TEST_REQUIRE(wsh_harness_init(&h), "harness init");
+    TEST_REQUIRE_GOTO(wsh_attach_parser(&h, websockets_protocol_default_create), "parser attach", teardown);
+
+    websocketsparser_t* parser = h.ctx.parser;
+    parser->ws_deflate_enabled = 1;
+
     int sentinel = 0;
     TEST_REQUIRE_GOTO(cqueue_append(h.ctx.queue, &sentinel), "sentinel appended", teardown);
 
@@ -1022,10 +1123,11 @@ TEST(test_wsh_deferred_handler_schedule_failure_keeps_component_regression) {
      * place - still linked in ctx->queue AND with the component inside, so
      * the caller's request was freed behind its back and the queue kept a
      * dangling pointer. */
-    TEST_CASE("a schedule failure returns 0, unlinks the item and leaves the request to the caller");
+    TEST_CASE("a schedule failure returns 0 and leaves the request to the caller");
 
     wsh_harness_t h;
     TEST_REQUIRE(wsh_harness_init(&h), "harness init");
+    TEST_REQUIRE_GOTO(wsh_attach_parser(&h, websockets_protocol_default_create), "parser attach", teardown);
 
     websockets_protocol_t* protocol = websockets_protocol_default_create();
     TEST_REQUIRE_NOT_NULL_GOTO(protocol, "protocol allocation", teardown);
@@ -1034,14 +1136,14 @@ TEST(test_wsh_deferred_handler_schedule_failure_keeps_component_regression) {
     if (request == NULL) protocol->free(protocol);
     TEST_REQUIRE_NOT_NULL_GOTO(request, "request allocation", teardown);
 
-    stub_control_mod_result = 0; /* connection_queue_append fails */
+    stub_control_mod_result = 0; /* the worker-queue schedule fails */
 
     const int r = websockets_deferred_handler(h.conn, request, websockets_queue_request_handler,
                                               wsh_noop_handle, websockets_queue_data_request_create, NULL);
 
     TEST_ASSERT_EQUAL(0, r, "failure reported");
-    TEST_ASSERT_EQUAL(1, cqueue_empty(h.ctx.queue), "item unlinked from the queue");
     TEST_ASSERT_EQUAL(1, atomic_load(&h.ctx.broadcast_ref_count), "scheduling flag rolled back");
+    TEST_ASSERT_EQUAL(1, atomic_load(&h.ctx.destroyed), "connection marked destroyed");
 
     /* The request is still the caller's: freeing it must be safe (a double
      * free here aborts the runner under AddressSanitizer). */

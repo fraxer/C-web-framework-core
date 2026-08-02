@@ -711,6 +711,11 @@ static int dispatch_setup(dispatch_harness_t* harness, route_t* routes) {
     harness->ctx.queue = cqueue_create();
     if (harness->ctx.queue == NULL) return 0;
 
+    /* Dispatch reserves this message's place in the output order before the
+     * item reaches a worker (docs/concurrency/00 §4.4). */
+    harness->ctx.write_queue = cqueue_create();
+    if (harness->ctx.write_queue == NULL) return 0;
+
     harness->connection.ctx = &harness->ctx;
 
     /* A non-empty per-connection queue keeps websockets_deferred_handler off
@@ -727,8 +732,17 @@ static connection_queue_item_t* dispatch_take_item(dispatch_harness_t* harness) 
     return cqueue_pop(harness->ctx.queue);
 }
 
+static void dispatch_out_slot_free_cb(void* data) {
+    if (data == NULL) return;
+    connection_out_slot_t* slot = data;
+    if (slot->response != NULL)
+        slot->response->free(slot->response);
+    free(slot);
+}
+
 static void dispatch_teardown(dispatch_harness_t* harness) {
     cqueue_free(harness->ctx.queue);
+    cqueue_freecb(harness->ctx.write_queue, dispatch_out_slot_free_cb);
 }
 
 TEST(test_wsres_get_resource_guards) {
