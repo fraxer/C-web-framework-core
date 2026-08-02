@@ -6,6 +6,7 @@
 #include "h2frame.h"
 #include "h2stream.h"
 #include "hpack.h"
+#include "cqueue.h"       /* publish_queue (docs/concurrency/01 §4.1, phase B) */
 #include "httpcontext.h"  /* httpctx_t — h2c_upgrade() entry point */
 
 /* Per-connection HTTP/2 session.
@@ -52,6 +53,16 @@ typedef struct h2session {
     h2stream_t* streams_tail;
     size_t      stream_count;
     uint32_t    last_stream_id; /* highest id accepted, reported in GOAWAY */
+
+    /* Ready-response handoff from handler threads to the worker
+     * (docs/concurrency/01 §4.1, phase B). A handler that has finished fills a
+     * response, pushes it here under the queue's own short lock, and re-arms
+     * epoll — without walking the stream table. The worker drains this at the
+     * start of every write pass (single-threaded, where the table is already
+     * its) and does the stream lookup there. Order does not matter: h2 has
+     * stream ids. Lock order is connection_s_lock -> publish_queue, never the
+     * reverse, matching the WebSocket write_queue (00 §4.4). */
+    cqueue_t* publish_queue;
 
     /* CONTINUATION accumulation (HEADERS without END_HEADERS + CONTINUATION*).
      * Connection-level: a header block may not be interleaved with any other
@@ -179,11 +190,21 @@ h2session_t* h2_session_of(connection_t* connection);
 void h2_server_attach_response(connection_t* connection, httprequest_t* request,
                                httpresponse_t* response);
 
-/* Called once a handler has filled the response (or once the dispatch path
- * produced one inline), from whichever thread ran it. Marks the owning stream
- * ready and wakes the connection's write path. The caller must already hold the
- * connection lock — every path into here does. */
+/* Called once a queued handler thread has filled its response. Pushes the
+ * response onto the session's publish queue (the queue's own short lock) and
+ * re-arms epoll under connection_s_lock, which it takes itself — so the caller
+ * must NOT hold the connection lock (it is a non-recursive spinlock). The stream
+ * table is not touched here; the worker drains the queue at the start of its
+ * write pass (docs/concurrency/01 §4.1). */
 int h2_server_response_ready(connection_t* connection, httpresponse_t* response);
+
+/* The inline counterpart, for responses the worker produced itself while it was
+ * already on the read path under connection_s_lock (the h2_dispatch fallback for
+ * 404/403/static/redirect, via __post_response). The worker owns the stream
+ * table exclusively here, so publish directly — no queue — and skip the re-arm:
+ * the read path's h2_drain_and_rearm sees the stream become writable and arms
+ * EPOLLOUT. The caller MUST already hold connection_s_lock. */
+int h2_server_publish_inline(connection_t* connection, httpresponse_t* response);
 
 /* Append a frame to the pending outbound buffer. Returns 1 on success, 0 on
  * allocation failure. Nothing is written to the socket here — h2_flush_out()

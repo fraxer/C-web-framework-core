@@ -405,6 +405,31 @@ int __handler_finished(connection_t* connection, httprequest_t* request, httpres
     return connection_after_read(connection);
 }
 
+/* Publish a finished response. The two protocols need different locking:
+ *
+ *  - h1.1 keeps one request in flight, and connection_after_read must re-arm
+ *    under connection_s_lock, so the caller's lock is taken here.
+ *  - h2 pushes to the session's publish queue under the queue's own short lock
+ *    and takes connection_s_lock itself only for the re-arm (the table walk runs
+ *    later, in the worker's drain — docs/concurrency/01 §4.1). h2 must therefore
+ *    be called WITHOUT the connection lock held: connection_s_lock is a
+ *    non-recursive spinlock, and h2_server_response_ready acquires it.
+ *
+ * Wrapping the branch keeps every caller out of the business of knowing which
+ * path locks. */
+static void __publish_response(connection_t* connection, httprequest_t* request, httpresponse_t* response) {
+    connection_server_ctx_t* ctx = connection->ctx;
+
+    if (ctx->is_http2) {
+        __handler_finished(connection, request, response);
+        return;
+    }
+
+    connection_s_lock(connection, __publish_site(ctx));
+    __handler_finished(connection, request, response);
+    connection_s_unlock(connection);
+}
+
 int http_server_dispatch(connection_t* connection, httprequest_t* request) {
     return __handle(connection, request, __post_response);
 }
@@ -685,18 +710,20 @@ void __queue_request_handler(void* arg) {
      * short sections below, another worker may be running another handler of
      * this same connection — for h2 that is the point of the exercise; for h1.1
      * it cannot happen anyway, since only one item at a time is ever dispatched
-     * (connection_queue_append, the serialized variant). */
-    connection_s_lock(item->connection, LOCK_SITE_HTTP_DISPATCH);
-
-    /* h2 keeps request and response on the stream: several may be in flight, so
-     * the single pair on the connection context would be clobbered. The item
-     * already carries the right pair either way. */
+     * (connection_queue_append, the serialized variant).
+     *
+     * h2 keeps request and response on the stream — several in flight would
+     * clobber the single pair on the connection context — so for h2 there is
+     * nothing to bind here. Taking the lock anyway left an empty lock/unlock
+     * that was the single largest source of contention on the dispatch path
+     * (~7400 waited acquisitions, ~10k sched_yield per 10k requests, guarding
+     * nothing). Skip the acquisition on h2 (docs/concurrency/01 §6 A.4 п.3). */
     if (!conn_ctx->is_http2) {
+        connection_s_lock(item->connection, LOCK_SITE_HTTP_DISPATCH);
         conn_ctx->request = data->request;
         conn_ctx->response = data->response;
+        connection_s_unlock(item->connection);
     }
-
-    connection_s_unlock(item->connection);
 
     if (!ratelimiter_allow(data->ratelimiter, item->connection->remote_ip, 1)) {
         if (data->response != NULL) {
@@ -704,9 +731,7 @@ void __queue_request_handler(void* arg) {
             data->response->add_header(data->response, "Retry-After", "1");
         }
 
-        connection_s_lock(item->connection, __publish_site(conn_ctx));
-        __handler_finished(item->connection, data->request, data->response);
-        connection_s_unlock(item->connection);
+        __publish_response(item->connection, data->request, data->response);
         return;
     }
 
@@ -719,11 +744,10 @@ void __queue_request_handler(void* arg) {
 
     httpctx_clear(&ctx);
 
-    /* Publishing the response walks the session's stream table and re-arms
-     * epoll, so it goes back under the lock. */
-    connection_s_lock(item->connection, __publish_site(conn_ctx));
-    __handler_finished(item->connection, data->request, data->response);
-    connection_s_unlock(item->connection);
+    /* Publishing: h2 pushes to the session queue and re-arms under its own
+     * acquisition; h1.1 needs connection_s_lock for the re-arm. __publish_response
+     * owns that difference (docs/concurrency/01 §4.1, phase B). */
+    __publish_response(item->connection, data->request, data->response);
 }
 
 void __queue_response_handler(void* arg) {
@@ -746,17 +770,18 @@ void __queue_response_handler(void* arg) {
     }
 
     /* No user code here — the response is already built (a static file, or a
-     * handler that finished earlier), so the whole runner stays under the lock. */
-    connection_s_lock(item->connection, __publish_site(conn_ctx));
-
+     * handler that finished earlier). h1.1 binds request/response under the
+     * lock; h2 keeps them on the stream. __publish_response owns the lock split
+     * for the actual publish (h2 re-arms under its own acquisition, h1.1 under
+     * the caller's) — the whole runner no longer stays under one lock. */
     if (!conn_ctx->is_http2) {
+        connection_s_lock(item->connection, __publish_site(conn_ctx));
         conn_ctx->request = data->request;
         conn_ctx->response = data->response;
+        connection_s_unlock(item->connection);
     }
 
-    __handler_finished(item->connection, data->request, data->response);
-
-    connection_s_unlock(item->connection);
+    __publish_response(item->connection, data->request, data->response);
 }
 
 int __run_header_filters(httprequest_t* request, httpresponse_t* response) {
@@ -1012,9 +1037,13 @@ int __post_response(httprequest_t* request, httpresponse_t* response) {
     }
 
     /* h2 responses are per-stream and may complete in any order, so there is no
-     * queue to wait behind — hand the response straight to the stream. */
+     * queue to wait behind. This is the inline path — the worker produced the
+     * response itself on the read path (h2_dispatch fallback for 404/static/
+     * redirect), so it already holds connection_s_lock; publish straight to the
+     * stream and let h2_drain_and_rearm re-arm. The queued-handler path uses
+     * h2_server_response_ready via __publish_response instead. */
     if (ctx->is_http2)
-        return h2_server_response_ready(connection, response);
+        return h2_server_publish_inline(connection, response);
 
     cqueue_lock(ctx->queue);
     const int queue_empty = cqueue_empty(ctx->queue);

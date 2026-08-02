@@ -26,7 +26,7 @@ static const char* const __wait_bucket_name[METRICS_WAIT_BUCKETS] = {
  * so they are worth spelling out. */
 static const char* const __lock_site_name[LOCK_SITE__COUNT] = {
     "other",
-    "h2.read", "h2.write", "h2.publish",
+    "h2.read", "h2.write", "h2.publish", "h2.rearm",
     "http.read", "http.write", "http.dispatch", "http.publish",
     "ws.read", "ws.write", "ws.reserve", "ws.publish",
     "broadcast",

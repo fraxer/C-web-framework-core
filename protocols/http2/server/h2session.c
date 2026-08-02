@@ -1427,9 +1427,63 @@ static h2_write_status_e h2_write_stream(h2session_t* s, h2stream_t* stream) {
     return H2_WRITE_DONE;
 }
 
+/* Publish one ready response to its stream. Runs in the worker's single-threaded
+ * write context — the drain — or the OOM fallback, both under connection_s_lock.
+ * This is the work the handler used to do under the lock (docs/concurrency/01
+ * §2.3): the stream-table walk and the cancelled/liveness check moved here, so a
+ * handler thread no longer touches session internals.
+ *
+ * The response is still owned by its stream (h2_server_attach_response bound
+ * it). On the cancelled/missing-stream paths the stream's own teardown (or this
+ * drop) frees it; otherwise it stays with the stream until the write path drops
+ * it after END_STREAM. */
+static void h2_publish_one(h2session_t* s, httpresponse_t* response) {
+    h2stream_t* stream = h2stream_find_by_response(s, response);
+    if (stream == NULL) {
+        /* The stream went away before its response was drained and nothing else
+         * owns it now. */
+        httpresponse_free(response);
+        return;
+    }
+
+    /* handler_pending was set at dispatch and kept set through the push so that
+     * a RST_STREAM arriving meanwhile could only mark the stream cancelled, not
+     * free it out from under the queued response. Clearing it here is what
+     * finally makes the stream eligible for destruction. */
+    atomic_store_explicit(&stream->handler_pending, 0, memory_order_release);
+
+    if (atomic_load_explicit(&stream->cancelled, memory_order_acquire)) {
+        h2_session_drop_stream(s, stream);
+        return;
+    }
+
+    /* Release-store so the write path, which loads this with acquire, cannot
+     * observe the flag before the response body and headers the handler wrote. */
+    atomic_store_explicit(&stream->response_ready, 1, memory_order_release);
+}
+
+/* Worker drains the publish queue at the start of every write pass. The worker
+ * already holds connection_s_lock (h2_server_guard_write); the queue's own lock
+ * only keeps the list consistent, in the connection_s_lock -> cqueue order the
+ * WebSocket path already uses. */
+static void h2_publish_drain(h2session_t* s) {
+    if (s->publish_queue == NULL) return;
+
+    cqueue_lock(s->publish_queue);
+    void* response;
+    while ((response = cqueue_pop(s->publish_queue)) != NULL)
+        h2_publish_one(s, response);
+    cqueue_unlock(s->publish_queue);
+}
+
 static int h2_write(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
     h2session_t* s = ctx->parser;
+
+    /* Bring any responses handlers pushed since the last turn onto their streams
+     * before walking them: the write loop below consumes response_ready, which
+     * the drain sets. (docs/concurrency/01 §4.1, phase B) */
+    h2_publish_drain(s);
 
     const int flushed = h2_flush_out(s);
     if (flushed == 0) return 0;
@@ -1566,39 +1620,66 @@ void h2_server_attach_response(connection_t* connection, httprequest_t* request,
     }
 }
 
+/* Handler thread: push the finished response onto the session's publish queue,
+ * wake the worker, and re-arm. The stream-table walk is NOT done here — it runs
+ * in the worker's drain (h2_publish_drain), so the handler never touches session
+ * internals under the connection lock (docs/concurrency/01 §4.1, §2.3). The push
+ * uses only the queue's own short lock; connection_s_lock is taken for the re-arm
+ * alone. handler_pending is left set until the drain, which keeps the owning
+ * stream (and the response this entry points at) alive across the handoff. */
+static int h2_publish_push(h2session_t* s, httpresponse_t* response) {
+    cqueue_lock(s->publish_queue);
+    const int ok = cqueue_append(s->publish_queue, response);
+    cqueue_unlock(s->publish_queue);
+    return ok;
+}
+
 int h2_server_response_ready(connection_t* connection, httpresponse_t* response) {
     connection_server_ctx_t* ctx = connection->ctx;
     h2session_t* s = h2_session_of(connection);
-    if (s == NULL) return 0;
-
-    h2stream_t* stream = h2stream_find_by_response(s, response);
-    if (stream == NULL) {
-        /* The stream went away before its response was ready and nothing else
-         * owns it now. */
+    if (s == NULL) {
         httpresponse_free(response);
         return connection_after_read(connection);
     }
 
-    atomic_store_explicit(&stream->handler_pending, 0, memory_order_release);
-
-    if (atomic_load_explicit(&stream->cancelled, memory_order_acquire)) {
-        h2_session_drop_stream(s, stream);
-        return connection_after_read(connection);
+    if (!h2_publish_push(s, response)) {
+        /* Queue-item allocation failed (OOM): publish inline rather than strand
+         * the response. The caller does not hold connection_s_lock for h2 (see
+         * __publish_response), and h2_publish_one mutates the stream table, so
+         * take the lock here — this is exactly the old under-lock path. */
+        connection_s_lock(connection, LOCK_SITE_H2_PUBLISH);
+        h2_publish_one(s, response);
+        connection_s_unlock(connection);
     }
 
-    /* The publication (docs/concurrency/00 §4.2): release-store so that the
-     * write path, which loads this with acquire, cannot observe the flag
-     * before the response body and headers the handler just wrote. */
-    atomic_store_explicit(&stream->response_ready, 1, memory_order_release);
     atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
 
-    /* No chain to drive any more. This used to hand the worker slot on to the
-     * next queued handler, because a connection sat in the global queue only
-     * once and its items had to be walked one after another. With fan-out
-     * dispatch (connection_queue_append_parallel) every item already has its own
-     * queue entry and its own worker, so re-queueing here would only add a
-     * spurious wake-up. docs/concurrency/00 §5.2. */
-    return connection_after_read(connection);
+    /* The only thing that stays under connection_s_lock: the re-arm. It reads
+     * ctx->detached, which connection_close_locked sets under the same lock, so
+     * the test cannot go stale against epoll_ctl (00 §4.6, bug #2). */
+    connection_s_lock(connection, LOCK_SITE_H2_REARM);
+    const int r = connection_after_read(connection);
+    connection_s_unlock(connection);
+
+    return r;
+}
+
+int h2_server_publish_inline(connection_t* connection, httpresponse_t* response) {
+    connection_server_ctx_t* ctx = connection->ctx;
+    h2session_t* s = h2_session_of(connection);
+    if (s == NULL) {
+        httpresponse_free(response);
+        return 1;
+    }
+
+    /* The worker is on the read path, holding connection_s_lock and sole owner
+     * of the stream table, so skip the queue and publish straight to the stream.
+     * No re-arm here: h2_drain_and_rearm at the end of h2_read sees the stream
+     * become writable (h2_has_writable) and arms EPOLLOUT itself. */
+    h2_publish_one(s, response);
+    atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
+
+    return 1;
 }
 
 /* ======================================================================= *
@@ -1755,7 +1836,8 @@ static h2session_t* h2_session_begin(connection_t* connection) {
     s->read_buf = malloc(s->read_cap);
     s->decoder = hpack_decoder_create(4096);
     s->encoder = hpack_encoder_create(4096);
-    if (s->read_buf == NULL || s->decoder == NULL || s->encoder == NULL) {
+    s->publish_queue = cqueue_create();
+    if (s->read_buf == NULL || s->decoder == NULL || s->encoder == NULL || s->publish_queue == NULL) {
         h2_session_free(s);
         return NULL;
     }
@@ -1977,6 +2059,10 @@ void h2_session_free(void* arg) {
     h2session_t* s = arg;
 
     h2stream_free_all(s);
+
+    /* The publish queue holds response pointers the streams above already
+     * owned and freed, so free only the queue wrappers — never the data. */
+    cqueue_free(s->publish_queue);
 
     free(s->read_buf);
     free(s->cont);
