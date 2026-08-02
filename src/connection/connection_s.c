@@ -405,6 +405,7 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
     ctx->response = NULL;
     ctx->queue = cqueue_create();
     ctx->broadcast_queue = cqueue_create();
+    ctx->write_queue = cqueue_create();
     ctx->switch_to_protocol.fn = NULL;
     ctx->switch_to_protocol.data = NULL;
     ctx->switch_to_protocol.data_free = NULL;
@@ -415,9 +416,10 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
             ctx->server = item->data;
     }
 
-    if (ctx->queue == NULL || ctx->broadcast_queue == NULL) {
+    if (ctx->queue == NULL || ctx->broadcast_queue == NULL || ctx->write_queue == NULL) {
         cqueue_free(ctx->queue);
         cqueue_free(ctx->broadcast_queue);
+        cqueue_free(ctx->write_queue);
         free(ctx);
         return NULL;
     }
@@ -456,6 +458,19 @@ static void __ctx_queue_item_free_callback(void* data) {
     item->free(item);
 }
 
+/* Slots left in the output order when the connection died: some hold a response
+ * nobody got to write, some were never filled because their handler was
+ * discarded with the queue. Both are ours to release. */
+static void __ctx_out_slot_free_callback(void* data) {
+    if (data == NULL) return;
+
+    connection_out_slot_t* slot = data;
+    if (slot->response != NULL)
+        slot->response->free(slot->response);
+
+    free(slot);
+}
+
 void __ctx_free(void* arg) {
     connection_server_ctx_t* ctx = arg;
 
@@ -465,6 +480,7 @@ void __ctx_free(void* arg) {
     // Освобождаем очереди с callback'ом для освобождения item'ов
     cqueue_freecb(ctx->queue, __ctx_queue_item_free_callback);
     cqueue_freecb(ctx->broadcast_queue, __ctx_queue_item_free_callback);
+    cqueue_freecb(ctx->write_queue, __ctx_out_slot_free_callback);
 
     request_t* request = ctx->request;
     if (request != NULL) {

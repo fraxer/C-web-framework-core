@@ -34,6 +34,19 @@ typedef struct switch_to_protocol {
     void* data;
 } switch_to_protocol_t;
 
+/* One place in a connection's output order.
+ *
+ * Reserved (empty) when a message is dispatched and filled when its response is
+ * ready, so handlers may finish in any order while their frames still leave in
+ * the order the messages arrived. Only the WebSocket write path interprets the
+ * response; the struct is declared here so the connection layer can drain
+ * ctx->write_queue at teardown through the generic response_t::free.
+ *
+ * docs/concurrency/00 §4.4. */
+typedef struct connection_out_slot {
+    response_t* response; /* NULL until the producer publishes */
+} connection_out_slot_t;
+
 typedef struct {
     connection_ctx_t base;
 
@@ -44,6 +57,10 @@ typedef struct {
     void* response;
     cqueue_t* queue;
     cqueue_t* broadcast_queue;
+    /* Ordered output slots (connection_out_slot_t*), WebSocket only. HTTP/1.1
+     * has one response in flight and HTTP/2 keeps responses on the stream, so
+     * neither needs it — it stays empty for both. */
+    cqueue_t* write_queue;
 
     switch_to_protocol_t switch_to_protocol;
 

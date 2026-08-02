@@ -8,6 +8,7 @@
 #include "log.h"
 #include "broadcast.h"
 #include "websocketsresponse.h"
+#include "websocketsserverhandlers.h"
 
 /*
  * Модель блокировок:
@@ -331,26 +332,26 @@ int __broadcast_batch_append(char** buffer, size_t* size, size_t* capacity, cons
     return 1;
 }
 
-/* Runs under connection_s_lock, taken here rather than by the worker: the batch
- * drain writes conn_ctx->response and walks broadcast_queue, and the whole thing
- * has to look atomic to the write path. */
+/* Runs without connection_s_lock: the batch is built into a response of its own
+ * and only handed over at the end (websockets_response_post), so nothing here
+ * has to look atomic to the write path. It used to build into
+ * conn_ctx->response, which is why the lock had to span the whole drain —
+ * docs/concurrency/00 §4.4. */
 void __broadcast_queue_request_handler(void* arg) {
     connection_queue_item_t* first_item = arg;
     connection_t* connection = first_item->connection;
     connection_server_ctx_t* conn_ctx = connection->ctx;
 
-    connection_s_lock(connection);
-
     websocketsresponse_t* response = websocketsresponse_create(connection);
     if (response == NULL) {
         // TODO: close connection, return error
         atomic_store(&conn_ctx->destroyed, 1);
+
+        connection_s_lock(connection);
         connection_after_read(connection);
         connection_s_unlock(connection);
         return;
     }
-
-    conn_ctx->response = response;
 
     char* batch = NULL;
     size_t batch_size = 0;
@@ -365,7 +366,7 @@ void __broadcast_queue_request_handler(void* arg) {
         connection_queue_broadcast_data_t* data = (connection_queue_broadcast_data_t*)item->data;
 
         // обработчик строит один кадр в теле response
-        data->handler(conn_ctx->response, data->payload->data, data->payload->size);
+        data->handler(&response->base, data->payload->data, data->payload->size);
 
         size_t frame_size = 0;
         char* frame = websocketsresponse_detach_body(response, &frame_size);
@@ -384,8 +385,8 @@ void __broadcast_queue_request_handler(void* arg) {
         if (processed >= BROADCAST_BATCH_MESSAGES || batch_size >= BROADCAST_BATCH_BYTES)
             break;
 
-        // соединение залочено этим же runner'ом, продюсеры пишут под
-        // cqueue_lock — снимать под тем же локом безопасно
+        // продюсеры пишут в очередь под cqueue_lock — снимать под ним же
+        // безопасно и без connection_s_lock
         cqueue_lock(conn_ctx->broadcast_queue);
         connection_queue_item_t* next = cqueue_pop(conn_ctx->broadcast_queue);
         cqueue_unlock(conn_ctx->broadcast_queue);
@@ -398,9 +399,7 @@ void __broadcast_queue_request_handler(void* arg) {
 
     websocketsresponse_set_body(response, batch, batch_size);
 
-    connection_after_read(connection);
-
-    connection_s_unlock(connection);
+    websockets_response_post(response);
 }
 
 connection_queue_broadcast_data_t* __broadcast_queue_data_create(broadcast_payload_t* payload, void(*handle)(response_t*, const char*, size_t)) {
