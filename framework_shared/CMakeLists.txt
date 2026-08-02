@@ -12,7 +12,7 @@ add_library(cwfr_framework SHARED cwfr_framework.c)
 # database with its conditionally-enabled DB drivers.
 set(FW_LIBS
 	model database http misc protocols view storage session config connection
-	broadcast domain mimetype moduleloader multiplexing openssl ratelimiter
+	broadcast domain metrics mimetype moduleloader multiplexing openssl ratelimiter
 	redirect route server signal socket thread taskmanager middleware translation
 	http_client http_client_parsers http_server http_server_filters http_server_parsers
 	smtp smtp_client smtp_client_parsers websocket websocket_server websocket_server_parsers

@@ -5,6 +5,7 @@
 
 #include "log.h"
 #include "json.h"
+#include "metrics.h"
 #include "signal/signal.h"
 #include "threadhandler.h"
 #include "connection_queue.h"
@@ -30,11 +31,20 @@ void* thread_handler(void* arg) {
 
         connection_server_ctx_t* ctx = connection->ctx;
 
+        /* Read once per iteration, not once per instrumented point: a config
+         * reload could flip it between the begin and the end of a handler, and
+         * a half-counted handler would leave the in-flight gauges drifting. */
+        const int counted = metrics_enabled();
+
         /* cqueue_lock is now the only thing protecting these queues: it used to
          * be redundant next to connection_s_lock, and is not any more. */
         cqueue_lock(ctx->queue);
+        const int depth = counted ? cqueue_size(ctx->queue) : 0;
         connection_queue_item_t* item = cqueue_pop(ctx->queue);
         cqueue_unlock(ctx->queue);
+
+        if (counted)
+            metrics_queue_pop(depth);
 
         /* An empty handler queue is normal, not an error: the fan-out appends
          * one queue entry per item, and connection_after_write may add one more
@@ -47,8 +57,16 @@ void* thread_handler(void* arg) {
         }
 
         if (item != NULL) {
+            if (counted)
+                metrics_handler_begin(atomic_fetch_add_explicit(&ctx->handlers_inflight, 1, memory_order_relaxed) + 1);
+
             item->run(item);
             item->free(item);
+
+            if (counted) {
+                atomic_fetch_sub_explicit(&ctx->handlers_inflight, 1, memory_order_relaxed);
+                metrics_handler_end();
+            }
         }
 
         /* Only the reference is dropped here. Releasing the lock is no longer

@@ -82,6 +82,12 @@ typedef struct {
      * reaped. */
     atomic_bool detached;
     atomic_bool locked;
+    /* How many handlers of this connection are running right now. Maintained by
+     * thread_handler and read by nothing else — it exists so the metrics can
+     * answer "did the fan-out actually fan out on THIS connection", which a
+     * process-wide gauge cannot (docs/concurrency/00, phase D). Only updated
+     * while metrics are enabled, so it reads 0 otherwise. */
+    atomic_int handlers_inflight;
     /* A response is staged and needs an EPOLLOUT turn. Atomic, and deliberately
      * not a bitfield: it is set by whichever thread finished the response
      * (a handler thread, via __post_response / h2_server_response_ready) and

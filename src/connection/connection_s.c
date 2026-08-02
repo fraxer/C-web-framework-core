@@ -3,6 +3,7 @@
 #include <sched.h>
 
 #include "log.h"
+#include "metrics.h"
 #include "openssl.h"
 #include "connection_s.h"
 #include "connection_queue.h"
@@ -138,13 +139,23 @@ int connection_s_lock(connection_t* connection) {
 
     connection_server_ctx_t* ctx = connection->ctx;
 
+    _Bool expected = 0;
+    if (atomic_compare_exchange_weak(&ctx->locked, &expected, 1)) {
+        if (metrics_enabled())
+            metrics_lock_fast();
+
+        return 1;
+    }
+
+    /* Contended. The clock is read only on this path, and only when metrics are
+     * on: on the fast path above an unconditional clock_gettime pair would cost
+     * more than the lock itself (docs/concurrency/00, phase D). */
+    const int counted = metrics_enabled();
+    const uint64_t started_ns = counted ? metrics_now_ns() : 0;
+    unsigned yields = 0;
     unsigned spins = 0;
 
     for (;;) {
-        _Bool expected = 0;
-        if (atomic_compare_exchange_weak(&ctx->locked, &expected, 1))
-            return 1;
-
         /* Re-test with a plain load before trying the CAS again: the CAS writes
          * to the cache line whether or not it succeeds, so a crowd of waiters
          * looping on it ping-pongs the line between cores and starves the
@@ -156,9 +167,19 @@ int connection_s_lock(connection_t* connection) {
             }
 
             spins = 0;
+            yields++;
             sched_yield();
         }
+
+        expected = 0;
+        if (atomic_compare_exchange_weak(&ctx->locked, &expected, 1))
+            break;
     }
+
+    if (counted)
+        metrics_lock_slow(metrics_now_ns() - started_ns, yields);
+
+    return 1;
 }
 
 int connection_s_unlock(connection_t* connection) {
@@ -172,7 +193,11 @@ int connection_s_unlock(connection_t* connection) {
 }
 
 /* Non-blocking trylock for the timer sweep: a connection currently busy with a
- * handler or I/O is skipped this tick and revisited on the next one. */
+ * handler or I/O is skipped this tick and revisited on the next one.
+ *
+ * Deliberately not counted in the lock metrics: it never waits, so it has no
+ * wait time to report, and folding its attempts into the acquisition count
+ * would skew the contention ratio with a per-tick sweep that is not contention. */
 int connection_s_trylock(connection_t* connection) {
     if (connection == NULL) return 0;
 
@@ -398,6 +423,7 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
     atomic_store(&ctx->ref_count, 1);
     atomic_store(&ctx->broadcast_ref_count, 1);
     atomic_store(&ctx->locked, 0);
+    atomic_store(&ctx->handlers_inflight, 0);
     ctx->listener = listener;
     ctx->parser = NULL;
     ctx->server = NULL;
