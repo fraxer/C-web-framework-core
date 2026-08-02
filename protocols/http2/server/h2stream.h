@@ -17,6 +17,16 @@
  * The one thing that ordering does NOT rule out is a RST_STREAM arriving while
  * a handler is still queued, which is what `cancelled` is for. */
 
+/* Receive-side flow-control state of one flow — a stream, or the connection
+ * itself (RFC 9113 §6.9). Shared shape so one tuner serves both; see
+ * h2_recv_credit() in h2session.c. */
+typedef struct {
+    int64_t  size;      /* window currently advertised to the peer */
+    int64_t  pending;   /* consumed by the peer, not yet given back */
+    int64_t  bytes;     /* received since epoch_ms — the rate sample */
+    uint64_t epoch_ms;  /* start of the current rate sample (CLOCK_MONOTONIC) */
+} h2_recv_window_t;
+
 typedef enum {
     H2_STREAM_IDLE = 0,
     H2_STREAM_OPEN,               /* HEADERS received, END_STREAM not yet */
@@ -37,8 +47,8 @@ typedef struct h2stream {
      * SETTINGS_INITIAL_WINDOW_SIZE decrease may drive it negative, which is
      * legal and must not wrap. */
     int64_t send_window;
-    /* Receive side: bytes consumed but not yet returned with WINDOW_UPDATE. */
-    int64_t recv_pending;
+    /* Receive side: advertised window plus the counters that auto-scale it. */
+    h2_recv_window_t recv;
 
     size_t  req_body_len;   /* DATA bytes spooled into request->payload_.file */
     int64_t content_length; /* declared, or -1 when the request carried none */
