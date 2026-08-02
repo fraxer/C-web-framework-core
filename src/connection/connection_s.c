@@ -134,15 +134,17 @@ static inline void __cpu_relax(void) {
  * burning a core is pure waste. */
 #define CONNECTION_LOCK_SPINS 128
 
-int connection_s_lock(connection_t* connection) {
+int connection_s_lock(connection_t* connection, metrics_lock_site_t site) {
     if (connection == NULL) return 0;
 
     connection_server_ctx_t* ctx = connection->ctx;
 
     _Bool expected = 0;
     if (atomic_compare_exchange_weak(&ctx->locked, &expected, 1)) {
-        if (metrics_enabled())
-            metrics_lock_fast();
+        if (metrics_enabled()) {
+            atomic_store_explicit(&ctx->lock_site, site, memory_order_relaxed);
+            metrics_lock_fast(site);
+        }
 
         return 1;
     }
@@ -152,6 +154,11 @@ int connection_s_lock(connection_t* connection) {
      * more than the lock itself (docs/concurrency/00, phase D). */
     const int counted = metrics_enabled();
     const uint64_t started_ns = counted ? metrics_now_ns() : 0;
+    /* Who is in the way, sampled once at the start of the wait. Reading it again
+     * later would name whoever happened to hold the lock at the end, which is not
+     * the section that caused this wait. */
+    const metrics_lock_site_t blocker = counted ?
+        (metrics_lock_site_t)atomic_load_explicit(&ctx->lock_site, memory_order_relaxed) : LOCK_SITE_OTHER;
     unsigned yields = 0;
     unsigned spins = 0;
 
@@ -176,8 +183,10 @@ int connection_s_lock(connection_t* connection) {
             break;
     }
 
-    if (counted)
-        metrics_lock_slow(metrics_now_ns() - started_ns, yields);
+    if (counted) {
+        atomic_store_explicit(&ctx->lock_site, site, memory_order_relaxed);
+        metrics_lock_slow(site, blocker, metrics_now_ns() - started_ns, yields);
+    }
 
     return 1;
 }
@@ -204,7 +213,15 @@ int connection_s_trylock(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
 
     _Bool expected = 0;
-    return atomic_compare_exchange_strong(&ctx->locked, &expected, 1);
+    if (!atomic_compare_exchange_strong(&ctx->locked, &expected, 1))
+        return 0;
+
+    /* Not counted, but the sweep does hold the lock: without this a waiter that
+     * piles up behind a tick would be charged to whichever site held it last. */
+    if (metrics_enabled())
+        atomic_store_explicit(&ctx->lock_site, LOCK_SITE_TICK, memory_order_relaxed);
+
+    return 1;
 }
 
 void connection_s_inc(connection_t* connection) {
@@ -374,7 +391,7 @@ int connection_after_read(connection_t* connection) {
 }
 
 int connection_close(connection_t* connection) {
-    connection_s_lock(connection);
+    connection_s_lock(connection, LOCK_SITE_CLOSE);
     return connection_close_locked(connection);
 }
 
@@ -423,6 +440,7 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
     atomic_store(&ctx->ref_count, 1);
     atomic_store(&ctx->broadcast_ref_count, 1);
     atomic_store(&ctx->locked, 0);
+    atomic_store(&ctx->lock_site, LOCK_SITE_OTHER);
     atomic_store(&ctx->handlers_inflight, 0);
     ctx->listener = listener;
     ctx->parser = NULL;

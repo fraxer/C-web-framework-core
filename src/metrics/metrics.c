@@ -21,13 +21,38 @@ static const char* const __wait_bucket_name[METRICS_WAIT_BUCKETS] = {
     "<1us", "<10us", "<100us", "<1ms", "<10ms", ">=10ms"
 };
 
+/* Index-matched to metrics_lock_site_t. Kept next to the enum's comment, not
+ * generated from it: the names go into JSON that benchmark notes quote verbatim,
+ * so they are worth spelling out. */
+static const char* const __lock_site_name[LOCK_SITE__COUNT] = {
+    "other",
+    "h2.read", "h2.write", "h2.publish",
+    "http.read", "http.write", "http.dispatch", "http.publish",
+    "ws.read", "ws.write", "ws.reserve", "ws.publish",
+    "broadcast",
+    "close",
+    "tick"
+};
+
+/* One of these per call site. The totals reported under `lock` are summed from
+ * them at snapshot time rather than kept in their own counters: a second set of
+ * atomics would double the read-modify-writes on the lock path to save an
+ * addition over a dozen slots on a path taken once per HTTP request. */
 typedef struct {
-    atomic_ullong lock_acquired;
-    atomic_ullong lock_contended;
-    atomic_ullong lock_yields;
-    atomic_ullong lock_wait_ns;
-    atomic_ullong lock_wait_ns_max;
-    atomic_ullong lock_wait_hist[METRICS_WAIT_BUCKETS];
+    atomic_ullong acquired;
+    atomic_ullong contended;
+    atomic_ullong yields;
+    atomic_ullong wait_ns;
+    atomic_ullong wait_ns_max;
+    atomic_ullong wait_hist[METRICS_WAIT_BUCKETS];
+} lock_site_metrics_t;
+
+typedef struct {
+    lock_site_metrics_t lock_site[LOCK_SITE__COUNT];
+    /* Same shape, different question: indexed by the site that was holding the
+     * lock, so only the wait fields are filled — `acquired` stays zero and is
+     * not reported for these. */
+    lock_site_metrics_t lock_blocker[LOCK_SITE__COUNT];
 
     atomic_ullong handler_runs;
     atomic_int handler_inflight;
@@ -97,19 +122,44 @@ void metrics_init(int enabled) {
         atomic_store_explicit(&__m.window_started_ns, metrics_now_ns(), memory_order_relaxed);
 }
 
-void metrics_lock_fast(void) {
-    atomic_fetch_add_explicit(&__m.lock_acquired, 1, memory_order_relaxed);
+/* An out-of-range tag is folded into "other" instead of being trusted as an
+ * index: the value crosses a library boundary, and a stray one would corrupt
+ * neighbouring counters rather than announce itself. */
+static lock_site_metrics_t* __site_slot(lock_site_metrics_t* array, metrics_lock_site_t site) {
+    if (site < 0 || site >= LOCK_SITE__COUNT)
+        return &array[LOCK_SITE_OTHER];
+
+    return &array[site];
 }
 
-void metrics_lock_slow(uint64_t wait_ns, unsigned yields) {
-    atomic_fetch_add_explicit(&__m.lock_acquired, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&__m.lock_contended, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&__m.lock_wait_ns, wait_ns, memory_order_relaxed);
-    atomic_fetch_add_explicit(&__m.lock_wait_hist[__wait_bucket(wait_ns)], 1, memory_order_relaxed);
-    __max_ull(&__m.lock_wait_ns_max, wait_ns);
+static lock_site_metrics_t* __lock_site(metrics_lock_site_t site) {
+    return __site_slot(__m.lock_site, site);
+}
+
+void metrics_lock_fast(metrics_lock_site_t site) {
+    atomic_fetch_add_explicit(&__lock_site(site)->acquired, 1, memory_order_relaxed);
+}
+
+void metrics_lock_slow(metrics_lock_site_t site, metrics_lock_site_t blocker, uint64_t wait_ns, unsigned yields) {
+    const int bucket = __wait_bucket(wait_ns);
+
+    lock_site_metrics_t* m = __lock_site(site);
+
+    atomic_fetch_add_explicit(&m->acquired, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&m->contended, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&m->wait_ns, wait_ns, memory_order_relaxed);
+    atomic_fetch_add_explicit(&m->wait_hist[bucket], 1, memory_order_relaxed);
+    __max_ull(&m->wait_ns_max, wait_ns);
 
     if (yields > 0)
-        atomic_fetch_add_explicit(&__m.lock_yields, yields, memory_order_relaxed);
+        atomic_fetch_add_explicit(&m->yields, yields, memory_order_relaxed);
+
+    lock_site_metrics_t* b = __site_slot(__m.lock_blocker, blocker);
+
+    atomic_fetch_add_explicit(&b->contended, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&b->wait_ns, wait_ns, memory_order_relaxed);
+    atomic_fetch_add_explicit(&b->wait_hist[bucket], 1, memory_order_relaxed);
+    __max_ull(&b->wait_ns_max, wait_ns);
 }
 
 void metrics_handler_begin(int inflight) {
@@ -154,16 +204,71 @@ static json_token_t* __hist_json(atomic_ullong* values, const char* const* names
     return object;
 }
 
+/* One lock object's numbers, loaded: a single site, a single blocker, or a sum
+ * over either. */
+typedef struct {
+    unsigned long long acquired;
+    unsigned long long contended;
+    unsigned long long yields;
+    unsigned long long wait_ns;
+    unsigned long long wait_ns_max;
+    unsigned long long wait_hist[METRICS_WAIT_BUCKETS];
+} lock_totals_t;
+
+static void __lock_totals_add(lock_totals_t* into, lock_site_metrics_t* from) {
+    into->acquired += __load(&from->acquired);
+    into->contended += __load(&from->contended);
+    into->yields += __load(&from->yields);
+    into->wait_ns += __load(&from->wait_ns);
+
+    const unsigned long long max = __load(&from->wait_ns_max);
+    if (max > into->wait_ns_max)
+        into->wait_ns_max = max;
+
+    for (int i = 0; i < METRICS_WAIT_BUCKETS; i++)
+        into->wait_hist[i] += __load(&from->wait_hist[i]);
+}
+
+/* Values already loaded, so a site object and the totals object are built by the
+ * same code and cannot drift in shape. `blocker` drops the acquisition-side
+ * fields, which are meaningless for a slot indexed by who was holding: nobody
+ * counted an acquisition there, only the waits it caused. Returns NULL on
+ * allocation failure; the caller decides whether that is fatal. */
+static json_token_t* __lock_json(const lock_totals_t* t, int blocker) {
+    json_token_t* object = json_create_object();
+    if (object == NULL) return NULL;
+
+    if (blocker)
+        json_object_set(object, "waits_caused", json_create_number((long double)t->contended));
+    else {
+        json_object_set(object, "acquisitions", json_create_number((long double)t->acquired));
+        json_object_set(object, "contended", json_create_number((long double)t->contended));
+        json_object_set(object, "contention_ratio", json_create_number(t->acquired == 0 ? 0.0L : (long double)t->contended / (long double)t->acquired));
+        json_object_set(object, "yields", json_create_number((long double)t->yields));
+    }
+
+    json_object_set(object, "wait_ns_total", json_create_number((long double)t->wait_ns));
+    json_object_set(object, "wait_ns_max", json_create_number((long double)t->wait_ns_max));
+    /* Averaged over contended acquisitions only: mixing in the uncontended ones
+     * would divide by a number so much larger that any real stall disappears. */
+    json_object_set(object, "wait_ns_avg_contended", json_create_number(t->contended == 0 ? 0.0L : (long double)t->wait_ns / (long double)t->contended));
+
+    json_token_t* hist = json_create_object();
+    if (hist != NULL)
+        for (int i = 0; i < METRICS_WAIT_BUCKETS; i++)
+            json_object_set(hist, __wait_bucket_name[i], json_create_number((long double)t->wait_hist[i]));
+
+    json_object_set(object, "wait_hist", hist);
+
+    return object;
+}
+
 json_doc_t* metrics_snapshot_json(void) {
     json_doc_t* doc = json_root_create_object();
     if (doc == NULL) return NULL;
 
     const unsigned long long started_ns = __load(&__m.window_started_ns);
     const unsigned long long window_ns = started_ns == 0 ? 0 : metrics_now_ns() - started_ns;
-
-    const unsigned long long acquired = __load(&__m.lock_acquired);
-    const unsigned long long contended = __load(&__m.lock_contended);
-    const unsigned long long wait_ns = __load(&__m.lock_wait_ns);
 
     const unsigned long long pops = __load(&__m.queue_pops);
     const unsigned long long depth_sum = __load(&__m.queue_depth_sum);
@@ -175,22 +280,39 @@ json_doc_t* metrics_snapshot_json(void) {
     /* Every sub-object is checked before it is filled: json_object_set drops the
      * value token when the object is NULL, so filling a failed object would leak
      * one token per field. */
-    json_token_t* lock = json_create_object();
+    lock_totals_t totals = {0};
+    lock_totals_t site_totals[LOCK_SITE__COUNT] = {{0}};
+    lock_totals_t blocker_totals[LOCK_SITE__COUNT] = {{0}};
+
+    for (int i = 0; i < LOCK_SITE__COUNT; i++) {
+        __lock_totals_add(&site_totals[i], &__m.lock_site[i]);
+        __lock_totals_add(&totals, &__m.lock_site[i]);
+        __lock_totals_add(&blocker_totals[i], &__m.lock_blocker[i]);
+    }
+
+    json_token_t* lock = __lock_json(&totals, 0);
     if (lock == NULL) {
         json_free(doc);
         return NULL;
     }
 
-    json_object_set(lock, "acquisitions", json_create_number((long double)acquired));
-    json_object_set(lock, "contended", json_create_number((long double)contended));
-    json_object_set(lock, "contention_ratio", json_create_number(acquired == 0 ? 0.0L : (long double)contended / (long double)acquired));
-    json_object_set(lock, "yields", json_create_number((long double)__load(&__m.lock_yields)));
-    json_object_set(lock, "wait_ns_total", json_create_number((long double)wait_ns));
-    json_object_set(lock, "wait_ns_max", json_create_number((long double)__load(&__m.lock_wait_ns_max)));
-    /* Averaged over contended acquisitions only: mixing in the uncontended ones
-     * would divide by a number so much larger that any real stall disappears. */
-    json_object_set(lock, "wait_ns_avg_contended", json_create_number(contended == 0 ? 0.0L : (long double)wait_ns / (long double)contended));
-    json_object_set(lock, "wait_hist", __hist_json(__m.lock_wait_hist, __wait_bucket_name, METRICS_WAIT_BUCKETS));
+    /* Sites that never fired are left out: with a dozen tags and one protocol
+     * under test, printing them all buries the three lines being read. */
+    json_token_t* sites = json_create_object();
+    if (sites != NULL)
+        for (int i = 0; i < LOCK_SITE__COUNT; i++)
+            if (site_totals[i].acquired != 0)
+                json_object_set(sites, __lock_site_name[i], __lock_json(&site_totals[i], 0));
+
+    json_object_set(lock, "sites", sites);
+
+    json_token_t* blockers = json_create_object();
+    if (blockers != NULL)
+        for (int i = 0; i < LOCK_SITE__COUNT; i++)
+            if (blocker_totals[i].contended != 0)
+                json_object_set(blockers, __lock_site_name[i], __lock_json(&blocker_totals[i], 1));
+
+    json_object_set(lock, "blocked_by", blockers);
     json_object_set(root, "lock", lock);
 
     json_token_t* handlers = json_create_object();
@@ -223,14 +345,22 @@ json_doc_t* metrics_snapshot_json(void) {
 }
 
 void metrics_reset(void) {
-    atomic_store_explicit(&__m.lock_acquired, 0, memory_order_relaxed);
-    atomic_store_explicit(&__m.lock_contended, 0, memory_order_relaxed);
-    atomic_store_explicit(&__m.lock_yields, 0, memory_order_relaxed);
-    atomic_store_explicit(&__m.lock_wait_ns, 0, memory_order_relaxed);
-    atomic_store_explicit(&__m.lock_wait_ns_max, 0, memory_order_relaxed);
+    for (int s = 0; s < LOCK_SITE__COUNT; s++) {
+        lock_site_metrics_t* pair[2] = { &__m.lock_site[s], &__m.lock_blocker[s] };
 
-    for (int i = 0; i < METRICS_WAIT_BUCKETS; i++)
-        atomic_store_explicit(&__m.lock_wait_hist[i], 0, memory_order_relaxed);
+        for (int p = 0; p < 2; p++) {
+            lock_site_metrics_t* m = pair[p];
+
+            atomic_store_explicit(&m->acquired, 0, memory_order_relaxed);
+            atomic_store_explicit(&m->contended, 0, memory_order_relaxed);
+            atomic_store_explicit(&m->yields, 0, memory_order_relaxed);
+            atomic_store_explicit(&m->wait_ns, 0, memory_order_relaxed);
+            atomic_store_explicit(&m->wait_ns_max, 0, memory_order_relaxed);
+
+            for (int i = 0; i < METRICS_WAIT_BUCKETS; i++)
+                atomic_store_explicit(&m->wait_hist[i], 0, memory_order_relaxed);
+        }
+    }
 
     atomic_store_explicit(&__m.handler_runs, 0, memory_order_relaxed);
     /* handler_inflight is a gauge with live holders — see the header. */

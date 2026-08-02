@@ -28,6 +28,44 @@
  * ordering between them buys nothing and the read-modify-write is what costs.
  */
 
+/* Where connection_s_lock was taken (docs/concurrency/01, phase A).
+ *
+ * Phase D counted waits in one pile, which was enough to see that the
+ * distribution has two humps but not to say what sits under the second one. A
+ * tag per acquisition splits the same histogram by call site, so "publication
+ * waits behind I/O" becomes something the counters state rather than something
+ * the code review guesses. It is also what turned up the section that pile had
+ * been hiding — an empty-for-h2 dispatch lock costing more than every I/O guard
+ * together (`01` §6 A.4).
+ *
+ * Semantic names, not __FILE__:__LINE__: the phases of `01` are accepted per
+ * tag ("the hump on the read/write tags is gone"), and a tag that moves with an
+ * unrelated edit above it cannot carry that. LOCK_SITE_OTHER is the fallback for
+ * paths nobody has looked at yet — a non-trivial count there means the split is
+ * incomplete, so it is worth reading. */
+typedef enum {
+    LOCK_SITE_OTHER = 0,
+    LOCK_SITE_H2_READ,          /* h2_server_guard_read  — recv + frame parse + dispatch */
+    LOCK_SITE_H2_WRITE,         /* h2_server_guard_write — framing + send */
+    LOCK_SITE_H2_PUBLISH,       /* handler thread publishing an h2 response */
+    LOCK_SITE_HTTP_READ,        /* http_server_guard_read */
+    LOCK_SITE_HTTP_WRITE,       /* http_server_guard_write */
+    LOCK_SITE_HTTP_DISPATCH,    /* binding request/response before user code runs */
+    LOCK_SITE_HTTP_PUBLISH,     /* handler thread publishing an h1.1 response */
+    LOCK_SITE_WS_READ,          /* websockets_guard_read */
+    LOCK_SITE_WS_WRITE,         /* websockets_guard_write */
+    LOCK_SITE_WS_RESERVE,       /* reserving a place in the ws output order */
+    LOCK_SITE_WS_PUBLISH,       /* filling a reserved ws slot + re-arm */
+    LOCK_SITE_BROADCAST,        /* broadcast batch runner */
+    LOCK_SITE_CLOSE,            /* connection_close / listener teardown */
+    /* The timer sweep. Never counted as an acquisition — connection_s_trylock
+     * does not wait, and folding a per-second sweep into the totals would dilute
+     * the contention ratio — but it does hold the lock, so it has to be nameable
+     * as a blocker. */
+    LOCK_SITE_TICK,
+    LOCK_SITE__COUNT
+} metrics_lock_site_t;
+
 /* Not for direct use — read it through metrics_enabled(). */
 extern atomic_int __metrics_on;
 
@@ -43,13 +81,20 @@ void metrics_init(int enabled);
 uint64_t metrics_now_ns(void);
 
 /* connection_s_lock acquired on the first CAS — no waiting. */
-void metrics_lock_fast(void);
+void metrics_lock_fast(metrics_lock_site_t site);
 
 /* connection_s_lock acquired after contention: `wait_ns` is the time from the
  * failed first CAS to the successful one, `yields` how many times the waiter
  * gave up its slice in between (a non-zero count means someone held the lock for
- * longer than the spin budget). */
-void metrics_lock_slow(uint64_t wait_ns, unsigned yields);
+ * longer than the spin budget).
+ *
+ * Two tags, because one does not answer the question: `site` is where the waiter
+ * asked for the lock, `blocker` is the site whose acquisition was in the way when
+ * the wait began. Waiter alone says which paths are slow to get in; blocker is
+ * what names the section that has to be shortened. The holder may change while
+ * the wait runs, so `blocker` is the first one observed — for a wait long enough
+ * to matter, that is the one that caused it. */
+void metrics_lock_slow(metrics_lock_site_t site, metrics_lock_site_t blocker, uint64_t wait_ns, unsigned yields);
 
 /* One item taken from ctx->queue. `inflight` is how many handlers of that
  * connection are now running, this one included. */

@@ -468,7 +468,7 @@ TEST(test_connection_s_create_local_and_free_local) {
 TEST(test_connection_s_lock_unlock) {
     TEST_CASE("connection_s_lock/unlock toggle ctx->locked, NULL-safe");
 
-    TEST_ASSERT_EQUAL(0, connection_s_lock(NULL), "lock(NULL) returns 0");
+    TEST_ASSERT_EQUAL(0, connection_s_lock(NULL, LOCK_SITE_OTHER), "lock(NULL) returns 0");
     TEST_ASSERT_EQUAL(0, connection_s_unlock(NULL), "unlock(NULL) returns 0");
 
     conn_harness_t h;
@@ -476,7 +476,7 @@ TEST(test_connection_s_lock_unlock) {
 
     connection_server_ctx_t* ctx = h.conn->ctx;
 
-    TEST_ASSERT_EQUAL(1, connection_s_lock(h.conn), "lock returns 1");
+    TEST_ASSERT_EQUAL(1, connection_s_lock(h.conn, LOCK_SITE_OTHER), "lock returns 1");
     TEST_ASSERT_EQUAL(1, atomic_load(&ctx->locked), "locked flag set");
 
     TEST_ASSERT_EQUAL(1, connection_s_unlock(h.conn), "unlock returns 1");
