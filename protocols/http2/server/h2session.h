@@ -157,6 +157,13 @@ void h2_upgrade_settings_free(void* data);
  * 101 is staged and the handler must not run), or 0 for an ordinary request. */
 int h2c_upgrade(httpctx_t* ctx);
 
+/* Read the process-wide h2 policy (idle timeout, PING watchdog, receive window,
+ * write quantum) from main.env. Call once per config load, after the config is
+ * readable and BEFORE any worker or handler thread exists — the values are
+ * plain globals, and that ordering is the only thing making them safe to read
+ * from every thread afterwards. Until it runs, the built-in defaults apply. */
+void h2_policy_init(void);
+
 int h2_server_guard_read(connection_t* connection);
 int h2_server_guard_write(connection_t* connection);
 
