@@ -226,7 +226,11 @@ int connection_after_write(connection_t* connection) {
     const int broadcast_empty = cqueue_empty(ctx->broadcast_queue);
     cqueue_unlock(ctx->broadcast_queue);
 
-    if (!cqueue_empty(ctx->queue) || !broadcast_empty) {
+    cqueue_lock(ctx->queue);
+    const int handlers_empty = cqueue_empty(ctx->queue);
+    cqueue_unlock(ctx->queue);
+
+    if (!handlers_empty || !broadcast_empty) {
         connection_queue_guard_append(connection);
         return ctx->listener->api->control_mod(connection, MPXONESHOT);
     }
@@ -252,6 +256,36 @@ int connection_after_write(connection_t* connection) {
     return ctx->listener->api->control_mod(connection, MPXIN | MPXRDHUP);
 }
 
+/* Take the connection out of epoll for the duration of the queued work.
+ *
+ * broadcast_ref_count doubles as the parked flag: 1 = live in epoll, 2 = parked.
+ * Idempotent — only the caller that wins the CAS issues the epoll_ctl, everyone
+ * after it finds the connection already parked and has nothing to do. Returns 0
+ * only when the epoll_ctl itself failed, and then leaves the flag as it was.
+ *
+ * Parking is deliberately separate from queueing (docs/concurrency/00 §5.2):
+ * the fd is parked once, but the connection may be queued several times over,
+ * once per pending item. */
+static int __park(connection_t* connection) {
+    connection_server_ctx_t* ctx = connection->ctx;
+
+    int expected = 1;
+    if (!atomic_compare_exchange_strong(&ctx->broadcast_ref_count, &expected, 2))
+        return 1; /* somebody else parked it already */
+
+    if (!ctx->listener->api->control_mod(connection, MPXONESHOT)) {
+        atomic_store(&ctx->broadcast_ref_count, 1);
+        return 0;
+    }
+
+    return 1;
+}
+
+/* Serialized dispatch: park, and queue the connection only if it is not queued
+ * already. One entry means one worker at a time, and the next item gets its turn
+ * from the chain that connection_after_write / the runner drives. This is what
+ * HTTP/1.1 and WebSocket want — both keep exactly one request in flight per
+ * connection, and h1.1 responses have to leave in request order anyway. */
 int connection_queue_append(connection_queue_item_t* item) {
     connection_server_ctx_t* ctx = item->connection->ctx;
 
@@ -264,6 +298,24 @@ int connection_queue_append(connection_queue_item_t* item) {
         atomic_store(&ctx->broadcast_ref_count, 1);
         return 0;
     }
+
+    connection_queue_guard_append_item(item);
+    return 1;
+}
+
+/* Fan-out dispatch: park (once), then queue the connection for *this* item
+ * regardless of whether it is queued already. N pending items become N queue
+ * entries and go to N workers, which is the whole point of
+ * docs/concurrency/00 §5.2 — without it, narrowing the connection lock buys
+ * nothing, because a connection sitting in the queue once is only ever handed
+ * to one worker at a time.
+ *
+ * HTTP/2 only. Handlers of one h2 connection are independent: request and
+ * response live on the stream, and the write path serves whichever streams are
+ * ready, in any order. */
+int connection_queue_append_parallel(connection_queue_item_t* item) {
+    if (!__park(item->connection))
+        return 0;
 
     connection_queue_guard_append_item(item);
     return 1;
@@ -284,6 +336,15 @@ int connection_queue_append_broadcast(connection_t* connection) {
 int connection_after_read(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
 
+    /* Called by handler threads, under connection_s_lock — the same lock
+     * connection_close_locked holds while it detaches. Re-arming a detached
+     * connection would push this pointer into some other connection's epoll
+     * registration; see connection_server_ctx_t::detached. Reporting success is
+     * deliberate: there is nothing left to do and nothing went wrong, and the
+     * callers up the h2 stack turn a 0 into a connection error. */
+    if (atomic_load(&ctx->detached))
+        return 1;
+
     return ctx->listener->api->control_mod(connection, MPXOUT | MPXRDHUP);
 }
 
@@ -300,6 +361,10 @@ int connection_close_locked(connection_t* connection) {
 
     if (!ctx->listener->api->control_del(connection))
         log_error("Connection not removed from api\n");
+
+    /* From here the fd number may be recycled by the next accept(), so no epoll
+     * re-arm may reference this connection again. */
+    atomic_store(&ctx->detached, 1);
 
     if (connection->ssl != NULL) {
         SSL_shutdown(connection->ssl);
@@ -329,6 +394,7 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
     ctx->h2c_preface = 0;
     ctx->h2c_peeked = 0;
     atomic_store(&ctx->destroyed, 0);
+    atomic_store(&ctx->detached, 0);
     atomic_store(&ctx->ref_count, 1);
     atomic_store(&ctx->broadcast_ref_count, 1);
     atomic_store(&ctx->locked, 0);

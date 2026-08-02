@@ -19,33 +19,42 @@ void* thread_handler(void* arg) {
         if (atomic_load(&appconfig->shutdown))
             break;
 
-        // connection already locked
+        /* Handed over unlocked: taking connection_s_lock is the runner's job,
+         * for the state it actually touches. Several workers may be holding the
+         * same connection here at once — one per queued item — which is what
+         * makes handlers of one HTTP/2 connection run in parallel
+         * (docs/concurrency/00 §5). */
         connection_t* connection = connection_queue_guard_pop();
         if (connection == NULL)
             continue;
 
         connection_server_ctx_t* ctx = connection->ctx;
 
+        /* cqueue_lock is now the only thing protecting these queues: it used to
+         * be redundant next to connection_s_lock, and is not any more. */
         cqueue_lock(ctx->queue);
         connection_queue_item_t* item = cqueue_pop(ctx->queue);
         cqueue_unlock(ctx->queue);
 
-        if (item != NULL) {
-            item->run(item);
-            item->free(item);
-        } else {
+        /* An empty handler queue is normal, not an error: the fan-out appends
+         * one queue entry per item, and connection_after_write may add one more
+         * for a queue that a worker has meanwhile drained. Fall through to the
+         * broadcast queue and, failing that, just drop the reference. */
+        if (item == NULL) {
             cqueue_lock(ctx->broadcast_queue);
             item = cqueue_pop(ctx->broadcast_queue);
             cqueue_unlock(ctx->broadcast_queue);
-
-            if (item != NULL) {
-                item->run(item);
-                item->free(item);
-            }
         }
 
-        if (connection_s_dec(connection) == CONNECTION_DEC_RESULT_DECREMENT)
-            connection_s_unlock(connection);
+        if (item != NULL) {
+            item->run(item);
+            item->free(item);
+        }
+
+        /* Only the reference is dropped here. Releasing the lock is no longer
+         * tied to it (§4.7): the runner that took the lock released it, and this
+         * worker may not even have been the one holding it. */
+        connection_s_dec(connection);
     }
 
     appconfg_threads_decrement(appconfig);

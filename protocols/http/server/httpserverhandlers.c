@@ -19,6 +19,15 @@ typedef struct {
     httpresponse_t* response;
     connection_t* connection;
     ratelimiter_t* ratelimiter;
+    /* The virtual host this request resolved to, captured at dispatch time.
+     *
+     * ctx->server is per-connection but rewritten per request by
+     * httpparser_select_server, so reading it from the handler thread is both a
+     * data race and wrong: under h2 the worker may already have parsed a later
+     * request — possibly for a different :authority, hence a different vhost —
+     * on the same connection. The request's own server is the one its
+     * middlewares belong to. */
+    server_t* server;
 } connection_queue_http_data_t;
 
 struct middleware_item;
@@ -336,22 +345,37 @@ int __deferred_handler(connection_t* connection, httprequest_t* request, httpres
     }
 
     connection_server_ctx_t* ctx = connection->ctx;
-    const int queue_empty = cqueue_empty(ctx->queue);
 
-    if (!cqueue_append(ctx->queue, item)) {
+    /* h2 hands every item to its own worker; h1.1 keeps one request in flight
+     * and lets the chain pass the next one on (docs/concurrency/00 §5.2). */
+    const int parallel = ctx->is_http2;
+
+    /* ctx->queue used to be covered by connection_s_lock, which the worker held
+     * for the whole handler run. It does not any more, so the queue needs its
+     * own mutual exclusion — and the "was it empty" test has to be taken
+     * together with the append, or two dispatches both decide they were first. */
+    cqueue_lock(ctx->queue);
+    const int queue_empty = cqueue_empty(ctx->queue);
+    const int appended = cqueue_append(ctx->queue, item);
+    cqueue_unlock(ctx->queue);
+
+    if (!appended) {
         item->free(item);
         return 0;
     }
 
-    if (!queue_empty)
+    /* Past this point the item belongs to ctx->queue and must not be freed here
+     * — a worker may already be running it. */
+    if (!parallel && !queue_empty)
         return 1;
 
-    if (!connection_queue_append(item)) {
-        /* The item is already in ctx->queue: freeing it in place left a
-         * dangling pointer that the worker thread or __ctx_free freed again.
-         * It was appended to an empty queue, so pop takes this same item. */
-        cqueue_pop(ctx->queue);
-        item->free(item);
+    if (parallel ? !connection_queue_append_parallel(item) : !connection_queue_append(item)) {
+        /* The item cannot be taken back out: cqueue has no removal by identity,
+         * and under fan-out the head of the queue need not be the item we just
+         * appended. Failing here means epoll or an allocation gave up, so take
+         * the connection down instead and let __ctx_free drain the queue — the
+         * caller closes it on our 0. */
+        atomic_store(&ctx->destroyed, 1);
         return 0;
     }
 
@@ -589,6 +613,7 @@ void* __queue_data_request_create(connection_t* connection, httprequest_t* reque
     data->connection = connection;
     data->response = response;
     data->ratelimiter = ratelimiter;
+    data->server = ((connection_server_ctx_t*)connection->ctx)->server;
 
     return data;
 }
@@ -602,6 +627,7 @@ void* __queue_data_response_create(connection_t* connection, httprequest_t* requ
     data->connection = connection;
     data->response = response;
     data->ratelimiter = ratelimiter;
+    data->server = ((connection_server_ctx_t*)connection->ctx)->server;
 
     return data;
 }
@@ -646,6 +672,14 @@ void __queue_request_handler(void* arg) {
         return;
     }
 
+    /* The critical section is deliberately narrow (docs/concurrency/00 §5.1):
+     * the lock guards connection state, not the user's handler. Between the two
+     * short sections below, another worker may be running another handler of
+     * this same connection — for h2 that is the point of the exercise; for h1.1
+     * it cannot happen anyway, since only one item at a time is ever dispatched
+     * (connection_queue_append, the serialized variant). */
+    connection_s_lock(item->connection);
+
     /* h2 keeps request and response on the stream: several may be in flight, so
      * the single pair on the connection context would be clobbered. The item
      * already carries the right pair either way. */
@@ -654,24 +688,34 @@ void __queue_request_handler(void* arg) {
         conn_ctx->response = data->response;
     }
 
+    connection_s_unlock(item->connection);
+
     if (!ratelimiter_allow(data->ratelimiter, item->connection->remote_ip, 1)) {
         if (data->response != NULL) {
             httpresponse_default(data->response, 429);
             data->response->add_header(data->response, "Retry-After", "1");
         }
+
+        connection_s_lock(item->connection);
         __handler_finished(item->connection, data->request, data->response);
+        connection_s_unlock(item->connection);
         return;
     }
 
+    /* --- user code: middlewares and the route handler, no lock held --- */
     httpctx_t ctx;
     httpctx_init(&ctx, data->request, data->response);
 
-    if (run_middlewares(conn_ctx->server->http.middleware, &ctx))
+    if (run_middlewares(data->server->http.middleware, &ctx))
         item->handle(&ctx);
 
     httpctx_clear(&ctx);
 
+    /* Publishing the response walks the session's stream table and re-arms
+     * epoll, so it goes back under the lock. */
+    connection_s_lock(item->connection);
     __handler_finished(item->connection, data->request, data->response);
+    connection_s_unlock(item->connection);
 }
 
 void __queue_response_handler(void* arg) {
@@ -693,12 +737,18 @@ void __queue_response_handler(void* arg) {
         return;
     }
 
+    /* No user code here — the response is already built (a static file, or a
+     * handler that finished earlier), so the whole runner stays under the lock. */
+    connection_s_lock(item->connection);
+
     if (!conn_ctx->is_http2) {
         conn_ctx->request = data->request;
         conn_ctx->response = data->response;
     }
 
     __handler_finished(item->connection, data->request, data->response);
+
+    connection_s_unlock(item->connection);
 }
 
 int __run_header_filters(httprequest_t* request, httpresponse_t* response) {
@@ -958,7 +1008,11 @@ int __post_response(httprequest_t* request, httpresponse_t* response) {
     if (ctx->is_http2)
         return h2_server_response_ready(connection, response);
 
-    if (cqueue_empty(ctx->queue)) {
+    cqueue_lock(ctx->queue);
+    const int queue_empty = cqueue_empty(ctx->queue);
+    cqueue_unlock(ctx->queue);
+
+    if (queue_empty) {
         ctx->request = request;
         ctx->response = response;
         atomic_store_explicit(&ctx->need_write, 1, memory_order_release);

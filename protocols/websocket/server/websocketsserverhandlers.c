@@ -224,15 +224,23 @@ int __handle(websocketsparser_t* parser, deferred_handler handler) {
     return handler(response);
 }
 
+/* Still fully serialized, lock held across the user handler — WebSocket keeps
+ * its response on the connection context (conn_ctx->response), so two messages
+ * of one connection cannot be in flight at once. Untangling that is phase C of
+ * docs/concurrency/00 (§4.4). The lock used to be taken by the worker before
+ * the runner was called; it is taken here now, which is the same coverage. */
 void websockets_queue_request_handler(void* arg) {
     connection_queue_item_t* item = arg;
     connection_queue_websockets_data_t* data = (connection_queue_websockets_data_t*)item->data;
     connection_server_ctx_t* conn_ctx = item->connection->ctx;
 
+    connection_s_lock(item->connection);
+
     websocketsresponse_t* response = websocketsresponse_create(item->connection);
     if (response == NULL) {
         atomic_store(&conn_ctx->destroyed, 1);
         connection_after_read(item->connection);
+        connection_s_unlock(item->connection);
         return;
     }
 
@@ -241,6 +249,7 @@ void websockets_queue_request_handler(void* arg) {
     if (!ratelimiter_allow(data->ratelimiter, item->connection->remote_ip, 1)) {
         websocketsresponse_default(response, "Too Many Requests");
         connection_after_read(item->connection);
+        connection_s_unlock(item->connection);
         return;
     }
 
@@ -253,6 +262,8 @@ void websockets_queue_request_handler(void* arg) {
     wsctx_clear(&ctx);
 
     connection_after_read(item->connection);
+
+    connection_s_unlock(item->connection);
 }
 
 void* websockets_queue_data_request_create(connection_t* connection, void* component, ratelimiter_t* ratelimiter) {
@@ -309,7 +320,11 @@ int __post_response(websocketsresponse_t* response) {
     connection_t* connection = response->connection;
     connection_server_ctx_t* ctx = connection->ctx;
 
-    if (cqueue_empty(ctx->queue)) {
+    cqueue_lock(ctx->queue);
+    const int queue_is_empty = cqueue_empty(ctx->queue);
+    cqueue_unlock(ctx->queue);
+
+    if (queue_is_empty) {
         ctx->response = response;
         atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
         return connection_after_read(connection);
@@ -353,9 +368,12 @@ int websockets_deferred_handler(connection_t* connection, void* component, queue
     }
 
     connection_server_ctx_t* ctx = connection->ctx;
+    cqueue_lock(ctx->queue);
     const int queue_empty = cqueue_empty(ctx->queue);
+    const int appended = cqueue_append(ctx->queue, item);
+    cqueue_unlock(ctx->queue);
 
-    if (!cqueue_append(ctx->queue, item)) {
+    if (!appended) {
         connection_queue_websockets_data_t* data = (connection_queue_websockets_data_t*)item->data;
         data->request = NULL;
         data->response = NULL;
@@ -387,12 +405,16 @@ void __queue_response_handler(void* arg) {
     connection_queue_websockets_data_t* data = (connection_queue_websockets_data_t*)item->data;
     connection_server_ctx_t* conn_ctx = item->connection->ctx;
 
+    connection_s_lock(item->connection);
+
     /* Ownership moves to the connection ctx; drop it from the item so
      * __queue_data_response_free does not free what the ctx now owns. */
     conn_ctx->response = data->response;
     data->response = NULL;
 
     connection_after_read(item->connection);
+
+    connection_s_unlock(item->connection);
 }
 
 void* __queue_data_response_create(connection_t* connection, void* component, ratelimiter_t* ratelimiter) {

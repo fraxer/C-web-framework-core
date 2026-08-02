@@ -50,6 +50,20 @@ typedef struct {
     atomic_int ref_count;
     atomic_int broadcast_ref_count;
     atomic_bool destroyed;
+    /* The fd is gone: control_del has run and close(2) has been called, so the
+     * kernel is free to hand that number to the next accept(). Any epoll_ctl
+     * after this point either fails or — far worse — lands on whatever
+     * connection inherited the number and repoints its registration at this
+     * (soon to be freed) object.
+     *
+     * Set under connection_s_lock, which every re-arm path also takes, so the
+     * check cannot go stale between test and epoll_ctl. It only became reachable
+     * with concurrent handlers: a handler finishing on one core re-arms while
+     * the worker on another has already closed the connection
+     * (docs/concurrency/00 §4.6). Distinct from `destroyed`, which error paths
+     * set on a connection whose fd is still open and still needs an event to be
+     * reaped. */
+    atomic_bool detached;
     atomic_bool locked;
     /* A response is staged and needs an EPOLLOUT turn. Atomic, and deliberately
      * not a bitfield: it is set by whichever thread finished the response
@@ -108,7 +122,14 @@ connection_dec_result_e connection_s_dec(connection_t*);
 
 int connection_close_locked(connection_t*);
 int connection_after_write(connection_t*);
+/* Serialized dispatch (HTTP/1.1, WebSocket): at most one queue entry per
+ * connection, so at most one handler runs at a time. */
 int connection_queue_append(connection_queue_item_t*);
+
+/* Fan-out dispatch (HTTP/2): one queue entry per item, so several handlers of
+ * the same connection run at once. docs/concurrency/00 §5.2. */
+int connection_queue_append_parallel(connection_queue_item_t*);
+
 int connection_queue_append_broadcast(connection_t*);
 int connection_after_read(connection_t*);
 int connection_close(connection_t* connection);

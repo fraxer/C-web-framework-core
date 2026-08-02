@@ -35,6 +35,17 @@ int __connection_queue_append_item(cqueue_t* queue, void* data) {
     return r;
 }
 
+/* Returns the next connection with work to do, holding a reference (taken by the
+ * append) but NOT connection_s_lock.
+ *
+ * Handing it over locked is what used to serialize every handler on a
+ * connection: the lock spanned the whole handler run (docs/concurrency/00 §2.1).
+ * Now the runner takes the lock for the state it actually touches, so two
+ * workers may hold this same connection at once — which is the point.
+ *
+ * The destroyed check needs no lock: the flag is atomic, and it is only a
+ * fast path. Losing the race is harmless — the runner re-checks whatever it
+ * cares about under the lock. */
 connection_t* __connection_queue_pop() {
     cqueue_lock(queue);
     connection_t* connection = cqueue_pop(queue);
@@ -44,14 +55,10 @@ connection_t* __connection_queue_pop() {
     if (connection == NULL)
         return NULL;
 
-    connection_s_lock(connection);
-
     connection_server_ctx_t* ctx = connection->ctx;
 
     if (atomic_load(&ctx->destroyed)) {
-        if (connection_s_dec(connection) == CONNECTION_DEC_RESULT_DECREMENT)
-            connection_s_unlock(connection);
-
+        connection_s_dec(connection);
         return NULL;
     }
 
