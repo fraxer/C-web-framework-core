@@ -196,6 +196,25 @@ int __out_publish(connection_t* connection, connection_out_slot_t* slot, websock
  * connection_s_lock; use __post_response instead when it is already held.
  *
  * Takes ownership of the response either way: it is freed here on failure. */
+int websockets_response_post_to(websocketsresponse_t* response, cqueue_t* out_queue,
+                                void* out_owner, int (*out_wake)(connection_t*, void*)) {
+    connection_t* connection = response->connection;
+
+    if (out_queue == NULL)
+        return websockets_response_post(response);
+
+    connection_s_lock(connection, LOCK_SITE_WS_RESERVE);
+    connection_out_slot_t* slot = __out_reserve_in(out_queue);
+    connection_s_unlock(connection);
+
+    if (slot == NULL) {
+        response->base.free(response);
+        return 0;
+    }
+
+    return __out_publish_tunnel(connection, slot, response, out_owner, out_wake);
+}
+
 int websockets_response_post(websocketsresponse_t* response) {
     connection_t* connection = response->connection;
 

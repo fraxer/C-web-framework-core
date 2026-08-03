@@ -25,6 +25,18 @@ typedef struct broadcast_item {
     /** WebSocket connection of the subscriber */
     connection_t* connection;
 
+    /* Where this subscriber's frames belong when the subscriber is not the
+     * connection itself but one RFC 8441 tunnel on it (docs/http2/09, step 5).
+     * A connection may host several tunnels, each its own subscriber, so
+     * "connection" alone stops identifying anybody. NULL/NULL on HTTP/1.1.
+     *
+     * Deliberately plain types: broadcast must not learn about HTTP/2 or about
+     * WebSocket tunnels — it only needs to know where to put bytes and how to
+     * wake whoever writes them. */
+    cqueue_t* out_queue;
+    void* out_owner;
+    int (*out_wake)(connection_t*, void* owner);
+
     /** Custom identifier for filtering during send. May be NULL */
     broadcast_id_t* id;
 
@@ -101,12 +113,30 @@ void broadcast_free(broadcast_t* broadcast);
 int broadcast_add(const char* broadcast_name, connection_t* connection, void* id, void(*response_handler)(response_t* response, const char* payload, size_t size));
 
 /**
+ * Subscribe an output binding rather than a bare connection: the same channel
+ * mechanics, but the subscriber is identified by (connection, owner) and its
+ * frames go to `out_queue` (docs/http2/09, step 5). Passing NULL for the
+ * binding is exactly broadcast_add().
+ */
+int broadcast_add_out(const char* broadcast_name, connection_t* connection, void* id,
+                      void(*response_handler)(response_t* response, const char* payload, size_t size),
+                      cqueue_t* out_queue, void* out_owner,
+                      int (*out_wake)(connection_t*, void* owner));
+
+/**
  * Unsubscribes connection from specified broadcast channel.
  * A channel left without subscribers is destroyed.
  * @param broadcast_name  Channel name
  * @param connection      WebSocket connection to unsubscribe
  */
 void broadcast_remove(const char* broadcast_name, connection_t* connection);
+
+/** Unsubscribe one owner on a connection; owner == NULL means the connection itself. */
+void broadcast_remove_out(const char* broadcast_name, connection_t* connection, void* out_owner);
+
+/** Drop every subscription belonging to one owner, on every channel. Called when
+ *  an RFC 8441 tunnel dies while its connection lives on. */
+void broadcast_clear_owner(connection_t* connection, void* out_owner);
 
 /**
  * Unsubscribes connection from all broadcast channels.
