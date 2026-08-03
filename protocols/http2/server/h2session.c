@@ -1356,7 +1356,17 @@ static h2_frame_result_e h2_request_failed(h2session_t* s, h2stream_t* stream,
  * immediately half-closed it. Legal, useless, and not worth a special path: the
  * tunnel opens and dies on the next sweep. */
 static h2_frame_result_e h2_open_tunnel(h2session_t* s, h2stream_t* stream, int end_stream) {
-    stream->ws = h2_ws_tunnel_create(s->connection);
+    /* Sec-WebSocket-Protocol picks the message protocol exactly as it does on
+     * the HTTP/1.1 handshake (websocketsswitch.c): "resource" routes each message
+     * by its own method+location, anything else goes to the default handler.
+     * It is an ordinary header here — RFC 8441 changes the handshake, not the
+     * subprotocol negotiation. */
+    const http_header_t* subprotocol =
+        stream->request->get_headern(stream->request, "Sec-WebSocket-Protocol", 22);
+    const int resource = subprotocol != NULL && subprotocol->value != NULL &&
+        strcmp(subprotocol->value, "resource") == 0;
+
+    stream->ws = h2_ws_tunnel_create(s->connection, resource);
     if (stream->ws == NULL) {
         h2_session_drop_stream(s, stream);
         return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
@@ -1370,6 +1380,10 @@ static h2_frame_result_e h2_open_tunnel(h2session_t* s, h2stream_t* stream, int 
 
     /* 200, not 101: HTTP/2 has no 101 at all (RFC 8441 §4). */
     response->status_code = 200;
+
+    /* Echo the accepted subprotocol, as the HTTP/1.1 handshake does. */
+    if (resource)
+        response->add_headern(response, "Sec-WebSocket-Protocol", 22, "resource", 8);
 
     stream->response = response;
     stream->headers_done = 1;

@@ -11,7 +11,9 @@
 #include "middleware.h"
 #include "connection_s.h"
 
-typedef struct connection_queue_websockets_data {
+typedef struct connection_queue_websockets_data connection_queue_websockets_data_t;
+
+struct connection_queue_websockets_data {
     connection_queue_item_data_t base;
     websocketsrequest_t* request;
     connection_t* connection;
@@ -20,11 +22,18 @@ typedef struct connection_queue_websockets_data {
      * filled by the runner when the handler returns. Owned by ctx->write_queue,
      * not by the item. */
     connection_out_slot_t* out;
+    /* Where the reply goes when this message came in through an RFC 8441
+     * tunnel instead of a WebSocket connection (docs/http2/09, step 4). Copied
+     * off the request at dispatch, because the request may be gone by the time
+     * the handler returns. NULL/NULL on the HTTP/1.1 path. */
+    cqueue_t* out_queue;
+    void* out_owner;
+    int (*out_wake)(connection_t*, void* owner);
     /* The virtual host the connection was upgraded on, captured at dispatch.
      * Same reasoning as the HTTP runner: ctx->server belongs to the worker, and
      * a handler thread has no business reading it. */
     server_t* server;
-} connection_queue_websockets_data_t;
+};
 
 static int __read(connection_t* connection);
 static int __write(connection_t* connection);
@@ -34,6 +43,8 @@ static void __queue_data_request_free(void* arg);
 static int __post_close_default(connection_t* connection, unsigned short status_code, const char* reason);
 static int __post_response(websocketsresponse_t* response);
 static connection_out_slot_t* __out_reserve(connection_t* connection);
+static int __publish(connection_t* connection, struct connection_queue_websockets_data* data,
+                     websocketsresponse_t* response);
 static int __out_promote(connection_t* connection);
 static int __out_publish(connection_t* connection, connection_out_slot_t* slot, websocketsresponse_t* response);
 static void __out_finish_current(connection_t* connection);
@@ -61,19 +72,22 @@ static void __out_finish_current(connection_t* connection);
  * reverse.
  * -------------------------------------------------------------------------- */
 
-/* Reserve this message's place. Caller holds connection_s_lock. */
-connection_out_slot_t* __out_reserve(connection_t* connection) {
-    connection_server_ctx_t* ctx = connection->ctx;
-    if (ctx->write_queue == NULL) return NULL;
+/* Reserve this message's place. Caller holds connection_s_lock.
+ *
+ * `queue` selects whose order this message belongs to: the connection's, or a
+ * single RFC 8441 tunnel's. Every other property of the slot is the same, which
+ * is the point — ordering is ordering whatever carries the bytes. */
+connection_out_slot_t* __out_reserve_in(cqueue_t* queue) {
+    if (queue == NULL) return NULL;
 
     connection_out_slot_t* slot = malloc(sizeof * slot);
     if (slot == NULL) return NULL;
 
     slot->response = NULL;
 
-    cqueue_lock(ctx->write_queue);
-    const int appended = cqueue_append(ctx->write_queue, slot);
-    cqueue_unlock(ctx->write_queue);
+    cqueue_lock(queue);
+    const int appended = cqueue_append(queue, slot);
+    cqueue_unlock(queue);
 
     if (!appended) {
         free(slot);
@@ -81,6 +95,12 @@ connection_out_slot_t* __out_reserve(connection_t* connection) {
     }
 
     return slot;
+}
+
+connection_out_slot_t* __out_reserve(connection_t* connection) {
+    connection_server_ctx_t* ctx = connection->ctx;
+
+    return __out_reserve_in(ctx->write_queue);
 }
 
 /* Move a filled head slot into ctx->response. Returns 1 when something became
@@ -135,6 +155,19 @@ void __out_finish_current(connection_t* connection) {
 /* Publish a finished response into its reserved slot and, if that makes the
  * head writable, hand it to the event loop. Takes connection_s_lock, so the
  * caller must not hold it. */
+/* Publish into a tunnel's slot. The tunnel owns the ordering and the waking, so
+ * all that is shared with the connection path is the slot itself. */
+static int __out_publish_tunnel(connection_t* connection, connection_out_slot_t* slot,
+                                websocketsresponse_t* response,
+                                void* owner, int (*wake)(connection_t*, void*)) {
+    connection_s_lock(connection, LOCK_SITE_WS_PUBLISH);
+    slot->response = &response->base;
+    const int r = wake != NULL ? wake(connection, owner) : 1;
+    connection_s_unlock(connection);
+
+    return r;
+}
+
 int __out_publish(connection_t* connection, connection_out_slot_t* slot, websocketsresponse_t* response) {
     connection_server_ctx_t* ctx = connection->ctx;
 
@@ -420,6 +453,17 @@ int __handle(websocketsparser_t* parser) {
  * another worker may be running another message of this same connection — the
  * point of phase C. The reply goes into the slot reserved for this message at
  * dispatch time, so parallel handlers cannot reorder the stream. */
+/* Send a finished reply to wherever this message's order lives: its tunnel's
+ * queue, or the connection's. */
+static int __publish(connection_t* connection, connection_queue_websockets_data_t* data,
+                     websocketsresponse_t* response) {
+    if (data->out_queue != NULL)
+        return __out_publish_tunnel(connection, data->out, response,
+                                    data->out_owner, data->out_wake);
+
+    return __out_publish(connection, data->out, response);
+}
+
 void websockets_queue_request_handler(void* arg) {
     connection_queue_item_t* item = arg;
     connection_queue_websockets_data_t* data = (connection_queue_websockets_data_t*)item->data;
@@ -447,7 +491,7 @@ void websockets_queue_request_handler(void* arg) {
 
     if (!ratelimiter_allow(data->ratelimiter, connection->remote_ip, 1)) {
         websocketsresponse_default(response, "Too Many Requests");
-        __out_publish(connection, data->out, response);
+        __publish(connection, data, response);
         return;
     }
 
@@ -460,7 +504,7 @@ void websockets_queue_request_handler(void* arg) {
 
     wsctx_clear(&ctx);
 
-    __out_publish(connection, data->out, response);
+    __publish(connection, data, response);
 }
 
 void* websockets_queue_data_request_create(connection_t* connection, void* component, ratelimiter_t* ratelimiter) {
@@ -474,10 +518,20 @@ void* websockets_queue_data_request_create(connection_t* connection, void* compo
     data->connection = connection;
     data->ratelimiter = ratelimiter;
     data->server = ctx->server;
+
+    /* A tunnelled message belongs to its tunnel's order, not the connection's.
+     * Copied off the request now: by the time the handler returns, the request
+     * may already have been freed. */
+    const websocketsrequest_t* request = component;
+    data->out_queue = request != NULL ? request->out_queue : NULL;
+    data->out_owner = request != NULL ? request->out_owner : NULL;
+    data->out_wake = request != NULL ? request->out_wake : NULL;
+
     /* Reserved here, before the item is handed to a worker: the output order
      * has to be the order messages were dispatched in, and this is the last
      * point at which the read path is still the only thread involved. */
-    data->out = __out_reserve(connection);
+    data->out = data->out_queue != NULL ?
+        __out_reserve_in(data->out_queue) : __out_reserve(connection);
 
     if (data->out == NULL) {
         free(data);
@@ -562,7 +616,13 @@ int __post_response(websocketsresponse_t* response) {
  * is to keep compressed connections serialized. Moving framing and compression
  * into the (ordered, single-threaded) write path would lift this; see phase C
  * in docs/concurrency/00. */
-static int __fanout_allowed(connection_t* connection) {
+static int __fanout_allowed(connection_t* connection, const websocketsrequest_t* request) {
+    /* A tunnelled message decides for itself: on an HTTP/2 connection
+     * ctx->parser is an h2session_t, and reading it as a websocketsparser_t
+     * would be type confusion, not a policy (docs/http2/09, step 4). */
+    if (request != NULL && request->out_queue != NULL)
+        return request->out_parallel;
+
     connection_server_ctx_t* ctx = connection->ctx;
     const websocketsparser_t* parser = ctx->parser;
 
@@ -587,7 +647,7 @@ int websockets_deferred_handler(connection_t* connection, void* component, queue
 
     connection_server_ctx_t* ctx = connection->ctx;
 
-    const int parallel = __fanout_allowed(connection);
+    const int parallel = __fanout_allowed(connection, component);
 
     cqueue_lock(ctx->queue);
     const int queue_empty = cqueue_empty(ctx->queue);
