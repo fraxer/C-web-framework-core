@@ -24,6 +24,7 @@
 #include "httprequestparser.h"
 #include "httpresponse.h"
 #include "h2field.h"
+#include "h2ws.h"
 #include "h2stream.h"
 #include "httpserverhandlers.h"
 #include "log.h"
@@ -768,6 +769,8 @@ typedef enum {
     H2_REQUEST_INTERNAL,
     H2_REQUEST_TOO_LARGE,   /* over the advertised header list size → 431 */
     H2_REQUEST_TOO_LARGE_HARD, /* over the hard cap: decode aborted mid-block */
+    H2_REQUEST_EXTENDED_CONNECT, /* RFC 8441 shape, protocol we do not serve → 501 */
+    H2_REQUEST_WEBSOCKET,        /* RFC 8441 :protocol websocket — open a tunnel */
 } h2_request_status_e;
 
 /* Size of a decoded header list as RFC 9113 §6.5.2 counts it. */
@@ -818,6 +821,17 @@ static h2_request_status_e h2_build_request(h2session_t* s, h2stream_t* stream,
     int scheme_seen = 0;
     int authority_seen = 0;
     int regular_seen = 0;
+    /* Extended CONNECT (RFC 8441) — docs/http2/09-extended-connect.md.
+     *
+     * The verdict on :protocol is taken here, inside the loop, and only a copy
+     * of the name survives it. The decoded header array is freed before the
+     * post-loop checks run, so anything that still pointed into it there would
+     * be reading freed memory — the same reason :path is copied by h2_set_path.
+     * The copy is bounded and only feeds a log line. */
+    int connect_method = 0;
+    int protocol_seen = 0;
+    int protocol_websocket = 0;
+    char protocol_name[32] = {0};
 
     stream->content_length = -1;
 
@@ -850,6 +864,10 @@ static h2_request_status_e h2_build_request(h2session_t* s, h2stream_t* stream,
                     break;
                 }
                 request->method = method_from(value, value_len);
+                /* CONNECT is deliberately absent from method_from: it is not a
+                 * routable method here (docs/http2/08 §D.2). Noted separately so
+                 * the extended form can be told apart after the loop. */
+                connect_method = (value_len == 7 && memcmp(value, "CONNECT", 7) == 0);
                 method_seen = 1;
             }
             else if (name_len == 5 && memcmp(name, ":path", 5) == 0) {
@@ -881,6 +899,25 @@ static h2_request_status_e h2_build_request(h2session_t* s, h2stream_t* stream,
                 if (request->add_headern(request, "Host", 4, value, value_len) != 0)
                     status = H2_REQUEST_INTERNAL;
                 authority_seen = 1;
+            }
+            else if (name_len == 9 && memcmp(name, ":protocol", 9) == 0) {
+                /* Extended CONNECT (RFC 8441 §4) — docs/http2/09. Whether it is
+                 * allowed to appear at all is decided after the loop: it is
+                 * legal only in a CONNECT request that also carries :scheme and
+                 * :path, and that is not knowable until every pseudo-header has
+                 * been seen. */
+                if (value_len == 0 || protocol_seen) {
+                    status = H2_REQUEST_MALFORMED;
+                    break;
+                }
+                protocol_websocket = (value_len == 9 && memcmp(value, "websocket", 9) == 0);
+
+                const size_t copy = value_len < sizeof(protocol_name) ?
+                    value_len : sizeof(protocol_name) - 1;
+                memcpy(protocol_name, value, copy);
+                protocol_name[copy] = '\0';
+
+                protocol_seen = 1;
             }
             else {
                 /* Unknown pseudo-headers, and the response-only ones such as
@@ -925,6 +962,35 @@ static h2_request_status_e h2_build_request(h2session_t* s, h2stream_t* stream,
     hpack_headers_free(headers, count);
 
     if (status != H2_REQUEST_OK) return status;
+
+    /* Extended CONNECT (RFC 8441 §4) — docs/http2/09, step 1.
+     *
+     * The two CONNECT shapes are told apart by exactly this: the extended form
+     * carries :protocol, :scheme and :path, the tunnelling form carries none of
+     * them. Which is why supporting one says nothing about supporting the other.
+     *
+     * :protocol outside a CONNECT is malformed — §4 forbids it there. Inside
+     * one, the request is well formed and we simply do not serve it yet: it
+     * gets 501, not a reset, so a client learns the difference between "you
+     * asked wrongly" and "this server will not do that". */
+    if (protocol_seen) {
+        if (!connect_method || !scheme_seen || !path_seen || !authority_seen)
+            return H2_REQUEST_MALFORMED;
+
+        /* Only "websocket" is registered for us. Anything else is a protocol we
+         * do not implement, which is a 501 — the request itself is fine. */
+        if (!protocol_websocket) {
+            log_info("h2: extended CONNECT for unsupported protocol \"%s\" (fd %d)\n",
+                     protocol_name, s->connection->fd);
+            return H2_REQUEST_EXTENDED_CONNECT;
+        }
+
+        return H2_REQUEST_WEBSOCKET;
+    }
+
+    /* Plain CONNECT — the forward-proxy tunnel. Not supported by decision
+     * (docs/http2/08 §D.2): it has no :scheme and no :path, so it fails the
+     * check below anyway; naming it here keeps that from looking accidental. */
 
     if (!method_seen || !path_seen || !scheme_seen || request->method == ROUTE_NONE)
         return H2_REQUEST_MALFORMED;
@@ -1276,6 +1342,47 @@ static h2_frame_result_e h2_request_failed(h2session_t* s, h2stream_t* stream,
  * the request harmless: the peer may already be sending a body it could not know
  * we did not want, and that DATA has to keep being credited and discarded rather
  * than dispatched or treated as an error. */
+/* Accept an extended CONNECT and turn the stream into a WebSocket tunnel
+ * (RFC 8441) — docs/http2/09, step 2.
+ *
+ * Two things make this unlike every other response on an h2 stream, and both
+ * are the tunnel's defining property rather than special cases:
+ *   - the answer is 200 with no body and, crucially, **no END_STREAM**: the
+ *     stream stays open in both directions, which is what a tunnel is;
+ *   - the stream is not closed when that response has been written. The write
+ *     path checks stream->ws for both (see h2_write_finished).
+ *
+ * END_STREAM on the request itself means a client that opened a tunnel and
+ * immediately half-closed it. Legal, useless, and not worth a special path: the
+ * tunnel opens and dies on the next sweep. */
+static h2_frame_result_e h2_open_tunnel(h2session_t* s, h2stream_t* stream, int end_stream) {
+    stream->ws = h2_ws_tunnel_create(s->connection);
+    if (stream->ws == NULL) {
+        h2_session_drop_stream(s, stream);
+        return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
+    }
+
+    httpresponse_t* response = httpresponse_create_h2(s->connection);
+    if (response == NULL) {
+        h2_session_drop_stream(s, stream);
+        return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
+    }
+
+    /* 200, not 101: HTTP/2 has no 101 at all (RFC 8441 §4). */
+    response->status_code = 200;
+
+    stream->response = response;
+    stream->headers_done = 1;
+    if (end_stream) stream->state = H2_STREAM_HALF_CLOSED_REMOTE;
+
+    log_info("h2: WebSocket tunnel opened on stream %u (fd %d)\n",
+             stream->id, s->connection->fd);
+
+    atomic_store_explicit(&stream->response_ready, 1, memory_order_release);
+
+    return H2_FRAME_OK;
+}
+
 static h2_frame_result_e h2_reject_stream(h2session_t* s, h2stream_t* stream,
                                           int status_code, int end_stream) {
     httpresponse_t* response = httpresponse_create_h2(s->connection);
@@ -1339,6 +1446,13 @@ static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
         metrics_h2_abuse(METRICS_H2_HEADER_LIST);
         return h2_reject_stream(s, stream, 431, end_stream);
     }
+    /* A tunnel request answered with a status: `rejected` makes whatever the
+     * client already sent into the tunnel be credited and dropped rather than
+     * treated as a request body (docs/http2/09, step 1). */
+    if (status == H2_REQUEST_EXTENDED_CONNECT)
+        return h2_reject_stream(s, stream, 501, end_stream);
+    if (status == H2_REQUEST_WEBSOCKET)
+        return h2_open_tunnel(s, stream, end_stream);
     if (status != H2_REQUEST_OK)
         return h2_request_failed(s, stream, status);
 
@@ -1514,6 +1628,19 @@ static h2_frame_result_e h2_on_data(h2session_t* s, const h2_frame_t* frame) {
     }
 
     h2_recv_credit(s, stream->id, &stream->recv, frame->payload_len);
+
+    /* A tunnel: this DATA is not a request body, it is WebSocket frames
+     * (RFC 8441). The payload buffer is the frame parser's own and is writable,
+     * which the WebSocket parser needs — it unmasks in place, exactly as it
+     * does with connection->buffer on the HTTP/1.1 path. */
+    if (stream->ws != NULL) {
+        if (!h2_ws_tunnel_feed(stream->ws, (uint8_t*)data, data_len))
+            return h2_stream_error(s, stream->id, H2_ERR_PROTOCOL_ERROR);
+
+        if (frame->flags & H2_FLAG_END_STREAM) stream->state = H2_STREAM_HALF_CLOSED_REMOTE;
+
+        return H2_FRAME_OK;
+    }
 
     /* Answered already (431 from the header-list limit): the body is credited
      * like any other, then dropped. The peer could not have known. */
@@ -1785,6 +1912,27 @@ typedef enum {
     H2_WRITE_FAILED,
 } h2_write_status_e;
 
+/* One response has fully left the stream.
+ *
+ * For an ordinary stream that is the end of it. A tunnel stays: its 200 was
+ * only the handshake, and the stream goes on carrying WebSocket frames. The
+ * response is retired all the same — leaving it staged would make the next
+ * write pass re-run the filter chain and send a second HEADERS block. */
+static void h2_write_finished(h2session_t* s, h2stream_t* stream) {
+    if (stream->ws == NULL) {
+        stream->state = H2_STREAM_CLOSED;
+        h2_session_drop_stream(s, stream);
+        return;
+    }
+
+    atomic_store_explicit(&stream->response_ready, 0, memory_order_release);
+
+    if (stream->response != NULL) {
+        httpresponse_free(stream->response);
+        stream->response = NULL;
+    }
+}
+
 /* Give one stream its turn: refill its quantum and run the filter chain until it
  * finishes, blocks, or spends the quantum.
  *
@@ -1813,6 +1961,11 @@ static h2_write_status_e h2_write_stream(h2session_t* s, h2stream_t* stream) {
         if (stream->yielded) return H2_WRITE_YIELD;
         return stream->window_blocked ? H2_WRITE_WINDOW : H2_WRITE_SOCKET;
     }
+
+    /* A tunnel's handshake response ends there: no trailing empty DATA, because
+     * that would carry END_STREAM and close the half of the stream the tunnel
+     * exists to keep open (docs/http2/09). */
+    if (stream->ws != NULL) return H2_WRITE_DONE;
 
     /* The filter chain emits no buffer at all for an empty body (and the
      * HEADERS frame only carries END_STREAM when we could prove up front that
@@ -1924,8 +2077,7 @@ static int h2_write(connection_t* connection) {
             break;
         case H2_WRITE_DONE:
             s->writing = NULL;
-            stream->state = H2_STREAM_CLOSED;
-            h2_session_drop_stream(s, stream);
+            h2_write_finished(s, stream);
             break;
         }
     }
@@ -1965,8 +2117,7 @@ static int h2_write(connection_t* connection) {
             continue;
         }
 
-        stream->state = H2_STREAM_CLOSED;
-        h2_session_drop_stream(s, stream);
+        h2_write_finished(s, stream);
 
         stream = next;
     }

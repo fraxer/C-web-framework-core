@@ -3,6 +3,7 @@
 #include <stdlib.h>
 
 #include "h2session.h"
+#include "h2ws.h"
 
 /* The table is a plain singly-linked list, kept in arrival order with a tail
  * pointer. SETTINGS_MAX_CONCURRENT_STREAMS caps it at a low hundred, so a linear
@@ -63,6 +64,9 @@ h2stream_t* h2stream_find_by_response(h2session_t* session, const httpresponse_t
 static void h2stream_destroy(h2stream_t* stream) {
     if (stream->request != NULL) httprequest_free(stream->request);
     if (stream->response != NULL) httpresponse_free(stream->response);
+    /* A tunnel dies with its stream — whether the stream ended cleanly, was
+     * reset, or went down with the connection (h2stream_free_all). */
+    if (stream->ws != NULL) h2_ws_tunnel_free(stream->ws);
 
     free(stream);
 }

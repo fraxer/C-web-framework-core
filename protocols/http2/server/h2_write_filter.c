@@ -253,6 +253,10 @@ static int __build_headers(httprequest_t* request, httpresponse_t* response,
     }
 
     const int has_body = __has_body(request, response);
+    /* A WebSocket tunnel's 200 must not carry END_STREAM even though no body
+     * follows it: the stream stays open in both directions, which is the whole
+     * point (RFC 8441, docs/http2/09). */
+    const int end_stream = !has_body && stream->ws == NULL;
     size_t off = 0;
     size_t written = 0;
     for (size_t i = 0; i < frames; i++) {
@@ -262,7 +266,7 @@ static int __build_headers(httprequest_t* request, httpresponse_t* response,
         uint8_t type = (i == 0) ? H2_FRAME_HEADERS : H2_FRAME_CONTINUATION;
         uint8_t flags = 0;
         if (last) flags |= H2_FLAG_END_HEADERS;
-        if (i == 0 && !has_body) flags |= H2_FLAG_END_STREAM;
+        if (i == 0 && end_stream) flags |= H2_FLAG_END_STREAM;
 
         const size_t got = h2frame_encode((uint8_t*)out->data + written, total - written,
                                           type, flags, stream->id, block + off, chunk);
@@ -280,7 +284,7 @@ static int __build_headers(httprequest_t* request, httpresponse_t* response,
     bufo_set_size(out, written);
     bufo_reset_pos(out);
 
-    if (!has_body)
+    if (end_stream)
         stream->end_stream_sent = 1;
 
     return 1;
