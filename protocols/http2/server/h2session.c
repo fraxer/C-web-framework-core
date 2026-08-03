@@ -23,6 +23,7 @@
 #include "httprequest.h"
 #include "httprequestparser.h"
 #include "httpresponse.h"
+#include "h2field.h"
 #include "h2stream.h"
 #include "httpserverhandlers.h"
 #include "log.h"
@@ -812,7 +813,11 @@ static h2_request_status_e h2_build_request(h2session_t* s, h2stream_t* stream,
         const char* value = headers[i].value;
         const size_t value_len = headers[i].value_len;
 
-        if (name_len == 0) {
+        /* §8.2.1, before anything reads the bytes: an invalid octet in a name
+         * or a value makes the request malformed whatever the field means.
+         * Applies to pseudo-headers too — h2_field_name_valid knows about the
+         * leading colon. */
+        if (h2_field_validate(name, name_len, value, value_len) != H2_FIELD_OK) {
             status = H2_REQUEST_MALFORMED;
             break;
         }
@@ -875,14 +880,8 @@ static h2_request_status_e h2_build_request(h2session_t* s, h2stream_t* stream,
 
         regular_seen = 1;
 
-        /* §8.2.1: an uppercase name is malformed. */
-        for (size_t j = 0; j < name_len; j++) {
-            if (name[j] >= 'A' && name[j] <= 'Z') {
-                status = H2_REQUEST_MALFORMED;
-                break;
-            }
-        }
-        if (status != H2_REQUEST_OK) break;
+        /* The uppercase rule of §8.2.1 used to be checked here; it is part of
+         * h2_field_validate above now, along with the rest of the octet rules. */
 
         if (is_forbidden_h2_header(name, name_len)) {
             status = H2_REQUEST_MALFORMED;
@@ -963,7 +962,14 @@ static h2_request_status_e h2_consume_trailers(h2session_t* s, const uint8_t* bl
 
     h2_request_status_e status = H2_REQUEST_OK;
     for (size_t i = 0; i < count; i++) {
+        /* Same octet rules as a header block (§8.2.1 does not distinguish), plus
+         * §8.1: no pseudo-headers in trailers. */
         if (headers[i].name_len > 0 && headers[i].name[0] == ':') {
+            status = H2_REQUEST_MALFORMED;
+            break;
+        }
+        if (h2_field_validate(headers[i].name, headers[i].name_len,
+                              headers[i].value, headers[i].value_len) != H2_FIELD_OK) {
             status = H2_REQUEST_MALFORMED;
             break;
         }
