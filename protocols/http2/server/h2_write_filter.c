@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 
 #include "connection_s.h"
+#include "h2data.h"
 #include "h2frame.h"
 #include "h2session.h"
 #include "h2stream.h"
@@ -26,12 +27,8 @@ typedef struct {
      * after an EAGAIN would corrupt the HPACK encoder's dynamic table. */
     bufo_t* buf;
 
-    /* DATA frame currently in flight. */
-    uint8_t fh[H2_FRAME_HEADER_LEN];
-    size_t  fh_len;                 /* 0 = no frame header pending/being built */
-    size_t  fh_pos;
-    size_t  frame_remaining;        /* payload bytes still owed for this frame */
-    unsigned frame_end_stream : 1;
+    /* DATA frame currently in flight (h2data.c owns the state machine). */
+    h2_data_writer_t writer;
 } h2_module_write_t;
 
 static int __header(httprequest_t* request, httpresponse_t* response);
@@ -77,25 +74,6 @@ static int __write_status(httpresponse_t* response, ssize_t written) {
     log_error("h2_write_filter: write error: %s\n", strerror(errno));
 
     return CWF_ERROR;
-}
-
-/* Drain data[*pos..size) to the socket, advancing *pos. */
-static int __write_from(httpresponse_t* response, const char* data, size_t size, size_t* pos) {
-    while (*pos < size) {
-        const ssize_t written = __raw_write(response->connection, data + *pos, size - *pos);
-        if (written < 0) {
-            const int r = __write_status(response, written);
-            if (r == CWF_DATA_AGAIN) continue; /* EINTR */
-            return r;
-        }
-        if (written == 0) {
-            log_error("h2_write_filter: connection closed\n");
-            return CWF_ERROR;
-        }
-        *pos += (size_t)written;
-    }
-
-    return CWF_OK;
 }
 
 static int __write_bufo(httpresponse_t* response, bufo_t* buf) {
@@ -321,95 +299,25 @@ static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* pare
     module->base.parent_buf = parent_buf;
     if (parent_buf == NULL) return CWF_ERROR;
 
-    for (;;) {
-        /* Start a new DATA frame. */
-        if (module->fh_len == 0) {
-            const size_t remaining = parent_buf->size > parent_buf->pos ?
-                parent_buf->size - parent_buf->pos : 0;
+    /* The framing itself lives in h2data.c — the WebSocket tunnel of RFC 8441
+     * needs the same windows, quantum and frame-boundary rules, and having one
+     * copy of that arithmetic is the point (docs/http2/09 §4.3). What stays
+     * here is the translation into the filter chain's vocabulary. */
+    switch (h2_data_write(&module->writer, s, stream, parent_buf)) {
+    case H2_DATA_DRAINED:
+        return CWF_DATA_AGAIN;
 
-            /* Upstream is drained. END_STREAM rides on the last non-empty frame;
-             * when the final buffer arrives empty the session appends a trailing
-             * empty DATA frame instead. */
-            if (remaining == 0)
-                return CWF_DATA_AGAIN;
+    case H2_DATA_YIELD:
+    case H2_DATA_WINDOW:
+    case H2_DATA_SOCKET:
+        /* All three resume through the same path; which one it was is already
+         * recorded on the stream (yielded / window_blocked), and that is what
+         * the write scheduler reads. */
+        response->event_again = 1;
+        return CWF_EVENT_AGAIN;
 
-            /* Quantum spent, and we are between frames — hand the socket back so
-             * the other streams on this connection get a turn. Only ever here:
-             * yielding mid-frame would splice another stream's bytes into ours,
-             * and yielding during the header phase would let a second stream
-             * encode a header block while this one's is still unsent, which
-             * desyncs the peer's HPACK decoder (blocks must arrive in the order
-             * they were encoded, RFC 9113 §4.3). */
-            if (stream->write_credit <= 0) {
-                stream->yielded = 1;
-                response->event_again = 1;
-                return CWF_EVENT_AGAIN;
-            }
-
-            size_t chunk = remaining;
-            if (chunk > s->peer_max_frame_size)
-                chunk = s->peer_max_frame_size;
-
-            const int64_t window = s->send_window < stream->send_window ?
-                s->send_window : stream->send_window;
-            if (window <= 0) {
-                /* Nothing may be sent until the peer enlarges a window. Waiting
-                 * on EPOLLOUT would spin: the socket is writable already. */
-                stream->window_blocked = 1;
-                if (s->send_window <= 0) s->window_blocked = 1;
-                response->event_again = 1;
-                return CWF_EVENT_AGAIN;
-            }
-            if ((int64_t)chunk > window)
-                chunk = (size_t)window;
-
-            module->frame_end_stream = (parent_buf->is_last && chunk == remaining) ? 1 : 0;
-            module->frame_remaining = chunk;
-            module->fh_pos = 0;
-            module->fh_len = h2frame_encode_header(module->fh, H2_FRAME_DATA,
-                                                   module->frame_end_stream ? H2_FLAG_END_STREAM : 0,
-                                                   stream->id, chunk);
-            if (module->fh_len == 0) return CWF_ERROR;
-        }
-
-        const int r = __write_from(response, (const char*)module->fh, module->fh_len, &module->fh_pos);
-        if (r != CWF_OK) return r;
-
-        /* Payload: written straight from the upstream buffer. */
-        while (module->frame_remaining > 0) {
-            const size_t chunk = bufo_chunk_size(parent_buf, module->frame_remaining);
-            if (chunk == 0) {
-                log_error("h2_write_filter: DATA frame underrun\n");
-                return CWF_ERROR;
-            }
-
-            const ssize_t written = __raw_write(response->connection, bufo_data(parent_buf), chunk);
-            if (written < 0) {
-                const int st = __write_status(response, written);
-                if (st == CWF_DATA_AGAIN) continue; /* EINTR */
-                return st;
-            }
-            if (written == 0) {
-                log_error("h2_write_filter: connection closed\n");
-                return CWF_ERROR;
-            }
-
-            bufo_move_front_pos(parent_buf, (size_t)written);
-            module->frame_remaining -= (size_t)written;
-            s->send_window -= written;
-            stream->send_window -= written;
-            stream->write_credit -= written;
-        }
-
-        if (module->frame_end_stream)
-            stream->end_stream_sent = 1;
-
-        module->fh_len = 0;
-        module->fh_pos = 0;
-        module->frame_end_stream = 0;
-
-        if (parent_buf->pos >= parent_buf->size)
-            return CWF_DATA_AGAIN;
+    default:
+        return CWF_ERROR;
     }
 }
 
@@ -430,10 +338,7 @@ static void __reset(void* arg) {
     module->base.cont = 0;
     module->base.done = 0;
     module->base.parent_buf = NULL;
-    module->fh_len = 0;
-    module->fh_pos = 0;
-    module->frame_remaining = 0;
-    module->frame_end_stream = 0;
+    h2_data_writer_reset(&module->writer);
 
     bufo_clear(module->buf);
 }
@@ -453,10 +358,7 @@ http_filter_t* h2_write_filter_create(void) {
     module->base.parent_buf = NULL;
     module->base.free = __free;
     module->base.reset = __reset;
-    module->fh_len = 0;
-    module->fh_pos = 0;
-    module->frame_remaining = 0;
-    module->frame_end_stream = 0;
+    h2_data_writer_reset(&module->writer);
     module->buf = bufo_create();
 
     if (module->buf == NULL) {
