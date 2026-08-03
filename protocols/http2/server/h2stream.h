@@ -57,6 +57,8 @@ typedef enum {
     H2_STREAM_CLOSED,
 } h2stream_state_e;
 
+struct h2_ws_tunnel;
+
 typedef struct h2stream {
     uint32_t id;
     h2stream_state_e state;
@@ -86,6 +88,12 @@ typedef struct h2stream {
     atomic_bool handler_pending; /* queued for, or running in, a handler thread */
     atomic_bool response_ready;  /* handler returned; the response may be sent */
     atomic_bool cancelled;       /* reset by the peer — discard the response */
+
+    /* WebSocket tunnel (RFC 8441), NULL on an ordinary stream. Owned by the
+     * stream: opened by an accepted extended CONNECT, freed with the stream.
+     * See docs/http2/09-extended-connect.md — this pointer is the whole reason
+     * the tunnel is per-stream state rather than per-connection state. */
+    struct h2_ws_tunnel* ws;
 
     /* Worker-only, both paths under the connection lock. */
     unsigned headers_done    : 1; /* the request header block is complete */
