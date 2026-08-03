@@ -78,11 +78,28 @@ websocketsresponse_t* websocketsresponse_create(connection_t* connection) {
     response->base.reset = (void(*)(void*))websocketsresponse_reset;
     response->base.free = (void(*)(void*))websocketsresponse_free;
 
+    /* permessage-deflate context, taken from the connection's WebSocket parser.
+     *
+     * Only ever valid when the connection IS a WebSocket connection. On an
+     * HTTP/2 connection ctx->parser is an h2session_t, and reading it as a
+     * websocketsparser_t is type confusion — it produced a ws_deflate pointer
+     * 4 KB past the session, which ASan caught on the first tunnelled message
+     * (docs/http2/09, step 4). A tunnel attaches its own context with
+     * websocketsresponse_set_deflate() instead. */
     connection_server_ctx_t* ctx = connection->ctx;
-    websocketsparser_t* parser = ctx != NULL ? ctx->parser : NULL;
+    websocketsparser_t* parser = (ctx != NULL && !ctx->is_http2) ? ctx->parser : NULL;
     response->ws_deflate = parser != NULL ? &parser->ws_deflate : NULL;
 
     return response;
+}
+
+/* Attach a permessage-deflate context explicitly. Needed wherever the
+ * connection is not itself the WebSocket — an RFC 8441 tunnel keeps its context
+ * on the stream (docs/http2/09). */
+void websocketsresponse_set_deflate(websocketsresponse_t* response, ws_deflate_t* deflate) {
+    if (response == NULL) return;
+
+    response->ws_deflate = deflate;
 }
 
 void websocketsresponse_reset(websocketsresponse_t* response) {

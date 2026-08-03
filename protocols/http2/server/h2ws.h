@@ -41,7 +41,7 @@ typedef struct h2_ws_tunnel {
      * other; that is what their h2 stream ids are for. Hence a queue here
      * rather than the connection-wide ctx->write_queue the HTTP/1.1 path uses
      * (docs/http2/09 §4.1). */
-    cqueue_t* out;
+    cqueue_t* out;                  /* connection_out_slot_t*, in arrival order */
     websocketsresponse_t* writing;  /* head being framed out right now */
     h2_data_writer_t writer;        /* resumable DATA framing state */
 
@@ -53,7 +53,7 @@ typedef struct h2_ws_tunnel {
 
 /* Build a tunnel for a stream whose extended CONNECT was accepted. Returns NULL
  * on allocation failure, in which case the caller must fail the stream. */
-h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection);
+h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, int resource_protocol);
 void h2_ws_tunnel_free(h2_ws_tunnel_t* tunnel);
 
 /* Hand one DATA payload to the parser. `data` must be writable: WebSocket

@@ -101,6 +101,10 @@ typedef struct websocketsresponse {
  */
 websocketsresponse_t* websocketsresponse_create(connection_t* connection);
 
+/* Attach a permessage-deflate context explicitly (RFC 8441 tunnels: the context
+ * lives on the stream, not on the connection). NULL disables compression. */
+void websocketsresponse_set_deflate(websocketsresponse_t* response, ws_deflate_t* deflate);
+
 /**
  * Reset response and send text message (convenience wrapper).
  * @param response Response to reset and use

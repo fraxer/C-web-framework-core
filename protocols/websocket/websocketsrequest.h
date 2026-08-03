@@ -75,6 +75,20 @@ typedef struct websocketsrequest {
 
     /** Connection this request belongs to */
     connection_t* connection;
+
+    /* Where this message's reply belongs, when the message did not arrive on a
+     * WebSocket *connection* at all but inside an HTTP/2 stream (RFC 8441 —
+     * docs/http2/09). On the HTTP/1.1 path all four are NULL/0 and the
+     * connection's own write_queue is used, exactly as before.
+     *
+     * Deliberately a queue plus a callback rather than a pointer to anything
+     * HTTP/2: the WebSocket layer must not depend on the HTTP/2 layer, which
+     * links it. The tunnel fills these in before dispatch and they travel with
+     * the message to the handler thread. */
+    cqueue_t* out_queue;                          /* slots, in tunnel order */
+    void* out_owner;                              /* opaque: the tunnel */
+    int (*out_wake)(connection_t*, void* owner);  /* make the writer run */
+    int out_parallel;                             /* fan-out allowed for this one */
 } websocketsrequest_t;
 
 /**

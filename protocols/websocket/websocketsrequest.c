@@ -45,6 +45,10 @@ websocketsrequest_t* websocketsrequest_create(connection_t* connection, websocke
     request->connection = connection;
     request->base.reset = websocketsrequest_reset;
     request->base.free = websocketsrequest_free;
+    request->out_queue = NULL;
+    request->out_owner = NULL;
+    request->out_wake = NULL;
+    request->out_parallel = 0;
 
     return request;
 }

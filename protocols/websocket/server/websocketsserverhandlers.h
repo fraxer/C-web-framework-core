@@ -22,4 +22,8 @@ int websockets_deferred_handler(connection_t* connection, void* component, queue
 void websockets_queue_request_handler(void*);
 void* websockets_queue_data_request_create(connection_t* connection, void* component, ratelimiter_t* ratelimiter);
 
+/* Reserve a place in an output order. Exposed for the RFC 8441 tunnel, whose
+ * order lives on the stream rather than on the connection (docs/http2/09). */
+connection_out_slot_t* __out_reserve_in(cqueue_t* queue);
+
 #endif
