@@ -87,7 +87,7 @@ int bufferdata_move(bufferdata_t* buffer) {
 
     size_t dbuffer_length = buffer->offset_dbuffer + buffer->offset_sbuffer;
 
-    if (buffer->dbuffer_size <= dbuffer_length) {
+    if (buffer->dynamic_buffer == NULL || buffer->dbuffer_size <= dbuffer_length) {
         char* data = realloc(buffer->dynamic_buffer, dbuffer_length + 1);
         if (data == NULL) return 0;
 

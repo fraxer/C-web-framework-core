@@ -178,12 +178,24 @@ int websockets_response_post(websocketsresponse_t* response) {
     return __out_publish(connection, slot, response);
 }
 
-int websockets_guard_read(connection_t* connection) {
+static int __handle_locked(connection_t* connection, websocketsparser_t* parser) {
     connection_s_lock(connection, LOCK_SITE_WS_READ);
-    const int r = __read(connection);
+    const int r = __handle(parser);
     connection_s_unlock(connection);
 
     return r;
+}
+
+static int __post_close_default_locked(connection_t* connection, unsigned short status_code, const char* reason) {
+    connection_s_lock(connection, LOCK_SITE_WS_READ);
+    const int r = __post_close_default(connection, status_code, reason);
+    connection_s_unlock(connection);
+
+    return r;
+}
+
+int websockets_guard_read(connection_t* connection) {
+    return __read(connection);
 }
 
 int websockets_guard_write(connection_t* connection) {
@@ -225,14 +237,14 @@ int __read(connection_t* connection) {
                 case WSPARSER_OUT_OF_MEMORY:
                     return 0;
                 case WSPARSER_PAYLOAD_LARGE:
-                    return __post_close_default(connection, 1009, "Payload large");
+                    return __post_close_default_locked(connection, 1009, "Payload large");
                 case WSPARSER_BAD_REQUEST:
-                    return __post_close_default(connection, 1002, "Bad request");
+                    return __post_close_default_locked(connection, 1002, "Bad request");
                 case WSPARSER_CONTINUE:
                     goto read_data;
                 case WSPARSER_HANDLE_AND_CONTINUE:
                 {
-                    if (!__handle(parser))
+                    if (!__handle_locked(connection, parser))
                         return 0;
 
                     websocketsparser_prepare_remains(parser);
@@ -240,7 +252,7 @@ int __read(connection_t* connection) {
                 }
                 case WSPARSER_COMPLETE:
                 {
-                    if (!__handle(parser))
+                    if (!__handle_locked(connection, parser))
                         return 0;
 
                     websocketsparser_reset(parser);

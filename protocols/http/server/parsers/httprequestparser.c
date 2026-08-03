@@ -85,8 +85,7 @@ void httpparser_reset(httprequestparser_t* parser) {
 }
 
 void __clear_buf(httprequestparser_t* parser) {
-    if (parser->buf.dynamic_buffer) free(parser->buf.dynamic_buffer);
-    parser->buf.dynamic_buffer = NULL;
+    bufferdata_clear(&parser->buf);
 }
 
 int __clear_and_return(httprequestparser_t* parser, int error) {

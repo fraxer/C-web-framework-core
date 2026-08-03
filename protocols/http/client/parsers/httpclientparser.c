@@ -264,8 +264,7 @@ int httpclientparser_parse(httpclientparser_t* parser, const char* url) {
 }
 
 void __httpclientparser_flush(httpclientparser_t* parser) {
-    if (parser->buf.dynamic_buffer) free(parser->buf.dynamic_buffer);
-    parser->buf.dynamic_buffer = NULL;
+    bufferdata_clear(&parser->buf);
 
     bufferdata_reset(&parser->buf);
 

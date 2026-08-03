@@ -22,8 +22,7 @@ void dkimheaderparser_set_buffer(dkimheaderparser_t* parser, const char* buffer,
 }
 
 void dkimheaderparser_flush(dkimheaderparser_t* parser) {
-    if (parser->buf.dynamic_buffer) free(parser->buf.dynamic_buffer);
-    parser->buf.dynamic_buffer = NULL;
+    bufferdata_clear(&parser->buf);
 }
 
 void dkimheaderparser_free(dkimheaderparser_t* parser) {

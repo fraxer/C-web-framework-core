@@ -39,8 +39,7 @@ httpteparser_t* httpteparser_init() {
 }
 
 void httpteparser_free(httpteparser_t* parser) {
-    if (parser->buf.dynamic_buffer) free(parser->buf.dynamic_buffer);
-    parser->buf.dynamic_buffer = NULL;
+    bufferdata_clear(&parser->buf);
 
     /*
      * inflateInit2() вызывается лениво при первом gzip-чанке, а inflateEnd() —
