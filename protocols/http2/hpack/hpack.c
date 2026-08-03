@@ -357,13 +357,26 @@ static int out_push(hpack_header_t** arr, size_t* count, size_t* cap,
     return 1;
 }
 
+/* Accumulate the decoded size of one field and report whether the block has
+ * outgrown the limit (RFC 9113 §6.5.2 accounting: name + value + 32). */
+static int list_size_exceeded(size_t* total, size_t max_list_size,
+                              size_t name_len, size_t value_len) {
+    if (max_list_size == 0) return 0;
+
+    *total += name_len + value_len + 32;
+
+    return *total > max_list_size;
+}
+
 hpack_status_e hpack_decoder_decode(hpack_decoder_t* d,
                                     const uint8_t* block, size_t len,
+                                    size_t max_list_size,
                                     hpack_header_t** out, size_t* out_count) {
     const uint8_t* p = block;
     const uint8_t* end = block + len;
     hpack_header_t* arr = NULL;
     size_t cnt = 0, cap = 0;
+    size_t list_size = 0;
     hpack_status_e st = HPACK_OK;
     /* RFC 7541 §4.2: dynamic table size updates MUST occur at the beginning of
      * a header block, before any header field representation. */
@@ -380,6 +393,10 @@ hpack_status_e hpack_decoder_decode(hpack_decoder_t* d,
             const char *name, *value; size_t nl, vl;
             st = hpack_resolve_index(&d->table, idx, &name, &nl, &value, &vl);
             if (st) goto done;
+            /* Checked before the copy: an indexed field is one byte on the wire
+             * and can be repeated for as long as the block lasts, so this is the
+             * representation a decompression bomb is built from. */
+            if (list_size_exceeded(&list_size, max_list_size, nl, vl)) { st = HPACK_ERR_TOO_LARGE; goto done; }
             if (!out_push(&arr, &cnt, &cap, name, nl, value, vl)) { st = HPACK_ERR_MEMORY; goto done; }
             field_seen = 1;
         } else if ((b & 0xe0) == 0x20) {
@@ -416,6 +433,10 @@ hpack_status_e hpack_decoder_decode(hpack_decoder_t* d,
             char* value; size_t value_len;
             st = hpack_decode_string(&p, end, &value, &value_len);
             if (st) { free(owned_name); goto done; }
+
+            if (list_size_exceeded(&list_size, max_list_size, name_len, value_len)) {
+                free(owned_name); free(value); st = HPACK_ERR_TOO_LARGE; goto done;
+            }
 
             if (!out_push(&arr, &cnt, &cap, name, name_len, value, value_len)) {
                 free(owned_name); free(value); st = HPACK_ERR_MEMORY; goto done;

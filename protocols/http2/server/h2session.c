@@ -2,6 +2,7 @@
 #include "h2session.h"
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,7 @@
 #include "h2stream.h"
 #include "httpserverhandlers.h"
 #include "log.h"
+#include "metrics.h"
 #include "multiplexing.h"
 #include "openssl.h"
 #include "route.h"
@@ -37,6 +39,7 @@
 #define H2_ERR_STREAM_CLOSED      5
 #define H2_ERR_REFUSED_STREAM     7
 #define H2_ERR_COMPRESSION_ERROR  9
+#define H2_ERR_ENHANCE_YOUR_CALM  11
 
 /* SETTINGS identifiers (RFC 9113 §6.5.2). */
 #define H2_SETTINGS_HEADER_TABLE_SIZE      0x1
@@ -44,6 +47,7 @@
 #define H2_SETTINGS_MAX_CONCURRENT_STREAMS 0x3
 #define H2_SETTINGS_INITIAL_WINDOW_SIZE    0x4
 #define H2_SETTINGS_MAX_FRAME_SIZE         0x5
+#define H2_SETTINGS_MAX_HEADER_LIST_SIZE   0x6
 
 #define H2_MAX_WINDOW 2147483647LL /* 2^31 - 1 */
 
@@ -57,6 +61,32 @@
 /* Cap on a single header block (HEADERS + CONTINUATION*). Bounds the
  * CONTINUATION-flood attack noted in docs/http2/07. */
 #define H2_MAX_HEADER_BLOCK (1u << 20)
+
+/* ======================================================================= *
+ *  Abuse limits (docs/http2/08-spec-gaps.md, phase A)
+ * ======================================================================= *
+ * Three of the four are thresholds guessed from what an honest client does, so
+ * each is a knob and each one that fires is counted (metrics_h2_abuse) — an
+ * operator otherwise cannot tell an attack from a limit set too tight.
+ *
+ * Stream aborts: a browser that leaves a page resets everything it had open at
+ * once, so the burst has to be well above the concurrency limit; the sustained
+ * rate is what separates that from a loop. */
+#define H2_DEFAULT_ABORT_RATE  100   /* tokens/s */
+#define H2_DEFAULT_ABORT_BURST 200   /* tokens */
+
+/* Frames per header block. At the default max frame size this is the same 1 MB
+ * H2_MAX_HEADER_BLOCK allows, approached from the other side: empty
+ * CONTINUATION frames cost work without costing bytes. */
+#define H2_DEFAULT_MAX_CONTINUATION_FRAMES 64
+
+/* SETTINGS_MAX_HEADER_LIST_SIZE we advertise, and the hard multiple of it the
+ * decoder is allowed to reach before the connection is written off. The soft
+ * limit is answerable (431, the block is decoded to the end so the shared HPACK
+ * table survives); the hard one is not — reaching it means aborting mid-block,
+ * which desynchronises that table for good. */
+#define H2_DEFAULT_MAX_HEADER_LIST_SIZE 32768
+#define H2_HEADER_LIST_HARD_FACTOR 8
 
 /* ======================================================================= *
  *  Lifecycle policy (Phase 5): idle timeout, PING watchdog
@@ -108,6 +138,12 @@ static uint32_t h2_ping_ack_timeout_sec = H2_DEFAULT_PING_ACK_TIMEOUT_SEC;
 static int64_t  h2_recv_window_initial = H2_DEFAULT_WINDOW;
 static int64_t  h2_recv_window_max = H2_DEFAULT_RECV_WINDOW_MAX;
 static int64_t  h2_write_quantum = H2_DEFAULT_WRITE_QUANTUM;
+static int64_t  h2_abort_rate = H2_DEFAULT_ABORT_RATE;
+static int64_t  h2_abort_burst = H2_DEFAULT_ABORT_BURST;
+static uint32_t h2_max_continuation_frames = H2_DEFAULT_MAX_CONTINUATION_FRAMES;
+static int64_t  h2_max_header_list_size = H2_DEFAULT_MAX_HEADER_LIST_SIZE;
+static int64_t  h2_max_header_list_hard =
+    (int64_t)H2_DEFAULT_MAX_HEADER_LIST_SIZE * H2_HEADER_LIST_HARD_FACTOR;
 
 void h2_policy_init(void) {
     h2_idle_timeout_sec = (uint32_t)env_get_int("http2_idle_timeout_sec", H2_DEFAULT_IDLE_TIMEOUT_SEC);
@@ -132,6 +168,29 @@ void h2_policy_init(void) {
      * lower for latency when many small responses share a connection. */
     h2_write_quantum = env_get_int("http2_write_quantum", H2_DEFAULT_WRITE_QUANTUM);
     if (h2_write_quantum < H2_MIN_WRITE_QUANTUM) h2_write_quantum = H2_MIN_WRITE_QUANTUM;
+
+    /* Abuse limits (phase A). Each takes 0 to mean "off", because every one of
+     * them can in principle misfire on a client nobody has met yet, and an
+     * operator needs a way to prove that before the fix ships. */
+    h2_abort_rate = env_get_int("http2_abort_rate", H2_DEFAULT_ABORT_RATE);
+    if (h2_abort_rate < 0) h2_abort_rate = 0;
+
+    h2_abort_burst = env_get_int("http2_abort_burst", H2_DEFAULT_ABORT_BURST);
+    /* A burst below the concurrency limit would fire on a client that merely
+     * cancels everything it has open, which is ordinary behaviour. */
+    if (h2_abort_burst < H2_MAX_CONCURRENT_STREAMS) h2_abort_burst = H2_MAX_CONCURRENT_STREAMS;
+
+    h2_max_continuation_frames = (uint32_t)env_get_int("http2_max_continuation_frames",
+                                                       H2_DEFAULT_MAX_CONTINUATION_FRAMES);
+
+    h2_max_header_list_size = env_get_int("http2_max_header_list_size",
+                                          H2_DEFAULT_MAX_HEADER_LIST_SIZE);
+    if (h2_max_header_list_size < 0) h2_max_header_list_size = 0;
+    /* Clamped so the value can be advertised in a 32-bit SETTINGS field. */
+    if (h2_max_header_list_size > UINT32_MAX) h2_max_header_list_size = UINT32_MAX;
+
+    h2_max_header_list_hard = h2_max_header_list_size * H2_HEADER_LIST_HARD_FACTOR;
+    if (h2_max_header_list_size == 0) h2_max_header_list_hard = 0; /* both off */
 }
 
 /* CLOCK_MONOTONIC milliseconds — immune to wall-clock jumps, so deadlines never
@@ -151,6 +210,7 @@ typedef enum {
 
 static int h2_flush_out(h2session_t* s);
 static void h2_session_drop_stream(h2session_t* s, h2stream_t* stream);
+static void h2_recv_settle(h2session_t* s);
 
 /* ======================================================================= *
  *  Outbound frame buffer
@@ -191,6 +251,11 @@ int h2_session_queue_frame(h2session_t* s, uint8_t type, uint8_t flags,
  * would block and bytes remain. */
 static int h2_flush_out(h2session_t* s) {
     connection_t* conn = s->connection;
+
+    /* Whatever window credit is queued is on its way to the peer now — see
+     * h2_recv_settle. Done here rather than in the callers because this is the
+     * one place every path goes through on its way to the socket. */
+    h2_recv_settle(s);
 
     while (s->out_pos < s->out_len) {
         const ssize_t written = connection_data_write(conn, (const char*)(s->out + s->out_pos),
@@ -243,7 +308,13 @@ static int h2_fail(h2session_t* s, uint32_t error_code) {
     return 0;
 }
 
-static void h2_queue_window_update(h2session_t* s, uint32_t stream_id, uint32_t increment) {
+/* Grant `increment` more receive window on one flow. `w` is that flow's state:
+ * the credit is added to it only if the frame was actually queued, which is what
+ * keeps w->avail equal to what the peer has been told it may send. Crediting a
+ * frame that never went out would make us accept bytes the peer was never
+ * allowed to send — silently, and only under memory pressure. */
+static void h2_queue_window_update(h2session_t* s, uint32_t stream_id,
+                                   h2_recv_window_t* w, uint32_t increment) {
     if (increment == 0) return;
 
     const uint8_t payload[4] = {
@@ -253,7 +324,37 @@ static void h2_queue_window_update(h2session_t* s, uint32_t stream_id, uint32_t 
         (uint8_t)(increment & 0xff),
     };
 
-    (void)h2_session_queue_frame(s, H2_FRAME_WINDOW_UPDATE, 0, stream_id, payload, sizeof(payload));
+    if (!h2_session_queue_frame(s, H2_FRAME_WINDOW_UPDATE, 0, stream_id, payload, sizeof(payload)))
+        return;
+
+    w->credited += increment;
+    /* Only a stream's credit needs the table walk in h2_recv_settle; the
+     * connection's own window is settled unconditionally, being one field. */
+    if (stream_id != 0) s->stream_credit_pending = 1;
+}
+
+/* Hand the queued window credit to the peer's account. Called as the outbound
+ * buffer is about to go to the socket — deliberately without waiting to see how
+ * much of it the socket took: crediting slightly early costs nothing (we accept
+ * bytes the peer was about to be allowed to send anyway), while crediting late
+ * would kill a connection whose peer used a window it had legitimately been
+ * granted. The direction of the error matters more than its timing. */
+static void h2_recv_settle(h2session_t* s) {
+    s->recv.avail += s->recv.credited;
+    s->recv.credited = 0;
+
+    /* Guarded because this is on the write path's hot loop: with a hundred
+     * streams on a connection, walking the table on every flush would cost more
+     * than the accounting it exists for. Only an upload queues stream credit,
+     * and most connections never send a byte of request body. */
+    if (!s->stream_credit_pending) return;
+
+    for (h2stream_t* stream = s->streams; stream != NULL; stream = stream->next) {
+        stream->recv.avail += stream->recv.credited;
+        stream->recv.credited = 0;
+    }
+
+    s->stream_credit_pending = 0;
 }
 
 /* Process-wide, monotonically increasing. Makes every PING's opaque 8-byte
@@ -381,16 +482,59 @@ static void h2_recv_credit(h2session_t* s, uint32_t stream_id, h2_recv_window_t*
         }
     }
 
-    h2_queue_window_update(s, stream_id, (uint32_t)increment);
+    h2_queue_window_update(s, stream_id, w, (uint32_t)increment);
+}
+
+/* Debit a flow-controlled frame from one flow's window (§6.9.1). Returns 0 when
+ * the peer overran it: everything the frame carried counts, padding included,
+ * and it counts whatever we then do with the payload — the peer spent the credit
+ * the moment it sent the frame. */
+static int h2_recv_debit(h2_recv_window_t* w, uint32_t len) {
+    w->avail -= (int64_t)len;
+
+    return w->avail >= 0;
 }
 
 /* A fresh stream is credited up to the learned window (§6.9.2 lets SETTINGS set
  * only the initial value, so the difference has to go out as a WINDOW_UPDATE). */
 static void h2_stream_recv_init(h2session_t* s, h2stream_t* stream) {
     stream->recv.epoch_ms = h2_now_ms();
+    /* SETTINGS_INITIAL_WINDOW_SIZE is all the peer credits a new stream with;
+     * anything this connection has already learned above that is only ours to
+     * count once the WINDOW_UPDATE below has been queued. */
+    stream->recv.avail = h2_recv_window_initial;
 
     if (stream->recv.size > h2_recv_window_initial)
-        h2_queue_window_update(s, stream->id, (uint32_t)(stream->recv.size - h2_recv_window_initial));
+        h2_queue_window_update(s, stream->id, &stream->recv,
+                               (uint32_t)(stream->recv.size - h2_recv_window_initial));
+}
+
+/* Spend one token of the stream-abort budget (docs/http2/08, phase A.2).
+ *
+ * A stream that is opened and immediately reset costs a dispatch and an HPACK
+ * decode while holding a concurrency slot for no measurable time, so
+ * MAX_CONCURRENT_STREAMS bounds nothing at all — this is CVE-2023-44487. The
+ * bucket is kept in milli-tokens so the refill is exact integer arithmetic: a
+ * rate of R tokens per second is R milli-tokens per elapsed millisecond, with no
+ * remainder to drop however often this is called.
+ *
+ * Returns 0 when the budget is spent, and the caller ends the connection. */
+static int h2_abort_budget_spend(h2session_t* s) {
+    if (h2_abort_rate == 0) return 1; /* disabled */
+
+    const uint64_t now = h2_now_ms();
+    const uint64_t elapsed = now - s->abort_epoch_ms;
+    const int64_t cap = h2_abort_burst * 1000;
+
+    s->abort_epoch_ms = now;
+    s->abort_tokens += (int64_t)elapsed * h2_abort_rate;
+    if (s->abort_tokens > cap) s->abort_tokens = cap;
+
+    if (s->abort_tokens < 1000) return 0;
+
+    s->abort_tokens -= 1000;
+
+    return 1;
 }
 
 static int rearm(connection_t* conn, int events) {
@@ -607,7 +751,30 @@ typedef enum {
     H2_REQUEST_MALFORMED,   /* stream error: RST_STREAM(PROTOCOL_ERROR) */
     H2_REQUEST_COMPRESSION, /* connection error: the HPACK context is unusable */
     H2_REQUEST_INTERNAL,
+    H2_REQUEST_TOO_LARGE,   /* over the advertised header list size → 431 */
+    H2_REQUEST_TOO_LARGE_HARD, /* over the hard cap: decode aborted mid-block */
 } h2_request_status_e;
+
+/* Size of a decoded header list as RFC 9113 §6.5.2 counts it. */
+static size_t h2_header_list_size(const hpack_header_t* headers, size_t count) {
+    size_t total = 0;
+
+    for (size_t i = 0; i < count; i++)
+        total += headers[i].name_len + headers[i].value_len + 32;
+
+    return total;
+}
+
+/* Map an HPACK failure onto the request outcome. TOO_LARGE is the hard cap only:
+ * the decoder stopped in the middle of the block, so the dynamic table no longer
+ * matches the peer's and the connection cannot continue. The soft limit is
+ * checked by the caller, over a block that was decoded in full. */
+static h2_request_status_e h2_hpack_failed(hpack_status_e st) {
+    if (st == HPACK_ERR_TOO_LARGE) return H2_REQUEST_TOO_LARGE_HARD;
+    if (st == HPACK_ERR_MEMORY) return H2_REQUEST_INTERNAL;
+
+    return H2_REQUEST_COMPRESSION;
+}
 
 /* Fill an httprequest_t from a decoded HPACK block, applying the request
  * validity rules of RFC 9113 §8.3 / §8.2 on the way. Everything the h1.1 parser
@@ -617,8 +784,18 @@ static h2_request_status_e h2_build_request(h2session_t* s, h2stream_t* stream,
     httprequest_t* request = stream->request;
     hpack_header_t* headers = NULL;
     size_t count = 0;
-    if (hpack_decoder_decode(s->decoder, block, len, &headers, &count) != HPACK_OK)
-        return H2_REQUEST_COMPRESSION;
+    const hpack_status_e hst = hpack_decoder_decode(s->decoder, block, len,
+                                                    (size_t)h2_max_header_list_hard,
+                                                    &headers, &count);
+    if (hst != HPACK_OK) return h2_hpack_failed(hst);
+
+    /* §6.5.2: over what we advertised, but decoded in full — the connection
+     * stays usable and the stream can be answered rather than reset. */
+    if (h2_max_header_list_size != 0 &&
+        h2_header_list_size(headers, count) > (size_t)h2_max_header_list_size) {
+        hpack_headers_free(headers, count);
+        return H2_REQUEST_TOO_LARGE;
+    }
 
     h2_request_status_e status = H2_REQUEST_OK;
     int method_seen = 0;
@@ -762,8 +939,10 @@ static h2_request_status_e h2_build_request(h2session_t* s, h2stream_t* stream,
 static h2_request_status_e h2_discard_header_block(h2session_t* s, const uint8_t* block, size_t len) {
     hpack_header_t* headers = NULL;
     size_t count = 0;
-    if (hpack_decoder_decode(s->decoder, block, len, &headers, &count) != HPACK_OK)
-        return H2_REQUEST_COMPRESSION;
+    const hpack_status_e st = hpack_decoder_decode(s->decoder, block, len,
+                                                   (size_t)h2_max_header_list_hard,
+                                                   &headers, &count);
+    if (st != HPACK_OK) return h2_hpack_failed(st);
 
     hpack_headers_free(headers, count);
 
@@ -777,8 +956,10 @@ static h2_request_status_e h2_discard_header_block(h2session_t* s, const uint8_t
 static h2_request_status_e h2_consume_trailers(h2session_t* s, const uint8_t* block, size_t len) {
     hpack_header_t* headers = NULL;
     size_t count = 0;
-    if (hpack_decoder_decode(s->decoder, block, len, &headers, &count) != HPACK_OK)
-        return H2_REQUEST_COMPRESSION;
+    const hpack_status_e hst = hpack_decoder_decode(s->decoder, block, len,
+                                                    (size_t)h2_max_header_list_hard,
+                                                    &headers, &count);
+    if (hst != HPACK_OK) return h2_hpack_failed(hst);
 
     h2_request_status_e status = H2_REQUEST_OK;
     for (size_t i = 0; i < count; i++) {
@@ -888,6 +1069,13 @@ static h2_frame_result_e h2_apply_settings_payload(h2session_t* s,
                 return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
             s->peer_max_frame_size = value;
             break;
+        case H2_SETTINGS_MAX_HEADER_LIST_SIZE:
+            /* Advisory (§6.5.2): the peer cannot make this binding, since we may
+             * have committed to a response before it arrives. Kept so an
+             * oversize response can say so in the log instead of coming back as
+             * an unexplained reset from the client. */
+            s->peer_max_header_list_size = value;
+            break;
         default:
             break; /* unknown settings must be ignored (§6.5.2) */
         }
@@ -969,6 +1157,16 @@ static h2_frame_result_e h2_on_rst_stream(h2session_t* s, const h2_frame_t* fram
 
     h2stream_t* stream = h2stream_find(s, frame->stream_id);
     if (stream != NULL) {
+        /* A reset before the response went out is the expensive kind: the work
+         * was queued and is now thrown away. Resetting a stream that has already
+         * been answered is what an ordinary client does when it stops reading,
+         * and it costs the server nothing — so it costs no budget either. */
+        if (!stream->end_stream_sent && !h2_abort_budget_spend(s)) {
+            metrics_h2_abuse(METRICS_H2_RST_FLOOD);
+            log_error("h2: stream-abort budget exhausted (fd %d)\n", s->connection->fd);
+            return h2_conn_error(s, H2_ERR_ENHANCE_YOUR_CALM);
+        }
+
         stream->state = H2_STREAM_CLOSED;
         h2_session_drop_stream(s, stream);
     }
@@ -981,17 +1179,52 @@ static h2_frame_result_e h2_request_failed(h2session_t* s, h2stream_t* stream,
                                            h2_request_status_e status) {
     const uint32_t stream_id = stream->id;
 
-    /* A bad HPACK block leaves the shared decoder unusable, so the connection
-     * has to go; a merely malformed request only costs the stream. */
-    if (status == H2_REQUEST_COMPRESSION || status == H2_REQUEST_INTERNAL) {
-        h2_session_drop_stream(s, stream);
-        return h2_conn_error(s, status == H2_REQUEST_COMPRESSION ?
-                             H2_ERR_COMPRESSION_ERROR : H2_ERR_INTERNAL_ERROR);
-    }
-
     h2_session_drop_stream(s, stream);
 
-    return h2_stream_error(s, stream_id, H2_ERR_PROTOCOL_ERROR);
+    /* Anything that left the shared HPACK decoder mid-block, or out of step with
+     * the peer, costs the connection: every later stream would decode garbage.
+     * A merely malformed request costs only its own stream. */
+    switch (status) {
+    case H2_REQUEST_COMPRESSION:
+        return h2_conn_error(s, H2_ERR_COMPRESSION_ERROR);
+    case H2_REQUEST_INTERNAL:
+        return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
+    case H2_REQUEST_TOO_LARGE_HARD:
+        metrics_h2_abuse(METRICS_H2_HEADER_LIST_HARD);
+        log_error("h2: header list over the hard cap on stream %u — closing connection\n", stream_id);
+        return h2_conn_error(s, H2_ERR_ENHANCE_YOUR_CALM);
+    default:
+        return h2_stream_error(s, stream_id, H2_ERR_PROTOCOL_ERROR);
+    }
+}
+
+/* Answer a request the session refuses to route, without running a handler.
+ *
+ * The stream keeps its slot until the write path has sent the response, so it
+ * goes out the same way a handler's would. `rejected` is what makes the rest of
+ * the request harmless: the peer may already be sending a body it could not know
+ * we did not want, and that DATA has to keep being credited and discarded rather
+ * than dispatched or treated as an error. */
+static h2_frame_result_e h2_reject_stream(h2session_t* s, h2stream_t* stream,
+                                          int status_code, int end_stream) {
+    httpresponse_t* response = httpresponse_create_h2(s->connection);
+    if (response == NULL) {
+        h2_session_drop_stream(s, stream);
+        return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
+    }
+
+    httpresponse_default(response, status_code);
+
+    stream->response = response;
+    stream->rejected = 1;
+    stream->headers_done = 1;
+    if (end_stream) stream->state = H2_STREAM_HALF_CLOSED_REMOTE;
+
+    /* Release-store for symmetry with h2_publish_one: the write path loads this
+     * with acquire, and must not see the flag before the response it announces. */
+    atomic_store_explicit(&stream->response_ready, 1, memory_order_release);
+
+    return H2_FRAME_OK;
 }
 
 static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
@@ -1013,6 +1246,13 @@ static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
         if (!end_stream)
             return h2_stream_error(s, stream_id, H2_ERR_PROTOCOL_ERROR);
 
+        /* Already answered without a handler — the trailers were decoded to keep
+         * the HPACK table in step, and that is all they were needed for. */
+        if (stream->rejected) {
+            stream->state = H2_STREAM_HALF_CLOSED_REMOTE;
+            return H2_FRAME_OK;
+        }
+
         return h2_dispatch(s, stream);
     }
 
@@ -1024,6 +1264,10 @@ static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
     if (stream_id > s->last_stream_id) s->last_stream_id = stream_id;
 
     const h2_request_status_e status = h2_build_request(s, stream, block, len);
+    if (status == H2_REQUEST_TOO_LARGE) {
+        metrics_h2_abuse(METRICS_H2_HEADER_LIST);
+        return h2_reject_stream(s, stream, 431, end_stream);
+    }
     if (status != H2_REQUEST_OK)
         return h2_request_failed(s, stream, status);
 
@@ -1079,10 +1323,20 @@ static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) 
         if (frame->flags & H2_FLAG_END_HEADERS) {
             const h2_request_status_e status = h2_discard_header_block(s, block, block_len);
             if (status != H2_REQUEST_OK)
-                return h2_conn_error(s, H2_ERR_COMPRESSION_ERROR);
+                return h2_conn_error(s, status == H2_REQUEST_TOO_LARGE_HARD ?
+                                     H2_ERR_ENHANCE_YOUR_CALM : H2_ERR_COMPRESSION_ERROR);
         }
 
         if (frame->stream_id > s->last_stream_id) s->last_stream_id = frame->stream_id;
+
+        /* A refusal is work the peer made us do for a stream it never got to
+         * hold, exactly like a reset — same budget (phase A.2). Charged after
+         * the block is decoded, so the HPACK table is in step either way. */
+        if (refused && !h2_abort_budget_spend(s)) {
+            metrics_h2_abuse(METRICS_H2_RST_FLOOD);
+            log_error("h2: refused-stream budget exhausted (fd %d)\n", s->connection->fd);
+            return h2_conn_error(s, H2_ERR_ENHANCE_YOUR_CALM);
+        }
 
         return h2_stream_error(s, frame->stream_id,
                                refused ? H2_ERR_REFUSED_STREAM : H2_ERR_PROTOCOL_ERROR);
@@ -1100,6 +1354,7 @@ static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) 
         s->cont_stream_id = frame->stream_id;
         s->cont_end_stream = end_stream;
         s->cont_active = 1;
+        s->cont_frames = 1; /* this HEADERS counts towards the block's frame budget */
 
         return H2_FRAME_OK;
     }
@@ -1113,6 +1368,16 @@ static h2_frame_result_e h2_on_continuation(h2session_t* s, const h2_frame_t* fr
 
     if (s->cont_len + frame->payload_len > H2_MAX_HEADER_BLOCK)
         return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
+
+    /* The byte limit above bounds memory, not work: an empty CONTINUATION adds
+     * nothing to cont_len, so without a frame count the peer can keep this loop
+     * running for as long as it likes (docs/http2/08, phase A.3). */
+    if (h2_max_continuation_frames != 0 && ++s->cont_frames > h2_max_continuation_frames) {
+        metrics_h2_abuse(METRICS_H2_CONT_FLOOD);
+        log_error("h2: CONTINUATION flood on stream %u (fd %d)\n",
+                  frame->stream_id, s->connection->fd);
+        return h2_conn_error(s, H2_ERR_ENHANCE_YOUR_CALM);
+    }
 
     uint8_t* buf = realloc(s->cont, s->cont_len + frame->payload_len + 1);
     if (buf == NULL) return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
@@ -1129,6 +1394,17 @@ static h2_frame_result_e h2_on_continuation(h2session_t* s, const h2_frame_t* fr
 }
 
 static h2_frame_result_e h2_on_data(h2session_t* s, const h2_frame_t* frame) {
+    /* Debit before anything else: the peer spent connection window the moment it
+     * sent the frame, whatever we then decide to do with the payload. Overrunning
+     * the connection window is a connection error (§6.9.1) — there is no way to
+     * resynchronise a window the peer is not tracking. */
+    if (!h2_recv_debit(&s->recv, frame->payload_len)) {
+        metrics_h2_abuse(METRICS_H2_FLOW_CONN);
+        log_error("h2: connection receive window overrun by %ld bytes (fd %d)\n",
+                  (long)-s->recv.avail, s->connection->fd);
+        return h2_conn_error(s, H2_ERR_FLOW_CONTROL_ERROR);
+    }
+
     /* Credit the connection window back regardless of what happens to the
      * payload: the peer counted it against our window either way. */
     h2_recv_credit(s, 0, &s->recv, frame->payload_len);
@@ -1155,7 +1431,21 @@ static h2_frame_result_e h2_on_data(h2session_t* s, const h2_frame_t* frame) {
         data_len -= pad_len;
     }
 
+    /* Same debit on the stream's own window. Only the stream dies here: the
+     * connection window is still consistent, so the rest of it carries on. */
+    if (!h2_recv_debit(&stream->recv, frame->payload_len)) {
+        metrics_h2_abuse(METRICS_H2_FLOW_STREAM);
+        return h2_stream_error(s, stream->id, H2_ERR_FLOW_CONTROL_ERROR);
+    }
+
     h2_recv_credit(s, stream->id, &stream->recv, frame->payload_len);
+
+    /* Answered already (431 from the header-list limit): the body is credited
+     * like any other, then dropped. The peer could not have known. */
+    if (stream->rejected) {
+        if (frame->flags & H2_FLAG_END_STREAM) stream->state = H2_STREAM_HALF_CLOSED_REMOTE;
+        return H2_FRAME_OK;
+    }
 
     if (!h2_body_append(stream, data, data_len))
         return h2_stream_error(s, stream->id, H2_ERR_INTERNAL_ERROR);
@@ -1817,6 +2107,7 @@ void h2_server_tick(connection_t* connection, int shutdown_now) {
 /* Server connection preface (§3.4): SETTINGS must be the first frame we send. */
 static int h2_send_preface(h2session_t* s) {
     const uint32_t window = (uint32_t)h2_recv_window_initial;
+    const uint32_t header_list = (uint32_t)h2_max_header_list_size;
     const uint8_t settings[] = {
         0x00, H2_SETTINGS_ENABLE_PUSH,            0x00, 0x00, 0x00, 0x00,
         0x00, H2_SETTINGS_MAX_CONCURRENT_STREAMS,
@@ -1829,15 +2120,26 @@ static int h2_send_preface(h2session_t* s) {
             (uint8_t)((window >> 16) & 0xff),
             (uint8_t)((window >> 8) & 0xff),
             (uint8_t)(window & 0xff),
+        /* §6.5.2: what a client is told here it can keep to, and a client that
+         * does gets a 200 where it would otherwise have collected a 431. */
+        0x00, H2_SETTINGS_MAX_HEADER_LIST_SIZE,
+            (uint8_t)((header_list >> 24) & 0xff),
+            (uint8_t)((header_list >> 16) & 0xff),
+            (uint8_t)((header_list >> 8) & 0xff),
+            (uint8_t)(header_list & 0xff),
     };
 
-    if (!h2_session_queue_frame(s, H2_FRAME_SETTINGS, 0, 0, settings, sizeof(settings)))
+    /* With the limit disabled the setting is left out entirely — advertising 0
+     * would announce that no header at all is acceptable. */
+    const size_t len = h2_max_header_list_size == 0 ? sizeof(settings) - 6 : sizeof(settings);
+
+    if (!h2_session_queue_frame(s, H2_FRAME_SETTINGS, 0, 0, settings, len))
         return 0;
 
     /* SETTINGS_INITIAL_WINDOW_SIZE governs streams only (§6.9.2); the
      * connection window moves by WINDOW_UPDATE alone. */
     if (h2_recv_window_initial > H2_DEFAULT_WINDOW)
-        h2_queue_window_update(s, 0, (uint32_t)(h2_recv_window_initial - H2_DEFAULT_WINDOW));
+        h2_queue_window_update(s, 0, &s->recv, (uint32_t)(h2_recv_window_initial - H2_DEFAULT_WINDOW));
 
     return 1;
 }
@@ -1874,10 +2176,16 @@ static h2session_t* h2_session_begin(connection_t* connection) {
     s->peer_header_table_size = 4096;
     s->send_window = H2_DEFAULT_WINDOW;
     s->recv.size = h2_recv_window_initial;
+    /* The connection window starts at the protocol default whatever we intend to
+     * grow it to: SETTINGS cannot set it (§6.9.2), only the WINDOW_UPDATE that
+     * h2_send_preface queues below, which credits avail as it goes. */
+    s->recv.avail = H2_DEFAULT_WINDOW;
     s->recv.epoch_ms = h2_now_ms();
     s->stream_recv_learned = h2_recv_window_initial;
     s->error_code = H2_ERR_PROTOCOL_ERROR;
     s->last_activity_ms = h2_now_ms();
+    s->abort_tokens = h2_abort_burst * 1000;
+    s->abort_epoch_ms = s->last_activity_ms;
 
     /* Server connection preface (§3.4): SETTINGS must be the first frame we send. */
     if (!h2_send_preface(s)) {

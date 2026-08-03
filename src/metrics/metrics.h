@@ -67,6 +67,23 @@ typedef enum {
     LOCK_SITE__COUNT
 } metrics_lock_site_t;
 
+/* HTTP/2 abuse limits (docs/http2/08-spec-gaps.md, phase A).
+ *
+ * Every one of these ends a stream or a connection. Without a counter per limit
+ * an operator sees only "clients keep getting disconnected" and cannot tell an
+ * attack from a client this server has started rejecting wrongly — which is the
+ * failure mode these limits actually have, since each one guesses a threshold.
+ * They fire once per victim, so unlike the lock counters they are free. */
+typedef enum {
+    METRICS_H2_FLOW_CONN = 0,     /* peer overran the connection receive window */
+    METRICS_H2_FLOW_STREAM,       /* peer overran a stream's receive window */
+    METRICS_H2_RST_FLOOD,         /* stream-abort budget spent (Rapid Reset) */
+    METRICS_H2_CONT_FLOOD,        /* too many CONTINUATION frames in one block */
+    METRICS_H2_HEADER_LIST,       /* header list over the advertised limit → 431 */
+    METRICS_H2_HEADER_LIST_HARD,  /* header list over the hard cap → connection */
+    METRICS_H2_ABUSE__COUNT
+} metrics_h2_abuse_t;
+
 /* Not for direct use — read it through metrics_enabled(). */
 extern atomic_int __metrics_on;
 
@@ -106,6 +123,11 @@ void metrics_handler_end(void);
  * the item just taken. depth == 0 records an empty pop — the fan-out queued a
  * connection whose items another worker had already drained. */
 void metrics_queue_pop(int depth);
+
+/* One HTTP/2 abuse limit fired. Unlike the counters above this one checks
+ * metrics_enabled() itself: the call sites are error paths where the caller
+ * would otherwise have to wrap every one of them in the same test. */
+void metrics_h2_abuse(metrics_h2_abuse_t kind);
 
 /* Snapshot of every counter as a JSON object. Caller owns the document and
  * frees it with json_free(). Never blocks: the counters are read one by one, so

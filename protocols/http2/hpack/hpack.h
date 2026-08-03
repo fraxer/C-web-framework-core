@@ -25,7 +25,8 @@ typedef enum {
     HPACK_OK = 0,
     HPACK_ERR_COMPRESSION, /* bad Huffman code / EOS mid-stream / bad padding → connection error */
     HPACK_ERR_INVALID,     /* bad index, forbidden representation, truncated input, overflow */
-    HPACK_ERR_MEMORY
+    HPACK_ERR_MEMORY,
+    HPACK_ERR_TOO_LARGE    /* decoded list exceeded max_list_size — decode aborted */
 } hpack_status_e;
 
 /* ---- Dynamic table (RFC 7541 §4) ----
@@ -71,9 +72,20 @@ void hpack_decoder_free(hpack_decoder_t* d);
 /* Decode a complete header block. On HPACK_OK, *out is a malloc'd array of
  * *out_count entries (caller frees with hpack_headers_free). Name/value bytes
  * within each entry are null-terminated for convenience but name_len/value_len
- * hold the authoritative length. */
+ * hold the authoritative length.
+ *
+ * max_list_size bounds the *decoded* size — the sum of `name_len + value_len +
+ * 32` over the fields, which is how RFC 9113 §6.5.2 measures
+ * SETTINGS_MAX_HEADER_LIST_SIZE — and returns HPACK_ERR_TOO_LARGE as soon as it
+ * is passed. 0 disables the check. This is the only bound on how much a block
+ * can expand to: a few bytes of indexed repeats decode into megabytes, so a
+ * caller with no limit has none. Aborting mid-block leaves the dynamic table
+ * out of step with the peer's, so a caller that wants to keep the connection
+ * must pass a limit it is willing to lose the connection over, and enforce any
+ * softer, per-request limit on the returned fields. */
 hpack_status_e hpack_decoder_decode(hpack_decoder_t* d,
                                     const uint8_t* block, size_t len,
+                                    size_t max_list_size,
                                     hpack_header_t** out, size_t* out_count);
 void hpack_headers_free(hpack_header_t* headers, size_t count);
 

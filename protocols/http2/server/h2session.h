@@ -72,11 +72,26 @@ typedef struct h2session {
     uint32_t cont_stream_id;
     int      cont_end_stream;
     int      cont_active;
+    /* Frames in the block being accumulated, HEADERS included. The byte limit
+     * above bounds memory but not work: an empty CONTINUATION adds nothing to
+     * cont_len and can be repeated forever (docs/http2/08, phase A.3). */
+    uint32_t cont_frames;
 
     /* Peer settings (RFC defaults until the peer sends SETTINGS). */
     uint32_t peer_max_frame_size;
     uint32_t peer_initial_window;
     uint32_t peer_header_table_size;
+    /* SETTINGS_MAX_HEADER_LIST_SIZE the peer advertised, 0 = unlimited (its
+     * absence and its "no limit" are the same thing to us). Advisory: §6.5.2
+     * makes it a hint, so an oversize response is logged, not truncated. */
+    uint32_t peer_max_header_list_size;
+
+    /* Budget for stream aborts (docs/http2/08, phase A.2), in milli-tokens.
+     * Spent by RST_STREAM on an unanswered stream and by streams we refuse over
+     * the concurrency limit — the two ways a peer can make the server do work
+     * without ever holding a slot. */
+    int64_t  abort_tokens;
+    uint64_t abort_epoch_ms;
 
     /* Connection-level send window (RFC 9113 §6.9); each stream has its own. */
     int64_t  send_window;
@@ -88,6 +103,10 @@ typedef struct h2session {
     /* Receive side: the connection window we advertise, plus the counters that
      * auto-scale it (§6.9.1). Streams carry the same state of their own. */
     h2_recv_window_t recv;
+    /* A stream window has credit queued but not yet handed over (see
+     * h2_recv_settle). Keeps the settle off the stream table on the connections
+     * — the overwhelming majority — that never receive a request body. */
+    int      stream_credit_pending;
     /* Receive window a stream on this connection has grown to; new streams open
      * there rather than ramping again from the advertised initial value. */
     int64_t  stream_recv_learned;

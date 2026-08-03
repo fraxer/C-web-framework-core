@@ -216,6 +216,21 @@ static int __build_headers(httprequest_t* request, httpresponse_t* response,
         n++;
     }
 
+    /* RFC 9113 §6.5.2 is explicit that this limit is advisory, and truncating is
+     * worse than exceeding it: the fields a response cannot afford to lose
+     * (Set-Cookie, Location, Content-Type) are not distinguishable from the ones
+     * it can. So the response goes out whole and the log says why the client may
+     * reject it — otherwise that arrives as an unexplained RST_STREAM. */
+    if (s->peer_max_header_list_size != 0) {
+        size_t list_size = 0;
+        for (size_t i = 0; i < n; i++)
+            list_size += fields[i].name_len + fields[i].value_len + 32;
+
+        if (list_size > s->peer_max_header_list_size)
+            log_error("h2_write_filter: response header list %zu > peer limit %u on stream %u\n",
+                      list_size, s->peer_max_header_list_size, stream->id);
+    }
+
     uint8_t* block = NULL;
     size_t block_len = 0;
     const hpack_status_e st = hpack_encoder_encode(s->encoder, fields, n, 1, &block, &block_len);

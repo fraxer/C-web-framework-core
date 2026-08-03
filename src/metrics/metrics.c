@@ -21,6 +21,13 @@ static const char* const __wait_bucket_name[METRICS_WAIT_BUCKETS] = {
     "<1us", "<10us", "<100us", "<1ms", "<10ms", ">=10ms"
 };
 
+/* Index-matched to metrics_h2_abuse_t. */
+static const char* const __h2_abuse_name[METRICS_H2_ABUSE__COUNT] = {
+    "flow_control.connection", "flow_control.stream",
+    "rst_flood", "continuation_flood",
+    "header_list_too_large", "header_list_hard_cap"
+};
+
 /* Index-matched to metrics_lock_site_t. Kept next to the enum's comment, not
  * generated from it: the names go into JSON that benchmark notes quote verbatim,
  * so they are worth spelling out. */
@@ -65,6 +72,8 @@ typedef struct {
     atomic_ullong queue_depth_sum;
     atomic_int queue_depth_max;
     atomic_ullong queue_depth_hist[METRICS_COUNT_BUCKETS];
+
+    atomic_ullong h2_abuse[METRICS_H2_ABUSE__COUNT];
 
     atomic_ullong window_started_ns;
 } metrics_t;
@@ -188,6 +197,13 @@ void metrics_queue_pop(int depth) {
     atomic_fetch_add_explicit(&__m.queue_depth_sum, (unsigned long long)depth, memory_order_relaxed);
     atomic_fetch_add_explicit(&__m.queue_depth_hist[__count_bucket(depth)], 1, memory_order_relaxed);
     __max_int(&__m.queue_depth_max, depth);
+}
+
+void metrics_h2_abuse(metrics_h2_abuse_t kind) {
+    if (!metrics_enabled()) return;
+    if (kind < 0 || kind >= METRICS_H2_ABUSE__COUNT) return;
+
+    atomic_fetch_add_explicit(&__m.h2_abuse[kind], 1, memory_order_relaxed);
 }
 
 static unsigned long long __load(atomic_ullong* slot) {
@@ -341,6 +357,18 @@ json_doc_t* metrics_snapshot_json(void) {
     json_object_set(queue, "depth_hist", __hist_json(__m.queue_depth_hist, __count_bucket_name, METRICS_COUNT_BUCKETS));
     json_object_set(root, "queue", queue);
 
+    /* Limits that never fired are omitted, like the lock sites: a page of zeroes
+     * is what an operator has to read past to find the one that did. */
+    json_token_t* abuse = json_create_object();
+    if (abuse != NULL)
+        for (int i = 0; i < METRICS_H2_ABUSE__COUNT; i++) {
+            const unsigned long long n = __load(&__m.h2_abuse[i]);
+            if (n != 0)
+                json_object_set(abuse, __h2_abuse_name[i], json_create_number((long double)n));
+        }
+
+    json_object_set(root, "http2_abuse", abuse);
+
     return doc;
 }
 
@@ -376,6 +404,9 @@ void metrics_reset(void) {
     atomic_store_explicit(&__m.queue_pops_empty, 0, memory_order_relaxed);
     atomic_store_explicit(&__m.queue_depth_sum, 0, memory_order_relaxed);
     atomic_store_explicit(&__m.queue_depth_max, 0, memory_order_relaxed);
+
+    for (int i = 0; i < METRICS_H2_ABUSE__COUNT; i++)
+        atomic_store_explicit(&__m.h2_abuse[i], 0, memory_order_relaxed);
 
     atomic_store_explicit(&__m.window_started_ns, metrics_now_ns(), memory_order_relaxed);
 }
