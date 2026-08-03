@@ -1329,6 +1329,20 @@ static int h2_drain_and_rearm(h2session_t* s, connection_t* connection) {
     return 1;
 }
 
+/* The read path owns its lock lifecycle (docs/concurrency/01 §4.2, phase C). The
+ * recv and the session-buffer accumulate are worker-only — §2.1: the connection
+ * belongs to this thread, and connection->buffer is the per-worker scratch used
+ * one connection at a time — so they run without connection_s_lock. The lock is
+ * taken only around h2_process_buffer (which mutates the stream table and
+ * dispatches handlers) and around the final drain/re-arm.
+ *
+ * Why the lock still guards the parse: handler threads re-arm under it, and on
+ * the rare OOM push-fallback one walks the table under it; connection_close_locked
+ * detaches under it, so the re-arm's detached check cannot race control_del
+ * (00 §4.6, bug #2). The parser is worker-only, but it is kept inside the lock
+ * with the table work it does per frame — splitting per-frame would churn the
+ * lock for no gain and is the race §8 warns about. Returns with the lock
+ * released; every exit path does. */
 static int h2_read(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
     h2session_t* s = ctx->parser;
@@ -1366,11 +1380,19 @@ static int h2_read(connection_t* connection) {
          * that has gone silent. */
         s->last_activity_ms = h2_now_ms();
 
-        if (!h2_process_buffer(s)) return 0;
+        /* Parse + dispatch under the lock: the stream table is walked and
+         * mutated here, and handlers are queued. */
+        connection_s_lock(connection, LOCK_SITE_H2_READ);
+        const int ok = h2_process_buffer(s);
+        connection_s_unlock(connection);
+        if (!ok) return 0;
     }
 
     /* Acks and window updates produced while parsing. */
-    return h2_drain_and_rearm(s, connection);
+    connection_s_lock(connection, LOCK_SITE_H2_READ);
+    const int r = h2_drain_and_rearm(s, connection);
+    connection_s_unlock(connection);
+    return r;
 }
 
 /* ======================================================================= *
@@ -1687,11 +1709,9 @@ int h2_server_publish_inline(connection_t* connection, httpresponse_t* response)
  * ======================================================================= */
 
 int h2_server_guard_read(connection_t* connection) {
-    connection_s_lock(connection, LOCK_SITE_H2_READ);
-    const int r = h2_read(connection);
-    connection_s_unlock(connection);
-
-    return r;
+    /* h2_read manages connection_s_lock itself (phase C): the recv and buffer
+     * work run lock-free, the lock is taken only around parsing and the re-arm. */
+    return h2_read(connection);
 }
 
 int h2_server_guard_write(connection_t* connection) {
