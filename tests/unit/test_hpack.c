@@ -163,7 +163,7 @@ TEST(test_hpack_decode_c3_sequence) {
     /* C.3.1 */
     size_t l1; uint8_t* b1 = hex_to_bytes("828684410f7777772e6578616d706c652e636f6d", &l1);
     hpack_header_t* h; size_t n;
-    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, b1, l1, &h, &n), "C.3.1 status");
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, b1, l1, 0, &h, &n), "C.3.1 status");
     TEST_ASSERT_EQUAL((size_t)4, n, "C.3.1 count");
     TEST_ASSERT(hdr_eq(&h[0], ":method", "GET"), "C.3.1 h0");
     TEST_ASSERT(hdr_eq(&h[1], ":scheme", "http"), "C.3.1 h1");
@@ -173,7 +173,7 @@ TEST(test_hpack_decode_c3_sequence) {
 
     /* C.3.2 reuses :authority via dynamic index 62 (0xbe) */
     size_t l2; uint8_t* b2 = hex_to_bytes("828684be58086e6f2d6361636865", &l2);
-    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, b2, l2, &h, &n), "C.3.2 status");
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, b2, l2, 0, &h, &n), "C.3.2 status");
     TEST_ASSERT_EQUAL((size_t)5, n, "C.3.2 count");
     TEST_ASSERT(hdr_eq(&h[0], ":method", "GET"), "C.3.2 h0");
     TEST_ASSERT(hdr_eq(&h[3], ":authority", "www.example.com"), "C.3.2 authority via dyn");
@@ -182,7 +182,7 @@ TEST(test_hpack_decode_c3_sequence) {
 
     /* C.3.3 references :authority via dynamic index 63 (0xbf) */
     size_t l3; uint8_t* b3 = hex_to_bytes("828785bf400a637573746f6d2d6b65790c637573746f6d2d76616c7565", &l3);
-    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, b3, l3, &h, &n), "C.3.3 status");
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, b3, l3, 0, &h, &n), "C.3.3 status");
     TEST_ASSERT_EQUAL((size_t)5, n, "C.3.3 count");
     TEST_ASSERT(hdr_eq(&h[1], ":scheme", "https"), "C.3.3 https");
     TEST_ASSERT(hdr_eq(&h[2], ":path", "/index.html"), "C.3.3 path");
@@ -204,19 +204,19 @@ TEST(test_hpack_decode_c4_huffman) {
     size_t l; uint8_t* b; hpack_header_t* h; size_t n;
 
     b = hex_to_bytes("828684418cf1e3c2e5f23a6ba0ab90f4ff", &l);
-    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, b, l, &h, &n), "C.4.1 status");
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, b, l, 0, &h, &n), "C.4.1 status");
     TEST_ASSERT_EQUAL((size_t)4, n, "C.4.1 count");
     TEST_ASSERT(hdr_eq(&h[3], ":authority", "www.example.com"), "C.4.1 authority (huffman)");
     hpack_headers_free(h, n); free(b);
 
     b = hex_to_bytes("828684be5886a8eb10649cbf", &l);
-    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, b, l, &h, &n), "C.4.2 status");
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, b, l, 0, &h, &n), "C.4.2 status");
     TEST_ASSERT_EQUAL((size_t)5, n, "C.4.2 count");
     TEST_ASSERT(hdr_eq(&h[4], "cache-control", "no-cache"), "C.4.2 cache-control (huffman)");
     hpack_headers_free(h, n); free(b);
 
     b = hex_to_bytes("828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf", &l);
-    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, b, l, &h, &n), "C.4.3 status");
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, b, l, 0, &h, &n), "C.4.3 status");
     TEST_ASSERT_EQUAL((size_t)5, n, "C.4.3 count");
     TEST_ASSERT(hdr_eq(&h[4], "custom-key", "custom-value"), "C.4.3 custom (huffman)");
     hpack_headers_free(h, n); free(b);
@@ -233,7 +233,7 @@ TEST(test_hpack_decode_c51_response) {
         "2032303a31333a323120474d546e1768747470733a2f2f7777772e6578616d70"
         "6c652e636f6d", &l);
     hpack_header_t* h; size_t n;
-    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, b, l, &h, &n), "C.5.1 status");
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, b, l, 0, &h, &n), "C.5.1 status");
     TEST_ASSERT_EQUAL((size_t)4, n, "C.5.1 count");
     TEST_ASSERT(hdr_eq(&h[0], ":status", "302"), "C.5.1 status");
     TEST_ASSERT(hdr_eq(&h[1], "cache-control", "private"), "C.5.1 cache-control");
@@ -248,7 +248,7 @@ TEST(test_hpack_decode_rejects_bad_index) {
     hpack_decoder_t* d = hpack_decoder_create(4096);
     uint8_t in[] = {0xff, 0xff, 0xff, 0xff, 0x07}; /* indexed index ~2^28 → out of range */
     hpack_header_t* h; size_t n;
-    hpack_status_e s = hpack_decoder_decode(d, in, sizeof(in), &h, &n);
+    hpack_status_e s = hpack_decoder_decode(d, in, sizeof(in), 0, &h, &n);
     TEST_ASSERT(s != HPACK_OK, "oversized index rejected");
     hpack_decoder_free(d);
 }
@@ -279,7 +279,7 @@ TEST(test_hpack_encoder_roundtrip) {
 
         hpack_header_t* h = NULL; size_t n = 0;
         TEST_ASSERT_EQUAL(HPACK_OK,
-            hpack_decoder_decode(d, out, out_len, &h, &n), "decode");
+            hpack_decoder_decode(d, out, out_len, 0, &h, &n), "decode");
         TEST_ASSERT_EQUAL(cnt, n, "count matches");
         for (size_t i = 0; i < n; i++) {
             TEST_ASSERT(h[i].name_len == in[i].name_len &&
@@ -327,7 +327,7 @@ TEST(test_hpack_fuzz_no_crash) {
         }
         hpack_decoder_t* d = hpack_decoder_create(4096);
         hpack_header_t* h = NULL; size_t n = 0;
-        hpack_status_e s = hpack_decoder_decode(d, buf, len, &h, &n);
+        hpack_status_e s = hpack_decoder_decode(d, buf, len, 0, &h, &n);
         (void)s;
         hpack_headers_free(h, n);
         hpack_decoder_free(d);
@@ -367,7 +367,7 @@ TEST(test_hpack_encoder_emits_size_update) {
     TEST_ASSERT_EQUAL(256, (int)e->table.max, "encoder table resized");
 
     hpack_header_t* out = NULL; size_t n = 0;
-    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, block, block_len, &out, &n),
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, block, block_len, 0, &out, &n),
                       "decoder accepts the block");
     TEST_ASSERT_EQUAL(2, (int)n, "both headers decoded");
     TEST_ASSERT_EQUAL(256, (int)d->table.max, "decoder table followed the update");
@@ -439,7 +439,7 @@ TEST(test_hpack_size_update_must_lead_block) {
     const uint8_t trailing[] = {0x82, 0x20};
     hpack_header_t* out = NULL; size_t n = 0;
     TEST_ASSERT_EQUAL(HPACK_ERR_COMPRESSION,
-                      hpack_decoder_decode(d, trailing, sizeof(trailing), &out, &n),
+                      hpack_decoder_decode(d, trailing, sizeof(trailing), 0, &out, &n),
                       "size update after a field is rejected");
     hpack_headers_free(out, n);
     hpack_decoder_free(d);
@@ -450,7 +450,7 @@ TEST(test_hpack_size_update_must_lead_block) {
 
     const uint8_t leading[] = {0x20, 0x82};
     out = NULL; n = 0;
-    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, leading, sizeof(leading), &out, &n),
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, leading, sizeof(leading), 0, &out, &n),
                       "size update before any field is accepted");
     TEST_ASSERT_EQUAL(1, (int)n, "the indexed field still decodes");
     TEST_ASSERT_EQUAL(0, (int)d->table.max, "table resized to 0");
@@ -469,10 +469,85 @@ TEST(test_hpack_consecutive_size_updates_allowed) {
 
     const uint8_t block[] = {0x20, 0x3f, 0xe1, 0x1f, 0x82}; /* →0, →4096, :method GET */
     hpack_header_t* out = NULL; size_t n = 0;
-    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, block, sizeof(block), &out, &n),
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, block, sizeof(block), 0, &out, &n),
                       "two leading size updates accepted");
     TEST_ASSERT_EQUAL(1, (int)n, "one header decoded");
     TEST_ASSERT_EQUAL(4096, (int)d->table.max, "final size applied");
+
+    hpack_headers_free(out, n);
+    hpack_decoder_free(d);
+}
+
+/* ===================================================================== *
+ *  Decoded-size limit (RFC 9113 §6.5.2 — docs/http2/08, phase A.4)
+ * ===================================================================== */
+
+/* The bomb this bounds: one indexed field repeated, which is one byte on the
+ * wire per copy. `\x82` is :method GET — 7 + 3 + 32 = 42 accounted bytes each. */
+TEST(test_hpack_list_size_limit_stops_indexed_repeats) {
+    TEST_CASE("indexed repeats stop at max_list_size");
+
+    hpack_decoder_t* d = hpack_decoder_create(4096);
+    TEST_REQUIRE(d != NULL, "decoder created");
+
+    uint8_t block[1000];
+    memset(block, 0x82, sizeof(block));
+
+    hpack_header_t* out = NULL; size_t n = 0;
+    TEST_ASSERT_EQUAL(HPACK_ERR_TOO_LARGE,
+                      hpack_decoder_decode(d, block, sizeof(block), 420, &out, &n),
+                      "aborted once past the limit");
+    TEST_ASSERT_EQUAL((size_t)0, n, "nothing handed back on failure");
+    TEST_ASSERT(out == NULL, "no array leaked to the caller");
+
+    /* One field short of the limit still decodes: the check must not fire on
+     * the field that exactly fills the budget. */
+    hpack_header_t* ok = NULL; size_t okn = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, block, 10, 420, &ok, &okn),
+                      "10 fields = 420 bytes, exactly at the limit");
+    TEST_ASSERT_EQUAL((size_t)10, okn, "all ten decoded");
+
+    hpack_headers_free(ok, okn);
+    hpack_decoder_free(d);
+}
+
+TEST(test_hpack_list_size_limit_zero_disables) {
+    TEST_CASE("max_list_size 0 means unlimited");
+
+    hpack_decoder_t* d = hpack_decoder_create(4096);
+    TEST_REQUIRE(d != NULL, "decoder created");
+
+    uint8_t block[1000];
+    memset(block, 0x82, sizeof(block));
+
+    hpack_header_t* out = NULL; size_t n = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, block, sizeof(block), 0, &out, &n),
+                      "no limit, no error");
+    TEST_ASSERT_EQUAL((size_t)1000, n, "every repeat decoded");
+
+    hpack_headers_free(out, n);
+    hpack_decoder_free(d);
+}
+
+/* A literal field is counted by its decoded length, not its encoded one — the
+ * point of the limit is what the request costs us in memory, not on the wire. */
+TEST(test_hpack_list_size_limit_counts_literals) {
+    TEST_CASE("literal fields count toward max_list_size");
+
+    hpack_decoder_t* d = hpack_decoder_create(4096);
+    TEST_REQUIRE(d != NULL, "decoder created");
+
+    /* Literal without indexing, name "a" (1) + value "bb" (2) + 32 = 35. */
+    const uint8_t block[] = {0x00, 0x01, 'a', 0x02, 'b', 'b'};
+    hpack_header_t* out = NULL; size_t n = 0;
+
+    TEST_ASSERT_EQUAL(HPACK_ERR_TOO_LARGE,
+                      hpack_decoder_decode(d, block, sizeof(block), 34, &out, &n),
+                      "35 > 34 rejected");
+    TEST_ASSERT_EQUAL(HPACK_OK,
+                      hpack_decoder_decode(d, block, sizeof(block), 35, &out, &n),
+                      "35 == 35 accepted");
+    TEST_ASSERT_EQUAL((size_t)1, n, "one field");
 
     hpack_headers_free(out, n);
     hpack_decoder_free(d);

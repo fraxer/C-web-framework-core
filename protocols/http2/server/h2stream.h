@@ -31,6 +31,20 @@
  * h2_recv_credit() in h2session.c. */
 typedef struct {
     int64_t  size;      /* window currently advertised to the peer */
+    /* What is left of that window: every flow-controlled byte received debits
+     * it, every WINDOW_UPDATE actually put on the wire credits it back. Negative
+     * means the peer sent more than it was allowed to, which is the only way to
+     * notice — `size` alone says what we offered, never what is still owed
+     * (docs/http2/08, phase A.1). */
+    int64_t  avail;
+    /* Window granted in frames that are queued but not yet flushed. It moves
+     * into `avail` only when the outbound buffer goes to the socket, because
+     * until then the peer cannot possibly know about it — and a peer is judged
+     * by the window it knew it had. Crediting at queue time instead would make
+     * `avail` unable to go negative at all: every byte received is credited back
+     * during the same batch it arrived in, so the debit would always be matched
+     * before the next frame is looked at. */
+    int64_t  credited;
     int64_t  pending;   /* consumed by the peer, not yet given back */
     int64_t  bytes;     /* received since epoch_ms — the rate sample */
     uint64_t epoch_ms;  /* start of the current rate sample (CLOCK_MONOTONIC) */
@@ -75,6 +89,10 @@ typedef struct h2stream {
 
     /* Worker-only, both paths under the connection lock. */
     unsigned headers_done    : 1; /* the request header block is complete */
+    /* Answered without a handler (a 431 from the header-list limit). The request
+     * body is of no further interest, but the peer may already be sending it, so
+     * DATA keeps being credited and discarded instead of dispatched. */
+    unsigned rejected        : 1;
     unsigned end_stream_sent : 1; /* the response already carried END_STREAM */
     unsigned window_blocked  : 1; /* body stalled waiting on a WINDOW_UPDATE */
     unsigned yielded         : 1; /* quantum spent; more body still to send */
