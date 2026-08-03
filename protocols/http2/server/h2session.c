@@ -1634,7 +1634,7 @@ static h2_frame_result_e h2_on_data(h2session_t* s, const h2_frame_t* frame) {
      * which the WebSocket parser needs — it unmasks in place, exactly as it
      * does with connection->buffer on the HTTP/1.1 path. */
     if (stream->ws != NULL) {
-        if (!h2_ws_tunnel_feed(stream->ws, (uint8_t*)data, data_len))
+        if (!h2_ws_tunnel_feed(stream->ws, s->connection, (uint8_t*)data, data_len))
             return h2_stream_error(s, stream->id, H2_ERR_PROTOCOL_ERROR);
 
         if (frame->flags & H2_FLAG_END_STREAM) stream->state = H2_STREAM_HALF_CLOSED_REMOTE;
@@ -1781,10 +1781,18 @@ static int h2_process_buffer(h2session_t* s) {
     return result;
 }
 
+/* This stream has something to put on the wire: a response a handler finished,
+ * or WebSocket frames queued on its tunnel. */
+static int h2_stream_writable(const h2stream_t* stream) {
+    if (atomic_load_explicit(&stream->response_ready, memory_order_acquire)) return 1;
+
+    return stream->ws != NULL && h2_ws_tunnel_has_output(stream->ws);
+}
+
 /* A stream is waiting for the write path. */
 static int h2_has_writable(const h2session_t* s) {
     for (const h2stream_t* stream = s->streams; stream != NULL; stream = stream->next)
-        if (atomic_load_explicit(&stream->response_ready, memory_order_acquire)) return 1;
+        if (h2_stream_writable(stream)) return 1;
 
     return 0;
 }
@@ -1919,7 +1927,9 @@ typedef enum {
  * response is retired all the same — leaving it staged would make the next
  * write pass re-run the filter chain and send a second HEADERS block. */
 static void h2_write_finished(h2session_t* s, h2stream_t* stream) {
-    if (stream->ws == NULL) {
+    /* A tunnel whose CLOSE frame has left carried END_STREAM out with it, so
+     * the stream really is finished — the ordinary teardown applies. */
+    if (stream->ws == NULL || stream->end_stream_sent) {
         stream->state = H2_STREAM_CLOSED;
         h2_session_drop_stream(s, stream);
         return;
@@ -1949,6 +1959,19 @@ static h2_write_status_e h2_write_stream(h2session_t* s, h2stream_t* stream) {
     stream->yielded = 0;
     stream->served = 1;
     stream->write_credit = h2_write_quantum;
+
+    /* A tunnel past its handshake has no response staged — its output is
+     * WebSocket frames, framed by the same DATA writer the filter chain uses
+     * (docs/http2/09 §4.3). */
+    if (stream->ws != NULL && stream->response == NULL) {
+        switch (h2_ws_tunnel_write(s, stream)) {
+        case H2_DATA_DRAINED: return H2_WRITE_DONE;
+        case H2_DATA_YIELD:   return H2_WRITE_YIELD;
+        case H2_DATA_WINDOW:  return H2_WRITE_WINDOW;
+        case H2_DATA_SOCKET:  return H2_WRITE_SOCKET;
+        default:              return H2_WRITE_FAILED;
+        }
+    }
 
     int r = __run_header_filters(stream->request, stream->response);
     if (r == CWF_ERROR) return H2_WRITE_FAILED;
@@ -2089,8 +2112,7 @@ static int h2_write(connection_t* connection) {
     while (stream != NULL) {
         h2stream_t* next = stream->next;
 
-        if (stream->served || stream->response == NULL ||
-            !atomic_load_explicit(&stream->response_ready, memory_order_acquire)) {
+        if (stream->served || !h2_stream_writable(stream)) {
             stream = next;
             continue;
         }
