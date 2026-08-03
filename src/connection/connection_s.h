@@ -166,6 +166,10 @@ int connection_queue_append_parallel(connection_queue_item_t*);
 
 int connection_queue_append_broadcast(connection_t*);
 int connection_after_read(connection_t*);
+
+/* Re-arm the one-shot read of a connection that is still parked (h2 only; a
+ * no-op returning 1 otherwise). docs/concurrency/01, phase E. */
+int connection_park_rearm(connection_t*);
 int connection_close(connection_t* connection);
 
 #endif
