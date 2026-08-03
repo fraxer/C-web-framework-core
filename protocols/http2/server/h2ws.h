@@ -30,6 +30,10 @@ struct h2session;
  * to handlers is step 4; until then a parsed message is logged and dropped. */
 
 typedef struct h2_ws_tunnel {
+    /* The connection this tunnel rides on. Kept so teardown can unsubscribe it
+     * from broadcast channels without walking back through the stream. */
+    connection_t* connection;
+
     /* Frame parser for this tunnel. Created with the connection so it can build
      * requests, but deliberately NOT installed anywhere on it — the connection
      * still speaks HTTP/2. */

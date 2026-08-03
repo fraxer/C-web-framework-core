@@ -32,6 +32,11 @@ typedef struct connection_queue_broadcast_data {
     connection_queue_item_data_t base;
     broadcast_payload_t* payload;
     void(*handler)(response_t*, const char*, size_t);
+    /* Whose output order this message belongs to (docs/http2/09, step 5).
+     * NULL on the HTTP/1.1 path, where it is the connection's own. */
+    cqueue_t* out_queue;
+    void* out_owner;
+    int (*out_wake)(connection_t*, void* owner);
 } connection_queue_broadcast_data_t;
 
 void __broadcast_queue_request_handler(void*);
@@ -160,6 +165,9 @@ void __broadcast_free_list(broadcast_list_t* list) {
     free(list);
 }
 
+static void __broadcast_clear(connection_t* connection, void* out_owner, int any_owner);
+void __broadcast_queue_add(broadcast_item_t* subscriber, broadcast_payload_t* payload);
+
 broadcast_item_t* __broadcast_create_item(connection_t* connection, void* id, void(*response_handler)(response_t*, const char*, size_t)) {
     broadcast_item_t* item = malloc(sizeof * item);
     if (!item) return NULL;
@@ -168,6 +176,9 @@ broadcast_item_t* __broadcast_create_item(connection_t* connection, void* id, vo
     item->next = NULL;
     item->response_handler = response_handler;
     item->id = id;
+    item->out_queue = NULL;
+    item->out_owner = NULL;
+    item->out_wake = NULL;
 
     return item;
 }
@@ -214,9 +225,9 @@ void __broadcast_unlink_list(broadcast_t* broadcast, broadcast_list_t* list, bro
 }
 
 // требует захваченного list->locked
-int __broadcast_list_contains(broadcast_list_t* list, connection_t* connection) {
+int __broadcast_list_contains(broadcast_list_t* list, connection_t* connection, void* out_owner) {
     for (broadcast_item_t* item = list->item; item != NULL; item = item->next)
-        if (item->connection == connection)
+        if (item->connection == connection && item->out_owner == out_owner)
             return 1;
 
     return 0;
@@ -233,30 +244,48 @@ void __broadcast_append_item(broadcast_list_t* list, broadcast_item_t* item) {
 }
 
 // требует захваченного list->locked
-void __broadcast_list_remove_connection(broadcast_list_t* list, connection_t* connection) {
+/* Remove subscribers of `connection`. With any_owner the whole connection goes
+ * (it is closing); otherwise only the one owner — a single RFC 8441 tunnel,
+ * leaving the connection's other tunnels subscribed.
+ *
+ * One subscription exists per (connection, owner), so the targeted form could
+ * stop at the first hit; the loop runs on because any_owner has to sweep every
+ * tunnel of the connection. */
+void __broadcast_list_remove_connection(broadcast_list_t* list, connection_t* connection,
+                                        void* out_owner, int any_owner) {
     broadcast_item_t* prev = NULL;
     broadcast_item_t* item = list->item;
 
     while (item != NULL) {
-        if (item->connection == connection) {
-            if (prev != NULL)
-                prev->next = item->next;
-            else
-                list->item = item->next;
+        const int match = item->connection == connection &&
+            (any_owner || item->out_owner == out_owner);
 
-            if (list->item_last == item)
-                list->item_last = prev;
-
-            __broadcast_free_item(item);
-            return; // соединение подписано на канал не более одного раза
+        if (!match) {
+            prev = item;
+            item = item->next;
+            continue;
         }
 
-        prev = item;
-        item = item->next;
+        broadcast_item_t* next = item->next;
+
+        if (prev != NULL)
+            prev->next = next;
+        else
+            list->item = next;
+
+        if (list->item_last == item)
+            list->item_last = prev;
+
+        __broadcast_free_item(item);
+
+        if (!any_owner) return;
+
+        item = next;
     }
 }
 
-void __broadcast_queue_add(connection_t* connection, broadcast_payload_t* payload, void(*handle)(response_t* response, const char* payload, size_t size)) {
+void __broadcast_queue_add(broadcast_item_t* subscriber, broadcast_payload_t* payload) {
+    connection_t* connection = subscriber->connection;
     connection_server_ctx_t* ctx = connection->ctx;
 
     if (atomic_load(&ctx->destroyed))
@@ -268,7 +297,20 @@ void __broadcast_queue_add(connection_t* connection, broadcast_payload_t* payloa
     item->run = __broadcast_queue_request_handler;
     item->handle = NULL;
     item->connection = connection;
-    item->data = (connection_queue_item_data_t*)__broadcast_queue_data_create(payload, handle);
+    item->data = (connection_queue_item_data_t*)__broadcast_queue_data_create(payload, subscriber->response_handler);
+
+    /* Which output order this message belongs to. Delivery cannot be done here
+     * — broadcast_send holds the channel lock, and publishing takes
+     * connection_s_lock, which teardown takes in the opposite order (a dying
+     * tunnel unsubscribes under it). That inversion deadlocked the server on
+     * the first fan-out into tunnels; the queue exists precisely so that the
+     * publish happens later, on a runner, with no broadcast lock held. */
+    if (item->data != NULL) {
+        connection_queue_broadcast_data_t* bdata = (connection_queue_broadcast_data_t*)item->data;
+        bdata->out_queue = subscriber->out_queue;
+        bdata->out_owner = subscriber->out_owner;
+        bdata->out_wake = subscriber->out_wake;
+    }
 
     if (item->data == NULL) {
         item->free(item);
@@ -353,6 +395,9 @@ void __broadcast_queue_request_handler(void* arg) {
         return;
     }
 
+    connection_queue_broadcast_data_t* first_data =
+        (connection_queue_broadcast_data_t*)first_item->data;
+
     char* batch = NULL;
     size_t batch_size = 0;
     size_t batch_capacity = 0;
@@ -387,8 +432,21 @@ void __broadcast_queue_request_handler(void* arg) {
 
         // продюсеры пишут в очередь под cqueue_lock — снимать под ним же
         // безопасно и без connection_s_lock
+        //
+        // Merged only while the next message belongs to the SAME output order.
+        // One connection may host several RFC 8441 tunnels, and a batch is one
+        // response posted to one place — mixing two tunnels' frames into it
+        // would deliver each stream the other's bytes. What is left stays
+        // queued, and connection_after_read dispatches another runner for it.
         cqueue_lock(conn_ctx->broadcast_queue);
-        connection_queue_item_t* next = cqueue_pop(conn_ctx->broadcast_queue);
+        cqueue_item_t* head = cqueue_first(conn_ctx->broadcast_queue);
+        connection_queue_item_t* candidate = head != NULL ? head->data : NULL;
+        const connection_queue_broadcast_data_t* cdata = candidate != NULL ?
+            (connection_queue_broadcast_data_t*)candidate->data : NULL;
+        const int same_target = cdata != NULL && cdata->out_queue == first_data->out_queue &&
+            cdata->out_owner == first_data->out_owner;
+        connection_queue_item_t* next = same_target ?
+            cqueue_pop(conn_ctx->broadcast_queue) : NULL;
         cqueue_unlock(conn_ctx->broadcast_queue);
 
         if (next == NULL)
@@ -399,13 +457,17 @@ void __broadcast_queue_request_handler(void* arg) {
 
     websocketsresponse_set_body(response, batch, batch_size);
 
-    websockets_response_post(response);
+    websockets_response_post_to(response, first_data->out_queue,
+                                first_data->out_owner, first_data->out_wake);
 }
 
 connection_queue_broadcast_data_t* __broadcast_queue_data_create(broadcast_payload_t* payload, void(*handle)(response_t*, const char*, size_t)) {
     connection_queue_broadcast_data_t* data = malloc(sizeof * data);
     if (data == NULL) return NULL;
 
+    data->out_queue = NULL;
+    data->out_owner = NULL;
+    data->out_wake = NULL;
     data->base.free = __broadcast_queue_data_free;
     data->payload = __broadcast_payload_acquire(payload);
     data->handler = handle;
@@ -457,6 +519,13 @@ void broadcast_free(broadcast_t* broadcast) {
 }
 
 int broadcast_add(const char* broadcast_name, connection_t* connection, void* id, void(*response_handler)(response_t* response, const char* payload, size_t size)) {
+    return broadcast_add_out(broadcast_name, connection, id, response_handler, NULL, NULL, NULL);
+}
+
+int broadcast_add_out(const char* broadcast_name, connection_t* connection, void* id,
+                      void(*response_handler)(response_t* response, const char* payload, size_t size),
+                      cqueue_t* out_queue, void* out_owner,
+                      int (*out_wake)(connection_t*, void* owner)) {
     if (broadcast_name == NULL || connection == NULL || response_handler == NULL) {
         __broadcast_id_free(id);
         return 0;
@@ -484,9 +553,12 @@ int broadcast_add(const char* broadcast_name, connection_t* connection, void* id
 
     __broadcast_lock_list(list);
 
-    if (created || !__broadcast_list_contains(list, connection)) {
+    if (created || !__broadcast_list_contains(list, connection, out_owner)) {
         broadcast_item_t* item = __broadcast_create_item(connection, id, response_handler);
         if (item != NULL) {
+            item->out_queue = out_queue;
+            item->out_owner = out_owner;
+            item->out_wake = out_wake;
             __broadcast_append_item(list, item);
             result = 1;
         }
@@ -514,6 +586,12 @@ int broadcast_add(const char* broadcast_name, connection_t* connection, void* id
 }
 
 void broadcast_remove(const char* broadcast_name, connection_t* connection) {
+    broadcast_remove_out(broadcast_name, connection, NULL);
+}
+
+void broadcast_remove_out(const char* broadcast_name, connection_t* connection, void* out_owner) {
+    const int any_owner = 0;
+
     if (broadcast_name == NULL || connection == NULL)
         return;
 
@@ -534,7 +612,7 @@ void broadcast_remove(const char* broadcast_name, connection_t* connection) {
 
     if (list != NULL) {
         __broadcast_lock_list(list);
-        __broadcast_list_remove_connection(list, connection);
+        __broadcast_list_remove_connection(list, connection, out_owner, any_owner);
         const int empty = list->item == NULL;
         __broadcast_unlock_list(list);
 
@@ -549,6 +627,21 @@ void broadcast_remove(const char* broadcast_name, connection_t* connection) {
 }
 
 void broadcast_clear(connection_t* connection) {
+    /* The connection is going: every subscriber on it goes with it, tunnels
+     * included. */
+    __broadcast_clear(connection, NULL, 1);
+}
+
+/* One tunnel died while its connection lives on (a reset stream, a CLOSE
+ * frame). Its subscriptions must go, or the next fan-out would publish into a
+ * freed tunnel — docs/http2/09, step 5. */
+void broadcast_clear_owner(connection_t* connection, void* out_owner) {
+    if (connection == NULL || out_owner == NULL) return;
+
+    __broadcast_clear(connection, out_owner, 0);
+}
+
+static void __broadcast_clear(connection_t* connection, void* out_owner, int any_owner) {
     connection_server_ctx_t* ctx = connection->ctx;
 
     // connection_close вызывает broadcast_clear безусловно: без гардов
@@ -568,7 +661,7 @@ void broadcast_clear(connection_t* connection) {
         broadcast_list_t* next = list->next;
 
         __broadcast_lock_list(list);
-        __broadcast_list_remove_connection(list, connection);
+        __broadcast_list_remove_connection(list, connection, out_owner, any_owner);
         const int empty = list->item == NULL;
         __broadcast_unlock_list(list);
 
@@ -622,7 +715,7 @@ void broadcast_send(const char* broadcast_name, connection_t* connection, const 
         if (id != NULL && compare_handler != NULL && !compare_handler(item->id, id))
             continue;
 
-        __broadcast_queue_add(item->connection, shared_payload, item->response_handler);
+        __broadcast_queue_add(item, shared_payload);
     }
 
     __broadcast_unlock_list(list);

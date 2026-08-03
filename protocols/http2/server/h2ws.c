@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 
+#include "broadcast.h"
 #include "connection_s.h"
 #include "h2session.h"
 #include "log.h"
@@ -18,6 +19,7 @@ h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, int resource_proto
     /* Same choice the HTTP/1.1 handshake makes from Sec-WebSocket-Protocol
      * (websocketsswitch.c): "resource" routes each message by its own
      * method+location, the default protocol sends everything to one handler. */
+    tunnel->connection = connection;
     tunnel->parser = websocketsparser_create(connection, resource_protocol ?
                                              websockets_protocol_resource_create :
                                              websockets_protocol_default_create);
@@ -34,6 +36,13 @@ h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, int resource_proto
 
 void h2_ws_tunnel_free(h2_ws_tunnel_t* tunnel) {
     if (tunnel == NULL) return;
+
+    /* Unsubscribe before anything is released: a fan-out in flight would
+     * otherwise publish into this tunnel's queue after it is gone. The
+     * connection may well live on — only this stream is ending — so
+     * broadcast_clear() would be both too much and too late. */
+    if (tunnel->connection != NULL)
+        broadcast_clear_owner(tunnel->connection, tunnel);
 
     if (tunnel->parser != NULL)
         tunnel->parser->base.free(tunnel->parser);
