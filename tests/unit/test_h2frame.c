@@ -209,7 +209,12 @@ TEST(test_h2frame_preface_bad_magic) {
  *  Validation (RFC 9113 §8)
  * ===================================================================== */
 
-static void expect_bad(const char* label, uint32_t len, uint8_t type, uint8_t flags, uint32_t sid) {
+/* The parser separates a structural violation from a length one, because the
+ * session maps them to different RFC error codes — PROTOCOL_ERROR against
+ * FRAME_SIZE_ERROR (docs/http2/08, phase C.1). Which one comes back is part of
+ * the contract, so the expected status is spelled out per case. */
+static void expect_status(h2parse_status_e want, const char* label,
+                          uint32_t len, uint8_t type, uint8_t flags, uint32_t sid) {
     uint8_t hdr[H2_FRAME_HEADER_LEN];
     put_header(hdr, len, type, flags, sid);
     uint8_t* buf = malloc(sizeof(hdr) + len);
@@ -220,9 +225,17 @@ static void expect_bad(const char* label, uint32_t len, uint8_t type, uint8_t fl
     h2frame_parser_init(&p, 0, H2_MAX_FRAME_SIZE_DEFAULT);
     const uint8_t* pp = buf;
     h2parse_status_e s = h2frame_parser_feed(&p, &pp, buf + sizeof(hdr) + len);
-    TEST_ASSERT_EQUAL(H2PARSE_BAD_FRAME, s, label);
+    TEST_ASSERT_EQUAL(want, s, label);
     h2frame_parser_free(&p);
     free(buf);
+}
+
+static void expect_bad(const char* label, uint32_t len, uint8_t type, uint8_t flags, uint32_t sid) {
+    expect_status(H2PARSE_BAD_FRAME, label, len, type, flags, sid);
+}
+
+static void expect_size(const char* label, uint32_t len, uint8_t type, uint8_t flags, uint32_t sid) {
+    expect_status(H2PARSE_FRAME_SIZE, label, len, type, flags, sid);
 }
 
 /* RFC 9113 §4.1 leaves the reserved bit undefined and requires receivers to
@@ -259,16 +272,26 @@ TEST(test_h2frame_reserved_bit_ignored) {
 TEST(test_h2frame_validation) {
     TEST_CASE("header-level rejections (§8)");
 
+    /* Structural: the frame type and the stream id disagree (§6.x). */
     expect_bad("DATA with stream id 0", 0, H2_FRAME_DATA, 0, 0);
     expect_bad("SETTINGS with stream id != 0", 0, H2_FRAME_SETTINGS, 0, 1);
     expect_bad("PING with stream id != 0", 8, H2_FRAME_PING, 0, 1);
-    expect_bad("PING wrong length (not 8)", 7, H2_FRAME_PING, 0, 0);
-    expect_bad("WINDOW_UPDATE wrong length (not 4)", 3, H2_FRAME_WINDOW_UPDATE, 0, 1);
-    expect_bad("PRIORITY wrong length (not 5)", 4, H2_FRAME_PRIORITY, 0, 1);
-    expect_bad("RST_STREAM wrong length (not 4)", 5, H2_FRAME_RST_STREAM, 0, 1);
-    expect_bad("SETTINGS length not multiple of 6", 7, H2_FRAME_SETTINGS, 0, 0);
-    expect_bad("GOAWAY length < 8", 7, H2_FRAME_GOAWAY, 0, 0);
-    expect_bad("oversize length", H2_MAX_FRAME_SIZE_DEFAULT + 1, H2_FRAME_DATA, 0, 1);
+
+    /* Length: the size is wrong for the type, or past max_frame_size (§4.2). */
+    expect_size("PING wrong length (not 8)", 7, H2_FRAME_PING, 0, 0);
+    expect_size("WINDOW_UPDATE wrong length (not 4)", 3, H2_FRAME_WINDOW_UPDATE, 0, 1);
+    expect_size("PRIORITY wrong length (not 5)", 4, H2_FRAME_PRIORITY, 0, 1);
+    expect_size("RST_STREAM wrong length (not 4)", 5, H2_FRAME_RST_STREAM, 0, 1);
+    expect_size("SETTINGS length not multiple of 6", 7, H2_FRAME_SETTINGS, 0, 0);
+    expect_size("GOAWAY length < 8", 7, H2_FRAME_GOAWAY, 0, 0);
+    expect_size("oversize length", H2_MAX_FRAME_SIZE_DEFAULT + 1, H2_FRAME_DATA, 0, 1);
+
+    /* §6.5: a SETTINGS ACK carries no payload. A length that is a legal
+     * multiple of 6 makes this the one size violation the session could not
+     * catch on its own — h2_on_settings returns on the ACK flag before it looks
+     * at anything else (phase C.2). */
+    expect_size("SETTINGS ACK with a payload", 6, H2_FRAME_SETTINGS, H2_FLAG_ACK, 0);
+    expect_size("SETTINGS ACK with a 1-byte payload", 1, H2_FRAME_SETTINGS, H2_FLAG_ACK, 0);
 }
 
 TEST(test_h2frame_valid_frames_pass) {

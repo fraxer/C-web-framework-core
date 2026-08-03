@@ -37,7 +37,9 @@
 #define H2_ERR_PROTOCOL_ERROR     1
 #define H2_ERR_INTERNAL_ERROR     2
 #define H2_ERR_FLOW_CONTROL_ERROR 3
+#define H2_ERR_SETTINGS_TIMEOUT   4
 #define H2_ERR_STREAM_CLOSED      5
+#define H2_ERR_FRAME_SIZE_ERROR   6
 #define H2_ERR_REFUSED_STREAM     7
 #define H2_ERR_COMPRESSION_ERROR  9
 #define H2_ERR_ENHANCE_YOUR_CALM  11
@@ -100,6 +102,12 @@
 #define H2_DEFAULT_IDLE_TIMEOUT_SEC 120
 #define H2_DEFAULT_PING_ACK_TIMEOUT_SEC 15
 
+/* Grace for the peer to acknowledge our SETTINGS (§6.5.3) — docs/http2/08,
+ * phase C.4. Generous: the ACK is due "as soon as possible", but a client that
+ * is slow to start should not be cut off, and the failure this catches (a peer
+ * that never acks at all) is not time-sensitive. */
+#define H2_DEFAULT_SETTINGS_ACK_TIMEOUT_SEC 10
+
 /* Receive-window policy (Phase 4 tail, RFC §6.9.1). The RFC default of 65535
  * caps inbound throughput at window/RTT whatever the bandwidth — 0.6 MB/s over
  * a 100 ms link, per connection, however many streams are uploading. So the
@@ -136,6 +144,7 @@
 static uint32_t h2_idle_timeout_sec = H2_DEFAULT_IDLE_TIMEOUT_SEC;
 static uint32_t h2_ping_interval_sec = 0;
 static uint32_t h2_ping_ack_timeout_sec = H2_DEFAULT_PING_ACK_TIMEOUT_SEC;
+static uint32_t h2_settings_ack_timeout_sec = H2_DEFAULT_SETTINGS_ACK_TIMEOUT_SEC;
 static int64_t  h2_recv_window_initial = H2_DEFAULT_WINDOW;
 static int64_t  h2_recv_window_max = H2_DEFAULT_RECV_WINDOW_MAX;
 static int64_t  h2_write_quantum = H2_DEFAULT_WRITE_QUANTUM;
@@ -154,6 +163,11 @@ void h2_policy_init(void) {
     uint32_t ack_default = h2_ping_interval_sec ? h2_ping_interval_sec : H2_DEFAULT_PING_ACK_TIMEOUT_SEC;
     if (ack_default > H2_DEFAULT_PING_ACK_TIMEOUT_SEC) ack_default = H2_DEFAULT_PING_ACK_TIMEOUT_SEC;
     h2_ping_ack_timeout_sec = (uint32_t)env_get_int("http2_ping_ack_timeout_sec", (int)ack_default);
+
+    /* 0 disables the SETTINGS_TIMEOUT check — the idle timeout still reaps a
+     * peer that goes on to do nothing. */
+    h2_settings_ack_timeout_sec = (uint32_t)env_get_int("http2_settings_ack_timeout_sec",
+                                                        H2_DEFAULT_SETTINGS_ACK_TIMEOUT_SEC);
 
     /* Window we open with, advertised in the preface; the auto-scaler takes it
      * from there. Set max == initial to pin the window and disable scaling. */
@@ -1091,7 +1105,14 @@ static h2_frame_result_e h2_apply_settings_payload(h2session_t* s,
 }
 
 static h2_frame_result_e h2_on_settings(h2session_t* s, const h2_frame_t* frame) {
-    if (frame->flags & H2_FLAG_ACK) return H2_FRAME_OK;
+    if (frame->flags & H2_FLAG_ACK) {
+        /* Retires the SETTINGS_TIMEOUT watch (§6.5.3). An ACK with a payload
+         * never gets here — the frame validator rejects it with
+         * FRAME_SIZE_ERROR (phase C.2), which is exactly the check this early
+         * return used to swallow. */
+        s->settings_sent_ms = 0;
+        return H2_FRAME_OK;
+    }
 
     const h2_frame_result_e r = h2_apply_settings_payload(s, frame->payload, frame->payload_len);
     if (r != H2_FRAME_OK) return r;
@@ -1176,6 +1197,50 @@ static h2_frame_result_e h2_on_rst_stream(h2session_t* s, const h2_frame_t* fram
         stream->state = H2_STREAM_CLOSED;
         h2_session_drop_stream(s, stream);
     }
+
+    return H2_FRAME_OK;
+}
+
+/* Peer GOAWAY (§6.8) — docs/http2/08, phase C.3.
+ *
+ * This used to close the connection on the spot, which threw away every
+ * response still owed to a stream the peer had asked for and was still waiting
+ * on: GOAWAY means "I am going away", not "hang up on me now". What §6.8 asks
+ * for is what the shutdown path already does — stop accepting new streams, let
+ * the ones in flight finish, then close — so this reuses `draining` and lets
+ * h2_server_tick do the closing once the table empties.
+ *
+ * The peer's last_stream_id bounds what IT will process, i.e. the responses it
+ * has any use for; ours is unaffected. The code and the debug data are logged
+ * because they are the only account we will ever get of what the client thought
+ * we did wrong. */
+static h2_frame_result_e h2_on_goaway(h2session_t* s, const h2_frame_t* frame) {
+    const uint8_t* p = frame->payload;
+    const uint32_t last_stream_id = ((uint32_t)(p[0] & 0x7f) << 24) |
+                                    ((uint32_t)p[1] << 16) |
+                                    ((uint32_t)p[2] << 8) | p[3];
+    const uint32_t error_code = ((uint32_t)p[4] << 24) | ((uint32_t)p[5] << 16) |
+                                ((uint32_t)p[6] << 8) | p[7];
+
+    /* Debug data is opaque and attacker-controlled: length-bounded, and only
+     * worth a line at all when the peer is reporting an actual error. */
+    if (error_code != H2_ERR_NO_ERROR) {
+        const size_t debug_len = frame->payload_len > 8 ? frame->payload_len - 8 : 0;
+        log_error("h2: peer GOAWAY error=%u last_stream_id=%u (fd %d)%.*s%.*s\n",
+                  error_code, last_stream_id, s->connection->fd,
+                  debug_len > 0 ? 8 : 0, " debug=\"",
+                  (int)(debug_len > 256 ? 256 : debug_len), (const char*)p + 8);
+    }
+
+    s->peer_goaway = 1;
+
+    /* Nothing left to serve — close now rather than wait for a tick. */
+    if (s->stream_count == 0) return H2_FRAME_CLOSE;
+
+    /* Streams in flight: answer them, then go. h2_server_tick closes the
+     * connection once the table is empty; the idle timeout is the backstop if
+     * the peer stops reading and a response can never drain. */
+    s->draining = 1;
 
     return H2_FRAME_OK;
 }
@@ -1324,7 +1389,11 @@ static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) 
          /* RFC 9113 §6.8: once GOAWAY(last_stream_id) is out, streams with a
           * higher id are out of bounds. Streams at or below the boundary that
           * the peer had in flight before seeing our GOAWAY are still served. */
-         (s->goaway_sent && frame->stream_id > s->last_stream_id));
+         (s->goaway_sent && frame->stream_id > s->last_stream_id) ||
+         /* §6.8 also forbids the peer opening new streams once it has itself
+          * announced it is going away. Refusing keeps the drain finite: every
+          * accepted stream would push the close back another response. */
+         s->peer_goaway);
     if (self_dependent || refused) {
         if (frame->flags & H2_FLAG_END_HEADERS) {
             const h2_request_status_e status = h2_discard_header_block(s, block, block_len);
@@ -1522,7 +1591,7 @@ static h2_frame_result_e h2_handle_frame(h2session_t* s, const h2_frame_t* frame
         return h2_on_rst_stream(s, frame);
 
     case H2_FRAME_GOAWAY:
-        return H2_FRAME_CLOSE;
+        return h2_on_goaway(s, frame);
 
     case H2_FRAME_PUSH_PROMISE:
         return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR); /* a client never sends one (§6.6) */
@@ -1550,7 +1619,14 @@ static int h2_process_buffer(h2session_t* s) {
         if (st == H2PARSE_CONTINUE) break;
 
         if (st != H2PARSE_FRAME_READY) {
-            const uint32_t err = (st == H2PARSE_OOM) ? H2_ERR_INTERNAL_ERROR : H2_ERR_PROTOCOL_ERROR;
+            /* §4.2: a frame-size error on a frame that could change the state of
+             * the whole connection is a connection error — which every frame
+             * this parser rejects is, since it never got far enough to be tied
+             * to a stream. Only the code differs (docs/http2/08, phase C.1). */
+            uint32_t err = H2_ERR_PROTOCOL_ERROR;
+            if (st == H2PARSE_OOM) err = H2_ERR_INTERNAL_ERROR;
+            else if (st == H2PARSE_FRAME_SIZE) err = H2_ERR_FRAME_SIZE_ERROR;
+
             result = h2_fail(s, err);
             break;
         }
@@ -2082,6 +2158,31 @@ void h2_server_tick(connection_t* connection, int shutdown_now) {
         return;
     }
 
+    /* The peer said it is going away (§6.8) and we kept the connection up to
+     * finish what it had already asked for. Close as soon as that is done — the
+     * same drain as shutdown, reached from the other side. Nothing forces this
+     * to complete: a peer that stops reading leaves a response undrainable, and
+     * the idle timeout below is what eventually reaps that. */
+    if (s->draining && s->peer_goaway && s->stream_count == 0) {
+        h2_graceful_close_locked(s);
+        return;
+    }
+
+    /* SETTINGS_TIMEOUT (§6.5.3) — docs/http2/08, phase C.4. Our SETTINGS is the
+     * first frame of the server preface, and every one of them (window sizes,
+     * concurrency, header list limit) only takes effect once the peer applies
+     * it. A peer that never acks is not speaking HTTP/2 at us in any useful
+     * sense, and until this check it could sit there until the idle timeout. */
+    if (h2_settings_ack_timeout_sec != 0 && s->settings_sent_ms != 0 &&
+        now - s->settings_sent_ms >= (uint64_t)h2_settings_ack_timeout_sec * 1000u) {
+        log_error("h2: no SETTINGS ACK in %us (fd %d)\n",
+                  h2_settings_ack_timeout_sec, connection->fd);
+        h2_queue_goaway(s, H2_ERR_SETTINGS_TIMEOUT);
+        (void)h2_flush_out(s);
+        connection_close_locked(connection);
+        return;
+    }
+
     /* Idle timeout — only when nothing is in flight: a connection mid-request
      * or mid-response is not idle even if the peer has gone quiet (the PING
      * watchdog covers that case). */
@@ -2141,6 +2242,11 @@ static int h2_send_preface(h2session_t* s) {
 
     if (!h2_session_queue_frame(s, H2_FRAME_SETTINGS, 0, 0, settings, len))
         return 0;
+
+    /* Start the §6.5.3 clock. Timed from here rather than from the flush: the
+     * frame is the first thing in the outbound buffer, and a socket that cannot
+     * take nine bytes is a problem of its own. */
+    s->settings_sent_ms = h2_now_ms();
 
     /* SETTINGS_INITIAL_WINDOW_SIZE governs streams only (§6.9.2); the
      * connection window moves by WINDOW_UPDATE alone. */

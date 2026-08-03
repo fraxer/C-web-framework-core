@@ -56,7 +56,16 @@ typedef struct {
 typedef enum {
     H2PARSE_CONTINUE,    /* all bytes consumed; need more */
     H2PARSE_FRAME_READY, /* one complete frame assembled — read with h2frame_parser_get */
-    H2PARSE_BAD_FRAME,   /* reserved bit set / oversize / bad stream-id+type / bad type size */
+    /* Two ways a frame header can be wrong, kept apart because RFC 9113 gives
+     * them different error codes and a peer implementer reads that code to find
+     * the bug (docs/http2/08-spec-gaps.md, phase C.1):
+     *  - BAD_FRAME: the frame is structurally wrong for its type — a
+     *    connection-control frame on a stream, or a stream frame on stream 0
+     *    (§6.x) → PROTOCOL_ERROR;
+     *  - FRAME_SIZE: the length is wrong — past max_frame_size (§4.2), or not
+     *    the fixed size the type requires (§6.x) → FRAME_SIZE_ERROR. */
+    H2PARSE_BAD_FRAME,
+    H2PARSE_FRAME_SIZE,
     H2PARSE_PREFACE_BAD, /* connection preface magic mismatch */
     H2PARSE_OOM,
 } h2parse_status_e;
