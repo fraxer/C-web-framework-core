@@ -1326,7 +1326,13 @@ static int h2_drain_and_rearm(h2session_t* s, connection_t* connection) {
         return rearm(connection, MPXOUT | MPXRDHUP);
     }
 
-    return 1;
+    /* Nothing to write, but handlers dispatched from this very read are still
+     * running, so the connection is parked on a one-shot read that this event
+     * has just spent. Re-arm it, or the next TCP segment would wait for the
+     * first response to be written — the whole point of phase E
+     * (docs/concurrency/01 §6). A no-op when the connection is not parked: then
+     * it is live on level-triggered MPXIN and needs nothing. */
+    return connection_park_rearm(connection);
 }
 
 /* The read path owns its lock lifecycle (docs/concurrency/01 §4.2, phase C). The

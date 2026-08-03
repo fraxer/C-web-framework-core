@@ -298,6 +298,27 @@ int connection_after_write(connection_t* connection) {
     return ctx->listener->api->control_mod(connection, MPXIN | MPXRDHUP);
 }
 
+/* The event set a parked connection keeps, by protocol (docs/concurrency/01,
+ * phase E).
+ *
+ * h1.1 and WebSocket park deaf — a bare MPXONESHOT, no event bits, nothing is
+ * delivered. Both keep exactly one request in flight, so reading the next one
+ * before the current reply has left buys h1.1 nothing and would break the
+ * WebSocket output order (`00` phase C).
+ *
+ * h2 parks still readable. Its handlers already run in parallel, so a request
+ * that arrives in a later TCP segment has no reason to wait for the first
+ * response to be written — which is exactly what it used to do, at a cost of
+ * T + first-write instead of T. Two things make it safe, and neither is new:
+ * the connection belongs to one worker (§2.1), so the read stays
+ * single-threaded and the per-worker connection->buffer cannot be taken from
+ * under it; and MPXONESHOT means the one event that is delivered disarms the
+ * fd again, so the worker still decides when the next one may come (it re-arms
+ * from h2_drain_and_rearm while the connection stays parked). */
+static int __park_events(const connection_server_ctx_t* ctx) {
+    return ctx->is_http2 ? (MPXIN | MPXRDHUP | MPXONESHOT) : MPXONESHOT;
+}
+
 /* Take the connection out of epoll for the duration of the queued work.
  *
  * broadcast_ref_count doubles as the parked flag: 1 = live in epoll, 2 = parked.
@@ -315,12 +336,29 @@ static int __park(connection_t* connection) {
     if (!atomic_compare_exchange_strong(&ctx->broadcast_ref_count, &expected, 2))
         return 1; /* somebody else parked it already */
 
-    if (!ctx->listener->api->control_mod(connection, MPXONESHOT)) {
+    if (!ctx->listener->api->control_mod(connection, __park_events(ctx))) {
         atomic_store(&ctx->broadcast_ref_count, 1);
         return 0;
     }
 
     return 1;
+}
+
+/* Re-arm a connection that is still parked: the one-shot read it was parked
+ * with has been spent, and more work may yet arrive before the handlers that
+ * parked it are done. Only h2 asks for this — see __park_events. Returns 1 when
+ * there was nothing to do, so callers can use it as a plain success. */
+int connection_park_rearm(connection_t* connection) {
+    connection_server_ctx_t* ctx = connection->ctx;
+
+    if (!ctx->is_http2) return 1;
+    if (atomic_load(&ctx->broadcast_ref_count) != 2) return 1; /* not parked */
+
+    /* Same guard as connection_after_read: never epoll_ctl a connection whose
+     * fd is already closed and whose number may belong to somebody else. */
+    if (atomic_load(&ctx->detached)) return 1;
+
+    return ctx->listener->api->control_mod(connection, __park_events(ctx));
 }
 
 /* Serialized dispatch: park, and queue the connection only if it is not queued
