@@ -22,8 +22,7 @@ void dkimcanonparser_set_buffer(dkimcanonparser_t* parser, const char* buffer, c
 }
 
 void dkimcanonparser_flush(dkimcanonparser_t* parser) {
-    if (parser->buf.dynamic_buffer) free(parser->buf.dynamic_buffer);
-    parser->buf.dynamic_buffer = NULL;
+    bufferdata_clear(&parser->buf);
 }
 
 void dkimcanonparser_free(dkimcanonparser_t* parser) {

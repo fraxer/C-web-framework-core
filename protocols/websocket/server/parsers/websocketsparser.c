@@ -103,8 +103,7 @@ void __clear(websocketsparser_t* parser) {
 }
 
 void websocketsparser_flush(websocketsparser_t* parser) {
-    if (parser->buf.dynamic_buffer) free(parser->buf.dynamic_buffer);
-    parser->buf.dynamic_buffer = NULL;
+    bufferdata_clear(&parser->buf);
 
     parser->stage = WSPARSER_STAGE_FIRST_BYTE;
     parser->bytes_readed = 0;

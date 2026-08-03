@@ -65,8 +65,7 @@ void httpresponseparser_reset(httpresponseparser_t* parser) {
 }
 
 void __httpresponseparser_flush(httpresponseparser_t* parser) {
-    if (parser->buf.dynamic_buffer) free(parser->buf.dynamic_buffer);
-    parser->buf.dynamic_buffer = NULL;
+    bufferdata_clear(&parser->buf);
 
     /*
      * Завершаем zlib-поток: иначе последующий httpresponseparser_init()
