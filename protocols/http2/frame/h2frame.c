@@ -4,9 +4,10 @@
 #include <string.h>
 
 /* Validate header fields that are known once the 9-byte header is parsed.
- * Returns 0 if valid, non-zero if the frame is malformed (caller maps to
- * H2PARSE_BAD_FRAME). RFC 9113 §8 checks. */
-static int h2frame_header_invalid(const h2frame_parser_t* p) {
+ * Returns H2PARSE_FRAME_READY when the header is acceptable, otherwise the
+ * status the caller should report — BAD_FRAME for a structural violation,
+ * FRAME_SIZE for a length one. RFC 9113 §4.2, §6, §8 checks. */
+static h2parse_status_e h2frame_header_invalid(const h2frame_parser_t* p) {
     /* The reserved bit (R) of the stream identifier is left undefined by
      * RFC §4.1 and MUST be ignored when receiving — a sender may set it. It is
      * masked off while decoding stream_id, which is all that is required; it is
@@ -14,14 +15,14 @@ static int h2frame_header_invalid(const h2frame_parser_t* p) {
      * expects a normal PING ACK back). */
 
     /* Frame size limits (RFC §4.2). */
-    if (p->length > p->max_frame_size) return 1;
-    if (p->length > H2_MAX_FRAME_SIZE_LIMIT) return 1;
+    if (p->length > p->max_frame_size) return H2PARSE_FRAME_SIZE;
+    if (p->length > H2_MAX_FRAME_SIZE_LIMIT) return H2PARSE_FRAME_SIZE;
 
     /* Connection-control frames carry stream id 0; stream frames MUST NOT. */
     int is_conn = (p->type == H2_FRAME_SETTINGS ||
                    p->type == H2_FRAME_PING ||
                    p->type == H2_FRAME_GOAWAY);
-    if (is_conn && p->stream_id != 0) return 1;
+    if (is_conn && p->stream_id != 0) return H2PARSE_BAD_FRAME;
 
     /* Frames that MUST carry a non-zero stream id. WINDOW_UPDATE is excluded:
      * it may target stream 0 (connection-level flow control) or a stream. */
@@ -31,19 +32,28 @@ static int h2frame_header_invalid(const h2frame_parser_t* p) {
                      p->type == H2_FRAME_RST_STREAM ||
                      p->type == H2_FRAME_PUSH_PROMISE ||
                      p->type == H2_FRAME_CONTINUATION);
-    if (is_stream && p->stream_id == 0) return 1;
+    if (is_stream && p->stream_id == 0) return H2PARSE_BAD_FRAME;
 
     /* Type-specific payload lengths that are fixed and known up front. */
     switch (p->type) {
-    case H2_FRAME_PING:          if (p->length != 8) return 1; break;
-    case H2_FRAME_WINDOW_UPDATE: if (p->length != 4) return 1; break;
-    case H2_FRAME_PRIORITY:      if (p->length != 5) return 1; break;
-    case H2_FRAME_RST_STREAM:    if (p->length != 4) return 1; break;
-    case H2_FRAME_SETTINGS:      if ((p->length % 6) != 0) return 1; break; /* ACK is length 0 */
-    case H2_FRAME_GOAWAY:        if (p->length < 8) return 1; break;
+    case H2_FRAME_PING:          if (p->length != 8) return H2PARSE_FRAME_SIZE; break;
+    case H2_FRAME_WINDOW_UPDATE: if (p->length != 4) return H2PARSE_FRAME_SIZE; break;
+    case H2_FRAME_PRIORITY:      if (p->length != 5) return H2PARSE_FRAME_SIZE; break;
+    case H2_FRAME_RST_STREAM:    if (p->length != 4) return H2PARSE_FRAME_SIZE; break;
+    case H2_FRAME_SETTINGS:
+        /* §6.5: an ACK carries no payload at all, and any other length must be a
+         * multiple of the 6-byte setting. Checking the ACK case here rather than
+         * in the session is what makes it an error instead of a silent ignore —
+         * h2_on_settings returns on the ACK flag before it ever looks at the
+         * length (docs/http2/08, phase C.2). */
+        if ((p->flags & H2_FLAG_ACK) && p->length != 0) return H2PARSE_FRAME_SIZE;
+        if ((p->length % 6) != 0) return H2PARSE_FRAME_SIZE;
+        break;
+    case H2_FRAME_GOAWAY:        if (p->length < 8) return H2PARSE_FRAME_SIZE; break;
     default: break; /* unknown types pass through per RFC §5.5 */
     }
-    return 0;
+
+    return H2PARSE_FRAME_READY;
 }
 
 void h2frame_parser_init(h2frame_parser_t* p, int preface_required, uint32_t max_frame_size) {
@@ -108,7 +118,8 @@ h2parse_status_e h2frame_parser_feed(h2frame_parser_t* p, const uint8_t** pp, co
                            ((uint32_t)p->header[7] << 8) |
                            ((uint32_t)p->header[8]);
 
-            if (h2frame_header_invalid(p)) { *pp = cur; return H2PARSE_BAD_FRAME; }
+            const h2parse_status_e bad = h2frame_header_invalid(p);
+            if (bad != H2PARSE_FRAME_READY) { *pp = cur; return bad; }
 
             p->payload_pos = 0;
             if (p->length == 0) {

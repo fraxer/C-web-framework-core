@@ -139,6 +139,9 @@ typedef struct h2session {
     uint64_t last_activity_ms;
     uint64_t ping_sent_ms;      /* 0 = no watchdog PING outstanding */
     uint8_t  ping_payload[8];   /* opaque data of the outstanding PING (for ACK) */
+    /* When our own SETTINGS went out, cleared by its ACK; 0 = nothing pending.
+     * §6.5.3 gives the peer a bounded time to answer (docs/http2/08, phase C.4). */
+    uint64_t settings_sent_ms;
 
     /* Window tuning (§6.9.1): path RTT measured by our own PING, and the probe
      * currently outstanding. Separate from the watchdog above — this one only
@@ -148,6 +151,9 @@ typedef struct h2session {
     uint64_t tune_ping_done_ms; /* when the last one was answered (rate limit) */
     uint8_t  tune_ping_payload[8];
     int      draining;          /* GOAWAY(NO_ERROR) sent on shutdown; close once idle */
+    /* The peer sent GOAWAY (§6.8). The connection stays up only long enough to
+     * answer the streams it had already opened — see h2_on_goaway. */
+    int      peer_goaway;
 } h2session_t;
 
 /* Entry point called from __handshake once ALPN selects h2. Returns 1 on
