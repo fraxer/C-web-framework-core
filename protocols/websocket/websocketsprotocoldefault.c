@@ -35,6 +35,16 @@ websockets_protocol_t* websockets_protocol_default_create(void) {
 int websocketsrequest_get_default(connection_t* connection, websocketsrequest_t* request) {
     connection_server_ctx_t* ctx = connection->ctx;
 
+    /* No default handler configured for this vhost: there is nothing to
+     * dispatch to, and dispatching anyway put a NULL into item->handle for the
+     * runner to call. Unreachable while only the application could start a
+     * WebSocket session (it would not, on a vhost without one); reachable the
+     * moment RFC 8441 lets a *client* open a tunnel wherever it likes
+     * (docs/http2/09, step 8). Treated as "no route", like the resource
+     * protocol treats an unmatched path. */
+    if (ctx->server->websockets.default_handler == NULL)
+        return 0;
+
     ratelimiter_t* ratelimiter = ctx->server->websockets.ratelimiter;
 
     return websockets_deferred_handler(connection, request, websockets_queue_request_handler, ctx->server->websockets.default_handler, websockets_queue_data_request_create, ratelimiter);

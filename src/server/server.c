@@ -25,6 +25,7 @@ server_t* server_create() {
     server->http.middleware = NULL;
     server->http.ratelimiter = NULL;
     server->websockets.default_handler = NULL;
+    server->websockets.configured = 0;
     server->websockets.route = NULL;
     server->websockets.middleware = NULL;
     server->websockets.ratelimiter = NULL;

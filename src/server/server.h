@@ -31,6 +31,17 @@ typedef struct server_websockets {
     ratelimiter_t* ratelimiter;
     void(*default_handler)(void*);
     struct middleware_item* middleware;
+    /* The vhost actually declared a "websockets" section.
+     *
+     * default_handler alone cannot answer that: a vhost without the section is
+     * given the framework's stub handler anyway (moduleloader), so that an
+     * application calling switch_to_websockets() there gets a reply instead of
+     * a NULL call. That is fine while the *application* decides to start a
+     * WebSocket session — under RFC 8441 the *client* decides, on whatever
+     * vhost it likes, and "this vhost was never meant to serve WebSocket"
+     * becomes an answer the server has to be able to give
+     * (docs/http2/09, step 8). */
+    int configured;
 } server_websockets_t;
 
 struct broadcast;

@@ -52,6 +52,7 @@
 #define H2_SETTINGS_INITIAL_WINDOW_SIZE    0x4
 #define H2_SETTINGS_MAX_FRAME_SIZE         0x5
 #define H2_SETTINGS_MAX_HEADER_LIST_SIZE   0x6
+#define H2_SETTINGS_ENABLE_CONNECT_PROTOCOL 0x8 /* RFC 8441 §3 */
 
 #define H2_MAX_WINDOW 2147483647LL /* 2^31 - 1 */
 
@@ -226,6 +227,8 @@ typedef enum {
 
 static int h2_flush_out(h2session_t* s);
 static void h2_session_drop_stream(h2session_t* s, h2stream_t* stream);
+static h2_frame_result_e h2_reject_stream(h2session_t* s, h2stream_t* stream,
+                                          int status_code, int end_stream);
 static void h2_recv_settle(h2session_t* s);
 
 /* ======================================================================= *
@@ -1155,6 +1158,13 @@ static h2_frame_result_e h2_apply_settings_payload(h2session_t* s,
                 return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
             s->peer_max_frame_size = value;
             break;
+        case H2_SETTINGS_ENABLE_CONNECT_PROTOCOL:
+            /* RFC 8441 §3: only 0 and 1 exist. The value itself says what the
+             * *sender* supports, which for a client means nothing to us — we
+             * are the one being connected to. Validated all the same, because
+             * §3 makes anything else a connection error. */
+            if (value > 1) return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
+            break;
         case H2_SETTINGS_MAX_HEADER_LIST_SIZE:
             /* Advisory (§6.5.2): the peer cannot make this binding, since we may
              * have committed to a response before it arrives. Kept so an
@@ -1356,6 +1366,18 @@ static h2_frame_result_e h2_request_failed(h2session_t* s, h2stream_t* stream,
  * immediately half-closed it. Legal, useless, and not worth a special path: the
  * tunnel opens and dies on the next sweep. */
 static h2_frame_result_e h2_open_tunnel(h2session_t* s, h2stream_t* stream, int end_stream) {
+    /* A vhost that declares no "websockets" section does not serve tunnels.
+     * Worth checking rather than assuming, because advertising the capability
+     * is per connection while serving it is per vhost, and it is the client
+     * that now picks where to open one. 501: the request is fine, this endpoint
+     * is not the place for it (docs/http2/09, step 8). */
+    connection_server_ctx_t* conn_ctx = s->connection->ctx;
+    if (conn_ctx->server == NULL || !conn_ctx->server->websockets.configured) {
+        log_info("h2: extended CONNECT on a vhost without websockets (fd %d)\n",
+                 s->connection->fd);
+        return h2_reject_stream(s, stream, 501, end_stream);
+    }
+
     /* Sec-WebSocket-Protocol picks the message protocol exactly as it does on
      * the HTTP/1.1 handshake (websocketsswitch.c): "resource" routes each message
      * by its own method+location, anything else goes to the default handler.
@@ -2451,13 +2473,33 @@ static int h2_send_preface(h2session_t* s) {
             (uint8_t)((header_list >> 16) & 0xff),
             (uint8_t)((header_list >> 8) & 0xff),
             (uint8_t)(header_list & 0xff),
+        /* RFC 8441: WebSocket over HTTP/2 is available here. This is the last
+         * thing the feature needed and deliberately the last thing added: a
+         * browser that sees it stops opening a separate HTTP/1.1 connection for
+         * wss:// and starts sending extended CONNECT instead. Advertising it
+         * before the tunnel worked would have broken every such client
+         * (docs/http2/09 §2). */
+        0x00, H2_SETTINGS_ENABLE_CONNECT_PROTOCOL, 0x00, 0x00, 0x00, 0x01,
     };
 
-    /* With the limit disabled the setting is left out entirely — advertising 0
-     * would announce that no header at all is acceptable. */
-    const size_t len = h2_max_header_list_size == 0 ? sizeof(settings) - 6 : sizeof(settings);
+    /* With the header-list limit disabled that setting is left out entirely —
+     * advertising 0 would announce that no header at all is acceptable. It sits
+     * before ENABLE_CONNECT_PROTOCOL in the block, so dropping it means moving
+     * the tail up rather than shortening the frame. */
+    uint8_t block[sizeof(settings)];
+    size_t len = 0;
 
-    if (!h2_session_queue_frame(s, H2_FRAME_SETTINGS, 0, 0, settings, len))
+    if (h2_max_header_list_size == 0) {
+        memcpy(block, settings, sizeof(settings) - 12);
+        memcpy(block + sizeof(settings) - 12, settings + sizeof(settings) - 6, 6);
+        len = sizeof(settings) - 6;
+    }
+    else {
+        memcpy(block, settings, sizeof(settings));
+        len = sizeof(settings);
+    }
+
+    if (!h2_session_queue_frame(s, H2_FRAME_SETTINGS, 0, 0, block, len))
         return 0;
 
     /* Start the §6.5.3 clock. Timed from here rather than from the flush: the

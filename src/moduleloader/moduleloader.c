@@ -825,6 +825,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
         const json_token_t* token_websockets = json_object_get(token_server, "websockets");
         if (token_websockets != NULL) {
             finded_fields[WEBSOCKETS] = 1;
+            server->websockets.configured = 1;
 
             if (!json_is_object(token_websockets)) {
                 __module_loader_config_error("__module_loader_servers_load: websockets must be object\n");

@@ -526,7 +526,10 @@ void websockets_queue_request_handler(void* arg) {
     wsctx_t ctx;
     wsctx_init(&ctx, data->request, response);
 
-    if (run_middlewares(data->server->websockets.middleware, &ctx))
+    /* handle is NULL-checked rather than trusted: every producer is supposed to
+     * refuse the dispatch instead of queueing a message with no handler, and
+     * this is the one place where being wrong about that is a crash. */
+    if (item->handle != NULL && run_middlewares(data->server->websockets.middleware, &ctx))
         item->handle(&ctx);
 
     wsctx_clear(&ctx);
