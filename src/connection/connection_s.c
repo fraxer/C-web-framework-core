@@ -293,6 +293,12 @@ int connection_after_write(connection_t* connection) {
             connection_queue_guard_append(connection);
             return ctx->listener->api->control_mod(connection, MPXONESHOT);
         }
+
+        /* Lost the race: the producer that put the message there parked the
+         * connection itself and queued its own worker. Arming for reading below
+         * would undo that park and let a read event in while the connection is
+         * supposed to be off the loop. */
+        return 1;
     }
 
     return ctx->listener->api->control_mod(connection, MPXIN | MPXRDHUP);

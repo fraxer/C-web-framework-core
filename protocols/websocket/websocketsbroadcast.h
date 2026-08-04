@@ -18,4 +18,12 @@ int websockets_broadcast_add(const char* broadcast_name, websocketsrequest_t* re
 
 void websockets_broadcast_remove(const char* broadcast_name, websocketsrequest_t* request);
 
+/* Owner-aware send: suppresses only the sender tunnel, not every tunnel on its
+ * connection. Pulls (connection, out_owner) off the request and forwards to
+ * broadcast_send (docs/http2/09, step 5, send path). Ownership of id is
+ * taken always, even on a NULL request. */
+void websockets_broadcast_send(const char* broadcast_name, websocketsrequest_t* request, const char* payload, size_t size, void* id, int(*compare_handler)(void* st1, void* st2));
+
+void websockets_broadcast_send_all(const char* broadcast_name, websocketsrequest_t* request, const char* payload, size_t size);
+
 #endif

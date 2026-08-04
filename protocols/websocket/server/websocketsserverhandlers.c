@@ -48,7 +48,10 @@ static int __publish(connection_t* connection, struct connection_queue_websocket
                      websocketsresponse_t* response);
 static int __out_promote(connection_t* connection);
 static int __out_publish(connection_t* connection, connection_out_slot_t* slot, websocketsresponse_t* response);
+static int __out_publish_new(websocketsresponse_t* response, cqueue_t* out_queue, void* out_owner,
+                             int (*out_wake)(connection_t*, void*, int), int handler_done);
 static void __out_finish_current(connection_t* connection);
+static int __fanout_allowed(connection_t* connection, const websocketsrequest_t* request);
 
 /* --------------------------------------------------------------------------
  * Output ordering (docs/concurrency/00 §4.4, phase C)
@@ -71,6 +74,28 @@ static void __out_finish_current(connection_t* connection);
  * publish against take; the inner cqueue_lock only keeps the list itself
  * consistent. Lock order is connection_s_lock -> cqueue_lock, never the
  * reverse.
+ *
+ * Reserving at dispatch is for connections whose handlers actually run in
+ * parallel. A serialized connection (permessage-deflate — see __fanout_allowed)
+ * takes its slot at publish time instead, and __out_reserve_at_dispatch is what
+ * tells the two apart. Two reasons, and both were bugs:
+ *
+ *   - A dispatched-but-not-yet-run message leaves an empty slot at the head of
+ *     the queue. Nothing behind it can be written, so a broadcast frame
+ *     published meanwhile never arms EPOLLOUT — and on a serialized connection
+ *     the only thing that hands the pending message to a worker is
+ *     connection_after_write, i.e. the write that this very slot is blocking.
+ *     The connection went silent for good.
+ *   - permessage-deflate with context takeover compresses every frame against
+ *     the window left by the previous one, so the order frames are compressed
+ *     in has to be the order they are written in. A broadcast frame is
+ *     compressed by its runner and only then takes a slot; a handler's reply
+ *     takes its slot first and is compressed later. Interleave the two and the
+ *     peer inflates against the wrong window — which is what showed up as
+ *     duplicated messages.
+ *
+ * Publishing into a slot reserved in the same critical section keeps both
+ * orders equal to the order the (serialized) items ran in.
  * -------------------------------------------------------------------------- */
 
 /* Reserve this message's place. Caller holds connection_s_lock.
@@ -192,6 +217,46 @@ int __out_publish(connection_t* connection, connection_out_slot_t* slot, websock
     return r;
 }
 
+/* Take a place in the output order and fill it, in one critical section.
+ *
+ * Reserve and fill have to be one step: a slot that is visible while still
+ * empty stalls the write path behind it, and — with permessage-deflate — a slot
+ * taken apart from the compression that produced its bytes lets a second
+ * producer slip in between the two, so the write order stops matching the
+ * order the window was fed in.
+ *
+ * out_queue selects whose order this is: a tunnel's, or (NULL) the
+ * connection's. Takes ownership of the response; it is freed here on failure. */
+static int __out_publish_new(websocketsresponse_t* response, cqueue_t* out_queue, void* out_owner,
+                             int (*out_wake)(connection_t*, void*, int), int handler_done) {
+    connection_t* connection = response->connection;
+    connection_server_ctx_t* ctx = connection->ctx;
+
+    connection_s_lock(connection, LOCK_SITE_WS_PUBLISH);
+
+    connection_out_slot_t* slot = __out_reserve_in(out_queue != NULL ? out_queue : ctx->write_queue);
+    if (slot == NULL) {
+        connection_s_unlock(connection);
+        response->base.free(response);
+        return 0;
+    }
+
+    slot->response = &response->base;
+
+    int r = 1;
+
+    if (out_queue != NULL)
+        r = out_wake != NULL ? out_wake(connection, out_owner, handler_done) : 1;
+    else if (__out_promote(connection)) {
+        atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
+        r = connection_after_read(connection);
+    }
+
+    connection_s_unlock(connection);
+
+    return r;
+}
+
 /* Publish a response that needs no slot of its own reserved in advance — a
  * broadcast frame, or a reply produced straight on the read path. Takes
  * connection_s_lock; use __post_response instead when it is already held.
@@ -199,38 +264,13 @@ int __out_publish(connection_t* connection, connection_out_slot_t* slot, websock
  * Takes ownership of the response either way: it is freed here on failure. */
 int websockets_response_post_to(websocketsresponse_t* response, cqueue_t* out_queue,
                                 void* out_owner, int (*out_wake)(connection_t*, void*, int)) {
-    connection_t* connection = response->connection;
-
-    if (out_queue == NULL)
-        return websockets_response_post(response);
-
-    connection_s_lock(connection, LOCK_SITE_WS_RESERVE);
-    connection_out_slot_t* slot = __out_reserve_in(out_queue);
-    connection_s_unlock(connection);
-
-    if (slot == NULL) {
-        response->base.free(response);
-        return 0;
-    }
-
     /* handler_done = 0: this frame was produced by a broadcast or by the read
      * path, not by a dispatched handler, so it retires nothing. */
-    return __out_publish_tunnel(connection, slot, response, out_owner, out_wake, 0);
+    return __out_publish_new(response, out_queue, out_owner, out_wake, 0);
 }
 
 int websockets_response_post(websocketsresponse_t* response) {
-    connection_t* connection = response->connection;
-
-    connection_s_lock(connection, LOCK_SITE_WS_RESERVE);
-    connection_out_slot_t* slot = __out_reserve(connection);
-    connection_s_unlock(connection);
-
-    if (slot == NULL) {
-        response->base.free(response);
-        return 0;
-    }
-
-    return __out_publish(connection, slot, response);
+    return __out_publish_new(response, NULL, NULL, NULL, 0);
 }
 
 static int __handle_locked(connection_t* connection, websocketsparser_t* parser) {
@@ -479,6 +519,12 @@ int __handle(websocketsparser_t* parser) {
  * queue, or the connection's. */
 static int __publish(connection_t* connection, connection_queue_websockets_data_t* data,
                      websocketsresponse_t* response) {
+    /* No slot was reserved at dispatch: this connection (or tunnel) runs its
+     * messages one at a time, so the place in the output order is taken now,
+     * together with the bytes that go into it. */
+    if (data->out == NULL)
+        return __out_publish_new(response, data->out_queue, data->out_owner, data->out_wake, 1);
+
     if (data->out_queue != NULL)
         return __out_publish_tunnel(connection, data->out, response,
                                     data->out_owner, data->out_wake, 1);
@@ -504,6 +550,12 @@ void websockets_queue_request_handler(void* arg) {
         websocketsresponse_set_deflate(response, data->out_deflate);
 
     if (response == NULL) {
+        /* Nothing was reserved for this message, so the output order is intact
+         * and the connection survives an allocation failure — it just gets no
+         * reply to this one message. */
+        if (data->out == NULL)
+            return;
+
         /* The slot stays unfilled and would block the output order forever, so
          * the connection has to go: there is no reply to send and no way to
          * skip a place in the stream. */
@@ -560,7 +612,18 @@ void* websockets_queue_data_request_create(connection_t* connection, void* compo
 
     /* Reserved here, before the item is handed to a worker: the output order
      * has to be the order messages were dispatched in, and this is the last
-     * point at which the read path is still the only thread involved. */
+     * point at which the read path is still the only thread involved.
+     *
+     * Only for a connection whose handlers really do run in parallel. A
+     * serialized one publishes into a slot it takes at that moment — its
+     * messages run one after another anyway, so that order is the same, and an
+     * empty head slot would deadlock the write path (see the block comment
+     * above __out_reserve_in). */
+    if (!__fanout_allowed(connection, request)) {
+        data->out = NULL;
+        return data;
+    }
+
     data->out = data->out_queue != NULL ?
         __out_reserve_in(data->out_queue) : __out_reserve(connection);
 
