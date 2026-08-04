@@ -4,6 +4,7 @@
 #include "route.h"
 #include "connection_s.h"
 #include "websocketscommon.h"
+#include "ws_deflate.h"
 #include "json.h"
 #include "request.h"
 #include "file.h"
@@ -89,6 +90,11 @@ typedef struct websocketsrequest {
     void* out_owner;                              /* opaque: the tunnel */
     int (*out_wake)(connection_t*, void* owner);  /* make the writer run */
     int out_parallel;                             /* fan-out allowed for this one */
+    /* permessage-deflate context of the tunnel, or NULL. On HTTP/1.1 the
+     * response finds it through the connection's parser; a tunnel keeps its own
+     * on the stream, so it has to travel with the message (docs/http2/09,
+     * step 6). */
+    ws_deflate_t* out_deflate;
 } websocketsrequest_t;
 
 /**

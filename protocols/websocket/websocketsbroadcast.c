@@ -11,7 +11,8 @@ int websockets_broadcast_add(const char* broadcast_name, websocketsrequest_t* re
     }
 
     return broadcast_add_out(broadcast_name, request->connection, id, response_handler,
-                             request->out_queue, request->out_owner, request->out_wake);
+                             request->out_queue, request->out_owner, request->out_wake,
+                             request->out_deflate);
 }
 
 void websockets_broadcast_remove(const char* broadcast_name, websocketsrequest_t* request) {

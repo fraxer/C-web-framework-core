@@ -36,6 +36,9 @@ typedef struct broadcast_item {
     cqueue_t* out_queue;
     void* out_owner;
     int (*out_wake)(connection_t*, void* owner);
+    /* permessage-deflate context of that tunnel, or NULL. Opaque here — the
+     * response layer is what uses it. */
+    void* out_deflate;
 
     /** Custom identifier for filtering during send. May be NULL */
     broadcast_id_t* id;
@@ -121,7 +124,7 @@ int broadcast_add(const char* broadcast_name, connection_t* connection, void* id
 int broadcast_add_out(const char* broadcast_name, connection_t* connection, void* id,
                       void(*response_handler)(response_t* response, const char* payload, size_t size),
                       cqueue_t* out_queue, void* out_owner,
-                      int (*out_wake)(connection_t*, void* owner));
+                      int (*out_wake)(connection_t*, void* owner), void* out_deflate);
 
 /**
  * Unsubscribes connection from specified broadcast channel.

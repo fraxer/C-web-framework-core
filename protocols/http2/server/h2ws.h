@@ -57,7 +57,11 @@ typedef struct h2_ws_tunnel {
 
 /* Build a tunnel for a stream whose extended CONNECT was accepted. Returns NULL
  * on allocation failure, in which case the caller must fail the stream. */
-h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, int resource_protocol);
+/* `deflate` is the negotiated permessage-deflate configuration, or NULL when
+ * the client did not ask for it (or asked for something unusable). The context
+ * lives on the tunnel: two tunnels on one connection compress independently. */
+h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, int resource_protocol,
+                                    const ws_deflate_config_t* deflate);
 void h2_ws_tunnel_free(h2_ws_tunnel_t* tunnel);
 
 /* Hand one DATA payload to the parser. `data` must be writable: WebSocket
