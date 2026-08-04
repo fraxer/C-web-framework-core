@@ -20,3 +20,19 @@ void websockets_broadcast_remove(const char* broadcast_name, websocketsrequest_t
 
     broadcast_remove_out(broadcast_name, request->connection, request->out_owner);
 }
+
+void websockets_broadcast_send(const char* broadcast_name, websocketsrequest_t* request, const char* payload, size_t size, void* id, int(*compare_handler)(void* st1, void* st2)) {
+    if (request == NULL) {
+        broadcast_id_t* wrapped = id;
+        if (wrapped != NULL && wrapped->free != NULL) wrapped->free(wrapped);
+        return;
+    }
+
+    broadcast_send(broadcast_name, request->connection, request->out_owner, payload, size, id, compare_handler);
+}
+
+void websockets_broadcast_send_all(const char* broadcast_name, websocketsrequest_t* request, const char* payload, size_t size) {
+    if (request == NULL) return;
+
+    broadcast_send_all(broadcast_name, request->connection, request->out_owner, payload, size);
+}

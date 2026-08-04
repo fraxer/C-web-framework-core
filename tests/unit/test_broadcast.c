@@ -415,7 +415,7 @@ TEST(test_broadcast_add_without_server_broadcast) {
 
     broadcast_remove("room", conn); /* no crash */
     broadcast_clear(conn);          /* no crash */
-    broadcast_send("room", conn, "x", 1, bc_test_id_create(2), bc_compare_user); /* no crash */
+    broadcast_send("room", conn, NULL, "x", 1, bc_test_id_create(2), bc_compare_user); /* no crash */
     TEST_ASSERT_EQUAL(2, bc_id_free_calls, "send id freed when broadcast is missing");
 
     cleanup:
@@ -577,7 +577,7 @@ TEST(test_broadcast_send_all_delivers_and_excludes_sender) {
     TEST_ASSERT_EQUAL(1, broadcast_add("room", first, NULL, bc_capture_handler), "first subscribed");
     TEST_ASSERT_EQUAL(1, broadcast_add("room", second, NULL, bc_capture_handler), "second subscribed");
 
-    broadcast_send_all("room", sender, "hello", 5);
+    broadcast_send_all("room", sender, NULL, "hello", 5);
 
     TEST_ASSERT_EQUAL(0, bc_broadcast_queue_size(sender), "sender receives nothing");
     TEST_ASSERT_EQUAL(1, bc_broadcast_queue_size(first), "first got one message");
@@ -625,7 +625,7 @@ TEST(test_broadcast_send_filters_by_id) {
     TEST_ASSERT_EQUAL(1, broadcast_add("room", matched, bc_test_id_create(1), bc_capture_handler), "matched subscribed");
     TEST_ASSERT_EQUAL(1, broadcast_add("room", other, bc_test_id_create(2), bc_capture_handler), "other subscribed");
 
-    broadcast_send("room", sender, "ping", 4, bc_test_id_create(1), bc_compare_user);
+    broadcast_send("room", sender, NULL, "ping", 4, bc_test_id_create(1), bc_compare_user);
 
     TEST_ASSERT_EQUAL(1, bc_id_free_calls, "sent id freed after send");
     TEST_ASSERT_EQUAL(1, bc_broadcast_queue_size(matched), "matched subscriber got message");
@@ -637,7 +637,7 @@ TEST(test_broadcast_send_filters_by_id) {
     TEST_ASSERT_STR_EQUAL("ping", bc_handler_payload, "payload delivered to matched");
 
     /* NULL compare_handler disables filtering even when id is set */
-    broadcast_send("room", sender, "all", 3, bc_test_id_create(1), NULL);
+    broadcast_send("room", sender, NULL, "all", 3, bc_test_id_create(1), NULL);
     TEST_ASSERT_EQUAL(2, bc_id_free_calls, "unfiltered send id freed too");
     TEST_ASSERT_EQUAL(1, bc_broadcast_queue_size(matched), "matched got unfiltered message");
     TEST_ASSERT_EQUAL(1, bc_broadcast_queue_size(other), "other got unfiltered message");
@@ -670,21 +670,21 @@ TEST(test_broadcast_send_edge_cases) {
     TEST_REQUIRE_NOT_NULL_GOTO(receiver, "receiver connection alloc", cleanup);
 
     /* unknown channel: nothing delivered, id still freed */
-    broadcast_send("nowhere", sender, "x", 1, bc_test_id_create(1), bc_compare_user);
+    broadcast_send("nowhere", sender, NULL, "x", 1, bc_test_id_create(1), bc_compare_user);
     TEST_ASSERT_EQUAL(1, bc_id_free_calls, "id freed for unknown channel");
 
     /* NULL channel name: no crash, id freed */
-    broadcast_send(NULL, sender, "x", 1, bc_test_id_create(2), bc_compare_user);
+    broadcast_send(NULL, sender, NULL, "x", 1, bc_test_id_create(2), bc_compare_user);
     TEST_ASSERT_EQUAL(2, bc_id_free_calls, "id freed for NULL channel name");
 
     TEST_ASSERT_EQUAL(1, broadcast_add("room", receiver, NULL, bc_capture_handler), "receiver subscribed");
 
     /* NULL payload with size > 0: message dropped instead of memcpy(NULL) */
-    broadcast_send_all("room", sender, NULL, 5);
+    broadcast_send_all("room", sender, NULL, NULL, 5);
     TEST_ASSERT_EQUAL(0, bc_broadcast_queue_size(receiver), "NULL payload dropped");
 
     /* empty payload is a valid message */
-    broadcast_send_all("room", sender, "", 0);
+    broadcast_send_all("room", sender, NULL, "", 0);
     TEST_ASSERT_EQUAL(1, bc_broadcast_queue_size(receiver), "empty payload delivered");
 
     TEST_ASSERT_NOT_NULL(bc_worker_queue_pop(), "receiver scheduled into worker queue");
@@ -730,7 +730,7 @@ TEST(test_broadcast_send_queue_overflow_drops_message) {
     cqueue_unlock(ctx->broadcast_queue);
     TEST_REQUIRE_GOTO(prefilled == 3001, "queue prefilled over the limit", cleanup);
 
-    broadcast_send_all("room", sender, "late", 4);
+    broadcast_send_all("room", sender, NULL, "late", 4);
     TEST_ASSERT_EQUAL(3001, bc_broadcast_queue_size(receiver), "overflowing message dropped");
 
     TEST_ASSERT_EQUAL(3001, bc_drain_broadcast_queue(receiver, 0), "prefilled stubs drained");
@@ -777,9 +777,9 @@ TEST(test_broadcast_batch_coalesces_frames) {
 
     TEST_ASSERT_EQUAL(1, broadcast_add("room", receiver, NULL, bc_frame_handler), "receiver subscribed");
 
-    broadcast_send_all("room", sender, "a", 1);
-    broadcast_send_all("room", sender, "bb", 2);
-    broadcast_send_all("room", sender, "ccc", 3);
+    broadcast_send_all("room", sender, NULL, "a", 1);
+    broadcast_send_all("room", sender, NULL, "bb", 2);
+    broadcast_send_all("room", sender, NULL, "ccc", 3);
     TEST_ASSERT_EQUAL(3, bc_broadcast_queue_size(receiver), "three messages queued");
 
     /* the three sends scheduled the receiver into the global queue exactly
@@ -838,7 +838,7 @@ TEST(test_broadcast_batch_is_bounded) {
     /* BROADCAST_BATCH_MESSAGES is 64; queue more so a remainder stays behind */
     enum { QUEUED = 70, BATCH = 64 };
     for (int i = 0; i < QUEUED; i++)
-        broadcast_send_all("room", sender, "m", 1);
+        broadcast_send_all("room", sender, NULL, "m", 1);
     TEST_ASSERT_EQUAL(QUEUED, bc_broadcast_queue_size(receiver), "all messages queued");
 
     TEST_ASSERT_NOT_NULL(bc_worker_queue_pop(), "receiver scheduled once");
@@ -876,7 +876,7 @@ static void* bc_sender_thread(void* arg) {
     bc_sender_args_t* args = arg;
 
     for (int i = 0; i < args->count; i++)
-        broadcast_send_all(args->channel, args->sender, "x", 1);
+        broadcast_send_all(args->channel, args->sender, NULL, "x", 1);
 
     return NULL;
 }

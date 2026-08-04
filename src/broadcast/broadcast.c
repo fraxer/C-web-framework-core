@@ -687,11 +687,11 @@ static void __broadcast_clear(connection_t* connection, void* out_owner, int any
     __broadcast_unlock(broadcast);
 }
 
-void broadcast_send_all(const char* broadcast_name, connection_t* connection, const char* payload, size_t size) {
-    broadcast_send(broadcast_name, connection, payload, size, NULL, NULL);
+void broadcast_send_all(const char* broadcast_name, connection_t* connection, void* out_owner, const char* payload, size_t size) {
+    broadcast_send(broadcast_name, connection, out_owner, payload, size, NULL, NULL);
 }
 
-void broadcast_send(const char* broadcast_name, connection_t* connection, const char* payload, size_t size, void* id, int(*compare_handler)(void* st1, void* st2)) {
+void broadcast_send(const char* broadcast_name, connection_t* connection, void* out_owner, const char* payload, size_t size, void* id, int(*compare_handler)(void* st1, void* st2)) {
     broadcast_t* broadcast = NULL;
 
     if (broadcast_name != NULL && connection != NULL) {
@@ -717,7 +717,13 @@ void broadcast_send(const char* broadcast_name, connection_t* connection, const 
     }
 
     for (broadcast_item_t* item = list->item; item != NULL; item = item->next) {
-        if (connection == item->connection)
+        /* Пропускаем только точного отправителя. На одном h2-соединении может
+         * жить несколько туннелей (docs/http2/09, шаг 5), каждый — отдельный
+         * подписчик; сравнение одного лишь connection пропускало всех соседей
+         * отправителя по соединению, а не только его самого. На HTTP/1.1
+         * out_owner = NULL у отправителя и у всех подписчиков, поэтому проверка
+         * сводится к соединению — ровно прежнее поведение. */
+        if (connection == item->connection && out_owner == item->out_owner)
             continue;
 
         // фильтр применяется только когда заданы и id, и компаратор

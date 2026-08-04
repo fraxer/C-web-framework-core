@@ -150,29 +150,40 @@ void broadcast_clear(connection_t* connection);
 
 /**
  * Sends message to all channel subscribers except the sender.
+ * `out_owner` identifies which RFC 8441 tunnel on `connection` is the sender
+ * (NULL = the connection itself, i.e. HTTP/1.1). Only that exact subscriber is
+ * suppressed; other tunnels sharing the connection still receive — comparing
+ * connection alone skipped every tunnel on the sender's connection
+ * (docs/http2/09, step 5, send path).
  * Note: the sender never receives the message, even if subscribed.
+ *
  * @param broadcast_name  Channel name
  * @param connection      Sender connection (will not receive message)
+ * @param out_owner       Sender tunnel on the connection, or NULL (HTTP/1.1)
  * @param payload         Data to send
  * @param size            Data size in bytes
  */
-void broadcast_send_all(const char* broadcast_name, connection_t* connection, const char* payload, size_t size);
+void broadcast_send_all(const char* broadcast_name, connection_t* connection, void* out_owner, const char* payload, size_t size);
 
 /**
  * Sends message to channel subscribers with identifier filtering.
  * Allows sending message only to specific subscribers.
  * Filtering applies only when both id and compare_handler are provided;
  * if either is NULL, the message is sent to all subscribers (except sender).
+ * `out_owner` identifies the sender tunnel (NULL on HTTP/1.1); see
+ * broadcast_send_all for the suppression semantics.
  * Ownership of id is taken by this function: it is always freed via
  * its broadcast_id_t free handler before returning. Do not reuse id after the call.
+ *
  * @param broadcast_name   Channel name
  * @param connection       Sender connection (will not receive message)
+ * @param out_owner        Sender tunnel on the connection, or NULL (HTTP/1.1)
  * @param payload          Data to send
  * @param size             Data size in bytes
  * @param id               Identifier for filtering (inherits broadcast_id_t). NULL to send to all
  * @param compare_handler  Identifier comparison function. Returns != 0 if subscriber should receive message.
  *                         First argument is subscriber id, second is passed id. NULL to send to all
  */
-void broadcast_send(const char* broadcast_name, connection_t* connection, const char* payload, size_t size, void* id, int(*compare_handler)(void* st1, void* st2));
+void broadcast_send(const char* broadcast_name, connection_t* connection, void* out_owner, const char* payload, size_t size, void* id, int(*compare_handler)(void* st1, void* st2));
 
 #endif
