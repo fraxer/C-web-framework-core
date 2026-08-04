@@ -903,6 +903,31 @@ int __handshake(connection_t* connection) {
         SSL_get0_alpn_selected(connection->ssl, &alpn, &alpn_len);
 
         if (alpn != NULL && alpn_len == 2 && memcmp(alpn, "h2", 2) == 0) {
+            /* RFC 9113 §9.2.2: HTTP/2 over a cipher suite from Appendix A is a
+             * connection error of type INADEQUATE_SECURITY. Reachable only when
+             * the operator has configured such a suite and a client picked it,
+             * so the log line matters as much as the refusal — otherwise this
+             * looks like the client's fault (docs/http2/08, phase F.3). */
+            if (!openssl_cipher_ok_for_http2(connection->ssl)) {
+                const SSL_CIPHER* cipher = SSL_get_current_cipher(connection->ssl);
+                log_error("__handshake: HTTP/2 refused, cipher %s is forbidden by RFC 9113 "
+                          "§9.2.2 (fd %d) — remove it from the vhost's \"ciphers\"\n",
+                          cipher != NULL ? SSL_CIPHER_get_name(cipher) : "(unknown)",
+                          connection->fd);
+
+                /* The connection preface must lead, even when the next thing on
+                 * it is a refusal: SETTINGS (empty) then GOAWAY(0x0c). Both
+                 * frames are constant, so no session has to be built for them. */
+                static const unsigned char refusal[] = {
+                    0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x08, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c,
+                };
+                openssl_write(connection->ssl, refusal, sizeof(refusal));
+
+                return 0;
+            }
+
             if (!h2_server_set_http2(connection))
                 return 0;
         } else {
