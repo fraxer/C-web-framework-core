@@ -85,6 +85,11 @@ typedef struct h2session {
      * absence and its "no limit" are the same thing to us). Advisory: §6.5.2
      * makes it a hint, so an oversize response is logged, not truncated. */
     uint32_t peer_max_header_list_size;
+    /* SETTINGS_NO_RFC7540_PRIORITIES (RFC 9218 §2.1): what the peer said, and
+     * whether it has said it at all. Kept only to enforce §2.1's "must not
+     * change" — this server ignores RFC 7540 priorities either way. */
+    int      peer_no_rfc7540_priorities;
+    int      peer_no_rfc7540_priorities_seen;
 
     /* Budget for stream aborts (docs/http2/08, phase A.2), in milli-tokens.
      * Spent by RST_STREAM on an unanswered stream and by streams we refuse over

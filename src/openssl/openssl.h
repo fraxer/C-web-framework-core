@@ -44,4 +44,16 @@ int openssl_read(SSL*, void*, size_t);
 int openssl_write(SSL*, const void*, size_t);
 openssl_io_status_e openssl_io_status(SSL*, int ret);
 
+/* Is the negotiated cipher suite acceptable for HTTP/2 (RFC 9113 §9.2.2)?
+ *
+ * §9.2.2 forbids the suites listed in Appendix A — some 250 of them. Rather
+ * than carry that table, this applies the rule that *generates* it: every suite
+ * in Appendix A either is not an AEAD, or does not use an ephemeral key
+ * exchange. Checking those two properties is equivalent, stays correct if the
+ * list ever grows, and asks OpenSSL questions it can answer directly.
+ *
+ * TLS 1.3 suites are all AEAD with ephemeral exchange by construction, so they
+ * pass without a special case beyond their key-exchange NID being "any". */
+int openssl_cipher_ok_for_http2(SSL* ssl);
+
 #endif

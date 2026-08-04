@@ -306,3 +306,27 @@ openssl_io_status_e openssl_io_status(SSL* ssl, int ret) {
         return OPENSSL_IO_ERROR;
     }
 }
+
+int openssl_cipher_ok_for_http2(SSL* ssl) {
+    if (ssl == NULL) return 0;
+
+    const SSL_CIPHER* cipher = SSL_get_current_cipher(ssl);
+    if (cipher == NULL) return 0;
+
+    /* Not an AEAD: every CBC and RC4 suite of Appendix A fails here. */
+    if (!SSL_CIPHER_is_aead(cipher)) return 0;
+
+    /* Static RSA and static DH key exchange — the rest of Appendix A. TLS 1.3
+     * reports NID_kx_any because the exchange is not part of the suite there;
+     * it is always ephemeral, so it is accepted. */
+    switch (SSL_CIPHER_get_kx_nid(cipher)) {
+    case NID_kx_ecdhe:
+    case NID_kx_dhe:
+    case NID_kx_ecdhe_psk:
+    case NID_kx_dhe_psk:
+    case NID_kx_any:
+        return 1;
+    default:
+        return 0;
+    }
+}

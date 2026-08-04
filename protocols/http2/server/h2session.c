@@ -54,6 +54,7 @@
 #define H2_SETTINGS_MAX_FRAME_SIZE         0x5
 #define H2_SETTINGS_MAX_HEADER_LIST_SIZE   0x6
 #define H2_SETTINGS_ENABLE_CONNECT_PROTOCOL 0x8 /* RFC 8441 §3 */
+#define H2_SETTINGS_NO_RFC7540_PRIORITIES   0x9 /* RFC 9218 §2.1 */
 
 #define H2_MAX_WINDOW 2147483647LL /* 2^31 - 1 */
 
@@ -1158,6 +1159,18 @@ static h2_frame_result_e h2_apply_settings_payload(h2session_t* s,
             if (value < H2_MAX_FRAME_SIZE_DEFAULT || value > H2_MAX_FRAME_SIZE_LIMIT)
                 return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
             s->peer_max_frame_size = value;
+            break;
+        case H2_SETTINGS_NO_RFC7540_PRIORITIES:
+            /* RFC 9218 §2.1: 0 or 1, and once a value has been sent it may not
+             * change — a peer that flips it is signalling two different
+             * prioritization schemes for one connection. */
+            if (value > 1) return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
+            if (s->peer_no_rfc7540_priorities_seen &&
+                s->peer_no_rfc7540_priorities != (int)value)
+                return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
+
+            s->peer_no_rfc7540_priorities = (int)value;
+            s->peer_no_rfc7540_priorities_seen = 1;
             break;
         case H2_SETTINGS_ENABLE_CONNECT_PROTOCOL:
             /* RFC 8441 §3: only 0 and 1 exist. The value itself says what the
@@ -2553,6 +2566,11 @@ static int h2_send_preface(h2session_t* s) {
          * before the tunnel worked would have broken every such client
          * (docs/http2/09 §2). */
         0x00, H2_SETTINGS_ENABLE_CONNECT_PROTOCOL, 0x00, 0x00, 0x00, 0x01,
+        /* RFC 9218 §2.1: this server ignores RFC 7540 priority signals, which
+         * RFC 9113 §5.3 deprecated. Saying so lets a client stop sending
+         * PRIORITY frames and priority fields it will get nothing for; it is a
+         * statement of fact, not a claim to implement RFC 9218 scheduling. */
+        0x00, H2_SETTINGS_NO_RFC7540_PRIORITIES, 0x00, 0x00, 0x00, 0x01,
     };
 
     /* With the header-list limit disabled that setting is left out entirely —
@@ -2563,8 +2581,10 @@ static int h2_send_preface(h2session_t* s) {
     size_t len = 0;
 
     if (h2_max_header_list_size == 0) {
-        memcpy(block, settings, sizeof(settings) - 12);
-        memcpy(block + sizeof(settings) - 12, settings + sizeof(settings) - 6, 6);
+        /* The header-list setting sits before the last two, so dropping it
+         * means moving that tail up rather than shortening the frame. */
+        memcpy(block, settings, sizeof(settings) - 18);
+        memcpy(block + sizeof(settings) - 18, settings + sizeof(settings) - 12, 12);
         len = sizeof(settings) - 6;
     }
     else {
