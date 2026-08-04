@@ -67,6 +67,9 @@ static void h2stream_destroy(h2stream_t* stream) {
     /* A tunnel dies with its stream — whether the stream ended cleanly, was
      * reset, or went down with the connection (h2stream_free_all). */
     if (stream->ws != NULL) h2_ws_tunnel_free(stream->ws);
+    /* Hints the peer will never see: the stream ended before the write pass
+     * reached them. */
+    http_headers_free(stream->early_hints);
 
     free(stream);
 }

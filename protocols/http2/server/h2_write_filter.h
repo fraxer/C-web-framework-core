@@ -2,6 +2,8 @@
 #define __H2_WRITE_FILTER__
 
 #include "http_filter.h"
+#include "h2stream.h"
+#include "httpresponse.h"
 
 /* Terminal stage of the HTTP/2 filter chain (see filters_create_h2).
  *
@@ -18,5 +20,20 @@
  * Every earlier stage is shared with HTTP/1.1 verbatim — this is the only
  * protocol-specific stage. */
 http_filter_t* h2_write_filter_create(void);
+
+struct h2session;
+
+/* Encode the response's trailing fields into a HEADERS block with END_STREAM and
+ * queue it (RFC 9113 §8.1) — docs/http2/08, phase E.1. Queued rather than
+ * written directly: the block is small, and going through the session's
+ * outbound buffer keeps it behind every DATA byte already on the socket without
+ * a second resumable-write path. Returns 1 on success. */
+int h2_write_filter_trailers(struct h2session* s, h2stream_t* stream, httpresponse_t* response);
+
+/* Encode one informational response (103 Early Hints) into a HEADERS block and
+ * queue it — docs/http2/08, phase E.2. No END_STREAM: a 1xx is not the final
+ * response, and the stream carries on. `fields` is borrowed, not consumed. */
+int h2_write_filter_early_hints(struct h2session* s, h2stream_t* stream,
+                                const http_header_t* fields);
 
 #endif

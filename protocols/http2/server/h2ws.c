@@ -199,7 +199,7 @@ h2_data_status_e h2_ws_tunnel_write(h2session_t* s, h2stream_t* stream) {
          * stream would shut the tunnel the client is still using. */
         view.is_last = (response->frame_code == WEBSOCKETS_CLOSE) ? 1 : 0;
 
-        const h2_data_status_e st = h2_data_write(&tunnel->writer, s, stream, &view);
+        const h2_data_status_e st = h2_data_write(&tunnel->writer, s, stream, &view, 1);
 
         response->body.pos = view.pos;
 

@@ -8,6 +8,8 @@
 #include <errno.h>
 #include <sys/stat.h>
 
+#include "connection_s.h"
+#include "h2session.h"
 #include "log.h"
 #include "helpers.h"
 #include "json.h"
@@ -33,6 +35,10 @@ static void __httpresponse_models(httpresponse_t* response, array_t* models, ...
 static http_header_t* __httpresponse_header_get(httpresponse_t* response, const char* key);
 static int __httpresponse_header_add(httpresponse_t* response, const char* key, const char* value);
 static int __httpresponse_headern_add(httpresponse_t* response, const char* key, size_t key_length, const char* value, size_t value_length);
+static int __httpresponse_trailer_add(httpresponse_t* response, const char* key, const char* value);
+static int __httpresponse_early_hint_add(httpresponse_t* response, const char* key, const char* value);
+static int __httpresponse_early_hints_send(httpresponse_t* response);
+static int __httpresponse_trailern_add(httpresponse_t* response, const char* key, size_t key_length, const char* value, size_t value_length);
 static int __httpresponse_headeru_add(httpresponse_t* response, const char* key, size_t key_length, const char* value, size_t value_length);
 static int __httpresponse_header_exist(httpresponse_t* response, const char* key);
 static int __httpresponse_header_remove(httpresponse_t* response, const char* key);
@@ -118,6 +124,10 @@ static httpresponse_t* __httpresponse_create(connection_t* connection, int http2
     response->file_ = file_alloc();
     response->header_ = NULL;
     response->last_header = NULL;
+    response->trailer_ = NULL;
+    response->last_trailer = NULL;
+    response->early_hint_ = NULL;
+    response->last_early_hint = NULL;
     response->filter = http2 ? filters_create_h2() : filters_create();
     if (response->filter == NULL) {
         free(response);
@@ -140,6 +150,10 @@ static httpresponse_t* __httpresponse_create(connection_t* connection, int http2
     response->get_header = __httpresponse_header_get;
     response->add_header = __httpresponse_header_add;
     response->add_headern = __httpresponse_headern_add;
+    response->add_trailer = __httpresponse_trailer_add;
+    response->add_trailern = __httpresponse_trailern_add;
+    response->add_early_hint = __httpresponse_early_hint_add;
+    response->send_early_hints = __httpresponse_early_hints_send;
     response->add_headeru = __httpresponse_headeru_add;
     response->add_content_length = __httpresponse_header_add_content_length;
     response->remove_header = __httpresponse_header_remove;
@@ -189,6 +203,16 @@ void __httpresponse_reset(httpresponse_t* response) {
     http_headers_free(response->header_);
     response->header_ = NULL;
     response->last_header = NULL;
+
+    http_headers_free(response->trailer_);
+    response->trailer_ = NULL;
+    response->last_trailer = NULL;
+
+    http_headers_free(response->early_hint_);
+    response->early_hint_ = NULL;
+    response->last_early_hint = NULL;
+    response->early_hint_ = NULL;
+    response->last_early_hint = NULL;
 
     httpresponseparser_reset(response->parser);
 }
@@ -337,6 +361,97 @@ http_header_t* __httpresponse_header_get(httpresponse_t* response, const char* k
 
 int __httpresponse_header_add(httpresponse_t* response, const char* key, const char* value) {
     return __httpresponse_headern_add(response, key, strlen(key), value, strlen(value));
+}
+
+int __httpresponse_early_hint_add(httpresponse_t* response, const char* key, const char* value) {
+    if (key == NULL || value == NULL) return 0;
+
+    const connection_t* connection = response->connection;
+    const connection_server_ctx_t* ctx = connection != NULL ? connection->ctx : NULL;
+    if (ctx != NULL && !ctx->is_http2) {
+        /* HTTP/1.1 can carry 1xx, but its write path has no notion of an
+         * interim response, and the feature exists for browsers — which speak
+         * HTTP/2 to anything that offers it. Refused loudly rather than
+         * silently dropped. */
+        log_error("httpresponse: early hints are HTTP/2 only, dropping \"%s\"\n", key);
+        return 0;
+    }
+
+    http_header_t* hint = http_header_create(key, strlen(key), value, strlen(value));
+    if (hint == NULL) return 0;
+    if (hint->key == NULL || hint->value == NULL) {
+        http_header_free(hint);
+        return 0;
+    }
+
+    if (response->early_hint_ == NULL)
+        response->early_hint_ = hint;
+
+    if (response->last_early_hint != NULL)
+        response->last_early_hint->next = hint;
+
+    response->last_early_hint = hint;
+
+    return 1;
+}
+
+int __httpresponse_early_hints_send(httpresponse_t* response) {
+    if (response->early_hint_ == NULL) return 0;
+
+    /* Ownership of the list moves to the stream, which encodes and sends it on
+     * the worker — the handler thread must not encode HPACK, because blocks
+     * have to reach the peer in the order they were encoded (RFC 9113 §4.3)
+     * and only the worker can guarantee that. */
+    http_header_t* fields = response->early_hint_;
+    response->early_hint_ = NULL;
+    response->last_early_hint = NULL;
+
+    if (h2_server_early_hints(response->connection, response, fields))
+        return 1;
+
+    http_headers_free(fields);
+
+    return 0;
+}
+
+int __httpresponse_trailer_add(httpresponse_t* response, const char* key, const char* value) {
+    if (key == NULL || value == NULL) return 0;
+
+    return __httpresponse_trailern_add(response, key, strlen(key), value, strlen(value));
+}
+
+/* Trailers are kept apart from the headers rather than flagged among them: they
+ * are encoded into their own HPACK block after the body, and nothing that walks
+ * the header list (the write filter, gzip, range) should ever see them. */
+int __httpresponse_trailern_add(httpresponse_t* response, const char* key, size_t key_length, const char* value, size_t value_length) {
+    /* HTTP/1.1 would need chunked encoding and a Trailer header to carry these,
+     * and the one thing that wants them — gRPC — is HTTP/2 only. Rather than
+     * pretend, say so: silently dropping a gRPC status is the kind of thing
+     * that gets debugged from the client side for a day. */
+    const connection_t* connection = response->connection;
+    const connection_server_ctx_t* ctx = connection != NULL ? connection->ctx : NULL;
+    if (ctx != NULL && !ctx->is_http2) {
+        log_error("httpresponse: trailers are HTTP/2 only, dropping \"%.*s\"\n",
+                  (int)(key_length > 64 ? 64 : key_length), key);
+        return 0;
+    }
+
+    http_header_t* trailer = http_header_create(key, key_length, value, value_length);
+    if (trailer == NULL) return 0;
+    if (trailer->key == NULL || trailer->value == NULL) {
+        http_header_free(trailer);
+        return 0;
+    }
+
+    if (response->trailer_ == NULL)
+        response->trailer_ = trailer;
+
+    if (response->last_trailer != NULL)
+        response->last_trailer->next = trailer;
+
+    response->last_trailer = trailer;
+
+    return 1;
 }
 
 int __httpresponse_headern_add(httpresponse_t* response, const char* key, size_t key_length, const char* value, size_t value_length) {

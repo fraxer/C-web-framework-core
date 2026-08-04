@@ -95,8 +95,17 @@ typedef struct h2stream {
      * the tunnel is per-stream state rather than per-connection state. */
     struct h2_ws_tunnel* ws;
 
+    /* Informational responses staged by the handler and not yet sent (103 Early
+     * Hints — docs/http2/08, phase E.2). Owned by the stream; each entry is a
+     * field list encoded into its own 1xx HEADERS block by the write path. */
+    http_header_t* early_hints;
+    http_header_t* last_early_hint;
+
     /* Worker-only, both paths under the connection lock. */
     unsigned headers_done    : 1; /* the request header block is complete */
+    /* The final response's HEADERS block has been built. Nothing informational
+     * may follow it — 1xx precedes the final response, by definition. */
+    unsigned response_headers_sent : 1;
     /* Answered without a handler (a 431 from the header-list limit). The request
      * body is of no further interest, but the peer may already be sending it, so
      * DATA keeps being credited and discarded instead of dispatched. */

@@ -71,7 +71,7 @@ static h2_data_status_e __write_frame_header(h2_data_writer_t* w, connection_t* 
 }
 
 h2_data_status_e h2_data_write(h2_data_writer_t* w, h2session_t* s,
-                               h2stream_t* stream, bufo_t* src) {
+                               h2stream_t* stream, bufo_t* src, int end_stream_allowed) {
     connection_t* connection = s->connection;
 
     if (src == NULL) return H2_DATA_ERROR;
@@ -114,7 +114,7 @@ h2_data_status_e h2_data_write(h2_data_writer_t* w, h2session_t* s,
             if ((int64_t)chunk > window)
                 chunk = (size_t)window;
 
-            w->frame_end_stream = (src->is_last && chunk == remaining) ? 1 : 0;
+            w->frame_end_stream = (end_stream_allowed && src->is_last && chunk == remaining) ? 1 : 0;
             w->frame_remaining = chunk;
             w->fh_pos = 0;
             w->fh_len = h2frame_encode_header(w->fh, H2_FRAME_DATA,

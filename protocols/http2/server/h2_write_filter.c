@@ -132,6 +132,12 @@ static void __lowercase(char* dst, const char* src, size_t len) {
     }
 }
 
+/* This response ends with a trailing HEADERS block (RFC 9113 §8.1), so
+ * END_STREAM belongs there and nowhere earlier — docs/http2/08, phase E.1. */
+static int __has_trailers(httpresponse_t* response) {
+    return response->trailer_ != NULL;
+}
+
 /* A body will follow the HEADERS frame. Mirrors the early returns of
  * http_data_filter's __body: those cases emit no body buffer at all, so
  * END_STREAM has to ride on HEADERS or the stream would never close.
@@ -234,7 +240,7 @@ static int __build_headers(httprequest_t* request, httpresponse_t* response,
     /* A WebSocket tunnel's 200 must not carry END_STREAM even though no body
      * follows it: the stream stays open in both directions, which is the whole
      * point (RFC 8441, docs/http2/09). */
-    const int end_stream = !has_body && stream->ws == NULL;
+    const int end_stream = !has_body && stream->ws == NULL && !__has_trailers(response);
     size_t off = 0;
     size_t written = 0;
     for (size_t i = 0; i < frames; i++) {
@@ -261,6 +267,9 @@ static int __build_headers(httprequest_t* request, httpresponse_t* response,
 
     bufo_set_size(out, written);
     bufo_reset_pos(out);
+
+    /* From here on an informational response would be out of order. */
+    stream->response_headers_sent = 1;
 
     if (end_stream)
         stream->end_stream_sent = 1;
@@ -303,7 +312,7 @@ static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* pare
      * needs the same windows, quantum and frame-boundary rules, and having one
      * copy of that arithmetic is the point (docs/http2/09 §4.3). What stays
      * here is the translation into the filter chain's vocabulary. */
-    switch (h2_data_write(&module->writer, s, stream, parent_buf)) {
+    switch (h2_data_write(&module->writer, s, stream, parent_buf, !__has_trailers(response))) {
     case H2_DATA_DRAINED:
         return CWF_DATA_AGAIN;
 
@@ -341,6 +350,111 @@ static void __reset(void* arg) {
     h2_data_writer_reset(&module->writer);
 
     bufo_clear(module->buf);
+}
+
+/* Trailing fields as their own HPACK block. Shares the encoder with the header
+ * block, which is exactly why it may not be encoded early: blocks must reach the
+ * peer in the order they were encoded (RFC 9113 §4.3). Encoding here, at the
+ * point of sending, keeps that true by construction. */
+/* Encode a field list into HEADERS (+CONTINUATION) and queue it. Shared by the
+ * two blocks that are not the response's own: the trailing one and the
+ * informational ones. `status` is NULL for trailers, which carry no
+ * pseudo-header at all (§8.1). */
+static int __queue_extra_block(h2session_t* s, h2stream_t* stream,
+                               const http_header_t* list, const char* status,
+                               int end_stream) {
+    size_t count = status != NULL ? 1 : 0;
+    size_t names_size = 0;
+    for (const http_header_t* h = list; h != NULL; h = h->next) {
+        if (h->key_length == 0 || h->key[0] == ':' || __is_forbidden(h->key, h->key_length))
+            continue;
+        count++;
+        names_size += h->key_length;
+    }
+
+    if (count == 0) return 0;
+
+    hpack_header_t* fields = malloc(sizeof(*fields) * count);
+    char* names = malloc(names_size > 0 ? names_size : 1);
+    if (fields == NULL || names == NULL) {
+        free(fields);
+        free(names);
+        return 0;
+    }
+
+    size_t n = 0;
+    if (status != NULL) {
+        fields[n].name = ":status";
+        fields[n].name_len = 7;
+        fields[n].value = (char*)status;
+        fields[n].value_len = strlen(status);
+        n++;
+    }
+
+    size_t names_off = 0;
+    for (const http_header_t* h = list; h != NULL; h = h->next) {
+        if (h->key_length == 0 || h->key[0] == ':' || __is_forbidden(h->key, h->key_length))
+            continue;
+
+        __lowercase(names + names_off, h->key, h->key_length);
+        fields[n].name = names + names_off;
+        fields[n].name_len = h->key_length;
+        fields[n].value = (char*)h->value;
+        fields[n].value_len = h->value_length;
+        names_off += h->key_length;
+        n++;
+    }
+
+    uint8_t* block = NULL;
+    size_t block_len = 0;
+    const hpack_status_e st = hpack_encoder_encode(s->encoder, fields, n, 1, &block, &block_len);
+
+    free(fields);
+    free(names);
+
+    if (st != HPACK_OK) {
+        log_error("h2_write_filter: hpack encode failed (%d)\n", (int)st);
+        return 0;
+    }
+
+    const size_t mfs = s->peer_max_frame_size ? s->peer_max_frame_size : H2_MAX_FRAME_SIZE_DEFAULT;
+    const size_t frames = block_len > mfs ? (block_len + mfs - 1) / mfs : 1;
+
+    int ok = 1;
+    size_t off = 0;
+    for (size_t i = 0; i < frames && ok; i++) {
+        const size_t chunk = block_len - off < mfs ? block_len - off : mfs;
+        const int last = (i + 1 == frames);
+
+        uint8_t flags = 0;
+        if (last) flags |= H2_FLAG_END_HEADERS;
+        if (i == 0 && end_stream) flags |= H2_FLAG_END_STREAM;
+
+        ok = h2_session_queue_frame(s, i == 0 ? H2_FRAME_HEADERS : H2_FRAME_CONTINUATION,
+                                    flags, stream->id, block + off, chunk);
+        off += chunk;
+    }
+
+    free(block);
+
+    return ok;
+}
+
+int h2_write_filter_early_hints(h2session_t* s, h2stream_t* stream, const http_header_t* fields) {
+    /* 103 has no body and does not end the stream: the final response follows
+     * on the same one (RFC 8297). */
+    return __queue_extra_block(s, stream, fields, "103", 0);
+}
+
+int h2_write_filter_trailers(h2session_t* s, h2stream_t* stream, httpresponse_t* response) {
+    /* Trailers carry no :status and close the stream. Encoded here, at the
+     * point of sending, because they share the encoder with the header block
+     * and blocks must reach the peer in the order they were encoded (§4.3). */
+    const int ok = __queue_extra_block(s, stream, response->trailer_, NULL, 1);
+
+    if (ok) stream->end_stream_sent = 1;
+
+    return ok;
 }
 
 http_filter_t* h2_write_filter_create(void) {
