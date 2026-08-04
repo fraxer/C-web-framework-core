@@ -1151,6 +1151,16 @@ static h2_frame_result_e h2_apply_settings_payload(h2session_t* s,
 
             for (h2stream_t* stream = s->streams; stream != NULL; stream = stream->next) {
                 stream->send_window += delta;
+
+                /* §6.9.2: a raise that pushes any stream window past 2^31-1 is
+                 * a connection error. Reachable only in combination with
+                 * WINDOW_UPDATE — the setting alone is bounded above — which is
+                 * why the value check on entry is not enough. The deltas
+                 * already applied are left as they are: the session is going
+                 * away with this return. */
+                if (stream->send_window > H2_MAX_WINDOW)
+                    return h2_conn_error(s, H2_ERR_FLOW_CONTROL_ERROR);
+
                 if (stream->send_window > 0) stream->window_blocked = 0;
             }
             break;
