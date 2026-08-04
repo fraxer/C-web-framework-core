@@ -88,7 +88,11 @@ typedef struct websocketsrequest {
      * the message to the handler thread. */
     cqueue_t* out_queue;                          /* slots, in tunnel order */
     void* out_owner;                              /* opaque: the tunnel */
-    int (*out_wake)(connection_t*, void* owner);  /* make the writer run */
+    /* Make the writer run. handler_done says whether this publish retires a
+     * message that had been dispatched to a handler — the tunnel counts those
+     * to know when it may be destroyed (docs/http2/09, step 7). A broadcast
+     * frame was never dispatched, so it passes 0. */
+    int (*out_wake)(connection_t*, void* owner, int handler_done);
     int out_parallel;                             /* fan-out allowed for this one */
     /* permessage-deflate context of the tunnel, or NULL. On HTTP/1.1 the
      * response finds it through the connection's parser; a tunnel keeps its own

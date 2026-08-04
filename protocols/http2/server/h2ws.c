@@ -12,8 +12,8 @@
 #include "websocketsrequest.h"
 #include "websocketsserverhandlers.h"
 
-h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, int resource_protocol,
-                                    const ws_deflate_config_t* deflate) {
+h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, h2stream_t* stream,
+                                    int resource_protocol, const ws_deflate_config_t* deflate) {
     h2_ws_tunnel_t* tunnel = calloc(1, sizeof(*tunnel));
     if (tunnel == NULL) return NULL;
 
@@ -21,6 +21,8 @@ h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, int resource_proto
      * (websocketsswitch.c): "resource" routes each message by its own
      * method+location, the default protocol sends everything to one handler. */
     tunnel->connection = connection;
+    tunnel->stream = stream;
+    atomic_init(&tunnel->inflight, 0);
     tunnel->parser = websocketsparser_create(connection, resource_protocol ?
                                              websockets_protocol_resource_create :
                                              websockets_protocol_default_create);
@@ -118,13 +120,44 @@ int h2_ws_tunnel_has_output(const h2_ws_tunnel_t* tunnel) {
     return ready;
 }
 
-/* A handler thread finished and filled a slot: make the worker write it. Runs
- * under connection_s_lock, taken by the publisher. */
-static int h2_ws_wake(connection_t* connection, void* owner) {
+/* Something filled a slot: make the worker write it. Runs under
+ * connection_s_lock, taken by the publisher.
+ *
+ * `handler_done` retires one dispatched message. When the last one is retired
+ * the stream stops being held, and if a RST_STREAM arrived meanwhile the stream
+ * is released here — this is the only place that can know it is now safe
+ * (docs/http2/09, step 7). */
+static int h2_ws_wake(connection_t* connection, void* owner, int handler_done) {
     connection_server_ctx_t* ctx = connection->ctx;
-    (void)owner;
+    h2_ws_tunnel_t* tunnel = owner;
+
+    int released = 0;
+
+    if (handler_done && tunnel != NULL) {
+        const int left = atomic_fetch_sub(&tunnel->inflight, 1) - 1;
+
+        if (left == 0 && tunnel->stream != NULL) {
+            h2stream_t* stream = tunnel->stream;
+
+            atomic_store_explicit(&stream->handler_pending, 0, memory_order_release);
+
+            /* Reset while we were working: the stream was kept alive only for
+             * this, and nothing else will come to collect it. */
+            if (atomic_load_explicit(&stream->cancelled, memory_order_acquire)) {
+                h2_server_stream_release(connection, stream);
+                released = 1;
+            }
+        }
+    }
 
     atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
+
+    /* Re-arm even when this stream has just been released. "Nothing of ours to
+     * write" is not "nothing to write": the connection carries other streams,
+     * and skipping the re-arm here left it parked with their responses queued —
+     * an intermittent stall where a later CONNECT simply went unanswered.
+     * `tunnel` must not be touched past the release; `connection` is fine. */
+    (void)released;
 
     return connection_after_read(connection);
 }
@@ -242,11 +275,21 @@ static int h2_ws_message_seen(h2_ws_tunnel_t* tunnel, connection_t* connection) 
         parser->request->out_parallel = !parser->ws_deflate_enabled;
         parser->request->out_deflate = parser->ws_deflate_enabled ? &parser->ws_deflate : NULL;
 
+        /* Counted BEFORE the dispatch: a handler can finish (and decrement)
+         * before get_resource has even returned. */
+        atomic_fetch_add(&tunnel->inflight, 1);
+        if (tunnel->stream != NULL)
+            atomic_store_explicit(&tunnel->stream->handler_pending, 1, memory_order_release);
+
         if (parser->request->protocol->get_resource(connection, parser->request)) {
             /* Dispatched: the queue item owns the request now. The parser drops
              * its pointer on reset without freeing, so nothing is done here. */
             return 1;
         }
+
+        /* Not dispatched after all — take the count back. */
+        if (atomic_fetch_sub(&tunnel->inflight, 1) - 1 == 0 && tunnel->stream != NULL)
+            atomic_store_explicit(&tunnel->stream->handler_pending, 0, memory_order_release);
 
         /* No route matched, or the queue refused it: ownership never left the
          * parser and the request has to be released, or every message to an

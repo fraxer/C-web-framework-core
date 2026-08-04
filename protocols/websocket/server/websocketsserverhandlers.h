@@ -27,7 +27,7 @@ void* websockets_queue_data_request_create(connection_t* connection, void* compo
  * out_queue == NULL falls back to websockets_response_post(). Takes ownership
  * of the response either way. */
 int websockets_response_post_to(websocketsresponse_t* response, cqueue_t* out_queue,
-                                void* out_owner, int (*out_wake)(connection_t*, void*));
+                                void* out_owner, int (*out_wake)(connection_t*, void*, int));
 
 /* Reserve a place in an output order. Exposed for the RFC 8441 tunnel, whose
  * order lives on the stream rather than on the connection (docs/http2/09). */

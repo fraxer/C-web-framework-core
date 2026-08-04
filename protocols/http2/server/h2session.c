@@ -1376,7 +1376,7 @@ static h2_frame_result_e h2_open_tunnel(h2session_t* s, h2stream_t* stream, int 
     if (extensions != NULL && extensions->value != NULL)
         deflate = ws_deflate_parse_header(extensions->value, &deflate_config);
 
-    stream->ws = h2_ws_tunnel_create(s->connection, resource, deflate ? &deflate_config : NULL);
+    stream->ws = h2_ws_tunnel_create(s->connection, stream, resource, deflate ? &deflate_config : NULL);
     if (stream->ws == NULL) {
         h2_session_drop_stream(s, stream);
         return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
@@ -1817,6 +1817,9 @@ static int h2_process_buffer(h2session_t* s) {
 /* This stream has something to put on the wire: a response a handler finished,
  * or WebSocket frames queued on its tunnel. */
 static int h2_stream_writable(const h2stream_t* stream) {
+    /* Reset by the peer: whatever is queued is owed to nobody. */
+    if (atomic_load_explicit(&stream->cancelled, memory_order_acquire)) return 0;
+
     if (atomic_load_explicit(&stream->response_ready, memory_order_acquire)) return 1;
 
     return stream->ws != NULL && h2_ws_tunnel_has_output(stream->ws);
@@ -2330,6 +2333,14 @@ static void h2_graceful_close_locked(h2session_t* s) {
     h2_queue_goaway(s, H2_ERR_NO_ERROR);
     (void)h2_flush_out(s);
     connection_close_locked(s->connection);
+}
+
+void h2_server_stream_release(connection_t* connection, h2stream_t* stream) {
+    h2session_t* s = h2_session_of(connection);
+    if (s == NULL || stream == NULL) return;
+
+    /* handler_pending is already clear, so this really frees. */
+    h2_session_drop_stream(s, stream);
 }
 
 void h2_server_tick(connection_t* connection, int shutdown_now) {

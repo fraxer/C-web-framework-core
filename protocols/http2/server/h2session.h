@@ -237,6 +237,11 @@ int h2_server_publish_inline(connection_t* connection, httpresponse_t* response)
 int h2_session_queue_frame(h2session_t* s, uint8_t type, uint8_t flags,
                            uint32_t stream_id, const uint8_t* payload, size_t len);
 
+/* Release a stream that was being kept alive for a handler which has now
+ * finished, after the peer reset it (docs/http2/09, step 7). The caller must
+ * hold connection_s_lock and must not touch the stream afterwards. */
+void h2_server_stream_release(connection_t* connection, h2stream_t* stream);
+
 /* Worker-timer entry point (Phase 5). Called once per h2 connection on each tick
  * of the multiplexing sweep. Owns the whole lock lifecycle: it trylocks, and
  * every path out releases the lock (a close frees/unlocks via

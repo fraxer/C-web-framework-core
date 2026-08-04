@@ -2,6 +2,7 @@
 #define __H2WS__
 
 #include <stddef.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 #include "connection.h"
@@ -34,6 +35,20 @@ typedef struct h2_ws_tunnel {
      * from broadcast channels without walking back through the stream. */
     connection_t* connection;
 
+    /* The stream this tunnel *is*. Needed to hold the stream alive while a
+     * handler of ours is still running — see `inflight`. */
+    h2stream_t* stream;
+
+    /* Messages dispatched to handlers and not yet published back.
+     *
+     * A handler thread holds a pointer to its reserved output slot, and that
+     * slot lives in this tunnel's queue. If a RST_STREAM freed the tunnel
+     * meanwhile, the handler would fill freed memory. So while this is
+     * non-zero the stream keeps handler_pending set, which is exactly the
+     * mechanism h2stream_close already uses to defer destruction for ordinary
+     * HTTP requests (docs/http2/09, step 7). */
+    atomic_int inflight;
+
     /* Frame parser for this tunnel. Created with the connection so it can build
      * requests, but deliberately NOT installed anywhere on it — the connection
      * still speaks HTTP/2. */
@@ -60,8 +75,8 @@ typedef struct h2_ws_tunnel {
 /* `deflate` is the negotiated permessage-deflate configuration, or NULL when
  * the client did not ask for it (or asked for something unusable). The context
  * lives on the tunnel: two tunnels on one connection compress independently. */
-h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, int resource_protocol,
-                                    const ws_deflate_config_t* deflate);
+h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, h2stream_t* stream,
+                                    int resource_protocol, const ws_deflate_config_t* deflate);
 void h2_ws_tunnel_free(h2_ws_tunnel_t* tunnel);
 
 /* Hand one DATA payload to the parser. `data` must be writable: WebSocket

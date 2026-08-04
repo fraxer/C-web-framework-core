@@ -36,7 +36,7 @@ typedef struct connection_queue_broadcast_data {
      * NULL on the HTTP/1.1 path, where it is the connection's own. */
     cqueue_t* out_queue;
     void* out_owner;
-    int (*out_wake)(connection_t*, void* owner);
+    int (*out_wake)(connection_t*, void* owner, int handler_done);
     void* out_deflate;
 } connection_queue_broadcast_data_t;
 
@@ -533,7 +533,7 @@ int broadcast_add(const char* broadcast_name, connection_t* connection, void* id
 int broadcast_add_out(const char* broadcast_name, connection_t* connection, void* id,
                       void(*response_handler)(response_t* response, const char* payload, size_t size),
                       cqueue_t* out_queue, void* out_owner,
-                      int (*out_wake)(connection_t*, void* owner), void* out_deflate) {
+                      int (*out_wake)(connection_t*, void* owner, int handler_done), void* out_deflate) {
     if (broadcast_name == NULL || connection == NULL || response_handler == NULL) {
         __broadcast_id_free(id);
         return 0;

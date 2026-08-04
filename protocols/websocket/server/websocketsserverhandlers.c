@@ -28,7 +28,7 @@ struct connection_queue_websockets_data {
      * the handler returns. NULL/NULL on the HTTP/1.1 path. */
     cqueue_t* out_queue;
     void* out_owner;
-    int (*out_wake)(connection_t*, void* owner);
+    int (*out_wake)(connection_t*, void* owner, int handler_done);
     ws_deflate_t* out_deflate;
     /* The virtual host the connection was upgraded on, captured at dispatch.
      * Same reasoning as the HTTP runner: ctx->server belongs to the worker, and
@@ -159,11 +159,11 @@ void __out_finish_current(connection_t* connection) {
 /* Publish into a tunnel's slot. The tunnel owns the ordering and the waking, so
  * all that is shared with the connection path is the slot itself. */
 static int __out_publish_tunnel(connection_t* connection, connection_out_slot_t* slot,
-                                websocketsresponse_t* response,
-                                void* owner, int (*wake)(connection_t*, void*)) {
+                                websocketsresponse_t* response, void* owner,
+                                int (*wake)(connection_t*, void*, int), int handler_done) {
     connection_s_lock(connection, LOCK_SITE_WS_PUBLISH);
     slot->response = &response->base;
-    const int r = wake != NULL ? wake(connection, owner) : 1;
+    const int r = wake != NULL ? wake(connection, owner, handler_done) : 1;
     connection_s_unlock(connection);
 
     return r;
@@ -198,7 +198,7 @@ int __out_publish(connection_t* connection, connection_out_slot_t* slot, websock
  *
  * Takes ownership of the response either way: it is freed here on failure. */
 int websockets_response_post_to(websocketsresponse_t* response, cqueue_t* out_queue,
-                                void* out_owner, int (*out_wake)(connection_t*, void*)) {
+                                void* out_owner, int (*out_wake)(connection_t*, void*, int)) {
     connection_t* connection = response->connection;
 
     if (out_queue == NULL)
@@ -213,7 +213,9 @@ int websockets_response_post_to(websocketsresponse_t* response, cqueue_t* out_qu
         return 0;
     }
 
-    return __out_publish_tunnel(connection, slot, response, out_owner, out_wake);
+    /* handler_done = 0: this frame was produced by a broadcast or by the read
+     * path, not by a dispatched handler, so it retires nothing. */
+    return __out_publish_tunnel(connection, slot, response, out_owner, out_wake, 0);
 }
 
 int websockets_response_post(websocketsresponse_t* response) {
@@ -479,7 +481,7 @@ static int __publish(connection_t* connection, connection_queue_websockets_data_
                      websocketsresponse_t* response) {
     if (data->out_queue != NULL)
         return __out_publish_tunnel(connection, data->out, response,
-                                    data->out_owner, data->out_wake);
+                                    data->out_owner, data->out_wake, 1);
 
     return __out_publish(connection, data->out, response);
 }
