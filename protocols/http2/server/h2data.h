@@ -44,12 +44,16 @@ void h2_data_writer_reset(h2_data_writer_t* w);
 
 /* Push as much of `src` as the windows, the quantum and the socket allow.
  *
- * `src->is_last` asks for END_STREAM on the frame that carries the final byte;
- * a tunnel passes 0 there, since ending the stream is exactly what it must not
- * do. Advances src->pos by what was written, sets stream->yielded /
- * window_blocked on the matching outcomes, and leaves `w` positioned to resume.
- */
+ * END_STREAM rides the frame carrying the final byte when `src->is_last` and
+ * `end_stream_allowed` agree. Two gates rather than one because the reasons are
+ * different and both real: `is_last` is "this is the end of the data", while
+ * end_stream_allowed is "the stream may end here at all" — false for a tunnel,
+ * and false for a response whose trailing HEADERS block still has to follow
+ * (RFC 9113 §8.1, docs/http2/08 phase E.1).
+ *
+ * Advances src->pos by what was written, sets stream->yielded / window_blocked
+ * on the matching outcomes, and leaves `w` positioned to resume. */
 h2_data_status_e h2_data_write(h2_data_writer_t* w, struct h2session* s,
-                               h2stream_t* stream, bufo_t* src);
+                               h2stream_t* stream, bufo_t* src, int end_stream_allowed);
 
 #endif

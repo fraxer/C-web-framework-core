@@ -35,6 +35,22 @@ typedef struct httpresponse {
 
     http_header_t* header_;
     http_header_t* last_header;
+
+    /* Trailing fields, sent after the body as a second HEADERS block with
+     * END_STREAM (RFC 9113 §8.1) — docs/http2/08, phase E.1. This is how gRPC
+     * reports its status, and it exists on HTTP/2 only: HTTP/1.1 would need
+     * chunked encoding and a Trailer header, and gRPC does not run there
+     * anyway. On an HTTP/1.1 response these are ignored, with a warning. */
+    http_header_t* trailer_;
+    http_header_t* last_trailer;
+
+    /* Fields staged for an informational response — 103 Early Hints
+     * (RFC 8297), the thing that replaced server push. Accumulated by
+     * add_early_hint() and handed to the stream by send_early_hints(), which
+     * clears them; HTTP/2 only, like trailers (docs/http2/08, phase E.2). */
+    http_header_t* early_hint_;
+    http_header_t* last_early_hint;
+
     http_filter_t* filter;
     http_filter_t* cur_filter;
 
@@ -137,6 +153,31 @@ typedef struct httpresponse {
      * @return 1 on success, 0 on error
      */
     int(*add_headern)(struct httpresponse* response, const char* key, size_t key_length, const char* value, size_t value_length);
+
+    /*
+     * Add a trailing field, sent after the body (HTTP/2 only — see trailer_).
+     * Order is preserved. Returns 1 on success, 0 on allocation failure.
+     * @param response - pointer to httpresponse
+     * @param key - field name (lowercase on the wire, as any HTTP/2 field)
+     * @param value - field value
+     */
+    int(*add_trailer)(struct httpresponse* response, const char* key, const char* value);
+    int(*add_trailern)(struct httpresponse* response, const char* key, size_t key_length, const char* value, size_t value_length);
+
+    /*
+     * Stage a field for the next informational response (103 Early Hints).
+     * Nothing is sent until send_early_hints(); typical use is one or more
+     * Link: <...>; rel=preload, so the client can start fetching while the
+     * handler is still working. HTTP/2 only.
+     */
+    int(*add_early_hint)(struct httpresponse* response, const char* key, const char* value);
+
+    /*
+     * Send the staged fields as a 103 response and clear them. Returns 1 when
+     * the hints were handed over. May be called several times; every call after
+     * the final response has begun is refused, since 1xx must precede it.
+     */
+    int(*send_early_hints)(struct httpresponse* response);
 
     /*
      * Add header if it doesn't already exist (unique).

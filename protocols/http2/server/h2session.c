@@ -23,6 +23,7 @@
 #include "httprequest.h"
 #include "httprequestparser.h"
 #include "httpresponse.h"
+#include "h2_write_filter.h"
 #include "h2field.h"
 #include "h2ws.h"
 #include "h2stream.h"
@@ -1842,6 +1843,10 @@ static int h2_stream_writable(const h2stream_t* stream) {
     /* Reset by the peer: whatever is queued is owed to nobody. */
     if (atomic_load_explicit(&stream->cancelled, memory_order_acquire)) return 0;
 
+    /* Informational responses go out while the handler is still working — that
+     * is the entire point of 103, so they make a stream writable on their own. */
+    if (stream->early_hints != NULL) return 1;
+
     if (atomic_load_explicit(&stream->response_ready, memory_order_acquire)) return 1;
 
     return stream->ws != NULL && h2_ws_tunnel_has_output(stream->ws);
@@ -2048,6 +2053,16 @@ static h2_write_status_e h2_write_stream(h2session_t* s, h2stream_t* stream) {
      * exists to keep open (docs/http2/09). */
     if (stream->ws != NULL) return H2_WRITE_DONE;
 
+    /* Trailing fields (RFC 9113 §8.1) close the stream instead of the empty
+     * DATA frame below — docs/http2/08, phase E.1. */
+    if (!stream->end_stream_sent && stream->response != NULL &&
+        stream->response->trailer_ != NULL) {
+        if (!h2_write_filter_trailers(s, stream, stream->response))
+            return H2_WRITE_FAILED;
+
+        return H2_WRITE_DONE;
+    }
+
     /* The filter chain emits no buffer at all for an empty body (and the
      * HEADERS frame only carries END_STREAM when we could prove up front that
      * no body follows), so close the stream explicitly when it is still open. */
@@ -2131,6 +2146,22 @@ static int h2_write(connection_t* connection) {
      * each turn because the rotation below appends served streams behind the
      * cursor, so the walk would otherwise reach them a second time. */
     for (h2stream_t* st = s->streams; st != NULL; st = st->next) st->served = 0;
+
+    /* Informational responses first, and outside the per-stream turn: a 103 is
+     * a queued block, not a scheduled body, and it has to precede the final
+     * HEADERS of its own stream (docs/http2/08, phase E.2). */
+    for (h2stream_t* st = s->streams; st != NULL; st = st->next) {
+        if (st->early_hints == NULL) continue;
+
+        http_header_t* fields = st->early_hints;
+        st->early_hints = NULL;
+        st->last_early_hint = NULL;
+
+        if (!st->response_headers_sent)
+            (void)h2_write_filter_early_hints(s, st, fields);
+
+        http_headers_free(fields);
+    }
 
     /* A stream that stopped *mid-frame* owns the socket until it finishes:
      * starting another one would splice its bytes into the unfinished frame.
@@ -2355,6 +2386,48 @@ static void h2_graceful_close_locked(h2session_t* s) {
     h2_queue_goaway(s, H2_ERR_NO_ERROR);
     (void)h2_flush_out(s);
     connection_close_locked(s->connection);
+}
+
+int h2_server_early_hints(connection_t* connection, httpresponse_t* response,
+                          http_header_t* fields) {
+    if (connection == NULL || fields == NULL) return 0;
+
+    connection_server_ctx_t* ctx = connection->ctx;
+    h2session_t* s = h2_session_of(connection);
+    if (s == NULL) return 0;
+
+    /* The stream table belongs to the worker, so this walk is under the lock —
+     * the same slow path h2_server_publish_inline takes. Early hints happen
+     * once or twice per request, not per byte, so a lock here costs nothing
+     * worth avoiding. */
+    connection_s_lock(connection, LOCK_SITE_H2_PUBLISH);
+
+    int ok = 0;
+    h2stream_t* stream = h2stream_find_by_response(s, response);
+
+    if (stream != NULL && !stream->response_headers_sent) {
+        http_header_t* last = fields;
+        while (last->next != NULL) last = last->next;
+
+        if (stream->early_hints == NULL)
+            stream->early_hints = fields;
+        else
+            stream->last_early_hint->next = fields;
+
+        stream->last_early_hint = last;
+        ok = 1;
+
+        atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
+        connection_after_read(connection);
+    }
+    else if (stream != NULL) {
+        log_error("h2: early hints after the response has started on stream %u — dropped\n",
+                  stream->id);
+    }
+
+    connection_s_unlock(connection);
+
+    return ok;
 }
 
 void h2_server_stream_release(connection_t* connection, h2stream_t* stream) {

@@ -237,6 +237,14 @@ int h2_server_publish_inline(connection_t* connection, httpresponse_t* response)
 int h2_session_queue_frame(h2session_t* s, uint8_t type, uint8_t flags,
                            uint32_t stream_id, const uint8_t* payload, size_t len);
 
+/* Hand a staged list of informational fields (103 Early Hints) to the stream
+ * that owns `response`, and wake the worker to encode and send it. Called from
+ * a handler thread, which must NOT hold connection_s_lock; takes it itself.
+ * Takes ownership of `fields` on success (returns 1); on failure the caller
+ * still owns them (docs/http2/08, phase E.2). */
+int h2_server_early_hints(connection_t* connection, httpresponse_t* response,
+                          http_header_t* fields);
+
 /* Release a stream that was being kept alive for a handler which has now
  * finished, after the peer reset it (docs/http2/09, step 7). The caller must
  * hold connection_s_lock and must not touch the stream afterwards. */
