@@ -37,6 +37,7 @@ typedef struct connection_queue_broadcast_data {
     cqueue_t* out_queue;
     void* out_owner;
     int (*out_wake)(connection_t*, void* owner);
+    void* out_deflate;
 } connection_queue_broadcast_data_t;
 
 void __broadcast_queue_request_handler(void*);
@@ -179,6 +180,7 @@ broadcast_item_t* __broadcast_create_item(connection_t* connection, void* id, vo
     item->out_queue = NULL;
     item->out_owner = NULL;
     item->out_wake = NULL;
+    item->out_deflate = NULL;
 
     return item;
 }
@@ -310,6 +312,7 @@ void __broadcast_queue_add(broadcast_item_t* subscriber, broadcast_payload_t* pa
         bdata->out_queue = subscriber->out_queue;
         bdata->out_owner = subscriber->out_owner;
         bdata->out_wake = subscriber->out_wake;
+        bdata->out_deflate = subscriber->out_deflate;
     }
 
     if (item->data == NULL) {
@@ -384,7 +387,14 @@ void __broadcast_queue_request_handler(void* arg) {
     connection_t* connection = first_item->connection;
     connection_server_ctx_t* conn_ctx = connection->ctx;
 
+    connection_queue_broadcast_data_t* first_data =
+        (connection_queue_broadcast_data_t*)first_item->data;
+
     websocketsresponse_t* response = websocketsresponse_create(connection);
+    /* A tunnel keeps its compression context on the stream (docs/http2/09). */
+    if (response != NULL && first_data->out_deflate != NULL)
+        websocketsresponse_set_deflate(response, first_data->out_deflate);
+
     if (response == NULL) {
         // TODO: close connection, return error
         atomic_store(&conn_ctx->destroyed, 1);
@@ -394,9 +404,6 @@ void __broadcast_queue_request_handler(void* arg) {
         connection_s_unlock(connection);
         return;
     }
-
-    connection_queue_broadcast_data_t* first_data =
-        (connection_queue_broadcast_data_t*)first_item->data;
 
     char* batch = NULL;
     size_t batch_size = 0;
@@ -468,6 +475,7 @@ connection_queue_broadcast_data_t* __broadcast_queue_data_create(broadcast_paylo
     data->out_queue = NULL;
     data->out_owner = NULL;
     data->out_wake = NULL;
+    data->out_deflate = NULL;
     data->base.free = __broadcast_queue_data_free;
     data->payload = __broadcast_payload_acquire(payload);
     data->handler = handle;
@@ -519,13 +527,13 @@ void broadcast_free(broadcast_t* broadcast) {
 }
 
 int broadcast_add(const char* broadcast_name, connection_t* connection, void* id, void(*response_handler)(response_t* response, const char* payload, size_t size)) {
-    return broadcast_add_out(broadcast_name, connection, id, response_handler, NULL, NULL, NULL);
+    return broadcast_add_out(broadcast_name, connection, id, response_handler, NULL, NULL, NULL, NULL);
 }
 
 int broadcast_add_out(const char* broadcast_name, connection_t* connection, void* id,
                       void(*response_handler)(response_t* response, const char* payload, size_t size),
                       cqueue_t* out_queue, void* out_owner,
-                      int (*out_wake)(connection_t*, void* owner)) {
+                      int (*out_wake)(connection_t*, void* owner), void* out_deflate) {
     if (broadcast_name == NULL || connection == NULL || response_handler == NULL) {
         __broadcast_id_free(id);
         return 0;
@@ -559,6 +567,7 @@ int broadcast_add_out(const char* broadcast_name, connection_t* connection, void
             item->out_queue = out_queue;
             item->out_owner = out_owner;
             item->out_wake = out_wake;
+            item->out_deflate = out_deflate;
             __broadcast_append_item(list, item);
             result = 1;
         }

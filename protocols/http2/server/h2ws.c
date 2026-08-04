@@ -12,7 +12,8 @@
 #include "websocketsrequest.h"
 #include "websocketsserverhandlers.h"
 
-h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, int resource_protocol) {
+h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, int resource_protocol,
+                                    const ws_deflate_config_t* deflate) {
     h2_ws_tunnel_t* tunnel = calloc(1, sizeof(*tunnel));
     if (tunnel == NULL) return NULL;
 
@@ -30,6 +31,20 @@ h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, int resource_proto
     }
 
     h2_data_writer_reset(&tunnel->writer);
+
+    /* Inbound decompression needs nothing else: the parser inflates on its own
+     * once this is set. Outbound compression travels to the handler with the
+     * message (request->out_deflate) — the response is built on another thread
+     * and cannot reach the connection for it. */
+    if (deflate != NULL) {
+        tunnel->parser->ws_deflate.config = *deflate;
+        if (ws_deflate_start(&tunnel->parser->ws_deflate))
+            tunnel->parser->ws_deflate_enabled = 1;
+        else
+            /* Degrade, but not silently: the 200 already advertised
+             * permessage-deflate, so compressed frames will now be rejected. */
+            log_error("h2 ws tunnel: ws_deflate_start failed, compressed frames will be rejected\n");
+    }
 
     return tunnel;
 }
@@ -225,6 +240,7 @@ static int h2_ws_message_seen(h2_ws_tunnel_t* tunnel, connection_t* connection) 
          * handler, so a compressed tunnel keeps its handlers serialized —
          * exactly the limitation docs/concurrency/00 phase C records. */
         parser->request->out_parallel = !parser->ws_deflate_enabled;
+        parser->request->out_deflate = parser->ws_deflate_enabled ? &parser->ws_deflate : NULL;
 
         if (parser->request->protocol->get_resource(connection, parser->request)) {
             /* Dispatched: the queue item owns the request now. The parser drops

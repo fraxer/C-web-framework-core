@@ -49,6 +49,7 @@ websocketsrequest_t* websocketsrequest_create(connection_t* connection, websocke
     request->out_owner = NULL;
     request->out_wake = NULL;
     request->out_parallel = 0;
+    request->out_deflate = NULL;
 
     return request;
 }

@@ -29,6 +29,7 @@ struct connection_queue_websockets_data {
     cqueue_t* out_queue;
     void* out_owner;
     int (*out_wake)(connection_t*, void* owner);
+    ws_deflate_t* out_deflate;
     /* The virtual host the connection was upgraded on, captured at dispatch.
      * Same reasoning as the HTTP runner: ctx->server belongs to the worker, and
      * a handler thread has no business reading it. */
@@ -495,6 +496,11 @@ void websockets_queue_request_handler(void* arg) {
         return;
 
     websocketsresponse_t* response = websocketsresponse_create(connection);
+    /* A tunnel's compression context lives on its stream, not on the
+     * connection, so websocketsresponse_create could not have found it. */
+    if (response != NULL && data->out_deflate != NULL)
+        websocketsresponse_set_deflate(response, data->out_deflate);
+
     if (response == NULL) {
         /* The slot stays unfilled and would block the output order forever, so
          * the connection has to go: there is no reply to send and no way to
@@ -545,6 +551,7 @@ void* websockets_queue_data_request_create(connection_t* connection, void* compo
     data->out_queue = request != NULL ? request->out_queue : NULL;
     data->out_owner = request != NULL ? request->out_owner : NULL;
     data->out_wake = request != NULL ? request->out_wake : NULL;
+    data->out_deflate = request != NULL ? request->out_deflate : NULL;
 
     /* Reserved here, before the item is handed to a worker: the output order
      * has to be the order messages were dispatched in, and this is the last

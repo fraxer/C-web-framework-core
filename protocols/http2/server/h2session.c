@@ -1366,7 +1366,17 @@ static h2_frame_result_e h2_open_tunnel(h2session_t* s, h2stream_t* stream, int 
     const int resource = subprotocol != NULL && subprotocol->value != NULL &&
         strcmp(subprotocol->value, "resource") == 0;
 
-    stream->ws = h2_ws_tunnel_create(s->connection, resource);
+    /* permessage-deflate is negotiated by an ordinary header here too, exactly
+     * as in the HTTP/1.1 handshake (websocketsswitch.c) — RFC 8441 replaces the
+     * upgrade, not the extension negotiation. */
+    ws_deflate_config_t deflate_config;
+    int deflate = 0;
+    const http_header_t* extensions =
+        stream->request->get_headern(stream->request, "Sec-WebSocket-Extensions", 24);
+    if (extensions != NULL && extensions->value != NULL)
+        deflate = ws_deflate_parse_header(extensions->value, &deflate_config);
+
+    stream->ws = h2_ws_tunnel_create(s->connection, resource, deflate ? &deflate_config : NULL);
     if (stream->ws == NULL) {
         h2_session_drop_stream(s, stream);
         return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
@@ -1381,9 +1391,18 @@ static h2_frame_result_e h2_open_tunnel(h2session_t* s, h2stream_t* stream, int 
     /* 200, not 101: HTTP/2 has no 101 at all (RFC 8441 §4). */
     response->status_code = 200;
 
-    /* Echo the accepted subprotocol, as the HTTP/1.1 handshake does. */
+    /* Echo the accepted subprotocol and extension, as the HTTP/1.1 handshake
+     * does. Only what was actually accepted: the tunnel is already built, so
+     * "negotiated" here means "in use". */
     if (resource)
         response->add_headern(response, "Sec-WebSocket-Protocol", 22, "resource", 8);
+
+    if (deflate && stream->ws->parser->ws_deflate_enabled) {
+        char ext[256];
+        const int len = ws_deflate_build_header(&deflate_config, ext, sizeof(ext));
+        if (len > 0)
+            response->add_headern(response, "Sec-WebSocket-Extensions", 24, ext, (size_t)len);
+    }
 
     stream->response = response;
     stream->headers_done = 1;
