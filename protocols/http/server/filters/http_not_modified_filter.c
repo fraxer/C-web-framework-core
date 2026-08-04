@@ -5,6 +5,7 @@
 #include "httprequestparser.h"
 #include "route.h"
 #include "helpers.h"
+#include "http_gzip_filter.h"
 #include <string.h>
 #include <strings.h>
 #include <stdlib.h>
@@ -17,7 +18,8 @@ static void __reset(void* arg);
 static int __check_not_modified(httprequest_t* request, httpresponse_t* response);
 static int __etag_matches(const char* if_none_match, size_t if_none_match_len,
                            const char* etag, size_t etag_len);
-static int __generate_etag(time_t mtime, off_t size, char* etag_buf, size_t etag_buf_size);
+static int __generate_etag(time_t mtime, off_t size, int will_gzip,
+                           char* etag_buf, size_t etag_buf_size);
 static time_t __parse_http_date(const char* date, size_t len);
 
 http_filter_t* http_not_modified_filter_create(void) {
@@ -78,9 +80,28 @@ int http_not_modified_header(httprequest_t* request, httpresponse_t* response) {
             response->add_header(response, "Last-Modified", last_modified);
         }
 
+        // This filter runs BEFORE the gzip filter, so the ETag must predict
+        // whether the body will be compressed and tag the validator for that
+        // representation (W/"mtime-size-gzip", nginx-style). Without it, a
+        // gzipped and an identity response for the same file share one ETag and
+        // a cache can cross-serve them. The decision mirrors the gzip filter
+        // exactly: CE set during response build + size at or above the gzip
+        // minimum. The 304 path keeps the suffix too — the client cached the
+        // gzipped bytes, so it sends If-None-Match: ...-gzip and must match the
+        // same generated value. Vary: Accept-Encoding is emitted alongside so a
+        // cache keys the negotiated representation by the request encoding, and
+        // it appears on the 304 as well because this block precedes the 304
+        // decision below.
+        const int will_gzip = response->content_encoding != CE_NONE &&
+                              response->file_.size >= HTTP_GZIP_MIN_SIZE;
+
+        if (will_gzip)
+            response->add_header(response, "Vary", "Accept-Encoding");
+
         // Generate and add ETag header
         char etag[64];
-        if (__generate_etag(response->file_.mtime, response->file_.size, etag, sizeof(etag)) > 0) {
+        if (__generate_etag(response->file_.mtime, response->file_.size, will_gzip,
+                            etag, sizeof(etag)) > 0) {
             response->add_header(response, "ETag", etag);
         }
     }
@@ -212,13 +233,16 @@ int __etag_matches(const char* if_none_match, size_t if_none_match_len,
     return 0; // No match
 }
 
-int __generate_etag(time_t mtime, off_t size, char* etag_buf, size_t etag_buf_size) {
+int __generate_etag(time_t mtime, off_t size, int will_gzip, char* etag_buf, size_t etag_buf_size) {
     if (etag_buf == NULL || etag_buf_size == 0)
         return -1;
 
-    // Generate ETag in format: "mtime-size" (weak ETag)
-    // Using weak ETag (W/) since we're using mtime which has 1-second granularity
-    int n = snprintf(etag_buf, etag_buf_size, "W/\"%lx-%lx\"",
+    // Generate a weak ETag (W/) since mtime has only 1-second granularity. For
+    // the gzipped representation the -gzip suffix is appended inside the quotes
+    // (HTTP_GZIP_ETAG) so the two representations of the same file validate
+    // independently.
+    const char* fmt = will_gzip ? "W/\"%lx-%lx" HTTP_GZIP_ETAG "\"" : "W/\"%lx-%lx\"";
+    int n = snprintf(etag_buf, etag_buf_size, fmt,
                      (unsigned long)mtime, (unsigned long)size);
 
     if (n < 0 || (size_t)n >= etag_buf_size)
