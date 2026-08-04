@@ -79,7 +79,7 @@ int __header(httprequest_t* request, httpresponse_t* response) {
     if (response->file_.fd > -1)
         data_size = response->file_.size;
 
-    if (response->content_encoding == CE_NONE || data_size < 1024)
+    if (response->content_encoding == CE_NONE || data_size < HTTP_GZIP_MIN_SIZE)
         return filter_next_handler_header(request, response);
 
     if (response->last_modified)
@@ -130,7 +130,7 @@ int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf)
     if (response->file_.fd > -1)
         data_size = response->file_.size;
 
-    if (response->content_encoding == CE_NONE || data_size < 1024)
+    if (response->content_encoding == CE_NONE || data_size < HTTP_GZIP_MIN_SIZE)
         return filter_next_handler_body(request, response, parent_buf);
 
     if (response->last_modified)

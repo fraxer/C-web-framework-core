@@ -12,7 +12,9 @@
  *   - construction defaults;
  *   - __header: Last-Modified / ETag are generated only for real files
  *     (fd > -1, mtime > 0), and the generated values match the documented
- *     formats (http_format_date IMF-fixdate and W/"mtime-size");
+ *     formats (http_format_date IMF-fixdate and W/"mtime-size", plus a
+ *     -gzip suffix and Vary: Accept-Encoding when the response will be
+ *     compressed);
  *   - __check_not_modified: method gate (GET/HEAD only), If-None-Match exact /
  *     "*" / comma list / whitespace, If-None-Match precedence over
  *     If-Modified-Since, If-Modified-Since equal / older / newer, invalid date;
@@ -35,6 +37,7 @@
 #include "httprequest.h"
 #include "http_not_modified_filter.h"
 #include "http_filter.h"
+#include "http_gzip_filter.h"
 #include "route.h"
 #include "bufo.h"
 
@@ -45,8 +48,9 @@
 /* Fixed mtime/size so the generated ETag and Last-Modified are deterministic.
  *
  *   mtime = 1700000000  -> 2023-11-14 22:13:20 UTC (a Tuesday)
- *   size  = 1234
- *   ETag          = W/"6553f100-4d2"   (%lx of mtime - %lx of size)
+ *   size  = 1234        (>= HTTP_GZIP_MIN_SIZE, so it qualifies for gzip)
+ *   ETag          = W/"6553f100-4d2"            (identity, %lx of mtime - %lx of size)
+ *   ETag (gzip)   = W/"6553f100-4d2-gzip"       (gzipped representation)
  *   Last-Modified = "Tue, 14 Nov 2023 22:13:20 GMT"
  *
  * The ETag/Last-Modified value tests below pin these exact strings, so any
@@ -55,6 +59,7 @@
 #define TEST_MTIME           1700000000L
 #define TEST_SIZE            1234
 #define EXPECTED_ETAG        "W/\"6553f100-4d2\""
+#define EXPECTED_ETAG_GZIP   "W/\"6553f100-4d2-gzip\""
 #define EXPECTED_LAST_MOD    "Tue, 14 Nov 2023 22:13:20 GMT"
 
 /* request->add_header returns 0 on success (-1 on error); response->add_header
@@ -273,6 +278,62 @@ TEST(test_nm_header_file_adds_last_modified_and_etag) {
     fixture_teardown(&fx);
 }
 
+TEST(test_nm_header_file_gzip_etag_suffix_and_vary) {
+    TEST_SUITE("http_not_modified_filter: header generation");
+    TEST_CASE("a gzipped file response gets a -gzip ETag suffix and Vary: Accept-Encoding");
+
+    nm_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx), "fixture should be created");
+
+    arm_file(&fx, TEST_MTIME, TEST_SIZE);   /* TEST_SIZE >= HTTP_GZIP_MIN_SIZE */
+    fx.response->content_encoding = CE_GZIP; /* the gzip filter will compress */
+
+    const int r = run_header(&fx);
+    TEST_ASSERT_EQUAL(CWF_OK, r, "header chain should finish with CWF_OK");
+
+    http_header_t* et = fx.response->get_header(fx.response, "ETag");
+    TEST_REQUIRE_NOT_NULL_GOTO(et, "ETag should be added", cleanup);
+    TEST_ASSERT_STR_EQUAL(EXPECTED_ETAG_GZIP, et->value,
+                          "ETag should carry the -gzip suffix for the compressed representation");
+
+    http_header_t* vary = fx.response->get_header(fx.response, "Vary");
+    TEST_REQUIRE_NOT_NULL_GOTO(vary, "Vary should be added for a negotiated response", cleanup);
+    TEST_ASSERT_STR_EQUAL("Accept-Encoding", vary->value,
+                          "Vary should advertise the Accept-Encoding negotiation");
+
+    cleanup:
+    fixture_teardown(&fx);
+}
+
+TEST(test_nm_header_file_gzip_below_min_keeps_plain_etag) {
+    TEST_SUITE("http_not_modified_filter: header generation");
+    TEST_CASE("a gzipped response below HTTP_GZIP_MIN_SIZE keeps the plain ETag and no Vary");
+
+    nm_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx), "fixture should be created");
+
+    const size_t small = HTTP_GZIP_MIN_SIZE - 1; /* 1023: gzip filter will skip it */
+    arm_file(&fx, TEST_MTIME, small);
+    fx.response->content_encoding = CE_GZIP;
+
+    const int r = run_header(&fx);
+    TEST_ASSERT_EQUAL(CWF_OK, r, "header chain should finish with CWF_OK");
+
+    char expected[64];
+    snprintf(expected, sizeof(expected), "W/\"%lx-%lx\"",
+             (unsigned long)TEST_MTIME, (unsigned long)small);
+
+    http_header_t* et = fx.response->get_header(fx.response, "ETag");
+    TEST_REQUIRE_NOT_NULL_GOTO(et, "ETag should be added", cleanup);
+    TEST_ASSERT_STR_EQUAL(expected, et->value, "no -gzip suffix below the gzip minimum");
+
+    TEST_ASSERT_NULL(fx.response->get_header(fx.response, "Vary"),
+                     "no Vary when the body will not actually be compressed");
+
+    cleanup:
+    fixture_teardown(&fx);
+}
+
 TEST(test_nm_header_non_file_adds_nothing) {
     TEST_SUITE("http_not_modified_filter: header generation");
     TEST_CASE("a non-file response (fd == -1) gets no Last-Modified / ETag");
@@ -355,6 +416,30 @@ TEST(test_nm_inm_exact_match_304) {
     TEST_ASSERT_EQUAL(CWF_OK, r, "header chain should finish with CWF_OK");
     TEST_ASSERT_EQUAL(304, fx.response->status_code, "exact ETag match -> 304");
     TEST_ASSERT_EQUAL_UINT(1, fx.response->last_modified, "last_modified should signal 304");
+
+    fixture_teardown(&fx);
+}
+
+TEST(test_nm_inm_gzip_etag_revalidates_304) {
+    TEST_SUITE("http_not_modified_filter: If-None-Match");
+    TEST_CASE("If-None-Match with the -gzip ETag revalidates a gzipped response to 304");
+
+    nm_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx), "fixture should be created");
+
+    fx.request->method = ROUTE_GET;
+    REQ_ADD(fx.request, "If-None-Match", EXPECTED_ETAG_GZIP);
+    arm_file(&fx, TEST_MTIME, TEST_SIZE);
+    fx.response->content_encoding = CE_GZIP;  /* client cached the gzipped body */
+
+    const int r = run_header(&fx);
+    TEST_ASSERT_EQUAL(CWF_OK, r, "header chain should finish with CWF_OK");
+    TEST_ASSERT_EQUAL(304, fx.response->status_code,
+                      "the -gzip ETag must match the gzipped representation -> 304");
+    TEST_ASSERT_EQUAL_UINT(1, fx.response->last_modified, "last_modified should signal 304");
+    /* The 304 carries the same Vary so a cache keeps the negotiated key. */
+    TEST_ASSERT_NOT_NULL(fx.response->get_header(fx.response, "Vary"),
+                         "Vary should be present on the 304 too");
 
     fixture_teardown(&fx);
 }
@@ -623,7 +708,7 @@ TEST(test_nm_304_suppresses_body_state) {
     TEST_REQUIRE(fixture_setup(&fx), "fixture should be created");
 
     fx.request->method = ROUTE_GET;
-    REQ_ADD(fx.request, "If-None-Match", EXPECTED_ETAG);
+    REQ_ADD(fx.request, "If-None-Match", EXPECTED_ETAG_GZIP);
     arm_file(&fx, TEST_MTIME, TEST_SIZE);
 
     /* Simulate an upstream that already negotiated body framing. */
