@@ -19,6 +19,16 @@ typedef struct hpack_header {
     size_t name_len;
     char*  value;
     size_t value_len;
+    /* RFC 7541 §7.1.3 "never indexed": this field must not enter either party's
+     * dynamic table. On the way out the caller sets it for fields whose value is
+     * a secret — a table entry is a compression oracle, and an attacker who can
+     * inject requests learns a `Set-Cookie` by watching sizes. On the way in the
+     * decoder reports how the peer sent it, which only an intermediary would
+     * have to preserve; this server has no use for it beyond diagnostics.
+     *
+     * Whether a name is sensitive is HTTP policy, not compression: this module
+     * only carries the flag, and h2_write_filter decides who gets it. */
+    int    never_indexed;
 } hpack_header_t;
 
 typedef enum {

@@ -36,4 +36,10 @@ int h2_write_filter_trailers(struct h2session* s, h2stream_t* stream, httprespon
 int h2_write_filter_early_hints(struct h2session* s, h2stream_t* stream,
                                 const http_header_t* fields);
 
+/* Encode an interim 100 (Continue) — a :status and nothing else — and queue it
+ * (RFC 9110 §10.1.1) — docs/http2/10, T.2. Sent from the read path as soon as a
+ * request that expects it has its headers in, since its whole purpose is to
+ * arrive before the body the client is holding back. Returns 1 on success. */
+int h2_write_filter_continue(struct h2session* s, h2stream_t* stream);
+
 #endif

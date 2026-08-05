@@ -123,6 +123,25 @@ static int __is_forbidden(const char* key, size_t len) {
     return 0;
 }
 
+/* Fields whose value must never enter an HPACK dynamic table (RFC 7541 §7.1.3).
+ *
+ * A table entry is a compression oracle: an attacker who can make the server
+ * emit a response of their choosing on the same connection learns a secret by
+ * watching the encoded size shrink when their guess matches. That is CRIME
+ * applied to HPACK, and the never-indexed representation is the RFC's answer.
+ *
+ * Compared against the already-lowercased name, so no case folding here. */
+static int __is_sensitive(const char* key, size_t len) {
+    static const struct { const char* name; size_t len; } sensitive[] = {
+        {"set-cookie", 10}, {"authorization", 13}, {"proxy-authorization", 19},
+    };
+
+    for (size_t i = 0; i < sizeof(sensitive) / sizeof(sensitive[0]); i++)
+        if (len == sensitive[i].len && memcmp(key, sensitive[i].name, len) == 0) return 1;
+
+    return 0;
+}
+
 /* RFC 9113 §8.2.1: field names MUST be lowercase on the wire; nghttp2-based
  * clients (curl, browsers) treat an uppercase byte as a PROTOCOL_ERROR. */
 static void __lowercase(char* dst, const char* src, size_t len) {
@@ -185,6 +204,7 @@ static int __build_headers(httprequest_t* request, httpresponse_t* response,
     fields[n].name_len = 7;
     fields[n].value = status;
     fields[n].value_len = (size_t)status_len;
+    fields[n].never_indexed = 0;
     n++;
 
     size_t names_off = 0;
@@ -196,6 +216,7 @@ static int __build_headers(httprequest_t* request, httpresponse_t* response,
         fields[n].name_len = h->key_length;
         fields[n].value = h->value;
         fields[n].value_len = h->value_length;
+        fields[n].never_indexed = __is_sensitive(names + names_off, h->key_length);
         names_off += h->key_length;
         n++;
     }
@@ -388,6 +409,7 @@ static int __queue_extra_block(h2session_t* s, h2stream_t* stream,
         fields[n].name_len = 7;
         fields[n].value = (char*)status;
         fields[n].value_len = strlen(status);
+        fields[n].never_indexed = 0;
         n++;
     }
 
@@ -401,6 +423,7 @@ static int __queue_extra_block(h2session_t* s, h2stream_t* stream,
         fields[n].name_len = h->key_length;
         fields[n].value = (char*)h->value;
         fields[n].value_len = h->value_length;
+        fields[n].never_indexed = __is_sensitive(names + names_off, h->key_length);
         names_off += h->key_length;
         n++;
     }
@@ -444,6 +467,14 @@ int h2_write_filter_early_hints(h2session_t* s, h2stream_t* stream, const http_h
     /* 103 has no body and does not end the stream: the final response follows
      * on the same one (RFC 8297). */
     return __queue_extra_block(s, stream, fields, "103", 0);
+}
+
+int h2_write_filter_continue(h2session_t* s, h2stream_t* stream) {
+    /* 100 (Continue) is a bare :status with no fields at all (RFC 9110
+     * §10.1.1) — and, like 103, it leaves the stream open for the response that
+     * follows. Queued from the read path the moment the request headers are in,
+     * which is the only moment it is worth anything. */
+    return __queue_extra_block(s, stream, NULL, "100", 0);
 }
 
 int h2_write_filter_trailers(h2session_t* s, h2stream_t* stream, httpresponse_t* response) {

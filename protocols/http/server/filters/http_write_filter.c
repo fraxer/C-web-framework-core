@@ -59,7 +59,27 @@ int __build_head(httpresponse_t* response, bufo_t* buf) {
         return 0;
     }
 
-    if (!bufo_alloc(buf, __head_size(response))) return 0;
+    /* An interim 100 the parser could not finish writing (docs/http2/10, T.2).
+     * It goes in the same buffer, ahead of the head: the peer must see a whole
+     * status line, never the tail of one spliced into the final response. */
+    connection_t* connection = response->connection;
+    connection_server_ctx_t* ctx = connection->ctx;
+    /* The `cont_sent < LEN` half is not redundant: subtracting an out-of-range
+     * counter underflows size_t into a gigantic length, and bufo_append clamps
+     * that to whatever the buffer has left instead of refusing it — so the
+     * mistake would surface as a memcpy reading past the string literal, not as
+     * a failed allocation. */
+    const size_t cont_left = ctx->cont_pending && ctx->cont_sent < HTTP_CONTINUE_LINE_LEN ?
+        HTTP_CONTINUE_LINE_LEN - ctx->cont_sent : 0;
+
+    if (!bufo_alloc(buf, __head_size(response) + cont_left)) return 0;
+
+    if (cont_left > 0) {
+        if (!__append_full(buf, HTTP_CONTINUE_LINE + ctx->cont_sent, cont_left)) return 0;
+
+        ctx->cont_pending = 0;
+        ctx->cont_sent = 0;
+    }
 
     if (!__append_full(buf, "HTTP/1.1 ", 9)) return 0;
     if (!__append_full(buf, status_string, status_length)) return 0;

@@ -25,6 +25,8 @@ void httprequest_init_payload(httprequest_t*);
 void httprequest_reset(httprequest_t*);
 http_header_t* httprequest_header(httprequest_t*, const char*);
 http_header_t* httprequest_headern(httprequest_t*, const char*, size_t);
+http_header_t* httprequest_trailer(httprequest_t*, const char*);
+http_header_t* httprequest_trailern(httprequest_t*, const char*, size_t);
 int httprequest_header_add(httprequest_t*, const char*, const char*);
 int httprequest_headern_add(httprequest_t*, const char*, size_t, const char*, size_t);
 int httprequest_header_del(httprequest_t*, const char*);
@@ -95,11 +97,15 @@ httprequest_t* httprequest_create(connection_t* connection) {
     request->last_query = NULL;
     request->header_ = NULL;
     request->last_header = NULL;
+    request->trailer_ = NULL;
+    request->last_trailer = NULL;
     request->cookie_ = NULL;
     request->ranges = NULL;
     request->connection = connection;
     request->get_header = httprequest_header;
     request->get_headern = httprequest_headern;
+    request->get_trailer = httprequest_trailer;
+    request->get_trailern = httprequest_trailern;
     request->add_header = httprequest_header_add;
     request->add_headern = httprequest_headern_add;
     request->get_cookie = httprequest_cookie;
@@ -148,6 +154,10 @@ void httprequest_reset(httprequest_t* request) {
     request->header_ = NULL;
     request->last_header = NULL;
 
+    http_headers_free(request->trailer_);
+    request->trailer_ = NULL;
+    request->last_trailer = NULL;
+
     http_cookie_free(request->cookie_);
     request->cookie_ = NULL;
 
@@ -177,6 +187,54 @@ http_header_t* httprequest_headern(httprequest_t* request, const char* key, size
     }
 
     return NULL;
+}
+
+/* Trailing fields (RFC 9113 §8.1) — docs/http2/10, T.1. A separate list from
+ * the headers on purpose: a trailer is not a header that happens to be late.
+ * Anything a request depends on for routing, authorisation or content
+ * negotiation has already been decided by the time these arrive, and merging
+ * them into header_ would let a client override those after the fact. */
+http_header_t* httprequest_trailer(httprequest_t* request, const char* key) {
+    return httprequest_trailern(request, key, strlen(key));
+}
+
+http_header_t* httprequest_trailern(httprequest_t* request, const char* key, size_t key_length) {
+    http_header_t* trailer = request->trailer_;
+
+    while (trailer) {
+        if (trailer->key_length != key_length) goto next;
+
+        for (size_t i = 0; i < key_length; i++) {
+            if (tolower(trailer->key[i]) != tolower(key[i])) goto next;
+        }
+
+        return trailer;
+
+        next:
+
+        trailer = trailer->next;
+    }
+
+    return NULL;
+}
+
+int httprequest_trailern_add(httprequest_t* request, const char* key, size_t key_length,
+                             const char* value, size_t value_length) {
+    http_header_t* trailer = http_header_create(key, key_length, value, value_length);
+    if (trailer == NULL) return -1;
+    if (trailer->key == NULL || trailer->value == NULL) {
+        http_header_free(trailer);
+        return -1;
+    }
+
+    if (request->trailer_ == NULL)
+        request->trailer_ = trailer;
+    else
+        request->last_trailer->next = trailer;
+
+    request->last_trailer = trailer;
+
+    return 0;
 }
 
 const char* httprequest_cookie(httprequest_t* request, const char* key) {

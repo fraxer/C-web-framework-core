@@ -140,11 +140,11 @@ TEST(test_hpack_static_table) {
     const char *n, *v; size_t nl, vl;
 
     TEST_ASSERT_EQUAL(HPACK_OK, hpack_resolve_index(&t, 2, &n, &nl, &v, &vl), "idx 2");
-    TEST_ASSERT(hdr_eq(&(hpack_header_t){(char*)n, nl, (char*)v, vl}, ":method", "GET"),
+    TEST_ASSERT(hdr_eq(&(hpack_header_t){(char*)n, nl, (char*)v, vl, 0}, ":method", "GET"),
                 "idx 2 = :method GET");
 
     TEST_ASSERT_EQUAL(HPACK_OK, hpack_resolve_index(&t, 4, &n, &nl, &v, &vl), "idx 4");
-    TEST_ASSERT(hdr_eq(&(hpack_header_t){(char*)n, nl, (char*)v, vl}, ":path", "/"),
+    TEST_ASSERT(hdr_eq(&(hpack_header_t){(char*)n, nl, (char*)v, vl, 0}, ":path", "/"),
                 "idx 4 = :path /");
 
     TEST_ASSERT_EQUAL(HPACK_ERR_INVALID, hpack_resolve_index(&t, 0, &n, &nl, &v, &vl),
@@ -262,12 +262,12 @@ TEST(test_hpack_decode_rejects_bad_index) {
 TEST(test_hpack_encoder_roundtrip) {
     TEST_CASE("encode → decode reproduces headers (with and without Huffman)");
     hpack_header_t in[] = {
-        {(char*)":method", 7, (char*)"GET", 3},
-        {(char*)":scheme", 7, (char*)"https", 5},
-        {(char*)":path", 5, (char*)"/index.html", 11},
-        {(char*)":authority", 10, (char*)"www.example.com", 15},
-        {(char*)"custom-key", 10, (char*)"custom-value", 12},
-        {(char*)"x-long-value", 12, (char*)"some fairly long descriptive value here", 38},
+        {(char*)":method", 7, (char*)"GET", 3, 0},
+        {(char*)":scheme", 7, (char*)"https", 5, 0},
+        {(char*)":path", 5, (char*)"/index.html", 11, 0},
+        {(char*)":authority", 10, (char*)"www.example.com", 15, 0},
+        {(char*)"custom-key", 10, (char*)"custom-value", 12, 0},
+        {(char*)"x-long-value", 12, (char*)"some fairly long descriptive value here", 38, 0},
     };
     size_t cnt = sizeof(in) / sizeof(in[0]);
 
@@ -299,7 +299,7 @@ TEST(test_hpack_encoder_roundtrip) {
 TEST(test_hpack_encoder_uses_huffman_when_shorter) {
     TEST_CASE("encoder with Huffman shrinks long values");
     hpack_header_t in[] = {
-        {(char*)"x-key", 5, (char*)"www.example.com is a long repetitive string", 44},
+        {(char*)"x-key", 5, (char*)"www.example.com is a long repetitive string", 44, 0},
     };
     hpack_encoder_t* e1 = hpack_encoder_create(0);
     hpack_encoder_t* e2 = hpack_encoder_create(0);
@@ -355,8 +355,8 @@ TEST(test_hpack_encoder_emits_size_update) {
     hpack_encoder_set_max_table_size(e, 256);
 
     hpack_header_t in[] = {
-        {":status", 7, "200", 3},
-        {"content-type", 12, "text/html", 9},
+        {":status", 7, "200", 3, 0},
+        {"content-type", 12, "text/html", 9, 0},
     };
 
     uint8_t* block = NULL; size_t block_len = 0;
@@ -389,7 +389,7 @@ TEST(test_hpack_encoder_size_update_emitted_once) {
 
     hpack_encoder_set_max_table_size(e, 512);
 
-    hpack_header_t in[] = {{":status", 7, "200", 3}};
+    hpack_header_t in[] = {{":status", 7, "200", 3, 0}};
 
     uint8_t* first = NULL; size_t first_len = 0;
     TEST_ASSERT_EQUAL(HPACK_OK, hpack_encoder_encode(e, in, 1, 1, &first, &first_len), "first block");
@@ -416,7 +416,7 @@ TEST(test_hpack_encoder_size_update_clamped_to_ceiling) {
 
     hpack_encoder_set_max_table_size(e, 65536);
 
-    hpack_header_t in[] = {{":status", 7, "200", 3}};
+    hpack_header_t in[] = {{":status", 7, "200", 3, 0}};
     uint8_t* block = NULL; size_t block_len = 0;
     TEST_ASSERT_EQUAL(HPACK_OK, hpack_encoder_encode(e, in, 1, 1, &block, &block_len), "encode");
     TEST_REQUIRE(block != NULL && block_len > 0, "block produced");
@@ -767,4 +767,95 @@ TEST(test_hpack_huffman_padding_rules) {
     TEST_ASSERT_EQUAL(HPACK_ERR_COMPRESSION,
                       hpack_huffman_decode(eos, sizeof(eos), out, sizeof(out), &n),
                       "EOS inside a string rejected");
+}
+
+/* ===================================================================== *
+ *  Never-indexed fields (RFC 7541 §6.2.3 / §7.1.3) — docs/http2/10, T.3
+ * ===================================================================== */
+
+TEST(test_hpack_never_indexed_stays_out_of_the_table) {
+    TEST_CASE("a never-indexed field is not added to the dynamic table");
+
+    hpack_encoder_t* e = hpack_encoder_create(4096);
+    TEST_REQUIRE(e != NULL, "encoder created");
+
+    hpack_header_t secret[] = {
+        {(char*)"set-cookie", 10, (char*)"session=deadbeefdeadbeef", 24, 1},
+    };
+    uint8_t* block = NULL; size_t len = 0;
+
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_encoder_encode(e, secret, 1, 0, &block, &len),
+                      "encode status");
+    /* 0001xxxx: literal never indexed, name by index. "set-cookie" is static
+     * entry 55, so the first byte is 0x10 | 15 with the rest of the index in the
+     * continuation byte — check the representation bits, not the index. */
+    TEST_ASSERT_EQUAL(0x10, (int)(block[0] & 0xf0), "never-indexed representation");
+    TEST_ASSERT_EQUAL((size_t)0, e->table.count, "nothing entered the dynamic table");
+
+    /* The same field again must encode identically: with no table entry there is
+     * nothing for a second pass to compress against, which is the property that
+     * closes the size oracle. */
+    uint8_t* again = NULL; size_t again_len = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_encoder_encode(e, secret, 1, 0, &again, &again_len),
+                      "second encode status");
+    TEST_ASSERT_EQUAL(len, again_len, "same length on the second pass");
+    TEST_ASSERT(memcmp(block, again, len) == 0, "same bytes on the second pass");
+
+    free(block); free(again);
+    hpack_encoder_free(e);
+}
+
+TEST(test_hpack_ordinary_field_still_indexed) {
+    TEST_CASE("an ordinary field is still added to the dynamic table");
+
+    hpack_encoder_t* e = hpack_encoder_create(4096);
+    TEST_REQUIRE(e != NULL, "encoder created");
+
+    hpack_header_t plain[] = {{(char*)"x-trace", 7, (char*)"abc123", 6, 0}};
+    uint8_t* first = NULL; size_t first_len = 0;
+    uint8_t* second = NULL; size_t second_len = 0;
+
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_encoder_encode(e, plain, 1, 0, &first, &first_len),
+                      "first encode");
+    TEST_ASSERT_EQUAL((size_t)1, e->table.count, "entry added");
+
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_encoder_encode(e, plain, 1, 0, &second, &second_len),
+                      "second encode");
+    TEST_ASSERT(second_len < first_len, "the repeat compresses against the table");
+
+    free(first); free(second);
+    hpack_encoder_free(e);
+}
+
+TEST(test_hpack_never_indexed_roundtrip) {
+    TEST_CASE("the decoder reports how the peer classified the field");
+
+    hpack_encoder_t* e = hpack_encoder_create(4096);
+    hpack_decoder_t* d = hpack_decoder_create(4096);
+    TEST_REQUIRE(e != NULL && d != NULL, "codec created");
+
+    hpack_header_t in[] = {
+        {(char*)":status", 7, (char*)"200", 3, 0},
+        {(char*)"set-cookie", 10, (char*)"a=b", 3, 1},
+        {(char*)"x-trace", 7, (char*)"abc", 3, 0},
+    };
+    uint8_t* block = NULL; size_t len = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_encoder_encode(e, in, 3, 1, &block, &len), "encode");
+
+    hpack_header_t* out = NULL; size_t n = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, block, len, 0, &out, &n), "decode");
+    TEST_ASSERT_EQUAL((size_t)3, n, "three fields");
+
+    TEST_ASSERT(hdr_eq(&out[1], "set-cookie", "a=b"), "field survived the round trip");
+    TEST_ASSERT_EQUAL(0, out[0].never_indexed, ":status is ordinary");
+    TEST_ASSERT_EQUAL(1, out[1].never_indexed, "set-cookie came back never-indexed");
+    TEST_ASSERT_EQUAL(0, out[2].never_indexed, "x-trace is ordinary");
+
+    /* And the decoder's own table did not take the secret either. */
+    TEST_ASSERT_EQUAL((size_t)1, d->table.count, "only the ordinary field was indexed");
+
+    hpack_headers_free(out, n);
+    free(block);
+    hpack_decoder_free(d);
+    hpack_encoder_free(e);
 }

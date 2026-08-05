@@ -26,6 +26,7 @@
 #define PCRE_VECTOR_SIZE 120           // Use static array instead of VLA for better portability
 
 static int __parse_payload(httprequestparser_t* parser);
+static int __expects_continue(httprequest_t* request);
 static int __validate_content_length(http_header_t* header, size_t* out_length);
 static int __set_method(httprequest_t* request, bufferdata_t* buf);
 static int __set_protocol(httprequest_t* request, bufferdata_t* buf);
@@ -61,6 +62,7 @@ void httpparser_init(httprequestparser_t* parser, connection_t* connection) {
     parser->host_header_seen = 0;
     parser->content_length_found = 0;
     parser->transfer_encoding_found = 0;
+    parser->expect_continue = 0;
     parser->headers_count = 0;
     parser->bytes_readed = 0;
     parser->pos_start = 0;
@@ -342,6 +344,13 @@ int httpparser_run(httprequestparser_t* parser) {
                     return __clear_and_return(parser, HTTP1PARSER_BAD_REQUEST);
                 }
 
+                /* The client is waiting for permission to send that body
+                 * (RFC 9110 §10.1.1). Recorded, not answered: writing to the
+                 * socket is the read path's business (httpserverhandlers.c),
+                 * and a parser that writes is a parser that has to know about
+                 * partial writes, TLS and epoll. */
+                parser->expect_continue = __expects_continue(parser->request);
+
                 break;
             }
             else {
@@ -369,6 +378,7 @@ void httpparser_prepare_continue(httprequestparser_t* parser) {
     parser->content_length = 0;
     parser->content_length_found = 0;
     parser->transfer_encoding_found = 0;
+    parser->expect_continue = 0;
     parser->host_header_seen = 0;
     parser->headers_count = 0;
     parser->content_saved_length = 0;
@@ -464,6 +474,22 @@ int __set_method(httprequest_t* request, bufferdata_t* buf) {
         return 0;
 
     return 1;
+}
+
+/* Does this request expect an interim 100 (Continue)? RFC 9110 §10.1.1 —
+ * docs/http2/10, T.2.
+ *
+ * Only for HTTP/1.1: HTTP/1.0 has no 1xx at all, and HTTP/2 has its own path
+ * (h2_write_filter_continue). Any other expectation is one this server does not
+ * know; §10.1.1 makes answering that with 417 a MAY, and staying quiet is the
+ * other option it allows. */
+static int __expects_continue(httprequest_t* request) {
+    if (request->version != HTTP1_VER_1_1) return 0;
+
+    const http_header_t* expect = request->get_headern(request, "Expect", 6);
+    if (expect == NULL || expect->value == NULL) return 0;
+
+    return strcasecmp(expect->value, "100-continue") == 0;
 }
 
 int httpparser_set_uri(httprequest_t* request, const char* string, size_t length) {

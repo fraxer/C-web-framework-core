@@ -36,6 +36,12 @@ typedef struct httprequestparser {
     size_t headers_count;         // Counter to limit number of headers
     size_t content_length;
     size_t content_saved_length;
+    /* The request headers are in, a body is announced, and the client said it
+     * would wait for a 100 (Continue) before sending it (RFC 9110 §10.1.1) —
+     * docs/http2/10, T.2. Only a record that the interim response is due: the
+     * parser reads bytes, it does not write them. The read path acts on it and
+     * clears it. */
+    int expect_continue;
 } httprequestparser_t;
 
 httprequestparser_t* httpparser_create(connection_t* connection);
