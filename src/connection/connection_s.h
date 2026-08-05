@@ -125,7 +125,28 @@ typedef struct {
      * connection->buffer, when the 24 bytes arrived split across TCP segments.
      * Always < 24, so 5 bits are enough. Meaningful only while h2c_preface. */
     unsigned h2c_peeked: 5;
+    /* An interim "100 Continue" is owed to the peer (RFC 9110 §10.1.1), and
+     * `cont_sent` is how much of that status line already went out.
+     *
+     * HTTP/1.1 has no outbound queue of its own — a response is written straight
+     * from the filter chain — so the parser writes the line itself when the
+     * request headers are in. A socket that cannot take all 25 bytes right then
+     * is close to impossible (nothing has been written on the exchange yet), but
+     * it must not be able to splice the remainder into the middle of the final
+     * response head: whatever is left rides in front of it instead
+     * (docs/http2/10, T.2). HTTP/2 needs none of this — it queues the interim
+     * response as a HEADERS frame like any other.
+     *
+     * Worker-thread only, like the bitfields above: the request parser and the
+     * write filter both run there. */
+    unsigned cont_pending: 1;
+    unsigned cont_sent: 6;
 } connection_server_ctx_t;
+
+/* The interim status line, shared by the parser that sends it and the write
+ * filter that flushes whatever is left of it. */
+#define HTTP_CONTINUE_LINE "HTTP/1.1 100 Continue\r\n\r\n"
+#define HTTP_CONTINUE_LINE_LEN 25
 
 typedef struct connection_queue_item_data {
     void(*free)(void*);

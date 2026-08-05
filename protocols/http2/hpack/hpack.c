@@ -356,7 +356,7 @@ void hpack_headers_free(hpack_header_t* headers, size_t count) {
 /* Append an owned header (copies name/value, null-terminated). */
 static int out_push(hpack_header_t** arr, size_t* count, size_t* cap,
                     const char* name, size_t name_len,
-                    const char* value, size_t value_len) {
+                    const char* value, size_t value_len, int never_indexed) {
     if (*count == *cap) {
         size_t nc = *cap ? *cap * 2 : 8;
         hpack_header_t* na = realloc(*arr, nc * sizeof(**arr));
@@ -370,6 +370,7 @@ static int out_push(hpack_header_t** arr, size_t* count, size_t* cap,
     memcpy(v, value, value_len); v[value_len] = '\0';
     (*arr)[*count].name = n; (*arr)[*count].name_len = name_len;
     (*arr)[*count].value = v; (*arr)[*count].value_len = value_len;
+    (*arr)[*count].never_indexed = never_indexed;
     (*count)++;
     return 1;
 }
@@ -414,7 +415,7 @@ hpack_status_e hpack_decoder_decode(hpack_decoder_t* d,
              * and can be repeated for as long as the block lasts, so this is the
              * representation a decompression bomb is built from. */
             if (list_size_exceeded(&list_size, max_list_size, nl, vl)) { st = HPACK_ERR_TOO_LARGE; goto done; }
-            if (!out_push(&arr, &cnt, &cap, name, nl, value, vl)) { st = HPACK_ERR_MEMORY; goto done; }
+            if (!out_push(&arr, &cnt, &cap, name, nl, value, vl, 0)) { st = HPACK_ERR_MEMORY; goto done; }
             field_seen = 1;
         } else if ((b & 0xe0) == 0x20) {
             /* Dynamic Table Size Update (§6.3) */
@@ -430,6 +431,10 @@ hpack_status_e hpack_decoder_decode(hpack_decoder_t* d,
              * decoder the last two are identical; only incremental indexing adds
              * to the dynamic table. */
             int do_index = (b & 0xc0) == 0x40; /* top two bits == 01 */
+            /* §6.2.3: 0001xxxx is "never indexed" — like "without indexing" for
+             * us, but the distinction is reported so a caller can see how the
+             * peer classified the field. */
+            int never_indexed = (b & 0xf0) == 0x10;
             uint8_t prefix = do_index ? 6 : 4;
             st = HPACK_OK;
             uint32_t idx = hpack_decode_int(&p, end, prefix, &st);
@@ -455,7 +460,7 @@ hpack_status_e hpack_decoder_decode(hpack_decoder_t* d,
                 free(owned_name); free(value); st = HPACK_ERR_TOO_LARGE; goto done;
             }
 
-            if (!out_push(&arr, &cnt, &cap, name, name_len, value, value_len)) {
+            if (!out_push(&arr, &cnt, &cap, name, name_len, value, value_len, never_indexed)) {
                 free(owned_name); free(value); st = HPACK_ERR_MEMORY; goto done;
             }
             if (do_index)
@@ -572,6 +577,31 @@ hpack_status_e hpack_encoder_encode(hpack_encoder_t* e,
         size_t name_len = headers[i].name_len;
         const uint8_t* value = (const uint8_t*)headers[i].value;
         size_t value_len = headers[i].value_len;
+
+        /* Never indexed (§6.2.3 / §7.1.3): the value is a secret, so it must not
+         * enter our dynamic table — nor the peer's, which the 0001 pattern is
+         * what tells it. An indexed representation is skipped for the same
+         * reason: it could only come from the table this field never enters, and
+         * looking it up would be pointless work.
+         *
+         * The *name* is not secret, so an indexed name is still used when there
+         * is one — that is the whole compression this field gets. */
+        if (headers[i].never_indexed) {
+            const size_t name_idx = enc_find(&e->table, name, name_len, NULL, 0, 0);
+
+            if (!bb_encode_int(&b, (uint32_t)name_idx, 4, 0x10)) b.oom = 1;
+            if (name_idx == 0 && !enc_string(&b, (const uint8_t*)name, name_len, use_huffman))
+                b.oom = 1;
+            if (!enc_string(&b, value, value_len, use_huffman)) b.oom = 1;
+
+            if (b.oom) {
+                free(b.data);
+                *out = NULL; *out_len = 0;
+                return HPACK_ERR_MEMORY;
+            }
+
+            continue;
+        }
 
         /* Exact (name+value) match → indexed. */
         size_t exact = enc_find(&e->table, name, name_len,

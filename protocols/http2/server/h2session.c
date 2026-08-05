@@ -1143,11 +1143,17 @@ static h2_request_status_e h2_discard_header_block(h2session_t* s, const uint8_t
     return H2_REQUEST_OK;
 }
 
-/* Trailers (a HEADERS frame after DATA). The block still has to be fed to the
- * decoder so the shared HPACK context stays in sync, but the fields are dropped:
- * nothing downstream consumes trailers. Pseudo-headers are forbidden there
- * (§8.1), which makes the request malformed. */
-static h2_request_status_e h2_consume_trailers(h2session_t* s, const uint8_t* block, size_t len) {
+/* Trailers (a HEADERS frame after DATA). The block is fed to the decoder — the
+ * shared HPACK context has to stay in sync whatever we do with the fields — and
+ * the fields are handed to the request, where a handler can read them back
+ * (docs/http2/10, T.1). They land in their own list, never merged into the
+ * headers: everything a request is routed and authorised by was decided long
+ * before these arrived. Pseudo-headers are forbidden here (§8.1), which makes
+ * the request malformed.
+ *
+ * `stream` may be NULL when the caller only needs the decoder kept in step. */
+static h2_request_status_e h2_consume_trailers(h2session_t* s, h2stream_t* stream,
+                                               const uint8_t* block, size_t len) {
     hpack_header_t* headers = NULL;
     size_t count = 0;
     const hpack_status_e hst = hpack_decoder_decode(s->decoder, block, len,
@@ -1166,6 +1172,25 @@ static h2_request_status_e h2_consume_trailers(h2session_t* s, const uint8_t* bl
         if (h2_field_validate(headers[i].name, headers[i].name_len,
                               headers[i].value, headers[i].value_len) != H2_FIELD_OK) {
             status = H2_REQUEST_MALFORMED;
+            break;
+        }
+
+        /* Fields banned in a header block are no more welcome in a trailer
+         * (§8.2.2), and §8.1 keeps out the ones that would change how the
+         * message itself is read — by the time they arrive, it has been read. */
+        if (is_forbidden_h2_header(headers[i].name, headers[i].name_len) ||
+            (headers[i].name_len == 14 &&
+             memcmp(headers[i].name, "content-length", 14) == 0)) {
+            status = H2_REQUEST_MALFORMED;
+            break;
+        }
+
+        if (stream == NULL) continue;
+
+        if (httprequest_trailern_add(stream->request,
+                                     headers[i].name, headers[i].name_len,
+                                     headers[i].value, headers[i].value_len) != 0) {
+            status = H2_REQUEST_INTERNAL;
             break;
         }
     }
@@ -1620,8 +1645,11 @@ static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
      * request (§8.1). */
     if (stream != NULL && stream->state == H2_STREAM_OPEN && stream->headers_done) {
         /* The block must still be decoded to keep the HPACK context in sync,
-         * even when the stream is about to be reset. */
-        const h2_request_status_e status = h2_consume_trailers(s, block, len);
+         * even when the stream is about to be reset — and a stream that was
+         * already answered without a handler has nobody to read the fields, so
+         * it only gets the decode. */
+        const h2_request_status_e status =
+            h2_consume_trailers(s, stream->rejected ? NULL : stream, block, len);
         if (status != H2_REQUEST_OK)
             return h2_request_failed(s, stream, status);
 
@@ -1680,7 +1708,20 @@ static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
 
     stream->headers_done = 1;
 
-    if (!end_stream) return H2_FRAME_OK;
+    if (!end_stream) {
+        /* A body is still to come and the client said it would wait for
+         * permission (RFC 9110 §10.1.1) — docs/http2/10, T.2. Queued straight
+         * away: h2_drain_and_rearm flushes the outbound buffer at the end of
+         * this read, so the 100 is on the wire before the client's timer. */
+        const http_header_t* expect =
+            stream->request->get_headern(stream->request, "Expect", 6);
+
+        if (expect != NULL && expect->value != NULL &&
+            strcasecmp(expect->value, "100-continue") == 0)
+            (void)h2_write_filter_continue(s, stream);
+
+        return H2_FRAME_OK;
+    }
 
     return h2_dispatch(s, stream);
 }

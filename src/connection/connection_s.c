@@ -479,6 +479,12 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
     ctx->is_http2 = 0;
     ctx->h2c_preface = 0;
     ctx->h2c_peeked = 0;
+    /* malloc, not calloc: every field here is set explicitly, and these two are
+     * read on the response path of every request — a garbage `cont_pending`
+     * makes the write filter emit an interim status line nobody asked for
+     * (docs/http2/10, T.2). */
+    ctx->cont_pending = 0;
+    ctx->cont_sent = 0;
     atomic_store(&ctx->destroyed, 0);
     atomic_store(&ctx->detached, 0);
     atomic_store(&ctx->ref_count, 1);
@@ -519,6 +525,11 @@ void __ctx_reset(void* arg) {
     connection_server_ctx_t* ctx = arg;
 
     atomic_store_explicit(&ctx->need_write, 0, memory_order_relaxed);
+
+    /* Owed to the request that is ending, not to the next one on the connection
+     * (docs/http2/10, T.2). */
+    ctx->cont_pending = 0;
+    ctx->cont_sent = 0;
 
     /* When a protocol switch is pending (h2c Upgrade — see connection_after_write),
      * the switch callback adopts the request: the upgraded HTTP/1.1 request

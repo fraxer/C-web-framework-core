@@ -50,6 +50,7 @@ static h2c_sniff_e __h2c_sniff_preface(connection_t* connection, size_t* len);
 static int __tls_read(connection_t* connection);
 static int __tls_write(connection_t* connection);
 static int __read(connection_t* connection);
+static void __send_continue(connection_t* connection);
 static int __write(connection_t* connection);
 static int __deferred_handler(connection_t* connection, httprequest_t* request, httpresponse_t* response, queue_handler runner, queue_handler handle, queue_data_create data_create, ratelimiter_t* ratelimiter);
 static int __handle(connection_t* connection, httprequest_t* request, deferred_handler handler);
@@ -106,6 +107,33 @@ int set_http(connection_t* connection) {
         return 0;
 
     return 1;
+}
+
+/* Write the interim "100 Continue" status line, best effort.
+ *
+ * HTTP/1.1 has no outbound queue of its own — a response is written straight
+ * from the filter chain — so this goes to the socket directly. Twenty-five bytes
+ * on an exchange that has sent nothing yet: a short write is close to
+ * impossible, and if it happens the remainder is emitted in front of the
+ * response head by the write filter rather than spliced into it. Failing
+ * altogether is survivable too — the client falls back to its own timer, which
+ * is what it did before any of this existed. */
+void __send_continue(connection_t* connection) {
+    connection_server_ctx_t* ctx = connection->ctx;
+
+    ctx->cont_pending = 1;
+    ctx->cont_sent = 0;
+
+    while (ctx->cont_sent < HTTP_CONTINUE_LINE_LEN) {
+        const ssize_t written = connection_data_write(connection,
+                                                      HTTP_CONTINUE_LINE + ctx->cont_sent,
+                                                      HTTP_CONTINUE_LINE_LEN - ctx->cont_sent);
+        if (written <= 0) return; /* the write filter finishes it */
+
+        ctx->cont_sent += (unsigned)written;
+    }
+
+    ctx->cont_pending = 0;
 }
 
 int http_server_guard_read(connection_t* connection) {
@@ -269,6 +297,16 @@ int __read(connection_t* connection) {
                 case HTTP1PARSER_HOST_NOT_FOUND:
                     return __post_response_default(connection, 404);
                 case HTTP1PARSER_CONTINUE:
+                    /* The headers are in and the client is holding its body
+                     * back until we answer (RFC 9110 §10.1.1) — docs/http2/10,
+                     * T.2. Here, on the way to waiting for more bytes, is the
+                     * only moment the answer is worth anything: the response
+                     * filters do not run until a handler produces something,
+                     * which is exactly what the client is preventing. */
+                    if (parser->expect_continue) {
+                        parser->expect_continue = 0;
+                        __send_continue(connection);
+                    }
                     goto read_data;
                 case HTTP1PARSER_HANDLE_AND_CONTINUE:
                 {

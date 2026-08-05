@@ -23,6 +23,15 @@ typedef struct httprequest {
     query_t* last_query;
     http_header_t* header_;
     http_header_t* last_header;
+    /* Trailing fields, i.e. the header block a client may send after the body
+     * (RFC 9113 §8.1) — docs/http2/10, T.1. HTTP/2 only, and not because of an
+     * omission: an HTTP/1.1 request carrying Transfer-Encoding is rejected
+     * outright here (request smuggling), so a chunked request — the only h1.1
+     * shape that can have trailers — never reaches a handler in the first place.
+     * Always NULL under h1.1, and NULL under h2 until the whole request has
+     * arrived, which is before any handler runs. */
+    http_header_t* trailer_;
+    http_header_t* last_trailer;
     http_cookie_t* cookie_;
     http_ranges_t* ranges;
 
@@ -37,6 +46,18 @@ typedef struct httprequest {
     http_header_t*(*get_header)(struct httprequest* request, const char* name);
 
     /**
+     * Get a trailing field by name (RFC 9113 §8.1).
+     *
+     * Trailers arrive after the body, so they are complete by the time a
+     * handler runs — but only under HTTP/2. Returns NULL on HTTP/1.1, where a
+     * request that could carry them is rejected before it gets this far.
+     * @param request - HTTP request instance
+     * @param name - trailer name (null-terminated string)
+     * @return pointer to header structure or NULL if not found
+     */
+    http_header_t*(*get_trailer)(struct httprequest* request, const char* name);
+
+    /**
      * Get HTTP header by name with length.
      * @param request - HTTP request instance
      * @param name - header name (not necessarily null-terminated)
@@ -44,6 +65,15 @@ typedef struct httprequest {
      * @return pointer to header structure or NULL if not found
      */
     http_header_t*(*get_headern)(struct httprequest* request, const char* name, size_t name_length);
+
+    /**
+     * Get a trailing field by name with length (RFC 9113 8.1). See get_trailer.
+     * @param request - HTTP request instance
+     * @param name - trailer name
+     * @param name_length - length of the name
+     * @return pointer to header structure or NULL if not found
+     */
+    http_header_t*(*get_trailern)(struct httprequest* request, const char* name, size_t name_length);
 
     /**
      * Add new HTTP header to request.
@@ -254,6 +284,12 @@ typedef struct httprequest {
     size_t uri_length;
     size_t path_length;
 } httprequest_t;
+
+/* Append a trailing field to a request (RFC 9113 §8.1). Used by the HTTP/2
+ * parser when the trailer block arrives, before the request is dispatched;
+ * handlers read them back through get_trailer / get_trailern. Returns 0 on
+ * success, like the header equivalents. */
+int httprequest_trailern_add(httprequest_t*, const char*, size_t, const char*, size_t);
 
 httprequest_t* httprequest_create(connection_t*);
 void httprequest_free(void* arg);
