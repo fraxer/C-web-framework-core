@@ -65,8 +65,9 @@
 #define H2_WINDOW_UPDATE_MIN 16384
 #define H2_WINDOW_UPDATE_DIVISOR 8
 
-/* Cap on a single header block (HEADERS + CONTINUATION*). Bounds the
- * CONTINUATION-flood attack noted in docs/http2/07. */
+/* Absolute cap on a single header block (HEADERS + CONTINUATION*), in encoded
+ * bytes. Bounds the CONTINUATION-flood attack noted in docs/http2/07 and, with
+ * it, the work one block can cost the HPACK decoder. */
 #define H2_MAX_HEADER_BLOCK (1u << 20)
 
 /* ======================================================================= *
@@ -158,6 +159,22 @@ static uint32_t h2_max_continuation_frames = H2_DEFAULT_MAX_CONTINUATION_FRAMES;
 static int64_t  h2_max_header_list_size = H2_DEFAULT_MAX_HEADER_LIST_SIZE;
 static int64_t  h2_max_header_list_hard =
     (int64_t)H2_DEFAULT_MAX_HEADER_LIST_SIZE * H2_HEADER_LIST_HARD_FACTOR;
+
+/* Cap on one header block for the limits actually configured.
+ *
+ * The block is measured in encoded bytes, the header-list cap in decoded ones,
+ * and Huffman can expand at most 30 bits per byte — so nothing above four times
+ * the hard cap could ever pass it, and decoding that far is work done for a
+ * block already certain to be rejected. At the default settings this is the
+ * same 1 MB the constant used to be; lowering http2_max_header_list_size now
+ * lowers the decoder's worst case with it (docs/http2/10, H.2). */
+static size_t h2_header_block_cap(void) {
+    if (h2_max_header_list_hard <= 0) return H2_MAX_HEADER_BLOCK;
+
+    const uint64_t cap = (uint64_t)h2_max_header_list_hard * 4;
+
+    return cap < H2_MAX_HEADER_BLOCK ? (size_t)cap : H2_MAX_HEADER_BLOCK;
+}
 
 void h2_policy_init(void) {
     h2_idle_timeout_sec = (uint32_t)env_get_int("http2_idle_timeout_sec", H2_DEFAULT_IDLE_TIMEOUT_SEC);
@@ -1523,6 +1540,17 @@ static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
     const h2_request_status_e status = h2_build_request(s, stream, block, len);
     if (status == H2_REQUEST_TOO_LARGE) {
         metrics_h2_abuse(METRICS_H2_HEADER_LIST);
+
+        /* Charged like a refusal (phase A.2): the block was decoded in full,
+         * which is the most expensive thing a peer can make this server do, and
+         * a 431 is answered without the stream ever holding a slot. Without the
+         * token an oversize block is free to repeat for as long as the client
+         * likes (docs/http2/10, H.2). */
+        if (!h2_abort_budget_spend(s)) {
+            log_error("h2: oversize-header budget exhausted (fd %d)\n", s->connection->fd);
+            return h2_conn_error(s, H2_ERR_ENHANCE_YOUR_CALM);
+        }
+
         return h2_reject_stream(s, stream, 431, end_stream);
     }
     /* A tunnel request answered with a status: `rejected` makes whatever the
@@ -1611,7 +1639,7 @@ static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) 
     }
 
     if (!(frame->flags & H2_FLAG_END_HEADERS)) {
-        if (block_len > H2_MAX_HEADER_BLOCK) return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
+        if (block_len > h2_header_block_cap()) return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
 
         uint8_t* buf = realloc(s->cont, block_len ? block_len : 1);
         if (buf == NULL) return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
@@ -1634,7 +1662,7 @@ static h2_frame_result_e h2_on_continuation(h2session_t* s, const h2_frame_t* fr
     if (!s->cont_active || frame->stream_id != s->cont_stream_id)
         return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
 
-    if (s->cont_len + frame->payload_len > H2_MAX_HEADER_BLOCK)
+    if (s->cont_len + frame->payload_len > h2_header_block_cap())
         return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
 
     /* The byte limit above bounds memory, not work: an empty CONTINUATION adds

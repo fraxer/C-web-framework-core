@@ -11,13 +11,104 @@
 # requires only the plain-text RFC (https://www.rfc-editor.org/rfc/rfc7541.txt).
 import re
 import sys
+from fractions import Fraction
+
+# Decoding-table entry flags (mirrored in hpack_huffman.h).
+HUFF_SYM = 0x01     # the entry completed a symbol, emit entry.sym
+HUFF_ACCEPT = 0x02  # the resulting state is a valid end of string
+HUFF_FAIL = 0x04    # the nibble walked into EOS — invalid inside a string
+
+EOS = 256
+
+
+def build_decode_table(syms):
+    """Nibble-driven DFA over the Huffman code tree.
+
+    A state is a position in the code tree reached after a whole number of
+    4-bit nibbles; the transition for one nibble walks four bits, emitting a
+    symbol (and returning to the root) whenever it lands on a leaf.  At most one
+    symbol can complete per nibble because the shortest code is 5 bits long,
+    which is what keeps an entry down to a single `sym` field.
+
+    Returns (table, states) where table[state][nibble] = (next, flags, sym).
+    """
+    leaves = {}    # (depth, value) -> symbol
+    prefixes = set()
+    for sym, code, length in syms:
+        for d in range(1, length):
+            prefixes.add((d, code >> (length - d)))
+        leaves[(length, code)] = sym
+
+    # A complete prefix code has every bit path ending on a leaf; the walk below
+    # relies on that (it never has to handle a missing child).
+    assert sum(Fraction(1, 2 ** l) for _, _, l in syms) == 1, "code is not complete"
+
+    root = (0, 0)
+
+    def step(node, bit):
+        depth, value = node
+        child = (depth + 1, (value << 1) | bit)
+        if child in leaves:
+            return True, leaves[child]
+        assert child in prefixes, "no child for %s bit %d" % (node, bit)
+        return False, child
+
+    def accepting(node):
+        # RFC 7541 5.2: padding is the most significant bits of EOS (all ones)
+        # and strictly shorter than one octet.
+        depth, value = node
+        return depth <= 7 and value == (1 << depth) - 1
+
+    states = [root]
+    index = {root: 0}
+    table = []
+    i = 0
+    while i < len(states):
+        row = []
+        for nibble in range(16):
+            node = states[i]
+            sym = None
+            fail = False
+            for shift in (3, 2, 1, 0):
+                is_leaf, val = step(node, (nibble >> shift) & 1)
+                if not is_leaf:
+                    node = val
+                    continue
+                if val == EOS:
+                    fail = True
+                    break
+                assert sym is None, "two symbols completed in one nibble"
+                sym = val
+                node = root
+            if fail:
+                # A discarded symbol here would make FAIL lose output the
+                # bit-at-a-time decoder emits first. It cannot happen — EOS is
+                # 30 bits, so no nibble can both complete a symbol and reach it
+                # — and the assert keeps that true if the code table ever moves.
+                assert sym is None, "nibble completed a symbol and then hit EOS"
+                row.append((0, HUFF_FAIL, 0))
+                continue
+            if node not in index:
+                index[node] = len(states)
+                states.append(node)
+            flags = (HUFF_SYM if sym is not None else 0)
+            flags |= (HUFF_ACCEPT if accepting(node) else 0)
+            row.append((index[node], flags, sym if sym is not None else 0))
+        table.append(row)
+        i += 1
+
+    assert len(states) <= 256, "%d states will not fit in uint8_t" % len(states)
+
+    return table, states
 
 
 def emit_huffman(syms):
     # syms: list of (sym, code, length) for 0..256
+    table, states = build_decode_table(syms)
     out = []
     out.append("/* Auto-generated from RFC 7541 Appendix B by gen_tables.py.")
-    out.append(" * HPACK Huffman code table: 257 symbols (0..255 + EOS=256).")
+    out.append(" * HPACK Huffman code table: 257 symbols (0..255 + EOS=256),")
+    out.append(" * plus the nibble-driven decoding DFA derived from it.")
     out.append(" * Do not edit by hand. */")
     out.append("#ifndef __HPACK_HUFFMAN_TABLE__")
     out.append("#define __HPACK_HUFFMAN_TABLE__")
@@ -38,6 +129,38 @@ def emit_huffman(syms):
     for i in range(0, 257, 16):
         chunk = syms[i:i + 16]
         out.append("    " + ", ".join("%2d" % l for _, _, l in chunk) + ",")
+    out.append("};")
+    out.append("")
+    out.append("/* ---- Decoding DFA ----")
+    out.append(" * One state per position in the code tree reachable at a nibble boundary;")
+    out.append(" * two lookups decode an octet. The bit-at-a-time alternative costs a scan")
+    out.append(" * of all 256 symbols per bit, which is ~0.5 us per input byte and turns a")
+    out.append(" * single large header block into hundreds of milliseconds of CPU.")
+    out.append(" *")
+    out.append(" * flags: SYM   — the entry completed `sym`, emit it;")
+    out.append(" *        ACCEPT — the resulting state is a legal end of string (padding is")
+    out.append(" *                 all ones and shorter than an octet, RFC 7541 5.2);")
+    out.append(" *        FAIL  — the walk reached EOS, which may not appear in a string. */")
+    out.append("#define HPACK_HUFF_SYM    0x01")
+    out.append("#define HPACK_HUFF_ACCEPT 0x02")
+    out.append("#define HPACK_HUFF_FAIL   0x04")
+    out.append("")
+    out.append("#define HPACK_HUFF_STATES %d" % len(states))
+    out.append("")
+    out.append("typedef struct {")
+    out.append("    uint8_t state; /* next state */")
+    out.append("    uint8_t flags;")
+    out.append("    uint8_t sym;   /* valid when flags & HPACK_HUFF_SYM */")
+    out.append("} hpack_huff_decode_t;")
+    out.append("")
+    out.append("static const hpack_huff_decode_t")
+    out.append("hpack_huff_decode[HPACK_HUFF_STATES][16] = {")
+    for st, row in enumerate(table):
+        out.append("    /* %3d */ {" % st)
+        for i in range(0, 16, 4):
+            cells = ", ".join("{%3d, 0x%02x, %3d}" % cell for cell in row[i:i + 4])
+            out.append("        " + cells + ",")
+        out.append("    },")
     out.append("};")
     out.append("")
     out.append("#endif")
