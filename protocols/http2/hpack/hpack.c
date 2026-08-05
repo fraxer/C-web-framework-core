@@ -147,41 +147,50 @@ hpack_status_e hpack_huffman_encode(const uint8_t* data, size_t len,
     return HPACK_OK;
 }
 
-/* Decode with a per-bit linear scan over the code table. Correctness-first:
- * every accumulated length is matched against all symbols; mid-stream EOS and
- * non-EOS-prefix padding are rejected. Output is bounded by ~8/5 of the input,
- * so callers allocate ~len*2. */
+/* Decode through the generated nibble DFA (hpack_huffman.h): two table lookups
+ * per octet, no per-bit work. The state encodes the position in the code tree,
+ * so a symbol split across octets needs no accumulator of its own.
+ *
+ * This used to be a per-bit scan over all 256 symbols — correct, and about
+ * 0.5 us per input byte, which let one 625 KB header block cost ~300 ms of the
+ * worker under connection_s_lock. The block limits could not bound it: the
+ * two-tier header-list limit has to decode a block to the end to keep the
+ * connection's HPACK table in step with the peer's (docs/http2/08, A.4), so the
+ * only lever left was the cost per byte (docs/http2/10, H.2).
+ *
+ * Output is bounded by ~8/5 of the input, so callers allocate ~len*2. */
 hpack_status_e hpack_huffman_decode(const uint8_t* data, size_t len,
                                     uint8_t* dst, size_t cap, size_t* out_len) {
     size_t n = 0;
-    uint32_t cur = 0;
-    int curbits = 0;
+    uint8_t state = 0;
+    /* Empty input decodes to the empty string; every other verdict comes from
+     * the last nibble's entry. */
+    int accept = 1;
 
     for (size_t i = 0; i < len; i++) {
-        for (int bitpos = 7; bitpos >= 0; bitpos--) {
-            if (curbits >= 30) return HPACK_ERR_COMPRESSION; /* no symbol exceeds 30 bits */
-            cur = (cur << 1) | (uint32_t)((data[i] >> bitpos) & 1);
-            curbits++;
+        const hpack_huff_decode_t* e = &hpack_huff_decode[state][data[i] >> 4];
 
-            for (int s = 0; s < 256; s++) {
-                if (hpack_huff_len[s] == curbits && hpack_huff_code[s] == cur) {
-                    if (n >= cap) return HPACK_ERR_INVALID;
-                    dst[n++] = (uint8_t)s;
-                    cur = 0; curbits = 0;
-                    goto next_bit;
-                }
-            }
-            if (hpack_huff_len[HPACK_HUFF_EOS] == curbits &&
-                hpack_huff_code[HPACK_HUFF_EOS] == cur) {
-                return HPACK_ERR_COMPRESSION; /* EOS only allowed as final padding */
-            }
-        next_bit:;
+        if (e->flags & HPACK_HUFF_FAIL) return HPACK_ERR_COMPRESSION;
+        if (e->flags & HPACK_HUFF_SYM) {
+            if (n >= cap) return HPACK_ERR_INVALID;
+            dst[n++] = e->sym;
         }
+        state = e->state;
+
+        e = &hpack_huff_decode[state][data[i] & 0x0f];
+
+        if (e->flags & HPACK_HUFF_FAIL) return HPACK_ERR_COMPRESSION;
+        if (e->flags & HPACK_HUFF_SYM) {
+            if (n >= cap) return HPACK_ERR_INVALID;
+            dst[n++] = e->sym;
+        }
+        state = e->state;
+        accept = (e->flags & HPACK_HUFF_ACCEPT) != 0;
     }
 
-    if (curbits > 7) return HPACK_ERR_COMPRESSION; /* leftover must be EOS-prefix padding */
-    if (curbits > 0 && cur != (((uint32_t)1 << curbits) - 1))
-        return HPACK_ERR_COMPRESSION;
+    /* Anything left over must be EOS-prefix padding shorter than an octet; the
+     * ACCEPT flag is exactly that property of the resulting state. */
+    if (!accept) return HPACK_ERR_COMPRESSION;
 
     *out_len = n;
     return HPACK_OK;
@@ -265,24 +274,32 @@ hpack_status_e hpack_dynamic_table_insert(hpack_dynamic_table_t* t,
                                           const char* value, size_t value_len) {
     size_t sz = entry_size(name_len, value_len);
     if (sz > t->max) {
-        /* Entry larger than the whole table: empty it, do not insert (RFC §4.4). */
+        /* Entry larger than the whole table: empty it, do not insert (RFC §4.4).
+         * Nothing is read from name/value here, so the eviction is safe. */
         while (t->count > 0) dt_evict_oldest(t);
         return HPACK_OK;
     }
-    while (t->count > 0 && t->total + sz > t->max) dt_evict_oldest(t);
 
-    if (t->count == t->cap) {
-        size_t ncap = t->cap ? t->cap * 2 : 8;
-        hpack_dtable_entry_t* ne = realloc(t->entries, ncap * sizeof(*ne));
-        if (ne == NULL) return HPACK_ERR_MEMORY;
-        t->entries = ne; t->cap = ncap;
-    }
-
+    /* Copy first, evict second. `name` and `value` may point *into* this very
+     * table — a literal field takes its name by index from it — and the entry
+     * they point at may be the one the eviction below frees. RFC 7541 §4.4 warns
+     * about exactly this; doing it in the other order is a use-after-free that
+     * also writes the resulting garbage back into the table, desynchronising
+     * every later block on the connection (docs/http2/10, H.1). */
     char* ncopy = malloc(name_len + 1);
     char* vcopy = malloc(value_len + 1);
     if (ncopy == NULL || vcopy == NULL) { free(ncopy); free(vcopy); return HPACK_ERR_MEMORY; }
     memcpy(ncopy, name, name_len); ncopy[name_len] = '\0';
     memcpy(vcopy, value, value_len); vcopy[value_len] = '\0';
+
+    if (t->count == t->cap) {
+        size_t ncap = t->cap ? t->cap * 2 : 8;
+        hpack_dtable_entry_t* ne = realloc(t->entries, ncap * sizeof(*ne));
+        if (ne == NULL) { free(ncopy); free(vcopy); return HPACK_ERR_MEMORY; }
+        t->entries = ne; t->cap = ncap;
+    }
+
+    while (t->count > 0 && t->total + sz > t->max) dt_evict_oldest(t);
 
     memmove(t->entries + 1, t->entries, t->count * sizeof(*t->entries));
     t->entries[0].name = ncopy; t->entries[0].name_len = name_len;

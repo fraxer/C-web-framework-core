@@ -1,5 +1,7 @@
 #include "framework.h"
 #include "hpack.h"
+/* For the code table the differential Huffman test uses as its oracle. */
+#include "hpack_huffman.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -551,4 +553,218 @@ TEST(test_hpack_list_size_limit_counts_literals) {
 
     hpack_headers_free(out, n);
     hpack_decoder_free(d);
+}
+
+/* ===================================================================== *
+ *  Dynamic table: eviction of an entry the new one references
+ *  (docs/http2/10, H.1 — RFC 7541 §4.4)
+ * ===================================================================== */
+
+/* A literal field may take its name by index from the dynamic table, and
+ * inserting it may evict the very entry that name lives in. Copying after the
+ * eviction reads freed memory and stores the garbage back into the table, which
+ * desyncs every later block on the connection. The peer controls all three
+ * factors (table size, entry size, which index it references), so this is a
+ * client-triggerable use-after-free — run under ASan, it is the whole test. */
+TEST(test_hpack_dtable_evicting_referenced_name) {
+    TEST_CASE("a new entry may reference the name of the entry it evicts");
+
+    hpack_decoder_t* d = hpack_decoder_create(256);
+    TEST_REQUIRE(d != NULL, "decoder created");
+
+    /* Literal + incremental indexing, new name (60 'a') and value (60 'b'):
+     * 60 + 60 + 32 = 152 bytes, so the 256-byte table holds exactly one. */
+    uint8_t block1[1 + 1 + 60 + 1 + 60];
+    size_t n1 = 0;
+    block1[n1++] = 0x40;
+    block1[n1++] = 60;
+    memset(block1 + n1, 'a', 60); n1 += 60;
+    block1[n1++] = 60;
+    memset(block1 + n1, 'b', 60); n1 += 60;
+
+    hpack_header_t* out = NULL; size_t n = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, block1, n1, 0, &out, &n),
+                      "first block decodes");
+    TEST_ASSERT_EQUAL((size_t)1, n, "one field");
+    hpack_headers_free(out, n);
+    TEST_ASSERT_EQUAL((size_t)1, d->table.count, "entry entered the table");
+
+    /* Literal + incremental indexing, name by index 62 — the entry above — with
+     * a value that makes the insert evict it first. */
+    uint8_t block2[1 + 1 + 60];
+    size_t n2 = 0;
+    block2[n2++] = 0x40 | 62;
+    block2[n2++] = 60;
+    memset(block2 + n2, 'c', 60); n2 += 60;
+
+    out = NULL; n = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_decoder_decode(d, block2, n2, 0, &out, &n),
+                      "second block decodes");
+    TEST_ASSERT_EQUAL((size_t)1, n, "one field");
+
+    char expect[61];
+    memset(expect, 'a', 60); expect[60] = '\0';
+    TEST_ASSERT(hdr_eq(&out[0], expect, "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
+                "the referenced name survived the eviction intact");
+
+    /* And the table itself must hold the copy, not a dangling read. */
+    TEST_ASSERT_EQUAL((size_t)1, d->table.count, "only the new entry is left");
+    TEST_ASSERT(memcmp(d->table.entries[0].name, expect, 60) == 0,
+                "table entry carries the copied name");
+
+    hpack_headers_free(out, n);
+    hpack_decoder_free(d);
+}
+
+/* ===================================================================== *
+ *  Huffman: the nibble DFA against the bit-at-a-time reference
+ *  (docs/http2/10, H.2)
+ * ===================================================================== */
+
+/* The decoder hpack.c used before the DFA, kept verbatim as the differential
+ * oracle: it is slow but was validated against RFC 7541 Appendix C, so any
+ * disagreement is a bug in the table or in the walk that uses it. */
+static hpack_status_e huffman_decode_reference(const uint8_t* data, size_t len,
+                                               uint8_t* dst, size_t cap, size_t* out_len) {
+    size_t n = 0;
+    uint32_t cur = 0;
+    int curbits = 0;
+
+    for (size_t i = 0; i < len; i++) {
+        for (int bitpos = 7; bitpos >= 0; bitpos--) {
+            if (curbits >= 30) return HPACK_ERR_COMPRESSION;
+            cur = (cur << 1) | (uint32_t)((data[i] >> bitpos) & 1);
+            curbits++;
+
+            for (int s = 0; s < 256; s++) {
+                if (hpack_huff_len[s] == curbits && hpack_huff_code[s] == cur) {
+                    if (n >= cap) return HPACK_ERR_INVALID;
+                    dst[n++] = (uint8_t)s;
+                    cur = 0; curbits = 0;
+                    goto next_bit;
+                }
+            }
+            if (hpack_huff_len[HPACK_HUFF_EOS] == curbits &&
+                hpack_huff_code[HPACK_HUFF_EOS] == cur)
+                return HPACK_ERR_COMPRESSION;
+        next_bit:;
+        }
+    }
+
+    if (curbits > 7) return HPACK_ERR_COMPRESSION;
+    if (curbits > 0 && cur != (((uint32_t)1 << curbits) - 1))
+        return HPACK_ERR_COMPRESSION;
+
+    *out_len = n;
+    return HPACK_OK;
+}
+
+TEST(test_hpack_huffman_all_symbols_roundtrip) {
+    TEST_CASE("every one of the 256 symbols survives encode → decode");
+
+    uint8_t raw[256];
+    for (int i = 0; i < 256; i++) raw[i] = (uint8_t)i;
+
+    uint8_t enc[1024]; size_t en = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK,
+                      hpack_huffman_encode(raw, sizeof(raw), enc, sizeof(enc), &en),
+                      "encode status");
+
+    uint8_t dec[1024]; size_t dn = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_huffman_decode(enc, en, dec, sizeof(dec), &dn),
+                      "decode status");
+    TEST_ASSERT_EQUAL(sizeof(raw), dn, "decoded length");
+    TEST_ASSERT(memcmp(dec, raw, sizeof(raw)) == 0, "decoded content");
+}
+
+TEST(test_hpack_huffman_matches_reference) {
+    TEST_CASE("DFA agrees with the bit-at-a-time decoder on random input");
+
+    unsigned int seed = 20260805u;
+    size_t decoded_ok = 0;
+
+    /* Arbitrary bytes: most are invalid codes, and the two decoders must reject
+     * (or accept) exactly the same ones with the same status. */
+    for (int iter = 0; iter < 20000; iter++) {
+        uint8_t in[24];
+        seed = seed * 1103515245u + 12345u;
+        size_t len = (seed >> 16) % sizeof(in);
+        for (size_t i = 0; i < len; i++) {
+            seed = seed * 1103515245u + 12345u;
+            in[i] = (uint8_t)(seed >> 13);
+        }
+
+        uint8_t a[64], b[64]; size_t an = 0, bn = 0;
+        const hpack_status_e sa = huffman_decode_reference(in, len, a, sizeof(a), &an);
+        const hpack_status_e sb = hpack_huffman_decode(in, len, b, sizeof(b), &bn);
+
+        TEST_ASSERT_EQUAL(sa, sb, "same status as the reference decoder");
+        if (sa != HPACK_OK) continue;
+
+        decoded_ok++;
+        TEST_ASSERT_EQUAL(an, bn, "same decoded length");
+        TEST_ASSERT(memcmp(a, b, an) == 0, "same decoded bytes");
+    }
+
+    /* Guard against the assertions above passing vacuously. */
+    TEST_ASSERT(decoded_ok > 1000, "a healthy share of the inputs decoded");
+
+    /* Valid encodings of random payloads, so the positive path is covered with
+     * strings the encoder itself produced. */
+    for (int iter = 0; iter < 2000; iter++) {
+        uint8_t raw[200];
+        seed = seed * 1103515245u + 12345u;
+        const size_t len = (seed >> 16) % sizeof(raw) + 1;
+        for (size_t i = 0; i < len; i++) {
+            seed = seed * 1103515245u + 12345u;
+            raw[i] = (uint8_t)(seed >> 13);
+        }
+
+        /* Random bytes are the worst case for the encoder: the rarest symbols
+         * are 30 bits, so a payload can grow to ~3.75x on the way out. (The
+         * production encoder only emits Huffman when it shortens the string —
+         * this test feeds the primitive directly.) */
+        uint8_t enc[sizeof(raw) * 4 + 16]; size_t en = 0;
+        TEST_ASSERT_EQUAL(HPACK_OK, hpack_huffman_encode(raw, len, enc, sizeof(enc), &en),
+                          "encode status");
+
+        uint8_t dec[sizeof(raw) * 2 + 16]; size_t dn = 0;
+        TEST_ASSERT_EQUAL(HPACK_OK, hpack_huffman_decode(enc, en, dec, sizeof(dec), &dn),
+                          "decode status");
+        TEST_ASSERT_EQUAL(len, dn, "round-trip length");
+        TEST_ASSERT(memcmp(dec, raw, len) == 0, "round-trip content");
+    }
+}
+
+TEST(test_hpack_huffman_padding_rules) {
+    TEST_CASE("RFC 7541 §5.2 padding: all ones, shorter than an octet");
+
+    uint8_t out[64]; size_t n = 0;
+
+    /* 0x3f = 001111 11: '1' (6 bits, code 0b111011 ... ) — build the cases from
+     * the encoder instead of by hand, then damage the padding. */
+    uint8_t enc[16]; size_t en = 0;
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_huffman_encode((const uint8_t*)"a", 1, enc, sizeof(enc), &en),
+                      "encode 'a'");
+    TEST_ASSERT_EQUAL(HPACK_OK, hpack_huffman_decode(enc, en, out, sizeof(out), &n),
+                      "correct padding accepted");
+
+    /* Clear the last padding bit: no longer an EOS prefix. */
+    uint8_t bad_pad = enc[en - 1] & (uint8_t)~1u;
+    TEST_ASSERT_EQUAL(HPACK_ERR_COMPRESSION,
+                      hpack_huffman_decode(&bad_pad, 1, out, sizeof(out), &n),
+                      "zero bit in the padding rejected");
+
+    /* A whole octet of padding: 'a' is 5 bits, so 0x1f + 0xff leaves 11 padding
+     * bits — more than the 7 the RFC allows. */
+    const uint8_t long_pad[] = {enc[0], 0xff};
+    TEST_ASSERT_EQUAL(HPACK_ERR_COMPRESSION,
+                      hpack_huffman_decode(long_pad, sizeof(long_pad), out, sizeof(out), &n),
+                      "padding of a full octet rejected");
+
+    /* EOS is 30 one-bits; four all-ones octets reach it mid-string. */
+    const uint8_t eos[] = {0xff, 0xff, 0xff, 0xff};
+    TEST_ASSERT_EQUAL(HPACK_ERR_COMPRESSION,
+                      hpack_huffman_decode(eos, sizeof(eos), out, sizeof(out), &n),
+                      "EOS inside a string rejected");
 }
