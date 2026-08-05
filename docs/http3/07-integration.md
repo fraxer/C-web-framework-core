@@ -1,0 +1,237 @@
+# Фаза 7. Интеграция: конфиг, Alt-Svc, метрики, лимиты, перезагрузка
+
+К этому моменту h3 работает, но им никто не пользуется: браузер о нём не знает,
+оператор не может его настроить и не видит, что происходит. Эта фаза делает h3
+пригодным для эксплуатации.
+
+---
+
+## 1. Конфигурация
+
+### 1.1 Секция vhost
+
+```json
+"servers": {
+  "s1": {
+    "domains": ["www.example1.com"],
+    "ip": "0.0.0.0",
+    "port": 443,
+    "tls": { "fullchain": "...", "private": "...", "ciphers": "..." },
+    "http3": {
+      "enabled": true,
+      "port": 443,
+      "alt_svc": true,
+      "alt_svc_max_age": 86400
+    },
+    "http": { "...": "..." }
+  }
+}
+```
+
+- `port` по умолчанию равен TCP-порту vhost. Разные порты допустимы, но тогда
+  `Alt-Svc` обязан их указывать.
+- Эндпоинт создаётся на каждую уникальную пару (ip, udp-порт) — так же, как
+  `__listener_get()` объединяет vhost'ы на один TCP-listener. Выбор vhost внутри
+  соединения — по SNI, точно как в TCP+TLS.
+- `enabled: true` без секции TLS — ошибка конфигурации: QUIC без TLS не бывает.
+
+### 1.2 Параметры `main.env`
+
+По образцу `h2_policy_init()` — плоские ключи, читаются один раз в
+`module_loader` до старта потоков, лежат в глобалах. Добавляется
+`h3_policy_init()`, вызываемая там же, где `h2_policy_init()`.
+
+```
+Транспорт
+  http3_max_connections              100000   0 = без лимита
+  http3_idle_timeout_sec             30
+  http3_max_udp_payload_size         1452
+  http3_initial_max_data             1048576
+  http3_initial_max_stream_data      262144
+  http3_max_streams_bidi             100
+  http3_max_streams_uni              8
+  http3_recv_window_max              16777216  авто-тюнинг, как в h2
+  http3_active_cid_limit             4
+  http3_ack_delay_ms                 25
+  http3_cc                           "newreno" | "cubic"(фаза 9)
+  http3_pacing                       true
+  http3_rx_batch                     32
+  http3_tx_batch                     32
+  http3_so_rcvbuf / http3_so_sndbuf  4194304
+
+Валидация адреса и защита
+  http3_retry                        "auto" | "always" | "never"
+  http3_retry_threshold              1000     рукопожатий в полёте
+  http3_token_lifetime_sec           86400
+  http3_new_token                    true
+  http3_handshake_rate               500      новых рукопожатий/с на процесс
+  http3_handshake_burst              1000
+  http3_stateless_reset_rate         100
+  http3_amplification_factor         3        менять нельзя, только для тестов
+
+HTTP/3
+  http3_max_field_section_size       262144   как http2_max_header_list_size
+  http3_qpack_max_table_capacity     4096     0 -> QPACK-lite (фаза 6.1)
+  http3_qpack_blocked_streams        16
+  http3_abort_rate / http3_abort_burst        как http2_abort_*
+  http3_ctrl_rate  / http3_ctrl_burst         как http2_ctrl_*
+
+Диагностика
+  http3_qlog_dir                     ""       пусто = выключено
+  http3_qlog_connections             10       первые N соединений
+```
+
+Принцип из h2 сохраняется: **0 означает «выключено»** у каждого лимита, чтобы
+оператор мог доказать, что срабатывание лимита — причина инцидента.
+
+---
+
+## 2. Alt-Svc — иначе h3 никто не увидит
+
+Браузер не пробует UDP наугад. Он узнаёт о h3 одним из двух способов:
+
+1. **Заголовок `Alt-Svc`** в ответе по h1.1/h2:
+   ```
+   Alt-Svc: h3=":443"; ma=86400
+   ```
+2. **DNS HTTPS/SVCB RR** (RFC 9460) — вне зоны ответственности сервера, но
+   документируем в `frontend/docs`:
+   ```
+   example.com. 3600 IN HTTPS 1 . alpn="h3,h2" port=443
+   ```
+
+**Реализация.** Заголовок добавляется в `http_write_filter` и `h2_write_filter`
+(не в h3 — там он бессмысленен) для vhost'ов с `http3.alt_svc: true`. Место —
+рядом с добавлением `Date`/`Server`; одна строка, значение вычисляется один раз
+при загрузке конфига и хранится в `server_t`.
+
+Не добавлять на ответы 1xx и на ответы, где заголовок уже задан хендлером.
+
+**Замечание к решению по h2.** В `docs/http2/08` фаза F.2 кадры `ALTSVC`/`ORIGIN`
+были закрыты по решению «не нужно». Это не противоречит: там речь о кадре
+`ALTSVC` (0xa) протокола HTTP/2, а здесь — о заголовке `Alt-Svc` (RFC 7838),
+который несёт обычный HTTP-ответ. Для обнаружения h3 нужен именно заголовок.
+
+---
+
+## 3. Метрики
+
+Расширение `/metrics` (секции появляются, только если h3 включён).
+
+```
+quic.*            — из фазы 1 (§9 документа 01)
+quic.handshakes_started / completed / failed{reason=tls|timeout|refused}
+quic.retry_sent, quic.token_valid, quic.token_invalid{expired|addr|forged}
+quic.rtt_us{p50,p90,p99}, quic.cwnd_bytes{p50,p99}
+quic.packets_lost, quic.loss_rate, quic.pto_fired, quic.persistent_congestion
+quic.key_updates, quic.decrypt_failures
+quic.migrations{attempted,validated,rejected}
+quic.streams_open, quic.streams_reset
+quic.flow_blocked{conn,stream}
+quic.amplification_limited     — сколько раз упёрлись в 3x
+
+http3.requests, http3.responses{1xx,2xx,3xx,4xx,5xx}
+http3.streams_cancelled, http3.goaway_sent
+http3.abuse{abort_budget,ctrl_budget,field_section_too_large,blocked_streams}
+http3.qpack{inserts,evictions,blocked_streams,literal_ratio}
+```
+
+Плюс новые `LOCK_SITE_*` из `01` §3.6, попадающие в существующую гистограмму
+ожидания `connection_s_lock` — тот же инструмент, что уже нашёл лишний лок в h2
+(`docs/concurrency/01` §6, A.4).
+
+---
+
+## 4. Защита от злоупотреблений
+
+QUIC даёт атакующему возможности, которых не было в TCP. Каждая закрывается
+бюджетом по образцу `docs/http2/08` фаза A (милли-токены, свой бакет на
+семантику).
+
+| Вектор | Защита |
+|---|---|
+| Спуфинг адреса → отражение | anti-amplification 3× (MUST) + Retry по порогу |
+| Флуд Initial-пакетов | `http3_handshake_rate/burst`, отказ `CONNECTION_REFUSED` |
+| Флуд пакетов с неизвестным CID | бюджет stateless reset; поиск по хеш-таблице O(1) |
+| Rapid Reset (RESET_STREAM без ответа) | `http3_abort_*`, как в h2 |
+| Флуд PING/ACK/NEW_CONNECTION_ID | `http3_ctrl_*` |
+| Огромный список полей | `MAX_FIELD_SECTION_SIZE` + жёсткий предел ×2 → 431 |
+| QPACK-бомба | предел декодированного размера, лимит блокированных потоков |
+| Дыры в потоке (память на сегменты) | лимит `buffered` в `quicrecvbuf` → `FLOW_CONTROL_ERROR` |
+| Открытие максимума потоков без данных | `initial_max_streams_bidi`, счётчик «пустых» потоков |
+| Флуд NEW_CONNECTION_ID | `active_connection_id_limit`, превышение → `CONNECTION_ID_LIMIT_ERROR` |
+| Миграция-флуд | не чаще одной валидации пути за 3×PTO |
+| Огромный ACK-«гребёнка» | ≤ 32 диапазона на приём и на отправку |
+
+Отдельный пункт — **память на соединение**. Оценка потолка: recv-буферы
+(`initial_max_data` = 1 МБ) + send-буферы + сегменты + ключи ≈ 1.3 МБ на
+соединение в худшем случае. При `http3_max_connections = 100000` это 130 ГБ —
+нереалистично. Поэтому:
+
+- `http3_max_connections` по умолчанию считается от доступной памяти
+  (`total_ram / 4 / оценка_на_соединение`), а не берётся с потолка;
+- `initial_max_data` уменьшается динамически, когда число соединений превышает
+  порог (тот же приём, что авто-тюнинг окна, только в обратную сторону).
+
+---
+
+## 5. Перезагрузка и остановка
+
+Существующая модель: `appconfig->shutdown`, `reload: soft|hard`,
+`__listeners_unlisten()`, дренаж по `api->connection_count`.
+
+Для h3:
+
+| Событие | Поведение |
+|---|---|
+| `shutdown` (мягкий) | Перестать принимать новые Initial (отвечать `CONNECTION_REFUSED`); по каждому соединению — h3 GOAWAY, дождаться потоков, `CONNECTION_CLOSE(H3_NO_ERROR)`; закрыть UDP-сокет, когда соединений не осталось |
+| `reload: soft` | То же, но `endpoint->reset_key` и `token_key` **переносятся** в новую конфигурацию, иначе выданные NEW_TOKEN и stateless reset станут невалидными |
+| `reload: hard` | Сокеты закрываются немедленно; клиенты переоткроют соединение (для QUIC это дешевле, чем для TCP, — 1-RTT) |
+| SIGTERM с таймаутом | По истечении — `CONNECTION_CLOSE(NO_ERROR)` всем и выход |
+
+Дренаж встраивается в `__mpx_on_tick` рядом с `h2_server_tick()`:
+`quicendpoint_tick()` проходит по своим соединениям и применяет ту же политику.
+Как и `h2_server_tick`, функция сама владеет жизненным циклом лока и может
+освободить соединение — вызывающий обязан сохранить `next` заранее.
+
+---
+
+## 6. Совместное существование h1.1 / h2 / h3
+
+- TCP-порт продолжает обслуживать h1.1 и h2 (ALPN), UDP-порт — только h3.
+- ALPN-колбэк: для QUIC-`SSL` предлагается **только** `h3`; для TCP —
+  прежний порядок `h2` → `http/1.1`. Смешение недопустимо (`03` §2.2).
+- Клиент, у которого h3 не проходит (UDP заблокирован), молча остаётся на TCP —
+  это и есть штатное поведение Alt-Svc. Никакой логики fallback на сервере не
+  требуется.
+- `H3_VERSION_FALLBACK` (0x0110) отправляем, если запрос по h3 обязан быть
+  обслужен более старой версией, — на практике не используется.
+
+---
+
+## 7. Документация для пользователей
+
+`frontend/docs/` (и `frontend/docs/en/`):
+
+- новая страница `http3.md`: как включить, требование OpenSSL ≥ 3.5, UDP-порт в
+  firewall (частая причина «не работает»), Alt-Svc, DNS HTTPS RR, как проверить
+  (`curl --http3`, `chrome://net-export`, вкладка Network → Protocol);
+- дополнение `config.md`: секция `http3` и ключи `main.env`;
+- дополнение `build-and-run.md`: флаг `-DINCLUDE_HTTP3=yes`;
+- дополнение `ssl-certs.md`: короткая цепочка сертификатов важнее, чем в TCP
+  (anti-amplification, `04` §8);
+- дополнение в раздел про WebSocket: RFC 9220 и что клиентской поддержки
+  WebSocket-over-h3 в браузерах пока почти нет — это работает, но применения
+  сегодня мало.
+
+---
+
+## 8. Критерии готовности фазы
+
+1. Браузер, зайдя по TCP, видит `Alt-Svc` и на следующем запросе переходит на h3
+   (проверяется в DevTools: Protocol = `h3`).
+2. `/metrics` показывает секции `quic` и `http3` с ненулевыми значениями.
+3. Мягкая перезагрузка не рвёт активные h3-соединения посреди запроса.
+4. Отключение `http3.enabled` в конфиге и reload убирает UDP-сокет.
+5. Нагрузочный прогон (`h2load --npn-list=h3` / `quiche-client`) 10 000 запросов
+   без утечек под ASan и без гонок под TSan.

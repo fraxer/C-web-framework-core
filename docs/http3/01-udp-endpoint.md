@@ -1,0 +1,410 @@
+# Фаза 0–1. UDP-эндпоинт, демультиплексирование и модель соединения
+
+Это фундамент: пока датаграмма не доходит до правильного объекта состояния и не
+уходит обратно с правильного адреса, писать QUIC бессмысленно. Фаза не требует
+ни криптографии, ни фреймов — только маршрутизацию.
+
+---
+
+## 1. Фаза 0: каркас сборки
+
+**0.1.** `core/CMakeLists.txt`: опция `INCLUDE_HTTP3` (по умолчанию `OFF`).
+При `ON` — проверка версии OpenSSL:
+
+```cmake
+if (INCLUDE_HTTP3)
+    if (OPENSSL_VERSION VERSION_LESS "3.5.0")
+        message(FATAL_ERROR
+            "HTTP/3 requires OpenSSL >= 3.5 (QUIC TLS API: SSL_set_quic_tls_cbs). "
+            "Found ${OPENSSL_VERSION}. Rebuild with -DINCLUDE_HTTP3=no or upgrade.")
+    endif()
+    add_compile_definitions(CWFR_HTTP3)
+endif()
+```
+
+Проверить также наличие символа через `check_symbol_exists(SSL_set_quic_tls_cbs
+"openssl/ssl.h" HAVE_QUIC_TLS_CBS)` — дистрибутивы иногда собирают OpenSSL с
+`no-quic`.
+
+**0.2.** Пустые `CMakeLists.txt` и заголовки-скелеты во всех каталогах из
+`00-overview.md` §7. Все новые файлы добавляются в `framework_shared`, как h2.
+
+**0.3.** `tests/CMakeLists.txt`: юнит-тесты h3 подключаются условно
+(`if (INCLUDE_HTTP3)`), чтобы `runner` собирался и без флага.
+
+**0.4.** Заглушка qlog (`quicqlog.h` с макросами, разворачивающимися в `((void)0)`
+при выключенном qlog) — вводится сразу, чтобы вызовы расставлялись по коду с
+самого начала, а не дописывались потом.
+
+**Готово, когда:** обе сборки (`-DINCLUDE_HTTP3=yes|no`) проходят, `runner`
+зелёный, бинарь без флага побайтово эквивалентен текущему по составу символов.
+
+---
+
+## 2. Проблема: `connection_t` привязан к дескриптору
+
+Сейчас (`src/connection/connection.h`):
+
+```c
+typedef struct connection {
+    int fd;
+    ...
+    int(*close)(struct connection*);
+    int(*read)(struct connection*);
+    int(*write)(struct connection*);
+    struct connection* prev; struct connection* next;  /* список воркера */
+} connection_t;
+```
+
+Всё построено на «`fd` ↔ соединение ↔ запись в epoll»:
+`__mpx_epoll_control_add/mod/del` вызывают `epoll_ctl(api->fd, …, connection->fd, …)`,
+`ev.data.ptr = connection`, а `api->conns` наполняется в `control_add`.
+
+В QUIC на один `fd` приходится N соединений. Прямая регистрация каждого
+`quicconn_t` в epoll невозможна — они бы перетирали регистрацию друг друга.
+
+### 2.1 Рассмотренная альтернатива: сокет на соединение
+
+Можно на каждое QUIC-соединение делать отдельный UDP-сокет, `bind()` на тот же
+локальный адрес с `SO_REUSEPORT` и `connect()` на адрес клиента. Ядро Linux при
+демультиплексировании UDP отдаёт предпочтение полностью связанному сокету перед
+wildcard, так что пакеты клиента попадут именно туда — и тогда `connection_t`,
+epoll и весь `multiplexing` работают вообще без изменений.
+
+**Отклонено.** Три причины:
+
+1. **Миграция и NAT-rebinding ломаются.** Клиент, сменивший адрес (Wi-Fi → LTE,
+   перебинденный NAT), попадёт на wildcard-сокет; нужно опознать соединение по
+   CID, пере-`connect()`-ить его сокет — то есть демультиплексор по CID всё
+   равно требуется, а к нему добавляется гонка «пакет уже в очереди старого
+   сокета».
+2. **Дескриптор на соединение.** У QUIC соединения живут дольше TCP-шных
+   (idle timeout, draining), лимит `ulimit -n` начинает упираться раньше.
+3. **Атака дешёвая:** каждый Initial-пакет от неизвестного адреса создавал бы
+   сокет до всякой валидации адреса.
+
+### 2.2 Принятое решение
+
+- **Эндпоинт** (`quicendpoint_t`) — один на пару (воркер, слушающий адрес).
+  Владеет UDP-сокетом, оборачивает его в обычный `connection_t` (как это делает
+  `listener_t`) и регистрирует в epoll на `MPXIN`. Его `read` — цикл `recvmmsg`.
+- **QUIC-соединение** (`quicconn_t`) — содержит вложенный `connection_t` с
+  `fd = endpoint->fd` (только для чтения/диагностики; ничего им не делаем),
+  `ssl != NULL`, `transport = CONN_TRANSPORT_QUIC`. Его `read`/`write`
+  **не вызываются из epoll** — их вызывает эндпоинт.
+- Все `epoll_ctl`-пути для QUIC-соединений заменяются на «пометить, что
+  эндпоинту есть что писать».
+
+---
+
+## 3. Правки в существующем коде
+
+Минимальные и локальные. Ниже — исчерпывающий список.
+
+**3.1. `connection.h`** — новое поле и признак транспорта:
+
+```c
+typedef enum {
+    CONN_TRANSPORT_TCP = 0,
+    CONN_TRANSPORT_QUIC
+} connection_transport_e;
+```
+
+Кладём в `connection_t` рядом с `keepalive`. Значение выставляется один раз при
+создании и не меняется — те же правила write-once, что у `is_http2`
+(`connection_s.h`), поэтому обычное битовое поле безопасно.
+
+**3.2. `multiplexingepoll.c`** — `__mpx_epoll_control_add/mod/del` в самом начале:
+
+```c
+if (connection->transport == CONN_TRANSPORT_QUIC)
+    return quicendpoint_arm(connection, events);   /* никакого epoll_ctl */
+```
+
+`control_del` для QUIC снимает соединение с таблицы эндпоинта и из его списка
+`conns` — заменяя `__mpx_conns_remove`.
+
+**3.3. `connection_s.c`** — `rearm()` и `connection_park_rearm()` идут через ту же
+развилку. Это единственные места, где хендлерный поток трогает epoll.
+
+**3.4. `multiplexingserver.c`** — `__listeners_create()` для сервера с
+`server->http3.enabled` дополнительно создаёт `quicendpoint_t`; `__mpx_on_tick`
+получает ветку `quicendpoint_tick()` (грубая уборка: idle, draining), тонкие
+таймеры — на собственном timerfd эндпоинта (§6).
+
+**3.5. `connection_s.h`** — в `connection_server_ctx_t` добавляется
+`unsigned is_http3: 1` по образцу `is_http2` (тот же write-once-контракт), и
+`ctx->parser` начинает уметь быть `h3session_t*`. Первым полем `h3session_t`,
+как и у `h2session_t`, обязан идти `void (*free)(void*)`.
+
+**3.6. `metrics.h`** — новые `LOCK_SITE_QUIC_RECV`, `LOCK_SITE_QUIC_SEND`,
+`LOCK_SITE_H3_READ`, `LOCK_SITE_H3_WRITE`, `LOCK_SITE_H3_PUBLISH`.
+
+**3.7. `server.h`** — секция `server_http3_t` (см. `07-integration.md` §1).
+
+Больше ничего в существующем коде не трогается. В частности, `connection_s_lock`,
+refcount, `connection_queue_append_parallel`, цепочка фильтров, роутинг и
+хендлеры остаются как есть.
+
+---
+
+## 4. `udpsocket.{c,h}`
+
+По образцу `src/socket/socket.c`, но:
+
+```c
+int udp_socket_create(const struct sockaddr_storage* addr, socklen_t addrlen);
+```
+
+Обязательные опции:
+
+| Опция | Зачем |
+|---|---|
+| `SO_REUSEPORT` | Несколько воркеров на один порт |
+| `SO_REUSEADDR` | Как в TCP |
+| `O_NONBLOCK` | Общая модель |
+| `IP_PKTINFO` / `IPV6_RECVPKTINFO` | На wildcard-bind узнать **локальный** адрес датаграммы. Без этого ответ уйдёт с адреса, выбранным ядром, и клиент его отбросит |
+| `IPV6_V6ONLY=0` (или два сокета) | Решение фиксируем: **два отдельных сокета**, v4 и v6. Dual-stack сокет усложняет `IP_PKTINFO` и различается между ядрами |
+| `IP_MTU_DISCOVER=IP_PMTUDISC_PROBE` / `IPV6_MTU_DISCOVER` | Ставим DF, чтобы не фрагментировать (RFC 9000 §14) |
+| `SO_RCVBUF`/`SO_SNDBUF` | Поднять; на дефолтах теряются пакеты на всплесках. Значения — из конфига |
+| `UDP_GRO` (опц.) | Фаза 9 |
+| `UDP_SEGMENT` (опц., per-message) | Фаза 9, GSO |
+
+**Чтение** — `recvmmsg()` пачками по 32 датаграммы, у каждой свой
+`msg_control` для `IP_PKTINFO` и (позже) ECN-битов из `IP_TOS`/`IPV6_TCLASS`.
+Буферы под датаграммы — заранее выделенный массив эндпоинта (не `malloc` на
+пакет), размер элемента — `max_udp_payload_size` (по умолчанию 1472 для v4;
+берём 2048 с запасом, при включённом GRO — 64 КБ).
+
+**Запись** — `sendmmsg()`, у каждого сообщения свой адрес назначения и
+`IP_PKTINFO` с локальным адресом источника.
+
+## 5. `quicendpoint.{c,h}`
+
+```c
+typedef struct quicendpoint {
+    connection_t*      conn;         /* тот, что в epoll: read = __endpoint_read */
+    struct mpxapi*     api;
+    listener_t*        listener;     /* vhosts на этом адресе: SNI выбирает нужный */
+
+    int                fd;
+    struct sockaddr_storage local;
+    socklen_t          local_len;
+
+    /* приёмная пачка */
+    struct mmsghdr     rx_msgs[QUIC_RX_BATCH];
+    struct iovec       rx_iov[QUIC_RX_BATCH];
+    uint8_t*           rx_buf;       /* QUIC_RX_BATCH * rx_datagram_size */
+    uint8_t            rx_cmsg[QUIC_RX_BATCH][CMSG_SPACE_TOTAL];
+
+    /* передающая пачка */
+    struct mmsghdr     tx_msgs[QUIC_TX_BATCH];
+    ...
+
+    /* соединения этого эндпоинта — для тика и graceful shutdown */
+    quicconn_t*        conns;
+    size_t             conn_count;
+
+    /* очередь "есть что отправить" */
+    quicconn_t*        tx_head;
+    quicconn_t*        tx_tail;
+    atomic_flag        tx_lock;      /* leaf-lock, см. §8 */
+
+    /* таймеры */
+    int                timerfd;
+    int                timer_tag;    /* адрес используется как ev.data.ptr */
+    quictimer_heap_t   timers;
+
+    /* ключ для stateless reset и для токенов Retry */
+    uint8_t            reset_key[32];
+    uint8_t            token_key[32];
+} quicendpoint_t;
+```
+
+Глобальная таблица соединений — **не** в эндпоинте (ADR-3):
+
+```c
+/* quiccid.c: DCID -> quicconn_t. Шардированная хеш-таблица на базе misc/hashmap.h,
+ * 64 шарда, каждый под своим мьютексом. Ключ — байты CID (переменная длина,
+ * 0..20), значение — quicconn_t* c инкрементированным refcount. */
+int      quic_conntable_insert(const uint8_t* cid, size_t len, quicconn_t*);
+quicconn_t* quic_conntable_lookup_acquire(const uint8_t* cid, size_t len);
+void     quic_conntable_remove(const uint8_t* cid, size_t len);
+```
+
+`lookup_acquire` возвращает соединение с уже взятой ссылкой
+(`connection_s_inc`), чтобы оно не было освобождено между поиском и обработкой.
+Это тот же контракт, что у broadcast-очереди.
+
+### 5.1 Путь приёма
+
+```
+epoll: MPXIN на fd эндпоинта
+  └─ __endpoint_read()
+       recvmmsg(до 32 датаграмм)
+       для каждой датаграммы:
+         quic_datagram_dispatch(ep, buf, len, &remote, &local)
+```
+
+`quic_datagram_dispatch` (это ещё не разбор пакета, только маршрутизация):
+
+1. Датаграмма может содержать **несколько скоалесцированных QUIC-пакетов**
+   (Initial+Handshake в одной). Извлекается DCID **первого** пакета — по
+   RFC 8999 это возможно, не зная версии: первый байт даёт форму заголовка,
+   дальше в long header идёт `version`, `dcid_len`, `dcid`. Все пакеты в
+   датаграмме обязаны иметь один DCID (§12.2), это проверяется позже.
+2. `quic_conntable_lookup_acquire(dcid)`.
+3. **Нашли** → `quicconn_recv_datagram(conn, ...)` под `connection_s_lock`.
+4. **Не нашли**:
+   - short header → возможно, это пакет к умершему соединению. Отвечаем
+     **Stateless Reset** (`03-quic-tls.md` §7), если размер позволяет, но с
+     собственным бюджетом (иначе получим усилитель трафика).
+   - long header, версия не наша → **Version Negotiation** пакет.
+   - long header, тип Initial, версия наша, длина датаграммы ≥ 1200 →
+     **новое соединение** (§5.2). Датаграмма меньше 1200 байт — молча
+     отбрасывается (RFC 9000 §14.1).
+   - long header, тип Handshake/0-RTT без соединения → отбросить.
+
+### 5.2 Приём нового соединения
+
+1. Проверка глобального лимита соединений и бюджета новых рукопожатий в секунду.
+2. Если включена валидация адреса (постоянно или по порогу нагрузки) и в пакете
+   нет валидного токена — отправить **Retry** и **не** создавать состояние.
+   Это единственная защита от спуфинга адреса до рукопожатия.
+3. Иначе — создать `quicconn_t`:
+   - выбрать server-chosen CID (8 байт: 1 байт — индекс воркера для будущей
+     аффинности + 7 байт `RAND_bytes`), зарегистрировать в таблице;
+   - зарегистрировать **также** original DCID клиента: до тех пор пока клиент не
+     увидел наш CID, он шлёт пакеты на свой случайный;
+   - создать `connection_t` через новый `connection_quic_alloc()` (аналог
+     `connection_s_alloc`), с полным `connection_server_ctx_t`;
+   - создать `SSL` (см. `03-quic-tls.md`), выставить transport parameters;
+   - выставить anti-amplification бюджет = 3 × полученных байт.
+
+### 5.3 Путь передачи
+
+Хендлерный поток и воркер не пишут в сокет напрямую — как и в h2 (инвариант в
+`connection.h`). Вместо `epoll_ctl(EPOLLOUT)`:
+
+```c
+void quicendpoint_want_write(quicconn_t* c);  /* ставит c в ep->tx_* очередь */
+```
+
+Эндпоинт после разбора пачки входящих (и на срабатывании таймера) делает проход
+отправки:
+
+```
+для каждого соединения в tx-очереди (round-robin, квант):
+    quicconn_write(c, &tx batch)   /* строит пакеты, соблюдая cwnd, pacing,
+                                      anti-amplification и flow control */
+sendmmsg(batch)
+```
+
+Соединение, у которого остались данные, но исчерпан cwnd или квант, ставится в
+хвост очереди и/или получает таймер pacing.
+
+`quicconn_write()` — единственная точка, где формируются исходящие пакеты, и она
+всегда исполняется на потоке-владельце эндпоинта. Это сохраняет тот же
+инвариант, что описан в `connection.h`: сокет пишет только воркер.
+
+---
+
+## 6. Таймеры
+
+QUIC требует таймеров разной срочности: PTO, ack delay (макс. 25 мс), pacing
+(доли миллисекунды), idle timeout (секунды), path validation, key update,
+draining. Тик воркера в 500 мс не годится.
+
+`quictimer.{c,h}` — бинарная куча по `deadline_us`, элемент —
+`{quicconn_t*, тип, deadline}`. У соединения не более одного элемента в куче:
+хранится ближайший из его собственных дедлайнов, а `quicconn_on_timeout()`
+разбирается, какой именно сработал, и перевзводит следующий. Так куча не растёт
+и удаление O(log n) не нужно на каждый ACK.
+
+Взвод: после каждой пачки событий эндпоинт смотрит вершину кучи и делает
+`timerfd_settime(ep->timerfd, TFD_TIMER_ABSTIME, ...)`. Регистрация timerfd — в
+том же epoll, `ev.data.ptr = &ep->timer_tag`; диспетчер в
+`__mpx_epoll_process_events` уже умеет сравнивать `ptr` с тегом таймера воркера —
+добавляется ветка для тегов эндпоинтов.
+
+**Разрешение.** `CLOCK_MONOTONIC`, микросекунды. Не наносекунды: `uint64_t` в
+микросекундах даёт запас на 500 тыс. лет и упрощает арифметику RTT.
+
+**Тестируемость.** Все модули берут время не из `clock_gettime()` напрямую, а
+через `quic_now_us()`, которое в тестах подменяется
+(`quic_time_set_source(fn)`). Без этого loss detection нельзя покрыть юнит-тестами.
+
+---
+
+## 7. Адреса, IPv6 и совместимость
+
+`quicconn_t` хранит `quicpath_t { sockaddr_storage local, remote; }`. Активный
+путь может смениться при миграции.
+
+`connection_t::remote_ip`/`remote_port` — `in_addr_t`, их читает ratelimiter и,
+возможно, хендлеры. Заполняем:
+
+- IPv4-путь — как обычно;
+- IPv6-путь — `remote_ip = 0` и новое поле `connection_t::remote_addr`
+  (`sockaddr_storage`), которое становится источником истины. Ratelimiter
+  получает вспомогательную функцию `connection_client_key()`, возвращающую
+  ключ для хеша (4 байта для v4, 8 байт префикса /64 для v6 — по /64, потому что
+  один клиент получает целую /64 и лимит по /128 бесполезен).
+
+Это единственное место, где h3 вынуждает менять поведение существующего кода;
+изменение обратно совместимо для IPv4.
+
+---
+
+## 8. Конкурентность и порядок блокировок
+
+Наследуем модель h2 (`docs/concurrency/`), добавляя один уровень:
+
+```
+ep->tx_lock            (leaf; удерживается на единицы инструкций)
+quic_conntable шард    (leaf; только на время lookup/insert/remove)
+connection_s_lock      (всё состояние соединения, как в h2)
+publish_queue          (берётся под connection_s_lock — как в h2)
+```
+
+Правила:
+
+1. **Никогда** не брать `connection_s_lock`, удерживая `tx_lock` или шард
+   таблицы. Обратный порядок разрешён и используется.
+2. Всё состояние `quicconn_t` (пакетные пространства, потоки, cwnd, ключи)
+   трогается только под `connection_s_lock` — тот же контракт, что у
+   `h2session_t`.
+3. Кучу таймеров эндпоинта трогает **только** поток-владелец эндпоинта. Если
+   пакет пришёл на «чужой» воркер (ADR-3) и требует перевзвода таймера, это
+   делается через `quicendpoint_want_write()` — то есть флагом, а не прямым
+   доступом к куче; владелец подберёт при следующем проходе.
+4. TSan-сборка (`-DSANITIZE=thread`) обязательна в CI начиная с фазы 4.
+
+---
+
+## 9. Метрики фазы
+
+Секция `quic` в `/metrics` (появляется вместе с эндпоинтом, наполняется дальше):
+
+```
+quic.datagrams_received, quic.datagrams_sent, quic.bytes_received, quic.bytes_sent
+quic.datagrams_dropped{reason=too_short|unknown_cid|bad_version|no_budget}
+quic.connections_active, quic.connections_accepted, quic.connections_closed
+quic.version_negotiation_sent, quic.stateless_reset_sent, quic.retry_sent
+quic.rx_batch_size (гистограмма), quic.tx_batch_size
+quic.recvmmsg_calls, quic.sendmmsg_calls, quic.send_errors{eagain|emsgsize|other}
+```
+
+---
+
+## 10. Критерии готовности фазы 1
+
+1. Сервер поднимает UDP-сокет на настроенном адресе, `ss -lun` его показывает.
+2. Датаграмма с неизвестной версией → в ответ корректный Version Negotiation
+   (проверяется скриптом на Python из `tests/`, разбор вручную).
+3. Датаграмма короче 1200 байт с long header → тишина, счётчик `too_short` растёт.
+4. Датаграмма с неизвестным CID и short header → Stateless Reset в пределах
+   бюджета.
+5. `/metrics` показывает секцию `quic`.
+6. Отключение `INCLUDE_HTTP3` возвращает сборку в исходное состояние.
+7. ASan и TSan чисты на нагрузке `hping`-подобным генератором мусора.
