@@ -1906,8 +1906,15 @@ TEST(test_httprequestparser_path_ending_traversal) {
     cleanup_mock_domain();
 }
 
+/* asterisk-form (RFC 9112 §3.2.4) — docs/http2/10, S.2.
+ *
+ * This case used to assert the opposite: that "OPTIONS *" is rejected because
+ * the target does not start with "/". That was the bug, written down as an
+ * expectation — the form is legal, and only for OPTIONS. */
 TEST(test_httprequestparser_options_asterisk) {
     TEST_CASE("Handle OPTIONS * request");
+
+    setup_mock_domain();
 
     char buffer[4096];
     const char* request = "OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n";
@@ -1919,11 +1926,39 @@ TEST(test_httprequestparser_options_asterisk) {
     httpparser_set_bytes_readed(parser, strlen(request));
     int result = httpparser_run(parser);
 
-    // OPTIONS * requires special handling - asterisk form not starting with /
-    TEST_ASSERT_EQUAL(HTTP1PARSER_BAD_REQUEST, result, "Should reject OPTIONS * (not starting with /)");
+    TEST_ASSERT_EQUAL(HTTP1PARSER_COMPLETE, result, "OPTIONS * should parse");
+    TEST_ASSERT_EQUAL(ROUTE_OPTIONS, parser->request->method, "Method should be OPTIONS");
+    TEST_ASSERT_EQUAL(1, parser->request->asterisk_form, "Request should be marked asterisk-form");
+    TEST_ASSERT_EQUAL((size_t)1, parser->request->path_length, "Path should be one character");
+    TEST_ASSERT(parser->request->path != NULL && parser->request->path[0] == '*',
+                "Path should be the literal \"*\", which no route matches");
 
     httpparser_free(parser);
     free_mock_connection(conn);
+    cleanup_mock_domain();
+}
+
+/* The other half of the rule: "*" is a target for OPTIONS and nothing else. */
+TEST(test_httprequestparser_get_asterisk_rejected) {
+    TEST_CASE("Reject GET * request");
+
+    setup_mock_domain();
+
+    char buffer[4096];
+    const char* request = "GET * HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    strcpy(buffer, request);
+
+    connection_t* conn = create_mock_connection(buffer, strlen(buffer));
+    httprequestparser_t* parser = httpparser_create(conn);
+
+    httpparser_set_bytes_readed(parser, strlen(request));
+    int result = httpparser_run(parser);
+
+    TEST_ASSERT_EQUAL(HTTP1PARSER_BAD_REQUEST, result, "asterisk-form is for OPTIONS only");
+
+    httpparser_free(parser);
+    free_mock_connection(conn);
+    cleanup_mock_domain();
 }
 
 TEST(test_httprequestparser_very_long_path) {
