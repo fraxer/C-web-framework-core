@@ -446,6 +446,22 @@ int __handle(connection_t* connection, httprequest_t* request, deferred_handler 
     if (conn_ctx->is_http2)
         h2_server_attach_response(connection, request, response);
 
+    /* asterisk-form (RFC 9110 §9.3.7): "OPTIONS *" asks what the server as a
+     * whole can do, not what one resource can do. There is nothing to route it
+     * to and no file to serve, so this is the only place it can be answered —
+     * ahead of the redirects, which are about resources too. The parsers let
+     * "*" through for no other method (docs/http2/10, S.2). */
+    if (request->asterisk_form) {
+        response->status_code = 200;
+        response->add_header(response, "Allow", "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS");
+        /* An empty body, and no Content-Type to describe it: the response says
+         * what the server accepts, it does not carry a representation. */
+        response->send_datan(response, "", 0);
+        response->remove_header(response, "Content-Type");
+
+        return handler(request, response);
+    }
+
     switch (__apply_redirect(request, response, handler)) {
     case -1:
         return 0;

@@ -77,6 +77,11 @@ typedef struct h2session {
      * cont_len and can be repeated forever (docs/http2/08, phase A.3). */
     uint32_t cont_frames;
 
+    /* The client preface is the 24-byte magic *and* a SETTINGS frame (§3.4);
+     * the frame parser consumes the magic, this records that the SETTINGS
+     * arrived. Anything else as the first frame is an invalid preface. */
+    int peer_settings_seen;
+
     /* Peer settings (RFC defaults until the peer sends SETTINGS). */
     uint32_t peer_max_frame_size;
     uint32_t peer_initial_window;

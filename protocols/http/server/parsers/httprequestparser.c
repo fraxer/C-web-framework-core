@@ -470,6 +470,19 @@ int httpparser_set_uri(httprequest_t* request, const char* string, size_t length
     request->uri = string;
     request->uri_length = length;
 
+    /* asterisk-form (RFC 9112 §3.2.4): the target is "*", which asks about the
+     * server itself and is legal for OPTIONS alone. `path` gets the literal "*"
+     * — no route matches it, and http_server_dispatch answers it before routing
+     * (docs/http2/10, S.2). Rejecting it used to be the only reason
+     * "OPTIONS * HTTP/1.1" came back 400. */
+    if (length == 1 && string[0] == '*') {
+        if (request->method != ROUTE_OPTIONS) return HTTP1PARSER_BAD_REQUEST;
+
+        request->asterisk_form = 1;
+
+        return __set_path(request, string, length);
+    }
+
     if (string[0] != '/')
         return HTTP1PARSER_BAD_REQUEST;
 

@@ -829,6 +829,24 @@ static int h2_set_path(httprequest_t* request, const char* value, size_t len) {
     request->uri = uri;
     request->uri_length = len;
 
+    /* asterisk-form (§8.3.1): ":path" of "*" for an OPTIONS request. Handled
+     * here rather than left to httpparser_set_uri, which decides it by looking
+     * at request->method: pseudo-headers may arrive in any order, so :method is
+     * not necessarily known yet. Whether OPTIONS was the method is therefore
+     * checked once the whole block has been read (docs/http2/10, S.2). */
+    if (len == 1 && uri[0] == '*') {
+        char* path = malloc(2);
+        if (path == NULL) return 0;
+
+        path[0] = '*';
+        path[1] = '\0';
+        request->path = path;
+        request->path_length = 1;
+        request->asterisk_form = 1;
+
+        return 1;
+    }
+
     return httpparser_set_uri(request, uri, len) == HTTP1PARSER_CONTINUE;
 }
 #pragma GCC diagnostic pop
@@ -1085,6 +1103,11 @@ static h2_request_status_e h2_build_request(h2session_t* s, h2stream_t* stream,
      * check below anyway; naming it here keeps that from looking accidental. */
 
     if (!method_seen || !path_seen || !scheme_seen || request->method == ROUTE_NONE)
+        return H2_REQUEST_MALFORMED;
+
+    /* §8.3.1: ":path" may be "*" only for an OPTIONS request. Checked here
+     * because the pseudo-headers may arrive in either order (see h2_set_path). */
+    if (request->asterisk_form && request->method != ROUTE_OPTIONS)
         return H2_REQUEST_MALFORMED;
 
     /* :authority (mapped to Host above) selects the virtual server, and on a
@@ -1668,10 +1691,20 @@ static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) 
     if ((frame->stream_id & 1) == 0) return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
 
     const h2stream_state_e state = h2_stream_state_of(s, frame->stream_id);
-    if (state == H2_STREAM_CLOSED || state == H2_STREAM_HALF_CLOSED_REMOTE)
-        return h2_conn_error(s, H2_ERR_STREAM_CLOSED);
+    /* §5.1 "closed": the stream is gone from the table, so there is nothing left
+     * to reset and no way to tell a finished stream from a never-opened id —
+     * both are a connection error here (the code that goes out is discussed in
+     * docs/http2/10, S.4). */
+    if (state == H2_STREAM_CLOSED) return h2_conn_error(s, H2_ERR_STREAM_CLOSED);
 
     const int trailers = (state == H2_STREAM_OPEN);
+    /* §5.1 "half-closed (remote)": the peer already ended its side, so this
+     * block is a violation — but a *stream* error, not a connection one. It has
+     * to travel the same path as a refusal below, because the block still has to
+     * reach the HPACK decoder: the table is shared with every other stream on
+     * the connection, and skipping one block desynchronises it for good.
+     * This used to kill the connection instead (docs/http2/10, S.3). */
+    const int half_closed = (state == H2_STREAM_HALF_CLOSED_REMOTE);
 
     const uint8_t* block = frame->payload;
     size_t block_len = frame->payload_len;
@@ -1697,7 +1730,7 @@ static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) 
 
     /* Reasons to reject the stream outright. The block is still decoded first,
      * to keep the connection-wide HPACK context usable for later streams. */
-    const int refused = !trailers &&
+    const int refused = !trailers && !half_closed &&
         (h2stream_active_count(s) >= H2_MAX_CONCURRENT_STREAMS ||
          /* RFC 9113 §6.8: once GOAWAY(last_stream_id) is out, streams with a
           * higher id are out of bounds. Streams at or below the boundary that
@@ -1707,7 +1740,7 @@ static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) 
           * announced it is going away. Refusing keeps the drain finite: every
           * accepted stream would push the close back another response. */
          s->peer_goaway);
-    if (self_dependent || refused) {
+    if (self_dependent || refused || half_closed) {
         if (frame->flags & H2_FLAG_END_HEADERS) {
             const h2_request_status_e status = h2_discard_header_block(s, block, block_len);
             if (status != H2_REQUEST_OK)
@@ -1719,7 +1752,11 @@ static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) 
 
         /* A refusal is work the peer made us do for a stream it never got to
          * hold, exactly like a reset — same budget (phase A.2). Charged after
-         * the block is decoded, so the HPACK table is in step either way. */
+         * the block is decoded, so the HPACK table is in step either way.
+         *
+         * A half-closed stream is not charged: the reset below drops it from the
+         * table, so the next block on that id is a "closed" stream and ends the
+         * connection anyway. One per id is not a loop. */
         if (refused && !h2_abort_budget_spend(s)) {
             metrics_h2_abuse(METRICS_H2_RST_FLOOD);
             log_error("h2: refused-stream budget exhausted (fd %d)\n", s->connection->fd);
@@ -1727,6 +1764,7 @@ static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) 
         }
 
         return h2_stream_error(s, frame->stream_id,
+                               half_closed ? H2_ERR_STREAM_CLOSED :
                                refused ? H2_ERR_REFUSED_STREAM : H2_ERR_PROTOCOL_ERROR);
     }
 
@@ -1865,6 +1903,19 @@ static h2_frame_result_e h2_on_data(h2session_t* s, const h2_frame_t* frame) {
 }
 
 static h2_frame_result_e h2_handle_frame(h2session_t* s, const h2_frame_t* frame) {
+    /* §3.4: the client preface is the magic *followed by a SETTINGS frame*, and
+     * an invalid preface is a connection error. The frame parser has consumed
+     * the magic by now; this is the other half of the rule, which used to be
+     * missing entirely — any frame at all was accepted first (docs/http2/10,
+     * S.1). An ACK does not count: the preface SETTINGS is the peer's own, not
+     * an acknowledgement of ours. */
+    if (!s->peer_settings_seen) {
+        if (frame->type != H2_FRAME_SETTINGS || (frame->flags & H2_FLAG_ACK))
+            return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
+
+        s->peer_settings_seen = 1;
+    }
+
     /* A header block must not be interleaved with any other frame (§6.10). */
     if (s->cont_active && frame->type != H2_FRAME_CONTINUATION)
         return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);

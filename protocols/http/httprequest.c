@@ -83,6 +83,7 @@ httprequest_t* httprequest_create(connection_t* connection) {
     if (request == NULL) return NULL;
 
     request->method = ROUTE_NONE;
+    request->asterisk_form = 0;
     request->version = HTTP1_VER_NONE;
     request->transfer_encoding = TE_NONE;
     request->content_encoding = CE_NONE;
@@ -126,6 +127,7 @@ httprequest_t* httprequest_create(connection_t* connection) {
 
 void httprequest_reset(httprequest_t* request) {
     request->method = ROUTE_NONE;
+    request->asterisk_form = 0;
     request->version = HTTP1_VER_NONE;
     request->uri_length = 0;
     request->path_length = 0;

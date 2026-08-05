@@ -241,6 +241,11 @@ typedef struct httprequest {
     int(*set_payload_file_content)(struct httprequest* request, const file_content_t* content);
 
     route_methods_e method;
+    /* asterisk-form: the target was "*", not a path (RFC 9112 §3.2.4 for h1.1,
+     * RFC 9113 §8.3.1 for h2). Legal only with OPTIONS, and it asks about the
+     * server rather than any resource — so it is answered before routing, and
+     * `path` carries the literal "*" that no route will ever match. */
+    int asterisk_form;
     http_version_e version;
     http_payload_t payload_;
     http_trunsfer_encoding_t transfer_encoding;
