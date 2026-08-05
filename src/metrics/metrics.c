@@ -25,7 +25,8 @@ static const char* const __wait_bucket_name[METRICS_WAIT_BUCKETS] = {
 static const char* const __h2_abuse_name[METRICS_H2_ABUSE__COUNT] = {
     "flow_control.connection", "flow_control.stream",
     "rst_flood", "continuation_flood",
-    "header_list_too_large", "header_list_hard_cap"
+    "header_list_too_large", "header_list_hard_cap", "header_list_flood",
+    "control_frame_flood", "output_backlog"
 };
 
 /* Index-matched to metrics_lock_site_t. Kept next to the enum's comment, not

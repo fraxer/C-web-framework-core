@@ -98,6 +98,14 @@ typedef struct h2session {
     int64_t  abort_tokens;
     uint64_t abort_epoch_ms;
 
+    /* Budget for frames that make us answer without advancing anything — PING,
+     * SETTINGS, empty DATA, PRIORITY, WINDOW_UPDATE for a stream that is gone
+     * (docs/http2/10, R.2). Same milli-token arithmetic as above, its own bucket
+     * because an honest client's rate of these has nothing to do with its rate
+     * of stream cancellations. */
+    int64_t  ctrl_tokens;
+    uint64_t ctrl_epoch_ms;
+
     /* Connection-level send window (RFC 9113 §6.9); each stream has its own. */
     int64_t  send_window;
     /* Every stream that can still send is out of connection-level window: stop

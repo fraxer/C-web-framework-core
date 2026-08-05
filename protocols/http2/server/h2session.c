@@ -83,6 +83,21 @@
 #define H2_DEFAULT_ABORT_RATE  100   /* tokens/s */
 #define H2_DEFAULT_ABORT_BURST 200   /* tokens */
 
+/* Frames that produce an answer but no progress (docs/http2/10, R.2). An honest
+ * client sends a PING every few seconds at most and a SETTINGS once or twice per
+ * connection, so this is two orders of magnitude above ordinary use — the point
+ * is to bound a loop, not to police pacing. */
+#define H2_DEFAULT_CTRL_RATE  100  /* tokens/s */
+#define H2_DEFAULT_CTRL_BURST 200  /* tokens */
+
+/* Cap on frames queued for the peer but not yet written (docs/http2/10, R.1).
+ * A peer that sends and never reads makes us hold its answers: the socket
+ * buffer fills, and everything after that lands in s->out. One megabyte is far
+ * above what any legitimate backlog reaches — the response headers and window
+ * updates for a hundred concurrent streams are tens of kilobytes — and it is
+ * the ceiling, not a target. */
+#define H2_DEFAULT_MAX_OUT_BACKLOG (1024 * 1024)
+
 /* Frames per header block. At the default max frame size this is the same 1 MB
  * H2_MAX_HEADER_BLOCK allows, approached from the other side: empty
  * CONTINUATION frames cost work without costing bytes. */
@@ -155,6 +170,9 @@ static int64_t  h2_recv_window_max = H2_DEFAULT_RECV_WINDOW_MAX;
 static int64_t  h2_write_quantum = H2_DEFAULT_WRITE_QUANTUM;
 static int64_t  h2_abort_rate = H2_DEFAULT_ABORT_RATE;
 static int64_t  h2_abort_burst = H2_DEFAULT_ABORT_BURST;
+static int64_t  h2_ctrl_rate = H2_DEFAULT_CTRL_RATE;
+static int64_t  h2_ctrl_burst = H2_DEFAULT_CTRL_BURST;
+static size_t   h2_max_out_backlog = H2_DEFAULT_MAX_OUT_BACKLOG;
 static uint32_t h2_max_continuation_frames = H2_DEFAULT_MAX_CONTINUATION_FRAMES;
 static int64_t  h2_max_header_list_size = H2_DEFAULT_MAX_HEADER_LIST_SIZE;
 static int64_t  h2_max_header_list_hard =
@@ -215,6 +233,19 @@ void h2_policy_init(void) {
     /* A burst below the concurrency limit would fire on a client that merely
      * cancels everything it has open, which is ordinary behaviour. */
     if (h2_abort_burst < H2_MAX_CONCURRENT_STREAMS) h2_abort_burst = H2_MAX_CONCURRENT_STREAMS;
+
+    h2_ctrl_rate = env_get_int("http2_ctrl_rate", H2_DEFAULT_CTRL_RATE);
+    if (h2_ctrl_rate < 0) h2_ctrl_rate = 0;
+
+    h2_ctrl_burst = env_get_int("http2_ctrl_burst", H2_DEFAULT_CTRL_BURST);
+    if (h2_ctrl_burst < 1) h2_ctrl_burst = 1;
+
+    /* 0 disables the backlog cap. Floored well above one maximum-size frame so
+     * the limit can never fire on a single legitimate write. */
+    h2_max_out_backlog = (size_t)env_get_int("http2_max_out_backlog",
+                                             H2_DEFAULT_MAX_OUT_BACKLOG);
+    if (h2_max_out_backlog != 0 && h2_max_out_backlog < 4 * H2_MAX_FRAME_SIZE_DEFAULT)
+        h2_max_out_backlog = 4 * H2_MAX_FRAME_SIZE_DEFAULT;
 
     h2_max_continuation_frames = (uint32_t)env_get_int("http2_max_continuation_frames",
                                                        H2_DEFAULT_MAX_CONTINUATION_FRAMES);
@@ -547,32 +578,62 @@ static void h2_stream_recv_init(h2session_t* s, h2stream_t* stream) {
                                (uint32_t)(stream->recv.size - h2_recv_window_initial));
 }
 
-/* Spend one token of the stream-abort budget (docs/http2/08, phase A.2).
+/* Spend one token of a leaky bucket. The bucket is kept in milli-tokens so the
+ * refill is exact integer arithmetic: a rate of R tokens per second is R
+ * milli-tokens per elapsed millisecond, with no remainder to drop however often
+ * this is called. `rate` of 0 disables the limit.
+ *
+ * Returns 0 when the budget is spent, and the caller ends the connection. */
+static int h2_budget_spend(int64_t* tokens, uint64_t* epoch_ms,
+                           int64_t rate, int64_t burst) {
+    if (rate == 0) return 1; /* disabled */
+
+    const uint64_t now = h2_now_ms();
+    const uint64_t elapsed = now - *epoch_ms;
+    const int64_t cap = burst * 1000;
+
+    *epoch_ms = now;
+    *tokens += (int64_t)elapsed * rate;
+    if (*tokens > cap) *tokens = cap;
+
+    if (*tokens < 1000) return 0;
+
+    *tokens -= 1000;
+
+    return 1;
+}
+
+/* Stream-abort budget (docs/http2/08, phase A.2).
  *
  * A stream that is opened and immediately reset costs a dispatch and an HPACK
  * decode while holding a concurrency slot for no measurable time, so
- * MAX_CONCURRENT_STREAMS bounds nothing at all — this is CVE-2023-44487. The
- * bucket is kept in milli-tokens so the refill is exact integer arithmetic: a
- * rate of R tokens per second is R milli-tokens per elapsed millisecond, with no
- * remainder to drop however often this is called.
- *
- * Returns 0 when the budget is spent, and the caller ends the connection. */
+ * MAX_CONCURRENT_STREAMS bounds nothing at all — this is CVE-2023-44487. */
 static int h2_abort_budget_spend(h2session_t* s) {
-    if (h2_abort_rate == 0) return 1; /* disabled */
+    return h2_budget_spend(&s->abort_tokens, &s->abort_epoch_ms,
+                           h2_abort_rate, h2_abort_burst);
+}
 
-    const uint64_t now = h2_now_ms();
-    const uint64_t elapsed = now - s->abort_epoch_ms;
-    const int64_t cap = h2_abort_burst * 1000;
+/* Budget for frames that make this server work without advancing anything
+ * (docs/http2/10, R.2). Everything charged here is legal, cheap for the peer to
+ * send, and either produces an answer of ours or is simply discarded:
+ *
+ *   PING without ACK      we must echo it back (CVE-2019-9512)
+ *   SETTINGS without ACK  we must acknowledge it (CVE-2019-9515)
+ *   DATA of zero length   costs no flow-control window at all (CVE-2019-9518)
+ *   PRIORITY              deprecated by §5.3 and ignored here (CVE-2019-9513)
+ *   WINDOW_UPDATE on a stream that no longer exists
+ *
+ * Deliberately a second bucket rather than a share of the abort one: an honest
+ * client's rate of these is nothing like its rate of stream cancellations, and
+ * one bucket for both would have to be set by the looser of the two. */
+static int h2_ctrl_budget_spend(h2session_t* s) {
+    return h2_budget_spend(&s->ctrl_tokens, &s->ctrl_epoch_ms,
+                           h2_ctrl_rate, h2_ctrl_burst);
+}
 
-    s->abort_epoch_ms = now;
-    s->abort_tokens += (int64_t)elapsed * h2_abort_rate;
-    if (s->abort_tokens > cap) s->abort_tokens = cap;
-
-    if (s->abort_tokens < 1000) return 0;
-
-    s->abort_tokens -= 1000;
-
-    return 1;
+/* Bytes queued for the peer and not yet on the wire. */
+static size_t h2_out_pending(const h2session_t* s) {
+    return s->out_len > s->out_pos ? s->out_len - s->out_pos : 0;
 }
 
 static int rearm(connection_t* conn, int events) {
@@ -596,6 +657,15 @@ static h2_frame_result_e h2_conn_error(h2session_t* s, uint32_t error_code) {
     s->error_code = error_code;
 
     return H2_FRAME_ERROR;
+}
+
+/* Common tail for a spent control budget: name the frame that ran it out, since
+ * which one it was is the whole diagnosis, and end the connection. */
+static h2_frame_result_e h2_ctrl_flood(h2session_t* s, const char* what) {
+    metrics_h2_abuse(METRICS_H2_CTRL_FLOOD);
+    log_error("h2: control-frame budget exhausted by %s (fd %d)\n", what, s->connection->fd);
+
+    return h2_conn_error(s, H2_ERR_ENHANCE_YOUR_CALM);
 }
 
 /* Retire a stream, keeping the session's write cursor consistent. h2stream_close
@@ -1231,6 +1301,11 @@ static h2_frame_result_e h2_on_settings(h2session_t* s, const h2_frame_t* frame)
         return H2_FRAME_OK;
     }
 
+    /* Every SETTINGS costs us an ACK, and an empty one costs the peer nine
+     * bytes (docs/http2/10, R.2). Charged before the payload is applied: a
+     * settings flood is a flood whether or not the values are meaningful. */
+    if (!h2_ctrl_budget_spend(s)) return h2_ctrl_flood(s, "SETTINGS");
+
     const h2_frame_result_e r = h2_apply_settings_payload(s, frame->payload, frame->payload_len);
     if (r != H2_FRAME_OK) return r;
 
@@ -1266,7 +1341,14 @@ static h2_frame_result_e h2_on_window_update(h2session_t* s, const h2_frame_t* f
         return h2_stream_error(s, frame->stream_id, H2_ERR_PROTOCOL_ERROR);
 
     h2stream_t* stream = h2stream_find(s, frame->stream_id);
-    if (stream == NULL) return H2_FRAME_OK;
+    if (stream == NULL) {
+        /* The stream is closed and gone: the update lands nowhere. A few of
+         * these are ordinary — the peer credited a stream we had just finished —
+         * which is why they are charged rather than refused (docs/http2/10, R.2). */
+        if (!h2_ctrl_budget_spend(s)) return h2_ctrl_flood(s, "WINDOW_UPDATE on a closed stream");
+
+        return H2_FRAME_OK;
+    }
 
     stream->send_window += increment;
     if (stream->send_window > H2_MAX_WINDOW)
@@ -1290,6 +1372,11 @@ static int h2_priority_self_dependent(uint32_t stream_id, const uint8_t* priorit
 static h2_frame_result_e h2_on_priority(h2session_t* s, const h2_frame_t* frame) {
     if (h2_priority_self_dependent(frame->stream_id, frame->payload))
         return h2_stream_error(s, frame->stream_id, H2_ERR_PROTOCOL_ERROR);
+
+    /* Nothing here changes any state — §5.3 deprecated the scheme and we
+     * advertise NO_RFC7540_PRIORITIES, so a conforming client sends none of
+     * these at all (docs/http2/10, R.2). */
+    if (!h2_ctrl_budget_spend(s)) return h2_ctrl_flood(s, "PRIORITY");
 
     return H2_FRAME_OK;
 }
@@ -1547,6 +1634,11 @@ static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
          * token an oversize block is free to repeat for as long as the client
          * likes (docs/http2/10, H.2). */
         if (!h2_abort_budget_spend(s)) {
+            /* Its own counter although it spends the abort budget: the operator's
+             * answer differs (raise http2_max_header_list_size, or treat it as an
+             * attack), and "header_list_too_large" above only says a 431 went out,
+             * not that the connection ended over it. */
+            metrics_h2_abuse(METRICS_H2_HEADER_LIST_FLOOD);
             log_error("h2: oversize-header budget exhausted (fd %d)\n", s->connection->fd);
             return h2_conn_error(s, H2_ERR_ENHANCE_YOUR_CALM);
         }
@@ -1705,6 +1797,14 @@ static h2_frame_result_e h2_on_data(h2session_t* s, const h2_frame_t* frame) {
      * payload: the peer counted it against our window either way. */
     h2_recv_credit(s, 0, &s->recv, frame->payload_len);
 
+    /* A DATA frame with no payload spends no window at all, so flow control —
+     * the thing that bounds every other DATA frame — does not bound this one
+     * (CVE-2019-9518). With END_STREAM it is meaningful: that is how a request
+     * with no body ends. Without it, it is nine bytes of nothing. */
+    if (frame->payload_len == 0 && !(frame->flags & H2_FLAG_END_STREAM) &&
+        !h2_ctrl_budget_spend(s))
+        return h2_ctrl_flood(s, "empty DATA");
+
     /* §5.1: DATA on a stream that was never opened is a connection error; on
      * one that no longer accepts data it is a stream error. */
     const h2stream_state_e state = h2_stream_state_of(s, frame->stream_id);
@@ -1801,6 +1901,10 @@ static h2_frame_result_e h2_handle_frame(h2session_t* s, const h2_frame_t* frame
             s->last_activity_ms = h2_now_ms();
             return H2_FRAME_OK;
         }
+        /* Every PING obliges us to send one back, which is what makes a flood
+         * of them worth anything to an attacker (docs/http2/10, R.2). */
+        if (!h2_ctrl_budget_spend(s)) return h2_ctrl_flood(s, "PING");
+
         if (!h2_session_queue_frame(s, H2_FRAME_PING, H2_FLAG_ACK, 0,
                                     frame->payload, frame->payload_len))
             return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
@@ -1875,6 +1979,24 @@ static int h2_process_buffer(h2session_t* s) {
         }
         if (r == H2_FRAME_CLOSE) {
             result = 0;
+            break;
+        }
+
+        /* Answers pile up here when the peer stops reading (docs/http2/10,
+         * R.1): the socket buffer fills, h2_flush_out can place nothing, and
+         * every frame it owes goes on growing s->out. Checked per frame rather
+         * than inside h2_session_queue_frame so the peer gets the honest error
+         * code and one counter — a failed queue is an allocation problem, this
+         * is a behaviour problem.
+         *
+         * Only the read path needs the check. The frames the write path queues
+         * for itself (trailers, early hints) are bounded by the stream table,
+         * and it drains to the socket in the same pass. */
+        if (h2_max_out_backlog != 0 && h2_out_pending(s) > h2_max_out_backlog) {
+            metrics_h2_abuse(METRICS_H2_OUT_BACKLOG);
+            log_error("h2: %zu bytes queued for a peer that is not reading (fd %d)\n",
+                      h2_out_pending(s), s->connection->fd);
+            result = h2_fail(s, H2_ERR_ENHANCE_YOUR_CALM);
             break;
         }
     }
@@ -2688,6 +2810,8 @@ static h2session_t* h2_session_begin(connection_t* connection) {
     s->last_activity_ms = h2_now_ms();
     s->abort_tokens = h2_abort_burst * 1000;
     s->abort_epoch_ms = s->last_activity_ms;
+    s->ctrl_tokens = h2_ctrl_burst * 1000;
+    s->ctrl_epoch_ms = s->last_activity_ms;
 
     /* Server connection preface (§3.4): SETTINGS must be the first frame we send. */
     if (!h2_send_preface(s)) {

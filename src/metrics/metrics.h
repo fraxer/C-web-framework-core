@@ -81,6 +81,9 @@ typedef enum {
     METRICS_H2_CONT_FLOOD,        /* too many CONTINUATION frames in one block */
     METRICS_H2_HEADER_LIST,       /* header list over the advertised limit → 431 */
     METRICS_H2_HEADER_LIST_HARD,  /* header list over the hard cap → connection */
+    METRICS_H2_HEADER_LIST_FLOOD, /* 431s repeated until the abort budget ran out */
+    METRICS_H2_CTRL_FLOOD,        /* PING/SETTINGS/empty DATA/PRIORITY budget spent */
+    METRICS_H2_OUT_BACKLOG,       /* peer stopped reading and the queue hit its cap */
     METRICS_H2_ABUSE__COUNT
 } metrics_h2_abuse_t;
 
