@@ -29,6 +29,8 @@ server_t* server_create() {
     server->websockets.route = NULL;
     server->websockets.middleware = NULL;
     server->websockets.ratelimiter = NULL;
+    server->http3.enabled = 0;
+    server->http3.port = 0;
     server->openssl = NULL;
     server->broadcast = NULL;
     server->ratelimits_config = NULL;

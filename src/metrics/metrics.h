@@ -87,6 +87,53 @@ typedef enum {
     METRICS_H2_ABUSE__COUNT
 } metrics_h2_abuse_t;
 
+#ifdef CWFR_HTTP3
+/* QUIC endpoint counters (docs/http3/01-udp-endpoint.md §9).
+ *
+ * The UDP endpoint answers unauthenticated datagrams from anyone, so unlike TCP
+ * there is no accept() to tell "a peer connected" from "a peer sent noise". The
+ * only way to tell a firewall problem from a scanner from a real client is to
+ * count why each datagram was dropped -- which is why the drop reasons are
+ * separate counters and not one total. The first question asked of a silent h3
+ * server is always "do datagrams arrive at all", and these answer it.
+ *
+ * Datagram counters sit on the per-datagram path; each is one relaxed
+ * read-modify-write behind a relaxed load of the enable flag. */
+typedef enum {
+    METRICS_QUIC_DGRAM_RECEIVED = 0,
+    METRICS_QUIC_DGRAM_SENT,
+    METRICS_QUIC_BYTES_RECEIVED,
+    METRICS_QUIC_BYTES_SENT,
+    /* Datagrams received divided by this gives the average recvmmsg batch --
+     * the number that says whether batching is earning anything. */
+    METRICS_QUIC_RECV_CALLS,
+
+    /* Drops, by reason. */
+    METRICS_QUIC_DROP_TRUNCATED,      /* buffer ended inside the invariant header */
+    METRICS_QUIC_DROP_OVERSIZE,       /* larger than the receive buffer (MSG_TRUNC) */
+    METRICS_QUIC_DROP_CID_TOO_LONG,   /* connection id past RFC 9000 §5.1's 20 bytes */
+    METRICS_QUIC_DROP_SHORT_INITIAL,  /* long header in a datagram under 1200 bytes */
+    METRICS_QUIC_DROP_UNKNOWN_CID,    /* no connection, and nothing owed in reply */
+    METRICS_QUIC_DROP_NO_BUDGET,      /* a reply was owed but the rate limit said no */
+    METRICS_QUIC_DROP_PEER_VN,        /* a peer sent US a Version Negotiation packet */
+
+    METRICS_QUIC_VERSION_NEGOTIATION, /* Version Negotiation packets sent */
+    METRICS_QUIC_STATELESS_RESET,     /* stateless resets sent */
+    /* An Initial packet that would start a connection. Counted and dropped
+     * until phase 3 brings the TLS handshake -- an h3 build before then is
+     * reachable but cannot accept anyone, and this is what says so. */
+    METRICS_QUIC_INITIAL_NO_TLS,
+
+    METRICS_QUIC_SEND_ERROR,
+    METRICS_QUIC__COUNT
+} metrics_quic_t;
+
+/* Checks metrics_enabled() itself, like metrics_h2_abuse: the call sites are
+ * spread across the datagram path and would otherwise each repeat the test. */
+void metrics_quic(metrics_quic_t kind);
+void metrics_quic_add(metrics_quic_t kind, unsigned long long amount);
+#endif
+
 /* Not for direct use — read it through metrics_enabled(). */
 extern atomic_int __metrics_on;
 

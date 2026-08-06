@@ -29,6 +29,19 @@ static const char* const __h2_abuse_name[METRICS_H2_ABUSE__COUNT] = {
     "control_frame_flood", "output_backlog"
 };
 
+#ifdef CWFR_HTTP3
+/* Index-matched to metrics_quic_t. */
+static const char* const __quic_name[METRICS_QUIC__COUNT] = {
+    "datagrams_received", "datagrams_sent",
+    "bytes_received", "bytes_sent",
+    "recv_calls",
+    "drop.truncated", "drop.oversize", "drop.cid_too_long",
+    "drop.short_initial", "drop.unknown_cid", "drop.no_budget", "drop.peer_version_negotiation",
+    "version_negotiation_sent", "stateless_reset_sent", "initial_dropped_no_tls",
+    "send_error"
+};
+#endif
+
 /* Index-matched to metrics_lock_site_t. Kept next to the enum's comment, not
  * generated from it: the names go into JSON that benchmark notes quote verbatim,
  * so they are worth spelling out. */
@@ -75,6 +88,10 @@ typedef struct {
     atomic_ullong queue_depth_hist[METRICS_COUNT_BUCKETS];
 
     atomic_ullong h2_abuse[METRICS_H2_ABUSE__COUNT];
+
+#ifdef CWFR_HTTP3
+    atomic_ullong quic[METRICS_QUIC__COUNT];
+#endif
 
     atomic_ullong window_started_ns;
 } metrics_t;
@@ -206,6 +223,19 @@ void metrics_h2_abuse(metrics_h2_abuse_t kind) {
 
     atomic_fetch_add_explicit(&__m.h2_abuse[kind], 1, memory_order_relaxed);
 }
+
+#ifdef CWFR_HTTP3
+void metrics_quic(metrics_quic_t kind) {
+    metrics_quic_add(kind, 1);
+}
+
+void metrics_quic_add(metrics_quic_t kind, unsigned long long amount) {
+    if (!metrics_enabled()) return;
+    if (kind < 0 || kind >= METRICS_QUIC__COUNT) return;
+
+    atomic_fetch_add_explicit(&__m.quic[kind], amount, memory_order_relaxed);
+}
+#endif
 
 static unsigned long long __load(atomic_ullong* slot) {
     return atomic_load_explicit(slot, memory_order_relaxed);
@@ -370,6 +400,23 @@ json_doc_t* metrics_snapshot_json(void) {
 
     json_object_set(root, "http2_abuse", abuse);
 
+#ifdef CWFR_HTTP3
+    /* Unlike the abuse limits, zeroes are reported here. "No datagrams arrived"
+     * and "no drops happened" are both answers an operator is looking for, and
+     * an omitted key reads as "the build has no h3" rather than "the counter is
+     * zero" -- the opposite of what is being asked. */
+    json_token_t* quic = json_create_object();
+    if (quic == NULL) {
+        json_free(doc);
+        return NULL;
+    }
+
+    for (int i = 0; i < METRICS_QUIC__COUNT; i++)
+        json_object_set(quic, __quic_name[i], json_create_number((long double)__load(&__m.quic[i])));
+
+    json_object_set(root, "quic", quic);
+#endif
+
     return doc;
 }
 
@@ -408,6 +455,11 @@ void metrics_reset(void) {
 
     for (int i = 0; i < METRICS_H2_ABUSE__COUNT; i++)
         atomic_store_explicit(&__m.h2_abuse[i], 0, memory_order_relaxed);
+
+#ifdef CWFR_HTTP3
+    for (int i = 0; i < METRICS_QUIC__COUNT; i++)
+        atomic_store_explicit(&__m.quic[i], 0, memory_order_relaxed);
+#endif
 
     atomic_store_explicit(&__m.window_started_ns, metrics_now_ns(), memory_order_relaxed);
 }

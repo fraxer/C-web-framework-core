@@ -7,6 +7,10 @@
 #include "httpserverhandlers.h"
 #include "h2session.h"
 
+#ifdef CWFR_HTTP3
+#include "quicendpoint.h"
+#endif
+
 static int BUFFER_SIZE = 16384;
 
 static listener_t* __listeners_create(mpxapi_t* api, char* buffer, server_t* server);
@@ -27,6 +31,9 @@ int mpxserver_run(appconfig_t* appconfig) {
     if (api == NULL) return result;
 
     listener_t* listeners = NULL;
+#ifdef CWFR_HTTP3
+    quicendpoint_t* endpoints = NULL;
+#endif
     char* buffer = malloc(BUFFER_SIZE);
     if (buffer == NULL) goto failed;
 
@@ -34,18 +41,39 @@ int mpxserver_run(appconfig_t* appconfig) {
     if (listeners == NULL)
         goto failed;
 
+#ifdef CWFR_HTTP3
+    /* One UDP endpoint per (address, port) over the vhosts that enable http3.
+     * A NULL result is normal -- it just means nothing configured h3 -- so the
+     * failure is reported separately from the value. */
+    int quic_ok = 1;
+    endpoints = quicendpoints_create(api, appconfig->server_chain->server, &quic_ok);
+    if (!quic_ok)
+        goto failed;
+#endif
+
     /* Wire the worker timer sweep (idle/PING timeouts, graceful shutdown). */
     api->on_tick = __mpx_on_tick;
 
     if (!__listeners_listen(listeners))
         goto failed;
 
+#ifdef CWFR_HTTP3
+    if (!quicendpoints_listen(endpoints))
+        goto failed;
+#endif
+
     while (1) {
         api->process_events(appconfig, api);
 
         if (atomic_load(&appconfig->shutdown)) {
-            if (appconfig->env.main.reload != APPCONFIG_RELOAD_HARD)
+            if (appconfig->env.main.reload != APPCONFIG_RELOAD_HARD) {
                 __listeners_unlisten(listeners);
+#ifdef CWFR_HTTP3
+                /* Endpoints hold a reference in connection_count like listeners
+                 * do, so the drain below cannot reach zero until they are gone. */
+                quicendpoints_unlisten(endpoints);
+#endif
+            }
 
             if (atomic_load(&api->connection_count) == 0)
                 break;
@@ -55,6 +83,10 @@ int mpxserver_run(appconfig_t* appconfig) {
     result = 1;
 
     failed:
+
+#ifdef CWFR_HTTP3
+    quicendpoints_free(endpoints);
+#endif
 
     __listeners_free(listeners);
 

@@ -44,6 +44,20 @@ typedef struct server_websockets {
     int configured;
 } server_websockets_t;
 
+/* HTTP/3 listener settings for one vhost (docs/http3/07-integration.md §1.1).
+ *
+ * Deliberately NOT behind #ifdef CWFR_HTTP3, unlike the rest of the h3 code.
+ * That macro is directory-scoped to core/, so application handlers compile
+ * without it; a conditional field here would give core and the handlers two
+ * different layouts for server_t, which they share through
+ * libcwfr_framework.so. Two ints are not worth an ABI split. */
+typedef struct server_http3 {
+    int enabled;
+    /* UDP port. Defaults to the vhost's TCP port -- h3 on the same number is
+     * what Alt-Svc advertises by default and what clients expect. */
+    unsigned short int port;
+} server_http3_t;
+
 struct broadcast;
 
 typedef struct server {
@@ -52,6 +66,7 @@ typedef struct server {
     in_addr_t ip;
     server_http_t http;
     server_websockets_t websockets;
+    server_http3_t http3;
 
     char* root;
     domain_t* domain;

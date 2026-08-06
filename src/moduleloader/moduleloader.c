@@ -35,6 +35,10 @@
 #include "taskmanager.h"
 #include "metrics.h"
 #include "i18n.h"
+
+#ifdef CWFR_HTTP3
+#include "quicendpoint.h"
+#endif
 #ifdef MySQL_FOUND
     #include "mysql.h"
 #endif
@@ -208,6 +212,18 @@ int __module_loader_init_modules(appconfig_t* config, json_doc_t* document) {
      * survived a reload. */
     metrics_init(env_get_bool("metrics", 0));
     h2_policy_init();
+
+#ifdef CWFR_HTTP3
+    /* Same ordering contract as h2_policy_init: the QUIC policy is a set of
+     * plain globals plus the process-wide connection table, and reading them
+     * from every worker is only safe because this runs before any worker
+     * exists. It also generates the stateless-reset key, so it has to precede
+     * the first endpoint. */
+    if (!quic_policy_init()) {
+        log_error("__module_loader_init_modules: quic_policy_init error\n");
+        goto failed;
+    }
+#endif
 
     if (config->server_chain && config->server_chain->server)
         http_server_init_sni_callbacks(config->server_chain->server);
@@ -865,6 +881,59 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
                 goto failed;
             }
         }
+
+        const json_token_t* token_http3 = json_object_get(token_server, "http3");
+        if (token_http3 != NULL) {
+            if (!json_is_object(token_http3)) {
+                __module_loader_config_error("__module_loader_servers_load: http3 must be object\n");
+                goto failed;
+            }
+
+            const json_token_t* token_h3_enabled = json_object_get(token_http3, "enabled");
+            if (token_h3_enabled != NULL) {
+                if (!json_is_bool(token_h3_enabled)) {
+                    __module_loader_config_error("__module_loader_servers_load: http3.enabled must be bool\n");
+                    goto failed;
+                }
+                server->http3.enabled = json_bool(token_h3_enabled) ? 1 : 0;
+            }
+
+            const json_token_t* token_h3_port = json_object_get(token_http3, "port");
+            if (token_h3_port != NULL) {
+                if (!json_is_number(token_h3_port)) {
+                    __module_loader_config_error("__module_loader_servers_load: http3.port must be number\n");
+                    goto failed;
+                }
+                int ok = 0;
+                const int port = json_int(token_h3_port, &ok);
+                if (!ok || port < 1 || port > 65535) {
+                    __module_loader_config_error("__module_loader_servers_load: http3.port must be 1..65535\n");
+                    goto failed;
+                }
+                server->http3.port = (unsigned short int)port;
+            }
+
+            /* QUIC is TLS: RFC 9001 has no cleartext mode, and there is no h3c
+             * the way there is an h2c. A vhost asking for h3 without a tls
+             * section is a configuration mistake, not something to start and
+             * fail at handshake time. */
+            if (server->http3.enabled && server->openssl == NULL) {
+                __module_loader_config_error("__module_loader_servers_load: http3 requires a tls section\n");
+                goto failed;
+            }
+
+#ifndef CWFR_HTTP3
+            if (server->http3.enabled) {
+                __module_loader_config_error("__module_loader_servers_load: http3 is enabled in the config but this build has no HTTP/3 support (configure with -DINCLUDE_HTTP3=yes)\n");
+                goto failed;
+            }
+#endif
+        }
+
+        /* Default to the vhost's TCP port: h3 on the same number is what
+         * Alt-Svc advertises by default and what clients try first. */
+        if (server->http3.enabled && server->http3.port == 0)
+            server->http3.port = server->port;
 
         for (int i = 0; i < R_FIELDS_COUNT; i++) {
             if (finded_fields[i] == 0) {
