@@ -15,6 +15,15 @@ include_directories(
 # --- Unit tests (no database required) ---
 file(GLOB UNIT_TEST_FILES "${CMAKE_CURRENT_SOURCE_DIR}/unit/test_*.c")
 
+# QUIC / HTTP/3 / QPACK tests only exist in an h3 build: the symbols they call
+# are not linked into libcwfr_framework.so otherwise (framework_shared), so
+# leaving them in the glob would fail the link rather than skip the tests.
+# Suites self-register through a constructor, so dropping the file is all it
+# takes -- runner.c needs no #ifdef.
+if(NOT INCLUDE_HTTP3 STREQUAL yes)
+    list(FILTER UNIT_TEST_FILES EXCLUDE REGEX "/test_(quic|h3|qpack)")
+endif()
+
 add_executable(
     runner
     unit/runner.c

@@ -18,6 +18,13 @@ set(FW_LIBS
 	smtp smtp_client smtp_client_parsers websocket websocket_server websocket_server_parsers
 	hpack h2frame h2server)
 
+# QUIC / HTTP/3 archives. They exist only in an h3 build -- protocols/quic and
+# protocols/http3 return early otherwise -- so naming them unconditionally would
+# break every build that leaves INCLUDE_HTTP3 at its default (core/CMakeLists.txt).
+if(INCLUDE_HTTP3 STREQUAL yes)
+	list(APPEND FW_LIBS quic_common h3frame)
+endif()
+
 # The embedding application may inject its own static archives (models,
 # middlewares implementing the middlewares_init() hook, contexts, ...) by
 # setting CWFR_EXTRA_FW_LIBS before add_subdirectory(core). They are aggregated

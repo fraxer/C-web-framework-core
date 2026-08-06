@@ -45,7 +45,7 @@ HTTP/3 — это не «ещё один протокол поверх соке�
 
 ### 2.1 Что берём из OpenSSL
 
-Проверено на этой машине: `libssl-dev 3.5.5`, заголовки содержат
+В системе установлен `libssl-dev 3.5.5`, чьи заголовки содержат
 
 ```c
 int SSL_set_quic_tls_cbs(SSL *s, const OSSL_DISPATCH *qtdis, void *arg);
@@ -54,7 +54,27 @@ int SSL_set_quic_tls_early_data_enabled(SSL *s, int enabled);
 ```
 
 и диспетчерские слоты `OSSL_FUNC_SSL_QUIC_TLS_CRYPTO_SEND` (2001) …
-`OSSL_FUNC_SSL_QUIC_TLS_ALERT` (2006) в `core_dispatch.h`.
+`OSSL_FUNC_SSL_QUIC_TLS_ALERT` (2006) в `core_dispatch.h`. Символы присутствуют
+и в библиотеке: `SSL_set_quic_tls_cbs@@OPENSSL_3.5.0` в
+`/usr/lib/x86_64-linux-gnu/libssl.so.3`.
+
+> **Машина сборки этого не видит.** В `/usr/local` лежит собранный вручную в
+> 2021 году OpenSSL 1.1.1k — и заголовки (`/usr/local/include/openssl/`), и
+> библиотеки (`/usr/local/lib/libssl.so.1.1`). `/usr/local/include` стоит в
+> списке поиска gcc **перед** `/usr/include`, а `/usr/local/lib` находит CMake,
+> поэтому сейчас проект компилируется и линкуется с 1.1.1k: `ldd exec/cwfr`
+> показывает `libssl.so.1.1 => /usr/local/lib/libssl.so.1.1`.
+>
+> `-I/usr/include` не помогает: gcc игнорирует `-I` для каталога, уже входящего
+> в стандартную цепочку, сохраняя его позицию. `-isystem /usr/include` порядок
+> меняет, но это негодное решение — в `/usr/local/include` лежат также `pcre.h`
+> и `idn2.h`, а соответствующие библиотеки проект берёт из `/usr/local/lib`.
+>
+> До фазы 3 это ни на что не влияет (фазы 1 и 2 к OpenSSL не обращаются), но к
+> ней окружение должно быть починено одним из двух способов: убрать OpenSSL
+> 1.1.1k из `/usr/local` (проверив, что от него ничего не зависит), либо
+> собирать в контейнере только с дистрибутивным OpenSSL — контейнер всё равно
+> понадобится для quic-interop-runner в фазе 8.
 
 Это **QUIC TLS API** — режим, в котором libssl делает только рукопожатие TLS 1.3
 и отдаёт наружу байты для CRYPTO-фреймов и выведенные секреты уровней. Весь
@@ -202,7 +222,7 @@ RFC 9000 §13.3 и оно определяет форму `quicsendbuf` и `quic
 
 | Фаза | Название | Документ | Объём | Критерий готовности |
 |---|---|---|---|---|
-| 0 | Каркас сборки, `INCLUDE_HTTP3`, скелет модулей, qlog-заглушка | `01` §1 | S | Собирается с и без флага; тесты зелёные |
+| 0 | Каркас сборки, `INCLUDE_HTTP3`, скелет модулей, qlog-заглушка | `01` §1 | S | **Сделано.** Собирается с и без флага; тесты зелёные в обеих |
 | 1 | UDP-эндпоинт, демультиплексирование, виртуальные соединения, таймеры | `01` | L | Эндпоинт принимает датаграммы, отвечает Version Negotiation, метрики считают |
 | 2 | Ядро QUIC: varint, пакеты, фреймы, CID, transport params | `02` | L | Юнит-тесты по векторам RFC 9000 Приложение A |
 | 3 | QUIC-TLS: key schedule, AEAD, header protection, интеграция с libssl | `03` | L | Векторы RFC 9001 Приложение A сходятся; handshake с `curl --http3` доходит до Handshake Done |
@@ -224,15 +244,17 @@ core/src/udp/                      udpsocket.{c,h}   — сокет, опции,
                                    quicendpoint.{c,h}— демультиплексор, таблица CID, таймеры
 
 core/protocols/quic/
-  common/  varint.{c,h}  quicpacket.{c,h}  quicframe.{c,h}
-           quiccid.{c,h} quictp.{c,h}      quicerror.h
+  common/  quic.h        varint.{c,h}      quicpacket.{c,h}  quicframe.{c,h}
+           quiccid.{c,h} quictp.{c,h}      quicerror.{c,h}
+           quictime.{c,h}  quicqlog.{c,h}  — время и qlog нужны всем слоям,
+                                             поэтому здесь, а не в transport/
   crypto/  quiccrypto.{c,h}  quichp.{c,h}  quicretry.{c,h}  quictls.{c,h}
   transport/ quicconn.{c,h}   quicstream.{c,h}  quicrecvbuf.{c,h} quicsendbuf.{c,h}
              quicflow.{c,h}   quicack.{c,h}     quicloss.{c,h}    quiccc.{c,h}
-             quicpacer.{c,h}  quicpath.{c,h}    quictimer.{c,h}   quicqlog.{c,h}
+             quicpacer.{c,h}  quicpath.{c,h}    quictimer.{c,h}
 
 core/protocols/http3/
-  frame/   h3frame.{c,h}
+  frame/   h3frame.{c,h}  h3error.{c,h}
   qpack/   qpack.{c,h}  qpack_statictable.h  (+ misc/huffman.{c,h} общий с HPACK)
   server/  h3session.{c,h}  h3stream.{c,h}  h3_write_filter.{c,h}  h3ws.{c,h}
 ```
