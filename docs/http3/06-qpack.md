@@ -269,6 +269,33 @@ API (нейтральное, как в §1): `huffman_encoded_len`, `huffman_enc
 `test_huffman.c` (roundtrip всех 256 байтов, padding, EOS, примеры §C.1.1/§C.1.2,
 флаги, усечение, бесконечное продолжение). Сборка с h3 и без — ASan-чисто.
 
-**Осталось (6.1, критический путь):** сгенерировать `qpack_statictable.h`
-(99 записей RFC 9204 Приложение A — новая цель в `gen_tables.py`), затем
-lite-декодер/кодировщик (только статическая таблица + литералы, RIC всегда 0).
+**Сделано (6.1 — статическая таблица):** `protocols/http3/qpack/qpack_statictable.h`
+— 99 записей RFC 9204 Приложение A, **0-индексация** (в отличие от HPACK:
+индекс 0 = `:authority`, не пустышка). Отдельный генератор
+`gen_qpack_static.py` (не расширение `gen_tables.py` — тот парсит RFC 7541, а
+эта таблица из RFC 9204; исходник иной, скрипт отдельный, генерирует один
+артефакт). Хеш-индексы (имя→индекс, имя+значение→индекс) НЕ добавлены — HPACK
+линейно сканирует 61 запись, QPACK-lite так же линейно сканирует 99; для full-
+кодировщика (6.2) можно добавить при необходимости. Записи проверены на краях
+(0=`:authority`, 17=`:method`/GET, 23=`:scheme`/https, 98=`x-frame-options`/
+sameorigin).
+
+**Сделано (6.1 — lite-декодер):** `qpack.{h,c}` разбирает Field Section
+(префикс RIC 8-бит + S|Delta Base 7-бит; в lite RIC обязан быть 0, Delta Base
+не используется) и представления: Indexed Static (`1T`), Literal With Name
+Reference статический (`01NT`), Literal With Literal Name (`001Nh` — имя и
+значение через общий `misc/huffman`, Хаффман для обоих). Все динамические/ post-
+base представления → `QPACK_ERR_DECOMPRESSION` (таблицы нет). `never_indexed`
+пробрасывается. `max_list_size` → `QPACK_ERR_TOO_LARGE` (как в HPACK/`docs/
+http2/08` A.4). Вывод — `qpack_header_t` (зеркало `hpack_header_t`), malloc-
+массив, освобождается `qpack_headers_free`. API сознательно урезан до lite
+(`decode_block`/`create`/`free`/`headers_free`); `read_encoder`, `pending`,
+`stream_id` придут с full-декодером 6.2. +34 проверки в `test_qpack_decode.c`
+(вектор RFC 9204 §B.1, indexed/literal/Huffman-имя/Huffman-значение, never-
+indexed, пустой блок, 5 ошибочных случаев). h3-сборка: 101 147 проверок ASan-
+чисто.
+
+**Осталось (6.1):** lite-**кодировщик** (`qpack_encode_block` — статическая
+таблица + литералы с Хаффманом, RIC=0/Delta Base=0; нужен для ответов h3), затем
+подключение к `h3session`/`h3_write_filter` — после этого `curl --http3` сможет
+получить первый ответ.
