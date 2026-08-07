@@ -135,6 +135,15 @@ quicstream_err_t quicstream_on_max_data(quicstream_t* stream, uint64_t limit);
 /* The application abandons the stream: send RESET_STREAM. */
 void quicstream_reset(quicstream_t* stream, uint64_t error_code);
 
+/* Ask the peer to stop sending on this stream: send STOP_SENDING (§3.5).
+ *
+ * Not the same as resetting it, and the difference is the whole reason both
+ * exist: RESET_STREAM abandons what *we* send, STOP_SENDING abandons what *we
+ * receive*. HTTP/3 needs the second on its own for a unidirectional stream of
+ * an unknown type (RFC 9114 §6.2.3), which has no send side to reset -- we
+ * simply will not read it, and saying so stops the peer wasting the window. */
+void quicstream_stop_sending(quicstream_t* stream, uint64_t error_code);
+
 /* Bytes readable by the application. */
 size_t quicstream_readable(const quicstream_t* stream);
 size_t quicstream_read(quicstream_t* stream, uint8_t* dst, size_t len);

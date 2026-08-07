@@ -82,6 +82,37 @@ static quicstream_t* __stream_open_peer(quicconn_t* conn, uint64_t id) {
     return result != NULL ? result : __stream_find(conn, id);
 }
 
+quicstream_t* quicconn_stream_find(quicconn_t* conn, uint64_t id) {
+    if (conn == NULL) return NULL;
+
+    return __stream_find(conn, id);
+}
+
+quicstream_t* quicconn_open_uni(quicconn_t* conn) {
+    if (conn == NULL) return NULL;
+
+    /* §4.6: our own streams are bounded by what the peer allowed us, and the
+     * limit counts streams, not ids -- next_local_uni is the count so far. */
+    if (conn->next_local_uni >= conn->peer_params.initial_max_streams_uni) return NULL;
+
+    const uint64_t id = (conn->next_local_uni << 2) | QUIC_STREAM_SERVER_UNI;
+
+    /* Send-only: the receive limits are zero because nothing may arrive on it,
+     * and the send limit is what the peer granted for our unidirectional
+     * streams. */
+    quicstream_t* s = quicstream_create(id, 0, 0,
+                                        conn->peer_params.initial_max_stream_data_uni);
+    if (s == NULL) return NULL;
+
+    conn->next_local_uni++;
+
+    s->next = conn->streams;
+    conn->streams = s;
+    conn->stream_count++;
+
+    return s;
+}
+
 /* ---- TLS bridge callbacks ---- */
 
 static int __on_secret(void* ctx, quic_enc_level_e level, quictls_dir_e dir,
@@ -628,6 +659,24 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
     if (level == QUIC_ENC_APP) {
         for (quicstream_t* s = conn->streams; s != NULL && p + 32 < payload_cap;
              s = s->next) {
+            /* STOP_SENDING is about the receive half, so it is not an
+             * alternative to the RESET_STREAM below -- a stream can owe both,
+             * and each is cleared on its own. */
+            if (s->send_stop_sending_pending) {
+                quicframe_t f;
+                memset(&f, 0, sizeof f);
+                f.type = QUIC_FRAME_STOP_SENDING;
+                f.u.stop_sending.id = s->id;
+                f.u.stop_sending.error = s->send_stop_sending_code;
+
+                const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
+                if (n > 0) {
+                    p += n;
+                    ack_eliciting = 1;
+                    s->send_stop_sending_pending = 0;
+                }
+            }
+
             if (s->send_reset_pending) {
                 quicframe_t f;
                 memset(&f, 0, sizeof f);

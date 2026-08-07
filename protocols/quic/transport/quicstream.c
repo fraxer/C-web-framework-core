@@ -158,6 +158,24 @@ void quicstream_reset(quicstream_t* stream, uint64_t error_code) {
     stream->send_reset_pending = 1;
 }
 
+void quicstream_stop_sending(quicstream_t* stream, uint64_t error_code) {
+    if (stream == NULL) return;
+    if (!quicstream_can_receive(stream->id)) return;
+
+    /* Pointless once the receive side is finished one way or the other: the
+     * peer has already stopped, and a STOP_SENDING for a stream it considers
+     * closed is at best noise. */
+    if (stream->recv_state == QUIC_RECV_RESET_RECVD ||
+        stream->recv_state == QUIC_RECV_RESET_READ ||
+        stream->recv_state == QUIC_RECV_DATA_RECVD ||
+        stream->recv_state == QUIC_RECV_DATA_READ) return;
+
+    if (stream->send_stop_sending_pending) return;
+
+    stream->send_stop_sending_pending = 1;
+    stream->send_stop_sending_code = error_code;
+}
+
 size_t quicstream_readable(const quicstream_t* stream) {
     if (stream == NULL) return 0;
 

@@ -10,4 +10,7 @@ cmake_minimum_required(VERSION 3.12.4)
 # h3frame, qpack, the shared http layer (httprequest/httpfields/h2field) and
 # config (env()->main.client_max_body_size); h3session needs h3frame, qpack and
 # quic_common, and deliberately not quic_transport -- it holds no connection.
-cwfr_add_lib(h3server LINK_LIBS h3frame quic_common qpack http config)
+# h3conn is the one module here that touches the transport: it reads QUIC
+# streams and turns h3 verdicts into RESET_STREAM / STOP_SENDING, hence
+# quic_transport. The others stay free of it on purpose.
+cwfr_add_lib(h3server LINK_LIBS h3frame quic_common quic_transport qpack http config)

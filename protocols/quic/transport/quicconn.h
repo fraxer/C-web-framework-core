@@ -187,4 +187,18 @@ uint64_t quicconn_next_timeout(const quicconn_t* conn);
 void quicconn_close(quicconn_t* conn, uint64_t error_code, int is_app,
                     uint64_t now_us);
 
+/* ---- Streams, for the application layer ---- */
+
+/* Find an open stream by id, or NULL. */
+quicstream_t* quicconn_stream_find(quicconn_t* conn, uint64_t id);
+
+/* Open the next server-initiated unidirectional stream (§2.1), or NULL when the
+ * peer's initial_max_streams_uni is exhausted or allocation fails.
+ *
+ * HTTP/3 needs several of these before it can say anything at all: the control
+ * stream carrying SETTINGS, both QPACK streams, and a grease stream (RFC 9114
+ * §6.2). Unlike peer-initiated streams there is no back-filling to do -- ids
+ * are handed out in order here, so none is ever skipped. */
+quicstream_t* quicconn_open_uni(quicconn_t* conn);
+
 #endif
