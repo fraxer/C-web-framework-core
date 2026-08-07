@@ -22,7 +22,7 @@ set(FW_LIBS
 # protocols/http3 return early otherwise -- so naming them unconditionally would
 # break every build that leaves INCLUDE_HTTP3 at its default (core/CMakeLists.txt).
 if(INCLUDE_HTTP3 STREQUAL yes)
-	list(APPEND FW_LIBS quic_common quic_crypto quic_transport h3frame h3unistream udp)
+	list(APPEND FW_LIBS quic_common quic_crypto quic_transport h3frame h3unistream qpack udp)
 endif()
 
 # The embedding application may inject its own static archives (models,
