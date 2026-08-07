@@ -369,10 +369,24 @@ varint'а — ловит именно то, что даёт QUIC-поток: б�
 середину двухбайтного типа); после READY повторная подача — no-op, чтобы байты
 содержимого потока не прочитались как второй тип.
 
-**Осталось:** QPACK-lite (статическая таблица + литералы), `h3session`/
-`h3stream` (открытие/маршрутизация служебных потоков теперь опираются на
-`h3unistream`), рефакторинг `h2_build_request()` в общий
-`httpfields_to_request()`, `h3_write_filter`, подключение к dispatch.
+**Сделано:** рефакторинг §6.1 — `h2_build_request()` разобран на HPACK-декод
+(остался в h2) и общий `protocols/http/httpfields.c::httpfields_to_request()`
+(валидность полей, псевдо-заголовки, запрещённые/TE/content-length, обязательные
+псевдо, asterisk-form, cookie/range, версия; выбор vhost — у вызывающего, т.к.
+нужен connection). h2 вызывает его через `HTTP_FIELDS_H2`, h3 будет через
+`HTTP_FIELDS_H3`; правила сегодня идентичны. Поле-дескриптор `httpfields_field_t`
+layout-совместим с `hpack_header_t`/`qpack_header_t` (guard — `_Static_assert`).
+`h2field.{c,h}` переехали из `protocols/http2/server/` в `protocols/http/` (общий
+слой валидности имён/значений ниже и h2, и h3; переименовывать функции не стали).
+`h2_consume_trailers` теперь зовёт `httpfields_is_forbidden_header`. Поведение h2
+не изменилось — существующие h2-тесты зелёные; +21 проверка в новом
+`test_httpfields.c` (12 нарушений §4.1/§8.3, positives для h2 и h3, content-length,
+OPTIONS\*). h3: 101 177, без h3: 100 210, ASan-чисто.
+
+**Осталось:** QPACK-lite (статическая таблица + литералы) — **см. док. 06, готов**;
+`h3session`/`h3stream` (открытие/маршрутизация служебных потоков опираются на
+`h3unistream`; сборка запроса — на `httpfields_to_request`), `h3_write_filter`,
+подключение к dispatch.
 
 ## 11. Тесты фазы
 
@@ -385,7 +399,8 @@ varint'а — ловит именно то, что даёт QUIC-поток: б�
 **Сделано** (модуль назван `h3unistream`, а не `h3stream_types`).
 
 `test_httpfields.c` — общая сборка запроса для h2 и h3 (после рефакторинга §6.1),
-с полным набором нарушений §4.1.
+с полным набором нарушений §4.1. **Сделано** (12 нарушений + positives h2/h3 +
+content-length + OPTIONS\* + forbidden-header).
 
 **Готово, когда:** `curl --http3 https://host/` отдаёт статический файл и ответ
 хендлера; POST с телом 10 МБ проходит; работают trailers, 103, gzip, Range;
