@@ -27,6 +27,11 @@ quicstream_t* quicstream_create(uint64_t id,
 void quicstream_free(quicstream_t* stream) {
     if (stream == NULL) return;
 
+    if (stream->app != NULL && stream->app_free != NULL) {
+        stream->app_free(stream->app);
+        stream->app = NULL;
+    }
+
     quicrecvbuf_free(&stream->recv);
     quicsendbuf_free(&stream->send);
     free(stream);

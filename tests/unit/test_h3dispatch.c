@@ -114,6 +114,9 @@ TEST(test_h3dispatch_publish) {
 
     h3stream_t* st = h3conn_request_of(qs);
     TEST_ASSERT(st != NULL && st->headers_done, "request built");
+    /* h3conn_t is what lives in ctx->parser, so it is h3conn_t that has to carry
+     * the free-through-a-void* contract __ctx_free relies on. */
+    TEST_ASSERT(f.c->free == (void(*)(void*))h3conn_free, "free is the first field");
 
     httpresponse_t* r = httpresponse_create_h3(&f.qc->conn);
     TEST_ASSERT(h3_server_attach_response(&f.qc->conn, st->request, r) == 1, "attached");
@@ -189,6 +192,52 @@ TEST(test_h3dispatch_write_turn) {
     TEST_ASSERT(h3conn_write(f.c, f.qc) == 1, "write turn ran");
     TEST_ASSERT(queued_frames(qs, H3_FRAME_HEADERS, NULL) == 1, "HEADERS");
     TEST_ASSERT(qs->send.fin, "FIN");
+    fixture_free(&f);
+}
+
+/* A response bigger than the connection's write-ahead budget cannot go out in
+ * one turn, and nothing but h3conn_has_pending would ever ask for another. */
+TEST(test_h3dispatch_large_response) {
+    TEST_SUITE("h3dispatch");
+
+    TEST_CASE("a big body takes several turns and reports itself pending");
+    h3fixture_t f;
+    fixture_init(&f);
+    quicstream_t* qs = add_request(&f, 0);
+    h3stream_t* st = h3conn_request_of(qs);
+
+    httpresponse_t* r = httpresponse_create_h3(&f.qc->conn);
+    h3_server_attach_response(&f.qc->conn, st->request, r);
+    r->status_code = 200;
+
+    const size_t size = QUICCONN_WRITE_AHEAD_MAX * 3;
+    char* body = malloc(size);
+    memset(body, 'x', size);
+    r->send_datan(r, body, size);
+    free(body);
+
+    h3_server_publish_inline(&f.qc->conn, r);
+
+    TEST_ASSERT(h3conn_write(f.c, f.qc) == 1, "first turn");
+    TEST_ASSERT(!st->response_done, "not finished in one turn");
+    TEST_ASSERT(h3conn_has_pending(f.c, f.qc), "and it says so");
+    TEST_ASSERT(quicconn_unsent_bytes(f.qc) <= QUICCONN_WRITE_AHEAD_MAX + H3_DATA_CHUNK_MAX,
+                "memory stayed inside the budget");
+
+    /* Drain and turn again, as the endpoint does once the send path has run. */
+    size_t turns = 0;
+    while (!st->response_done && turns < 1000) {
+        const size_t unsent = quicsendbuf_unsent_bytes(&qs->send);
+        if (unsent > 0) quicsendbuf_mark_sent(&qs->send, qs->send.sent_off, unsent, 0);
+        h3conn_write(f.c, f.qc);
+        turns++;
+    }
+
+    TEST_ASSERT(st->response_done, "finishes once the network keeps up");
+    TEST_ASSERT(turns > 1, "and it really did take several turns");
+    TEST_ASSERT(!h3conn_has_pending(f.c, f.qc), "nothing pending afterwards");
+    TEST_ASSERT(qs->send.fin, "stream closed");
+
     fixture_free(&f);
 }
 

@@ -94,7 +94,13 @@ typedef struct quicstream {
     int      send_stop_sending_pending;
     uint64_t send_stop_sending_code;
 
-    void*    app;   /* h3stream_t, phase 5 */
+    /* The application layer's per-stream state (an h3app_t) and how to release
+     * it. The transport cannot know what it is -- that is the point of the void*
+     * -- but it does own when the stream dies, so it has to be able to let go of
+     * it. Without the callback every stream of a closed connection leaked its
+     * request, response and parsers. */
+    void*    app;
+    void   (*app_free)(void*);
 
     struct quicstream* next;
     struct quicstream* send_next;   /* round-robin list of streams with data */

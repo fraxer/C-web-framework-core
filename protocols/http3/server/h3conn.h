@@ -69,6 +69,11 @@ typedef struct h3app {
 } h3app_t;
 
 typedef struct h3conn {
+    /* MUST be first: an h3conn_t lives in connection_server_ctx_t::parser,
+     * which __ctx_free releases through this pointer without knowing what it
+     * points at -- the same contract h2session_t carries for HTTP/2. */
+    void (*free)(void*);
+
     h3session_t* session;
     uint64_t     max_field_section_size;
 
@@ -154,5 +159,11 @@ int h3_server_publish_inline(connection_t* connection, httpresponse_t* response)
  * the transport before it builds packets. Returns 0 if the connection must
  * close. */
 int h3conn_write(h3conn_t* c, quicconn_t* qc);
+
+/* Is any response still unfinished? A response larger than the write-ahead
+ * budget stops mid-body and needs another turn once the send path has drained
+ * it, and nothing else would ask for one: quicconn_want_write is edge-driven,
+ * and the edge -- the handler finishing -- has already passed. */
+int h3conn_has_pending(const h3conn_t* c, const quicconn_t* qc);
 
 #endif

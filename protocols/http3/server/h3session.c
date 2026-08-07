@@ -53,8 +53,6 @@ h3session_t* h3session_create(uint64_t max_field_section_size, int enable_connec
     h3session_t* s = calloc(1, sizeof * s);
     if (s == NULL) return NULL;
 
-    s->free = (void(*)(void*))h3session_free;
-
     /* Lite QPACK: no dynamic table, so no stream can ever block on one
      * (docs/http3/06-qpack.md §6, step 6.1). Both zeros are advertised
      * explicitly rather than left to default, because a peer reading them is

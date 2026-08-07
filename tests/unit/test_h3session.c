@@ -29,7 +29,6 @@ TEST(test_h3session_settings) {
     TEST_CASE("our control preamble is the stream type then SETTINGS");
     h3session_t* s = h3session_create(65536, 1);
     TEST_ASSERT(s != NULL, "session created");
-    TEST_ASSERT(s->free == (void(*)(void*))h3session_free, "free is the first field");
 
     uint8_t pre[128];
     const size_t plen = h3session_control_preamble(s, pre, sizeof pre);

@@ -17,6 +17,7 @@
 #include "quicendpoint.h"
 #include "quicinvariants.h"
 #include "quictime.h"
+#include "h3conn.h"
 
 /* Largest datagram we will accept. Above the largest we send
  * (QUIC_MAX_UDP_PAYLOAD_V4) so that an oversized one is visibly rejected as
@@ -429,6 +430,84 @@ static void __accept(quicendpoint_t* ep, udp_datagram_t* dgram,
     __route(ep, conn, dgram);
 }
 
+
+/* Advertised SETTINGS_MAX_FIELD_SECTION_SIZE when nothing is configured -- the
+ * same 1 MB HTTP/2 defaults to. */
+#define H3_DEFAULT_MAX_FIELD_SECTION_SIZE (1024 * 1024)
+
+/* ---- The HTTP/3 layer ---- *
+ *
+ * The endpoint is where QUIC and HTTP/3 meet, and it is the right place for it:
+ * quicconn knows nothing of HTTP, and h3conn knows nothing of datagrams. What
+ * joins them is a fixed order that has to hold on every path that touches a
+ * connection -- receive, then read the streams, then let the responses that are
+ * ready write themselves, then build packets. Getting the last two the wrong way
+ * round costs a round trip on every response, because the bytes would miss the
+ * packet being built for them. */
+
+/* Attach the HTTP/3 layer once the handshake is done, and send our SETTINGS.
+ * Returns 0 if the connection cannot go on without them. */
+static int __h3_attach(quicconn_t* conn) {
+    connection_server_ctx_t* ctx = conn->conn.ctx;
+
+    if (ctx->parser != NULL) return 1;
+    if (conn->state != QUICCONN_ACTIVE) return 1;
+
+    /* ALPN settled this at the handshake: the QUIC context offers `h3` and
+     * nothing else (openssl.h), so an ACTIVE connection is an HTTP/3 one.
+     *
+     * The field-section limit rides on http2_max_header_list_size rather than a
+     * knob of its own: it is the same budget for the same reason, and one number
+     * an operator sets once beats two that must be kept equal. A key of its own
+     * belongs to phase 7 alongside the rest of the h3 configuration.
+     * Extended CONNECT is not advertised -- §8 is not implemented, and
+     * advertising what we cannot serve is worse than staying quiet. */
+    h3conn_t* c = h3conn_create((uint64_t)env_get_int("http2_max_header_list_size",
+                                                     H3_DEFAULT_MAX_FIELD_SECTION_SIZE), 0);
+    if (c == NULL) return 0;
+
+    ctx->parser = c;
+
+    if (!h3conn_open_service_streams(c, conn)) {
+        log_error("h3: could not open the service streams\n");
+        return 0;
+    }
+
+    return 1;
+}
+
+/* Ask for another turn if a response is still only partly written. */
+static void __h3_rearm(quicconn_t* conn) {
+    const connection_server_ctx_t* ctx = conn->conn.ctx;
+    if (ctx->parser == NULL) return;
+
+    if (h3conn_has_pending(ctx->parser, conn)) quicconn_want_write(&conn->conn);
+}
+
+/* Read, dispatch and write for one connection. Called with the connection lock
+ * held, which is what makes the dispatch inside reach the inline publish path
+ * rather than the handler-thread one. Returns 0 if the connection must close. */
+static int __h3_turn(quicconn_t* conn, uint64_t now) {
+    if (!__h3_attach(conn)) {
+        quicconn_close(conn, H3_INTERNAL_ERROR, 1, now);
+        return 0;
+    }
+
+    connection_server_ctx_t* ctx = conn->conn.ctx;
+    h3conn_t* c = ctx->parser;
+    if (c == NULL) return 1;   /* handshake still running */
+
+    uint64_t error = 0;
+    if (!h3conn_read(c, conn, &error)) {
+        quicconn_close(conn, error, 1, now);
+        return 0;
+    }
+
+    h3conn_write(c, conn);
+
+    return 1;
+}
+
 /* Hand a datagram to a connection and let it answer. */
 static void __route(quicendpoint_t* ep, quicconn_t* conn, udp_datagram_t* dgram) {
     /* The connection reaches its endpoint through its own pointer; this one is
@@ -454,7 +533,22 @@ static void __route(quicendpoint_t* ep, quicconn_t* conn, udp_datagram_t* dgram)
     connection_s_lock(&conn->conn, LOCK_SITE_QUIC_RECV);
 
     int alive = quicconn_recv(conn, dgram->data, dgram->len, &path, now);
-    if (alive) alive = quicconn_send(conn, now);
+    /* Streams first, packets after: a response produced here goes out in the
+     * very packet this call builds instead of waiting for the next event. */
+    if (alive) alive = __h3_turn(conn, now);
+
+    /* The send path runs even when something above decided to close, because
+     * that is where the CONNECTION_CLOSE quicconn_close staged actually goes
+     * out (§10.2.1) -- it builds the packet and keeps it, it does not send it.
+     * Skipping this left every protocol error hanging the peer up without a
+     * word, to be discovered as an idle timeout half a minute later. */
+    if (!quicconn_send(conn, now)) alive = 0;
+
+    /* A response bigger than the write-ahead budget stopped mid-body; now that
+     * the send path has taken what it could, ask for another turn. The tick
+     * drains this queue once per cycle, so re-queueing here paces the response
+     * to the network rather than spinning on it. */
+    __h3_rearm(conn);
 
     if (!alive || conn->state == QUICCONN_DEAD) {
         conn->conn.close(&conn->conn);   /* releases the lock */
@@ -784,7 +878,17 @@ static void __endpoint_tick(quicendpoint_t* ep, int shutdown_now) {
 
         connection_s_lock(&pending->conn, LOCK_SITE_QUIC_SEND);
 
-        if (!quicconn_send(pending, now) || pending->state == QUICCONN_DEAD)
+        /* This is the path a handler thread's response arrives on: it set
+         * need_write and queued the connection, and the filter chain has not
+         * run yet. Running it here rather than in the handler thread keeps the
+         * chain single-threaded per connection, as it is for h2. */
+        connection_server_ctx_t* pctx = pending->conn.ctx;
+        if (pctx->parser != NULL) h3conn_write(pctx->parser, pending);
+
+        const int sent = quicconn_send(pending, now);
+        if (sent) __h3_rearm(pending);
+
+        if (!sent || pending->state == QUICCONN_DEAD)
             pending->conn.close(&pending->conn);
         else
             connection_s_unlock(&pending->conn);

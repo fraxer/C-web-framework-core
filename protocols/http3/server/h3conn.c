@@ -43,6 +43,8 @@ h3conn_t* h3conn_create(uint64_t max_field_section_size, int enable_connect_prot
     h3conn_t* c = calloc(1, sizeof * c);
     if (c == NULL) return NULL;
 
+    c->free = (void(*)(void*))h3conn_free;
+
     c->session = h3session_create(max_field_section_size, enable_connect_protocol);
     if (c->session == NULL) {
         free(c);
@@ -74,6 +76,7 @@ void h3conn_stream_release(quicstream_t* qs) {
 
     __app_free(qs->app);
     qs->app = NULL;
+    qs->app_free = NULL;
 }
 
 h3stream_t* h3conn_request_of(quicstream_t* qs) {
@@ -123,6 +126,9 @@ static h3app_t* __app_of(h3conn_t* c, quicstream_t* qs) {
     }
 
     qs->app = app;
+    /* The transport owns when a stream dies and frees it without knowing what
+     * `app` is, so it is told here how to let go of it. */
+    qs->app_free = (void(*)(void*))__app_free;
 
     return app;
 }
@@ -553,6 +559,18 @@ int h3conn_write(h3conn_t* c, quicconn_t* qc) {
     }
 
     return 1;
+}
+
+int h3conn_has_pending(const h3conn_t* c, const quicconn_t* qc) {
+    if (c == NULL || qc == NULL) return 0;
+
+    for (quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
+        const h3stream_t* st = h3conn_request_of(qs);
+        if (st == NULL || st->response_done) continue;
+        if (atomic_load_explicit(&st->response_ready, memory_order_acquire)) return 1;
+    }
+
+    return 0;
 }
 
 h3conn_result_t h3conn_stream_read(h3conn_t* c, quicstream_t* qs) {

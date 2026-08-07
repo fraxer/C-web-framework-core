@@ -75,10 +75,9 @@ void h3uni_recv_free(h3uni_recv_t* uni);
 /* ---- The session ---- */
 
 typedef struct h3session {
-    /* MUST be first: the session lives in connection_server_ctx_t::parser,
-     * which is a void* freed through this pointer -- the same contract
-     * h2session_t carries. */
-    void (*free)(void*);
+    /* Owned by h3conn, not by the connection context: it is h3conn_t that lives
+     * in connection_server_ctx_t::parser and therefore h3conn_t that carries
+     * the `void (*free)(void*)` first-field contract. */
 
     /* Shared by every stream on the connection. */
     struct qpack_decoder* qdec;
