@@ -57,4 +57,27 @@ http_fields_status_e httpfields_to_request(httprequest_t* request,
  * Exposed for the trailers path, which rejects the same set. */
 int httpfields_is_forbidden_header(const char* name, size_t len);
 
+/* ---- The response side ---- *
+ *
+ * Shared by h2_write_filter and h3response for the reason httpfields exists at
+ * all: these are the same rules in RFC 9113 §8.2.2 and RFC 9114 §4.2, and a
+ * second copy is a second place to fix. */
+
+/* The request-side set plus `te`, which a response may not carry at all
+ * (§8.2.2 allows TE only in a request, and only as "trailers"). Compared
+ * case-insensitively: h1.1 response headers are canonical-cased. */
+int httpfields_is_forbidden_response_header(const char* name, size_t len);
+
+/* Fields whose value must never enter a compressor's dynamic table (RFC 7541
+ * §7.1.3, RFC 9204 §7.1). A table entry is a compression oracle: an attacker
+ * who can make the server emit a response of their choosing on the same
+ * connection learns a secret by watching the encoded size shrink when a guess
+ * matches -- CRIME applied to HPACK/QPACK. Expects an already-lowercased name. */
+int httpfields_is_sensitive_header(const char* name, size_t len);
+
+/* §8.2.1 / §4.2: field names are lowercase on the wire, and nghttp2-based
+ * clients (curl, browsers) treat an uppercase byte as a protocol error.
+ * `dst` must have room for `len` bytes; no terminator is written. */
+void httpfields_lowercase(char* dst, const char* src, size_t len);
+
 #endif

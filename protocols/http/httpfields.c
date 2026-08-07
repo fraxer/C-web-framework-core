@@ -43,6 +43,45 @@ int httpfields_is_forbidden_header(const char* key, size_t len) {
     return 0;
 }
 
+int httpfields_is_forbidden_response_header(const char* key, size_t len) {
+    static const struct { const char* name; size_t len; } banned[] = {
+        {"connection", 10}, {"keep-alive", 10}, {"proxy-connection", 16},
+        {"transfer-encoding", 17}, {"upgrade", 7}, {"te", 2},
+    };
+
+    for (size_t i = 0; i < sizeof(banned) / sizeof(banned[0]); i++) {
+        if (len != banned[i].len) continue;
+
+        size_t j = 0;
+        for (; j < len; j++) {
+            char c = key[j];
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            if (c != banned[i].name[j]) break;
+        }
+        if (j == len) return 1;
+    }
+
+    return 0;
+}
+
+int httpfields_is_sensitive_header(const char* key, size_t len) {
+    static const struct { const char* name; size_t len; } sensitive[] = {
+        {"set-cookie", 10}, {"authorization", 13}, {"proxy-authorization", 19},
+    };
+
+    for (size_t i = 0; i < sizeof(sensitive) / sizeof(sensitive[0]); i++)
+        if (len == sensitive[i].len && memcmp(key, sensitive[i].name, len) == 0) return 1;
+
+    return 0;
+}
+
+void httpfields_lowercase(char* dst, const char* src, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        const char c = src[i];
+        dst[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+    }
+}
+
 /* RFC 9113 §8.2.2 / RFC 9114 §4.3 allow exactly one TE value: "trailers". */
 static int te_is_valid(const char* value, size_t len) {
     return len == 8 && memcmp(value, "trailers", 8) == 0;

@@ -110,9 +110,20 @@ void h3frame_parser_init(h3frame_parser_t* p);
 void h3frame_parser_free(h3frame_parser_t* p);
 
 /* Feed bytes, advancing `*pp`. Call repeatedly while the status is a result
- * rather than H3FRAME_CONTINUE: one feed can produce several frames. */
+ * rather than H3FRAME_CONTINUE: one feed can produce several frames. An empty
+ * feed (`*pp == end`, NULL/NULL included) is legal and reports CONTINUE -- a
+ * QUIC STREAM frame carrying only FIN has no bytes. */
 h3frame_status_e h3frame_parser_feed(h3frame_parser_t* p,
                                      const uint8_t** pp, const uint8_t* end);
+
+/* Is the parser between frames -- nothing half-read? RFC 9114 §7.1: a stream
+ * that ends cleanly in the middle of a frame is a connection error of type
+ * H3_FRAME_ERROR, and this is how a caller detects that on FIN. Both the
+ * stage and a half-assembled varint count: the type/length varint of the next
+ * frame may itself have been cut in half. */
+static inline int h3frame_parser_at_boundary(const h3frame_parser_t* p) {
+    return p != NULL && p->stage == H3FRAME_STAGE_TYPE && p->varint_len == 0;
+}
 
 /* ---- Writing ---- */
 

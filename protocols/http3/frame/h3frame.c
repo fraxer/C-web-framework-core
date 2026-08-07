@@ -74,7 +74,12 @@ static int __accum_reserve(h3frame_parser_t* p, size_t need) {
 
 h3frame_status_e h3frame_parser_feed(h3frame_parser_t* p,
                                      const uint8_t** pp, const uint8_t* end) {
-    if (p == NULL || pp == NULL || end == NULL) return H3FRAME_ERR_ENCODING;
+    /* An empty feed is legal and common: a QUIC STREAM frame that carries only
+     * FIN has no bytes, and the caller still has to drive the parser to learn
+     * whether the stream ended on a frame boundary. `*pp == end` (both NULL
+     * included) therefore means "nothing new", not "bad argument"; only a
+     * cursor past its own end is an argument error. */
+    if (p == NULL || pp == NULL || *pp > end) return H3FRAME_ERR_ENCODING;
 
     p->payload = NULL;
     p->payload_len = 0;

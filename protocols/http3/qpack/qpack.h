@@ -75,6 +75,22 @@ qpack_status_e qpack_decode_block(qpack_decoder_t* d, const uint8_t* block, size
 
 void qpack_headers_free(qpack_header_t* headers, size_t count);
 
+/* Instructions arriving on the peer's QPACK encoder stream (RFC 9204 §4.3).
+ *
+ * In lite we advertise QPACK_MAX_TABLE_CAPACITY=0, so the peer has no table to
+ * insert into and exactly one instruction remains legal: `Set Dynamic Table
+ * Capacity` with a value of 0, which real clients do send as an opener. Insert
+ * With Name Reference, Insert With Literal Name, Duplicate, and any capacity
+ * above what we advertised are all QPACK_ERR_ENCODER_STREAM -- a connection
+ * error of type QPACK_ENCODER_STREAM_ERROR (§4.3.1).
+ *
+ * Refusing every byte instead would be wrong: capacity-0 is legal and common.
+ * The parser is resumable, because a stream hands over bytes in arbitrary
+ * pieces; a partial instruction leaves *consumed short of len and the caller
+ * re-feeds the remainder. */
+qpack_status_e qpack_decoder_read_encoder(qpack_decoder_t* d, const uint8_t* data,
+                                          size_t len, size_t* consumed);
+
 /* ---- Encoder (lite) ---- *
  *
  * Emits a field section that references only the static table and literals:

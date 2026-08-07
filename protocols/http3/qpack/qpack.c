@@ -29,6 +29,44 @@ void qpack_headers_free(qpack_header_t* headers, size_t count) {
     free(headers);
 }
 
+/* ---- The peer's encoder stream (lite) ---- */
+
+qpack_status_e qpack_decoder_read_encoder(qpack_decoder_t* d, const uint8_t* data,
+                                          size_t len, size_t* consumed) {
+    if (consumed != NULL) *consumed = 0;
+    if (d == NULL || (data == NULL && len != 0)) return QPACK_ERR_ENCODER_STREAM;
+
+    size_t p = 0;
+    while (p < len) {
+        const uint8_t octet = data[p];
+
+        /* Set Dynamic Table Capacity is `001iiiii`; every other opcode --
+         * `1Tiiiiii` insert-with-name-ref, `01Hiiiii` insert-with-literal-name,
+         * `000iiiii` duplicate -- writes to a table we said we do not have. */
+        if ((octet & 0xe0) != 0x20) return QPACK_ERR_ENCODER_STREAM;
+
+        /* A 5-bit prefix of all ones means the value is 31 or more and a
+         * continuation follows. When 31 already exceeds what we advertised the
+         * verdict is settled without reading it -- which is what keeps lite
+         * (capacity 0) free of any partial instruction to carry over. */
+        if ((octet & 0x1f) == 0x1f && d->max_capacity < 31)
+            return QPACK_ERR_ENCODER_STREAM;
+
+        uint64_t capacity = 0;
+        const size_t n = prefix_int_decode(data + p, len - p, 5, &capacity);
+        /* Not an error: the instruction may simply be split across feeds. The
+         * caller keeps the tail and re-feeds it with the next chunk. */
+        if (n == 0) break;
+
+        if (capacity > d->max_capacity) return QPACK_ERR_ENCODER_STREAM;
+
+        p += n;
+    }
+
+    if (consumed != NULL) *consumed = p;
+    return QPACK_OK;
+}
+
 /* ======================================================================= *
  *  Encoder (lite)
  * ======================================================================= *
@@ -260,16 +298,28 @@ qpack_status_e qpack_decode_block(qpack_decoder_t* d, const uint8_t* block, size
     p += n;
     if (ric != 0) return QPACK_ERR_DECOMPRESSION;
 
+    /* §4.5.1.2: Base = ReqInsertCount + DeltaBase when S=0, and
+     * ReqInsertCount - DeltaBase - 1 when S=1. With RIC pinned at 0, S=1 would
+     * put Base below zero and any DeltaBase above zero would name an entry of a
+     * table that does not exist -- both are malformed rather than merely
+     * unused, so lite refuses them instead of ignoring the field. */
+    if (p >= end) return QPACK_ERR_DECOMPRESSION;
+    const int base_sign = (*p & 0x80) != 0;
+
     uint64_t delta_base = 0;
     n = prefix_int_decode(p, (size_t)(end - p), 7, &delta_base);
     if (n == 0) return QPACK_ERR_DECOMPRESSION;
     p += n;
-    (void)delta_base;
+    if (base_sign || delta_base != 0) return QPACK_ERR_DECOMPRESSION;
 
     qpack_header_t* headers = NULL;
     size_t count = 0, cap = 0;
     size_t total = 0;
     qpack_status_e st = QPACK_OK;
+    /* Set once headers[count] has been zeroed and is therefore safe to free on
+     * the failure path. It is not, in particular, after a failed grow: count
+     * still equals cap there, and headers[count] is one past the end. */
+    int partial = 0;
 
     while (p < end) {
         if (count == cap) {
@@ -282,6 +332,7 @@ qpack_status_e qpack_decode_block(qpack_decoder_t* d, const uint8_t* block, size
         qpack_header_t* h = &headers[count];
         h->name = NULL; h->value = NULL;
         h->name_len = 0; h->value_len = 0; h->never_indexed = 0;
+        partial = 1;
 
         const uint8_t octet = *p;
 
@@ -349,6 +400,7 @@ qpack_status_e qpack_decode_block(qpack_decoder_t* d, const uint8_t* block, size
             return QPACK_ERR_TOO_LARGE;
         }
         count++;
+        partial = 0;
     }
 
     *out = headers;
@@ -357,8 +409,9 @@ qpack_status_e qpack_decode_block(qpack_decoder_t* d, const uint8_t* block, size
 
 fail:
     /* count was not incremented for the partial entry; release its allocations
-     * (NULL-safe) before freeing the completed ones. */
-    if (headers != NULL) {
+     * (NULL-safe) before freeing the completed ones. `partial` guards the case
+     * where the failure was the grow itself, so slot `count` does not exist. */
+    if (headers != NULL && partial) {
         free(headers[count].name);
         free(headers[count].value);
     }

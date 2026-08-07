@@ -60,7 +60,9 @@ static int __feed_varint(h3uni_parser_t* p, const uint8_t** pp, const uint8_t* e
 
 h3uni_status_e h3uni_parser_feed(h3uni_parser_t* p, const uint8_t** pp,
                                  const uint8_t* end) {
-    if (p == NULL || pp == NULL || end == NULL) return H3UNI_ERR_ENCODING;
+    /* As in h3frame: an empty feed is "nothing new", not a bad argument -- a
+     * uni-stream can be opened by a STREAM frame that carries no bytes yet. */
+    if (p == NULL || pp == NULL || *pp > end) return H3UNI_ERR_ENCODING;
 
     /* A type prefix is one varint. Once read, the parser is done: it reports
      * READY a single time and the caller switches to type-specific parsing.

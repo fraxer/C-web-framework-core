@@ -12,6 +12,7 @@
 #include "h2session.h"
 #include "h2stream.h"
 #include "hpack.h"
+#include "httpfields.h"
 #include "httprequest.h"
 #include "httpresponse.h"
 #include "log.h"
@@ -99,57 +100,13 @@ static int __write_bufo(httpresponse_t* response, bufo_t* buf) {
  *  HEADERS frame
  * ======================================================================= */
 
-/* Connection-specific fields banned in HTTP/2 (RFC 9113 §8.2.2). Compared
- * case-insensitively because h1.1 response headers are canonical-cased. */
-static int __is_forbidden(const char* key, size_t len) {
-    static const char* const banned[] = {
-        "connection", "keep-alive", "proxy-connection", "transfer-encoding",
-        "upgrade", "te",
-    };
-
-    for (size_t i = 0; i < sizeof(banned) / sizeof(banned[0]); i++) {
-        const size_t n = strlen(banned[i]);
-        if (n != len) continue;
-
-        size_t j = 0;
-        for (; j < n; j++) {
-            char c = key[j];
-            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
-            if (c != banned[i][j]) break;
-        }
-        if (j == n) return 1;
-    }
-
-    return 0;
-}
-
-/* Fields whose value must never enter an HPACK dynamic table (RFC 7541 §7.1.3).
- *
- * A table entry is a compression oracle: an attacker who can make the server
- * emit a response of their choosing on the same connection learns a secret by
- * watching the encoded size shrink when their guess matches. That is CRIME
- * applied to HPACK, and the never-indexed representation is the RFC's answer.
- *
- * Compared against the already-lowercased name, so no case folding here. */
-static int __is_sensitive(const char* key, size_t len) {
-    static const struct { const char* name; size_t len; } sensitive[] = {
-        {"set-cookie", 10}, {"authorization", 13}, {"proxy-authorization", 19},
-    };
-
-    for (size_t i = 0; i < sizeof(sensitive) / sizeof(sensitive[0]); i++)
-        if (len == sensitive[i].len && memcmp(key, sensitive[i].name, len) == 0) return 1;
-
-    return 0;
-}
-
-/* RFC 9113 §8.2.1: field names MUST be lowercase on the wire; nghttp2-based
- * clients (curl, browsers) treat an uppercase byte as a PROTOCOL_ERROR. */
-static void __lowercase(char* dst, const char* src, size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        char c = src[i];
-        dst[i] = (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
-    }
-}
+/* The forbidden-field, sensitive-field and lowercasing rules moved to
+ * protocols/http/httpfields.c when HTTP/3 needed the same three (RFC 9113
+ * §8.2.2 and RFC 9114 §4.2 are word-for-word here). Thin aliases keep this
+ * file's call sites readable. */
+#define __is_forbidden(key, len) httpfields_is_forbidden_response_header((key), (len))
+#define __is_sensitive(key, len) httpfields_is_sensitive_header((key), (len))
+#define __lowercase(dst, src, len) httpfields_lowercase((dst), (src), (len))
 
 /* This response ends with a trailing HEADERS block (RFC 9113 §8.1), so
  * END_STREAM belongs there and nowhere earlier — docs/http2/08, phase E.1. */
