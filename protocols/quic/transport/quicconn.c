@@ -846,6 +846,35 @@ void quicconn_want_write(connection_t* connection) {
 
 /* ---- Lifecycle ---- */
 
+/* Release the QUIC-specific state. Reached through
+ * connection_server_ctx_t::transport_free, i.e. from connection_free, which is
+ * the only code that knows when the last reference has gone. It must not free
+ * the object -- connection_free does that immediately afterwards, and the
+ * connection_t it frees *is* this quicconn_t. */
+static void __quicconn_transport_free(void* arg) {
+    quicconn_t* conn = arg;
+    if (conn == NULL) return;
+
+    quictls_free(&conn->tls);
+
+    for (int i = 0; i < QUIC_ENC_COUNT; i++) {
+        quickeys_free(&conn->rx[i]);
+        quickeys_free(&conn->tx[i]);
+        quicack_free(&conn->ack[i]);
+        quicsendbuf_free(&conn->crypto_out[i]);
+    }
+
+    quicloss_free(&conn->loss);
+
+    quicstream_t* s = conn->streams;
+    while (s != NULL) {
+        quicstream_t* next = s->next;
+        quicstream_free(s);
+        s = next;
+    }
+    conn->streams = NULL;
+}
+
 quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
                             const quiccid_t* odcid, const quiccid_t* peer_scid,
                             const quicpath_t* path, server_t* server) {
@@ -956,30 +985,68 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
         return NULL;
     }
 
+    /* The embedded connection_t, initialised in place: it has to live inside
+     * this object rather than beside it, because the connection layer casts
+     * between the two. The fd is the endpoint's shared socket -- kept for
+     * diagnostics only, since nothing here ever reads or writes it directly. */
+    const struct sockaddr_in* remote4 = (const struct sockaddr_in*)&path->remote;
+    const in_addr_t remote_ip = path->remote.ss_family == AF_INET
+                                ? remote4->sin_addr.s_addr : 0;
+    const unsigned short remote_port = path->remote.ss_family == AF_INET
+                                       ? ntohs(remote4->sin_port) : 0;
+
+    if (!connection_s_init(&conn->conn, quicendpoint_listener(endpoint),
+                           quicendpoint_fd(endpoint), 0, 0,
+                           remote_ip, remote_port, NULL, 0)) {
+        __quicconn_transport_free(conn);
+        free(conn);
+        return NULL;
+    }
+
+    conn->conn.transport = CONN_TRANSPORT_QUIC;
+    conn->conn.close = quicconn_close_cb;
+    conn->conn.read = NULL;    /* the endpoint reads; there is no fd of our own */
+    conn->conn.write = NULL;
+
+    connection_server_ctx_t* ctx = conn->conn.ctx;
+    ctx->transport_data = conn;
+    ctx->transport_free = __quicconn_transport_free;
+    ctx->server = server;
+
     return conn;
+}
+
+int quicconn_close_cb(connection_t* connection) {
+    if (connection == NULL) return 1;
+
+    quicconn_t* conn = __conn_of(connection);
+    connection_server_ctx_t* ctx = connection->ctx;
+
+    /* Already holding the lock: every close path in this server takes it before
+     * calling close(), and it is not recursive. */
+    quicendpoint_detach(conn->endpoint, conn);
+
+    /* The bookkeeping half of control_del -- the worker's list and count. For a
+     * QUIC connection there is no epoll registration to remove. */
+    if (!ctx->listener->api->control_del(connection))
+        log_error("quicconn: connection not removed from api\n");
+
+    atomic_store(&ctx->detached, 1);
+    atomic_store(&ctx->destroyed, 1);
+
+    if (connection_s_dec(connection) == CONNECTION_DEC_RESULT_DECREMENT)
+        connection_s_unlock(connection);
+
+    return 1;
 }
 
 void quicconn_free(quicconn_t* conn) {
     if (conn == NULL) return;
 
-    quictls_free(&conn->tls);
-
-    for (int i = 0; i < QUIC_ENC_COUNT; i++) {
-        quickeys_free(&conn->rx[i]);
-        quickeys_free(&conn->tx[i]);
-        quicack_free(&conn->ack[i]);
-        quicsendbuf_free(&conn->crypto_out[i]);
-    }
-
-    quicloss_free(&conn->loss);
-
-    quicstream_t* s = conn->streams;
-    while (s != NULL) {
-        quicstream_t* next = s->next;
-        quicstream_free(s);
-        s = next;
-    }
-
+    /* Only reachable from the failure paths of quicconn_accept, before the
+     * connection_t exists. Once it does, the object is released through the
+     * reference count like any other connection. */
+    __quicconn_transport_free(conn);
     free(conn);
 }
 

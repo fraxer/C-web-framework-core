@@ -140,4 +140,17 @@ ssize_t quicendpoint_send(quicendpoint_t* endpoint, const uint8_t* data, size_t 
  * tx_lock, never the reverse (docs/http3/01-udp-endpoint.md §8). */
 void quicendpoint_wake(quicendpoint_t* endpoint, struct quicconn* conn);
 
+/* Accessors, so quicconn.c can build its embedded connection_t without seeing
+ * inside the endpoint (which would reintroduce the header cycle). */
+listener_t* quicendpoint_listener(quicendpoint_t* endpoint);
+int quicendpoint_fd(quicendpoint_t* endpoint);
+
+/* Take a connection out of the routing table and the endpoint's lists. Called
+ * from the connection's close path; after it, no datagram can reach it. */
+void quicendpoint_detach(quicendpoint_t* endpoint, struct quicconn* conn);
+
+/* Drain the send queue and run each connection's timers. Called from the
+ * worker tick, alongside h2_server_tick. */
+void quicendpoints_tick(quicendpoint_t* endpoints, int shutdown_now);
+
 #endif

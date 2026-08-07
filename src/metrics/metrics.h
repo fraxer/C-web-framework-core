@@ -64,6 +64,12 @@ typedef enum {
      * the contention ratio — but it does hold the lock, so it has to be nameable
      * as a blocker. */
     LOCK_SITE_TICK,
+    /* QUIC puts more under the connection lock than HTTP/2 did -- decryption,
+     * reassembly and congestion control join the frame parsing that was
+     * already there. These two tags are how that shows up as a number rather
+     * than as a suspicion (docs/http3/01-udp-endpoint.md §8). */
+    LOCK_SITE_QUIC_RECV,        /* endpoint handing a datagram to a connection */
+    LOCK_SITE_QUIC_SEND,        /* endpoint building that connection's packets */
     LOCK_SITE__COUNT
 } metrics_lock_site_t;
 
@@ -119,10 +125,9 @@ typedef enum {
 
     METRICS_QUIC_VERSION_NEGOTIATION, /* Version Negotiation packets sent */
     METRICS_QUIC_STATELESS_RESET,     /* stateless resets sent */
-    /* An Initial packet that would start a connection. Counted and dropped
-     * until phase 3 brings the TLS handshake -- an h3 build before then is
-     * reachable but cannot accept anyone, and this is what says so. */
-    METRICS_QUIC_INITIAL_NO_TLS,
+
+    METRICS_QUIC_CONN_ACCEPTED,
+    METRICS_QUIC_CONN_CLOSED,
 
     METRICS_QUIC_SEND_ERROR,
     METRICS_QUIC__COUNT

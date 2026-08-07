@@ -37,7 +37,8 @@ static const char* const __quic_name[METRICS_QUIC__COUNT] = {
     "recv_calls",
     "drop.truncated", "drop.oversize", "drop.cid_too_long",
     "drop.short_initial", "drop.unknown_cid", "drop.no_budget", "drop.peer_version_negotiation",
-    "version_negotiation_sent", "stateless_reset_sent", "initial_dropped_no_tls",
+    "version_negotiation_sent", "stateless_reset_sent",
+    "connections_accepted", "connections_closed",
     "send_error"
 };
 #endif
@@ -52,7 +53,8 @@ static const char* const __lock_site_name[LOCK_SITE__COUNT] = {
     "ws.read", "ws.write", "ws.reserve", "ws.publish",
     "broadcast",
     "close",
-    "tick"
+    "tick",
+    "quic.recv", "quic.send"
 };
 
 /* One of these per call site. The totals reported under `lock` are summed from

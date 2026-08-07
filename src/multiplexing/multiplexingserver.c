@@ -49,6 +49,8 @@ int mpxserver_run(appconfig_t* appconfig) {
     endpoints = quicendpoints_create(api, appconfig->server_chain->server, &quic_ok);
     if (!quic_ok)
         goto failed;
+
+    api->quic_endpoints = endpoints;
 #endif
 
     /* Wire the worker timer sweep (idle/PING timeouts, graceful shutdown). */
@@ -321,9 +323,16 @@ static void __mpx_on_tick(mpxapi_t* api) {
     while (connection != NULL) {
         connection_t* next = connection->next;
 
-        if (((connection_server_ctx_t*)connection->ctx)->is_http2)
+        /* QUIC connections are aged by their endpoint instead: the send queue
+         * they share belongs to it, and draining that is half the work. */
+        if (connection->transport == CONN_TRANSPORT_TCP &&
+            ((connection_server_ctx_t*)connection->ctx)->is_http2)
             h2_server_tick(connection, shutdown_now);
 
         connection = next;
     }
+
+#ifdef CWFR_HTTP3
+    quicendpoints_tick(api->quic_endpoints, shutdown_now);
+#endif
 }

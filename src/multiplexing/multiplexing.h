@@ -31,6 +31,13 @@ typedef struct mpxapi {
     /* Fired by the worker timer (one tick per worker, ~500 ms). NULL until the
      * server layer wires the h2 idle/PING/shutdown sweep onto it. */
     void(*on_tick)(struct mpxapi*);
+
+#ifdef CWFR_HTTP3
+    /* This worker's QUIC endpoints (quicendpoint_t*), so the tick can reach
+     * them. Kept here rather than walked out of `conns` because the send queue
+     * belongs to the endpoint, not to any one connection. */
+    void* quic_endpoints;
+#endif
 } mpxapi_t;
 
 mpxapi_t* mpx_create();

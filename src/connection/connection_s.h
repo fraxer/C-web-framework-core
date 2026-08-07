@@ -141,6 +141,18 @@ typedef struct {
      * write filter both run there. */
     unsigned cont_pending: 1;
     unsigned cont_sent: 6;
+
+    /* Extra state a transport hangs off the connection, torn down with it.
+     *
+     * QUIC needs it and TCP does not: a quicconn_t *embeds* its connection_t as
+     * the first member (so the two can be cast between), which means the QUIC
+     * state has to be released at exactly the moment the connection is freed --
+     * and connection_free is the only code that knows when that is. The hook
+     * must not free the object itself; connection_free still does that.
+     *
+     * NULL for every TCP connection, where the ctx is the whole story. */
+    void* transport_data;
+    void (*transport_free)(void*);
 } connection_server_ctx_t;
 
 /* The interim status line, shared by the parser that sends it and the write
@@ -162,6 +174,12 @@ typedef struct connection_queue_item {
 
 connection_t* connection_s_create(int fd, in_addr_t ip, unsigned short int port, connection_server_ctx_t* ctx, char* buffer, size_t buffer_size);
 connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, unsigned short int port, in_addr_t client_ip, unsigned short int client_port, char* buffer, size_t buffer_size);
+
+/* Initialise a connection_t the caller already owns, rather than allocating
+ * one. For transports that embed a connection in a larger object -- QUIC, where
+ * quicconn_t starts with one so the two can be cast between. Returns 0 on
+ * failure, in which case nothing was allocated. */
+int connection_s_init(connection_t* connection, listener_t* listener, int fd, in_addr_t ip, unsigned short int port, in_addr_t client_ip, unsigned short int client_port, char* buffer, size_t buffer_size);
 connection_t* connection_s_create_local(server_t* server);
 void connection_s_free_local(connection_t* connection);
 

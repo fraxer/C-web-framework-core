@@ -62,9 +62,9 @@ typedef enum {
 struct quicendpoint;
 
 typedef struct quicconn {
-    /* MUST be first: the connection layer casts between the two. */
+    /* MUST be first: the connection layer casts between the two, and
+     * connection_free's free(connection) has to be a free() of this object. */
     connection_t conn;
-    connection_server_ctx_t ctx;
 
     struct quicendpoint* endpoint;
 
@@ -154,6 +154,11 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
                             const quicpath_t* path, server_t* server);
 
 void quicconn_free(quicconn_t* conn);
+
+/* connection_t::close for a QUIC connection: detach from the endpoint's tables
+ * so no further datagram can reach it, then drop the base reference. The object
+ * is released when the last reference goes, like any other connection. */
+int quicconn_close_cb(connection_t* connection);
 
 /* Process one datagram. The caller has already routed it here by connection id
  * and holds connection_s_lock. Returns 0 if the connection should be closed. */

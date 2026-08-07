@@ -64,15 +64,11 @@ connection_t* connection_s_create(int fd, in_addr_t ip, unsigned short int port,
     return result;
 }
 
-connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, unsigned short int port, in_addr_t remote_ip, unsigned short int remote_port, char* buffer, size_t buffer_size) {
-    connection_t* connection = malloc(sizeof * connection);
-    if (connection == NULL) return NULL;
+int connection_s_init(connection_t* connection, listener_t* listener, int fd, in_addr_t ip, unsigned short int port, in_addr_t remote_ip, unsigned short int remote_port, char* buffer, size_t buffer_size) {
+    if (connection == NULL) return 0;
 
     connection_server_ctx_t* ctx = __ctx_create(listener);
-    if (ctx == NULL) {
-        free(connection);
-        return NULL;
-    }
+    if (ctx == NULL) return 0;
 
     connection->fd = fd;
     connection->keepalive = 0;
@@ -91,6 +87,19 @@ connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, uns
     connection->prev = NULL;
     connection->next = NULL;
     connection->transport = CONN_TRANSPORT_TCP;
+
+    return 1;
+}
+
+connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, unsigned short int port, in_addr_t remote_ip, unsigned short int remote_port, char* buffer, size_t buffer_size) {
+    connection_t* connection = malloc(sizeof * connection);
+    if (connection == NULL) return NULL;
+
+    if (!connection_s_init(connection, listener, fd, ip, port, remote_ip,
+                           remote_port, buffer, buffer_size)) {
+        free(connection);
+        return NULL;
+    }
 
     return connection;
 }
@@ -504,6 +513,8 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
     ctx->switch_to_protocol.fn = NULL;
     ctx->switch_to_protocol.data = NULL;
     ctx->switch_to_protocol.data_free = NULL;
+    ctx->transport_data = NULL;
+    ctx->transport_free = NULL;
 
     if (listener != NULL) {
         cqueue_item_t* item = cqueue_first(&listener->servers);
@@ -592,6 +603,15 @@ void __ctx_free(void* arg) {
     if (response != NULL) {
         response->free(response);
         ctx->response = NULL;
+    }
+
+    /* Last, so the transport's teardown can still reach anything above. It
+     * releases the transport's own state only -- connection_free frees the
+     * object itself. */
+    if (ctx->transport_free != NULL) {
+        ctx->transport_free(ctx->transport_data);
+        ctx->transport_free = NULL;
+        ctx->transport_data = NULL;
     }
 
     free(ctx);

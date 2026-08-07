@@ -45,7 +45,10 @@
  * runs before any worker thread exists -- the same contract h2_policy_init()
  * holds (moduleloader.c). */
 
+static void __route(quicendpoint_t* ep, struct quicconn* conn, udp_datagram_t* dgram);
+
 static quiccidtable_t* __quic_table = NULL;
+static size_t   __quic_max_connections = QUIC_DEFAULT_MAX_CONNECTIONS;
 static uint8_t  __quic_reset_key[32];
 static size_t   __quic_rx_batch = 32;
 static int      __quic_rcvbuf = 0;
@@ -63,6 +66,7 @@ int quic_policy_init(void) {
     int64_t max_connections = env_get_int("http3_max_connections", QUIC_DEFAULT_MAX_CONNECTIONS);
     if (max_connections < 64) max_connections = 64;
     if (max_connections > 4000000) max_connections = 4000000;
+    __quic_max_connections = (size_t)max_connections;
 
     int64_t batch = env_get_int("http3_rx_batch", 32);
     if (batch < 1) batch = 1;
@@ -302,7 +306,143 @@ void quicendpoint_wake(quicendpoint_t* endpoint, struct quicconn* conn) {
     atomic_flag_clear_explicit(&endpoint->tx_lock, memory_order_release);
 }
 
+listener_t* quicendpoint_listener(quicendpoint_t* endpoint) {
+    return endpoint != NULL ? &endpoint->listener : NULL;
+}
+
+int quicendpoint_fd(quicendpoint_t* endpoint) {
+    return endpoint != NULL ? endpoint->fd : -1;
+}
+
+void quicendpoint_detach(quicendpoint_t* endpoint, quicconn_t* conn) {
+    if (endpoint == NULL || conn == NULL) return;
+
+    /* Every id this connection answers to, so a datagram in flight cannot find
+     * it after this returns. */
+    for (size_t i = 0; i < QUICCONN_MAX_LOCAL_CIDS; i++)
+        if (conn->local_cids[i].active)
+            quiccidtable_remove(endpoint->table, &conn->local_cids[i].cid);
+
+    quiccidtable_remove(endpoint->table, &conn->odcid);
+
+    quicconn_t** link = &endpoint->conns;
+    while (*link != NULL) {
+        if (*link == conn) {
+            *link = conn->ep_next;
+            if (endpoint->conn_count > 0) endpoint->conn_count--;
+            break;
+        }
+        link = &(*link)->ep_next;
+    }
+
+    /* And out of the send queue, under its own lock: a handler thread may be
+     * pushing onto it at this moment. */
+    while (atomic_flag_test_and_set_explicit(&endpoint->tx_lock, memory_order_acquire))
+        sched_yield();
+
+    quicconn_t** tx = &endpoint->tx_head;
+    quicconn_t* prev = NULL;
+    while (*tx != NULL) {
+        if (*tx == conn) {
+            *tx = conn->tx_next;
+            if (endpoint->tx_tail == conn) endpoint->tx_tail = prev;
+            conn->in_tx_queue = 0;
+            break;
+        }
+        prev = *tx;
+        tx = &(*tx)->tx_next;
+    }
+
+    atomic_flag_clear_explicit(&endpoint->tx_lock, memory_order_release);
+}
+
 /* ---- Routing ---- */
+
+/* Create a connection for a client's first Initial packet. */
+static void __accept(quicendpoint_t* ep, udp_datagram_t* dgram,
+                     const quicinvariants_t* inv) {
+    server_t* server = NULL;
+    cqueue_item_t* item = cqueue_first(&ep->listener.servers);
+    if (item != NULL) server = item->data;
+
+    if (server == NULL || server->openssl == NULL) {
+        metrics_quic(METRICS_QUIC_DROP_UNKNOWN_CID);
+        return;
+    }
+
+    quicpath_t path;
+    memset(&path, 0, sizeof path);
+    path.remote = dgram->peer;
+    path.remote_len = dgram->peer_len;
+    if (dgram->local_valid) {
+        path.local = dgram->local;
+        path.local_len = dgram->peer_len;
+    }
+
+    quicconn_t* conn = quicconn_accept(ep, &inv->dcid, &inv->scid, &path, server);
+    if (conn == NULL) {
+        metrics_quic(METRICS_QUIC_DROP_NO_BUDGET);
+        return;
+    }
+
+    /* Both ids are registered: the client addresses its next packets to the id
+     * we chose, but anything already in flight still carries the one it made
+     * up, and dropping those would cost a retransmission on every connection. */
+    if (quiccidtable_insert(ep->table, &conn->local_cids[0].cid, conn) != QUICCIDTABLE_OK ||
+        quiccidtable_insert(ep->table, &conn->odcid, conn) != QUICCIDTABLE_OK) {
+        quiccidtable_remove(ep->table, &conn->local_cids[0].cid);
+        quiccidtable_remove(ep->table, &conn->odcid);
+        quicconn_free(conn);
+        metrics_quic(METRICS_QUIC_DROP_NO_BUDGET);
+        return;
+    }
+
+    conn->ep_next = ep->conns;
+    ep->conns = conn;
+    ep->conn_count++;
+
+    /* Into the worker's connection list and count, so the timer sweep and the
+     * shutdown drain see it. For QUIC this does no epoll_ctl. */
+    if (!ep->listener.api->control_add(&conn->conn, MPXIN)) {
+        quicendpoint_detach(ep, conn);
+        quicconn_free(conn);
+        return;
+    }
+
+    metrics_quic(METRICS_QUIC_CONN_ACCEPTED);
+
+    __route(ep, conn, dgram);
+}
+
+/* Hand a datagram to a connection and let it answer. */
+static void __route(quicendpoint_t* ep, quicconn_t* conn, udp_datagram_t* dgram) {
+    quicpath_t path;
+    memset(&path, 0, sizeof path);
+    path.remote = dgram->peer;
+    path.remote_len = dgram->peer_len;
+    if (dgram->local_valid) {
+        path.local = dgram->local;
+        path.local_len = dgram->peer_len;
+    }
+
+    const uint64_t now = quic_now_us();
+
+    /* The connection lock guards every field of the connection, exactly as it
+     * does for HTTP/2 -- and here it also matters that a datagram of this
+     * connection may land on a different worker, since the kernel hashes the
+     * 4-tuple and QUIC does not (ADR-3). */
+    connection_s_lock(&conn->conn, LOCK_SITE_QUIC_RECV);
+
+    int alive = quicconn_recv(conn, dgram->data, dgram->len, &path, now);
+    if (alive) alive = quicconn_send(conn, now);
+
+    if (!alive || conn->state == QUICCONN_DEAD) {
+        conn->conn.close(&conn->conn);   /* releases the lock */
+        return;
+    }
+
+    connection_s_unlock(&conn->conn);
+}
 
 static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
     /* udp_rx_batch_recv zeroes the length of a datagram that did not fit: QUIC
@@ -336,12 +476,12 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
         return;
     }
 
-    void* connection = quiccidtable_lookup_acquire(ep->table, &inv.dcid);
-    if (connection != NULL) {
-        /* Phase 4 hands the datagram to the connection here. Nothing can reach
-         * this branch yet: no code inserts into the table until connections
-         * exist. */
-        metrics_quic(METRICS_QUIC_DROP_UNKNOWN_CID);
+    quicconn_t* conn = quiccidtable_lookup_acquire(ep->table, &inv.dcid);
+    if (conn != NULL) {
+        __route(ep, conn, dgram);
+        /* The reference the lookup took under the shard lock, which is what
+         * stopped the connection being freed between finding it and using it. */
+        connection_s_dec(&conn->conn);
         return;
     }
 
@@ -369,16 +509,18 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
         return;
     }
 
-    /* Our version, big enough, no connection: this would start one. Creating it
-     * needs the TLS handshake, which arrives in phase 3. Counted rather than
-     * silently dropped -- an h3 build before phase 3 is reachable but cannot
-     * accept anyone, and this counter is what says so out loud.
+    /* Our version, big enough, no connection: a new one.
      *
-     * The packet type is not inspected: reading it means decoding a
-     * version-1 header, which belongs to the v1 codec of phase 2. So a
-     * Handshake or 0-RTT packet for a connection we never had lands here too,
-     * which is the right disposition for it in any case. */
-    metrics_quic(METRICS_QUIC_INITIAL_NO_TLS);
+     * The packet type is not inspected. A Handshake or 0-RTT packet for a
+     * connection we never had would also land here, and quicconn_accept will
+     * fail to make sense of it -- which is the right disposition for it
+     * anyway, since without the Initial there are no keys to read it with. */
+    if (ep->conn_count >= __quic_max_connections) {
+        metrics_quic(METRICS_QUIC_DROP_NO_BUDGET);
+        return;
+    }
+
+    __accept(ep, dgram, &inv);
 }
 
 static int __endpoint_read(connection_t* connection) {
@@ -596,6 +738,73 @@ quicendpoint_t* quicendpoints_create(mpxapi_t* api, server_t* first_server, int*
     quicendpoints_free(head);
 
     return NULL;
+}
+
+/* One endpoint's share of the worker tick: send what is queued, then age every
+ * connection. Ordered that way so a connection that becomes dead in its tick is
+ * closed after it has had the chance to put its CONNECTION_CLOSE on the wire. */
+static void __endpoint_tick(quicendpoint_t* ep, int shutdown_now) {
+    const uint64_t now = quic_now_us();
+
+    /* Take the whole queue at once rather than popping under the lock per
+     * connection: a handler thread pushing meanwhile simply starts a new one. */
+    while (atomic_flag_test_and_set_explicit(&ep->tx_lock, memory_order_acquire))
+        sched_yield();
+
+    quicconn_t* pending = ep->tx_head;
+    ep->tx_head = NULL;
+    ep->tx_tail = NULL;
+
+    atomic_flag_clear_explicit(&ep->tx_lock, memory_order_release);
+
+    while (pending != NULL) {
+        quicconn_t* next = pending->tx_next;
+        pending->tx_next = NULL;
+        pending->in_tx_queue = 0;
+
+        connection_s_lock(&pending->conn, LOCK_SITE_QUIC_SEND);
+
+        if (!quicconn_send(pending, now) || pending->state == QUICCONN_DEAD)
+            pending->conn.close(&pending->conn);
+        else
+            connection_s_unlock(&pending->conn);
+
+        pending = next;
+    }
+
+    quicconn_t* conn = ep->conns;
+    while (conn != NULL) {
+        /* Captured first: the tick may close and free the connection. */
+        quicconn_t* next = conn->ep_next;
+
+        if (!connection_s_trylock(&conn->conn)) {
+            conn = next;
+            continue;
+        }
+
+        if (shutdown_now && conn->state == QUICCONN_ACTIVE)
+            quicconn_close(conn, QUIC_NO_ERROR, 0, now);
+
+        int alive = quicconn_tick(conn, now);
+        if (alive && conn->want_write) alive = quicconn_send(conn, now);
+
+        if (!alive || conn->state == QUICCONN_DEAD) {
+            metrics_quic(METRICS_QUIC_CONN_CLOSED);
+            conn->conn.close(&conn->conn);
+        }
+        else {
+            connection_s_unlock(&conn->conn);
+        }
+
+        conn = next;
+    }
+}
+
+void quicendpoints_tick(quicendpoint_t* endpoints, int shutdown_now) {
+    while (endpoints != NULL) {
+        __endpoint_tick(endpoints, shutdown_now);
+        endpoints = endpoints->next;
+    }
 }
 
 int quicendpoints_listen(quicendpoint_t* endpoints) {
