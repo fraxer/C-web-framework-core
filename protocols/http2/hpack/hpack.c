@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "hpack_huffman.h"
+#include "huffman.h"
 #include "hpack_statictable.h"
 
 /* ======================================================================= *
@@ -35,12 +35,6 @@ static int bb_reserve(hpack_bytebuf_t* b, size_t need) {
     return 1;
 }
 
-static int bb_putc(hpack_bytebuf_t* b, uint8_t c) {
-    if (!bb_reserve(b, 1)) return 0;
-    b->data[b->len++] = c;
-    return 1;
-}
-
 static int bb_write(hpack_bytebuf_t* b, const uint8_t* d, size_t n) {
     if (n == 0) return 1;
     if (!bb_reserve(b, n)) return 0;
@@ -49,150 +43,72 @@ static int bb_write(hpack_bytebuf_t* b, const uint8_t* d, size_t n) {
     return 1;
 }
 
-/* Encode an integer straight into the buffer. */
+/* Encode an integer straight into the buffer. A 32-bit prefix integer occupies
+ * at most 6 octets (1 prefix + 5 continuation), so reserve once and encode into
+ * the tail via the shared primitive. */
 static int bb_encode_int(hpack_bytebuf_t* b, uint32_t value,
                          uint8_t prefix_bits, uint8_t prefix_byte) {
-    uint32_t max = ((uint32_t)1 << prefix_bits) - 1;
-    if (!bb_putc(b, (uint8_t)(prefix_byte | (value < max ? value : max)))) return 0;
-    if (value < max) return 1;
-    value -= max;
-    while (value >= 128) {
-        if (!bb_putc(b, (uint8_t)((value & 0x7f) | 0x80))) return 0;
-        value >>= 7;
-    }
-    return bb_putc(b, (uint8_t)value);
+    if (!bb_reserve(b, 6)) return 0;
+    const size_t n = prefix_int_encode(b->data + b->len, b->cap - b->len, value,
+                                       prefix_bits, prefix_byte);
+    if (n == 0) { b->oom = 1; return 0; }
+    b->len += n;
+    return 1;
 }
 
 /* ======================================================================= *
  *  Integer representation (RFC 7541 §5.1)
- * ======================================================================= */
+ * ======================================================================= *
+ *  Thin wrappers over the shared prefix-int codec in misc/huffman.c, keeping
+ *  the hpack-shaped signatures (cursor + status, 32-bit) this file and its tests
+ *  were written against. The bounds checks the codec used to carry inlined here
+ *  move with it: prefix_int_decode caps at 2^62, and the 32-bit clamp below
+ *  preserves HPACK's narrower range. */
 
 uint32_t hpack_decode_int(const uint8_t** pp, const uint8_t* end,
                           uint8_t prefix_bits, hpack_status_e* st) {
+    uint64_t v = 0;
+    const size_t n = prefix_int_decode(*pp, (size_t)(end - *pp), prefix_bits, &v);
+    if (n == 0 || v > 0xffffffffu) { *st = HPACK_ERR_INVALID; return 0; }
+    *pp += n;
     *st = HPACK_OK;
-    if (*pp >= end) { *st = HPACK_ERR_INVALID; return 0; }
-
-    const uint32_t max = ((uint32_t)1 << prefix_bits) - 1;
-    uint32_t v = (uint32_t)**pp & max;
-    (*pp)++;
-    if (v < max) return v;
-
-    uint32_t m = 0;
-    for (;;) {
-        if (*pp >= end) { *st = HPACK_ERR_INVALID; return 0; }
-        uint8_t octet = **pp;
-        (*pp)++;
-        if (m > 28) { *st = HPACK_ERR_INVALID; return 0; } /* would exceed 32 bits */
-        uint32_t add = (uint32_t)(octet & 0x7f) << m;
-        if (add > 0xffffffffu - v) { *st = HPACK_ERR_INVALID; return 0; }
-        v += add;
-        m += 7;
-        if (!(octet & 0x80)) break;
-    }
-    return v;
+    return (uint32_t)v;
 }
 
 size_t hpack_encode_int(uint8_t* dst, size_t cap, uint32_t value,
                         uint8_t prefix_bits, uint8_t prefix_byte) {
-    const uint32_t max = ((uint32_t)1 << prefix_bits) - 1;
-    size_t n = 0;
-    if (cap < 1) return 0;
-    dst[n++] = (uint8_t)(prefix_byte | (value < max ? value : max));
-    if (value < max) return n;
-    value -= max;
-    while (value >= 128) {
-        if (n >= cap) return 0;
-        dst[n++] = (uint8_t)((value & 0x7f) | 0x80);
-        value >>= 7;
-    }
-    if (n >= cap) return 0;
-    dst[n++] = (uint8_t)value;
-    return n;
+    return prefix_int_encode(dst, cap, value, prefix_bits, prefix_byte);
 }
 
 /* ======================================================================= *
  *  Huffman coding (RFC 7541 §5.2, Appendix B)
- * ======================================================================= */
+ * ======================================================================= *
+ *  Thin wrappers over the shared codec in misc/huffman.c (the nibble DFA lives
+ *  in misc/huffman_table.h). The hpack-shaped signatures and the
+ *  COMPRESSION/INVALID split are kept so callers and tests are unchanged; -1
+ *  from the shared codec maps to COMPRESSION on decode (a malformed stream) and
+ *  to INVALID on encode (output cap too small). The decode cap-overflow case is
+ *  unreachable in practice -- hpack_decode_string sizes the buffer at 2*length+8
+ *  and Huffman expands by at most ~8/5 -- which is why collapsing it onto
+ *  COMPRESSION changes no observable behaviour. */
 
 size_t hpack_huffman_encoded_len(const uint8_t* data, size_t len) {
-    size_t bits = 0;
-    for (size_t i = 0; i < len; i++) bits += hpack_huff_len[data[i]];
-    return (bits + 7) / 8;
+    return huffman_encoded_len(data, len);
 }
 
 hpack_status_e hpack_huffman_encode(const uint8_t* data, size_t len,
                                     uint8_t* dst, size_t cap, size_t* out_len) {
-    uint64_t acc = 0;
-    int bits = 0;
-    size_t n = 0;
-    for (size_t i = 0; i < len; i++) {
-        uint32_t code = hpack_huff_code[data[i]];
-        int l = hpack_huff_len[data[i]];
-        acc = (acc << l) | code;
-        bits += l;
-        while (bits >= 8) {
-            bits -= 8;
-            if (n >= cap) return HPACK_ERR_INVALID;
-            dst[n++] = (uint8_t)((acc >> bits) & 0xff);
-        }
-    }
-    if (bits > 0) {
-        if (n >= cap) return HPACK_ERR_INVALID;
-        /* Pad the final octet with the EOS prefix (all 1 bits). */
-        uint8_t pad = (uint8_t)((acc << (8 - bits)) & 0xff);
-        pad |= (uint8_t)((1u << (8 - bits)) - 1);
-        dst[n++] = pad;
-    }
-    *out_len = n;
+    const ssize_t n = huffman_encode(dst, cap, data, len);
+    if (n < 0) return HPACK_ERR_INVALID;
+    *out_len = (size_t)n;
     return HPACK_OK;
 }
 
-/* Decode through the generated nibble DFA (hpack_huffman.h): two table lookups
- * per octet, no per-bit work. The state encodes the position in the code tree,
- * so a symbol split across octets needs no accumulator of its own.
- *
- * This used to be a per-bit scan over all 256 symbols — correct, and about
- * 0.5 us per input byte, which let one 625 KB header block cost ~300 ms of the
- * worker under connection_s_lock. The block limits could not bound it: the
- * two-tier header-list limit has to decode a block to the end to keep the
- * connection's HPACK table in step with the peer's (docs/http2/08, A.4), so the
- * only lever left was the cost per byte (docs/http2/10, H.2).
- *
- * Output is bounded by ~8/5 of the input, so callers allocate ~len*2. */
 hpack_status_e hpack_huffman_decode(const uint8_t* data, size_t len,
                                     uint8_t* dst, size_t cap, size_t* out_len) {
-    size_t n = 0;
-    uint8_t state = 0;
-    /* Empty input decodes to the empty string; every other verdict comes from
-     * the last nibble's entry. */
-    int accept = 1;
-
-    for (size_t i = 0; i < len; i++) {
-        const hpack_huff_decode_t* e = &hpack_huff_decode[state][data[i] >> 4];
-
-        if (e->flags & HPACK_HUFF_FAIL) return HPACK_ERR_COMPRESSION;
-        if (e->flags & HPACK_HUFF_SYM) {
-            if (n >= cap) return HPACK_ERR_INVALID;
-            dst[n++] = e->sym;
-        }
-        state = e->state;
-
-        e = &hpack_huff_decode[state][data[i] & 0x0f];
-
-        if (e->flags & HPACK_HUFF_FAIL) return HPACK_ERR_COMPRESSION;
-        if (e->flags & HPACK_HUFF_SYM) {
-            if (n >= cap) return HPACK_ERR_INVALID;
-            dst[n++] = e->sym;
-        }
-        state = e->state;
-        accept = (e->flags & HPACK_HUFF_ACCEPT) != 0;
-    }
-
-    /* Anything left over must be EOS-prefix padding shorter than an octet; the
-     * ACCEPT flag is exactly that property of the resulting state. */
-    if (!accept) return HPACK_ERR_COMPRESSION;
-
-    *out_len = n;
+    const ssize_t n = huffman_decode(dst, cap, data, len);
+    if (n < 0) return HPACK_ERR_COMPRESSION;
+    *out_len = (size_t)n;
     return HPACK_OK;
 }
 

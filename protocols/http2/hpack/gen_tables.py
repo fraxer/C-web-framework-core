@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-# Generates hpack_huffman.h and hpack_statictable.h verbatim from RFC 7541.
+# Generates misc/huffman_table.h and hpack_statictable.h verbatim from RFC 7541.
+#
+# The Huffman table is shared by HPACK (RFC 7541) and QPACK (RFC 9204 §5, which
+# references HPACK's Huffman coding), so it lives in misc/.  The static table is
+# HPACK-specific (61 entries) and stays here; QPACK's 99-entry table will be
+# generated separately.
 #
 #   Source data: RFC 7541
 #     - Appendix A  Static Table Definition
@@ -9,11 +14,12 @@
 # The generated headers are committed; this script documents their provenance
 # and lets the tables be regenerated / re-verified against the RFC.  Running it
 # requires only the plain-text RFC (https://www.rfc-editor.org/rfc/rfc7541.txt).
+import os
 import re
 import sys
 from fractions import Fraction
 
-# Decoding-table entry flags (mirrored in hpack_huffman.h).
+# Decoding-table entry flags (mirrored in misc/huffman_table.h).
 HUFF_SYM = 0x01     # the entry completed a symbol, emit entry.sym
 HUFF_ACCEPT = 0x02  # the resulting state is a valid end of string
 HUFF_FAIL = 0x04    # the nibble walked into EOS — invalid inside a string
@@ -110,22 +116,22 @@ def emit_huffman(syms):
     out.append(" * HPACK Huffman code table: 257 symbols (0..255 + EOS=256),")
     out.append(" * plus the nibble-driven decoding DFA derived from it.")
     out.append(" * Do not edit by hand. */")
-    out.append("#ifndef __HPACK_HUFFMAN_TABLE__")
-    out.append("#define __HPACK_HUFFMAN_TABLE__")
+    out.append("#ifndef __HUFFMAN_TABLE__")
+    out.append("#define __HUFFMAN_TABLE__")
     out.append("")
     out.append("#include <stdint.h>")
     out.append("")
-    out.append("#define HPACK_HUFF_EOS 256")
+    out.append("#define HUFF_EOS 256")
     out.append("")
     out.append("/* Huffman code value (MSB-aligned numeric value) per symbol. */")
-    out.append("static const uint32_t hpack_huff_code[257] = {")
+    out.append("static const uint32_t huff_code[257] = {")
     for i in range(0, 257, 8):
         chunk = syms[i:i + 8]
         out.append("    " + ", ".join("0x%08x" % c for _, c, _ in chunk) + ",")
     out.append("};")
     out.append("")
     out.append("/* Code length in bits per symbol. */")
-    out.append("static const uint8_t hpack_huff_len[257] = {")
+    out.append("static const uint8_t huff_len[257] = {")
     for i in range(0, 257, 16):
         chunk = syms[i:i + 16]
         out.append("    " + ", ".join("%2d" % l for _, _, l in chunk) + ",")
@@ -141,20 +147,20 @@ def emit_huffman(syms):
     out.append(" *        ACCEPT — the resulting state is a legal end of string (padding is")
     out.append(" *                 all ones and shorter than an octet, RFC 7541 5.2);")
     out.append(" *        FAIL  — the walk reached EOS, which may not appear in a string. */")
-    out.append("#define HPACK_HUFF_SYM    0x01")
-    out.append("#define HPACK_HUFF_ACCEPT 0x02")
-    out.append("#define HPACK_HUFF_FAIL   0x04")
+    out.append("#define HUFF_SYM    0x01")
+    out.append("#define HUFF_ACCEPT 0x02")
+    out.append("#define HUFF_FAIL   0x04")
     out.append("")
-    out.append("#define HPACK_HUFF_STATES %d" % len(states))
+    out.append("#define HUFF_STATES %d" % len(states))
     out.append("")
     out.append("typedef struct {")
     out.append("    uint8_t state; /* next state */")
     out.append("    uint8_t flags;")
-    out.append("    uint8_t sym;   /* valid when flags & HPACK_HUFF_SYM */")
-    out.append("} hpack_huff_decode_t;")
+    out.append("    uint8_t sym;   /* valid when flags & HUFF_SYM */")
+    out.append("} huff_decode_t;")
     out.append("")
-    out.append("static const hpack_huff_decode_t")
-    out.append("hpack_huff_decode[HPACK_HUFF_STATES][16] = {")
+    out.append("static const huff_decode_t")
+    out.append("huff_decode[HUFF_STATES][16] = {")
     for st, row in enumerate(table):
         out.append("    /* %3d */ {" % st)
         for i in range(0, 16, 4):
@@ -242,11 +248,15 @@ def main():
     if len(sys.argv) != 2:
         sys.exit("usage: gen_tables.py path/to/rfc7541.txt")
     syms, rows = parse(sys.argv[1])
-    with open("hpack_huffman.h", "w") as f:
+    # The shared Huffman table lives in misc/ (two levels up from this script);
+    # the HPACK static table stays alongside the script.
+    here = os.path.dirname(os.path.abspath(__file__))
+    huffman_out = os.path.join(here, "..", "..", "misc", "huffman_table.h")
+    with open(huffman_out, "w") as f:
         f.write(emit_huffman(syms))
     with open("hpack_statictable.h", "w") as f:
         f.write(emit_static(rows))
-    print("generated hpack_huffman.h (%d syms) and hpack_statictable.h (%d rows)"
+    print("generated misc/huffman_table.h (%d syms) and hpack_statictable.h (%d rows)"
           % (len(syms), len(rows)))
 
 

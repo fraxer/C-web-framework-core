@@ -6,10 +6,11 @@
 
 /* HPACK (RFC 7541) header compression for HTTP/2.
  *
- * Self-contained module: depends only on the C standard library, so it can be
- * unit-tested in isolation and reused by the future HTTP/2 connection layer.
- * Tables (Huffman, static) are generated verbatim from RFC 7541 Appendix A/B
- * by gen_tables.py — see hpack_huffman.h / hpack_statictable.h.
+ * Depends only on the C standard library plus the shared Huffman/prefix-int
+ * codec in misc/huffman.{c,h}, so it can be unit-tested in isolation. The
+ * Huffman table (shared with QPACK via RFC 9204 §5) is generated into
+ * misc/huffman_table.h; the HPACK static table (61 entries) into
+ * hpack_statictable.h — both by gen_tables.py from RFC 7541 Appendix A/B.
  *
  * A decoded/encoded header field uses non-null-terminated byte slices, mirroring
  * the codebase's http_header_t (name_len/value_len carry the real length). */

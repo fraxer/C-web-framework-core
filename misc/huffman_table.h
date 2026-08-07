@@ -1,16 +1,21 @@
 /* Auto-generated from RFC 7541 Appendix B by gen_tables.py.
- * HPACK Huffman code table: 257 symbols (0..255 + EOS=256),
+ * Huffman code table: 257 symbols (0..255 + EOS=256),
  * plus the nibble-driven decoding DFA derived from it.
+ *
+ * This is the shared RFC 7541 Appendix B table: RFC 9204 §5 defines QPACK to
+ * use "the Huffman coding defined in [HPACK]", so both HPACK (RFC 7541) and
+ * QPACK (RFC 9204) code against it via misc/huffman.{c,h}. It lives in misc/
+ * rather than under protocols/http2 for that reason.
  * Do not edit by hand. */
-#ifndef __HPACK_HUFFMAN_TABLE__
-#define __HPACK_HUFFMAN_TABLE__
+#ifndef __HUFFMAN_TABLE__
+#define __HUFFMAN_TABLE__
 
 #include <stdint.h>
 
-#define HPACK_HUFF_EOS 256
+#define HUFF_EOS 256
 
 /* Huffman code value (MSB-aligned numeric value) per symbol. */
-static const uint32_t hpack_huff_code[257] = {
+static const uint32_t huff_code[257] = {
     0x00001ff8, 0x007fffd8, 0x0fffffe2, 0x0fffffe3, 0x0fffffe4, 0x0fffffe5, 0x0fffffe6, 0x0fffffe7,
     0x0fffffe8, 0x00ffffea, 0x3ffffffc, 0x0fffffe9, 0x0fffffea, 0x3ffffffd, 0x0fffffeb, 0x0fffffec,
     0x0fffffed, 0x0fffffee, 0x0fffffef, 0x0ffffff0, 0x0ffffff1, 0x0ffffff2, 0x3ffffffe, 0x0ffffff3,
@@ -47,7 +52,7 @@ static const uint32_t hpack_huff_code[257] = {
 };
 
 /* Code length in bits per symbol. */
-static const uint8_t hpack_huff_len[257] = {
+static const uint8_t huff_len[257] = {
     13, 23, 28, 28, 28, 28, 28, 28, 28, 24, 30, 28, 28, 30, 28, 28,
     28, 28, 28, 28, 28, 28, 30, 28, 28, 28, 28, 28, 28, 28, 28, 28,
      6, 10, 10, 12, 13,  6,  8, 11, 10, 10,  8, 11,  8,  6,  6,  6,
@@ -77,20 +82,20 @@ static const uint8_t hpack_huff_len[257] = {
  *        ACCEPT — the resulting state is a legal end of string (padding is
  *                 all ones and shorter than an octet, RFC 7541 5.2);
  *        FAIL  — the walk reached EOS, which may not appear in a string. */
-#define HPACK_HUFF_SYM    0x01
-#define HPACK_HUFF_ACCEPT 0x02
-#define HPACK_HUFF_FAIL   0x04
+#define HUFF_SYM    0x01
+#define HUFF_ACCEPT 0x02
+#define HUFF_FAIL   0x04
 
-#define HPACK_HUFF_STATES 256
+#define HUFF_STATES 256
 
 typedef struct {
     uint8_t state; /* next state */
     uint8_t flags;
-    uint8_t sym;   /* valid when flags & HPACK_HUFF_SYM */
-} hpack_huff_decode_t;
+    uint8_t sym;   /* valid when flags & HUFF_SYM */
+} huff_decode_t;
 
-static const hpack_huff_decode_t
-hpack_huff_decode[HPACK_HUFF_STATES][16] = {
+static const huff_decode_t
+huff_decode[HUFF_STATES][16] = {
     /*   0 */ {
         {  1, 0x00,   0}, {  2, 0x00,   0}, {  3, 0x00,   0}, {  4, 0x00,   0},
         {  5, 0x00,   0}, {  6, 0x00,   0}, {  7, 0x00,   0}, {  8, 0x00,   0},

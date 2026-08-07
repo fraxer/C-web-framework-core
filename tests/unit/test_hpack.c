@@ -1,7 +1,7 @@
 #include "framework.h"
 #include "hpack.h"
 /* For the code table the differential Huffman test uses as its oracle. */
-#include "hpack_huffman.h"
+#include "huffman_table.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -637,15 +637,15 @@ static hpack_status_e huffman_decode_reference(const uint8_t* data, size_t len,
             curbits++;
 
             for (int s = 0; s < 256; s++) {
-                if (hpack_huff_len[s] == curbits && hpack_huff_code[s] == cur) {
+                if (huff_len[s] == curbits && huff_code[s] == cur) {
                     if (n >= cap) return HPACK_ERR_INVALID;
                     dst[n++] = (uint8_t)s;
                     cur = 0; curbits = 0;
                     goto next_bit;
                 }
             }
-            if (hpack_huff_len[HPACK_HUFF_EOS] == curbits &&
-                hpack_huff_code[HPACK_HUFF_EOS] == cur)
+            if (huff_len[HUFF_EOS] == curbits &&
+                huff_code[HUFF_EOS] == cur)
                 return HPACK_ERR_COMPRESSION;
         next_bit:;
         }
