@@ -12,4 +12,4 @@ endif()
 # connection brings the multiplexing headers with it (connection_s.h includes
 # multiplexingserver.h), so udp does not name multiplexing itself -- that would
 # declare a cycle, since multiplexingserver.c calls into this library.
-cwfr_add_lib(udp LINK_LIBS misc quic_common connection server config openssl metrics)
+cwfr_add_lib(udp LINK_LIBS misc quic_common quic_crypto quic_transport connection server config openssl metrics)

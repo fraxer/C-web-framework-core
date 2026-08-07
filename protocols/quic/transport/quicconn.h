@@ -1,0 +1,185 @@
+#ifndef __QUICCONN__
+#define __QUICCONN__
+
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+#include "connection_s.h"
+#include "quic.h"
+#include "quicack.h"
+#include "quiccc.h"
+#include "quiccrypto.h"
+#include "quicloss.h"
+#include "quicstream.h"
+#include "quictls.h"
+#include "quictp.h"
+
+/* A QUIC connection (RFC 9000).
+ *
+ * ## Why connection_t is embedded rather than pointed to
+ *
+ * Everything above the transport -- the request context, the lock, the
+ * reference count, the handler queue, the filter chain -- is written against
+ * connection_t and knows nothing about QUIC. Embedding it means all of that
+ * works unchanged, and `&qc->conn` is a connection like any other.
+ *
+ * What changes is that connection_t is no longer "the thing in epoll": its fd
+ * is the endpoint's shared socket, and every epoll_ctl path routes around it
+ * (connection.h, connection_transport_e). The cast back from connection_t to
+ * quicconn_t relies on conn being the first member. */
+
+typedef struct quicpath {
+    struct sockaddr_storage local;
+    struct sockaddr_storage remote;
+    socklen_t local_len;
+    socklen_t remote_len;
+} quicpath_t;
+
+/* A connection id we issued, with the sequence number and reset token that go
+ * with it (§5.1.1). */
+typedef struct quiccid_entry {
+    quiccid_t cid;
+    uint64_t  seq;
+    uint8_t   reset_token[16];
+    int       active;
+} quiccid_entry_t;
+
+#define QUICCONN_MAX_LOCAL_CIDS 8
+#define QUICCONN_MAX_PEER_CIDS  8
+
+typedef enum {
+    QUICCONN_HANDSHAKE = 0,
+    QUICCONN_ACTIVE,
+    /* We sent CONNECTION_CLOSE. The packet is kept and re-sent in answer to
+     * anything that arrives, but nothing new is processed (§10.2.1). */
+    QUICCONN_CLOSING,
+    /* The peer closed. Nothing is sent at all; we wait out the drain so late
+     * packets do not provoke a stateless reset (§10.2.2). */
+    QUICCONN_DRAINING,
+    QUICCONN_DEAD
+} quicconn_state_e;
+
+struct quicendpoint;
+
+typedef struct quicconn {
+    /* MUST be first: the connection layer casts between the two. */
+    connection_t conn;
+    connection_server_ctx_t ctx;
+
+    struct quicendpoint* endpoint;
+
+    quicpath_t path;
+
+    /* Identity. `odcid` is the Destination Connection ID from the client's
+     * first Initial -- the Initial keys derive from it, and the client checks
+     * it against the transport parameters we send. */
+    quiccid_t odcid;
+    quiccid_entry_t local_cids[QUICCONN_MAX_LOCAL_CIDS];
+    quiccid_t peer_cids[QUICCONN_MAX_PEER_CIDS];
+    size_t    peer_cid_count;
+    uint64_t  next_cid_seq;
+
+    /* Crypto: keys per level per direction, and the TLS bridge. */
+    quictls_t tls;
+    quickeys_t rx[QUIC_ENC_COUNT];
+    quickeys_t tx[QUIC_ENC_COUNT];
+    quic_aead_e suite;
+
+    /* Acknowledgement state, one per packet number space. */
+    quicack_t ack[QUIC_ENC_COUNT];
+
+    /* CRYPTO send buffers, one per level: handshake data is retransmitted the
+     * same way stream data is. */
+    quicsendbuf_t crypto_out[QUIC_ENC_COUNT];
+
+    quicloss_t loss;
+    quiccc_t   cc;
+    quicpacer_t pacer;
+
+    /* Streams, and the limits that bound them. */
+    quicstream_t* streams;
+    size_t    stream_count;
+    uint64_t  next_peer_bidi;   /* lowest client bidi id not yet opened */
+    uint64_t  next_peer_uni;
+    uint64_t  next_local_uni;
+
+    quicflow_t recv_flow;       /* connection-level, what we allow */
+    quicflow_t send_flow;       /* connection-level, what the peer allows */
+
+    quictp_t local_params;
+    quictp_t peer_params;
+    int      peer_params_seen;
+
+    /* §8.1: until the peer's address is validated, no more than three times
+     * what it has sent may go back to it. This is what stops the server being
+     * an amplifier for a spoofed source address, and it applies always --
+     * unlike Retry, which is a policy. */
+    uint64_t amplification_budget;
+    int      address_validated;
+
+    quicconn_state_e state;
+    uint64_t error_code;
+    int      error_is_app;
+    /* HANDSHAKE_DONE has gone out. It tells the client it may drop its
+     * handshake keys and stop retransmitting (§7.5), and it must be sent
+     * exactly once. */
+    int      handshake_done_sent;
+
+    /* The CONNECTION_CLOSE packet, kept so it can be re-sent (§10.2.1). */
+    uint8_t  close_packet[256];
+    size_t   close_packet_len;
+
+    uint64_t idle_timeout_us;
+    uint64_t last_activity_us;
+    uint64_t close_deadline_us;
+
+    /* Something is queued for sending. */
+    int      want_write;
+
+    struct quicconn* ep_next;   /* endpoint's connection list */
+    struct quicconn* tx_next;   /* endpoint's send queue */
+    int      in_tx_queue;
+} quicconn_t;
+
+/* Build a connection from a client's first Initial packet.
+ *
+ * `odcid` is that packet's Destination Connection ID, which both the Initial
+ * keys and the transport parameters depend on. Returns NULL if the connection
+ * could not be created; the caller drops the datagram.
+ *
+ * The returned connection is registered in the endpoint's tables and in the
+ * worker's connection list. */
+quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
+                            const quiccid_t* odcid, const quiccid_t* peer_scid,
+                            const quicpath_t* path, server_t* server);
+
+void quicconn_free(quicconn_t* conn);
+
+/* Process one datagram. The caller has already routed it here by connection id
+ * and holds connection_s_lock. Returns 0 if the connection should be closed. */
+int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
+                  const quicpath_t* path, uint64_t now_us);
+
+/* Build and send whatever is pending, within the congestion window, the pacer
+ * and the anti-amplification budget. Returns 0 if the connection should be
+ * closed. */
+int quicconn_send(quicconn_t* conn, uint64_t now_us);
+
+/* Mark the connection as having something to send, and wake its endpoint.
+ * Callable from a handler thread; takes no lock of its own beyond the
+ * endpoint's leaf lock. Declared taking connection_t* so the epoll layer can
+ * call it without knowing what a quicconn_t is. */
+void quicconn_want_write(connection_t* connection);
+
+/* Timer work: idle timeout, loss detection, the close and drain periods.
+ * Returns 0 when the connection has expired and must be freed. */
+int quicconn_tick(quicconn_t* conn, uint64_t now_us);
+
+/* When this connection next needs attention, or 0 if never. */
+uint64_t quicconn_next_timeout(const quicconn_t* conn);
+
+/* Begin closing with a transport error (§10.2). */
+void quicconn_close(quicconn_t* conn, uint64_t error_code, int is_app,
+                    uint64_t now_us);
+
+#endif

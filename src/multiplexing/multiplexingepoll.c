@@ -8,6 +8,10 @@
 #include "connection_s.h"
 #include "multiplexingepoll.h"
 
+#ifdef CWFR_HTTP3
+#include "quicconn.h"
+#endif
+
 #define EPOLL_MAX_EVENTS 16
 
 /* Worker timer tick: the idle/PING sweep runs this often. Coarse on purpose —
@@ -138,8 +142,22 @@ void __mpx_epoll_free(void* arg) {
     free(api);
 }
 
+/* A QUIC connection has no registration of its own: it shares the endpoint's
+ * one socket, and readiness for it is not something epoll can report. The
+ * bookkeeping -- the worker's connection list and count -- still applies, since
+ * the timer sweep and the shutdown drain walk it. Only the epoll_ctl is
+ * replaced (docs/http3/01-udp-endpoint.md §3). */
+#ifdef CWFR_HTTP3
+#define QUIC_CONNECTION(c) ((c)->transport == CONN_TRANSPORT_QUIC)
+#else
+#define QUIC_CONNECTION(c) (0)
+#endif
+
 int __mpx_epoll_control_add(connection_t* connection, int events) {
-    int result = __mpx_epoll_control(connection, EPOLL_CTL_ADD, events);
+    const int result = QUIC_CONNECTION(connection)
+        ? 1
+        : __mpx_epoll_control(connection, EPOLL_CTL_ADD, events);
+
     connection_server_ctx_t* ctx = connection->ctx;
     if (result) {
         ctx->listener->api->connection_count++;
@@ -150,11 +168,24 @@ int __mpx_epoll_control_add(connection_t* connection, int events) {
 }
 
 int __mpx_epoll_control_mod(connection_t* connection, int events) {
+#ifdef CWFR_HTTP3
+    if (QUIC_CONNECTION(connection)) {
+        /* "This connection has something to send" -- the closest thing QUIC has
+         * to arming EPOLLOUT. Anything else (a read re-arm, a park) is
+         * meaningless here: the endpoint reads the socket unconditionally. */
+        if (events & MPXOUT) quicconn_want_write(connection);
+        return 1;
+    }
+#endif
+
     return __mpx_epoll_control(connection, EPOLL_CTL_MOD, events);
 }
 
 int __mpx_epoll_control_del(connection_t* connection) {
-    int result = __mpx_epoll_control(connection, EPOLL_CTL_DEL, 0);
+    const int result = QUIC_CONNECTION(connection)
+        ? 1
+        : __mpx_epoll_control(connection, EPOLL_CTL_DEL, 0);
+
     connection_server_ctx_t* ctx = connection->ctx;
     if (result) {
         ctx->listener->api->connection_count--;

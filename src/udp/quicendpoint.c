@@ -10,6 +10,10 @@
 #include "appconfig.h"
 #include "log.h"
 #include "metrics.h"
+/* The full connection type: the header pair is deliberately opaque in both
+ * directions (quicconn.h holds a `struct quicendpoint*`, quicendpoint.h a
+ * `struct quicconn*`), so exactly one of the two .c files has to see both. */
+#include "quicconn.h"
 #include "quicendpoint.h"
 #include "quicinvariants.h"
 #include "quictime.h"
@@ -251,6 +255,51 @@ static void __send_version_negotiation(quicendpoint_t* ep, const udp_datagram_t*
     metrics_quic(METRICS_QUIC_VERSION_NEGOTIATION);
     metrics_quic(METRICS_QUIC_DGRAM_SENT);
     metrics_quic_add(METRICS_QUIC_BYTES_SENT, (unsigned long long)sent);
+}
+
+ssize_t quicendpoint_send(quicendpoint_t* endpoint, const uint8_t* data, size_t len,
+                          const quicpath_t* path) {
+    if (endpoint == NULL || data == NULL || path == NULL) return -1;
+    if (endpoint->fd == -1) return -1;
+
+    const ssize_t sent = udp_send(endpoint->fd, data, len,
+                                  (const struct sockaddr*)&path->remote,
+                                  path->remote_len,
+                                  path->local_len > 0 ? &path->local : NULL);
+
+    if (sent < 0) {
+        metrics_quic(METRICS_QUIC_SEND_ERROR);
+        return -1;
+    }
+
+    if (sent > 0) {
+        metrics_quic(METRICS_QUIC_DGRAM_SENT);
+        metrics_quic_add(METRICS_QUIC_BYTES_SENT, (unsigned long long)sent);
+    }
+
+    return sent;
+}
+
+void quicendpoint_wake(quicendpoint_t* endpoint, struct quicconn* conn) {
+    if (endpoint == NULL || conn == NULL) return;
+
+    /* A leaf lock held for a handful of instructions. It exists because this is
+     * reachable from a handler thread, which must not be holding -- or waiting
+     * for -- the connection lock at this point. */
+    while (atomic_flag_test_and_set_explicit(&endpoint->tx_lock, memory_order_acquire))
+        sched_yield();
+
+    if (!conn->in_tx_queue) {
+        conn->in_tx_queue = 1;
+        conn->tx_next = NULL;
+
+        if (endpoint->tx_tail != NULL) endpoint->tx_tail->tx_next = conn;
+        else endpoint->tx_head = conn;
+
+        endpoint->tx_tail = conn;
+    }
+
+    atomic_flag_clear_explicit(&endpoint->tx_lock, memory_order_release);
 }
 
 /* ---- Routing ---- */

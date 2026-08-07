@@ -10,6 +10,22 @@ typedef struct {
     void(*reset)(void*);
 } connection_ctx_t;
 
+/* What carries this connection.
+ *
+ * A TCP connection owns its file descriptor and is registered in epoll one to
+ * one; a QUIC connection shares one UDP socket with every other connection of
+ * its endpoint and is told apart by connection id, so there is nothing to
+ * register. Every epoll_ctl path checks this and routes a QUIC connection to
+ * its endpoint's send queue instead (docs/http3/01-udp-endpoint.md §3).
+ *
+ * Write-once, before any handler of the connection can run -- the same contract
+ * as connection_server_ctx_t::is_http2, and what makes it safe to read from a
+ * handler thread without synchronisation. */
+typedef enum {
+    CONN_TRANSPORT_TCP = 0,
+    CONN_TRANSPORT_QUIC
+} connection_transport_e;
+
 typedef struct connection {
     int fd;
     char* buffer;
@@ -22,6 +38,7 @@ typedef struct connection {
     in_addr_t remote_ip;
     unsigned short int remote_port;
     unsigned keepalive: 1;
+    unsigned transport: 1;   /* connection_transport_e */
 
     size_t buffer_size;
 

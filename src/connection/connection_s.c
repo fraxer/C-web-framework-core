@@ -90,6 +90,7 @@ connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, uns
     connection->write = NULL;
     connection->prev = NULL;
     connection->next = NULL;
+    connection->transport = CONN_TRANSPORT_TCP;
 
     return connection;
 }

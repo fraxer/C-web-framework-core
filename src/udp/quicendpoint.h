@@ -1,6 +1,8 @@
 #ifndef __QUICENDPOINT__
 #define __QUICENDPOINT__
 
+#include <stdatomic.h>
+
 #include "connection_s.h"
 #include "multiplexing.h"
 #include "quiccidtable.h"
@@ -73,6 +75,19 @@ typedef struct quicendpoint {
     int64_t  reset_tokens;
     uint64_t reset_epoch_us;
 
+    /* Connections on this endpoint, for the timer sweep and the shutdown drain.
+     * Touched only by the owning worker. */
+    struct quicconn* conns;
+    size_t conn_count;
+
+    /* Connections with something to send. Unlike `conns`, this is reachable
+     * from a handler thread finishing a response, so it has a lock of its own
+     * -- a leaf one, held for a few instructions and never while
+     * connection_s_lock is wanted. */
+    struct quicconn* tx_head;
+    struct quicconn* tx_tail;
+    atomic_flag tx_lock;
+
     struct quicendpoint* next;
 } quicendpoint_t;
 
@@ -104,5 +119,25 @@ quicendpoint_t* quicendpoints_create(mpxapi_t* api, server_t* first_server, int*
 int  quicendpoints_listen(quicendpoint_t* endpoints);
 void quicendpoints_unlisten(quicendpoint_t* endpoints);
 void quicendpoints_free(quicendpoint_t* endpoints);
+
+struct quicconn;
+struct quicpath;
+
+/* Send one datagram from this endpoint's socket, with the source address
+ * pinned to the one the peer sent to. Returns the bytes sent, 0 if the socket
+ * would block (QUIC datagrams are droppable; loss recovery will notice), or -1.
+ *
+ * The only way a connection reaches the wire: connections have no socket of
+ * their own. */
+ssize_t quicendpoint_send(quicendpoint_t* endpoint, const uint8_t* data, size_t len,
+                          const struct quicpath* path);
+
+/* Mark a connection as having something to send.
+ *
+ * Callable from a handler thread, which is why the queue has a leaf lock of its
+ * own: the handler must not take connection_s_lock here, and the endpoint's
+ * worker must not be blocked behind one. Lock order is connection_s_lock ->
+ * tx_lock, never the reverse (docs/http3/01-udp-endpoint.md §8). */
+void quicendpoint_wake(quicendpoint_t* endpoint, struct quicconn* conn);
 
 #endif
