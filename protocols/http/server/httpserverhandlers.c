@@ -1018,6 +1018,13 @@ int __sni_callback(SSL* ssl, int* ad, void* arg) {
     (void)arg;
 
     connection_t* connection = SSL_get_app_data(ssl);
+
+    /* Belt and braces: an SSL without a connection behind it means somebody
+     * built one this callback was not written for. Dereferencing it crashed a
+     * worker once, when the QUIC path first reached here. */
+    if (connection == NULL)
+        return SSL_TLSEXT_ERR_NOACK;
+
     const char* server_name = SSL_get_servername(ssl, TLSEXT_NAMETYPE_host_name);
 
     if (server_name == NULL)
@@ -1057,17 +1064,31 @@ int __sni_callback(SSL* ssl, int* ad, void* arg) {
             for (domain_t* domain = server->domain; domain; domain = domain->next) {
                 int matches_count = pcre_exec(domain->pcre_template, NULL, ascii_server_name, server_name_length, 0, 0, vector, vector_size);
                 if (matches_count > 0) {
-                    ctx->server = server;
-                    connection->ssl_ctx = server->openssl->ctx;
+                    /* Which of the vhost's two contexts depends on the
+                     * transport, and getting it wrong is not cosmetic: the TCP
+                     * context offers `h2` in ALPN and a ciphersuite list that
+                     * includes CCM, both of which RFC 9001 forbids over QUIC.
+                     * Switching to it here would produce a connection that
+                     * works and is non-conforming -- the worst kind. */
+                    SSL_CTX* target = server->openssl->ctx;
 
-                    SSL_set_SSL_CTX(ssl, server->openssl->ctx);
+#ifdef CWFR_HTTP3
+                    if (connection->transport == CONN_TRANSPORT_QUIC &&
+                        server->openssl->quic_ctx != NULL)
+                        target = server->openssl->quic_ctx;
+#endif
+
+                    ctx->server = server;
+                    connection->ssl_ctx = target;
+
+                    SSL_set_SSL_CTX(ssl, target);
 
     #if OPENSSL_VERSION_NUMBER >= 0x009080dfL
                     /* only in 0.9.8m+ */
-                    SSL_clear_options(ssl, SSL_get_options(ssl) & ~SSL_CTX_get_options(server->openssl->ctx));
+                    SSL_clear_options(ssl, SSL_get_options(ssl) & ~SSL_CTX_get_options(target));
     #endif
 
-                    SSL_set_options(ssl, SSL_CTX_get_options(server->openssl->ctx));
+                    SSL_set_options(ssl, SSL_CTX_get_options(target));
 
     #ifdef SSL_OP_NO_RENEGOTIATION
                     SSL_set_options(ssl, SSL_OP_NO_RENEGOTIATION);

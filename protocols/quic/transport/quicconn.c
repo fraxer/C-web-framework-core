@@ -974,12 +974,14 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
 
     conn->next_local_uni = 0;
 
-    if (server == NULL || server->openssl == NULL || server->openssl->ctx == NULL) {
+    /* The vhost's QUIC context, not its TCP one: TLS 1.3 only, `h3` alone in
+     * ALPN, no CCM (see openssl.h). */
+    if (server == NULL || server->openssl == NULL || server->openssl->quic_ctx == NULL) {
         quicconn_free(conn);
         return NULL;
     }
 
-    if (!quictls_init_server(&conn->tls, server->openssl->ctx, &__tls_ops, conn,
+    if (!quictls_init_server(&conn->tls, server->openssl->quic_ctx, &__tls_ops, conn,
                              &conn->local_params)) {
         quicconn_free(conn);
         return NULL;
@@ -1005,6 +1007,11 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
 
     conn->conn.transport = CONN_TRANSPORT_QUIC;
     conn->conn.close = quicconn_close_cb;
+    /* Where the SNI callback finds us. It reads the connection to pick the
+     * vhost -- and, since this one is QUIC, to pick the vhost's QUIC context
+     * rather than its TCP one. Without this the callback dereferences NULL,
+     * which is how it first showed up. */
+    SSL_set_app_data(conn->tls.ssl, &conn->conn);
     conn->conn.read = NULL;    /* the endpoint reads; there is no fd of our own */
     conn->conn.write = NULL;
 

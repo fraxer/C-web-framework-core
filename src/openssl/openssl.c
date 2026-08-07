@@ -7,6 +7,10 @@
 #include "log.h"
 #include "openssl.h"
 
+#ifdef CWFR_HTTP3
+#include "quictls.h"
+#endif
+
 #define OPENSSL_ERROR_CHAIN_FILE "Openssl error: can't load chain file\n"
 #define OPENSSL_ERROR_PRIVATE_FILE "Openssl error: can't load private file\n"
 #define OPENSSL_ERROR_CHECK_PRIVATE_FILE "Openssl error: private file check failed\n"
@@ -211,13 +215,45 @@ static int openssl_context_init(openssl_t* openssl) {
      * ssl_ctx до выбора ALPN, поэтому callback срабатывает уже для нужного vhost. */
     SSL_CTX_set_alpn_select_cb(openssl->ctx, __openssl_alpn_select_cb, NULL);
 
+#ifdef CWFR_HTTP3
+    /* The QUIC twin: same certificate and key, different protocol policy.
+     * Built here rather than lazily so that a configuration error shows up at
+     * load time, next to every other one, instead of on the first handshake. */
+    if (openssl->quic_ctx != NULL) {
+        SSL_CTX_free(openssl->quic_ctx);
+        openssl->quic_ctx = NULL;
+    }
+
+    openssl->quic_ctx = SSL_CTX_new(TLS_server_method());
+    if (openssl->quic_ctx == NULL) goto failed;
+
+    if (SSL_CTX_use_certificate_chain_file(openssl->quic_ctx, openssl->fullchain) != 1 ||
+        SSL_CTX_use_PrivateKey_file(openssl->quic_ctx, openssl->private, SSL_FILETYPE_PEM) != 1 ||
+        !SSL_CTX_check_private_key(openssl->quic_ctx)) {
+        log_error("Openssl error: can't build the QUIC context\n");
+        goto failed;
+    }
+
+    /* TLS 1.3 only, h3-only ALPN, and a ciphersuite list without CCM. */
+    if (!quictls_configure_ctx(openssl->quic_ctx)) {
+        log_error("Openssl error: can't configure the QUIC context\n");
+        goto failed;
+    }
+#endif
+
     result = 0;
 
     failed:
 
-    if (result == -1 && openssl->ctx != NULL) {
-        SSL_CTX_free(openssl->ctx);
-        openssl->ctx = NULL;
+    if (result == -1) {
+        if (openssl->ctx != NULL) {
+            SSL_CTX_free(openssl->ctx);
+            openssl->ctx = NULL;
+        }
+        if (openssl->quic_ctx != NULL) {
+            SSL_CTX_free(openssl->quic_ctx);
+            openssl->quic_ctx = NULL;
+        }
     }
 
     return result;
@@ -231,6 +267,7 @@ openssl_t* openssl_create(void) {
     openssl->private = NULL;
     openssl->ciphers = NULL;
     openssl->ctx = NULL;
+    openssl->quic_ctx = NULL;
 
     return openssl;
 }
@@ -249,6 +286,9 @@ void openssl_free(openssl_t* openssl) {
 
     if (openssl->ctx != NULL)
         SSL_CTX_free(openssl->ctx);
+
+    if (openssl->quic_ctx != NULL)
+        SSL_CTX_free(openssl->quic_ctx);
 
     free(openssl);
 }

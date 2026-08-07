@@ -22,6 +22,19 @@ typedef struct openssl {
     char* private;
     char* ciphers;
     SSL_CTX* ctx;
+
+    /* A second context for QUIC, from the same certificate and key.
+     *
+     * Not an optimisation to share one: the protocol policy genuinely differs.
+     * QUIC is TLS 1.3 only, offers `h3` alone in ALPN, and must not offer
+     * TLS_AES_128_CCM_8_SHA256, which RFC 9001 §5.3 forbids and which this
+     * project's config.json lists for TCP. A single context cannot be both,
+     * and SNI makes the difference load-bearing: the callback switches
+     * contexts mid-handshake, so a QUIC connection that landed on the TCP
+     * context would silently negotiate h2 over QUIC, or a forbidden cipher.
+     *
+     * NULL when the build has no HTTP/3. */
+    SSL_CTX* quic_ctx;
 } openssl_t;
 
 /* Split a configured cipher string into the TLS 1.2-and-below list and the

@@ -47,6 +47,13 @@
 
 static void __route(quicendpoint_t* ep, struct quicconn* conn, udp_datagram_t* dgram);
 
+/* Called by the CID table under its shard lock, on the value it is about to
+ * return. One atomic increment, which is what stops the connection being freed
+ * between the lookup finding it and the caller using it. */
+static void __table_acquire(void* value) {
+    connection_s_inc(&((quicconn_t*)value)->conn);
+}
+
 static quiccidtable_t* __quic_table = NULL;
 static size_t   __quic_max_connections = QUIC_DEFAULT_MAX_CONNECTIONS;
 static uint8_t  __quic_reset_key[32];
@@ -106,8 +113,16 @@ int quic_policy_init(void) {
 
     /* A connection holds several ids at once (its own plus every one it has
      * issued and not retired), so the table is sized above the connection
-     * limit. */
-    __quic_table = quiccidtable_create((size_t)max_connections * 4, 64, seed, NULL);
+     * limit.
+     *
+     * The acquire hook is not optional. Without it a lookup hands back a
+     * pointer with no reference held, and the matching release in __dispatch
+     * drops the base one -- so the connection is freed after the first
+     * datagram it ever receives, and every later one reads freed memory. That
+     * failure is invisible without ASan: the handshake completes perfectly on
+     * quarantined memory. */
+    __quic_table = quiccidtable_create((size_t)max_connections * 4, 64, seed,
+                                       __table_acquire);
     if (__quic_table == NULL) {
         log_error("quic_policy_init: cannot create the connection table\n");
         return 0;
@@ -416,6 +431,11 @@ static void __accept(quicendpoint_t* ep, udp_datagram_t* dgram,
 
 /* Hand a datagram to a connection and let it answer. */
 static void __route(quicendpoint_t* ep, quicconn_t* conn, udp_datagram_t* dgram) {
+    /* The connection reaches its endpoint through its own pointer; this one is
+     * kept in the signature because migration (phase 9) will need to know which
+     * endpoint the datagram arrived on, which need not be the same one. */
+    (void)ep;
+
     quicpath_t path;
     memset(&path, 0, sizeof path);
     path.remote = dgram->peer;

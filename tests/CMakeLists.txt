@@ -67,6 +67,33 @@ endif()
 
 add_test(NAME core_tests COMMAND runner)
 
+# --- QUIC test client ---
+#
+# Not part of `runner`: it needs a server to talk to, so it is a tool rather
+# than a unit test. It exists because nothing else on a typical machine can
+# speak QUIC to this server -- the system curl is built without HTTP/3 -- and
+# because the loss and reordering cases of docs/http3/08-testing.md §2 need a
+# peer whose behaviour the test controls.
+if(INCLUDE_HTTP3 STREQUAL yes)
+    add_executable(quicclient
+        quicclient/main.c
+        quicclient/quicclient.c
+    )
+
+    target_include_directories(quicclient PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/quic/common
+        ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/quic/crypto
+        ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/quic/transport
+    )
+
+    target_link_libraries(quicclient PRIVATE
+        cwfr_framework
+        ${OPENSSL_LIBRARIES}
+        Threads::Threads
+        ${CMAKE_DL_LIBS}
+    )
+endif()
+
 # --- Database tests (separate binary, requires database) ---
 set(HAS_DB FALSE)
 if(PostgreSQL_FOUND AND INCLUDE_POSTGRESQL STREQUAL "yes")
