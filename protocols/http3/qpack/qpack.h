@@ -75,4 +75,29 @@ qpack_status_e qpack_decode_block(qpack_decoder_t* d, const uint8_t* block, size
 
 void qpack_headers_free(qpack_header_t* headers, size_t count);
 
+/* ---- Encoder (lite) ---- *
+ *
+ * Emits a field section that references only the static table and literals:
+ * the prefix is always RIC=0, Delta Base=0. For each field it picks the smallest
+ * lite representation -- indexed static on an exact match, else a literal with a
+ * static name reference, else a literal with a literal name -- Huffman-encoding
+ * a string only when that is shorter. A field marked never_indexed is emitted
+ * as a literal with N=1 (never an indexed line), so a peer intermediary does
+ * not re-index a value that may be sensitive. */
+
+typedef struct qpack_encoder {
+    size_t max_capacity;   /* 0 in lite */
+    size_t max_blocked;    /* 0 in lite */
+} qpack_encoder_t;
+
+qpack_encoder_t* qpack_encoder_create(size_t max_capacity, size_t max_blocked);
+void qpack_encoder_free(qpack_encoder_t* e);
+
+/* Encode `count` fields into dst[0..cap). Returns bytes written, or 0 on error
+ * (cap too small / OOM). Even an empty field section is two bytes (the prefix),
+ * so 0 is unambiguous. The caller sizes dst to roughly twice the raw header size
+ * and retries larger on 0. */
+size_t qpack_encode_block(qpack_encoder_t* e, const qpack_header_t* fields, size_t count,
+                          uint8_t* dst, size_t cap);
+
 #endif

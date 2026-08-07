@@ -29,6 +29,161 @@ void qpack_headers_free(qpack_header_t* headers, size_t count) {
     free(headers);
 }
 
+/* ======================================================================= *
+ *  Encoder (lite)
+ * ======================================================================= *
+ *  A small growable buffer, the static-table lookup, and one helper per string
+ *  shape QPACK literals use. The value literal is `H | length (7-bit) | bytes`,
+ *  identical to HPACK; the literal-literal-name's name is `001 N H | length
+ *  (3-bit) | bytes`, with the Huffman flag carried in the opcode rather than a
+ *  length-prefix bit. */
+
+typedef struct {
+    uint8_t* data;
+    size_t   len;
+    size_t   cap;
+    int      oom;
+} qpack_buf_t;
+
+static void qpack_buf_init(qpack_buf_t* b) { b->data = NULL; b->len = 0; b->cap = 0; b->oom = 0; }
+
+static int qpack_buf_reserve(qpack_buf_t* b, size_t need) {
+    if (b->oom) return 0;
+    if (need <= b->cap - b->len && b->len <= b->cap) return 1;
+    size_t ncap = b->cap ? b->cap : 128;
+    while (ncap - b->len < need) {
+        if (ncap > ((size_t)-1) / 2) { b->oom = 1; return 0; }
+        ncap *= 2;
+    }
+    uint8_t* nd = realloc(b->data, ncap);
+    if (nd == NULL) { b->oom = 1; return 0; }
+    b->data = nd; b->cap = ncap;
+    return 1;
+}
+
+static int qpack_buf_int(qpack_buf_t* b, uint64_t value, uint8_t prefix_bits, uint8_t flags) {
+    if (!qpack_buf_reserve(b, 10)) return 0;
+    const size_t n = prefix_int_encode(b->data + b->len, b->cap - b->len, value, prefix_bits, flags);
+    if (n == 0) { b->oom = 1; return 0; }
+    b->len += n;
+    return 1;
+}
+
+static int qpack_buf_write(qpack_buf_t* b, const uint8_t* d, size_t n) {
+    if (n == 0) return 1;
+    if (!qpack_buf_reserve(b, n)) return 0;
+    memcpy(b->data + b->len, d, n);
+    b->len += n;
+    return 1;
+}
+
+/* A value string literal: `H | length (7-bit) | bytes`, Huffman only if shorter. */
+static int qpack_enc_value(qpack_buf_t* b, const uint8_t* data, size_t len) {
+    const size_t hlen = huffman_encoded_len(data, len);
+    if (hlen < len) {
+        if (!qpack_buf_int(b, hlen, 7, 0x80)) return 0;           /* H=1 */
+        if (!qpack_buf_reserve(b, hlen)) return 0;
+        const ssize_t n = huffman_encode(b->data + b->len, b->cap - b->len, data, len);
+        if (n < 0) { b->oom = 1; return 0; }
+        b->len += n;
+        return 1;
+    }
+    if (!qpack_buf_int(b, len, 7, 0x00)) return 0;                /* H=0 */
+    return qpack_buf_write(b, data, len);
+}
+
+/* Find a static-table entry. match_value=0 → first entry whose name matches;
+ * match_value=1 → first whose name AND value match. 0-based index out. */
+static int qpack_static_find(const char* name, size_t name_len,
+                             const char* value, size_t value_len,
+                             int match_value, size_t* idx) {
+    for (size_t i = 0; i < QPACK_STATIC_TABLE_SIZE; i++) {
+        const qpack_static_entry_t* e = &qpack_static_table[i];
+        const size_t en = strlen(e->name);
+        if (en != name_len || memcmp(e->name, name, name_len) != 0) continue;
+        if (!match_value) { *idx = i; return 1; }
+        const size_t ev = strlen(e->value);
+        if (ev == value_len && memcmp(e->value, value, value_len) == 0) { *idx = i; return 1; }
+    }
+    return 0;
+}
+
+qpack_encoder_t* qpack_encoder_create(size_t max_capacity, size_t max_blocked) {
+    qpack_encoder_t* e = malloc(sizeof * e);
+    if (e == NULL) return NULL;
+    e->max_capacity = max_capacity;
+    e->max_blocked = max_blocked;
+    return e;
+}
+
+void qpack_encoder_free(qpack_encoder_t* e) {
+    free(e);
+}
+
+size_t qpack_encode_block(qpack_encoder_t* e, const qpack_header_t* fields, size_t count,
+                          uint8_t* dst, size_t cap) {
+    if (e == NULL || (fields == NULL && count != 0) || dst == NULL || cap == 0) return 0;
+
+    qpack_buf_t b;
+    qpack_buf_init(&b);
+
+    /* Prefix: Required Insert Count 0 (8-bit), then S=0 | Delta Base 0 (7-bit).
+     * Fixed at two zero bytes for the whole of lite. */
+    if (!qpack_buf_int(&b, 0, 8, 0x00) || !qpack_buf_int(&b, 0, 7, 0x00)) {
+        free(b.data);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        const qpack_header_t* h = &fields[i];
+        const uint8_t* name = (const uint8_t*)h->name;
+        const uint8_t* value = (const uint8_t*)h->value;
+        const int never = h->never_indexed;
+
+        /* Exact static match → indexed static, unless the field is never-indexed
+         * (then a literal with N=1 is the conservative, intermediary-safe form). */
+        size_t idx = 0;
+        if (!never && qpack_static_find((const char*)name, h->name_len,
+                                        (const char*)value, h->value_len, 1, &idx)) {
+            if (!qpack_buf_int(&b, idx, 6, 0xc0)) break;          /* 1 T=1 (static) */
+            continue;
+        }
+
+        size_t nidx = 0;
+        if (qpack_static_find((const char*)name, h->name_len, NULL, 0, 0, &nidx)) {
+            /* Literal With Name Reference, static name (01 N T=1 iiii). */
+            const uint8_t flags = 0x40 | (never ? 0x20 : 0) | 0x10;
+            if (!qpack_buf_int(&b, nidx, 4, flags)) break;
+        } else {
+            /* Literal With Literal Name (001 N H iii). Huffman the name iff shorter;
+             * the length on the wire is then the Huffman length, not the raw one. */
+            const size_t nhlen = huffman_encoded_len(name, h->name_len);
+            const int H = (nhlen < h->name_len);
+            const uint8_t flags = 0x20 | (never ? 0x10 : 0) | (H ? 0x08 : 0);
+            if (!qpack_buf_int(&b, H ? nhlen : h->name_len, 3, flags)) break;
+            if (H) {
+                if (!qpack_buf_reserve(&b, nhlen)) break;
+                const ssize_t n = huffman_encode(b.data + b.len, b.cap - b.len, name, h->name_len);
+                if (n < 0) { b.oom = 1; break; }
+                b.len += n;
+            } else {
+                if (!qpack_buf_write(&b, name, h->name_len)) break;
+            }
+        }
+
+        if (!qpack_enc_value(&b, value, h->value_len)) break;
+    }
+
+    if (b.oom || b.len > cap) {
+        free(b.data);
+        return 0;
+    }
+
+    memcpy(dst, b.data, b.len);
+    free(b.data);
+    return b.len;
+}
+
 /* ---- String literals ---- */
 
 /* Decode [data, data+len) into a malloc'd, null-terminated string, Huffman-
