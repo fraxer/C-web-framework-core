@@ -88,6 +88,28 @@ quicstream_t* quicconn_stream_find(quicconn_t* conn, uint64_t id) {
     return __stream_find(conn, id);
 }
 
+uint64_t quicconn_unsent_bytes(const quicconn_t* conn) {
+    if (conn == NULL) return 0;
+
+    /* Summed rather than counted incrementally. The list is bounded by
+     * initial_max_streams_bidi (100), and this runs once per chunk written --
+     * per 16 KB, not per byte -- so a walk costs less than the two hooks a
+     * running total would need in quicstream_write and quicsendbuf_mark_sent,
+     * and cannot drift out of step with the buffers it describes. */
+    uint64_t total = 0;
+    for (const quicstream_t* s = conn->streams; s != NULL; s = s->next)
+        total += quicsendbuf_unsent_bytes(&s->send);
+
+    return total;
+}
+
+size_t quicconn_write_room(const quicconn_t* conn) {
+    const uint64_t unsent = quicconn_unsent_bytes(conn);
+    if (unsent >= QUICCONN_WRITE_AHEAD_MAX) return 0;
+
+    return (size_t)(QUICCONN_WRITE_AHEAD_MAX - unsent);
+}
+
 quicstream_t* quicconn_open_uni(quicconn_t* conn) {
     if (conn == NULL) return NULL;
 

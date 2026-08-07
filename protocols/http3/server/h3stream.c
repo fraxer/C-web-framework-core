@@ -38,6 +38,7 @@ h3stream_t* h3stream_create(size_t max_field_section_size) {
         return NULL;
     }
 
+    st->response = NULL;
     st->stage = H3STREAM_EXPECT_HEADERS;
     st->headers_done = 0;
     st->content_length = -1;

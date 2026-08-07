@@ -6,6 +6,9 @@
 #include "http_range_filter.h"
 #include "http_not_modified_filter.h"
 #include "h2_write_filter.h"
+#ifdef CWFR_HTTP3
+#include "h3_write_filter.h"
+#endif
 
 http_filter_t* filters_create(void) {
     http_filter_t* filter_write = http_write_filter_create();
@@ -48,6 +51,39 @@ http_filter_t* filters_create_h2(void) {
     filter_not_modified->next = filter_range;
 
     return filter_not_modified;
+}
+
+http_filter_t* filters_create_h3(void) {
+#ifdef CWFR_HTTP3
+    /* The same stages as h2 -- chunked is absent for the same reason, the body
+     * is framed by the protocol -- with the h3 terminal stage. Kept as its own
+     * function rather than a flag on filters_create_h2: the two terminal stages
+     * share no code, and a build without HTTP/3 has no h3 stage to name. */
+    http_filter_t* filter_write = h3_write_filter_create();
+    http_filter_t* filter_gzip = http_gzip_filter_create();
+    http_filter_t* filter_data = http_data_filter_create();
+    http_filter_t* filter_range = http_range_filter_create();
+    http_filter_t* filter_not_modified = http_not_modified_filter_create();
+
+    if (filter_write == NULL || filter_gzip == NULL || filter_data == NULL ||
+        filter_range == NULL || filter_not_modified == NULL) {
+        filters_free(filter_write);
+        filters_free(filter_gzip);
+        filters_free(filter_data);
+        filters_free(filter_range);
+        filters_free(filter_not_modified);
+        return NULL;
+    }
+
+    filter_gzip->next = filter_write;
+    filter_data->next = filter_gzip;
+    filter_range->next = filter_data;
+    filter_not_modified->next = filter_range;
+
+    return filter_not_modified;
+#else
+    return NULL;
+#endif
 }
 
 void filters_reset(http_filter_t* filter) {

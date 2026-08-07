@@ -192,6 +192,30 @@ void quicconn_close(quicconn_t* conn, uint64_t error_code, int is_app,
 /* Find an open stream by id, or NULL. */
 quicstream_t* quicconn_stream_find(quicconn_t* conn, uint64_t id);
 
+/* ---- Write-ahead back pressure ---- *
+ *
+ * quicsendbuf_write grows without bound on purpose: flow control is not a
+ * buffer's business. Something above it therefore has to decide how far in
+ * front of the network the application may run, or a gigabyte response becomes
+ * a gigabyte of memory.
+ *
+ * The limit is per *connection*, not per stream. Per stream it would have to be
+ * multiplied by initial_max_streams_bidi (100 here) to bound anything, which
+ * makes the bound useless; per connection it is one number whatever the stream
+ * count, and the send path's own round-robin already shares it out fairly.
+ *
+ * It bounds only the write-ahead. What has been sent and not acknowledged is
+ * held for retransmission regardless, and is bounded by the congestion window
+ * instead -- by the network, which is the right thing to be bounded by. */
+#define QUICCONN_WRITE_AHEAD_MAX (256 * 1024)
+
+/* Bytes written to this connection's streams that have not been packetised. */
+uint64_t quicconn_unsent_bytes(const quicconn_t* conn);
+
+/* How much more the application may write before it must wait. 0 means stop and
+ * resume when the send path has drained (quicconn_send is what frees it). */
+size_t quicconn_write_room(const quicconn_t* conn);
+
 /* Open the next server-initiated unidirectional stream (§2.1), or NULL when the
  * peer's initial_max_streams_uni is exhausted or allocation fails.
  *

@@ -61,7 +61,15 @@ static json_doc_t* __httpresponse_payload_json(httpresponse_t* response);
 
 static int __httpresponse_init_parser(httpresponse_t* response);
 static void __httpresponse_reset(httpresponse_t* response);
-static httpresponse_t* __httpresponse_create(connection_t* connection, int http2);
+/* Which terminal write stage the response's filter chain ends in. The three
+ * differ only there; every stage above is shared verbatim. */
+typedef enum {
+    HTTP_CHAIN_H1 = 0,
+    HTTP_CHAIN_H2,
+    HTTP_CHAIN_H3
+} http_chain_e;
+
+static httpresponse_t* __httpresponse_create(connection_t* connection, http_chain_e chain);
 
 void __httpresponse_view(httpresponse_t* response, json_doc_t* document, const char* storage_name, const char* path_format, ...);
 
@@ -105,14 +113,18 @@ void __httpresponse_view(httpresponse_t* response, json_doc_t* document, const c
 }
 
 httpresponse_t* httpresponse_create(connection_t* connection) {
-    return __httpresponse_create(connection, 0);
+    return __httpresponse_create(connection, HTTP_CHAIN_H1);
 }
 
 httpresponse_t* httpresponse_create_h2(connection_t* connection) {
-    return __httpresponse_create(connection, 1);
+    return __httpresponse_create(connection, HTTP_CHAIN_H2);
 }
 
-static httpresponse_t* __httpresponse_create(connection_t* connection, int http2) {
+httpresponse_t* httpresponse_create_h3(connection_t* connection) {
+    return __httpresponse_create(connection, HTTP_CHAIN_H3);
+}
+
+static httpresponse_t* __httpresponse_create(connection_t* connection, http_chain_e chain) {
     httpresponse_t* response = malloc(sizeof * response);
     if (response == NULL) return NULL;
 
@@ -128,7 +140,11 @@ static httpresponse_t* __httpresponse_create(connection_t* connection, int http2
     response->last_trailer = NULL;
     response->early_hint_ = NULL;
     response->last_early_hint = NULL;
-    response->filter = http2 ? filters_create_h2() : filters_create();
+    switch (chain) {
+    case HTTP_CHAIN_H2: response->filter = filters_create_h2(); break;
+    case HTTP_CHAIN_H3: response->filter = filters_create_h3(); break;
+    default:            response->filter = filters_create();    break;
+    }
     if (response->filter == NULL) {
         free(response);
         return NULL;

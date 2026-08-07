@@ -9,6 +9,8 @@
 #include "quicconn.h"
 #include "quicstream.h"
 
+struct httpresponse;
+
 /* Where HTTP/3 meets QUIC (docs/http3/05-http3.md §6.2).
  *
  * h3session and h3stream are pure state machines that take bytes; this is the
@@ -90,6 +92,22 @@ h3conn_result_t h3conn_stream_read(h3conn_t* c, quicstream_t* qs);
 
 /* The request state on a stream, or NULL if it is not a request stream. */
 h3stream_t* h3conn_request_of(quicstream_t* qs);
+
+/* The HTTP/3 state of a connection, or NULL if it is not one.
+ *
+ * The check is connection->transport, not a protocol bit on the ctx. That is a
+ * stronger guarantee than h2's: QUIC carries HTTP/3 and nothing else here --
+ * h1.1 and h2 are both TCP -- so a QUIC transport *is* the proof that
+ * ctx->parser is an h3conn_t. The two type-confusion bugs h2 hit on that same
+ * void* (docs/http2/09) came from a flag someone had to remember to set;
+ * nobody has to remember what transport a connection arrived on. */
+struct connection;
+h3conn_t* h3_conn_of(struct connection* connection);
+
+/* The QUIC stream carrying `response`, or NULL. Walks the connection's streams,
+ * as h2stream_find_by_response does: a response is answered once, on a list
+ * bounded by the peer's stream limit. */
+quicstream_t* h3conn_stream_by_response(quicconn_t* qc, const struct httpresponse* response);
 
 /* Release the per-stream state. Called before quicstream_free. */
 void h3conn_stream_release(quicstream_t* qs);

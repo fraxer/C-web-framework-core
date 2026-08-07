@@ -34,6 +34,10 @@ http_filter_t* filters_create(void);
  * chunked transfer-encoding is forbidden by RFC 9113 §8.2.2) and the terminal
  * write stage emits HEADERS/DATA frames instead of a status line + raw bytes. */
 http_filter_t* filters_create_h2(void);
+/* Filter chain for an HTTP/3 connection: the h2 chain with the h3 terminal
+ * stage, which emits QPACK HEADERS and DATA frames onto a QUIC stream. Returns
+ * NULL in a build without HTTP/3, where nothing can ask for it. */
+http_filter_t* filters_create_h3(void);
 void filters_reset(http_filter_t* filter);
 void filters_free(http_filter_t* filter);
 int filter_next_handler_header(struct httprequest* request, struct httpresponse* response);

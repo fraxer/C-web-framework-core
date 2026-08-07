@@ -89,9 +89,16 @@ static inline int h3stream_status_is_connection(h3stream_status_e st) {
  * reset (413, 431, 500) map to H3_NO_ERROR too -- the caller answers instead. */
 uint64_t h3stream_status_error(h3stream_status_e st);
 
+struct httpresponse;
+
 typedef struct h3stream {
     h3frame_parser_t parser;
     httprequest_t*   request;
+    /* Set when the request is dispatched, so the write filter can find its way
+     * back from a response to the QUIC stream that carries it
+     * (h3conn_stream_by_response). Owned by the dispatch path, not by h3stream:
+     * h3stream_free does not touch it. */
+    struct httpresponse* response;
 
     enum {
         H3STREAM_EXPECT_HEADERS = 0,

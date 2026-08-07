@@ -90,4 +90,13 @@ int quicsendbuf_complete(const quicsendbuf_t* buf);
 /* Bytes held but not yet acknowledged -- what the buffer is costing. */
 size_t quicsendbuf_inflight_bytes(const quicsendbuf_t* buf);
 
+/* Bytes written by the application that have not been put in a packet yet.
+ *
+ * This is the half of the buffer the application controls, and therefore the
+ * only half worth applying back pressure to: what has been sent but not
+ * acknowledged has to be held for retransmission whatever anyone wants (§13.3),
+ * while the write-ahead is purely a choice about how far to run in front of the
+ * network. See quicconn_write_room. */
+size_t quicsendbuf_unsent_bytes(const quicsendbuf_t* buf);
+
 #endif

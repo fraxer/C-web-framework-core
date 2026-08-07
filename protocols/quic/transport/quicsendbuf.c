@@ -209,3 +209,9 @@ int quicsendbuf_complete(const quicsendbuf_t* buf) {
 size_t quicsendbuf_inflight_bytes(const quicsendbuf_t* buf) {
     return buf == NULL ? 0 : buf->len;
 }
+
+size_t quicsendbuf_unsent_bytes(const quicsendbuf_t* buf) {
+    if (buf == NULL || buf->sent_off >= buf->write_off) return 0;
+
+    return (size_t)(buf->write_off - buf->sent_off);
+}

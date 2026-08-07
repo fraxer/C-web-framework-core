@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "connection_s.h"
+#include "httpresponse.h"
 #include "log.h"
 #include "qpack.h"
 
@@ -76,6 +78,26 @@ h3stream_t* h3conn_request_of(quicstream_t* qs) {
     const h3app_t* app = qs->app;
 
     return app->is_request ? app->req : NULL;
+}
+
+h3conn_t* h3_conn_of(connection_t* connection) {
+    if (connection == NULL || connection->transport != CONN_TRANSPORT_QUIC) return NULL;
+
+    connection_server_ctx_t* ctx = connection->ctx;
+    if (ctx == NULL) return NULL;
+
+    return ctx->parser;
+}
+
+quicstream_t* h3conn_stream_by_response(quicconn_t* qc, const httpresponse_t* response) {
+    if (qc == NULL || response == NULL) return NULL;
+
+    for (quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
+        const h3stream_t* st = h3conn_request_of(qs);
+        if (st != NULL && st->response == response) return qs;
+    }
+
+    return NULL;
 }
 
 /* Attach state on first sight of a stream. Which kind it is follows from the
