@@ -54,6 +54,17 @@ target_link_libraries(runner PRIVATE
     Threads::Threads
 )
 
+# The QUIC TLS bridge test runs a real TLS 1.3 handshake between two instances
+# in one process, which needs a certificate. Generated once and committed (valid
+# to 2126) rather than produced at build time: a test that shells out to openssl
+# fails differently on every machine, and this one is worthless without it.
+if(INCLUDE_HTTP3 STREQUAL yes)
+    target_compile_definitions(runner PRIVATE
+        TEST_QUIC_CERT="${CMAKE_CURRENT_SOURCE_DIR}/data/quic_test_cert.pem"
+        TEST_QUIC_KEY="${CMAKE_CURRENT_SOURCE_DIR}/data/quic_test_key.pem"
+    )
+endif()
+
 add_test(NAME core_tests COMMAND runner)
 
 # --- Database tests (separate binary, requires database) ---
