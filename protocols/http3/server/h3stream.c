@@ -9,6 +9,8 @@
 #include "httpfields.h"         /* httpfields_to_request, httpfields_is_forbidden_header */
 #include "httprequest.h"        /* httprequest_create_payload_file, ..._trailern_add */
 #include "httpresponse.h"       /* httpresponse_free -- the stream owns its response */
+#include "httprequestparser.h"  /* httpparser_select_server */
+#include "httpparsercommon.h"   /* HTTP1PARSER_CONTINUE */
 #include "qpack.h"
 
 _Static_assert(sizeof(qpack_header_t) == sizeof(httpfields_field_t),
@@ -28,12 +30,12 @@ uint64_t h3stream_status_error(h3stream_status_e st) {
     }
 }
 
-h3stream_t* h3stream_create(size_t max_field_section_size) {
+h3stream_t* h3stream_create(connection_t* connection, size_t max_field_section_size) {
     h3stream_t* st = malloc(sizeof * st);
     if (st == NULL) return NULL;
 
     h3frame_parser_init(&st->parser);
-    st->request = httprequest_create(NULL);
+    st->request = httprequest_create(connection);
     if (st->request == NULL) {
         free(st);
         return NULL;
@@ -127,13 +129,32 @@ static h3stream_status_e build_request(h3stream_t* st, qpack_decoder_t* qdec,
     case HTTP_FIELDS_OK:
     case HTTP_FIELDS_EXTENDED_CONNECT:
     case HTTP_FIELDS_WEBSOCKET:
-        return H3STREAM_REQUEST_READY;
+        break;
     case HTTP_FIELDS_INTERNAL:
         return H3STREAM_ERR_INTERNAL;
     default:
         return H3STREAM_ERR_MESSAGE;
     }
+
+    /* :authority (now Host) picks the virtual server, and on a TLS connection it
+     * must agree with the one SNI chose (RFC 9110 §7.4). Left to the caller in
+     * httpfields_to_request because it needs the connection, which that function
+     * deliberately does not take -- so it happens here, exactly as h2 does it in
+     * h2_build_request. Without it every request would be routed to the
+     * listener's first vhost. */
+    if (st->request->connection != NULL) {
+        const http_header_t* host = st->request->get_headern(st->request, "Host", 4);
+        if (host == NULL) return H3STREAM_ERR_MESSAGE;
+
+        if (httpparser_select_server(st->request->connection, host->value,
+                                     host->value_length) != HTTP1PARSER_CONTINUE)
+            return H3STREAM_ERR_MESSAGE;
+    }
+
+    return H3STREAM_REQUEST_READY;
 }
+
+
 
 /* Trailers (a HEADERS frame after DATA). The same octet and forbidden-field rules
  * as a header block apply, plus §4.1.2: no pseudo-headers, and content-length is

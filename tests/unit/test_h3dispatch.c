@@ -30,7 +30,11 @@ typedef struct {
 
 static void fixture_init(h3fixture_t* f) {
     f->qc = calloc(1, sizeof * f->qc);
-    f->c = h3conn_create(65536, 0);
+    /* NULL, not &f->qc->conn: a bare connection has no listener and therefore
+     * no vhost list, so select_server would refuse every request. What the
+     * connection is needed for -- routing and virtual-host selection -- is
+     * exactly what only the end-to-end client can exercise (tests/quicclient). */
+    f->c = h3conn_create(NULL, 65536, 0);
 
     memset(&f->ctx, 0, sizeof f->ctx);
     f->ctx.parser = f->c;
@@ -249,7 +253,7 @@ TEST(test_h3dispatch_refused) {
     fixture_init(&f);
     /* A field-section budget nothing fits in, so the read reports REFUSED. */
     h3conn_free(f.c);
-    f.c = h3conn_create(32, 0);
+    f.c = h3conn_create(NULL, 32, 0);
     f.ctx.parser = f.c;
 
     quicstream_t* qs = quicstream_create(0, STREAM_WINDOW, STREAM_WINDOW, STREAM_WINDOW);

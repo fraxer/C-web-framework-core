@@ -58,7 +58,7 @@ TEST(test_h3conn_request) {
     TEST_SUITE("h3conn");
 
     TEST_CASE("a request stream is read, built and reported done on FIN");
-    h3conn_t* c = h3conn_create(65536, 0);
+    h3conn_t* c = h3conn_create(NULL, 65536, 0);
     quicstream_t* qs = request_stream(0);
 
     uint8_t req[256];
@@ -83,7 +83,7 @@ TEST(test_h3conn_request) {
     h3conn_free(c);
 
     TEST_CASE("headers and FIN in one delivery report done, not headers");
-    c = h3conn_create(65536, 0);
+    c = h3conn_create(NULL, 65536, 0);
     qs = request_stream(0);
     deliver(qs, 0, req, n, 1);
     r = h3conn_stream_read(c, qs);
@@ -93,7 +93,7 @@ TEST(test_h3conn_request) {
     h3conn_free(c);
 
     TEST_CASE("a body spools through and the request completes");
-    c = h3conn_create(65536, 0);
+    c = h3conn_create(NULL, 65536, 0);
     qs = request_stream(0);
 
     uint8_t body[64];
@@ -108,8 +108,24 @@ TEST(test_h3conn_request) {
     stream_free(qs);
     h3conn_free(c);
 
+    TEST_CASE("a completed request is reported done exactly once");
+    /* h3stream_feed answers DONE for every feed after the FIN -- it describes a
+     * state, not an event -- so the driver has to be the thing that dispatches
+     * once. Without this the same request went out again on every datagram that
+     * followed, each dispatch opening its own response and its own file
+     * descriptor: a 1 MB file came back as 7 MB. Found end to end, because every
+     * module below was behaving correctly on its own. */
+    c = h3conn_create(NULL, 65536, 0);
+    qs = request_stream(0);
+    deliver(qs, 0, req, n, 1);
+    TEST_ASSERT(h3conn_stream_read(c, qs).status == H3CONN_REQUEST_DONE, "done once");
+    TEST_ASSERT(h3conn_stream_read(c, qs).status == H3CONN_OK, "and not again");
+    TEST_ASSERT(h3conn_stream_read(c, qs).status == H3CONN_OK, "however often it is read");
+    stream_free(qs);
+    h3conn_free(c);
+
     TEST_CASE("reading a stream with nothing new is a no-op");
-    c = h3conn_create(65536, 0);
+    c = h3conn_create(NULL, 65536, 0);
     qs = request_stream(0);
     TEST_ASSERT(h3conn_stream_read(c, qs).status == H3CONN_OK, "nothing to do");
     stream_free(qs);
@@ -120,7 +136,7 @@ TEST(test_h3conn_request_errors) {
     TEST_SUITE("h3conn");
 
     TEST_CASE("a malformed request resets the stream in both directions");
-    h3conn_t* c = h3conn_create(65536, 0);
+    h3conn_t* c = h3conn_create(NULL, 65536, 0);
     quicstream_t* qs = request_stream(0);
 
     /* A field section with no :method at all. */
@@ -143,7 +159,7 @@ TEST(test_h3conn_request_errors) {
     h3conn_free(c);
 
     TEST_CASE("an oversized field section is answered, not reset");
-    c = h3conn_create(32, 0);   /* a budget no real request fits in */
+    c = h3conn_create(NULL, 32, 0);   /* a budget no real request fits in */
     qs = request_stream(0);
     uint8_t req[256];
     const size_t n = get_request(req, sizeof req);
@@ -157,7 +173,7 @@ TEST(test_h3conn_request_errors) {
     h3conn_free(c);
 
     TEST_CASE("an HTTP/2 codepoint on a request stream closes the connection");
-    c = h3conn_create(65536, 0);
+    c = h3conn_create(NULL, 65536, 0);
     qs = request_stream(0);
     const uint8_t h2_ping[] = { 0x06, 0x00 };
     deliver(qs, 0, h2_ping, sizeof h2_ping, 0);
@@ -169,7 +185,7 @@ TEST(test_h3conn_request_errors) {
     h3conn_free(c);
 
     TEST_CASE("a client RESET_STREAM cancels the request without a reply");
-    c = h3conn_create(65536, 0);
+    c = h3conn_create(NULL, 65536, 0);
     qs = request_stream(0);
     deliver(qs, 0, req, n, 0);
     TEST_ASSERT(h3conn_stream_read(c, qs).status == H3CONN_REQUEST_HEADERS, "headers");
@@ -182,7 +198,7 @@ TEST(test_h3conn_request_errors) {
     h3conn_free(c);
 
     TEST_CASE("a request arriving after GOAWAY is rejected, not served");
-    c = h3conn_create(65536, 0);
+    c = h3conn_create(NULL, 65536, 0);
     uint8_t goaway[32];
     TEST_ASSERT(h3session_goaway_encode(c->session, goaway, sizeof goaway, 0) > 0, "goaway 0");
 
@@ -199,7 +215,7 @@ TEST(test_h3conn_uni_streams) {
     TEST_SUITE("h3conn");
 
     TEST_CASE("a control stream's SETTINGS reach the session");
-    h3conn_t* c = h3conn_create(65536, 0);
+    h3conn_t* c = h3conn_create(NULL, 65536, 0);
     quicstream_t* qs = uni_stream(0);
 
     uint8_t ctrl[32];
@@ -214,7 +230,7 @@ TEST(test_h3conn_uni_streams) {
     h3conn_free(c);
 
     TEST_CASE("an unknown stream type gets STOP_SENDING and is then ignored");
-    c = h3conn_create(65536, 0);
+    c = h3conn_create(NULL, 65536, 0);
     qs = uni_stream(0);
     const uint8_t unknown[] = { 0x09, 0xde, 0xad };
     deliver(qs, 0, unknown, sizeof unknown, 0);
@@ -233,7 +249,7 @@ TEST(test_h3conn_uni_streams) {
     h3conn_free(c);
 
     TEST_CASE("closing the control stream ends the connection");
-    c = h3conn_create(65536, 0);
+    c = h3conn_create(NULL, 65536, 0);
     qs = uni_stream(0);
     deliver(qs, 0, ctrl, n, 1);
 
@@ -244,7 +260,7 @@ TEST(test_h3conn_uni_streams) {
     h3conn_free(c);
 
     TEST_CASE("resetting the control stream is equally fatal");
-    c = h3conn_create(65536, 0);
+    c = h3conn_create(NULL, 65536, 0);
     qs = uni_stream(0);
     deliver(qs, 0, ctrl, n, 0);
     TEST_ASSERT(h3conn_stream_read(c, qs).status == H3CONN_OK, "opened");
@@ -257,7 +273,7 @@ TEST(test_h3conn_uni_streams) {
     h3conn_free(c);
 
     TEST_CASE("a second control stream is a stream-creation error");
-    c = h3conn_create(65536, 0);
+    c = h3conn_create(NULL, 65536, 0);
     quicstream_t* a = uni_stream(0);
     quicstream_t* b = uni_stream(1);
     deliver(a, 0, ctrl, n, 0);
@@ -272,7 +288,7 @@ TEST(test_h3conn_uni_streams) {
     h3conn_free(c);
 
     TEST_CASE("a stream type split across two deliveries still resolves");
-    c = h3conn_create(65536, 0);
+    c = h3conn_create(NULL, 65536, 0);
     qs = uni_stream(0);
     const uint8_t half1[] = { 0x40 };   /* two-byte varint for 0x21 (grease) */
     const uint8_t half2[] = { 0x21 };

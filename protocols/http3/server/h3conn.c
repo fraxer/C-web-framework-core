@@ -39,11 +39,13 @@ static h3conn_result_t __refused(int http_status) {
 
 /* ---- Lifecycle ---- */
 
-h3conn_t* h3conn_create(uint64_t max_field_section_size, int enable_connect_protocol) {
+h3conn_t* h3conn_create(connection_t* connection, uint64_t max_field_section_size,
+                        int enable_connect_protocol) {
     h3conn_t* c = calloc(1, sizeof * c);
     if (c == NULL) return NULL;
 
     c->free = (void(*)(void*))h3conn_free;
+    c->connection = connection;
 
     c->session = h3session_create(max_field_section_size, enable_connect_protocol);
     if (c->session == NULL) {
@@ -121,7 +123,7 @@ static h3app_t* __app_of(h3conn_t* c, quicstream_t* qs) {
         if (app->uni == NULL) { free(app); return NULL; }
     } else {
         app->is_request = 1;
-        app->req = h3stream_create((size_t)c->max_field_section_size);
+        app->req = h3stream_create(c->connection, (size_t)c->max_field_section_size);
         if (app->req == NULL) { free(app); return NULL; }
     }
 
@@ -319,6 +321,16 @@ static h3conn_result_t __read_request(h3conn_t* c, quicstream_t* qs, h3app_t* ap
             }
 
             if (st == H3STREAM_DONE) {
+                /* Reported once and once only. h3stream_feed answers DONE for
+                 * every feed after the FIN -- it is a state machine describing a
+                 * state, not an event -- so without this the same request is
+                 * dispatched again on every datagram that arrives afterwards,
+                 * each dispatch opening its own response and its own file
+                 * descriptor. A megabyte file came back as seven megabytes, and
+                 * nothing below this line could have shown it: each module was
+                 * behaving correctly, one request at a time. */
+                app->drained = 1;
+
                 h3conn_result_t r = { H3CONN_REQUEST_DONE, 0, 0 };
                 return r;
             }

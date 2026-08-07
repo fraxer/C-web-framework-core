@@ -145,6 +145,14 @@ void quicendpoint_wake(quicendpoint_t* endpoint, struct quicconn* conn);
 listener_t* quicendpoint_listener(quicendpoint_t* endpoint);
 int quicendpoint_fd(quicendpoint_t* endpoint);
 
+/* The address the endpoint is bound to, in the form connection_t carries it.
+ * A QUIC connection needs these because they are what selects the virtual
+ * server: httpparser_select_server matches a vhost by (ip, port), and a
+ * connection reporting 0/0 -- which is what it did before there was anywhere
+ * to get them from -- matches nothing at all. */
+in_addr_t quicendpoint_ip(quicendpoint_t* endpoint);
+unsigned short quicendpoint_port(quicendpoint_t* endpoint);
+
 /* Take a connection out of the routing table and the endpoint's lists. Called
  * from the connection's close path; after it, no datagram can reach it. */
 void quicendpoint_detach(quicendpoint_t* endpoint, struct quicconn* conn);

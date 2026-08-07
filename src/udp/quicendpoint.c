@@ -330,6 +330,22 @@ int quicendpoint_fd(quicendpoint_t* endpoint) {
     return endpoint != NULL ? endpoint->fd : -1;
 }
 
+in_addr_t quicendpoint_ip(quicendpoint_t* endpoint) {
+    if (endpoint == NULL || endpoint->local.ss_family != AF_INET) return 0;
+
+    const struct sockaddr_in* in = (const struct sockaddr_in*)&endpoint->local;
+
+    return in->sin_addr.s_addr;
+}
+
+unsigned short quicendpoint_port(quicendpoint_t* endpoint) {
+    if (endpoint == NULL || endpoint->local.ss_family != AF_INET) return 0;
+
+    const struct sockaddr_in* in = (const struct sockaddr_in*)&endpoint->local;
+
+    return ntohs(in->sin_port);
+}
+
 void quicendpoint_detach(quicendpoint_t* endpoint, quicconn_t* conn) {
     if (endpoint == NULL || conn == NULL) return;
 
@@ -462,8 +478,9 @@ static int __h3_attach(quicconn_t* conn) {
      * belongs to phase 7 alongside the rest of the h3 configuration.
      * Extended CONNECT is not advertised -- §8 is not implemented, and
      * advertising what we cannot serve is worse than staying quiet. */
-    h3conn_t* c = h3conn_create((uint64_t)env_get_int("http2_max_header_list_size",
-                                                     H3_DEFAULT_MAX_FIELD_SECTION_SIZE), 0);
+    h3conn_t* c = h3conn_create(&conn->conn,
+                                (uint64_t)env_get_int("http2_max_header_list_size",
+                                                      H3_DEFAULT_MAX_FIELD_SECTION_SIZE), 0);
     if (c == NULL) return 0;
 
     ctx->parser = c;

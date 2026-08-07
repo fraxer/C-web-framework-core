@@ -130,9 +130,12 @@ typedef struct h3stream {
     size_t   max_field_section_size;
 } h3stream_t;
 
-/* Create a stream with its own (empty) request. `max_field_section_size` is the
- * limit above; pass 0 for none. Returns NULL on OOM. */
-h3stream_t* h3stream_create(size_t max_field_section_size);
+/* Create a stream with its own (empty) request. `connection` is the one the
+ * request arrived on: it goes on the request, where the routing, redirect and
+ * virtual-host code all read it, and it is what select_server needs. NULL is
+ * accepted (the unit harness has no connection) and then no vhost is selected.
+ * `max_field_section_size` is the limit above; pass 0 for none. */
+h3stream_t* h3stream_create(connection_t* connection, size_t max_field_section_size);
 void h3stream_free(h3stream_t* st);
 
 /* Feed bytes received on this request stream, advancing *pp. Processes complete

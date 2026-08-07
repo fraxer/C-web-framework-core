@@ -78,12 +78,16 @@ if(INCLUDE_HTTP3 STREQUAL yes)
     add_executable(quicclient
         quicclient/main.c
         quicclient/quicclient.c
+        quicclient/h3client.c
     )
 
     target_include_directories(quicclient PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/quic/common
         ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/quic/crypto
         ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/quic/transport
+        ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http3/frame
+        ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http3/qpack
+        ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http3/server
     )
 
     target_link_libraries(quicclient PRIVATE

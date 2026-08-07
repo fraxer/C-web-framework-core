@@ -68,7 +68,7 @@ TEST(test_h3_write_filter_lookup) {
     qc->streams = a;
     qc->stream_count = 2;
 
-    h3conn_t* c = h3conn_create(65536, 0);
+    h3conn_t* c = h3conn_create(NULL, 65536, 0);
 
     /* Two request streams, each with its own response. */
     uint8_t req[256];

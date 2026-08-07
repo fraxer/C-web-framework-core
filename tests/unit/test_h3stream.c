@@ -52,7 +52,7 @@ TEST(test_h3stream_request) {
     uint8_t buf[512];
     const size_t n = headers_frame(enc, get, sizeof get / sizeof get[0], buf, sizeof buf);
 
-    h3stream_t* st = h3stream_create(0);
+    h3stream_t* st = h3stream_create(NULL, 0);
     TEST_ASSERT(feed(st, qdec, buf, n, 0) == H3STREAM_REQUEST_READY, "ready");
     TEST_ASSERT(st->headers_done, "headers_done");
     TEST_ASSERT(st->request->method == ROUTE_GET, "GET");
@@ -61,7 +61,7 @@ TEST(test_h3stream_request) {
     h3stream_free(st);
 
     TEST_CASE("HEADERS then FIN completes the request");
-    st = h3stream_create(0);
+    st = h3stream_create(NULL, 0);
     TEST_ASSERT(feed(st, qdec, buf, n, 0) == H3STREAM_REQUEST_READY, "ready");
     TEST_ASSERT(feed(st, qdec, NULL, 0, 1) == H3STREAM_DONE, "done on FIN");
     h3stream_free(st);
@@ -84,7 +84,7 @@ TEST(test_h3stream_body) {
     uint8_t hdr[256];
     const size_t hlen = headers_frame(enc, post, sizeof post / sizeof post[0], hdr, sizeof hdr);
 
-    h3stream_t* st = h3stream_create(0);
+    h3stream_t* st = h3stream_create(NULL, 0);
     TEST_ASSERT(feed(st, qdec, hdr, hlen, 0) == H3STREAM_REQUEST_READY, "ready");
 
     uint8_t data[128];
@@ -112,7 +112,7 @@ TEST(test_h3stream_trailers) {
     };
     uint8_t hdr[256];
     size_t n = headers_frame(enc, post, sizeof post / sizeof post[0], hdr, sizeof hdr);
-    h3stream_t* st = h3stream_create(0);
+    h3stream_t* st = h3stream_create(NULL, 0);
     TEST_ASSERT(feed(st, qdec, hdr, n, 0) == H3STREAM_REQUEST_READY, "ready");
 
     uint8_t data[128];
@@ -144,20 +144,20 @@ TEST(test_h3stream_errors) {
     TEST_CASE("DATA before HEADERS is a frame error");
     uint8_t data[64];
     const size_t dlen = data_frame((const uint8_t*)"x", 1, data, sizeof data);
-    h3stream_t* st = h3stream_create(0);
+    h3stream_t* st = h3stream_create(NULL, 0);
     TEST_ASSERT(feed(st, qdec, data, dlen, 0) == H3STREAM_ERR_FRAME_UNEXPECTED, "DATA first");
     h3stream_free(st);
 
     TEST_CASE("a control frame on a request stream is a frame error");
     uint8_t settings[16];
     const size_t slen = h3frame_write(settings, sizeof settings, H3_FRAME_SETTINGS, NULL, 0);
-    st = h3stream_create(0);
+    st = h3stream_create(NULL, 0);
     TEST_ASSERT(feed(st, qdec, settings, slen, 0) == H3STREAM_ERR_FRAME_UNEXPECTED,
                 "SETTINGS on stream");
     h3stream_free(st);
 
     TEST_CASE("FIN before HEADERS is request-incomplete");
-    st = h3stream_create(0);
+    st = h3stream_create(NULL, 0);
     TEST_ASSERT(feed(st, qdec, NULL, 0, 1) == H3STREAM_ERR_REQUEST_INCOMPLETE,
                 "FIN before HEADERS");
     h3stream_free(st);
@@ -166,7 +166,7 @@ TEST(test_h3stream_errors) {
     /* §11.2.1 and §7.1 name different codes, and the split is only visible if
      * the two are not collapsed into one status. */
     const uint8_t h2_ping[] = { 0x06, 0x00 };   /* type 0x06 = HTTP/2 PING */
-    st = h3stream_create(0);
+    st = h3stream_create(NULL, 0);
     TEST_ASSERT(feed(st, qdec, h2_ping, sizeof h2_ping, 0) == H3STREAM_ERR_FRAME_UNEXPECTED,
                 "reserved h2 codepoint");
     TEST_ASSERT(h3stream_status_error(H3STREAM_ERR_FRAME_UNEXPECTED) == H3_FRAME_UNEXPECTED,
@@ -194,7 +194,7 @@ TEST(test_h3stream_fin) {
     const size_t hlen = headers_frame(enc, post, sizeof post / sizeof post[0], hdr, sizeof hdr);
 
     TEST_CASE("a frame truncated by FIN is a connection-level frame error");
-    h3stream_t* st = h3stream_create(0);
+    h3stream_t* st = h3stream_create(NULL, 0);
     TEST_ASSERT(feed(st, qdec, hdr, hlen, 0) == H3STREAM_REQUEST_READY, "ready");
 
     uint8_t data[128];
@@ -207,7 +207,7 @@ TEST(test_h3stream_fin) {
     h3stream_free(st);
 
     TEST_CASE("content-length that disagrees with the body is a message error");
-    st = h3stream_create(0);
+    st = h3stream_create(NULL, 0);
     TEST_ASSERT(feed(st, qdec, hdr, hlen, 0) == H3STREAM_REQUEST_READY, "ready");
     TEST_ASSERT(st->content_length == 10, "content-length recorded");
 
@@ -220,7 +220,7 @@ TEST(test_h3stream_fin) {
     h3stream_free(st);
 
     TEST_CASE("a content-length that matches passes");
-    st = h3stream_create(0);
+    st = h3stream_create(NULL, 0);
     TEST_ASSERT(feed(st, qdec, hdr, hlen, 0) == H3STREAM_REQUEST_READY, "ready");
     TEST_ASSERT(feed(st, qdec, data, dlen, 0) == H3STREAM_BODY_CHUNK, "10 bytes");
     TEST_ASSERT(feed(st, qdec, NULL, 0, 1) == H3STREAM_DONE, "done");
@@ -248,7 +248,7 @@ TEST(test_h3stream_field_limit) {
 
     /* Four fields cost 4*32 plus their bytes, so a 32-byte budget is under it
      * however the fields are encoded. */
-    h3stream_t* st = h3stream_create(32);
+    h3stream_t* st = h3stream_create(NULL, 32);
     TEST_ASSERT(feed(st, qdec, buf, n, 0) == H3STREAM_ERR_FIELDS_TOO_LARGE, "over the limit");
     TEST_ASSERT(!h3stream_status_is_connection(H3STREAM_ERR_FIELDS_TOO_LARGE), "stream only");
     TEST_ASSERT(h3stream_status_error(H3STREAM_ERR_FIELDS_TOO_LARGE) == H3_NO_ERROR,
@@ -256,7 +256,7 @@ TEST(test_h3stream_field_limit) {
     h3stream_free(st);
 
     TEST_CASE("the same section under a generous limit passes");
-    st = h3stream_create(4096);
+    st = h3stream_create(NULL, 4096);
     TEST_ASSERT(feed(st, qdec, buf, n, 0) == H3STREAM_REQUEST_READY, "ready");
     h3stream_free(st);
 

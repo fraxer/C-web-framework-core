@@ -81,6 +81,68 @@ static const quictls_ops_t __ops = {
 
 /* Build one packet at `level`, carrying an ACK if one is owed and as much
  * CRYPTO as fits. Returns its length. */
+/* ---- Streams ---- */
+
+static clientstream_t* __stream_get(quicclient_t* c, uint64_t id, int create) {
+    for (size_t i = 0; i < CLIENT_MAX_STREAMS; i++)
+        if (c->streams[i].used && c->streams[i].id == id) return &c->streams[i];
+
+    if (!create) return NULL;
+
+    for (size_t i = 0; i < CLIENT_MAX_STREAMS; i++) {
+        clientstream_t* s = &c->streams[i];
+        if (s->used) continue;
+
+        s->used = 1;
+        s->id = id;
+        s->fin_queued = 0;
+        s->in_fin = 0;
+        quicsendbuf_init(&s->out);
+        /* The window we advertised, which is what bounds what the peer may put
+         * in here (quicclient_connect). */
+        quicrecvbuf_init(&s->in, 32 * 1024 * 1024);
+
+        return s;
+    }
+
+    return NULL;
+}
+
+int quicclient_stream_write(quicclient_t* client, uint64_t id,
+                            const uint8_t* data, size_t len, int fin) {
+    if (client == NULL) return 0;
+
+    clientstream_t* s = __stream_get(client, id, 1);
+    if (s == NULL) return 0;
+
+    if (len > 0 && !quicsendbuf_write(&s->out, data, len)) return 0;
+    if (fin) {
+        quicsendbuf_finish(&s->out);
+        s->fin_queued = 1;
+    }
+
+    return 1;
+}
+
+size_t quicclient_stream_readable(quicclient_t* client, uint64_t id) {
+    clientstream_t* s = __stream_get(client, id, 0);
+
+    return s == NULL ? 0 : quicrecvbuf_readable(&s->in);
+}
+
+size_t quicclient_stream_read(quicclient_t* client, uint64_t id,
+                              uint8_t* dst, size_t cap) {
+    clientstream_t* s = __stream_get(client, id, 0);
+
+    return s == NULL ? 0 : quicrecvbuf_read(&s->in, dst, cap);
+}
+
+int quicclient_stream_fin(quicclient_t* client, uint64_t id) {
+    clientstream_t* s = __stream_get(client, id, 0);
+
+    return s != NULL && s->in_fin;
+}
+
 static size_t __build(quicclient_t* c, quic_enc_level_e level,
                       uint8_t* dst, size_t cap, int pad_to_minimum) {
     quickeys_t* keys = &c->tx[level];
@@ -134,6 +196,42 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
                 p += n;
                 quicsendbuf_mark_sent(&c->crypto_out[level], offset, dlen, 0);
             }
+        }
+    }
+
+    /* Stream data, once the handshake keys exist. One frame per stream per
+     * packet is enough for a test whose whole exchange is a few kilobytes. */
+    if (level == QUIC_ENC_APP) {
+        for (size_t i = 0; i < CLIENT_MAX_STREAMS && p + 64 < sizeof payload; i++) {
+            clientstream_t* st = &c->streams[i];
+            if (!st->used || !quicsendbuf_pending(&st->out)) continue;
+
+            uint64_t offset = 0;
+            const uint8_t* data = NULL;
+            size_t dlen = 0;
+            int fin = 0;
+
+            const size_t room = sizeof payload - p - 96;
+            if (!quicsendbuf_next(&st->out, room, &offset, &data, &dlen, &fin)) continue;
+
+            quicframe_t f;
+            memset(&f, 0, sizeof f);
+            f.type = QUIC_FRAME_STREAM | QUIC_STREAM_FLAG_LEN |
+                     (offset > 0 ? QUIC_STREAM_FLAG_OFF : 0) |
+                     (fin ? QUIC_STREAM_FLAG_FIN : 0);
+            f.u.stream.id = st->id;
+            f.u.stream.offset = offset;
+            f.u.stream.len = dlen;
+            f.u.stream.data = data;
+
+            const size_t n = quicframe_write(payload + p, sizeof payload - p, &f);
+            if (n == 0) continue;
+
+            p += n;
+            quicsendbuf_mark_sent(&st->out, offset, dlen, fin);
+
+            __log(c, "  [client] -> STREAM %llu, %zu bytes%s\n",
+                  (unsigned long long)st->id, dlen, fin ? " FIN" : "");
         }
     }
 
@@ -226,6 +324,24 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
     while ((st = quicframe_next(payload, len, &off, &f)) == QUICFRAME_OK) {
         if (quicframe_is_ack_eliciting(f.type)) *out_ack_eliciting = 1;
 
+        if (f.type >= QUIC_FRAME_STREAM && f.type < QUIC_FRAME_STREAM + 8) {
+            clientstream_t* s = __stream_get(c, f.u.stream.id, 1);
+            if (s == NULL) return 0;
+
+            if (quicrecvbuf_insert(&s->in, f.u.stream.offset, f.u.stream.data,
+                                   (size_t)f.u.stream.len, f.u.stream.fin) != QUICRECVBUF_OK)
+                return 0;
+
+            if (f.u.stream.fin) s->in_fin = 1;
+
+            __log(c, "  [client] <- STREAM %llu, %llu bytes at %llu%s\n",
+                  (unsigned long long)f.u.stream.id,
+                  (unsigned long long)f.u.stream.len,
+                  (unsigned long long)f.u.stream.offset,
+                  f.u.stream.fin ? " FIN" : "");
+            continue;
+        }
+
         switch (f.type) {
         case QUIC_FRAME_CRYPTO:
             if (!quictls_recv_crypto(&c->tls, level, f.u.crypto.offset,
@@ -239,6 +355,18 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
         case QUIC_FRAME_ACK_ECN:
             __log(c, "  [client] <- ACK (largest %llu)\n",
                   (unsigned long long)f.u.ack.largest);
+            break;
+
+        case QUIC_FRAME_RESET_STREAM:
+            printf("  [client] <- RESET_STREAM %llu, error 0x%llx\n",
+                   (unsigned long long)f.u.reset_stream.id,
+                   (unsigned long long)f.u.reset_stream.error);
+            break;
+
+        case QUIC_FRAME_STOP_SENDING:
+            __log(c, "  [client] <- STOP_SENDING %llu, error 0x%llx\n",
+                  (unsigned long long)f.u.stop_sending.id,
+                  (unsigned long long)f.u.stop_sending.error);
             break;
 
         case QUIC_FRAME_HANDSHAKE_DONE:
@@ -389,9 +517,14 @@ int quicclient_connect(quicclient_t* client, const char* host, uint16_t port,
 
     quictp_t params;
     quictp_defaults(&params);
-    params.initial_max_data = 1048576;
-    params.initial_max_stream_data_bidi_local = 262144;
-    params.initial_max_stream_data_uni = 262144;
+    /* Generous on purpose. This client never sends MAX_DATA or MAX_STREAM_DATA
+     * -- see the note in quicclient.h -- so whatever it advertises here is all
+     * the room a response will ever get. It has to exceed the server's
+     * write-ahead budget several times over, or a large response would stall on
+     * flow control and look like a server bug. */
+    params.initial_max_data = 64 * 1024 * 1024;
+    params.initial_max_stream_data_bidi_local = 32 * 1024 * 1024;
+    params.initial_max_stream_data_uni = 1024 * 1024;
     params.initial_max_streams_bidi = 16;
     params.initial_max_streams_uni = 16;
     params.max_idle_timeout = 30000;
@@ -454,6 +587,42 @@ int quicclient_run(quicclient_t* client, int timeout_ms) {
     return client->handshake_complete;
 }
 
+int quicclient_pump(quicclient_t* client, int timeout_ms) {
+    if (client == NULL) return 0;
+
+    if (!__flush(client)) return 0;
+
+    const uint64_t deadline = quic_now_us() + (uint64_t)timeout_ms * 1000;
+    int got_anything = 0;
+
+    /* Drains every datagram that is ready, not just the first. Reading one per
+     * call was the whole reason a megabyte response arrived as sixty
+     * kilobytes: at ~1200 bytes a datagram, fifty calls is sixty kilobytes, and
+     * the response looked truncated by the server. */
+    while (quic_now_us() < deadline) {
+        struct pollfd pfd = { .fd = client->fd, .events = POLLIN };
+
+        /* Wait only while nothing has arrived yet; once the burst starts, take
+         * the rest of it without pausing between datagrams. */
+        const int wait_ms = got_anything ? 0 : 20;
+        const int r = poll(&pfd, 1, wait_ms);
+        if (r < 0) return 0;
+        if (r == 0) break;
+
+        uint8_t buf[2048];
+        const ssize_t n = recv(client->fd, buf, sizeof buf, 0);
+        if (n <= 0) break;
+
+        if (!__recv_datagram(client, buf, (size_t)n)) return 0;
+        got_anything = 1;
+    }
+
+    /* Acknowledge the burst in one go rather than per datagram. */
+    if (got_anything && !__flush(client)) return 0;
+
+    return 1;
+}
+
 void quicclient_free(quicclient_t* client) {
     if (client == NULL) return;
 
@@ -464,6 +633,12 @@ void quicclient_free(quicclient_t* client) {
         quickeys_free(&client->tx[i]);
         quicsendbuf_free(&client->crypto_out[i]);
         quicrange_free(&client->received[i]);
+    }
+
+    for (size_t i = 0; i < CLIENT_MAX_STREAMS; i++) {
+        if (!client->streams[i].used) continue;
+        quicsendbuf_free(&client->streams[i].out);
+        quicrecvbuf_free(&client->streams[i].in);
     }
 
     if (client->ssl_ctx != NULL) SSL_CTX_free(client->ssl_ctx);

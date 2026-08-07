@@ -62,9 +62,10 @@ typedef struct h3app {
     int            is_request;
     h3uni_recv_t*  uni;      /* is_request == 0 */
     h3stream_t*    req;      /* is_request == 1 */
-    /* The stream's bytes are no longer wanted: a discarded uni-stream, or a
-     * request already answered. Bytes still have to be drained so the flow
-     * control window keeps moving, but nothing looks at them. */
+    /* Nothing further on this stream is worth parsing: a discarded uni-stream,
+     * a request that was refused, or -- the common case -- a request that has
+     * been dispatched. Bytes still have to be read so the flow-control window
+     * keeps moving, but nothing looks at them. */
     int            drained;
 } h3app_t;
 
@@ -74,6 +75,12 @@ typedef struct h3conn {
      * points at -- the same contract h2session_t carries for HTTP/2. */
     void (*free)(void*);
 
+    /* The connection this belongs to -- &quicconn_t::conn. Kept because every
+     * request built here needs it: routing, redirects and virtual-host
+     * selection all read request->connection, and a NULL there is a null
+     * dereference the moment a redirect rule is consulted. */
+    connection_t* connection;
+
     h3session_t* session;
     uint64_t     max_field_section_size;
 
@@ -81,7 +88,8 @@ typedef struct h3conn {
     int          service_streams_open;
 } h3conn_t;
 
-h3conn_t* h3conn_create(uint64_t max_field_section_size, int enable_connect_protocol);
+h3conn_t* h3conn_create(connection_t* connection, uint64_t max_field_section_size,
+                        int enable_connect_protocol);
 void h3conn_free(h3conn_t* c);
 
 /* Open our control, QPACK encoder, QPACK decoder and grease streams and write

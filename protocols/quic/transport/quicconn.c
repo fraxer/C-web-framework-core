@@ -1068,8 +1068,13 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     const unsigned short remote_port = path->remote.ss_family == AF_INET
                                        ? ntohs(remote4->sin_port) : 0;
 
+    /* The local address matters: httpparser_select_server picks the virtual
+     * server by (ip, port), so a connection that reports 0/0 matches no vhost
+     * and every request is a 421. TCP gets these from accept(); QUIC has to
+     * take them from the endpoint it arrived on. */
     if (!connection_s_init(&conn->conn, quicendpoint_listener(endpoint),
-                           quicendpoint_fd(endpoint), 0, 0,
+                           quicendpoint_fd(endpoint),
+                           quicendpoint_ip(endpoint), quicendpoint_port(endpoint),
                            remote_ip, remote_port, NULL, 0)) {
         __quicconn_transport_free(conn);
         free(conn);

@@ -2,24 +2,34 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "h3client.h"
+#include "h3frame.h"
 #include "quicclient.h"
 
-/* Drive a QUIC handshake against this server and report what happened.
+/* Drive a QUIC handshake and one HTTP/3 request against this server, and report
+ * what happened.
  *
- *   quicclient [host] [port] [-q]
+ *   quicclient [host] [port] [-q] [-p /path] [--handshake-only]
  *
  * Exists because nothing else on this machine can: the system curl is built
  * without HTTP/3, and no QUIC library is installed. Until phase 8 stands up the
- * interop runner, this is the only thing that can say whether a real handshake
- * completes. */
+ * interop runner, this is the only thing that can say whether the whole path --
+ * handshake, SETTINGS, request, dispatch, response -- works end to end. Every
+ * module below it is unit-tested; what only this can check is that they are
+ * wired to each other in the right order. */
 
 int main(int argc, char* argv[]) {
     const char* host = argc > 1 ? argv[1] : "127.0.0.1";
     const uint16_t port = argc > 2 ? (uint16_t)atoi(argv[2]) : 18443;
 
     int verbose = 1;
-    for (int i = 1; i < argc; i++)
+    int handshake_only = 0;
+    const char* path = "/";
+    for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) verbose = 0;
+        else if (strcmp(argv[i], "--handshake-only") == 0) handshake_only = 1;
+        else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) path = argv[++i];
+    }
 
     printf("connecting to %s:%u\n", host, port);
 
@@ -51,10 +61,63 @@ int main(int argc, char* argv[]) {
                cipher != NULL ? SSL_CIPHER_get_name(cipher) : "(none)");
     }
 
+    if (!ok || handshake_only) {
+        quicclient_free(&client);
+        printf("\n%s\n", ok ? "OK: the handshake completed end to end"
+                            : "FAIL: the handshake did not complete");
+        return ok ? 0 : 1;
+    }
+
+    /* ---- HTTP/3 ---- */
+
+    printf("\nGET %s\n", path);
+
+    int h3_ok = h3client_start(&client);
+    if (!h3_ok) printf("FAIL: could not open the control stream\n");
+
+    h3client_response_t response;
+    memset(&response, 0, sizeof response);
+
+    if (h3_ok) {
+        h3_ok = h3client_get(&client, 0, "localhost", path, 5000, &response);
+        if (!h3_ok) printf("FAIL: no response\n");
+    }
+
+    /* Read after the request, not before: service streams and request streams
+     * are delivered independently, so the server's SETTINGS may well arrive
+     * alongside the response rather than ahead of it. */
+    h3settings_t peer;
+    const int settings_seen = h3client_peer_settings(&client, &peer);
+
+    printf("server SETTINGS:           %s\n", settings_seen ? "yes" : "no");
+    if (settings_seen) {
+        printf("  qpack capacity:          %llu\n",
+               (unsigned long long)peer.qpack_max_table_capacity);
+        printf("  blocked streams:         %llu\n",
+               (unsigned long long)peer.qpack_blocked_streams);
+        printf("  max field section:       %llu\n",
+               (unsigned long long)peer.max_field_section_size);
+    }
+
+    if (h3_ok) {
+        printf("status:                    %d\n", response.status);
+        printf("fields:                    %zu\n", response.fields_count);
+        printf("body:                      %zu bytes\n", response.body_len);
+
+        if (verbose && response.body_len > 0) {
+            const size_t show = response.body_len > 512 ? 512 : response.body_len;
+            printf("---\n%.*s%s\n---\n", (int)show, response.body,
+                   show < response.body_len ? "\n[truncated]" : "");
+        }
+    }
+
+    const int all_ok = h3_ok && settings_seen && response.status > 0;
+
+    h3client_response_free(&response);
     quicclient_free(&client);
 
-    printf("\n%s\n", ok ? "OK: the handshake completed end to end"
-                        : "FAIL: the handshake did not complete");
+    printf("\n%s\n", all_ok ? "OK: request and response completed end to end"
+                            : "FAIL: the HTTP/3 exchange did not complete");
 
-    return ok ? 0 : 1;
+    return all_ok ? 0 : 1;
 }

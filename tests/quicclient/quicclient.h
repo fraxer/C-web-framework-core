@@ -8,6 +8,7 @@
 #include "quic.h"
 #include "quiccrypto.h"
 #include "quicrange.h"
+#include "quicrecvbuf.h"
 #include "quicsendbuf.h"
 #include "quictls.h"
 
@@ -34,6 +35,22 @@
  * server's own modules -- the only thing written twice is the *client* side of
  * the packet loop, which is what has to be independent for the test to mean
  * anything. */
+
+/* Streams the test drives. A handful is plenty: HTTP/3 needs one control
+ * stream, one request stream, and room for whatever the server opens back --
+ * its control stream and both QPACK streams. */
+#define CLIENT_MAX_STREAMS 16
+
+typedef struct clientstream {
+    uint64_t      id;
+    int           used;
+
+    quicsendbuf_t out;
+    int           fin_queued;
+
+    quicrecvbuf_t in;
+    int           in_fin;
+} clientstream_t;
 
 typedef struct quicclient {
     int fd;
@@ -63,6 +80,8 @@ typedef struct quicclient {
     int got_server_initial;
     int got_server_handshake;
 
+    clientstream_t streams[CLIENT_MAX_STREAMS];
+
     int verbose;
 } quicclient_t;
 
@@ -73,6 +92,31 @@ int quicclient_connect(quicclient_t* client, const char* host, uint16_t port,
 /* Drive the exchange until the handshake completes or `timeout_ms` elapses.
  * Returns 1 if it completed. */
 int quicclient_run(quicclient_t* client, int timeout_ms);
+
+/* ---- Streams ---- *
+ *
+ * Deliberately minimal, and honest about it: send-side flow control is not
+ * enforced and no MAX_DATA is ever sent back. A test exchange is a request of a
+ * few hundred bytes and a response the server's own windows already bound, so
+ * neither can bite; a general-purpose client would need both. */
+
+/* Queue bytes on a stream, opening it on first use. `fin` ends it. */
+int quicclient_stream_write(quicclient_t* client, uint64_t id,
+                            const uint8_t* data, size_t len, int fin);
+
+/* Bytes ready to read on a stream, and reading them. */
+size_t quicclient_stream_readable(quicclient_t* client, uint64_t id);
+size_t quicclient_stream_read(quicclient_t* client, uint64_t id,
+                              uint8_t* dst, size_t cap);
+
+/* Has the server finished its half of this stream? */
+int quicclient_stream_fin(quicclient_t* client, uint64_t id);
+
+/* One turn of the loop: send what is queued, then receive for up to
+ * `timeout_ms`. Unlike quicclient_run it has no completion condition of its
+ * own -- the caller decides when it has what it wanted. Returns 0 if the
+ * connection failed. */
+int quicclient_pump(quicclient_t* client, int timeout_ms);
 
 void quicclient_free(quicclient_t* client);
 
