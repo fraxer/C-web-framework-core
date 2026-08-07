@@ -8,6 +8,7 @@
 #include "httpcommon.h"         /* http_payload_t */
 #include "httpfields.h"         /* httpfields_to_request, httpfields_is_forbidden_header */
 #include "httprequest.h"        /* httprequest_create_payload_file, ..._trailern_add */
+#include "httpresponse.h"       /* httpresponse_free -- the stream owns its response */
 #include "qpack.h"
 
 _Static_assert(sizeof(qpack_header_t) == sizeof(httpfields_field_t),
@@ -39,6 +40,8 @@ h3stream_t* h3stream_create(size_t max_field_section_size) {
     }
 
     st->response = NULL;
+    atomic_init(&st->response_ready, 0);
+    st->response_done = 0;
     st->stage = H3STREAM_EXPECT_HEADERS;
     st->headers_done = 0;
     st->content_length = -1;
@@ -51,6 +54,7 @@ void h3stream_free(h3stream_t* st) {
     if (st == NULL) return;
     h3frame_parser_free(&st->parser);
     if (st->request != NULL) httprequest_free(st->request);
+    if (st->response != NULL) httpresponse_free(st->response);
     free(st);
 }
 

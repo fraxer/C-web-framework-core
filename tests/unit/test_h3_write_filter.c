@@ -102,9 +102,9 @@ TEST(test_h3_write_filter_lookup) {
     TEST_ASSERT(h3conn_stream_by_response(qc, orphan) == NULL, "no match");
     TEST_ASSERT(h3conn_stream_by_response(qc, NULL) == NULL, "and NULL is not a wildcard");
 
+    /* ra and rb belong to their streams now (h3stream_t::response), so releasing
+     * the streams frees them; only the orphan is ours to free. */
     httpresponse_free(orphan);
-    httpresponse_free(ra);
-    httpresponse_free(rb);
     h3conn_stream_release(a);
     h3conn_stream_release(b);
     quicstream_free(a);

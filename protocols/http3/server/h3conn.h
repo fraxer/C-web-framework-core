@@ -7,9 +7,9 @@
 #include "h3session.h"
 #include "h3stream.h"
 #include "quicconn.h"
+#include "httprequest.h"
+#include "httpresponse.h"
 #include "quicstream.h"
-
-struct httpresponse;
 
 /* Where HTTP/3 meets QUIC (docs/http3/05-http3.md §6.2).
  *
@@ -90,6 +90,16 @@ int h3conn_open_service_streams(h3conn_t* c, quicconn_t* qc);
  * Safe to call on a stream with nothing new. */
 h3conn_result_t h3conn_stream_read(h3conn_t* c, quicstream_t* qs);
 
+/* Read every stream of the connection that has something new, dispatching the
+ * requests that completed and answering the ones that were refused. This is
+ * what the transport calls after quicconn_recv and before quicconn_send.
+ *
+ * Returns 0 when the connection must close; *error then carries the HTTP/3
+ * application code for CONNECTION_CLOSE. The caller must hold
+ * connection_s_lock, which is why dispatch from here reaches the inline publish
+ * path rather than the handler-thread one. */
+int h3conn_read(h3conn_t* c, quicconn_t* qc, uint64_t* error);
+
 /* The request state on a stream, or NULL if it is not a request stream. */
 h3stream_t* h3conn_request_of(quicstream_t* qs);
 
@@ -101,15 +111,48 @@ h3stream_t* h3conn_request_of(quicstream_t* qs);
  * ctx->parser is an h3conn_t. The two type-confusion bugs h2 hit on that same
  * void* (docs/http2/09) came from a flag someone had to remember to set;
  * nobody has to remember what transport a connection arrived on. */
-struct connection;
-h3conn_t* h3_conn_of(struct connection* connection);
+h3conn_t* h3_conn_of(connection_t* connection);
 
 /* The QUIC stream carrying `response`, or NULL. Walks the connection's streams,
  * as h2stream_find_by_response does: a response is answered once, on a list
  * bounded by the peer's stream limit. */
-quicstream_t* h3conn_stream_by_response(quicconn_t* qc, const struct httpresponse* response);
+quicstream_t* h3conn_stream_by_response(quicconn_t* qc, const httpresponse_t* response);
 
 /* Release the per-stream state. Called before quicstream_free. */
 void h3conn_stream_release(quicstream_t* qs);
+
+/* ---- Dispatch and publication ---- *
+ *
+ * The same three-way split HTTP/2 arrived at (docs/concurrency/01 phase B), for
+ * the same reasons:
+ *
+ *  - attach binds the response to its stream *before* user code runs, so the
+ *    write filter can find its way back from a response alone;
+ *  - response_ready is what a handler thread calls, and it must be called
+ *    WITHOUT connection_s_lock -- it takes the lock itself;
+ *  - publish_inline is what the worker calls when it built the response on the
+ *    read path and is already holding that lock. connection_s_lock is a
+ *    non-recursive spinlock, so calling the wrong one deadlocks. h2 hit exactly
+ *    this and the second entry point is the fix it landed on.
+ */
+
+/* Bind `response` to the stream carrying `request`. Returns 0 if no stream
+ * owns the request, which means it was cancelled while the handler queued. */
+int h3_server_attach_response(connection_t* connection, httprequest_t* request,
+                              httpresponse_t* response);
+
+/* A handler thread finished a response. Marks the stream ready and wakes the
+ * endpoint so the send path picks it up. Call without connection_s_lock. */
+int h3_server_response_ready(connection_t* connection, httpresponse_t* response);
+
+/* The worker built the response itself, on the read path, under
+ * connection_s_lock. Marks the stream ready without taking anything. */
+int h3_server_publish_inline(connection_t* connection, httpresponse_t* response);
+
+/* Run the write turn: for every stream whose response is ready, drive the
+ * filter chain until it finishes or the write-ahead budget is spent. Called by
+ * the transport before it builds packets. Returns 0 if the connection must
+ * close. */
+int h3conn_write(h3conn_t* c, quicconn_t* qc);
 
 #endif

@@ -4,8 +4,12 @@
 #include <string.h>
 
 #include "connection_s.h"
+#include "h3response.h"
+#include "http_filter.h"
 #include "httpresponse.h"
+#include "httpserverhandlers.h"
 #include "log.h"
+#include "metrics.h"
 #include "qpack.h"
 
 /* One read from a QUIC stream. Big enough that an ordinary request's headers
@@ -327,6 +331,228 @@ static h3conn_result_t __read_request(h3conn_t* c, quicstream_t* qs, h3app_t* ap
     }
 
     return __ok();
+}
+
+/* ---- Dispatch ---- */
+
+/* Answer a refused request (413/431/500) without running a handler: the stream
+ * is well-formed, so it gets a real response rather than a reset. Builds the
+ * response the same way the dispatch path does, so it goes out through the same
+ * filter chain. */
+static void __answer_status(connection_t* connection, quicstream_t* qs, int status_code) {
+    h3stream_t* st = h3conn_request_of(qs);
+    if (st == NULL) return;
+
+    httpresponse_t* response = httpresponse_create_h3(connection);
+    if (response == NULL) return;
+
+    httpresponse_default(response, status_code);
+    st->response = response;
+
+    /* The worker is on the read path with the connection lock held, so this is
+     * the inline publication -- taking it again would deadlock. */
+    h3_server_publish_inline(connection, response);
+}
+
+int h3conn_read(h3conn_t* c, quicconn_t* qc, uint64_t* error) {
+    if (c == NULL || qc == NULL) return 0;
+
+    connection_t* connection = &qc->conn;
+
+    for (quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
+        /* Nothing new and no state change to report: skip without allocating
+         * per-stream state for a stream that has said nothing yet. */
+        if (qs->app == NULL && quicstream_readable(qs) == 0 &&
+            qs->recv_state != QUIC_RECV_RESET_RECVD)
+            continue;
+
+        const h3conn_result_t r = h3conn_stream_read(c, qs);
+
+        switch (r.status) {
+        case H3CONN_OK:
+        case H3CONN_REQUEST_HEADERS:
+        case H3CONN_REQUEST_RESET:
+            break;
+
+        case H3CONN_REQUEST_DONE: {
+            h3stream_t* st = h3conn_request_of(qs);
+            if (st == NULL) break;
+
+            /* http_server_dispatch queues the handler and, for anything it can
+             * answer itself (a static file, a 404, a redirect), publishes
+             * inline -- which is why this has to run with the lock already
+             * held and never take it again. */
+            if (!http_server_dispatch(connection, st->request)) {
+                if (error != NULL) *error = H3_INTERNAL_ERROR;
+                return 0;
+            }
+            break;
+        }
+
+        case H3CONN_REQUEST_REFUSED:
+            __answer_status(connection, qs, r.http_status);
+            break;
+
+        case H3CONN_CLOSED:
+            if (error != NULL) *error = r.h3_error;
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+/* ---- Publication ---- */
+
+/* The stream carrying `request`, or NULL. */
+static quicstream_t* __stream_by_request(quicconn_t* qc, const httprequest_t* request) {
+    for (quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
+        const h3stream_t* st = h3conn_request_of(qs);
+        if (st != NULL && st->request == request) return qs;
+    }
+
+    return NULL;
+}
+
+int h3_server_attach_response(connection_t* connection, httprequest_t* request,
+                              httpresponse_t* response) {
+    if (h3_conn_of(connection) == NULL) return 0;
+
+    quicconn_t* qc = (quicconn_t*)connection;
+    quicstream_t* qs = __stream_by_request(qc, request);
+    if (qs == NULL) return 0;
+
+    h3stream_t* st = h3conn_request_of(qs);
+    st->response = response;
+
+    return 1;
+}
+
+/* Mark the stream that owns `response` ready for its write turn. Returns 0 when
+ * no stream owns it any more -- the client reset it while the handler ran -- in
+ * which case the response is nobody's and is freed here. */
+static int __publish_one(quicconn_t* qc, httpresponse_t* response) {
+    quicstream_t* qs = h3conn_stream_by_response(qc, response);
+    if (qs == NULL) {
+        httpresponse_free(response);
+        return 0;
+    }
+
+    h3stream_t* st = h3conn_request_of(qs);
+    atomic_store_explicit(&st->response_ready, 1, memory_order_release);
+
+    return 1;
+}
+
+int h3_server_response_ready(connection_t* connection, httpresponse_t* response) {
+    if (h3_conn_of(connection) == NULL) {
+        httpresponse_free(response);
+        return 0;
+    }
+
+    /* Unlike h2 there is no publish queue here, and none is needed. h2's exists
+     * because its publish walks a stream table the worker owns; ours sets one
+     * atomic flag on a stream the response already points at, so there is
+     * nothing to hand over. The lock is still taken, because finding the stream
+     * walks the connection's stream list, which the worker mutates.
+     * (docs/concurrency/01 §2.3 measured h2's queue as a net contention cost --
+     * worth not repeating.) */
+    connection_s_lock(connection, LOCK_SITE_H3_PUBLISH);
+    __publish_one((quicconn_t*)connection, response);
+    connection_s_unlock(connection);
+
+    connection_server_ctx_t* ctx = connection->ctx;
+    atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
+
+    /* Wake the endpoint so it gives this connection a send turn. Takes only the
+     * endpoint's leaf lock, never connection_s_lock, which is why it is outside
+     * the block above. */
+    quicconn_want_write(connection);
+
+    return 1;
+}
+
+int h3_server_publish_inline(connection_t* connection, httpresponse_t* response) {
+    if (h3_conn_of(connection) == NULL) {
+        httpresponse_free(response);
+        return 1;
+    }
+
+    /* The worker is on the read path and already holds connection_s_lock, so it
+     * is the sole owner of the stream list: publish straight to the stream.
+     * Taking the lock again would deadlock -- it is not recursive. This is the
+     * trap h2 hit and solved the same way (docs/concurrency/01 phase B.1). */
+    __publish_one((quicconn_t*)connection, response);
+
+    connection_server_ctx_t* ctx = connection->ctx;
+    atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
+
+    return 1;
+}
+
+/* ---- The write turn ---- */
+
+/* One stream's turn at the filter chain. */
+static int __write_stream(quicstream_t* qs, h3stream_t* st) {
+    httpresponse_t* response = st->response;
+    if (response == NULL) return 1;
+
+    int r = __run_header_filters(st->request, response);
+    if (r == CWF_ERROR) return 0;
+    if (r == CWF_EVENT_AGAIN) return 1;   /* budget spent; resumed next turn */
+
+    r = __run_body_filters(st->request, response);
+    if (r == CWF_ERROR) return 0;
+    if (r == CWF_EVENT_AGAIN) return 1;
+
+    /* Trailing fields close the stream instead of a bare FIN (§4.1). Encoded
+     * here, at the point of sending, for the reason h2 encodes them here too:
+     * field sections must reach the peer in the order they were encoded, and in
+     * full QPACK an early encode would put the dynamic table out of step. */
+    if (!qs->send.fin && response->trailer_ != NULL) {
+        h3conn_t* c = h3_conn_of(response->connection);
+        uint8_t* frame = NULL;
+        size_t flen = 0;
+
+        if (c != NULL &&
+            h3response_trailers(c->session->qenc, response->trailer_, &frame, &flen)
+                == H3RESPONSE_OK) {
+            const int ok = quicstream_write(qs, frame, flen);
+            free(frame);
+            if (!ok) return 0;
+        }
+    }
+
+    /* The chain emits no buffer at all for an empty body, and the header stage
+     * only finishes the stream when it could prove up front that none follows,
+     * so close it explicitly when it is still open. */
+    if (!qs->send.fin) quicstream_finish(qs);
+
+    st->response_done = 1;
+    atomic_store_explicit(&st->response_ready, 0, memory_order_release);
+
+    return 1;
+}
+
+int h3conn_write(h3conn_t* c, quicconn_t* qc) {
+    if (c == NULL || qc == NULL) return 0;
+
+    for (quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
+        h3stream_t* st = h3conn_request_of(qs);
+        if (st == NULL || st->response_done) continue;
+        if (!atomic_load_explicit(&st->response_ready, memory_order_acquire)) continue;
+
+        if (!__write_stream(qs, st)) {
+            log_error("h3: write failed on stream %llu\n", (unsigned long long)qs->id);
+            /* One stream's response failing is not the connection's problem:
+             * reset it and carry on with the rest. */
+            quicstream_reset(qs, H3_INTERNAL_ERROR);
+            st->response_done = 1;
+            atomic_store_explicit(&st->response_ready, 0, memory_order_release);
+        }
+    }
+
+    return 1;
 }
 
 h3conn_result_t h3conn_stream_read(h3conn_t* c, quicstream_t* qs) {

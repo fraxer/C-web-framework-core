@@ -70,6 +70,12 @@ typedef enum {
      * than as a suspicion (docs/http3/01-udp-endpoint.md §8). */
     LOCK_SITE_QUIC_RECV,        /* endpoint handing a datagram to a connection */
     LOCK_SITE_QUIC_SEND,        /* endpoint building that connection's packets */
+    /* The h3 counterparts of the two h2 publish tags. Measured apart from h2's
+     * on purpose: the two protocols reach the same publish code by different
+     * paths (epoll re-arm versus quicconn_want_write), and a shared tag would
+     * make it impossible to tell which one is waiting. */
+    LOCK_SITE_H3_PUBLISH,       /* handler thread publishing an h3 response */
+    LOCK_SITE_H3_REARM,         /* handler thread waking the endpoint after it */
     LOCK_SITE__COUNT
 } metrics_lock_site_t;
 

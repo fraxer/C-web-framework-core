@@ -12,6 +12,46 @@
 #include "openssl.h"
 #include "idn_utils.h"
 #include "h2session.h"
+#ifdef CWFR_HTTP3
+#include "h3conn.h"
+#endif
+
+/* A multiplexed protocol: several exchanges in flight on one connection, each
+ * response bound to its own stream rather than to the connection context. That
+ * is what decides parallel dispatch, where request/response live, and which
+ * publish path runs -- and it is true of HTTP/3 for exactly the same reasons it
+ * is true of HTTP/2.
+ *
+ * HTTP/3 is recognised by its transport, not by a bit on the ctx: QUIC carries
+ * nothing else here (h1.1 and h2 are both TCP), so the transport is already the
+ * answer, and a bit would be one more thing to remember to set. */
+static int __is_http3(const connection_t* connection) {
+#ifdef CWFR_HTTP3
+    return connection != NULL && connection->transport == CONN_TRANSPORT_QUIC;
+#else
+    (void)connection;
+    return 0;
+#endif
+}
+
+static int __is_multiplexed(const connection_t* connection) {
+    const connection_server_ctx_t* ctx = connection->ctx;
+
+    return ctx->is_http2 || __is_http3(connection);
+}
+
+/* The response carries its protocol's filter chain, so which one is created is
+ * the same decision as which terminal write stage will run. */
+static httpresponse_t* __create_response(connection_t* connection) {
+    const connection_server_ctx_t* ctx = connection->ctx;
+
+    if (ctx->is_http2) return httpresponse_create_h2(connection);
+#ifdef CWFR_HTTP3
+    if (__is_http3(connection)) return httpresponse_create_h3(connection);
+#endif
+
+    return httpresponse_create(connection);
+}
 
 typedef struct {
     connection_queue_item_data_t base;
@@ -386,7 +426,7 @@ int __deferred_handler(connection_t* connection, httprequest_t* request, httpres
 
     /* h2 hands every item to its own worker; h1.1 keeps one request in flight
      * and lets the chain pass the next one on (docs/concurrency/00 §5.2). */
-    const int parallel = ctx->is_http2;
+    const int parallel = __is_multiplexed(connection);
 
     /* ctx->queue used to be covered by connection_s_lock, which the worker held
      * for the whole handler run. It does not any more, so the queue needs its
@@ -424,8 +464,13 @@ int __deferred_handler(connection_t* connection, httprequest_t* request, httpres
  * measured apart: docs/concurrency/01 accepts phase B on the h2 publish tag
  * specifically, and h1.1 — one request in flight — has nothing to contend with
  * there. Hence a runtime tag instead of a constant one. */
-static metrics_lock_site_t __publish_site(connection_server_ctx_t* ctx) {
-    return ctx->is_http2 ? LOCK_SITE_H2_PUBLISH : LOCK_SITE_HTTP_PUBLISH;
+static metrics_lock_site_t __publish_site(connection_t* connection) {
+    const connection_server_ctx_t* ctx = connection->ctx;
+
+    if (ctx->is_http2) return LOCK_SITE_H2_PUBLISH;
+    if (__is_http3(connection)) return LOCK_SITE_H3_PUBLISH;
+
+    return LOCK_SITE_HTTP_PUBLISH;
 }
 
 /* A handler (or the inline dispatch path) has finished filling a response. h1.1
@@ -437,6 +482,11 @@ int __handler_finished(connection_t* connection, httprequest_t* request, httpres
 
     if (ctx->is_http2)
         return h2_server_response_ready(connection, response);
+
+#ifdef CWFR_HTTP3
+    if (__is_http3(connection))
+        return h3_server_response_ready(connection, response);
+#endif
 
     (void)request;
 
@@ -456,14 +506,12 @@ int __handler_finished(connection_t* connection, httprequest_t* request, httpres
  * Wrapping the branch keeps every caller out of the business of knowing which
  * path locks. */
 static void __publish_response(connection_t* connection, httprequest_t* request, httpresponse_t* response) {
-    connection_server_ctx_t* ctx = connection->ctx;
-
-    if (ctx->is_http2) {
+    if (__is_multiplexed(connection)) {
         __handler_finished(connection, request, response);
         return;
     }
 
-    connection_s_lock(connection, __publish_site(ctx));
+    connection_s_lock(connection, __publish_site(connection));
     __handler_finished(connection, request, response);
     connection_s_unlock(connection);
 }
@@ -474,15 +522,18 @@ int http_server_dispatch(connection_t* connection, httprequest_t* request) {
 
 int __handle(connection_t* connection, httprequest_t* request, deferred_handler handler) {
     connection_server_ctx_t* conn_ctx = connection->ctx;
-    httpresponse_t* response = conn_ctx->is_http2 ?
-        httpresponse_create_h2(connection) : httpresponse_create(connection);
+    httpresponse_t* response = __create_response(connection);
     if (response == NULL) return 0;
 
-    /* Under h2 the response belongs to a stream, not to the connection: bind it
-     * now so the write path and the write filter can reach it from the response
-     * alone, and so it is freed with the stream. */
+    /* Under a multiplexed protocol the response belongs to a stream, not to the
+     * connection: bind it now so the write path and the write filter can reach
+     * it from the response alone, and so it is freed with the stream. */
     if (conn_ctx->is_http2)
         h2_server_attach_response(connection, request, response);
+#ifdef CWFR_HTTP3
+    else if (__is_http3(connection))
+        h3_server_attach_response(connection, request, response);
+#endif
 
     /* asterisk-form (RFC 9110 §9.3.7): "OPTIONS *" asks what the server as a
      * whole can do, not what one resource can do. There is nothing to route it
@@ -772,7 +823,7 @@ void __queue_request_handler(void* arg) {
      * that was the single largest source of contention on the dispatch path
      * (~7400 waited acquisitions, ~10k sched_yield per 10k requests, guarding
      * nothing). Skip the acquisition on h2 (docs/concurrency/01 §6 A.4 п.3). */
-    if (!conn_ctx->is_http2) {
+    if (!__is_multiplexed(item->connection)) {
         connection_s_lock(item->connection, LOCK_SITE_HTTP_DISPATCH);
         conn_ctx->request = data->request;
         conn_ctx->response = data->response;
@@ -828,8 +879,8 @@ void __queue_response_handler(void* arg) {
      * lock; h2 keeps them on the stream. __publish_response owns the lock split
      * for the actual publish (h2 re-arms under its own acquisition, h1.1 under
      * the caller's) — the whole runner no longer stays under one lock. */
-    if (!conn_ctx->is_http2) {
-        connection_s_lock(item->connection, __publish_site(conn_ctx));
+    if (!__is_multiplexed(item->connection)) {
+        connection_s_lock(item->connection, __publish_site(item->connection));
         conn_ctx->request = data->request;
         conn_ctx->response = data->response;
         connection_s_unlock(item->connection);
@@ -1108,9 +1159,7 @@ int __sni_callback(SSL* ssl, int* ad, void* arg) {
 }
 
 int __post_response_default(connection_t* connection, int status_code) {
-    connection_server_ctx_t* conn_ctx = connection->ctx;
-    httpresponse_t* response = conn_ctx->is_http2 ?
-        httpresponse_create_h2(connection) : httpresponse_create(connection);
+    httpresponse_t* response = __create_response(connection);
     if (response == NULL) return 0;
 
     httpresponse_default(response, status_code);
@@ -1144,6 +1193,11 @@ int __post_response(httprequest_t* request, httpresponse_t* response) {
      * h2_server_response_ready via __publish_response instead. */
     if (ctx->is_http2)
         return h2_server_publish_inline(connection, response);
+
+#ifdef CWFR_HTTP3
+    if (__is_http3(connection))
+        return h3_server_publish_inline(connection, response);
+#endif
 
     cqueue_lock(ctx->queue);
     const int queue_empty = cqueue_empty(ctx->queue);

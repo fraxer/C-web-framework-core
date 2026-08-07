@@ -1,6 +1,7 @@
 #ifndef __H3STREAM__
 #define __H3STREAM__
 
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -96,8 +97,12 @@ typedef struct h3stream {
     httprequest_t*   request;
     /* Set when the request is dispatched, so the write filter can find its way
      * back from a response to the QUIC stream that carries it
-     * (h3conn_stream_by_response). Owned by the dispatch path, not by h3stream:
-     * h3stream_free does not touch it. */
+     * (h3conn_stream_by_response).
+     *
+     * The stream owns it, exactly as h2stream owns its own: a response outlives
+     * the handler that filled it and has to survive until the write turn has
+     * drained it, and the stream is the only thing whose lifetime covers that.
+     * h3stream_free releases it. */
     struct httpresponse* response;
 
     enum {
@@ -109,6 +114,14 @@ typedef struct h3stream {
     int      headers_done;     /* first HEADERS received */
     int64_t  content_length;   /* declared, or -1 when the request carried none */
     size_t   req_body_len;     /* DATA bytes spooled into request->payload_ */
+
+    /* The response is filled and the write turn may run the filter chain for
+     * this stream. Atomic because a handler thread sets it and the worker reads
+     * it; release/acquire, so seeing the flag implies seeing the response.
+     * The same contract as h2stream_t::response_ready. */
+    atomic_int response_ready;
+    /* The filter chain has run to completion on this stream. */
+    int      response_done;
 
     /* Our advertised SETTINGS_MAX_FIELD_SECTION_SIZE. A decoded field section
      * larger than this is refused with 431 rather than decompressed into

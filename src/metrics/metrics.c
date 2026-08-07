@@ -54,7 +54,8 @@ static const char* const __lock_site_name[LOCK_SITE__COUNT] = {
     "broadcast",
     "close",
     "tick",
-    "quic.recv", "quic.send"
+    "quic.recv", "quic.send",
+    "h3.publish", "h3.rearm"
 };
 
 /* One of these per call site. The totals reported under `lock` are summed from
