@@ -1,7 +1,7 @@
 #include "h2field.h"
 
 /* Field name octets (RFC 9110 §5.6.2 `tchar`, minus the uppercase letters that
- * RFC 9113 §8.2.1 bans on the wire).
+ * RFC 9113 §8.2.1 / RFC 9114 §4.3 ban on the wire).
  *
  * §8.2.1 itself only forbids 0x00-0x20, 0x41-0x5a and 0x7f-0xff, which would
  * leave ':', ',', '(' and friends legal inside a name. This table is the
@@ -47,9 +47,9 @@ int h2_field_value_valid(const char* value, size_t len) {
     if (len == 0) return 1; /* an empty value is legal */
     if (value == NULL) return 0;
 
-    /* §8.2.1: a value must not start or end with SP or HTAB. HPACK carries the
-     * bytes verbatim, unlike HTTP/1.1 where the framing strips leading OWS, so
-     * this is a check only HTTP/2 needs. */
+    /* §8.2.1: a value must not start or end with SP or HTAB. HPACK/QPACK carry
+     * the bytes verbatim, unlike HTTP/1.1 where the framing strips leading OWS,
+     * so this is a check only the multiplexed protocols need. */
     const char first = value[0];
     const char last = value[len - 1];
     if (first == ' ' || first == '\t' || last == ' ' || last == '\t') return 0;

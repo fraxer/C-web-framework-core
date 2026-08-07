@@ -25,6 +25,13 @@
 #include "httpresponse.h"
 #include "h2_write_filter.h"
 #include "h2field.h"
+#include "httpfields.h"
+
+/* The decoded HPACK field array is handed to httpfields_to_request by viewing
+ * it as httpfields_field_t. The two are layout-compatible by construction; this
+ * guards against silent drift if either struct changes. */
+_Static_assert(sizeof(hpack_header_t) == sizeof(httpfields_field_t),
+               "hpack_header_t must stay layout-compatible with httpfields_field_t");
 #include "h2ws.h"
 #include "h2stream.h"
 #include "httpserverhandlers.h"
@@ -720,157 +727,13 @@ h2session_t* h2_session_of(connection_t* connection) {
 
 /* ======================================================================= *
  *  Request construction from frames
- * ======================================================================= */
+ * ======================================================================= *
+ *  The field list → httprequest_t rules live in protocols/http/httpfields.c,
+ *  shared with HTTP/3 (docs/http3/05-http3.md §6.1). h2_build_request keeps
+ *  only the HPACK-specific half: decode the block, enforce the header-list
+ *  size, hand the decoded fields to httpfields_to_request, then select the
+ *  virtual server (which needs the connection the shared builder does not). */
 
-static route_methods_e method_from(const char* method, size_t len) {
-    if (len == 3 && memcmp(method, "GET", 3) == 0) return ROUTE_GET;
-    if (len == 4 && memcmp(method, "POST", 4) == 0) return ROUTE_POST;
-    if (len == 3 && memcmp(method, "PUT", 3) == 0) return ROUTE_PUT;
-    if (len == 6 && memcmp(method, "DELETE", 6) == 0) return ROUTE_DELETE;
-    if (len == 7 && memcmp(method, "OPTIONS", 7) == 0) return ROUTE_OPTIONS;
-    if (len == 5 && memcmp(method, "PATCH", 5) == 0) return ROUTE_PATCH;
-    if (len == 4 && memcmp(method, "HEAD", 4) == 0) return ROUTE_HEAD;
-
-    return ROUTE_NONE;
-}
-
-/* Connection-specific fields banned in requests too (RFC 9113 §8.2.2). */
-static int is_forbidden_h2_header(const char* key, size_t len) {
-    static const struct { const char* name; size_t len; } banned[] = {
-        {"connection", 10}, {"keep-alive", 10}, {"proxy-connection", 16},
-        {"transfer-encoding", 17}, {"upgrade", 7},
-    };
-
-    for (size_t i = 0; i < sizeof(banned) / sizeof(banned[0]); i++)
-        if (len == banned[i].len && memcmp(key, banned[i].name, len) == 0) return 1;
-
-    return 0;
-}
-
-/* The h1.1 parser derives cookies and ranges from headers as it parses them
- * (httprequestparser.c __try_set_cookie / __try_set_range). h2 gets its headers
- * from HPACK, so the same derivations run here, over the request's own
- * null-terminated copies. */
-static void h2_apply_cookies(httprequest_t* request) {
-    size_t total = 0;
-    size_t count = 0;
-    for (http_header_t* h = request->header_; h != NULL; h = h->next) {
-        if (h->key_length != 6 || memcmp(h->key, "cookie", 6) != 0) continue;
-        total += h->value_length;
-        count++;
-    }
-
-    if (count == 0) return;
-
-    /* RFC 9113 §8.2.3 lets a client split Cookie into several fields for better
-     * compression (browsers do); rejoin them with "; " before parsing. */
-    total += (count - 1) * 2;
-
-    char* joined = malloc(total + 1);
-    if (joined == NULL) return;
-
-    size_t off = 0;
-    for (http_header_t* h = request->header_; h != NULL; h = h->next) {
-        if (h->key_length != 6 || memcmp(h->key, "cookie", 6) != 0) continue;
-
-        if (off > 0) {
-            memcpy(joined + off, "; ", 2);
-            off += 2;
-        }
-        memcpy(joined + off, h->value, h->value_length);
-        off += h->value_length;
-    }
-    joined[off] = '\0';
-
-    cookieparser_t parser;
-    cookieparser_init(&parser);
-    if (!cookieparser_parse(&parser, joined, off)) {
-        log_error("Cookie parser error: %s\n", parser.error);
-        free(joined);
-        return;
-    }
-
-    http_cookie_free(request->cookie_);
-    request->cookie_ = cookieparser_cookie(&parser);
-
-    free(joined);
-}
-
-static void h2_apply_range(httprequest_t* request) {
-    for (http_header_t* h = request->header_; h != NULL; h = h->next) {
-        if (h->key_length != 5 || memcmp(h->key, "range", 5) != 0) continue;
-
-        http_ranges_free(request->ranges);
-        request->ranges = httpparser_parse_range(h->value, h->value_length);
-        return;
-    }
-}
-
-/* Copy the :path slice and hand it to the request. The HPACK slice belongs to
- * the decoded header array, while request->uri must be a heap buffer the
- * request owns — httprequest_reset() frees it exactly once. httpparser_set_uri
- * stores the buffer before it validates, so the request owns it on either
- * outcome and it must never be freed here.
- *
- * -fanalyzer reports the hand-off as a leak: httpparser_set_uri takes the
- * buffer as const char* yet retains it, and the owning httprequest_t is freed
- * from another translation unit, so the analyzer cannot follow it. Assigning
- * request->uri here as well makes the escape explicit to a reader but does not
- * convince the analyzer, hence the scoped suppression. */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wanalyzer-malloc-leak"
-static int h2_set_path(httprequest_t* request, const char* value, size_t len) {
-    char* uri = malloc(len + 1);
-    if (uri == NULL) return 0;
-
-    memcpy(uri, value, len);
-    uri[len] = '\0';
-
-    request->uri = uri;
-    request->uri_length = len;
-
-    /* asterisk-form (§8.3.1): ":path" of "*" for an OPTIONS request. Handled
-     * here rather than left to httpparser_set_uri, which decides it by looking
-     * at request->method: pseudo-headers may arrive in any order, so :method is
-     * not necessarily known yet. Whether OPTIONS was the method is therefore
-     * checked once the whole block has been read (docs/http2/10, S.2). */
-    if (len == 1 && uri[0] == '*') {
-        char* path = malloc(2);
-        if (path == NULL) return 0;
-
-        path[0] = '*';
-        path[1] = '\0';
-        request->path = path;
-        request->path_length = 1;
-        request->asterisk_form = 1;
-
-        return 1;
-    }
-
-    return httpparser_set_uri(request, uri, len) == HTTP1PARSER_CONTINUE;
-}
-#pragma GCC diagnostic pop
-
-/* RFC 9113 §8.2.2 allows exactly one TE value: "trailers". */
-static int h2_te_is_valid(const char* value, size_t len) {
-    return len == 8 && memcmp(value, "trailers", 8) == 0;
-}
-
-/* Parse a content-length value into *out. Returns 0 if it is not a plain
- * non-negative integer, which makes the request malformed. */
-static int h2_parse_content_length(const char* value, size_t len, int64_t* out) {
-    if (len == 0 || len > 19) return 0;
-
-    int64_t n = 0;
-    for (size_t i = 0; i < len; i++) {
-        if (value[i] < '0' || value[i] > '9') return 0;
-        n = n * 10 + (value[i] - '0');
-    }
-
-    *out = n;
-
-    return 1;
-}
 
 typedef enum {
     H2_REQUEST_OK = 0,
@@ -925,201 +788,32 @@ static h2_request_status_e h2_build_request(h2session_t* s, h2stream_t* stream,
         return H2_REQUEST_TOO_LARGE;
     }
 
-    h2_request_status_e status = H2_REQUEST_OK;
-    int method_seen = 0;
-    int path_seen = 0;
-    int scheme_seen = 0;
-    int authority_seen = 0;
-    int regular_seen = 0;
-    /* Extended CONNECT (RFC 8441) — docs/http2/09-extended-connect.md.
-     *
-     * The verdict on :protocol is taken here, inside the loop, and only a copy
-     * of the name survives it. The decoded header array is freed before the
-     * post-loop checks run, so anything that still pointed into it there would
-     * be reading freed memory — the same reason :path is copied by h2_set_path.
-     * The copy is bounded and only feeds a log line. */
-    int connect_method = 0;
-    int protocol_seen = 0;
-    int protocol_websocket = 0;
-    char protocol_name[32] = {0};
-
-    stream->content_length = -1;
-
-    for (size_t i = 0; i < count && status == H2_REQUEST_OK; i++) {
-        const char* name = headers[i].name;
-        const size_t name_len = headers[i].name_len;
-        const char* value = headers[i].value;
-        const size_t value_len = headers[i].value_len;
-
-        /* §8.2.1, before anything reads the bytes: an invalid octet in a name
-         * or a value makes the request malformed whatever the field means.
-         * Applies to pseudo-headers too — h2_field_name_valid knows about the
-         * leading colon. */
-        if (h2_field_validate(name, name_len, value, value_len) != H2_FIELD_OK) {
-            status = H2_REQUEST_MALFORMED;
-            break;
-        }
-
-        if (name[0] == ':') {
-            /* §8.3: pseudo-headers must all precede the regular fields. */
-            if (regular_seen) {
-                status = H2_REQUEST_MALFORMED;
-                break;
-            }
-
-            if (name_len == 7 && memcmp(name, ":method", 7) == 0) {
-                /* A repeated pseudo-header makes the request malformed (§8.3.1). */
-                if (method_seen) {
-                    status = H2_REQUEST_MALFORMED;
-                    break;
-                }
-                request->method = method_from(value, value_len);
-                /* CONNECT is deliberately absent from method_from: it is not a
-                 * routable method here (docs/http2/08 §D.2). Noted separately so
-                 * the extended form can be told apart after the loop. */
-                connect_method = (value_len == 7 && memcmp(value, "CONNECT", 7) == 0);
-                method_seen = 1;
-            }
-            else if (name_len == 5 && memcmp(name, ":path", 5) == 0) {
-                if (value_len == 0 || path_seen) {
-                    status = H2_REQUEST_MALFORMED;
-                    break;
-                }
-                if (!h2_set_path(request, value, value_len))
-                    status = H2_REQUEST_MALFORMED;
-                path_seen = 1;
-            }
-            else if (name_len == 7 && memcmp(name, ":scheme", 7) == 0) {
-                /* The value carries no routing information — the transport
-                 * already says http vs https — but §8.3.1 requires it to be
-                 * present exactly once. */
-                if (value_len == 0 || scheme_seen) {
-                    status = H2_REQUEST_MALFORMED;
-                    break;
-                }
-                scheme_seen = 1;
-            }
-            else if (name_len == 10 && memcmp(name, ":authority", 10) == 0) {
-                if (authority_seen) {
-                    status = H2_REQUEST_MALFORMED;
-                    break;
-                }
-                /* httprequest's add_headern returns 0 on success (the mirror
-                 * method on httpresponse returns 1 — they disagree). */
-                if (request->add_headern(request, "Host", 4, value, value_len) != 0)
-                    status = H2_REQUEST_INTERNAL;
-                authority_seen = 1;
-            }
-            else if (name_len == 9 && memcmp(name, ":protocol", 9) == 0) {
-                /* Extended CONNECT (RFC 8441 §4) — docs/http2/09. Whether it is
-                 * allowed to appear at all is decided after the loop: it is
-                 * legal only in a CONNECT request that also carries :scheme and
-                 * :path, and that is not knowable until every pseudo-header has
-                 * been seen. */
-                if (value_len == 0 || protocol_seen) {
-                    status = H2_REQUEST_MALFORMED;
-                    break;
-                }
-                protocol_websocket = (value_len == 9 && memcmp(value, "websocket", 9) == 0);
-
-                const size_t copy = value_len < sizeof(protocol_name) ?
-                    value_len : sizeof(protocol_name) - 1;
-                memcpy(protocol_name, value, copy);
-                protocol_name[copy] = '\0';
-
-                protocol_seen = 1;
-            }
-            else {
-                /* Unknown pseudo-headers, and the response-only ones such as
-                 * :status, are malformed in a request (§8.3). */
-                status = H2_REQUEST_MALFORMED;
-                break;
-            }
-
-            continue;
-        }
-
-        regular_seen = 1;
-
-        /* The uppercase rule of §8.2.1 used to be checked here; it is part of
-         * h2_field_validate above now, along with the rest of the octet rules. */
-
-        if (is_forbidden_h2_header(name, name_len)) {
-            status = H2_REQUEST_MALFORMED;
-            break;
-        }
-
-        if (name_len == 2 && memcmp(name, "te", 2) == 0 && !h2_te_is_valid(value, value_len)) {
-            status = H2_REQUEST_MALFORMED;
-            break;
-        }
-
-        if (name_len == 14 && memcmp(name, "content-length", 14) == 0) {
-            int64_t declared = 0;
-            /* A second content-length is only tolerable if it agrees. */
-            if (!h2_parse_content_length(value, value_len, &declared) ||
-                (stream->content_length >= 0 && stream->content_length != declared)) {
-                status = H2_REQUEST_MALFORMED;
-                break;
-            }
-            stream->content_length = declared;
-        }
-
-        if (request->add_headern(request, name, name_len, value, value_len) != 0)
-            status = H2_REQUEST_INTERNAL;
-    }
-
+    int64_t content_length = -1;
+    const http_fields_status_e fst = httpfields_to_request(
+        request, (const httpfields_field_t*)headers, count, HTTP_FIELDS_H2, &content_length);
     hpack_headers_free(headers, count);
+    stream->content_length = content_length;
 
+    /* Map the shared builder's verdict onto the h2 stream outcomes. The two line
+     * up 1:1; TOO_LARGE/COMPRESSION are HPACK-specific and handled above.
+     * EXTENDED_CONNECT/WEBSOCKET reach h2ws.c unchanged. */
+    h2_request_status_e status;
+    switch (fst) {
+    case HTTP_FIELDS_OK:               status = H2_REQUEST_OK;               break;
+    case HTTP_FIELDS_INTERNAL:         status = H2_REQUEST_INTERNAL;         break;
+    case HTTP_FIELDS_EXTENDED_CONNECT: status = H2_REQUEST_EXTENDED_CONNECT; break;
+    case HTTP_FIELDS_WEBSOCKET:        status = H2_REQUEST_WEBSOCKET;        break;
+    default:                           status = H2_REQUEST_MALFORMED;        break;
+    }
     if (status != H2_REQUEST_OK) return status;
 
-    /* Extended CONNECT (RFC 8441 §4) — docs/http2/09, step 1.
-     *
-     * The two CONNECT shapes are told apart by exactly this: the extended form
-     * carries :protocol, :scheme and :path, the tunnelling form carries none of
-     * them. Which is why supporting one says nothing about supporting the other.
-     *
-     * :protocol outside a CONNECT is malformed — §4 forbids it there. Inside
-     * one, the request is well formed and we simply do not serve it yet: it
-     * gets 501, not a reset, so a client learns the difference between "you
-     * asked wrongly" and "this server will not do that". */
-    if (protocol_seen) {
-        if (!connect_method || !scheme_seen || !path_seen || !authority_seen)
-            return H2_REQUEST_MALFORMED;
-
-        /* Only "websocket" is registered for us. Anything else is a protocol we
-         * do not implement, which is a 501 — the request itself is fine. */
-        if (!protocol_websocket) {
-            log_info("h2: extended CONNECT for unsupported protocol \"%s\" (fd %d)\n",
-                     protocol_name, s->connection->fd);
-            return H2_REQUEST_EXTENDED_CONNECT;
-        }
-
-        return H2_REQUEST_WEBSOCKET;
-    }
-
-    /* Plain CONNECT — the forward-proxy tunnel. Not supported by decision
-     * (docs/http2/08 §D.2): it has no :scheme and no :path, so it fails the
-     * check below anyway; naming it here keeps that from looking accidental. */
-
-    if (!method_seen || !path_seen || !scheme_seen || request->method == ROUTE_NONE)
-        return H2_REQUEST_MALFORMED;
-
-    /* §8.3.1: ":path" may be "*" only for an OPTIONS request. Checked here
-     * because the pseudo-headers may arrive in either order (see h2_set_path). */
-    if (request->asterisk_form && request->method != ROUTE_OPTIONS)
-        return H2_REQUEST_MALFORMED;
-
-    /* :authority (mapped to Host above) selects the virtual server, and on a
-     * TLS connection it must agree with the SNI-selected one (RFC 9110 §7.4).
-     * Without this, routing would silently use the listener's first server. */
+    /* :authority (now Host) selects the virtual server and must agree with SNI
+     * (RFC 9110 §7.4). Kept here: it needs the connection the shared builder
+     * deliberately does not take. */
     http_header_t* host = request->get_headern(request, "Host", 4);
     if (host == NULL) return H2_REQUEST_MALFORMED; /* §8.3.1: :authority or Host */
     if (httpparser_select_server(s->connection, host->value, host->value_length) != HTTP1PARSER_CONTINUE)
         return H2_REQUEST_MALFORMED;
-
-    h2_apply_cookies(request);
-    h2_apply_range(request);
 
     request->version = HTTP1_VER_1_1;
 
@@ -1178,7 +872,7 @@ static h2_request_status_e h2_consume_trailers(h2session_t* s, h2stream_t* strea
         /* Fields banned in a header block are no more welcome in a trailer
          * (§8.2.2), and §8.1 keeps out the ones that would change how the
          * message itself is read — by the time they arrive, it has been read. */
-        if (is_forbidden_h2_header(headers[i].name, headers[i].name_len) ||
+        if (httpfields_is_forbidden_header(headers[i].name, headers[i].name_len) ||
             (headers[i].name_len == 14 &&
              memcmp(headers[i].name, "content-length", 14) == 0)) {
             status = H2_REQUEST_MALFORMED;
