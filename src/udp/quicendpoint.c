@@ -447,10 +447,6 @@ static void __accept(quicendpoint_t* ep, udp_datagram_t* dgram,
 }
 
 
-/* Advertised SETTINGS_MAX_FIELD_SECTION_SIZE when nothing is configured -- the
- * same 1 MB HTTP/2 defaults to. */
-#define H3_DEFAULT_MAX_FIELD_SECTION_SIZE (1024 * 1024)
-
 /* ---- The HTTP/3 layer ---- *
  *
  * The endpoint is where QUIC and HTTP/3 meet, and it is the right place for it:
@@ -472,15 +468,9 @@ static int __h3_attach(quicconn_t* conn) {
     /* ALPN settled this at the handshake: the QUIC context offers `h3` and
      * nothing else (openssl.h), so an ACTIVE connection is an HTTP/3 one.
      *
-     * The field-section limit rides on http2_max_header_list_size rather than a
-     * knob of its own: it is the same budget for the same reason, and one number
-     * an operator sets once beats two that must be kept equal. A key of its own
-     * belongs to phase 7 alongside the rest of the h3 configuration.
      * Extended CONNECT is not advertised -- §8 is not implemented, and
      * advertising what we cannot serve is worse than staying quiet. */
-    h3conn_t* c = h3conn_create(&conn->conn,
-                                (uint64_t)env_get_int("http2_max_header_list_size",
-                                                      H3_DEFAULT_MAX_FIELD_SECTION_SIZE), 0);
+    h3conn_t* c = h3conn_create(&conn->conn, h3_policy_max_field_section_size(), 0);
     if (c == NULL) return 0;
 
     ctx->parser = c;

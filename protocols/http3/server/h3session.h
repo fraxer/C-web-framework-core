@@ -74,6 +74,18 @@ void h3uni_recv_free(h3uni_recv_t* uni);
 
 /* ---- The session ---- */
 
+/* ---- Policy ---- *
+ *
+ * Read once per config load, before any worker thread exists, and read-only
+ * afterwards -- the same contract h2_policy_init() carries, and the only reason
+ * plain globals are safe here. Called from module_loader next to it.
+ *
+ * Until this existed the field-section limit rode on http2_max_header_list_size
+ * because it happens to be the same budget for the same reason. That was a
+ * stopgap and said so: two protocols sharing one operator-facing key means
+ * neither can be tuned without the other. */
+void h3_policy_init(void);
+
 typedef struct h3session {
     /* Owned by h3conn, not by the connection context: it is h3conn_t that lives
      * in connection_server_ctx_t::parser and therefore h3conn_t that carries
@@ -107,7 +119,36 @@ typedef struct h3session {
     uint64_t     goaway_id;
     int          peer_goaway_seen;
     uint64_t     peer_goaway_id;
+
+    /* ---- Abuse budgets (docs/http3/07-integration.md §4) ---- *
+     *
+     * Leaky buckets in milli-tokens, the same shape docs/http2/08 phase A
+     * settled on. Two buckets rather than one because an honest client's rate
+     * of cancellations is nothing like its rate of control frames, and a single
+     * bucket would have to be set by the looser of the two. */
+    int64_t      abort_tokens;
+    uint64_t     abort_epoch_ms;
+    int64_t      ctrl_tokens;
+    uint64_t     ctrl_epoch_ms;
 } h3session_t;
+
+/* Charge one stream cancellation. Returns 0 when the budget is spent and the
+ * caller must close the connection with H3_EXCESSIVE_LOAD.
+ *
+ * A stream opened and immediately reset costs a QPACK decode, a dispatch and a
+ * concurrency slot held for no measurable time -- Rapid Reset (CVE-2023-44487)
+ * by another name. QUIC makes it *cheaper* than it was in HTTP/2: no
+ * three-way handshake stands between the attacker and the next stream, so the
+ * budget matters more here, not less. */
+int h3session_abort_spend(h3session_t* s);
+
+/* Charge one control-stream frame that advances nothing: a GOAWAY or
+ * MAX_PUSH_ID that changes no state, or a frame type we skip. Each is legal,
+ * costs the peer almost nothing to send, and makes us parse. */
+int h3session_ctrl_spend(h3session_t* s);
+
+/* What we advertise as SETTINGS_MAX_FIELD_SECTION_SIZE, from the policy. */
+uint64_t h3_policy_max_field_section_size(void);
 
 /* `max_field_section_size` is what we advertise (UINT64_MAX = unlimited, which
  * is what "absent" means on the wire). `enable_connect_protocol` advertises

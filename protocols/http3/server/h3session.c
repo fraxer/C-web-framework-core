@@ -3,9 +3,93 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "appconfig.h"
 #include "log.h"
 #include "qpack.h"
+#include "quictime.h"
 #include "varint.h"
+
+/* ---- Policy ---- */
+
+#define H3_DEFAULT_MAX_FIELD_SECTION_SIZE (1024 * 1024)
+#define H3_DEFAULT_ABORT_RATE  100   /* tokens/s */
+#define H3_DEFAULT_ABORT_BURST 200   /* tokens */
+#define H3_DEFAULT_CTRL_RATE   100
+#define H3_DEFAULT_CTRL_BURST  200
+
+/* Set once by h3_policy_init(), read by every worker afterwards. The values
+ * below are what applies when it has not run at all -- a unit test, say. */
+static uint64_t h3_max_field_section_size = H3_DEFAULT_MAX_FIELD_SECTION_SIZE;
+static int64_t  h3_abort_rate  = H3_DEFAULT_ABORT_RATE;
+static int64_t  h3_abort_burst = H3_DEFAULT_ABORT_BURST;
+static int64_t  h3_ctrl_rate   = H3_DEFAULT_CTRL_RATE;
+static int64_t  h3_ctrl_burst  = H3_DEFAULT_CTRL_BURST;
+
+static int64_t __policy_int(const char* key, int64_t fallback, int64_t min) {
+    int64_t v = env_get_int(key, (int)fallback);
+    if (v < min) v = min;
+
+    return v;
+}
+
+void h3_policy_init(void) {
+    h3_max_field_section_size =
+        (uint64_t)__policy_int("http3_max_field_section_size",
+                               H3_DEFAULT_MAX_FIELD_SECTION_SIZE, 0);
+
+    /* 0 disables a bucket, which is why the floor is 0 and not 1. */
+    h3_abort_rate  = __policy_int("http3_abort_rate",  H3_DEFAULT_ABORT_RATE, 0);
+    h3_abort_burst = __policy_int("http3_abort_burst", H3_DEFAULT_ABORT_BURST, 1);
+    h3_ctrl_rate   = __policy_int("http3_ctrl_rate",   H3_DEFAULT_CTRL_RATE, 0);
+    h3_ctrl_burst  = __policy_int("http3_ctrl_burst",  H3_DEFAULT_CTRL_BURST, 1);
+}
+
+uint64_t h3_policy_max_field_section_size(void) {
+    return h3_max_field_section_size;
+}
+
+/* ---- Budgets ---- */
+
+static uint64_t __now_ms(void) {
+    return quic_now_us() / 1000;
+}
+
+/* Spend one token of a leaky bucket. Kept in milli-tokens so the refill is
+ * exact integer arithmetic: a rate of R tokens per second is R milli-tokens per
+ * elapsed millisecond, with no remainder dropped however often this is called.
+ * A rate of 0 disables the limit. */
+static int __budget_spend(int64_t* tokens, uint64_t* epoch_ms,
+                          int64_t rate, int64_t burst) {
+    if (rate == 0) return 1;
+
+    const uint64_t now = __now_ms();
+    const uint64_t elapsed = now > *epoch_ms ? now - *epoch_ms : 0;
+    const int64_t cap = burst * 1000;
+
+    *epoch_ms = now;
+    *tokens += (int64_t)elapsed * rate;
+    if (*tokens > cap) *tokens = cap;
+
+    if (*tokens < 1000) return 0;
+
+    *tokens -= 1000;
+
+    return 1;
+}
+
+int h3session_abort_spend(h3session_t* s) {
+    if (s == NULL) return 1;
+
+    return __budget_spend(&s->abort_tokens, &s->abort_epoch_ms,
+                          h3_abort_rate, h3_abort_burst);
+}
+
+int h3session_ctrl_spend(h3session_t* s) {
+    if (s == NULL) return 1;
+
+    return __budget_spend(&s->ctrl_tokens, &s->ctrl_epoch_ms,
+                          h3_ctrl_rate, h3_ctrl_burst);
+}
 
 /* ---- Verdict helpers ---- */
 
@@ -73,6 +157,13 @@ h3session_t* h3session_create(uint64_t max_field_section_size, int enable_connec
     h3settings_defaults(&s->peer_settings);
 
     h3uni_seen_init(&s->peer_uni);
+
+    /* Full buckets at the start: a burst is what a legitimate client does on a
+     * fresh connection, and starting empty would punish exactly that. */
+    s->abort_epoch_ms = __now_ms();
+    s->ctrl_epoch_ms = s->abort_epoch_ms;
+    s->abort_tokens = h3_abort_burst * 1000;
+    s->ctrl_tokens = h3_ctrl_burst * 1000;
 
     return s;
 }
@@ -170,6 +261,10 @@ static h3session_verdict_t __control_frame(h3session_t* s, h3uni_recv_t* uni) {
     }
 
     case H3_FRAME_GOAWAY: {
+        /* Charged whatever it says: a client can repeat a GOAWAY with the same
+         * push id forever, and each one is a frame we parse for nothing. */
+        if (!h3session_ctrl_spend(s)) return __conn(H3_EXCESSIVE_LOAD);
+
         uint64_t id = 0;
         const size_t n = varint_read(uni->frames.payload, uni->frames.payload_len, &id);
         if (n == 0 || n != uni->frames.payload_len) return __conn(H3_FRAME_ERROR);
@@ -187,6 +282,9 @@ static h3session_verdict_t __control_frame(h3session_t* s, h3uni_recv_t* uni) {
     }
 
     case H3_FRAME_MAX_PUSH_ID: {
+        /* Same shape: repeating the current limit is legal and free to send. */
+        if (!h3session_ctrl_spend(s)) return __conn(H3_EXCESSIVE_LOAD);
+
         uint64_t id = 0;
         const size_t n = varint_read(uni->frames.payload, uni->frames.payload_len, &id);
         if (n == 0 || n != uni->frames.payload_len) return __conn(H3_FRAME_ERROR);
@@ -245,7 +343,12 @@ static h3session_verdict_t __control_feed(h3session_t* s, h3uni_recv_t* uni,
             /* An unknown or grease frame type, already stepped over. But §6.2.1
              * still wants SETTINGS first, and "first" means first frame of any
              * kind -- a grease frame ahead of SETTINGS is legal, so this is
-             * deliberately not a violation. */
+             * deliberately not a violation.
+             *
+             * Charged, though: §9 says to ignore the *type*, not to accept an
+             * unbounded stream of them. Skipping is cheap but not free, and a
+             * peer can generate them faster than we can read them. */
+            if (!h3session_ctrl_spend(s)) return __conn(H3_EXCESSIVE_LOAD);
             continue;
 
         case H3FRAME_DATA_CHUNK:
@@ -327,6 +430,10 @@ h3session_verdict_t h3session_uni_feed(h3session_t* s, h3uni_recv_t* uni,
         case H3UNI_CONN_ERROR:
             return __conn(verdict.error);
         case H3UNI_STOP_DROP:
+            /* Each one costs us a STOP_SENDING frame and a stream slot, and a
+             * peer may open them as fast as its stream limit allows. */
+            if (!h3session_ctrl_spend(s)) return __conn(H3_EXCESSIVE_LOAD);
+
             log_info("h3: unknown unidirectional stream type 0x%llx, discarded\n",
                      (unsigned long long)uni->type);
             return __stop(verdict.error);

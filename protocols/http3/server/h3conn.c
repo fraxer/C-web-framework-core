@@ -247,8 +247,19 @@ static h3conn_result_t __on_reset(h3conn_t* c, quicstream_t* qs, h3app_t* app) {
     }
 
     /* The request is abandoned. Nothing is owed to the peer -- it asked for
-     * this -- so the stream is simply dropped. */
+     * this -- so the stream is simply dropped.
+     *
+     * Charged first, and only when we had not answered yet: a cancellation
+     * after the response went out is an ordinary client changing its mind,
+     * while one before it is the Rapid Reset shape (docs/http3/07 §4). QUIC
+     * makes that attack cheaper than HTTP/2 did -- there is no handshake
+     * between the attacker and the next stream -- so the budget is not
+     * optional here. */
+    const int answered = app->req != NULL && app->req->response_done;
     app->drained = 1;
+
+    if (!answered && !h3session_abort_spend(c->session))
+        return __closed(H3_EXCESSIVE_LOAD);
 
     return __reset(H3_REQUEST_CANCELLED);
 }

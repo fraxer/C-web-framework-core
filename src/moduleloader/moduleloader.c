@@ -37,6 +37,7 @@
 #include "i18n.h"
 
 #ifdef CWFR_HTTP3
+#include "h3session.h"
 #include "quicendpoint.h"
 #endif
 #ifdef MySQL_FOUND
@@ -214,6 +215,8 @@ int __module_loader_init_modules(appconfig_t* config, json_doc_t* document) {
     h2_policy_init();
 
 #ifdef CWFR_HTTP3
+    h3_policy_init();
+
     /* Same ordering contract as h2_policy_init: the QUIC policy is a set of
      * plain globals plus the process-wide connection table, and reading them
      * from every worker is only safe because this runs before any worker
