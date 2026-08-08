@@ -388,9 +388,26 @@ int h3conn_read(h3conn_t* c, quicconn_t* qc, uint64_t* error) {
 
         switch (r.status) {
         case H3CONN_OK:
-        case H3CONN_REQUEST_HEADERS:
         case H3CONN_REQUEST_RESET:
             break;
+
+        case H3CONN_REQUEST_HEADERS: {
+            /* The body is still to come and the client said it would wait for
+             * permission (RFC 9110 §10.1.1). Sent at once, not staged: its whole
+             * purpose is to arrive before the client's timer, and the packets
+             * for this datagram are built moments from now. */
+            h3stream_t* st = h3conn_request_of(qs);
+            if (st == NULL) break;
+
+            const http_header_t* expect =
+                st->request->get_headern(st->request, "Expect", 6);
+
+            if (expect != NULL && expect->value != NULL &&
+                strcasecmp(expect->value, "100-continue") == 0)
+                (void)h3_server_continue(c, qs);
+
+            break;
+        }
 
         case H3CONN_REQUEST_DONE: {
             h3stream_t* st = h3conn_request_of(qs);
@@ -508,6 +525,67 @@ int h3_server_publish_inline(connection_t* connection, httpresponse_t* response)
     return 1;
 }
 
+/* ---- Informational responses ---- */
+
+int h3_server_early_hints(connection_t* connection, httpresponse_t* response,
+                          http_header_t* fields) {
+    if (connection == NULL || fields == NULL) return 0;
+    if (h3_conn_of(connection) == NULL) return 0;
+
+    connection_s_lock(connection, LOCK_SITE_H3_PUBLISH);
+
+    int ok = 0;
+    quicstream_t* qs = h3conn_stream_by_response((quicconn_t*)connection, response);
+    h3stream_t* st = h3conn_request_of(qs);
+
+    if (st != NULL && !st->response_headers_sent) {
+        http_header_t* last = fields;
+        while (last->next != NULL) last = last->next;
+
+        if (st->early_hints == NULL) st->early_hints = fields;
+        else                         st->last_early_hint->next = fields;
+
+        st->last_early_hint = last;
+        ok = 1;
+    }
+
+    connection_s_unlock(connection);
+
+    if (!ok) return 0;
+
+    connection_server_ctx_t* ctx = connection->ctx;
+    atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
+    quicconn_want_write(connection);
+
+    return 1;
+}
+
+/* Encode one informational response and put it on the stream. */
+static int __write_informational(h3conn_t* c, quicstream_t* qs, int status,
+                                 const http_header_t* fields) {
+    uint8_t* frame = NULL;
+    size_t flen = 0;
+
+    if (h3response_informational(c->session->qenc, status, fields, &frame, &flen)
+        != H3RESPONSE_OK)
+        return 0;
+
+    const int ok = quicstream_write(qs, frame, flen);
+    free(frame);
+
+    return ok;
+}
+
+int h3_server_continue(h3conn_t* c, quicstream_t* qs) {
+    if (c == NULL || qs == NULL) return 0;
+
+    h3stream_t* st = h3conn_request_of(qs);
+    if (st == NULL || st->response_headers_sent) return 0;
+
+    /* A 100 carries no fields at all -- just the status (RFC 9110 §10.1.1). */
+    return __write_informational(c, qs, 100, NULL);
+}
+
 /* ---- The write turn ---- */
 
 /* One stream's turn at the filter chain. */
@@ -554,6 +632,23 @@ static int __write_stream(quicstream_t* qs, h3stream_t* st) {
 
 int h3conn_write(h3conn_t* c, quicconn_t* qc) {
     if (c == NULL || qc == NULL) return 0;
+
+    /* Informational responses first, and outside the per-stream turn below: a
+     * 103 is a staged block, not a scheduled body, and it has to precede the
+     * final HEADERS of its own stream. */
+    for (quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
+        h3stream_t* st = h3conn_request_of(qs);
+        if (st == NULL || st->early_hints == NULL) continue;
+
+        http_header_t* fields = st->early_hints;
+        st->early_hints = NULL;
+        st->last_early_hint = NULL;
+
+        if (!st->response_headers_sent)
+            (void)__write_informational(c, qs, 103, fields);
+
+        http_headers_free(fields);
+    }
 
     for (quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
         h3stream_t* st = h3conn_request_of(qs);

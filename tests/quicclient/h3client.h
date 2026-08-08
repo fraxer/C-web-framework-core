@@ -39,6 +39,17 @@
 typedef struct h3client_response {
     int    status;
 
+    /* Interim responses seen before the final one (RFC 9110 §15.2): how many,
+     * and the status of the last. Recorded rather than skipped, because "the
+     * server sent no 103" and "the client threw it away" look the same from a
+     * body. */
+    int    interim_count;
+    int    interim_status;
+    size_t interim_fields;
+
+    /* Trailing fields, if a second field section followed the body (§4.1). */
+    size_t trailer_count;
+
     char*  body;
     size_t body_len;
 
@@ -73,6 +84,20 @@ int h3client_get(quicclient_t* client, uint64_t stream_id,
 int h3client_get_many(quicclient_t* client, size_t count,
                       const char* authority, const char* path,
                       int timeout_ms, h3client_response_t* out);
+
+/* A POST that withholds its body until the server says to send it
+ * (`Expect: 100-continue`, RFC 9110 §10.1.1).
+ *
+ * The withholding is the test. A client that sends the body anyway would get
+ * the same final response whether or not the server ever sent a 100, so the
+ * only way to see the interim response is to wait for it: headers go out
+ * without FIN, and the body follows only once a 1xx has arrived (or the wait
+ * runs out, which is what a real client does too). `out->interim_count` says
+ * which of the two happened. */
+int h3client_post_expect(quicclient_t* client, uint64_t stream_id,
+                         const char* authority, const char* path,
+                         const char* body, size_t body_len,
+                         int timeout_ms, h3client_response_t* out);
 
 /* What the server said on its control stream: whether SETTINGS arrived, and
  * what they contained. Read after a request, because service streams and

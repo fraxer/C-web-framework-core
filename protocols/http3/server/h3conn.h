@@ -162,6 +162,23 @@ int h3_server_response_ready(connection_t* connection, httpresponse_t* response)
  * connection_s_lock. Marks the stream ready without taking anything. */
 int h3_server_publish_inline(connection_t* connection, httpresponse_t* response);
 
+/* Stage a 103 Early Hints for the response's stream (RFC 8297). `fields` is
+ * taken over on success and must be freed by the caller on failure. Returns 0
+ * if no stream owns the response, or if its final headers already went out --
+ * a 1xx after them would be out of order by definition.
+ *
+ * Called from a handler thread, so it takes connection_s_lock itself: the
+ * stream list belongs to the worker. Early hints happen once or twice per
+ * request, never per byte, so the lock costs nothing worth avoiding. */
+int h3_server_early_hints(connection_t* connection, httpresponse_t* response,
+                          http_header_t* fields);
+
+/* Send an interim 100 (Continue) on `qs` at once (RFC 9110 §10.1.1). Called
+ * from the read path, where the request's headers have just been built and the
+ * client is holding its body back waiting for permission -- which is the whole
+ * point of sending it immediately rather than staging it. */
+int h3_server_continue(h3conn_t* c, quicstream_t* qs);
+
 /* Run the write turn: for every stream whose response is ready, drive the
  * filter chain until it finishes or the write-ahead budget is spent. Called by
  * the transport before it builds packets. Returns 0 if the connection must

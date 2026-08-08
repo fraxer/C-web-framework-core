@@ -122,6 +122,18 @@ typedef struct h3stream {
     atomic_int response_ready;
     /* The filter chain has run to completion on this stream. */
     int      response_done;
+    /* The final HEADERS frame is on the wire. After that an informational
+     * response would arrive out of order -- 1xx precedes the final status by
+     * definition -- so a late 103 is dropped rather than sent. */
+    int      response_headers_sent;
+
+    /* Fields staged for a 103 Early Hints, owned by the stream until the write
+     * turn encodes them. Staged rather than encoded on the spot for the reason
+     * h2 stages its own: a handler thread must not run the field encoder,
+     * because sections have to reach the peer in the order they were encoded
+     * and only the worker can guarantee that. */
+    struct http_header* early_hints;
+    struct http_header* last_early_hint;
 
     /* Our advertised SETTINGS_MAX_FIELD_SECTION_SIZE. A decoded field section
      * larger than this is refused with 431 rather than decompressed into

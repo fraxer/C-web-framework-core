@@ -22,6 +22,9 @@
 #include "json.h"
 #include "model.h"
 #include "str.h"
+#ifdef CWFR_HTTP3
+#include "h3conn.h"
+#endif
 
 static void __httpresponse_data(httpresponse_t* response, const char* data);
 static void __httpresponse_datan(httpresponse_t* response, const char* data, size_t length);
@@ -382,14 +385,23 @@ int __httpresponse_header_add(httpresponse_t* response, const char* key, const c
 int __httpresponse_early_hint_add(httpresponse_t* response, const char* key, const char* value) {
     if (key == NULL || value == NULL) return 0;
 
+    /* HTTP/1.1 can carry 1xx, but its write path has no notion of an interim
+     * response, and the feature exists for browsers — which speak HTTP/2 or
+     * HTTP/3 to anything that offers them. Refused loudly rather than silently
+     * dropped.
+     *
+     * HTTP/3 is recognised by its transport, not by the h2 bit: QUIC carries
+     * nothing else here. Left as an h2-only check, this refused every early
+     * hint on an h3 connection while the h3 write path was sitting there ready
+     * to send them — which is exactly how it behaved until an end-to-end probe
+     * asked for one. */
     const connection_t* connection = response->connection;
     const connection_server_ctx_t* ctx = connection != NULL ? connection->ctx : NULL;
-    if (ctx != NULL && !ctx->is_http2) {
-        /* HTTP/1.1 can carry 1xx, but its write path has no notion of an
-         * interim response, and the feature exists for browsers — which speak
-         * HTTP/2 to anything that offers it. Refused loudly rather than
-         * silently dropped. */
-        log_error("httpresponse: early hints are HTTP/2 only, dropping \"%s\"\n", key);
+    const int multiplexed = ctx != NULL &&
+        (ctx->is_http2 || connection->transport == CONN_TRANSPORT_QUIC);
+
+    if (ctx != NULL && !multiplexed) {
+        log_error("httpresponse: early hints need HTTP/2 or HTTP/3, dropping \"%s\"\n", key);
         return 0;
     }
 
@@ -422,7 +434,15 @@ int __httpresponse_early_hints_send(httpresponse_t* response) {
     response->early_hint_ = NULL;
     response->last_early_hint = NULL;
 
-    if (h2_server_early_hints(response->connection, response, fields))
+    const connection_t* connection = response->connection;
+
+    if (connection != NULL && connection->transport == CONN_TRANSPORT_QUIC) {
+#ifdef CWFR_HTTP3
+        if (h3_server_early_hints(response->connection, response, fields))
+            return 1;
+#endif
+    }
+    else if (h2_server_early_hints(response->connection, response, fields))
         return 1;
 
     http_headers_free(fields);
@@ -441,13 +461,21 @@ int __httpresponse_trailer_add(httpresponse_t* response, const char* key, const 
  * the header list (the write filter, gzip, range) should ever see them. */
 int __httpresponse_trailern_add(httpresponse_t* response, const char* key, size_t key_length, const char* value, size_t value_length) {
     /* HTTP/1.1 would need chunked encoding and a Trailer header to carry these,
-     * and the one thing that wants them — gRPC — is HTTP/2 only. Rather than
-     * pretend, say so: silently dropping a gRPC status is the kind of thing
-     * that gets debugged from the client side for a day. */
+     * and the one thing that wants them — gRPC — is a multiplexed-protocol
+     * feature. Rather than pretend, say so: silently dropping a gRPC status is
+     * the kind of thing that gets debugged from the client side for a day.
+     *
+     * HTTP/3 carries them too (a second HEADERS frame before the FIN), and it
+     * is recognised by its transport rather than by the h2 bit -- QUIC carries
+     * nothing else here. Left as an h2-only check, an h3 handler's trailers
+     * would have been dropped with a message blaming the wrong protocol. */
     const connection_t* connection = response->connection;
     const connection_server_ctx_t* ctx = connection != NULL ? connection->ctx : NULL;
-    if (ctx != NULL && !ctx->is_http2) {
-        log_error("httpresponse: trailers are HTTP/2 only, dropping \"%.*s\"\n",
+    const int multiplexed = ctx != NULL &&
+        (ctx->is_http2 || connection->transport == CONN_TRANSPORT_QUIC);
+
+    if (ctx != NULL && !multiplexed) {
+        log_error("httpresponse: trailers need HTTP/2 or HTTP/3, dropping \"%.*s\"\n",
                   (int)(key_length > 64 ? 64 : key_length), key);
         return 0;
     }

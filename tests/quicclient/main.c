@@ -9,7 +9,7 @@
 /* Drive a QUIC handshake and one HTTP/3 request against this server, and report
  * what happened.
  *
- *   quicclient [host] [port] [-q] [-p /path] [-n N] [--handshake-only]
+ *   quicclient [host] [port] [-q] [-p /path] [-n N] [--expect] [--handshake-only]
  *
  * Exists because nothing else on this machine can: the system curl is built
  * without HTTP/3, and no QUIC library is installed. Until phase 8 stands up the
@@ -26,11 +26,13 @@ int main(int argc, char* argv[]) {
     int handshake_only = 0;
     const char* path = "/";
     int concurrent = 1;
+    int expect_continue = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) verbose = 0;
         else if (strcmp(argv[i], "--handshake-only") == 0) handshake_only = 1;
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) path = argv[++i];
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) concurrent = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--expect") == 0) expect_continue = 1;
     }
 
     if (concurrent < 1) concurrent = 1;
@@ -94,6 +96,11 @@ int main(int argc, char* argv[]) {
         if (!h3_ok) printf("FAIL: not every response completed\n");
         else response = many[0];
     }
+    else if (h3_ok && expect_continue) {
+        h3_ok = h3client_post_expect(&client, 0, "localhost", path,
+                                     "body-after-permission", 21, 8000, &response);
+        if (!h3_ok) printf("FAIL: no response\n");
+    }
     else if (h3_ok) {
         h3_ok = h3client_get(&client, 0, "localhost", path, 5000, &response);
         if (!h3_ok) printf("FAIL: no response\n");
@@ -138,6 +145,11 @@ int main(int argc, char* argv[]) {
     if (h3_ok) {
         printf("status:                    %d\n", response.status);
         printf("fields:                    %zu\n", response.fields_count);
+        printf("interim responses:         %d%s", response.interim_count,
+               response.interim_count > 0 ? "" : "\n");
+        if (response.interim_count > 0)
+            printf(" (last %d, %zu fields)\n", response.interim_status, response.interim_fields);
+        printf("trailers:                  %zu\n", response.trailer_count);
         printf("body:                      %zu bytes\n", response.body_len);
 
         if (verbose && response.body_len > 0) {

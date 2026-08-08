@@ -44,6 +44,9 @@ h3stream_t* h3stream_create(connection_t* connection, size_t max_field_section_s
     st->response = NULL;
     atomic_init(&st->response_ready, 0);
     st->response_done = 0;
+    st->response_headers_sent = 0;
+    st->early_hints = NULL;
+    st->last_early_hint = NULL;
     st->stage = H3STREAM_EXPECT_HEADERS;
     st->headers_done = 0;
     st->content_length = -1;
@@ -57,6 +60,7 @@ void h3stream_free(h3stream_t* st) {
     h3frame_parser_free(&st->parser);
     if (st->request != NULL) httprequest_free(st->request);
     if (st->response != NULL) httpresponse_free(st->response);
+    http_headers_free(st->early_hints);
     free(st);
 }
 

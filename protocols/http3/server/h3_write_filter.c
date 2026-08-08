@@ -101,6 +101,11 @@ static int __header(httprequest_t* request, httpresponse_t* response) {
         }
         module->head_sent = 1;
 
+        /* From here on an informational response would be out of order: 1xx
+         * precedes the final status by definition. */
+        h3stream_t* st = h3conn_request_of(qs);
+        if (st != NULL) st->response_headers_sent = 1;
+
         /* No body and no trailers: the response is over, so the stream ends
          * here. The tunnel case of §8 is deliberately absent -- an Extended
          * CONNECT stream never ends on its own response -- and will add its
