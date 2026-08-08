@@ -24,10 +24,21 @@ if(INCLUDE_HTTP3 STREQUAL yes)
 	# Version alone is not proof: a distribution may configure OpenSSL with
 	# `no-quic`, which keeps the version and drops the API. Catch that at
 	# configure time instead of at link time.
-	include(CheckSymbolExists)
+	include(CheckCSourceCompiles)
 	set(CMAKE_REQUIRED_INCLUDES ${OPENSSL_INCLUDE_DIR})
 	set(CMAKE_REQUIRED_LIBRARIES OpenSSL::SSL)
-	check_symbol_exists(SSL_set_quic_tls_cbs "openssl/ssl.h" CWFR_HAVE_QUIC_TLS_CBS)
+	# check_symbol_exists generates a fragile "((int*)(&SYM))[i]" probe that GCC
+	# rejects on some prototypes ("arrays of functions are not meaningful",
+	# observed with OpenSSL 3.6.3's SSL_set_quic_tls_cbs). Probe the real way:
+	# include the header and call the function -- needs both the declaration and
+	# the symbol in libssl at link time.
+	check_c_source_compiles("
+#include <openssl/ssl.h>
+int main(void) {
+    (void)SSL_set_quic_tls_cbs(0, 0, 0);
+    return 0;
+}
+" CWFR_HAVE_QUIC_TLS_CBS)
 	unset(CMAKE_REQUIRED_INCLUDES)
 	unset(CMAKE_REQUIRED_LIBRARIES)
 
