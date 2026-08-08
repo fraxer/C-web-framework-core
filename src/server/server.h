@@ -51,11 +51,27 @@ typedef struct server_websockets {
  * without it; a conditional field here would give core and the handlers two
  * different layouts for server_t, which they share through
  * libcwfr_framework.so. Two ints are not worth an ABI split. */
+/* Longest Alt-Svc value this builds: `h3=":65535"; ma=4294967295`. */
+#define SERVER_ALT_SVC_MAX 48
+
 typedef struct server_http3 {
     int enabled;
     /* UDP port. Defaults to the vhost's TCP port -- h3 on the same number is
      * what Alt-Svc advertises by default and what clients expect. */
     unsigned short int port;
+
+    /* Advertise HTTP/3 in an `Alt-Svc` response header over HTTP/1.1 and
+     * HTTP/2 (RFC 7838, docs/http3/07-integration.md §2).
+     *
+     * Without it HTTP/3 is unreachable in practice: a browser does not probe
+     * UDP on speculation, it learns about h3 from this header or from a DNS
+     * HTTPS record. The value is built once here, at config load, because it
+     * cannot change while the server runs and building it per response would
+     * be a snprintf on the hot path of every single answer. */
+    int alt_svc;
+    unsigned int alt_svc_max_age;
+    char alt_svc_value[SERVER_ALT_SVC_MAX];
+    size_t alt_svc_length;
 } server_http3_t;
 
 struct broadcast;

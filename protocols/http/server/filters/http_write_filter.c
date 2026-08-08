@@ -5,6 +5,7 @@
 #include "http_write_filter.h"
 #include "log.h"
 #include "openssl.h"
+#include "httpfields.h"
 
 #define BUF_SIZE 16384
 
@@ -207,6 +208,10 @@ int http_write_header(httprequest_t* request, httpresponse_t* response) {
     (void)request;
     http_module_write_t* module = response->cur_filter->module;
     bufo_t* buf = module->buf;
+
+    /* Before the head is serialised, because from here on the fields are bytes.
+     * HTTP/3 is advertised on the protocols that are not it (RFC 7838). */
+    httpfields_apply_alt_svc(response);
 
     if (buf->size == 0)
         if (!__build_head(response, buf))

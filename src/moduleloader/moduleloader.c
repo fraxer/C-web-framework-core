@@ -913,6 +913,30 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
                 server->http3.port = (unsigned short int)port;
             }
 
+            const json_token_t* token_alt_svc = json_object_get(token_http3, "alt_svc");
+            if (token_alt_svc != NULL) {
+                if (!json_is_bool(token_alt_svc)) {
+                    __module_loader_config_error("__module_loader_servers_load: http3.alt_svc must be bool\n");
+                    goto failed;
+                }
+                server->http3.alt_svc = json_bool(token_alt_svc) ? 1 : 0;
+            }
+
+            const json_token_t* token_alt_svc_age = json_object_get(token_http3, "alt_svc_max_age");
+            if (token_alt_svc_age != NULL) {
+                if (!json_is_number(token_alt_svc_age)) {
+                    __module_loader_config_error("__module_loader_servers_load: http3.alt_svc_max_age must be number\n");
+                    goto failed;
+                }
+                int ok = 0;
+                const int age = json_int(token_alt_svc_age, &ok);
+                if (!ok || age < 0) {
+                    __module_loader_config_error("__module_loader_servers_load: http3.alt_svc_max_age must be >= 0\n");
+                    goto failed;
+                }
+                server->http3.alt_svc_max_age = (unsigned int)age;
+            }
+
             /* QUIC is TLS: RFC 9001 has no cleartext mode, and there is no h3c
              * the way there is an h2c. A vhost asking for h3 without a tls
              * section is a configuration mistake, not something to start and
@@ -934,6 +958,23 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
          * Alt-Svc advertises by default and what clients try first. */
         if (server->http3.enabled && server->http3.port == 0)
             server->http3.port = server->port;
+
+        /* The Alt-Svc value, built once. Only the port is given, never a host:
+         * an empty host in RFC 7838 means "the same one", which is what makes
+         * the header correct for every vhost sharing this listener and keeps it
+         * from pinning clients to a name the certificate may not cover. */
+        if (server->http3.enabled && server->http3.alt_svc) {
+            const int n = snprintf(server->http3.alt_svc_value,
+                                   sizeof server->http3.alt_svc_value,
+                                   "h3=\":%u\"; ma=%u",
+                                   (unsigned)server->http3.port,
+                                   server->http3.alt_svc_max_age);
+            if (n < 1 || (size_t)n >= sizeof server->http3.alt_svc_value) {
+                __module_loader_config_error("__module_loader_servers_load: cannot build the Alt-Svc value\n");
+                goto failed;
+            }
+            server->http3.alt_svc_length = (size_t)n;
+        }
 
         for (int i = 0; i < R_FIELDS_COUNT; i++) {
             if (finded_fields[i] == 0) {

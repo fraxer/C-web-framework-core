@@ -6,7 +6,10 @@
 #include "cookieparser.h"
 #include "h2field.h"
 #include "httpcommon.h"        /* http_header_t, HTTP1_VER_1_1 */
+#include "connection_s.h"      /* connection_server_ctx_t::server */
 #include "httprequestparser.h" /* httpparser_parse_range */
+#include "httpresponse.h"
+#include "server.h"           /* server_http3_t */
 #include "httpparsercommon.h"  /* HTTP1PARSER_CONTINUE */
 #include "log.h"
 
@@ -41,6 +44,35 @@ int httpfields_is_forbidden_header(const char* key, size_t len) {
         if (len == banned[i].len && memcmp(key, banned[i].name, len) == 0) return 1;
 
     return 0;
+}
+
+void httpfields_apply_alt_svc(httpresponse_t* response) {
+    if (response == NULL || response->connection == NULL) return;
+
+    /* 1xx is interim: the fields of a final response follow, and a client is
+     * free to drop these. Advertising here would be a header a peer may never
+     * read, on the one response shape where repeating it is guaranteed. */
+    if (response->status_code < 200) return;
+
+    /* httpresponse_t carries the connection as void* -- the response layer is
+     * built to not know about it. */
+    const connection_t* connection = response->connection;
+    const connection_server_ctx_t* ctx = connection->ctx;
+    if (ctx == NULL || ctx->server == NULL) return;
+
+    const server_http3_t* h3 = &ctx->server->http3;
+    if (!h3->enabled || !h3->alt_svc || h3->alt_svc_length == 0) return;
+
+    /* A handler that set its own knows something the config does not -- another
+     * host, another protocol -- so it wins. httpresponse_t has no reader for its
+     * own fields (nothing needed one before), so the list is walked here rather
+     * than growing the vtable for a single caller. */
+    for (const http_header_t* h = response->header_; h != NULL; h = h->next) {
+        if (h->key_length != 7) continue;
+        if (strncasecmp(h->key, "Alt-Svc", 7) == 0) return;
+    }
+
+    response->add_headern(response, "Alt-Svc", 7, h3->alt_svc_value, h3->alt_svc_length);
 }
 
 int httpfields_is_forbidden_response_header(const char* key, size_t len) {

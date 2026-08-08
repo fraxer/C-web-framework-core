@@ -6,6 +6,8 @@
 
 #include "httprequest.h"
 
+struct httpresponse;
+
 /* The protocol-agnostic half of request construction: turn a decoded field
  * list into an httprequest_t, applying the request validity rules of RFC 9113
  * §8.3/§8.2 (h2) and RFC 9114 §4.1-§4.3 (h3). The two are word-for-word on every
@@ -74,6 +76,21 @@ int httpfields_is_forbidden_response_header(const char* name, size_t len);
  * connection learns a secret by watching the encoded size shrink when a guess
  * matches -- CRIME applied to HPACK/QPACK. Expects an already-lowercased name. */
 int httpfields_is_sensitive_header(const char* name, size_t len);
+
+/* Advertise HTTP/3 on a response that is not itself HTTP/3 (RFC 7838,
+ * docs/http3/07-integration.md §2).
+ *
+ * A browser does not probe UDP on speculation: without this header, or a DNS
+ * HTTPS record, an HTTP/3 listener is never reached at all. The value is
+ * precomputed per vhost at config load (server_http3_t::alt_svc_value); this
+ * only decides whether to attach it.
+ *
+ * Skipped for an interim 1xx -- it is not the final response and a client may
+ * discard its fields -- and skipped when the handler set one itself, because a
+ * handler that names an alternative knows something the config does not.
+ * Never called from the h3 write filter: telling a client over HTTP/3 that
+ * HTTP/3 is available says nothing. */
+void httpfields_apply_alt_svc(struct httpresponse* response);
 
 /* §8.2.1 / §4.2: field names are lowercase on the wire, and nghttp2-based
  * clients (curl, browsers) treat an uppercase byte as a protocol error.

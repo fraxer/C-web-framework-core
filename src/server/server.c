@@ -31,6 +31,13 @@ server_t* server_create() {
     server->websockets.ratelimiter = NULL;
     server->http3.enabled = 0;
     server->http3.port = 0;
+    /* On by default once h3 is enabled: a vhost that turns HTTP/3 on and is
+     * never advertised has turned on something no client will use. Switching it
+     * off is for the case where a load balancer in front announces it instead. */
+    server->http3.alt_svc = 1;
+    server->http3.alt_svc_max_age = 86400;
+    server->http3.alt_svc_value[0] = '\0';
+    server->http3.alt_svc_length = 0;
     server->openssl = NULL;
     server->broadcast = NULL;
     server->ratelimits_config = NULL;

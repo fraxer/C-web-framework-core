@@ -264,6 +264,9 @@ static int __header(httprequest_t* request, httpresponse_t* response) {
         return CWF_ERROR;
     }
 
+    /* Before the block is encoded: once HPACK has run, the fields are bytes. */
+    httpfields_apply_alt_svc(response);
+
     if (module->buf->size == 0)
         if (!__build_headers(request, response, s, stream, module->buf))
             return CWF_ERROR;
