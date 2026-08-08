@@ -74,15 +74,30 @@ typedef struct quictls_ops {
  * quantum key shares -- exceeds one datagram routinely, and the pieces can
  * arrive out of order. TLS cannot be fed a hole, so the bytes are buffered
  * here until a contiguous prefix exists. */
+/* Received pieces past the contiguous prefix are tracked as ranges. A flight
+ * arrives in a handful of frames, so the list is small and fixed; a peer that
+ * manufactures more disjoint pieces than this is fragmenting to make us work,
+ * and is refused rather than accommodated. */
+#define QUICTLS_CRYPTO_MAX_RANGES 32
+
+typedef struct quictls_crypto_range {
+    size_t start;
+    size_t end;        /* exclusive */
+} quictls_crypto_range_t;
+
 typedef struct quictls_crypto_in {
-    uint8_t* data;
-    size_t   len;      /* bytes held */
+    uint8_t* data;     /* data[i] is stream offset i for this level */
+    /* Length of the *contiguous* prefix, which is all TLS may ever be handed.
+     * This used to be the highest offset seen, and the difference is not
+     * academic: a hole was zero-filled and passed to OpenSSL as if it were
+     * real, which a peer that splits its ClientHello across reordered CRYPTO
+     * frames -- every browser -- triggers on the first connection. */
+    size_t   len;
     size_t   cap;
-    uint64_t base;     /* stream offset of data[0] */
     size_t   consumed; /* how much of data OpenSSL has taken */
-    /* Highest offset seen, to bound memory: a peer that sends one byte at
-     * offset 2^40 must not make us allocate a terabyte. */
-    uint64_t max_offset;
+
+    quictls_crypto_range_t ranges[QUICTLS_CRYPTO_MAX_RANGES];
+    size_t   range_count;
 } quictls_crypto_in_t;
 
 typedef struct quictls {

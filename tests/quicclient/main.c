@@ -9,7 +9,12 @@
 /* Drive a QUIC handshake and one HTTP/3 request against this server, and report
  * what happened.
  *
- *   quicclient [host] [port] [-q] [-p /path] [-n N] [--expect] [--handshake-only]
+ *   quicclient [host] [port] [-q] [-p /path] [-a authority] [-n N] [--expect]
+ *              [--handshake-only]
+ *
+ * `-a` sets both the TLS server name and the :authority pseudo-header. They are
+ * one flag because a server matches the virtual host on one and validates it
+ * against the other, so setting them apart only ever produces a 421.
  *
  * Exists because nothing else on this machine can: the system curl is built
  * without HTTP/3, and no QUIC library is installed. Until phase 8 stands up the
@@ -25,12 +30,14 @@ int main(int argc, char* argv[]) {
     int verbose = 1;
     int handshake_only = 0;
     const char* path = "/";
+    const char* authority = "localhost";
     int concurrent = 1;
     int expect_continue = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) verbose = 0;
         else if (strcmp(argv[i], "--handshake-only") == 0) handshake_only = 1;
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) path = argv[++i];
+        else if (strcmp(argv[i], "-a") == 0 && i + 1 < argc) authority = argv[++i];
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) concurrent = atoi(argv[++i]);
         else if (strcmp(argv[i], "--expect") == 0) expect_continue = 1;
     }
@@ -40,7 +47,7 @@ int main(int argc, char* argv[]) {
     printf("connecting to %s:%u\n", host, port);
 
     quicclient_t client;
-    if (!quicclient_connect(&client, host, port, "localhost", verbose)) {
+    if (!quicclient_connect(&client, host, port, authority, verbose)) {
         printf("FAIL: could not send the first Initial\n");
         quicclient_free(&client);
         return 1;
@@ -76,7 +83,7 @@ int main(int argc, char* argv[]) {
 
     /* ---- HTTP/3 ---- */
 
-    printf("\nGET %s\n", path);
+    printf("\nGET https://%s%s\n", authority, path);
 
     int h3_ok = h3client_start(&client);
     if (!h3_ok) printf("FAIL: could not open the control stream\n");
@@ -91,18 +98,18 @@ int main(int argc, char* argv[]) {
     if (h3_ok && concurrent > 1) {
         many = calloc((size_t)concurrent, sizeof * many);
         h3_ok = many != NULL &&
-                h3client_get_many(&client, (size_t)concurrent, "localhost", path,
+                h3client_get_many(&client, (size_t)concurrent, authority, path,
                                   15000, many);
         if (!h3_ok) printf("FAIL: not every response completed\n");
         else response = many[0];
     }
     else if (h3_ok && expect_continue) {
-        h3_ok = h3client_post_expect(&client, 0, "localhost", path,
+        h3_ok = h3client_post_expect(&client, 0, authority, path,
                                      "body-after-permission", 21, 8000, &response);
         if (!h3_ok) printf("FAIL: no response\n");
     }
     else if (h3_ok) {
-        h3_ok = h3client_get(&client, 0, "localhost", path, 5000, &response);
+        h3_ok = h3client_get(&client, 0, authority, path, 5000, &response);
         if (!h3_ok) printf("FAIL: no response\n");
     }
 

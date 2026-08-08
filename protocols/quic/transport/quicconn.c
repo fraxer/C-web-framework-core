@@ -432,6 +432,17 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
 
     case QUIC_FRAME_CONNECTION_CLOSE:
     case QUIC_FRAME_CONNECTION_CLOSE_APP:
+        /* The peer's account of what we did wrong, and the only one there is:
+         * it is not repeated and nothing else carries it. Logged because a
+         * connection that simply stops looks identical to one the peer walked
+         * away from. */
+        log_error("quic: peer closed, %s error 0x%llx%s%.*s\n",
+                  frame->type == QUIC_FRAME_CONNECTION_CLOSE_APP ? "application" : "transport",
+                  (unsigned long long)frame->u.close.error,
+                  frame->u.close.reason_len > 0 ? ": " : "",
+                  (int)frame->u.close.reason_len,
+                  frame->u.close.reason != NULL ? frame->u.close.reason : "");
+
         /* §10.2.2: enter draining and send nothing further -- not even an
          * acknowledgement. Answering would keep the exchange alive after both
          * ends have finished with it. */
@@ -1138,6 +1149,9 @@ void quicconn_close(quicconn_t* conn, uint64_t error_code, int is_app,
     if (conn == NULL) return;
     if (conn->state == QUICCONN_CLOSING || conn->state == QUICCONN_DRAINING ||
         conn->state == QUICCONN_DEAD) return;
+
+    log_error("quic: closing, %s error 0x%llx\n",
+              is_app ? "application" : "transport", (unsigned long long)error_code);
 
     conn->state = QUICCONN_CLOSING;
     conn->error_code = error_code;

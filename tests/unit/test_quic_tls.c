@@ -136,8 +136,32 @@ TEST(test_quic_tls_crypto_reassembly) {
      * or the handshake stalls until the peer retransmits. */
     TEST_ASSERT(quictls_recv_crypto(&tls, QUIC_ENC_INITIAL, 16,
                                     (const uint8_t*)"DDDD", 4), "gap accepted");
+
+    /* And -- the part that matters -- it must not become *available*. `len` is
+     * what __cb_crypto_recv_rcd hands OpenSSL, so a hole counted here is a hole
+     * fed to TLS as zeroes.
+     *
+     * This is the bug a real browser found and this file did not: the case
+     * above asserted only that the insert was accepted, and `len` was the
+     * highest offset seen rather than the contiguous prefix. Chrome splits its
+     * ClientHello across reordered CRYPTO frames and hit it on the first
+     * connection; the test client, which sends one frame at offset 0, never
+     * could. */
+    TEST_ASSERT(tls.in[QUIC_ENC_INITIAL].len == 8,
+                "the prefix stops at the hole, not at the far piece");
+
     TEST_ASSERT(quictls_recv_crypto(&tls, QUIC_ENC_INITIAL, 8,
-                                    (const uint8_t*)"CCCC", 4), "gap filled");
+                                    (const uint8_t*)"CCCC", 4), "first hole filled");
+    /* 12..15 is still missing, so the far piece stays out of reach: the prefix
+     * grows to where the *next* hole begins, not to the end of what is held. */
+    TEST_ASSERT(tls.in[QUIC_ENC_INITIAL].len == 12, "up to the next hole");
+
+    TEST_ASSERT(quictls_recv_crypto(&tls, QUIC_ENC_INITIAL, 12,
+                                    (const uint8_t*)"EEEE", 4), "second hole filled");
+    TEST_ASSERT(tls.in[QUIC_ENC_INITIAL].len == 20,
+                "closing the last hole releases everything behind it");
+    TEST_ASSERT(memcmp(tls.in[QUIC_ENC_INITIAL].data, "AAAABBBBCCCCEEEEDDDD", 20) == 0,
+                "and every byte sits at the offset it was sent at");
 
     TEST_CASE("a retransmission of data already held is harmless");
     TEST_ASSERT(quictls_recv_crypto(&tls, QUIC_ENC_INITIAL, 0,

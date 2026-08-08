@@ -3,6 +3,8 @@
 #include <string.h>
 
 #include "log.h"
+#include <openssl/err.h>
+
 #include "quictls.h"
 
 /* OpenSSL's protection levels, mapped onto ours. They agree on order but not on
@@ -23,35 +25,66 @@ static void __crypto_in_free(quictls_crypto_in_t* in) {
     in->data = NULL;
     in->len = 0;
     in->cap = 0;
+    in->consumed = 0;
+    in->range_count = 0;
 }
 
-/* Insert at `offset`, growing as needed. Only a contiguous prefix is ever
- * handed to TLS, so out-of-order pieces simply sit until the gap is filled. */
+/* Record [start, end) in the received set, coalescing with what touches it.
+ * Returns 0 only when the set is full, which honest reordering cannot cause. */
+static int __ranges_add(quictls_crypto_in_t* in, size_t start, size_t end) {
+    if (end <= start) return 1;
+
+    /* The list is kept sorted and disjoint, so the ranges this one can touch
+     * are a single run: skip past those that end before it begins, then absorb
+     * every one that starts at or before its end. */
+    size_t i = 0;
+    while (i < in->range_count && in->ranges[i].end < start) i++;
+
+    size_t j = i;
+    while (j < in->range_count && in->ranges[j].start <= end) {
+        if (in->ranges[j].start < start) start = in->ranges[j].start;
+        if (in->ranges[j].end > end) end = in->ranges[j].end;
+        j++;
+    }
+
+    if (j > i) {
+        in->ranges[i].start = start;
+        in->ranges[i].end = end;
+
+        if (j > i + 1) {
+            memmove(&in->ranges[i + 1], &in->ranges[j],
+                    (in->range_count - j) * sizeof in->ranges[0]);
+            in->range_count -= (j - i - 1);
+        }
+
+        return 1;
+    }
+
+    if (in->range_count >= QUICTLS_CRYPTO_MAX_RANGES) return 0;
+
+    memmove(&in->ranges[i + 1], &in->ranges[i],
+            (in->range_count - i) * sizeof in->ranges[0]);
+    in->ranges[i].start = start;
+    in->ranges[i].end = end;
+    in->range_count++;
+
+    return 1;
+}
+
+/* Insert at `offset`, growing as needed. Only the contiguous prefix is ever
+ * handed to TLS, so out-of-order pieces sit in place until the gap is filled --
+ * and `len` is that prefix, not the highest byte written. */
 static int __crypto_in_insert(quictls_crypto_in_t* in, uint64_t offset,
                               const uint8_t* data, size_t len) {
     if (len == 0) return 1;
 
-    /* Entirely behind what OpenSSL has already taken: a retransmission of data
-     * that has served its purpose. */
-    if (offset + len <= in->base) return 1;
-
-    /* Overlapping the consumed part: trim the front rather than rejecting, as
-     * a retransmission may legitimately start earlier than where we are. */
-    if (offset < in->base) {
-        const uint64_t skip = in->base - offset;
-        if (skip >= len) return 1;
-        data += skip;
-        len -= (size_t)skip;
-        offset = in->base;
-    }
-
     const uint64_t end = offset + len;
-    if (end > in->max_offset) in->max_offset = end;
 
-    /* §7.5: bound what an incomplete handshake can hold open. */
-    if (end - in->base > QUICTLS_MAX_CRYPTO_BUFFER) return 0;
+    /* Bounds the memory an incomplete handshake can hold open (§7.5), and with
+     * it the arithmetic below: everything past this point fits in size_t. */
+    if (end > QUICTLS_MAX_CRYPTO_BUFFER) return 0;
 
-    const size_t need = (size_t)(end - in->base);
+    const size_t need = (size_t)end;
     if (need > in->cap) {
         size_t cap = in->cap == 0 ? 4096 : in->cap;
         while (cap < need) cap *= 2;
@@ -60,21 +93,24 @@ static int __crypto_in_insert(quictls_crypto_in_t* in, uint64_t offset,
         uint8_t* grown = realloc(in->data, cap);
         if (grown == NULL) return 0;
 
-        /* Zero the new region: a hole must read as something deterministic,
-         * even though nothing should read it before it is filled. */
         memset(grown + in->cap, 0, cap - in->cap);
         in->data = grown;
         in->cap = cap;
     }
 
-    memcpy(in->data + (offset - in->base), data, len);
+    /* A retransmission overwrites itself with identical bytes; nothing needs to
+     * detect that, because the offsets are absolute for the level. */
+    memcpy(in->data + offset, data, len);
 
-    if (need > in->len) in->len = need;
+    if (!__ranges_add(in, (size_t)offset, need)) return 0;
+
+    /* The prefix is whatever the first range covers, and only if it starts at
+     * the beginning. */
+    in->len = (in->range_count > 0 && in->ranges[0].start == 0)
+              ? in->ranges[0].end : 0;
 
     return 1;
 }
-
-/* ---- OpenSSL callbacks ---- */
 
 static int __cb_crypto_send(SSL* ssl, const unsigned char* buf, size_t buf_len,
                             size_t* consumed, void* arg) {
@@ -118,13 +154,11 @@ static int __cb_crypto_release_rcd(SSL* ssl, size_t bytes_read, void* arg) {
 
     in->consumed += bytes_read;
 
-    /* Once everything held has been taken, reclaim the buffer rather than let
-     * it creep: a handshake makes a handful of these calls in total. */
-    if (in->consumed == in->len) {
-        in->base += in->len;
-        in->len = 0;
-        in->consumed = 0;
-    }
+    /* The buffer is not compacted and the offsets stay absolute for the level.
+     * Sliding it would have to move the out-of-order pieces and every recorded
+     * range with them, and buy nothing: QUICTLS_MAX_CRYPTO_BUFFER already
+     * bounds a level's flight, and a handshake makes a handful of these calls
+     * in total. */
 
     return 1;
 }
@@ -181,6 +215,14 @@ static int __cb_alert(SSL* ssl, unsigned char alert_code, void* arg) {
 
     tls->alert_raised = 1;
     tls->alert_code = alert_code;
+
+    /* The alert is the only account of why a handshake died that reaches this
+     * side, and it was being swallowed. A peer refused over ALPN, over the
+     * certificate or over a parameter looked exactly like one that went away:
+     * the connection simply closed, with nothing logged and no counter moved. */
+    log_error("quictls: handshake alert %u (%s)\n", (unsigned)alert_code,
+              SSL_alert_desc_string_long(alert_code));
+
     tls->ops->alert(tls->ctx, alert_code);
 
     return 1;
@@ -362,8 +404,18 @@ int quictls_advance(quictls_t* tls) {
 
     /* Anything else is fatal. __cb_alert has usually already told the
      * connection which alert to report. */
-    if (!tls->alert_raised)
+    if (!tls->alert_raised) {
         log_error("quictls: handshake failed (SSL error %d)\n", err);
+
+        /* The error queue is where OpenSSL says what actually went wrong; the
+         * SSL_get_error code alone only says "fatal". */
+        unsigned long e;
+        char reason[256];
+        while ((e = ERR_get_error()) != 0) {
+            ERR_error_string_n(e, reason, sizeof reason);
+            log_error("quictls: %s\n", reason);
+        }
+    }
 
     return 0;
 }
