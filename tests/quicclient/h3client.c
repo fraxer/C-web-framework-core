@@ -217,6 +217,67 @@ int h3client_get(quicclient_t* client, uint64_t stream_id,
     return headers_seen;
 }
 
+int h3client_get_many(quicclient_t* client, size_t count,
+                      const char* authority, const char* path,
+                      int timeout_ms, h3client_response_t* out) {
+    if (client == NULL || out == NULL || count == 0) return 0;
+    if (count > CLIENT_MAX_STREAMS / 2) return 0;
+
+    h3frame_parser_t* parsers = calloc(count, sizeof * parsers);
+    int* headers_seen = calloc(count, sizeof * headers_seen);
+    int* complete = calloc(count, sizeof * complete);
+    if (parsers == NULL || headers_seen == NULL || complete == NULL) {
+        free(parsers); free(headers_seen); free(complete);
+        return 0;
+    }
+
+    /* Every request goes out before any response is read. That ordering is the
+     * test: the server must have all of them in flight at once, not one after
+     * another. */
+    for (size_t i = 0; i < count; i++) {
+        memset(&out[i], 0, sizeof out[i]);
+        h3frame_parser_init(&parsers[i]);
+
+        uint8_t req[1280];
+        const size_t n = __build_request(req, sizeof req, authority, path);
+        if (n == 0 || !quicclient_stream_write(client, i * 4, req, n, 1)) {
+            free(parsers); free(headers_seen); free(complete);
+            return 0;
+        }
+    }
+
+    const uint64_t deadline = quic_now_us() + (uint64_t)timeout_ms * 1000;
+    size_t done = 0;
+
+    while (done < count && quic_now_us() < deadline) {
+        if (!quicclient_pump(client, 100)) break;
+
+        for (size_t i = 0; i < count; i++) {
+            if (complete[i]) continue;
+
+            if (!__consume(client, i * 4, &parsers[i], &out[i], &headers_seen[i]))
+                goto finish;
+
+            if (quicclient_stream_fin(client, i * 4) &&
+                quicclient_stream_readable(client, i * 4) == 0) {
+                complete[i] = 1;
+                done++;
+            }
+        }
+    }
+
+finish:
+    for (size_t i = 0; i < count; i++) h3frame_parser_free(&parsers[i]);
+
+    const int ok = (done == count);
+    if (!ok)
+        printf("  [h3] %zu of %zu responses completed\n", done, count);
+
+    free(parsers); free(headers_seen); free(complete);
+
+    return ok;
+}
+
 int h3client_peer_settings(quicclient_t* client, h3settings_t* out) {
     if (client == NULL || out == NULL) return 0;
 

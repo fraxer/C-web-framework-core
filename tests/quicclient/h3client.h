@@ -62,6 +62,18 @@ int h3client_get(quicclient_t* client, uint64_t stream_id,
                  const char* authority, const char* path,
                  int timeout_ms, h3client_response_t* out);
 
+/* Send `count` GETs at once, on streams 0, 4, 8, ... and read all the
+ * responses. The whole point is that they are outstanding *together*: one
+ * request at a time exercises none of the concurrency the server was built
+ * for, and a server that serialises them looks identical from the outside
+ * unless several are in flight.
+ *
+ * `out` receives `count` responses, index i for stream 4*i. Returns 1 only if
+ * every one of them completed. */
+int h3client_get_many(quicclient_t* client, size_t count,
+                      const char* authority, const char* path,
+                      int timeout_ms, h3client_response_t* out);
+
 /* What the server said on its control stream: whether SETTINGS arrived, and
  * what they contained. Read after a request, because service streams and
  * request streams are delivered independently. */

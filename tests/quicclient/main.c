@@ -9,7 +9,7 @@
 /* Drive a QUIC handshake and one HTTP/3 request against this server, and report
  * what happened.
  *
- *   quicclient [host] [port] [-q] [-p /path] [--handshake-only]
+ *   quicclient [host] [port] [-q] [-p /path] [-n N] [--handshake-only]
  *
  * Exists because nothing else on this machine can: the system curl is built
  * without HTTP/3, and no QUIC library is installed. Until phase 8 stands up the
@@ -25,11 +25,15 @@ int main(int argc, char* argv[]) {
     int verbose = 1;
     int handshake_only = 0;
     const char* path = "/";
+    int concurrent = 1;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) verbose = 0;
         else if (strcmp(argv[i], "--handshake-only") == 0) handshake_only = 1;
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) path = argv[++i];
+        else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) concurrent = atoi(argv[++i]);
     }
+
+    if (concurrent < 1) concurrent = 1;
 
     printf("connecting to %s:%u\n", host, port);
 
@@ -78,7 +82,19 @@ int main(int argc, char* argv[]) {
     h3client_response_t response;
     memset(&response, 0, sizeof response);
 
-    if (h3_ok) {
+    /* Several at once when asked. They go out together, so the server has to
+     * hold them all open -- the case a single request cannot distinguish from
+     * a server that serialises everything. */
+    h3client_response_t* many = NULL;
+    if (h3_ok && concurrent > 1) {
+        many = calloc((size_t)concurrent, sizeof * many);
+        h3_ok = many != NULL &&
+                h3client_get_many(&client, (size_t)concurrent, "localhost", path,
+                                  15000, many);
+        if (!h3_ok) printf("FAIL: not every response completed\n");
+        else response = many[0];
+    }
+    else if (h3_ok) {
         h3_ok = h3client_get(&client, 0, "localhost", path, 5000, &response);
         if (!h3_ok) printf("FAIL: no response\n");
     }
@@ -99,6 +115,26 @@ int main(int argc, char* argv[]) {
                (unsigned long long)peer.max_field_section_size);
     }
 
+    if (h3_ok && concurrent > 1) {
+        printf("concurrent requests:       %d\n", concurrent);
+
+        /* Same status and a body on every one. Not identical *lengths*: a
+         * handler that reports its own timings answers differently every time,
+         * and demanding byte-equality there would fail a server that is working
+         * exactly as intended. */
+        int all_ok = 1;
+        size_t shortest = many[0].body_len, longest = many[0].body_len;
+        for (int i = 1; i < concurrent; i++) {
+            if (many[i].status != many[0].status || many[i].body_len == 0) all_ok = 0;
+            if (many[i].body_len < shortest) shortest = many[i].body_len;
+            if (many[i].body_len > longest) longest = many[i].body_len;
+        }
+
+        printf("all same status:           %s\n", all_ok ? "yes" : "no");
+        printf("body lengths:              %zu..%zu\n", shortest, longest);
+        if (!all_ok) h3_ok = 0;
+    }
+
     if (h3_ok) {
         printf("status:                    %d\n", response.status);
         printf("fields:                    %zu\n", response.fields_count);
@@ -112,6 +148,12 @@ int main(int argc, char* argv[]) {
     }
 
     const int all_ok = h3_ok && settings_seen && response.status > 0;
+
+    if (many != NULL) {
+        for (int i = 0; i < concurrent; i++) h3client_response_free(&many[i]);
+        free(many);
+        memset(&response, 0, sizeof response);   /* aliased many[0] */
+    }
 
     h3client_response_free(&response);
     quicclient_free(&client);

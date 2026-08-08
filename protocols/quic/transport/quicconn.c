@@ -267,7 +267,7 @@ static int __on_ack_frame(quicconn_t* conn, quic_enc_level_e level,
     quicframe_ref_free(lost);
     quicrange_free(&acked);
 
-    conn->want_write = 1;
+    atomic_store_explicit(&conn->want_write, 1, memory_order_release);
 
     return 1;
 }
@@ -376,13 +376,13 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
             quicconn_close(conn, err, 0, now_us);
             return 0;
         }
-        conn->want_write = 1;
+        atomic_store_explicit(&conn->want_write, 1, memory_order_release);
         return 1;
     }
 
     case QUIC_FRAME_MAX_DATA:
         if (quicflow_update_limit(&conn->send_flow, frame->u.max_data.max))
-            conn->want_write = 1;
+            atomic_store_explicit(&conn->want_write, 1, memory_order_release);
         return 1;
 
     case QUIC_FRAME_MAX_STREAM_DATA: {
@@ -395,7 +395,7 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
             quicconn_close(conn, err, 0, now_us);
             return 0;
         }
-        conn->want_write = 1;
+        atomic_store_explicit(&conn->want_write, 1, memory_order_release);
         return 1;
     }
 
@@ -424,7 +424,7 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
         /* Must be answered on the path it arrived on (§8.2). Path validation
          * proper -- probing a new address before migrating to it -- is phase 9;
          * answering a challenge costs nothing and is required regardless. */
-        conn->want_write = 1;
+        atomic_store_explicit(&conn->want_write, 1, memory_order_release);
         return 1;
 
     case QUIC_FRAME_PATH_RESPONSE:
@@ -530,7 +530,7 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
     quicack_on_received(&conn->ack[level], level, pn, ack_eliciting, now_us,
                         conn->local_params.max_ack_delay * 1000);
 
-    if (ack_eliciting) conn->want_write = 1;
+    if (ack_eliciting) atomic_store_explicit(&conn->want_write, 1, memory_order_release);
 
     return 1;
 }
@@ -545,7 +545,7 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
         /* §10.2.1: answer with the close packet again, since the peer evidently
          * did not receive it -- but not once per packet, or a peer that keeps
          * sending turns this into an amplifier. */
-        conn->want_write = 1;
+        atomic_store_explicit(&conn->want_write, 1, memory_order_release);
         return 1;
     }
 
@@ -589,7 +589,7 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
              * which is exactly what the amplification limit was waiting for. */
             conn->address_validated = 1;
             conn->loss.handshake_confirmed = 1;
-            conn->want_write = 1;
+            atomic_store_explicit(&conn->want_write, 1, memory_order_release);
         }
     }
 
@@ -844,7 +844,7 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
             quicendpoint_send(conn->endpoint, conn->close_packet,
                               conn->close_packet_len, &conn->path);
         }
-        conn->want_write = 0;
+        atomic_store_explicit(&conn->want_write, 0, memory_order_release);
         return 1;
     }
 
@@ -900,7 +900,7 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
         if (quiccc_available(&conn->cc) < QUICCONN_MAX_PACKET) break;
     }
 
-    conn->want_write = 0;
+    atomic_store_explicit(&conn->want_write, 0, memory_order_release);
     (void)sent_anything;
 
     return 1;
@@ -911,7 +911,7 @@ void quicconn_want_write(connection_t* connection) {
 
     quicconn_t* conn = __conn_of(connection);
 
-    conn->want_write = 1;
+    atomic_store_explicit(&conn->want_write, 1, memory_order_release);
     quicendpoint_wake(conn->endpoint, conn);
 }
 
@@ -1206,7 +1206,7 @@ void quicconn_close(quicconn_t* conn, uint64_t error_code, int is_app,
 
     conn->close_packet_len = total;
     conn->loss.space[level].next_pn++;
-    conn->want_write = 1;
+    atomic_store_explicit(&conn->want_write, 1, memory_order_release);
 }
 
 int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
@@ -1249,7 +1249,7 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
             quicframe_ref_free(lost);
         }
 
-        conn->want_write = 1;
+        atomic_store_explicit(&conn->want_write, 1, memory_order_release);
     }
 
     return 1;

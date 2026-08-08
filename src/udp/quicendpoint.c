@@ -927,7 +927,7 @@ static void __endpoint_tick(quicendpoint_t* ep, int shutdown_now) {
             quicconn_close(conn, QUIC_NO_ERROR, 0, now);
 
         int alive = quicconn_tick(conn, now);
-        if (alive && conn->want_write) alive = quicconn_send(conn, now);
+        if (alive && atomic_load_explicit(&conn->want_write, memory_order_acquire)) alive = quicconn_send(conn, now);
 
         if (!alive || conn->state == QUICCONN_DEAD) {
             metrics_quic(METRICS_QUIC_CONN_CLOSED);

@@ -2,6 +2,7 @@
 #define __QUICCONN__
 
 #include <netinet/in.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
 
 #include "connection_s.h"
@@ -133,8 +134,17 @@ typedef struct quicconn {
     uint64_t last_activity_us;
     uint64_t close_deadline_us;
 
-    /* Something is queued for sending. */
-    int      want_write;
+    /* Something is queued for sending.
+     *
+     * Atomic because quicconn_want_write is callable from a handler thread --
+     * that is the whole point of it -- while every other setter runs on the
+     * worker under connection_s_lock. Two handler threads finishing responses
+     * on the same connection wrote it concurrently, which ThreadSanitizer
+     * caught the first time HTTP/3 gave handler threads something to publish.
+     * Release on store / acquire on load, so seeing the flag implies seeing the
+     * data it announces -- the same contract connection_server_ctx_t::need_write
+     * carries next door. */
+    atomic_int want_write;
 
     struct quicconn* ep_next;   /* endpoint's connection list */
     struct quicconn* tx_next;   /* endpoint's send queue */
