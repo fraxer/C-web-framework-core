@@ -57,6 +57,10 @@ int main(int argc, char* argv[]) {
         appconfig_t* cfg = appconfig();
         const int grace_ms = env_get_int("http2_shutdown_grace_sec", 5) * 1000;
         log_info("shutdown: signal %d received, draining (grace %d ms)\n", sig, grace_ms);
+        /* Before the flag the workers watch: they read both in the same pass,
+         * and a worker that saw `shutdown` without `terminating` would take the
+         * reload path and leave its listeners open. */
+        appconfig_set_terminating();
         atomic_store(&cfg->shutdown, 1);
         module_loader_wakeup_all_threads();
 
@@ -68,6 +72,45 @@ int main(int argc, char* argv[]) {
                 break;
             usleep(100000);
         }
+
+        /* A thread that outlived the grace window is still inside library code.
+         * The ThreadSanitizer report that prompted this shows a worker in
+         * OpenSSL -- freeing a connection's TLS state -- while this thread tears
+         * OpenSSL down: exit() runs OPENSSL_cleanup from an atexit handler, and
+         * every other destructor with it.
+         *
+         * _exit() runs none of them, and that is the only safe answer here. The
+         * threads cannot be joined (they are detached), and killing them
+         * mid-work would be worse than letting them run. Nothing is lost by
+         * skipping the teardown: the process is ending, and the kernel reclaims
+         * everything a destructor would have freed. The clean path below still
+         * goes through exit(), so a leak checker's report survives on the only
+         * path where it means anything.
+         *
+         * Reaching this is normal today rather than exceptional -- see the note
+         * on the drain below -- which is why it must be correct and not merely
+         * defensive. */
+        const int alive = appconfig_threads_alive();
+        if (alive != 0) {
+            log_error("shutdown: %d thread(s) still running after the %d ms grace "
+                      "window; exiting without running destructors\n", alive, grace_ms);
+            fflush(NULL);
+            _exit(result);
+        }
+
+        /* Every thread has gone, and the last one out freed the configuration
+         * (appconfg_threads_decrement). The global env() hands out still points
+         * at it, and everything that logs reads env() -- so the teardown below
+         * would log through freed memory. ASan reported exactly that the moment
+         * the drain started completing; while it never did, nothing freed the
+         * config and the bug stayed hidden.
+         *
+         * Cleared here rather than inside appconfig_free: this thread is the
+         * only one left, so there is nobody to race with, and the reload path --
+         * where the global already points at the replacement config -- is not
+         * touched at all. The cost is the final log line, which env() now
+         * refuses to emit; everything worth saying was said above. */
+        appconfig_set(NULL);
     }
 
     failed:

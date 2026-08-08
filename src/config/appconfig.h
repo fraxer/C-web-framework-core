@@ -88,6 +88,22 @@ void appconfg_threads_decrement(appconfig_t* config);
  * Used by the shutdown drain to tell when the workers have finished. */
 int appconfig_threads_alive(void);
 
+/* The process is terminating, as opposed to reloading.
+ *
+ * Both raise appconfig_t::shutdown, and until this existed the two were
+ * indistinguishable -- which mattered in exactly one place. A *hard reload*
+ * deliberately leaves the listening sockets alone: signal_USR1 shuts them down
+ * itself and the replacement configuration takes them over. Terminate does
+ * neither, so under `reload: hard` the listeners stayed open, the worker's
+ * drain never reached zero connections, and every shutdown ran out its grace
+ * window with the workers still going.
+ *
+ * A file-static rather than a field on appconfig_t: the struct is shared with
+ * application handlers through libcwfr_framework.so, and a flag is not worth an
+ * ABI question. Same pattern as the thread counter above. */
+void appconfig_set_terminating(void);
+int  appconfig_terminating(void);
+
 const char* env_get_string(const char* key, const char* default_value);
 int env_get_int(const char* key, int default_value);
 long long env_get_llong(const char* key, long long default_value);

@@ -68,7 +68,14 @@ int mpxserver_run(appconfig_t* appconfig) {
         api->process_events(appconfig, api);
 
         if (atomic_load(&appconfig->shutdown)) {
-            if (appconfig->env.main.reload != APPCONFIG_RELOAD_HARD) {
+            /* A hard *reload* leaves the listeners alone on purpose: signal_USR1
+             * shut the sockets down itself and the new configuration takes them
+             * over. Terminating does neither, so it has to close them here or
+             * connection_count never falls to zero and this loop never ends --
+             * which is what made every `reload: hard` shutdown run out its grace
+             * window with the workers still running. */
+            if (appconfig->env.main.reload != APPCONFIG_RELOAD_HARD ||
+                appconfig_terminating()) {
                 __listeners_unlisten(listeners);
 #ifdef CWFR_HTTP3
                 /* Endpoints hold a reference in connection_count like listeners

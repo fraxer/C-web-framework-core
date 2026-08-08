@@ -17,6 +17,7 @@ static appconfig_t* __appconfig = NULL;
  * the config in the same breath, so the next read of config->threads_count is a
  * use-after-free. The shutdown drain in main() watches this copy instead. */
 static atomic_int __appconfig_threads_alive = 0;
+static atomic_int __appconfig_terminating = 0;
 
 static const char* __appconfig_get_path(int argc, char* argv[]);
 static void __appconfig_env_init(env_t* env);
@@ -167,6 +168,14 @@ void appconfg_threads_decrement(appconfig_t* config) {
 
 int appconfig_threads_alive(void) {
     return atomic_load(&__appconfig_threads_alive);
+}
+
+void appconfig_set_terminating(void) {
+    atomic_store(&__appconfig_terminating, 1);
+}
+
+int appconfig_terminating(void) {
+    return atomic_load(&__appconfig_terminating);
 }
 
 void __appconfig_env_init(env_t* env) {
