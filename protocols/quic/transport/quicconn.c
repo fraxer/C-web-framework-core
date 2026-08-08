@@ -22,6 +22,11 @@
  * is silently dropped by a tunnel. */
 #define QUICCONN_MAX_PACKET QUIC_DEFAULT_UDP_PAYLOAD
 
+/* Datagrams built per quicconn_send call. A cap rather than a loop to
+ * exhaustion: one connection must not hold the worker while a large flight or
+ * a large response goes out. Whatever is left keeps want_write raised. */
+#define QUICCONN_SEND_ROUNDS 4
+
 /* ---- Small helpers ---- */
 
 static quicconn_t* __conn_of(connection_t* connection) {
@@ -595,6 +600,13 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
         }
 
         if (conn->tls.handshake_complete) {
+            log_error("quic: handshake complete; peer streams_uni=%llu streams_bidi=%llu "
+                      "max_data=%llu max_stream_data_uni=%llu\n",
+                      (unsigned long long)conn->peer_params.initial_max_streams_uni,
+                      (unsigned long long)conn->peer_params.initial_max_streams_bidi,
+                      (unsigned long long)conn->peer_params.initial_max_data,
+                      (unsigned long long)conn->peer_params.initial_max_stream_data_uni);
+
             conn->state = QUICCONN_ACTIVE;
             /* Completing the handshake proves the peer received our packets,
              * which is exactly what the amplification limit was waiting for. */
@@ -861,8 +873,13 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
 
     uint8_t datagram[QUICCONN_MAX_PACKET];
     int sent_anything = 0;
+    /* Whether the loop stopped with work still owed. Only "nothing left to
+     * build" clears want_write; every other exit -- the round cap, the
+     * congestion window, the anti-amplification budget -- means the rest of the
+     * flight is still waiting and must be asked for again. */
+    int more_pending = 0;
 
-    for (int round = 0; round < 4; round++) {
+    for (int round = 0; round < QUICCONN_SEND_ROUNDS; round++) {
         size_t total = 0;
 
         /* Coalesce the levels into one datagram where possible: an Initial and
@@ -908,10 +925,21 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
 
         sent_anything = 1;
 
-        if (quiccc_available(&conn->cc) < QUICCONN_MAX_PACKET) break;
+        if (quiccc_available(&conn->cc) < QUICCONN_MAX_PACKET) {
+            more_pending = 1;
+            break;
+        }
+
+        /* The last round produced a full datagram, so there may well be
+         * another: a server flight carrying a certificate chain runs to six or
+         * more, and clearing the flag here left the remainder waiting for the
+         * peer to nudge us. */
+        if (round + 1 == QUICCONN_SEND_ROUNDS) more_pending = 1;
     }
 
-    atomic_store_explicit(&conn->want_write, 0, memory_order_release);
+    if (!more_pending)
+        atomic_store_explicit(&conn->want_write, 0, memory_order_release);
+
     (void)sent_anything;
 
     return 1;

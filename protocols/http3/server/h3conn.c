@@ -181,6 +181,12 @@ int h3conn_open_service_streams(h3conn_t* c, quicconn_t* qc) {
 
     c->service_streams_open = 1;
 
+    log_error("h3: service streams opened: control %llu, qpack %llu/%llu, grease %llu\n",
+              (unsigned long long)c->session->ctrl_send_id,
+              (unsigned long long)c->session->qpack_enc_send_id,
+              (unsigned long long)c->session->qpack_dec_send_id,
+              (unsigned long long)c->session->grease_send_id);
+
     return 1;
 }
 
