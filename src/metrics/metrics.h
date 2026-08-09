@@ -193,6 +193,14 @@ typedef enum {
      * (mobile networks, NAT rebinding), validated is how often that worked, and
      * the difference is either a broken path or someone spoofing addresses at
      * us -- and only the ratio distinguishes them. */
+    /* Address validation (§8.1). retry_sent against token_valid is the pair
+     * that says whether Retry is doing its job: every Retry should come back
+     * as a valid token, and a gap means clients are giving up on the extra
+     * round trip rather than completing it. */
+    METRICS_QUIC_RETRY_SENT,
+    METRICS_QUIC_TOKEN_VALID,
+    METRICS_QUIC_TOKEN_INVALID,
+
     METRICS_QUIC_MIGRATION_ATTEMPTED,
     METRICS_QUIC_MIGRATION_VALIDATED,
     METRICS_QUIC_MIGRATION_REJECTED,

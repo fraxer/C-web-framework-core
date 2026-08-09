@@ -11,6 +11,7 @@
 #include "quiccc.h"
 #include "quiccrypto.h"
 #include "quicloss.h"
+#include "quicretry.h"
 #include "quicstream.h"
 #include "quictls.h"
 #include "quictp.h"
@@ -181,6 +182,13 @@ typedef struct quicconn {
      * half of §9.3 -- an unvalidated path may carry data under a 3x limit, but
      * the old path has no such limit and, if the peer really moved, one round
      * trip of delay is all it costs. */
+    /* A NEW_TOKEN to hand the peer once its address is proven (§8.1.3), so its
+     * next connection skips the Retry round trip. Retransmitted if lost, like
+     * NEW_CONNECTION_ID and for the same reason: nothing else can reproduce it. */
+    uint8_t  new_token[QUIC_TOKEN_MAX_LEN];
+    size_t   new_token_len;
+    int      new_token_sent;
+
     quicpath_t probe_path;
     uint8_t    probe_data[8];
     int        probe_active;
@@ -236,9 +244,18 @@ typedef struct quicconn {
  *
  * The returned connection is registered in the endpoint's tables and in the
  * worker's connection list. */
+/* `address_validated` says the client proved this address by echoing a token
+ * back, so the §8.1 anti-amplification limit does not apply. `retry_odcid` is
+ * the Destination Connection ID of the Initial that provoked our Retry, and is
+ * NULL unless this handshake followed one: after a Retry the client checks
+ * *both* original_destination_connection_id (that first id) and
+ * retry_source_connection_id (the id we chose for the Retry, which is the one
+ * it is now addressing), and a server that reports only what it can see today
+ * fails that check. */
 quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
                             const quiccid_t* odcid, const quiccid_t* peer_scid,
-                            const quicpath_t* path, server_t* server);
+                            const quicpath_t* path, server_t* server,
+                            int address_validated, const quiccid_t* retry_odcid);
 
 void quicconn_free(quicconn_t* conn);
 

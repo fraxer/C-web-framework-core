@@ -278,6 +278,10 @@ static int __on_ack_frame(quicconn_t* conn, quic_enc_level_e level,
             if (s != NULL)
                 quicsendbuf_lost(&s->send, ref->offset, (size_t)ref->len, ref->fin);
         }
+        else if (ref->type == QUIC_FRAME_NEW_TOKEN) {
+            conn->new_token_sent = 0;
+            atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+        }
         else if (ref->type == QUIC_FRAME_NEW_CONNECTION_ID) {
             /* §13.3: unlike a limit, an id the peer never heard of cannot be
              * re-derived from anything, so the announcement is queued again.
@@ -954,6 +958,13 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
 
             conn->state = QUICCONN_ACTIVE;
 
+            /* Address proven by the handshake itself, so the peer has earned a
+             * token for next time (§8.1.3). */
+            conn->new_token_len =
+                quicendpoint_new_token((const struct sockaddr*)&conn->path.remote,
+                                       conn->path.remote_len,
+                                       conn->new_token, sizeof conn->new_token);
+
             /* Now that the peer's active_connection_id_limit is known, give it
              * the spares it said it would hold (§5.1.1). Not earlier: before
              * the transport parameters arrive the limit is a guess, and issuing
@@ -1024,6 +1035,28 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
             p += n;
             ack_eliciting = 1;
             conn->path_response_pending = 0;
+        }
+    }
+
+    if (level == QUIC_ENC_APP && conn->new_token_len > 0 && !conn->new_token_sent &&
+        p + conn->new_token_len + 16 < payload_cap) {
+        quicframe_t f;
+        memset(&f, 0, sizeof f);
+        f.type = QUIC_FRAME_NEW_TOKEN;
+        f.u.new_token.data = conn->new_token;
+        f.u.new_token.len = conn->new_token_len;
+
+        const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
+        if (n > 0) {
+            p += n;
+            ack_eliciting = 1;
+            conn->new_token_sent = 1;
+
+            quicframe_ref_t* ref = quicframe_ref_new(QUIC_FRAME_NEW_TOKEN);
+            if (ref != NULL) {
+                ref->next = refs;
+                refs = ref;
+            }
         }
     }
 
@@ -1497,7 +1530,8 @@ static void __quicconn_transport_free(void* arg) {
 
 quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
                             const quiccid_t* odcid, const quiccid_t* peer_scid,
-                            const quicpath_t* path, server_t* server) {
+                            const quicpath_t* path, server_t* server,
+                            int address_validated, const quiccid_t* retry_odcid) {
     if (endpoint == NULL || odcid == NULL || peer_scid == NULL || path == NULL)
         return NULL;
 
@@ -1593,7 +1627,24 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     conn->local_params.active_connection_id_limit = policy->active_cid_limit;
     conn->local_params.max_ack_delay = policy->ack_delay_ms;
     conn->local_params.has_original_dcid = 1;
-    conn->local_params.original_dcid = *odcid;
+
+    if (retry_odcid != NULL) {
+        /* §7.3: after a Retry the two ids are different things. The *original*
+         * is the one the client invented for its very first Initial, which only
+         * the Retry token remembers; the one it is addressing us by now is the
+         * one we chose for the Retry, and it goes in retry_source_connection_id.
+         * Reporting the current id as the original is the classic way to make a
+         * retried handshake fail with a transport parameter error. */
+        conn->local_params.original_dcid = *retry_odcid;
+        conn->local_params.has_retry_scid = 1;
+        conn->local_params.retry_scid = *odcid;
+    }
+    else
+        conn->local_params.original_dcid = *odcid;
+
+    /* A token proved the address; §8.1's three-times limit has nothing left to
+     * protect against and would only slow the handshake down. */
+    conn->address_validated = address_validated;
     conn->local_params.has_initial_scid = 1;
     conn->local_params.initial_scid = conn->local_cids[0].cid;
 

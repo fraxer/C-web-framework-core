@@ -132,6 +132,20 @@ typedef struct quicclient {
     int      ping_queued;
     uint64_t datagrams_received;
 
+    /* Retry (RFC 9000 §8.1.2). The token from a Retry packet, echoed in every
+     * Initial afterwards, and the state needed to start the handshake over --
+     * a Retry throws away everything derived from the first Destination
+     * Connection ID, including the TLS session. */
+    const char* server_name;
+    uint8_t  retry_token[256];
+    size_t   retry_token_len;
+    int      retry_seen;
+    int      new_token_received;     /* the server handed us one for next time */
+    uint8_t  new_token[256];
+    size_t   new_token_len;
+    quiccid_t retry_scid;            /* what the server chose in the Retry */
+    int      retry_scid_confirmed;   /* it matched retry_source_connection_id */
+
     int verbose;
 } quicclient_t;
 
@@ -163,6 +177,17 @@ int quicclient_path_challenge(quicclient_t* client);
 /* Set up and send the first Initial. Returns 0 on failure. */
 int quicclient_connect(quicclient_t* client, const char* host, uint16_t port,
                        const char* server_name, int verbose);
+
+/* The same, presenting an address validation token the server handed out on an
+ * earlier connection (a NEW_TOKEN). What it buys is visible only against a
+ * server that would otherwise send a Retry: with the token the round trip is
+ * skipped, without it there is one. */
+int quicclient_connect_token(quicclient_t* client, const char* host, uint16_t port,
+                             const char* server_name, int verbose,
+                             const uint8_t* token, size_t token_len);
+
+/* The NEW_TOKEN the server issued on this connection, or 0 if it issued none. */
+size_t quicclient_take_token(const quicclient_t* client, uint8_t* out, size_t cap);
 
 /* Drive the exchange until the handshake completes or `timeout_ms` elapses.
  * Returns 1 if it completed. */

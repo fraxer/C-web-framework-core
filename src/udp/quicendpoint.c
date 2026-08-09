@@ -14,8 +14,12 @@
  * directions (quicconn.h holds a `struct quicendpoint*`, quicendpoint.h a
  * `struct quicconn*`), so exactly one of the two .c files has to see both. */
 #include "quicconn.h"
+#include "quiccrypto.h"
 #include "quicendpoint.h"
+#include "quichp.h"
 #include "quicinvariants.h"
+#include "quicpacket.h"
+#include "quicretry.h"
 #include "quictime.h"
 #include "h3conn.h"
 
@@ -46,6 +50,15 @@
  * ceiling on how many connections may exist at all. */
 #define QUIC_DEFAULT_HANDSHAKE_RATE  500
 #define QUIC_DEFAULT_HANDSHAKE_BURST 1000
+/* Handshakes still in progress on one endpoint before Retry switches on in
+ * `auto` mode. Below it a Retry would cost every honest client a round trip to
+ * defend against an attack that is not happening. */
+#define QUIC_DEFAULT_RETRY_THRESHOLD 1000
+/* How long a token stays good. A Retry token is echoed back within a round
+ * trip, so seconds is generous; a NEW_TOKEN is meant for the client's *next*
+ * connection, which may be tomorrow. */
+#define QUIC_RETRY_TOKEN_LIFETIME_US (10ULL * 1000000ULL)
+#define QUIC_DEFAULT_TOKEN_LIFETIME_SEC 86400
 
 /* Connection defaults. The same figures quicconn_accept used to hold inline,
  * kept as the fallback so a build with no config -- a unit test -- behaves as
@@ -86,6 +99,17 @@ static int64_t  __quic_reset_rate = QUIC_DEFAULT_RESET_RATE;
 static int64_t  __quic_reset_burst = QUIC_DEFAULT_RESET_BURST;
 static int64_t  __quic_handshake_rate = QUIC_DEFAULT_HANDSHAKE_RATE;
 static int64_t  __quic_handshake_burst = QUIC_DEFAULT_HANDSHAKE_BURST;
+
+/* Address validation (RFC 9000 §8.1). Its own key, not the stateless reset
+ * one: the two authenticate different things to different audiences, and a
+ * single key would make a token forgeable by anyone who could collect resets. */
+static uint8_t  __quic_token_key[32];
+typedef enum { QUIC_RETRY_AUTO = 0, QUIC_RETRY_ALWAYS, QUIC_RETRY_NEVER } quic_retry_mode_e;
+static quic_retry_mode_e __quic_retry_mode = QUIC_RETRY_AUTO;
+static size_t   __quic_retry_threshold = QUIC_DEFAULT_RETRY_THRESHOLD;
+static uint64_t __quic_token_lifetime_us =
+    (uint64_t)QUIC_DEFAULT_TOKEN_LIFETIME_SEC * 1000000ULL;
+static int      __quic_new_token = 1;
 
 static quic_conn_policy_t __quic_conn_policy = {
     .idle_timeout_ms        = QUIC_DEFAULT_IDLE_TIMEOUT_SEC * 1000,
@@ -215,6 +239,22 @@ int quic_policy_init(void) {
     __quic_handshake_burst = env_get_int("http3_handshake_burst", QUIC_DEFAULT_HANDSHAKE_BURST);
     if (__quic_handshake_burst < 1) __quic_handshake_burst = 1;
 
+    const char* retry = env_get_string("http3_retry", "auto");
+    __quic_retry_mode = strcmp(retry, "always") == 0 ? QUIC_RETRY_ALWAYS
+                      : strcmp(retry, "never") == 0  ? QUIC_RETRY_NEVER
+                                                     : QUIC_RETRY_AUTO;
+
+    int64_t threshold = env_get_int("http3_retry_threshold", QUIC_DEFAULT_RETRY_THRESHOLD);
+    if (threshold < 0) threshold = 0;
+    __quic_retry_threshold = (size_t)threshold;
+
+    int64_t token_life = env_get_int("http3_token_lifetime_sec",
+                                     QUIC_DEFAULT_TOKEN_LIFETIME_SEC);
+    if (token_life < 1) token_life = 1;
+    __quic_token_lifetime_us = (uint64_t)token_life * 1000000ULL;
+
+    __quic_new_token = env_get_int("http3_new_token", 1) != 0;
+
     /* RAND_bytes rather than misc/random.h: these two are security inputs --
      * the reset key authenticates tokens a peer can collect, and the table seed
      * is what stops a peer from choosing colliding connection ids -- and
@@ -227,6 +267,11 @@ int quic_policy_init(void) {
 
     if (RAND_bytes(__quic_reset_key, sizeof __quic_reset_key) != 1) {
         log_error("quic_policy_init: RAND_bytes failed for the reset key\n");
+        return 0;
+    }
+
+    if (RAND_bytes(__quic_token_key, sizeof __quic_token_key) != 1) {
+        log_error("quic_policy_init: RAND_bytes failed for the token key\n");
         return 0;
     }
 
@@ -257,6 +302,7 @@ void quic_policy_free(void) {
     }
 
     explicit_bzero(__quic_reset_key, sizeof __quic_reset_key);
+    explicit_bzero(__quic_token_key, sizeof __quic_token_key);
 }
 
 /* ---- Token buckets ----
@@ -294,6 +340,14 @@ static int __budget_spend(int64_t* tokens, uint64_t* epoch_us,
 
 /* RFC 9000 §10.3. The token must be derivable without any per-connection state:
  * the whole point is to answer for a connection we no longer have. */
+size_t quicendpoint_new_token(const struct sockaddr* peer, socklen_t peer_len,
+                              uint8_t* out, size_t cap) {
+    if (!__quic_new_token || peer == NULL || out == NULL) return 0;
+
+    return quic_token_write(out, cap, __quic_token_key, QUIC_TOKEN_NEW_TOKEN,
+                            peer, peer_len, NULL, quic_now_us());
+}
+
 int quicendpoint_cid_register(quicendpoint_t* endpoint, const quiccid_t* cid,
                               quicconn_t* conn) {
     if (endpoint == NULL || cid == NULL || conn == NULL) return 0;
@@ -366,6 +420,121 @@ static void __send_stateless_reset(quicendpoint_t* ep, const udp_datagram_t* dgr
     metrics_quic(METRICS_QUIC_STATELESS_RESET);
     metrics_quic(METRICS_QUIC_DGRAM_SENT);
     metrics_quic_add(METRICS_QUIC_BYTES_SENT, (unsigned long long)sent);
+}
+
+/* ---- Replies that create no connection but do need our keys ---- */
+
+/* A Retry packet: "prove you can receive at this address, then come back"
+ * (RFC 9000 §8.1.2).
+ *
+ * Costs the server nothing to remember -- the whole state is in the token the
+ * client echoes back -- which is exactly why it is the answer to a flood of
+ * spoofed Initials. It costs an honest client one round trip, so it is a
+ * response to load rather than a default. */
+static void __send_retry(quicendpoint_t* ep, const udp_datagram_t* dgram,
+                         const quicinvariants_t* inv) {
+    uint8_t token[QUIC_TOKEN_MAX_LEN];
+    const size_t token_len =
+        quic_token_write(token, sizeof token, __quic_token_key, QUIC_TOKEN_RETRY,
+                         (const struct sockaddr*)&dgram->peer, dgram->peer_len,
+                         &inv->dcid, quic_now_us());
+    if (token_len == 0) return;
+
+    /* Our new Source Connection ID. The client will address the retried
+     * handshake to it, and it goes into retry_source_connection_id so the
+     * client can check that the Retry was not injected. */
+    quiccid_t scid;
+    scid.len = QUIC_LOCAL_CID_LEN;
+    if (RAND_bytes(scid.data, QUIC_LOCAL_CID_LEN) != 1) return;
+
+    uint8_t packet[256];
+    const size_t len = quicretry_write(packet, sizeof packet, &inv->dcid,
+                                       &inv->scid, &scid, token, token_len);
+    if (len == 0) return;
+
+    const ssize_t sent = udp_send(ep->fd, packet, len,
+                                  (const struct sockaddr*)&dgram->peer, dgram->peer_len,
+                                  dgram->local_valid ? &dgram->local : NULL);
+    if (sent < 0) {
+        metrics_quic(METRICS_QUIC_SEND_ERROR);
+        return;
+    }
+
+    metrics_quic(METRICS_QUIC_RETRY_SENT);
+    metrics_quic(METRICS_QUIC_DGRAM_SENT);
+    metrics_quic_add(METRICS_QUIC_BYTES_SENT, (unsigned long long)sent);
+}
+
+/* An Initial packet carrying nothing but CONNECTION_CLOSE.
+ *
+ * Used where the server will not open a connection for a reason the client can
+ * act on -- it is full, or the token it presented is one of ours and no longer
+ * valid. Silence would leave the client retransmitting into a void for its
+ * whole handshake timeout; this way it fails at once and can go elsewhere.
+ *
+ * Deliberately not used against a flood: it derives keys and builds a packet
+ * per datagram, which is work done for whoever is sending them. The rate
+ * budget drops those without a word (docs/http3/07 §4). */
+static void __send_initial_close(quicendpoint_t* ep, const udp_datagram_t* dgram,
+                                 const quicinvariants_t* inv, uint64_t error) {
+    uint8_t client_secret[32];
+    uint8_t server_secret[32];
+    if (!quiccrypto_initial_secrets(&inv->dcid, client_secret, server_secret)) return;
+
+    quickeys_t keys;
+    memset(&keys, 0, sizeof keys);
+
+    if (!quickeys_install(&keys, QUIC_AEAD_AES_128_GCM, server_secret, sizeof server_secret)) {
+        explicit_bzero(client_secret, sizeof client_secret);
+        explicit_bzero(server_secret, sizeof server_secret);
+        return;
+    }
+
+    quicframe_t f;
+    memset(&f, 0, sizeof f);
+    f.type = QUIC_FRAME_CONNECTION_CLOSE;
+    f.u.close.error = error;
+
+    uint8_t payload[64];
+    const size_t plen = quicframe_write(payload, sizeof payload, &f);
+
+    quicpkt_hdr_out_t hdr;
+    memset(&hdr, 0, sizeof hdr);
+    hdr.type = QUIC_PKT_INITIAL;
+    hdr.version = QUIC_VERSION_1;
+    /* Addressed to the id the client chose for itself, from the id it used for
+     * us: the mirror of what it sent, since no connection exists to have ids of
+     * its own. */
+    hdr.dcid = (quiccid_t*)&inv->scid;
+    hdr.scid = (quiccid_t*)&inv->dcid;
+    hdr.pn = 0;
+    hdr.pn_len = 1;
+    hdr.payload_len = plen + QUIC_AEAD_TAG_LEN;
+
+    uint8_t packet[256];
+    size_t pn_offset = 0;
+    const size_t header_len = quicpkt_write_header(packet, sizeof packet, &hdr, &pn_offset);
+
+    size_t sealed = 0;
+    const int ok = plen > 0 && header_len > 0 &&
+                   quiccrypto_seal(&keys, 0, packet, header_len, payload, plen,
+                                   packet + header_len, &sealed) &&
+                   quichp_apply(&keys, packet, header_len + sealed, pn_offset, 1);
+
+    if (ok) {
+        const ssize_t sent = udp_send(ep->fd, packet, header_len + sealed,
+                                      (const struct sockaddr*)&dgram->peer, dgram->peer_len,
+                                      dgram->local_valid ? &dgram->local : NULL);
+        if (sent < 0) metrics_quic(METRICS_QUIC_SEND_ERROR);
+        else {
+            metrics_quic(METRICS_QUIC_DGRAM_SENT);
+            metrics_quic_add(METRICS_QUIC_BYTES_SENT, (unsigned long long)sent);
+        }
+    }
+
+    quickeys_free(&keys);
+    explicit_bzero(client_secret, sizeof client_secret);
+    explicit_bzero(server_secret, sizeof server_secret);
 }
 
 static void __send_version_negotiation(quicendpoint_t* ep, const udp_datagram_t* dgram,
@@ -488,6 +657,11 @@ void quicendpoint_detach(quicendpoint_t* endpoint, quicconn_t* conn) {
 
     quiccidtable_remove(endpoint->table, &conn->odcid);
 
+    /* A connection that dies mid-handshake still leaves the count, or `auto`
+     * would ratchet up to permanent Retry after enough failed handshakes. */
+    if (conn->state == QUICCONN_HANDSHAKE && endpoint->handshakes_in_flight > 0)
+        endpoint->handshakes_in_flight--;
+
     quicconn_t** link = &endpoint->conns;
     while (*link != NULL) {
         if (*link == conn) {
@@ -523,7 +697,8 @@ void quicendpoint_detach(quicendpoint_t* endpoint, quicconn_t* conn) {
 
 /* Create a connection for a client's first Initial packet. */
 static void __accept(quicendpoint_t* ep, udp_datagram_t* dgram,
-                     const quicinvariants_t* inv) {
+                     const quicinvariants_t* inv,
+                     int address_validated, const quiccid_t* retry_odcid) {
     server_t* server = NULL;
     cqueue_item_t* item = cqueue_first(&ep->listener.servers);
     if (item != NULL) server = item->data;
@@ -542,7 +717,8 @@ static void __accept(quicendpoint_t* ep, udp_datagram_t* dgram,
         path.local_len = dgram->peer_len;
     }
 
-    quicconn_t* conn = quicconn_accept(ep, &inv->dcid, &inv->scid, &path, server);
+    quicconn_t* conn = quicconn_accept(ep, &inv->dcid, &inv->scid, &path, server,
+                                       address_validated, retry_odcid);
     if (conn == NULL) {
         metrics_quic(METRICS_QUIC_DROP_NO_BUDGET);
         return;
@@ -573,6 +749,7 @@ static void __accept(quicendpoint_t* ep, udp_datagram_t* dgram,
     }
 
     metrics_quic(METRICS_QUIC_CONN_ACCEPTED);
+    ep->handshakes_in_flight++;
 
     __route(ep, conn, dgram);
 }
@@ -648,10 +825,6 @@ static int __h3_turn(quicconn_t* conn, uint64_t now) {
 
 /* Hand a datagram to a connection and let it answer. */
 static void __route(quicendpoint_t* ep, quicconn_t* conn, udp_datagram_t* dgram) {
-    /* The connection reaches its endpoint through its own pointer; this one is
-     * kept in the signature because migration (phase 9) will need to know which
-     * endpoint the datagram arrived on, which need not be the same one. */
-    (void)ep;
 
     quicpath_t path;
     memset(&path, 0, sizeof path);
@@ -670,7 +843,15 @@ static void __route(quicendpoint_t* ep, quicconn_t* conn, udp_datagram_t* dgram)
      * 4-tuple and QUIC does not (ADR-3). */
     connection_s_lock(&conn->conn, LOCK_SITE_QUIC_RECV);
 
+    /* Handshakes still in progress are what `http3_retry: auto` watches, and
+     * this is the one place that sees a connection leave that state. */
+    const int was_handshaking = conn->state == QUICCONN_HANDSHAKE;
+
     int alive = quicconn_recv(conn, dgram->data, dgram->len, &path, now);
+
+    if (was_handshaking && conn->state != QUICCONN_HANDSHAKE &&
+        ep->handshakes_in_flight > 0)
+        ep->handshakes_in_flight--;
     /* Streams first, packets after: a response produced here goes out in the
      * very packet this call builds instead of waiting for the next event. */
     if (alive) alive = __h3_turn(conn, now);
@@ -761,6 +942,23 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
         return;
     }
 
+    /* The address validation token, if the client echoed one back. Only the
+     * first packet of the datagram is looked at: a token rides on the Initial,
+     * and an Initial is what starts a datagram that opens a connection. */
+    const uint8_t* pkt_token = NULL;
+    size_t pkt_token_len = 0;
+    {
+        size_t off = 0;
+        quicpkt_t first;
+        quicpkt_status_e pst;
+
+        if (quicpkt_next(dgram->data, dgram->len, &off, QUIC_LOCAL_CID_LEN, &first, &pst) &&
+            first.type == QUIC_PKT_INITIAL) {
+            pkt_token = first.token;
+            pkt_token_len = first.token_len;
+        }
+    }
+
     /* Our version, big enough, no connection: a new one.
      *
      * The packet type is not inspected. A Handshake or 0-RTT packet for a
@@ -769,6 +967,64 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
      * anyway, since without the Initial there are no keys to read it with. */
     if (ep->conn_count >= __quic_max_connections) {
         metrics_quic(METRICS_QUIC_AT_CAPACITY);
+        /* Told, not dropped. Being full is not an attack, and a client that
+         * knows can go elsewhere now instead of at its handshake timeout. */
+        __send_initial_close(ep, dgram, &inv, QUIC_CONNECTION_REFUSED);
+        return;
+    }
+
+    /* Address validation (§8.1). Three outcomes: the client presented a token
+     * we issued, so its address is proven and it is accepted; it presented
+     * nothing (or something stale) and the load says ask for proof, so it gets
+     * a Retry; or it presented one of our Retry tokens that no longer holds,
+     * which is the one case §8.1.3 answers with INVALID_TOKEN. */
+    quiccid_t retry_odcid;
+    int validated = 0;
+    int have_retry_odcid = 0;
+
+    if (pkt_token_len > 0) {
+        const uint64_t now = quic_now_us();
+        quic_token_status_e st =
+            quic_token_read(pkt_token, pkt_token_len, __quic_token_key, QUIC_TOKEN_RETRY,
+                            (const struct sockaddr*)&dgram->peer, dgram->peer_len,
+                            now, QUIC_RETRY_TOKEN_LIFETIME_US, &retry_odcid);
+
+        if (st == QUIC_TOKEN_OK) {
+            validated = 1;
+            have_retry_odcid = 1;
+            metrics_quic(METRICS_QUIC_TOKEN_VALID);
+        }
+        else if (st == QUIC_TOKEN_EXPIRED || st == QUIC_TOKEN_WRONG_ADDR) {
+            /* Ours, and no longer usable. §8.1.3 wants this said out loud
+             * rather than turned into another Retry: a client looping on a
+             * token it cannot fix would never get anywhere. */
+            metrics_quic(METRICS_QUIC_TOKEN_INVALID);
+            __send_initial_close(ep, dgram, &inv, QUIC_INVALID_TOKEN);
+            return;
+        }
+        else {
+            /* WRONG_KIND means a NEW_TOKEN from an earlier connection; BAD
+             * means not ours at all -- a token from a server that restarted, or
+             * noise. Neither is an error: the client simply has not proven this
+             * address, and falls through to the Retry decision. */
+            st = quic_token_read(pkt_token, pkt_token_len, __quic_token_key,
+                                 QUIC_TOKEN_NEW_TOKEN,
+                                 (const struct sockaddr*)&dgram->peer, dgram->peer_len,
+                                 now, __quic_token_lifetime_us, NULL);
+
+            if (st == QUIC_TOKEN_OK) {
+                validated = 1;
+                metrics_quic(METRICS_QUIC_TOKEN_VALID);
+            }
+            else
+                metrics_quic(METRICS_QUIC_TOKEN_INVALID);
+        }
+    }
+
+    if (!validated && __quic_retry_mode != QUIC_RETRY_NEVER &&
+        (__quic_retry_mode == QUIC_RETRY_ALWAYS ||
+         ep->handshakes_in_flight >= __quic_retry_threshold)) {
+        __send_retry(ep, dgram, &inv);
         return;
     }
 
@@ -776,17 +1032,17 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
      * that was never going to open a connection must not consume the budget
      * that decides whether real ones can.
      *
-     * Dropped, not refused. CONNECTION_REFUSED would be kinder to an honest
-     * client, but it costs an Initial key derivation and a packet per arriving
-     * datagram -- work performed for whoever is flooding us, at an address we
-     * have not validated. The client's own retransmissions handle the rest. */
+     * Dropped, not refused: answering costs an Initial key derivation and a
+     * packet per arriving datagram -- work performed for whoever is flooding
+     * us, at an address we have not validated. The client's own
+     * retransmissions handle the rest. */
     if (!__budget_spend(&ep->handshake_tokens, &ep->handshake_epoch_us,
                         __quic_handshake_rate, __quic_handshake_burst)) {
         metrics_quic(METRICS_QUIC_HANDSHAKE_RATE_LIMITED);
         return;
     }
 
-    __accept(ep, dgram, &inv);
+    __accept(ep, dgram, &inv, validated, have_retry_odcid ? &retry_odcid : NULL);
 }
 
 static int __endpoint_read(connection_t* connection) {

@@ -54,6 +54,23 @@ static int __on_crypto(void* ctx, quic_enc_level_e level,
 static int __on_params(void* ctx, const quictp_t* params) {
     quicclient_t* c = ctx;
 
+    /* §7.3: after a Retry the server must report both the id we invented for
+     * the first Initial and the one it chose for the Retry. Checked here rather
+     * than trusted, because reporting the current id as the original is the
+     * classic way to get this wrong and it fails silently in both directions. */
+    if (c->retry_seen) {
+        c->retry_scid_confirmed =
+            params->has_retry_scid &&
+            params->retry_scid.len == c->retry_scid.len &&
+            memcmp(params->retry_scid.data, c->retry_scid.data, c->retry_scid.len) == 0 &&
+            params->has_original_dcid &&
+            params->original_dcid.len == c->odcid.len &&
+            memcmp(params->original_dcid.data, c->odcid.data, c->odcid.len) == 0;
+
+        __log(c, "  [client] retry transport parameters %s\n",
+              c->retry_scid_confirmed ? "match" : "DO NOT MATCH");
+    }
+
     /* Every parameter the server takes from main.env (docs/http3/07 §1.2).
      * Printed in full because this is the only place they are observable: they
      * ride inside the encrypted handshake, so a key that never reached the wire
@@ -250,6 +267,23 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
     uint8_t payload[CLIENT_MAX_PACKET];
     size_t p = 0;
 
+    /* What the payload may grow to, bounded by the caller's datagram and not
+     * only by our own buffer. The header is sized conservatively: form byte,
+     * version, two length-prefixed connection ids, the token an Initial carries
+     * after a Retry, the length field and the packet number.
+     *
+     * Before Retry this was slack -- the token field was always a single zero
+     * byte -- and the code got away with measuring against `payload` alone. A
+     * hundred-byte token turned that slack negative, and the seal ran off the
+     * end of the caller's buffer. */
+    const size_t header_room = 7 + c->dcid.len + c->scid.len + 4 + 4 +
+                               (c->retry_token_len > 0 ? c->retry_token_len + 2 : 1);
+
+    if (cap < header_room + QUIC_AEAD_TAG_LEN + 32) return 0;
+
+    size_t payload_cap = cap - header_room - QUIC_AEAD_TAG_LEN;
+    if (payload_cap > sizeof payload) payload_cap = sizeof payload;
+
     /* Acknowledge what has arrived at this level. The server's loss detection
      * depends on it, and without it the handshake stalls into retransmissions. */
     if (c->ack_pending[level] && !quicrange_empty(&c->received[level])) {
@@ -264,7 +298,7 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
             blocks[i].smallest = span.start;
         }
 
-        const size_t n = quicframe_write_ack(payload + p, sizeof payload - p,
+        const size_t n = quicframe_write_ack(payload + p, payload_cap - p,
                                              blocks, count, 0, NULL);
         if (n > 0) {
             p += n;
@@ -278,7 +312,7 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
         f.type = QUIC_FRAME_RETIRE_CONNECTION_ID;
         f.u.retire_cid.seq = c->retire_seq;
 
-        const size_t n = quicframe_write(payload + p, sizeof payload - p, &f);
+        const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
         if (n > 0) {
             p += n;
             c->retire_queued = 0;
@@ -293,7 +327,7 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
         f.type = QUIC_FRAME_PATH_RESPONSE;
         memcpy(f.u.path.data, c->path_challenge_in, sizeof f.u.path.data);
 
-        const size_t n = quicframe_write(payload + p, sizeof payload - p, &f);
+        const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
         if (n > 0) {
             p += n;
             c->path_response_queued = 0;
@@ -306,7 +340,7 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
         memset(&f, 0, sizeof f);
         f.type = QUIC_FRAME_PING;
 
-        const size_t n = quicframe_write(payload + p, sizeof payload - p, &f);
+        const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
         if (n > 0) {
             p += n;
             c->ping_queued = 0;
@@ -323,7 +357,7 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
         f.type = QUIC_FRAME_PATH_CHALLENGE;
         memcpy(f.u.path.data, c->path_challenge_data, sizeof f.u.path.data);
 
-        const size_t n = quicframe_write(payload + p, sizeof payload - p, &f);
+        const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
         if (n > 0) {
             p += n;
             c->path_challenge_queued = 0;
@@ -339,7 +373,7 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
         int fin = 0;
 
         /* Leave room for the header, the packet number and the tag. */
-        const size_t room = sizeof payload - p - 96;
+        const size_t room = payload_cap - p - 96;
 
         if (quicsendbuf_next(&c->crypto_out[level], room, &offset, &data, &dlen, &fin)
             && dlen > 0) {
@@ -350,7 +384,7 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
             f.u.crypto.len = dlen;
             f.u.crypto.data = data;
 
-            const size_t n = quicframe_write(payload + p, sizeof payload - p, &f);
+            const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
             if (n > 0) {
                 p += n;
                 quicsendbuf_mark_sent(&c->crypto_out[level], offset, dlen, 0);
@@ -361,7 +395,7 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
     /* Stream data, once the handshake keys exist. One frame per stream per
      * packet is enough for a test whose whole exchange is a few kilobytes. */
     if (level == QUIC_ENC_APP) {
-        for (size_t i = 0; i < CLIENT_MAX_STREAMS && p + 64 < sizeof payload; i++) {
+        for (size_t i = 0; i < CLIENT_MAX_STREAMS && p + 64 < payload_cap; i++) {
             clientstream_t* st = &c->streams[i];
             if (!st->used || !quicsendbuf_pending(&st->out)) continue;
 
@@ -370,7 +404,7 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
             size_t dlen = 0;
             int fin = 0;
 
-            const size_t room = sizeof payload - p - 96;
+            const size_t room = payload_cap - p - 96;
             if (!quicsendbuf_next(&st->out, room, &offset, &data, &dlen, &fin)) continue;
 
             quicframe_t f;
@@ -383,7 +417,7 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
             f.u.stream.len = dlen;
             f.u.stream.data = data;
 
-            const size_t n = quicframe_write(payload + p, sizeof payload - p, &f);
+            const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
             if (n == 0) continue;
 
             p += n;
@@ -411,15 +445,32 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
     hdr.pn_len = pn_len;
     hdr.key_phase = c->key_phase;   /* ignored on long headers */
 
+    if (level == QUIC_ENC_INITIAL && c->retry_token_len > 0) {
+        hdr.token = c->retry_token;
+        hdr.token_len = c->retry_token_len;
+    }
+
     /* An Initial that will be padded has to declare the padding in its Length,
      * or the server reads the padding as part of the ciphertext. So the padding
      * goes into the payload, before sealing. */
     if (pad_to_minimum && level == QUIC_ENC_INITIAL) {
-        const size_t header_estimate = 7 + c->odcid.len + c->scid.len + 2 + pn_len;
-        const size_t want = QUIC_MIN_INITIAL_DATAGRAM - header_estimate - QUIC_AEAD_TAG_LEN;
-        if (want > p && want < sizeof payload) {
-            memset(payload + p, 0, want - p);
-            p = want;
+        /* The token counts. Before Retry existed this estimate was always
+         * right because the field was always one zero byte; with a token in it
+         * the header grows by ~100 bytes, the padding overshoots by the same
+         * amount, and the sealed packet runs past the caller's datagram --
+         * which is exactly what ASan caught the first time a Retry arrived. */
+        const size_t token_field = c->retry_token_len > 0 ? c->retry_token_len + 2 : 1;
+        const size_t dcid_len = c->dcid.len > 0 ? c->dcid.len : c->odcid.len;
+        const size_t header_estimate = 7 + dcid_len + c->scid.len + 2 + pn_len + token_field;
+
+        if (QUIC_MIN_INITIAL_DATAGRAM > header_estimate + QUIC_AEAD_TAG_LEN) {
+            const size_t want =
+                QUIC_MIN_INITIAL_DATAGRAM - header_estimate - QUIC_AEAD_TAG_LEN;
+
+            if (want > p && want < payload_cap) {
+                memset(payload + p, 0, want - p);
+                p = want;
+            }
         }
     }
 
@@ -529,6 +580,16 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
                   (unsigned long long)f.u.stop_sending.error);
             break;
 
+        case QUIC_FRAME_NEW_TOKEN:
+            c->new_token_received = 1;
+            if (f.u.new_token.len > 0 && f.u.new_token.len <= sizeof c->new_token) {
+                memcpy(c->new_token, f.u.new_token.data, (size_t)f.u.new_token.len);
+                c->new_token_len = (size_t)f.u.new_token.len;
+            }
+            __log(c, "  [client] <- NEW_TOKEN, %llu bytes\n",
+                  (unsigned long long)f.u.new_token.len);
+            break;
+
         case QUIC_FRAME_PATH_CHALLENGE:
             memcpy(c->path_challenge_in, f.u.path.data, sizeof c->path_challenge_in);
             c->path_challenge_received = 1;
@@ -586,6 +647,91 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
     return st == QUICFRAME_DONE || st == QUICFRAME_OK;
 }
 
+/* Everything derived from the Destination Connection ID, installed fresh.
+ *
+ * Called once at connect and again on a Retry: §5.2 derives the Initial keys
+ * from the id the client addresses its Initial to, and a Retry changes that id,
+ * so the whole handshake starts over -- keys, TLS session, packet numbers. */
+static int __handshake_start(quicclient_t* c, const quiccid_t* dcid) {
+    uint8_t client_secret[32];
+    uint8_t server_secret[32];
+    if (!quiccrypto_initial_secrets(dcid, client_secret, server_secret)) return 0;
+
+    quickeys_free(&c->tx[QUIC_ENC_INITIAL]);
+    quickeys_free(&c->rx[QUIC_ENC_INITIAL]);
+
+    /* Mirror image of the server: we write with the client secret and read with
+     * the server's. */
+    const int keys_ok =
+        quickeys_install(&c->tx[QUIC_ENC_INITIAL], QUIC_AEAD_AES_128_GCM,
+                         client_secret, sizeof client_secret) &&
+        quickeys_install(&c->rx[QUIC_ENC_INITIAL], QUIC_AEAD_AES_128_GCM,
+                         server_secret, sizeof server_secret);
+
+    explicit_bzero(client_secret, sizeof client_secret);
+    explicit_bzero(server_secret, sizeof server_secret);
+
+    if (!keys_ok) return 0;
+
+    quictp_t params;
+    quictp_defaults(&params);
+    /* Generous on purpose. This client never sends MAX_DATA or MAX_STREAM_DATA
+     * -- see the note in quicclient.h -- so whatever it advertises here is all
+     * the room a response will ever get. It has to exceed the server's
+     * write-ahead budget several times over, or a large response would stall on
+     * flow control and look like a server bug. */
+    params.initial_max_data = 64 * 1024 * 1024;
+    params.initial_max_stream_data_bidi_local = 32 * 1024 * 1024;
+    params.initial_max_stream_data_uni = 1024 * 1024;
+    params.initial_max_streams_bidi = 16;
+    params.initial_max_streams_uni = 16;
+    params.max_idle_timeout = 30000;
+    /* Above the RFC minimum of 2, so the server issuing spares is visible as a
+     * count rather than as a single id that could be a coincidence. */
+    params.active_connection_id_limit = 4;
+    params.has_initial_scid = 1;
+    params.initial_scid = c->scid;
+
+    quictls_free(&c->tls);
+
+    return quictls_init_client(&c->tls, c->ssl_ctx, &__ops, c, &params, c->server_name);
+}
+
+/* A Retry: the server wants the address proven before it will keep any state
+ * (§17.2.5). Everything so far is discarded and the handshake begins again,
+ * addressed to the id the Retry chose and carrying the token it supplied. */
+static int __on_retry(quicclient_t* c, const quicpkt_t* pkt) {
+    /* §17.2.5.2: exactly one. A second Retry is discarded, or an attacker who
+     * can inject them keeps the handshake restarting forever. */
+    if (c->retry_seen) return 1;
+
+    if (pkt->token_len == 0 || pkt->token_len > sizeof c->retry_token) return 1;
+
+    c->retry_seen = 1;
+    c->retry_scid = pkt->scid;
+    memcpy(c->retry_token, pkt->token, pkt->token_len);
+    c->retry_token_len = pkt->token_len;
+
+    /* The id we address from now on. odcid is deliberately left alone: it is
+     * what the server must report as original_destination_connection_id, and
+     * checking that is half the point of the exercise. */
+    c->dcid = pkt->scid;
+
+    for (int i = 0; i < QUIC_ENC_COUNT; i++) {
+        quicsendbuf_free(&c->crypto_out[i]);
+        quicsendbuf_init(&c->crypto_out[i]);
+        quicrange_free(&c->received[i]);
+        quicrange_init(&c->received[i], 0);
+        c->next_pn[i] = 0;
+        c->ack_pending[i] = 0;
+    }
+
+    __log(c, "  [client] <- RETRY, %zu-byte token; restarting the handshake\n",
+          pkt->token_len);
+
+    return __handshake_start(c, &c->retry_scid);
+}
+
 static int __recv_datagram(quicclient_t* c, uint8_t* buf, size_t len) {
     c->datagrams_received++;
 
@@ -596,6 +742,13 @@ static int __recv_datagram(quicclient_t* c, uint8_t* buf, size_t len) {
     while (quicpkt_next(buf, len, &off, QUIC_LOCAL_CID_LEN, &pkt, &st)) {
         uint8_t* start = buf + off - pkt.pkt_len;
         const quic_enc_level_e level = quicpkt_level(pkt.type);
+
+        /* A Retry carries no packet number and no payload to decrypt: it is
+         * handled whole, before any of the machinery below. */
+        if (pkt.type == QUIC_PKT_RETRY) {
+            if (!__on_retry(c, &pkt)) return 0;
+            continue;
+        }
 
         /* The server's first Initial tells us the connection id it wants us to
          * use from now on -- until then we address it by the random one we
@@ -685,6 +838,21 @@ static int __recv_datagram(quicclient_t* c, uint8_t* buf, size_t len) {
 
 int quicclient_connect(quicclient_t* client, const char* host, uint16_t port,
                        const char* server_name, int verbose) {
+    return quicclient_connect_token(client, host, port, server_name, verbose, NULL, 0);
+}
+
+size_t quicclient_take_token(const quicclient_t* client, uint8_t* out, size_t cap) {
+    if (client == NULL || !client->new_token_received) return 0;
+    if (client->new_token_len == 0 || client->new_token_len > cap) return 0;
+
+    memcpy(out, client->new_token, client->new_token_len);
+
+    return client->new_token_len;
+}
+
+int quicclient_connect_token(quicclient_t* client, const char* host, uint16_t port,
+                             const char* server_name, int verbose,
+                             const uint8_t* token, size_t token_len) {
     if (client == NULL) return 0;
 
     memset(client, 0, sizeof * client);
@@ -705,24 +873,6 @@ int quicclient_connect(quicclient_t* client, const char* host, uint16_t port,
         RAND_bytes(client->scid.data, 8) != 1)
         return 0;
 
-    uint8_t client_secret[32];
-    uint8_t server_secret[32];
-    if (!quiccrypto_initial_secrets(&client->odcid, client_secret, server_secret))
-        return 0;
-
-    /* Mirror image of the server: we write with the client secret and read with
-     * the server's. */
-    const int keys_ok =
-        quickeys_install(&client->tx[QUIC_ENC_INITIAL], QUIC_AEAD_AES_128_GCM,
-                         client_secret, sizeof client_secret) &&
-        quickeys_install(&client->rx[QUIC_ENC_INITIAL], QUIC_AEAD_AES_128_GCM,
-                         server_secret, sizeof server_secret);
-
-    explicit_bzero(client_secret, sizeof client_secret);
-    explicit_bzero(server_secret, sizeof server_secret);
-
-    if (!keys_ok) return 0;
-
     client->ssl_ctx = SSL_CTX_new(TLS_client_method());
     if (client->ssl_ctx == NULL) return 0;
 
@@ -730,28 +880,17 @@ int quicclient_connect(quicclient_t* client, const char* host, uint16_t port,
     /* This is a test client talking to a test certificate. */
     SSL_CTX_set_verify(client->ssl_ctx, SSL_VERIFY_NONE, NULL);
 
-    quictp_t params;
-    quictp_defaults(&params);
-    /* Generous on purpose. This client never sends MAX_DATA or MAX_STREAM_DATA
-     * -- see the note in quicclient.h -- so whatever it advertises here is all
-     * the room a response will ever get. It has to exceed the server's
-     * write-ahead budget several times over, or a large response would stall on
-     * flow control and look like a server bug. */
-    params.initial_max_data = 64 * 1024 * 1024;
-    params.initial_max_stream_data_bidi_local = 32 * 1024 * 1024;
-    params.initial_max_stream_data_uni = 1024 * 1024;
-    params.initial_max_streams_bidi = 16;
-    params.initial_max_streams_uni = 16;
-    params.max_idle_timeout = 30000;
-    /* Above the RFC minimum of 2, so the server issuing spares is visible as a
-     * count rather than as a single id that could be a coincidence. */
-    params.active_connection_id_limit = 4;
-    params.has_initial_scid = 1;
-    params.initial_scid = client->scid;
+    client->server_name = server_name;
 
-    if (!quictls_init_client(&client->tls, client->ssl_ctx, &__ops, client,
-                             &params, server_name))
-        return 0;
+    /* Presented on the very first Initial, before anything is negotiated: that
+     * is the whole point of a NEW_TOKEN -- the server decides whether to ask
+     * for proof before it has spent anything. */
+    if (token != NULL && token_len > 0 && token_len <= sizeof client->retry_token) {
+        memcpy(client->retry_token, token, token_len);
+        client->retry_token_len = token_len;
+    }
+
+    if (!__handshake_start(client, &client->odcid)) return 0;
 
     client->fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (client->fd < 0) return 0;

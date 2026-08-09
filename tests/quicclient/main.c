@@ -11,7 +11,7 @@
  *
  *   quicclient [host] [port] [-q] [-p /path] [-a authority] [-n N] [--expect]
  *              [--handshake-only] [--path-challenge] [--key-update] [--cid]
- *              [--migrate]
+ *              [--migrate] [--new-token]
  *
  * `-a` sets both the TLS server name and the :authority pseudo-header. They are
  * one flag because a server matches the virtual host on one and validates it
@@ -38,6 +38,7 @@ int main(int argc, char* argv[]) {
     int key_update = 0;
     int cid_test = 0;
     int migrate = 0;
+    int new_token = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) verbose = 0;
         else if (strcmp(argv[i], "--handshake-only") == 0) handshake_only = 1;
@@ -49,11 +50,60 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--key-update") == 0) key_update = 1;
         else if (strcmp(argv[i], "--cid") == 0) cid_test = 1;
         else if (strcmp(argv[i], "--migrate") == 0) migrate = 1;
+        else if (strcmp(argv[i], "--new-token") == 0) new_token = 1;
     }
 
     if (concurrent < 1) concurrent = 1;
 
     printf("connecting to %s:%u\n", host, port);
+
+    /* Two connections, so the second can present what the first was given.
+     * Meaningful only against a server configured to Retry -- that is the round
+     * trip the token is supposed to skip, and against a server that never
+     * retries there is nothing to see. */
+    if (new_token) {
+        quicclient_t first;
+        uint8_t token[256];
+        size_t token_len = 0;
+
+        if (quicclient_connect(&first, host, port, authority, 0) &&
+            quicclient_run(&first, 5000)) {
+            for (int i = 0; i < 20 && !first.new_token_received; i++)
+                quicclient_pump(&first, 100);
+
+            token_len = quicclient_take_token(&first, token, sizeof token);
+        }
+
+        const int first_retried = first.retry_seen;
+        quicclient_free(&first);
+
+        printf("\nNEW TOKEN\n");
+        printf("first connection retried:  %s\n", first_retried ? "yes" : "no");
+        printf("token issued:              %s (%zu bytes)\n",
+               token_len > 0 ? "yes" : "no", token_len);
+
+        if (token_len == 0) {
+            printf("\nFAIL: no token to present\n");
+            return 1;
+        }
+
+        quicclient_t second;
+        const int ok2 = quicclient_connect_token(&second, host, port, authority, verbose,
+                                                 token, token_len) &&
+                        quicclient_run(&second, 5000);
+        const int retried = second.retry_seen;
+        const int done = second.handshake_complete;
+        quicclient_free(&second);
+
+        printf("second connection retried: %s\n", retried ? "yes" : "no");
+        printf("second handshake complete: %s\n", done ? "yes" : "no");
+
+        /* The point of the whole exercise: the token replaced the round trip. */
+        const int good = ok2 && done && !retried;
+        printf("\n%s\n", good ? "OK: the token skipped the Retry"
+                                : "FAIL: the token did not skip the Retry");
+        return good ? 0 : 1;
+    }
 
     quicclient_t client;
     if (!quicclient_connect(&client, host, port, authority, verbose)) {

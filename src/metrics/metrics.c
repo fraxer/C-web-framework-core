@@ -54,6 +54,7 @@ static const char* const __quic_name[METRICS_QUIC__COUNT] = {
     "streams_opened", "streams_reset_sent", "streams_reset_received",
     "closed.idle_timeout", "closed.local_error", "closed.peer",
     "refused.at_capacity", "refused.handshake_rate",
+    "retry_sent", "token_valid", "token_invalid",
     "migrations.attempted", "migrations.validated", "migrations.rejected"
 };
 

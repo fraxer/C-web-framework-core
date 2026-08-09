@@ -86,6 +86,11 @@ typedef struct quicendpoint {
      * Touched only by the owning worker. */
     struct quicconn* conns;
     size_t conn_count;
+    /* Of those, how many are still handshaking. This is the load signal
+     * `http3_retry: auto` reacts to -- not the connection count, because a
+     * server with many established connections is busy, while one with many
+     * half-open ones is being attacked, and only the second calls for Retry. */
+    size_t handshakes_in_flight;
 
     /* Connections with something to send. Unlike `conns`, this is reachable
      * from a handler thread finishing a response, so it has a lock of its own
@@ -215,6 +220,15 @@ void quicendpoint_cid_forget(quicendpoint_t* endpoint, const quiccid_t* cid);
  * advance what the token for a new id will be. Both must produce the same 16
  * bytes or the peer cannot recognise a reset, so there is one derivation. */
 int  quicendpoint_reset_token(const quiccid_t* cid, uint8_t out[16]);
+
+/* A NEW_TOKEN for a peer whose address is now proven (§8.1.3): something it can
+ * present on its *next* connection to skip the Retry round trip. Returns the
+ * length written, or 0 when the feature is off or the token does not fit.
+ *
+ * Here rather than in quicconn for the same reason as the reset token: the key
+ * is the endpoint's, and a token minted from anywhere else would not verify. */
+size_t quicendpoint_new_token(const struct sockaddr* peer, socklen_t peer_len,
+                              uint8_t* out, size_t cap);
 
 /* Take a connection out of the routing table and the endpoint's lists. Called
  * from the connection's close path; after it, no datagram can reach it. */
