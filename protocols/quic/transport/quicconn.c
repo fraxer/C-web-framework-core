@@ -24,6 +24,18 @@
  * a large response goes out. Whatever is left keeps want_write raised. */
 #define QUICCONN_SEND_ROUNDS 4
 
+/* What __build_packet holds back for the header it has not written yet: a long
+ * header with two connection ids, a length and a packet number fits inside it
+ * with room to spare. Deliberately generous -- the cost is a few unused bytes
+ * per packet, and the alternative is sizing the payload against a header whose
+ * length is not known until the frames are done. */
+#define QUICCONN_HEADER_RESERVE 64
+
+/* The smallest payload worth building a packet for. Below it the packet costs
+ * more than it carries, and the caller has better uses for the remaining
+ * space -- there is always a next datagram. */
+#define QUICCONN_MIN_PAYLOAD 32
+
 /* ---- Small helpers ---- */
 
 static int __key_update_arm(quicconn_t* conn);
@@ -51,6 +63,30 @@ static quicstream_t* __stream_find(quicconn_t* conn, uint64_t id) {
     return NULL;
 }
 
+/* How many streams of a kind the peer may have opened by now.
+ *
+ * The transport parameter is only the *first* limit. Every MAX_STREAMS frame
+ * raises it, and enforcement has to follow: checking against the initial value
+ * for the life of the connection means the credit handed back for finished
+ * streams is advertised and then punished for being used -- the peer opens the
+ * 101st stream because we told it to, and the connection dies with
+ * STREAM_LIMIT_ERROR. That is what killed every h3 connection after a hundred
+ * requests, browsers included.
+ *
+ * The limit *sent* rather than the limit acknowledged: a MAX_STREAMS lost on
+ * the way is a limit the peer will not use, and being generous here costs
+ * nothing, while being strict would reject a stream the peer opened legally.
+ * No MAX_STREAMS_UNI is ever sent -- the three h3 control streams live as long
+ * as the connection, so there is no credit to return -- and the parameter stays
+ * the whole of the unidirectional limit. */
+static uint64_t __streams_limit(const quicconn_t* conn, int uni) {
+    if (uni) return conn->local_params.initial_max_streams_uni;
+
+    return conn->max_streams_bidi_sent > conn->local_params.initial_max_streams_bidi
+           ? conn->max_streams_bidi_sent
+           : conn->local_params.initial_max_streams_bidi;
+}
+
 /* Open a peer-initiated stream, and every stream of the same kind below it.
  *
  * §2.1: ids are a counter, and a peer may skip the ones it decided not to use.
@@ -60,9 +96,16 @@ static quicstream_t* __stream_open_peer(quicconn_t* conn, uint64_t id) {
     const uint64_t kind = id & 0x03;
     uint64_t* next = quic_stream_is_uni(id) ? &conn->next_peer_uni : &conn->next_peer_bidi;
 
+    /* An index, like the counter it is compared against -- the id itself is
+     * four times larger, and comparing the two opened four streams for every
+     * one asked for. The extras are peer-initiated streams nothing will ever
+     * finish, so they are never reaped either: 20000 requests left 28000 of
+     * them on the list, every one of them walked on every packet. */
+    const uint64_t index = quic_stream_index(id);
+
     quicstream_t* result = NULL;
 
-    while (*next <= id) {
+    while (*next <= index) {
         const uint64_t open_id = (*next << 2) | kind;
         *next += 1;
 
@@ -371,9 +414,7 @@ static int __on_stream_frame(quicconn_t* conn, const quicframe_t* frame,
     if (s == NULL) {
         /* §4.6: the peer may not open more streams than we allowed. */
         const uint64_t index = quic_stream_index(id);
-        const uint64_t limit = quic_stream_is_uni(id)
-                               ? conn->local_params.initial_max_streams_uni
-                               : conn->local_params.initial_max_streams_bidi;
+        const uint64_t limit = __streams_limit(conn, quic_stream_is_uni(id));
 
         if (index >= limit) {
             quicconn_close(conn, QUIC_STREAM_LIMIT_ERROR, 0, now_us);
@@ -1115,8 +1156,15 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
     quickeys_t* keys = &conn->tx[level];
     if (!keys->valid) return 0;
 
-    /* Leave room for the AEAD tag; everything below sizes against the payload. */
-    if (cap < QUIC_AEAD_TAG_LEN + 32) return 0;
+    /* Room for the tag, the header held back below, and a payload worth the
+     * packet. The check is what keeps the subtraction that follows from
+     * underflowing: a `cap` of, say, 50 leaves 34 bytes after the tag, and
+     * taking 64 off that hands the frame writers below a capacity of ~2^64 over
+     * a 1200-byte stack buffer. Such a `cap` is not hypothetical -- the tail of
+     * the anti-amplification budget is exactly that shape, and it smashed the
+     * stack a few hundred handshakes in. */
+    if (cap < QUIC_AEAD_TAG_LEN + QUICCONN_HEADER_RESERVE + QUICCONN_MIN_PAYLOAD)
+        return 0;
 
     uint8_t payload[QUICCONN_MAX_PACKET];
     size_t p = 0;
@@ -1125,7 +1173,7 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
 
     const size_t payload_cap =
         (cap - QUIC_AEAD_TAG_LEN > sizeof payload ? sizeof payload : cap - QUIC_AEAD_TAG_LEN)
-        - 64;   /* header, conservatively */
+        - QUICCONN_HEADER_RESERVE;
 
     /* An ACK first: it is what unblocks the peer, and it is cheap. */
     if (quicack_should_send(&conn->ack[level], now_us)) {
