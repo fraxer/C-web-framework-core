@@ -315,6 +315,58 @@ TEST(test_quic_crypto_key_update) {
     TEST_ASSERT(quiccrypto_open(&old_keys, 1, aad, sizeof aad, ct, ct_len, out, &out_len),
                 "the old key still opens it");
 
+    TEST_CASE("quickeys_next reaches the same generation quickeys_install does");
+    /* The two paths must agree, because the peer takes the other one: it
+     * derives its keys from the secret, we derive ours from the previous key
+     * set. A difference here is a connection that dies at the first update. */
+    quickeys_t stepped;
+    memset(&stepped, 0, sizeof stepped);
+    TEST_REQUIRE(quickeys_next(&stepped, &old_keys), "stepped to the next generation");
+
+    ct_len = 0;
+    TEST_REQUIRE(quiccrypto_seal(&stepped, 2, aad, sizeof aad, pt, sizeof pt, ct, &ct_len),
+                 "sealed with the stepped key");
+    TEST_ASSERT(quiccrypto_open(&new_keys, 2, aad, sizeof aad, ct, ct_len, out, &out_len) &&
+                out_len == sizeof pt && memcmp(out, pt, out_len) == 0,
+                "the independently installed key opens it");
+
+    TEST_CASE("header protection does not change across a key update");
+    /* RFC 9001 §5.4: the hp key keeps its value after an update. Getting this
+     * wrong breaks every packet in the new phase before the AEAD is even
+     * reached, and the symptom points at the AEAD -- so it is asserted
+     * directly rather than left to an end-to-end run to expose. */
+    TEST_ASSERT(stepped.hp_key_len == old_keys.hp_key_len &&
+                memcmp(stepped.hp_key, old_keys.hp_key, stepped.hp_key_len) == 0,
+                "same header protection key");
+    TEST_ASSERT(memcmp(stepped.iv, old_keys.iv, sizeof stepped.iv) != 0,
+                "but a different IV");
+
+    TEST_CASE("stepping in place is the same as stepping into a fresh key set");
+    quickeys_t inplace;
+    memset(&inplace, 0, sizeof inplace);
+    TEST_REQUIRE(quickeys_install(&inplace, QUIC_AEAD_AES_128_GCM, secret, 32), "installed");
+    TEST_REQUIRE(quickeys_next(&inplace, &inplace), "stepped in place");
+
+    ct_len = 0;
+    TEST_REQUIRE(quiccrypto_seal(&inplace, 3, aad, sizeof aad, pt, sizeof pt, ct, &ct_len),
+                 "sealed");
+    TEST_ASSERT(quiccrypto_open(&new_keys, 3, aad, sizeof aad, ct, ct_len, out, &out_len),
+                "opens with the same generation");
+
+    TEST_CASE("two updates land on the generation after the next");
+    quickeys_t twice;
+    memset(&twice, 0, sizeof twice);
+    TEST_REQUIRE(quickeys_next(&twice, &stepped), "stepped twice");
+
+    ct_len = 0;
+    TEST_REQUIRE(quiccrypto_seal(&twice, 4, aad, sizeof aad, pt, sizeof pt, ct, &ct_len),
+                 "sealed");
+    TEST_ASSERT(!quiccrypto_open(&new_keys, 4, aad, sizeof aad, ct, ct_len, out, &out_len),
+                "the previous generation cannot open it");
+
+    quickeys_free(&twice);
+    quickeys_free(&inplace);
+    quickeys_free(&stepped);
     quickeys_free(&old_keys);
     quickeys_free(&new_keys);
 }

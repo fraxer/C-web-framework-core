@@ -86,6 +86,30 @@ typedef struct quicconn {
     quickeys_t tx[QUIC_ENC_COUNT];
     quic_aead_e suite;
 
+    /* ---- Key update (RFC 9001 §6), application space only ---- *
+     *
+     * The Key Phase bit alternates, so which generation a 1-RTT packet belongs
+     * to follows from the bit plus the packet number, and never from the bit
+     * alone: a packet whose phase differs from ours is either one the peer sent
+     * before an update we already applied (reordered, so its number is below
+     * where the current phase began) or the peer starting a new one. */
+    int      key_phase;              /* the bit our current keys carry */
+    /* Derived ahead of the peer asking. §9.5 requires that answering an
+     * apparent update leaks no timing signal about whether the bit was valid,
+     * and deriving a key schedule only on the real thing is exactly such a
+     * signal. */
+    quickeys_t rx_next;
+    /* The generation before the current one, kept so packets that were already
+     * in flight when the update happened still open (§6.3). */
+    quickeys_t rx_prev;
+    uint64_t key_prev_expire_us;     /* 0 = nothing retained */
+    uint64_t key_phase_first_pn;     /* lowest 1-RTT pn accepted in this phase */
+    /* §6.5: a peer that toggles the bit repeatedly would otherwise make us
+     * derive a key schedule per packet. No second update is applied until one
+     * of our own packets in the current phase has been acknowledged. */
+    uint64_t key_update_tx_pn;
+    int      key_update_unconfirmed;
+
     /* Acknowledgement state, one per packet number space. */
     quicack_t ack[QUIC_ENC_COUNT];
 

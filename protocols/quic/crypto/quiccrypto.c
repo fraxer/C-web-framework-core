@@ -205,6 +205,16 @@ int quickeys_install(quickeys_t* keys, quic_aead_e suite,
     keys->sealed = 0;
     keys->open_failures = 0;
 
+    /* Kept for quickeys_next. A secret longer than the buffer would mean a hash
+     * this build does not support, so it is refused rather than truncated. */
+    if (secret_len > sizeof keys->secret) {
+        explicit_bzero(key, sizeof key);
+        return 0;
+    }
+
+    memcpy(keys->secret, secret, secret_len);
+    keys->secret_len = secret_len;
+
     /* Both contexts are keyed once here and reused for every packet: only the
      * nonce changes. Recreating an EVP_CIPHER_CTX per packet costs several
      * times the cost of the encryption itself at QUIC's packet sizes, and this
@@ -253,6 +263,93 @@ int quiccrypto_next_secret(quic_aead_e suite,
                                   out, secret_len);
 }
 
+int quickeys_next(quickeys_t* into, const quickeys_t* from) {
+    if (into == NULL || from == NULL || !from->valid || from->secret_len == 0)
+        return 0;
+
+    const EVP_MD* md = quiccrypto_md(from->suite);
+    const EVP_CIPHER* aead = __aead_cipher(from->suite);
+    const size_t key_len = quiccrypto_key_len(from->suite);
+    if (md == NULL || aead == NULL || key_len == 0) return 0;
+
+    uint8_t secret[sizeof from->secret];
+    uint8_t key[32];
+    uint8_t iv[12];
+
+    int ok = quiccrypto_next_secret(from->suite, from->secret, from->secret_len, secret);
+
+    ok = ok && quic_hkdf_expand_label(md, secret, from->secret_len, "quic key", NULL, 0,
+                                      key, key_len);
+    ok = ok && quic_hkdf_expand_label(md, secret, from->secret_len, "quic iv", NULL, 0,
+                                      iv, sizeof iv);
+
+    /* The AEAD context is built before anything in `into` is touched, so a
+     * failure here leaves the caller's current keys usable. That matters more
+     * than usual: `into` may be the live receive keys. */
+    EVP_CIPHER_CTX* ctx = ok ? EVP_CIPHER_CTX_new() : NULL;
+
+    ok = ok && ctx != NULL;
+    ok = ok && EVP_CipherInit_ex(ctx, aead, NULL, NULL, NULL, -1) == 1;
+    ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, (int)sizeof iv, NULL) == 1;
+    ok = ok && EVP_CipherInit_ex(ctx, NULL, NULL, key, NULL, -1) == 1;
+
+    if (!ok) {
+        EVP_CIPHER_CTX_free(ctx);
+        explicit_bzero(secret, sizeof secret);
+        explicit_bzero(key, sizeof key);
+        return 0;
+    }
+
+    /* Header protection carries over untouched -- §5.4, and the reason this
+     * function exists. When into == from that is automatic; when it is a
+     * different object the material is copied, including the keyed ChaCha
+     * context's key, which quichp applies per packet. */
+    if (into != from) {
+        /* Rebuilt from from->hp_key the same way quickeys_install does, rather
+         * than copied with EVP_CIPHER_CTX_copy: for ChaCha20 the header
+         * protection context is deliberately left unkeyed (quichp applies the
+         * key per packet), and copying a context that was never initialised is
+         * not something to rely on. */
+        const EVP_CIPHER* hp = __hp_cipher(from->suite);
+        EVP_CIPHER_CTX* hp_ctx = hp != NULL ? EVP_CIPHER_CTX_new() : NULL;
+
+        int hp_ok = hp_ctx != NULL;
+        if (hp_ok && from->suite != QUIC_AEAD_CHACHA20_POLY1305)
+            hp_ok = EVP_EncryptInit_ex(hp_ctx, hp, NULL, from->hp_key, NULL) == 1;
+
+        if (!hp_ok) {
+            EVP_CIPHER_CTX_free(ctx);
+            EVP_CIPHER_CTX_free(hp_ctx);
+            explicit_bzero(secret, sizeof secret);
+            explicit_bzero(key, sizeof key);
+            return 0;
+        }
+
+        EVP_CIPHER_CTX_free(into->aead);
+        EVP_CIPHER_CTX_free(into->hp);
+        into->hp = hp_ctx;
+
+        memcpy(into->hp_key, from->hp_key, sizeof into->hp_key);
+        into->hp_key_len = from->hp_key_len;
+        into->suite = from->suite;
+    }
+    else
+        EVP_CIPHER_CTX_free(into->aead);
+
+    into->aead = ctx;
+    memcpy(into->iv, iv, sizeof iv);
+    memcpy(into->secret, secret, from->secret_len);
+    into->secret_len = from->secret_len;
+    into->sealed = 0;
+    into->open_failures = 0;
+    into->valid = 1;
+
+    explicit_bzero(secret, sizeof secret);
+    explicit_bzero(key, sizeof key);
+
+    return 1;
+}
+
 void quickeys_free(quickeys_t* keys) {
     if (keys == NULL) return;
 
@@ -263,6 +360,8 @@ void quickeys_free(quickeys_t* keys) {
 
     explicit_bzero(keys->iv, sizeof keys->iv);
     explicit_bzero(keys->hp_key, sizeof keys->hp_key);
+    explicit_bzero(keys->secret, sizeof keys->secret);
+    keys->secret_len = 0;
     keys->valid = 0;
 }
 

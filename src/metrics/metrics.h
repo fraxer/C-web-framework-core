@@ -154,6 +154,10 @@ typedef enum {
 
     METRICS_QUIC_DECRYPT_FAILURE,           /* AEAD open failed; usually harmless */
     METRICS_QUIC_AEAD_LIMIT,                /* §6.6 confidentiality limit reached */
+    /* Key updates applied. Read next to decrypt_failures: before key updates
+     * existed, a peer that performed one showed up only as that counter rising
+     * while packets_lost stayed put. */
+    METRICS_QUIC_KEY_UPDATE,
 
     METRICS_QUIC_PACKETS_LOST,
     METRICS_QUIC_PTO_FIRED,

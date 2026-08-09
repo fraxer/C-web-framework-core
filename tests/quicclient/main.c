@@ -10,7 +10,7 @@
  * what happened.
  *
  *   quicclient [host] [port] [-q] [-p /path] [-a authority] [-n N] [--expect]
- *              [--handshake-only] [--path-challenge]
+ *              [--handshake-only] [--path-challenge] [--key-update]
  *
  * `-a` sets both the TLS server name and the :authority pseudo-header. They are
  * one flag because a server matches the virtual host on one and validates it
@@ -34,6 +34,7 @@ int main(int argc, char* argv[]) {
     int concurrent = 1;
     int expect_continue = 0;
     int path_challenge = 0;
+    int key_update = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) verbose = 0;
         else if (strcmp(argv[i], "--handshake-only") == 0) handshake_only = 1;
@@ -42,6 +43,7 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) concurrent = atoi(argv[++i]);
         else if (strcmp(argv[i], "--expect") == 0) expect_continue = 1;
         else if (strcmp(argv[i], "--path-challenge") == 0) path_challenge = 1;
+        else if (strcmp(argv[i], "--key-update") == 0) key_update = 1;
     }
 
     if (concurrent < 1) concurrent = 1;
@@ -100,10 +102,37 @@ int main(int argc, char* argv[]) {
         if (!client.path_response_matched) ok = 0;
     }
 
-    if (!ok || handshake_only || path_challenge) {
-        const char* what = path_challenge ? "the path challenge was answered"
+    /* Key update (RFC 9001 §6). Like the challenge above, this belongs before
+     * HTTP/3: it is a transport obligation, and the exchange that proves it has
+     * to be one the application layer plays no part in. */
+    if (ok && key_update) {
+        printf("\nKEY UPDATE\n");
+
+        if (!quicclient_key_update(&client))
+            printf("FAIL: could not move to the next key generation\n");
+        else {
+            /* Something ack-eliciting in the new phase, so the server has to
+             * answer in it: a PATH_CHALLENGE does nicely and needs no streams. */
+            quicclient_path_challenge(&client);
+
+            for (int i = 0; i < 30 && !client.read_after_update; i++)
+                quicclient_pump(&client, 100);
+        }
+
+        printf("server followed the update: %s\n",
+               client.read_after_update ? "yes" : "no");
+        printf("PATH_RESPONSE after update: %s\n",
+               client.path_response_matched ? "yes" : "no");
+
+        if (!client.read_after_update || !client.path_response_matched) ok = 0;
+    }
+
+    if (!ok || handshake_only || path_challenge || key_update) {
+        const char* what = key_update   ? "the key update was followed"
+                         : path_challenge ? "the path challenge was answered"
                                           : "the handshake completed end to end";
-        const char* why = path_challenge ? "the path challenge went unanswered"
+        const char* why = key_update   ? "the key update was not followed"
+                        : path_challenge ? "the path challenge went unanswered"
                                          : "the handshake did not complete";
 
         quicclient_free(&client);

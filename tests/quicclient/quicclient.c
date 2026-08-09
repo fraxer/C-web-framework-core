@@ -154,6 +154,27 @@ size_t quicclient_stream_read(quicclient_t* client, uint64_t id,
     return s == NULL ? 0 : quicrecvbuf_read(&s->in, dst, cap);
 }
 
+int quicclient_key_update(quicclient_t* client) {
+    if (client == NULL) return 0;
+    if (!client->tx[QUIC_ENC_APP].valid || !client->rx[QUIC_ENC_APP].valid) return 0;
+
+    /* The generation we are leaving is retained: the server is still sending in
+     * it until it sees a packet of ours in the new one. */
+    quickeys_free(&client->rx_prev);
+    client->rx_prev = client->rx[QUIC_ENC_APP];
+    memset(&client->rx[QUIC_ENC_APP], 0, sizeof client->rx[QUIC_ENC_APP]);
+
+    if (!quickeys_next(&client->rx[QUIC_ENC_APP], &client->rx_prev)) return 0;
+    if (!quickeys_next(&client->tx[QUIC_ENC_APP], &client->tx[QUIC_ENC_APP])) return 0;
+
+    client->key_phase = !client->key_phase;
+    client->key_update_done = 1;
+
+    __log(client, "  [client] key update -> phase %d\n", client->key_phase);
+
+    return 1;
+}
+
 int quicclient_path_challenge(quicclient_t* client) {
     if (client == NULL || !client->tx[QUIC_ENC_APP].valid) return 0;
     if (client->path_challenge_queued || client->path_challenge_sent) return 0;
@@ -298,6 +319,7 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
     hdr.scid = &c->scid;
     hdr.pn = pn;
     hdr.pn_len = pn_len;
+    hdr.key_phase = c->key_phase;   /* ignored on long headers */
 
     /* An Initial that will be padded has to declare the padding in its Length,
      * or the server reads the padding as part of the ciphertext. So the padding
@@ -487,6 +509,19 @@ static int __recv_datagram(quicclient_t* c, uint8_t* buf, size_t len) {
                            &pn_len, &truncated, &key_phase))
             continue;
 
+        /* We are the side that initiates, so a differing phase means only one
+         * thing: the server has not caught up yet and is still writing in the
+         * generation before ours. Header protection is unaffected either way --
+         * §5.4 keeps that key across updates -- so the bit is readable with the
+         * current keys even when the payload is not. */
+        int in_new_phase = 1;
+
+        if (level == QUIC_ENC_APP && key_phase != c->key_phase) {
+            if (!c->rx_prev.valid) continue;
+            keys = &c->rx_prev;
+            in_new_phase = 0;
+        }
+
         const uint64_t largest = quicrange_empty(&c->received[level])
                                  ? 0 : quicrange_max(&c->received[level]);
         const uint64_t pn = quicpkt_decode_pn(largest, truncated, pn_len);
@@ -504,6 +539,11 @@ static int __recv_datagram(quicclient_t* c, uint8_t* buf, size_t len) {
             __log(c, "  [client] decryption failed at level %d\n", (int)level);
             continue;
         }
+
+        /* The proof the server followed us: a packet it wrote with the next
+         * generation of its own send keys. */
+        if (level == QUIC_ENC_APP && c->key_update_done && in_new_phase)
+            c->read_after_update = 1;
 
         quicrange_add(&c->received[level], pn, pn);
 
@@ -688,6 +728,10 @@ void quicclient_free(quicclient_t* client) {
     if (client == NULL) return;
 
     quictls_free(&client->tls);
+
+    /* The generation a key update left behind. Its contexts are owned exactly
+     * like the live ones, so forgetting it here leaks a key set per update. */
+    quickeys_free(&client->rx_prev);
 
     for (int i = 0; i < QUIC_ENC_COUNT; i++) {
         quickeys_free(&client->rx[i]);

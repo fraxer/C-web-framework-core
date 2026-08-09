@@ -82,6 +82,18 @@ typedef struct quicclient {
 
     clientstream_t streams[CLIENT_MAX_STREAMS];
 
+    /* Key update (RFC 9001 §6), from the initiating side. The server only ever
+     * responds to one, so the client has to be the one that starts it.
+     *
+     * `rx_prev` matters more here than it looks: between our update and the
+     * server noticing it, the server is still sending in the old phase, and
+     * without the retained generation those packets -- typically the ACK for
+     * the very packet that carried the update -- would be dropped. */
+    int      key_phase;
+    quickeys_t rx_prev;
+    int      key_update_done;
+    int      read_after_update;      /* a packet opened in the new phase */
+
     /* Path validation (RFC 9000 §8.2), from the challenging side. The server
      * has no way to show that it answers a PATH_CHALLENGE other than by
      * answering one, so the client has to be able to ask. */
@@ -93,6 +105,10 @@ typedef struct quicclient {
 
     int verbose;
 } quicclient_t;
+
+/* Move both directions to the next key generation and flip the Key Phase bit
+ * (§6.1). Only meaningful once 1-RTT keys exist. Returns 0 on failure. */
+int quicclient_key_update(quicclient_t* client);
 
 /* Queue a PATH_CHALLENGE with random data. Only meaningful once 1-RTT keys
  * exist -- the frame is not permitted at any earlier level. Returns 0 if the

@@ -26,6 +26,8 @@
 
 /* ---- Small helpers ---- */
 
+static int __key_update_arm(quicconn_t* conn);
+
 static quicconn_t* __conn_of(connection_t* connection) {
     /* Safe because conn is the first member of quicconn_t, which is also why
      * that placement is load-bearing rather than stylistic. */
@@ -152,6 +154,11 @@ static int __on_secret(void* ctx, quic_enc_level_e level, quictls_dir_e dir,
         return 0;
     }
 
+    /* The application read keys are the only ones a key update ever touches, so
+     * this is where the next generation is first armed (§6.1). */
+    if (level == QUIC_ENC_APP && dir == QUICTLS_DIR_READ)
+        (void)__key_update_arm(conn);
+
     return 1;
 }
 
@@ -247,6 +254,13 @@ static int __on_ack_frame(quicconn_t* conn, quic_enc_level_e level,
 
     quicframe_ref_t* lost = NULL;
     quicloss_on_ack(&conn->loss, level, &acked, delay, now_us, &lost);
+
+    /* §6.5: the peer has read something we sent in the current key phase, so a
+     * further update from it is no longer a way to make us derive key schedules
+     * for free. */
+    if (level == QUIC_ENC_APP && conn->key_update_unconfirmed &&
+        quicrange_max(&acked) >= conn->key_update_tx_pn)
+        conn->key_update_unconfirmed = 0;
 
     /* Put the lost frames' information back on the queues that produced it.
      * The frames themselves are rebuilt from current state, not replayed --
@@ -477,6 +491,61 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
     }
 }
 
+/* ---- Key update (RFC 9001 §6) ---- */
+
+/* Arm the next generation of receive keys. Called as soon as the 1-RTT keys
+ * exist, and again after every update, so the schedule is never derived on the
+ * packet path -- see the timing-signal note on quicconn_t::rx_next. */
+static int __key_update_arm(quicconn_t* conn) {
+    if (!conn->rx[QUIC_ENC_APP].valid) return 1;
+
+    return quickeys_next(&conn->rx_next, &conn->rx[QUIC_ENC_APP]);
+}
+
+/* The peer's update opened a packet: adopt it.
+ *
+ * Both directions move together (§6.2). Ours has to: the peer switched its own
+ * read keys when it updated, so a packet from us in the old phase is one it can
+ * no longer open. */
+static int __key_update_commit(quicconn_t* conn, uint64_t pn, uint64_t now_us) {
+    /* The generation we are leaving becomes the retained one. Moved, not
+     * copied -- the contexts are owned pointers, and rx_prev is released first
+     * so the generation before last does not leak. */
+    quickeys_free(&conn->rx_prev);
+    conn->rx_prev = conn->rx[QUIC_ENC_APP];
+
+    conn->rx[QUIC_ENC_APP] = conn->rx_next;
+    memset(&conn->rx_next, 0, sizeof conn->rx_next);
+
+    if (!quickeys_next(&conn->tx[QUIC_ENC_APP], &conn->tx[QUIC_ENC_APP]))
+        return 0;
+
+    conn->key_phase = !conn->key_phase;
+    conn->key_phase_first_pn = pn;
+
+    /* §6.3: the retained generation is good for as long as a packet sent before
+     * the update could still be in flight. Three PTOs is the same figure the
+     * closing period uses, and for the same reason. */
+    conn->key_prev_expire_us = now_us + quicloss_pto_us(&conn->loss, QUIC_ENC_APP) * 3;
+
+    /* §6.5: no further update until the peer acknowledges something we sent in
+     * this phase. */
+    conn->key_update_tx_pn = conn->loss.space[QUIC_ENC_APP].next_pn;
+    conn->key_update_unconfirmed = 1;
+
+    metrics_quic(METRICS_QUIC_KEY_UPDATE);
+
+    log_info("quic: key update to phase %d at pn %llu\n",
+             conn->key_phase, (unsigned long long)pn);
+
+    /* Arming the next generation is deliberately last and its failure is not
+     * fatal: the update itself has already succeeded, and a connection that
+     * cannot pre-derive simply refuses the *following* update until it can. */
+    (void)__key_update_arm(conn);
+
+    return 1;
+}
+
 /* ---- Receive path ---- */
 
 static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
@@ -500,12 +569,36 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
     if (!quichp_remove(keys, buf, len, pkt->pn_offset, &pn_len, &truncated, &key_phase))
         return 1;
 
-    (void)key_phase;   /* key update is phase 9 */
-
     const uint64_t largest = conn->ack[level].any_received
                              ? conn->ack[level].largest : QUICPKT_NO_ACKED;
     const uint64_t pn = quicpkt_decode_pn(
         largest == QUICPKT_NO_ACKED ? 0 : largest, truncated, pn_len);
+
+    /* Which generation of keys this packet belongs to (§6.3). Long headers have
+     * no Key Phase bit and quichp reports 0 for them, so this only ever moves
+     * off the current keys in the application space. */
+    int updating = 0;
+
+    if (level == QUIC_ENC_APP && key_phase != conn->key_phase) {
+        if (pn < conn->key_phase_first_pn && conn->key_prev_expire_us > now_us &&
+            conn->rx_prev.valid) {
+            /* Sent before the update we already applied and reordered past it. */
+            keys = &conn->rx_prev;
+        }
+        else if (conn->rx_next.valid && !conn->key_update_unconfirmed) {
+            /* The peer is starting an update. Nothing is committed until the
+             * packet actually opens -- the bit is not authenticated, and a
+             * forged one must cost no more than a dropped packet. */
+            keys = &conn->rx_next;
+            updating = 1;
+        }
+        else {
+            /* Either the retained generation has expired, or the peer is
+             * toggling faster than §6.5 allows. Both are a dropped packet. */
+            metrics_quic(METRICS_QUIC_DECRYPT_FAILURE);
+            return 1;
+        }
+    }
 
     /* The AEAD's additional data is the header as it stands with the protection
      * removed -- which is why this runs after quichp_remove and not before. */
@@ -534,6 +627,15 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
     /* A replayed packet is bit-identical to the original, so the AEAD cannot
      * tell them apart -- this check is the only thing that can. */
     if (quicack_is_duplicate(&conn->ack[level], pn)) return 1;
+
+    /* The packet opened with the next generation's keys, which is the only
+     * proof that the peer really updated: the Key Phase bit itself is under
+     * header protection but not authenticated, so nothing above this line may
+     * change state. */
+    if (updating && !__key_update_commit(conn, pn, now_us)) {
+        quicconn_close(conn, QUIC_INTERNAL_ERROR, 0, now_us);
+        return 0;
+    }
 
     /* §12.4: a packet with no frames at all is a protocol violation. */
     if (plain_len == 0) {
@@ -875,6 +977,8 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
     hdr.scid = &conn->local_cids[0].cid;
     hdr.pn = pn;
     hdr.pn_len = pn_len;
+    /* Ignored for long headers, which have no such bit. */
+    hdr.key_phase = conn->key_phase;
     hdr.payload_len = p + QUIC_AEAD_TAG_LEN;
 
     size_t pn_offset = 0;
@@ -1026,6 +1130,9 @@ static void __quicconn_transport_free(void* arg) {
     if (conn == NULL) return;
 
     quictls_free(&conn->tls);
+
+    quickeys_free(&conn->rx_next);
+    quickeys_free(&conn->rx_prev);
 
     for (int i = 0; i < QUIC_ENC_COUNT; i++) {
         quickeys_free(&conn->rx[i]);

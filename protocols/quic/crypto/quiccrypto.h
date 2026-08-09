@@ -51,6 +51,12 @@ typedef struct quickeys {
     quic_aead_e suite;
     int      valid;
 
+    /* The secret these keys came from, kept so a key update can derive the next
+     * generation from it (§6.1).48 bytes covers SHA-384, the largest hash any
+     * suite here uses. Zeroed by quickeys_free like the rest of the material. */
+    uint8_t  secret[48];
+    size_t   secret_len;
+
     /* Packets sealed with this key, against the confidentiality limit of §6.6:
      * 2^23 for AES-GCM, effectively unbounded for ChaCha20-Poly1305. Exceeding
      * it requires a key update rather than being merely inadvisable. */
@@ -100,6 +106,19 @@ int quickeys_install(quickeys_t* keys, quic_aead_e suite,
 int quiccrypto_next_secret(quic_aead_e suite,
                            const uint8_t* secret, size_t secret_len,
                            uint8_t* out);
+
+/* Install the next generation of `from` into `into` -- a key update (§6).
+ *
+ * Not quickeys_install with the next secret, and the difference is the whole
+ * point: §5.4 says the header protection key does **not** change on a key
+ * update, so `into` keeps the header protection of `from` while its AEAD key
+ * and IV move on. Re-deriving "quic hp" from the new secret would produce a
+ * key the peer never computes, and every packet after the update would fail to
+ * unprotect -- a failure that looks like the AEAD, three layers away.
+ *
+ * `into` and `from` may be the same object. Returns 0 on failure, leaving
+ * `into` untouched. */
+int quickeys_next(quickeys_t* into, const quickeys_t* from);
 
 void quickeys_free(quickeys_t* keys);
 
