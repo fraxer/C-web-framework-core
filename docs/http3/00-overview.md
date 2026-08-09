@@ -12,6 +12,7 @@
 | `06-qpack.md` | QPACK: статическая/динамическая таблица, потоки encoder/decoder, blocked streams |
 | `07-integration.md` | Конфиг, Alt-Svc, метрики, лимиты злоупотреблений, shutdown/reload |
 | `08-testing.md` | Юнит-векторы, interop-раннер, h3spec, qlog, фаззинг, нагрузка |
+| `09-options.md` | Отложенное, разделённое на обязательное / производительность / опции: цена, зависимости и критерий готовности каждого пункта |
 
 ---
 
@@ -234,7 +235,7 @@ RFC 9000 §13.3 и оно определяет форму `quicsendbuf` и `quic
 | 6 | QPACK | `06` | L | Векторы RFC 9204 Приложение B; Chrome/Firefox открывают сайт |
 | 7 | Интеграция: конфиг, Alt-Svc, метрики, лимиты, shutdown/reload, WebSocket over h3 | `07` | M | Браузер сам переключается на h3 после Alt-Svc; `/metrics` показывает секцию quic |
 | 8 | Тесты и interop | `08` | L | quic-interop-runner: handshake, transfer, retry, resumption, multiplexing, http3 — зелёные; h3spec без падений |
-| 9 | Опции: 0-RTT, CUBIC, ECN, GSO/GRO, DPLPMTUD, аффинность по CID, QUIC v2 | все | — | По отдельности, каждая за флагом |
+| 9 | Отложенное: обязательное (key update, миграция, Retry), производительность (CUBIC/BBR, ECN, GSO/GRO, DPLPMTUD, аффинность), опции (0-RTT, QUIC v2) | `09` | — | По отдельности, каждый пункт за своим флагом и со своим критерием — см. `09` |
 
 Фазы 2 и 3 частично параллелятся; 5 и 6 — нет (h3 без QPACK не разбирает ни
 одного запроса; на старте используем «QPACK-lite»: только статическая таблица и
