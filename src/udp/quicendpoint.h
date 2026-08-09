@@ -151,24 +151,21 @@ typedef struct {
  * connection table and endpoint keys. Call once per config load, after the
  * config is readable and BEFORE any worker thread exists -- the values are
  * plain globals, and that ordering is what makes them safe to read from every
- * worker afterwards. Mirrors h2_policy_init(). Returns 0 on failure. */
+ * worker afterwards. Mirrors h2_policy_init(). Returns 0 on failure.
+ *
+ * Split in two, and the split is the point. **Tunables** are re-read on every
+ * call, so a reload applies them. The **connection table and the two keys** are
+ * built once per process and deliberately survive a reload: a soft reload
+ * leaves the previous workers draining connections that route through that
+ * table, and the keys authenticate stateless reset tokens and NEW_TOKENs that
+ * peers are still holding. The consequence is that http3_max_connections,
+ * which sizes the table, only takes effect on a restart. Nothing frees any of
+ * it -- see the comment at the split for why. */
 int quic_policy_init(void);
 
 /* The connection defaults, never NULL: before quic_policy_init() runs it
  * returns the built-in ones, which is what a unit test gets. */
 const quic_conn_policy_t* quic_policy_conn(void);
-
-/* Release what quic_policy_init() created.
- *
- * Exists for the reload path, and quic_policy_init() calls it itself before
- * building the replacement -- that is the only caller. Process exit
- * deliberately does not call it: the table is reachable from a static pointer,
- * so it is not a leak by LSan's definition, and the shutdown drain is bounded
- * by a grace window that can expire with a worker still inside the endpoint.
- * Freeing the table under that worker would turn an orderly exit into a
- * use-after-free, which is a strictly worse trade than a process-lifetime
- * allocation the kernel reclaims a moment later. */
-void quic_policy_free(void);
 
 /* One endpoint per (address, udp port) across every vhost that enables http3,
  * mirroring how __listener_get folds vhosts onto one TCP listener. Returns the

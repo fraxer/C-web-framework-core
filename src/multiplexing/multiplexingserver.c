@@ -78,12 +78,27 @@ int mpxserver_run(appconfig_t* appconfig) {
                 appconfig_terminating()) {
                 __listeners_unlisten(listeners);
 #ifdef CWFR_HTTP3
-                /* Not unlisten: a QUIC endpoint's socket carries its
-                 * connections as well as new arrivals, so closing it would
-                 * strand the very connections being drained. The endpoint
-                 * refuses new ones and closes itself when its last connection
-                 * is gone (docs/http3/07 §5). */
-                quicendpoints_drain(endpoints);
+                /* Terminating and reloading need opposite things here, and a
+                 * QUIC endpoint is where the difference bites.
+                 *
+                 * Terminating: nothing is taking the port, so the socket stays
+                 * open to finish the connections it carries -- closing it would
+                 * strand the very ones being drained -- and new arrivals are
+                 * refused (docs/http3/07 §5).
+                 *
+                 * Reloading: the new configuration's endpoints are already
+                 * bound to the same port under SO_REUSEPORT, and the kernel
+                 * hashes each client to one socket of the group. A draining
+                 * socket left in that group refuses whatever hashes to it, and
+                 * the client's retransmissions hash the same way -- so it fails
+                 * for good rather than reaching the instance that could serve
+                 * it. Leaving the group is the only way to hand those clients
+                 * over, and it costs the connections this endpoint still holds
+                 * (see §5a). */
+                if (appconfig_terminating())
+                    quicendpoints_drain(endpoints);
+                else
+                    quicendpoints_unlisten(endpoints);
 #endif
             }
 

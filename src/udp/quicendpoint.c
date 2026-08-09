@@ -202,10 +202,6 @@ static void __conn_policy_init(void) {
 }
 
 int quic_policy_init(void) {
-    /* A reload calls this again; drop the previous table rather than leak it.
-     * Connections do not survive a reload, so nothing is orphaned. */
-    quic_policy_free();
-
     int64_t max_connections = env_get_int("http3_max_connections", QUIC_DEFAULT_MAX_CONNECTIONS);
     if (max_connections < 64) max_connections = 64;
     if (max_connections > 4000000) max_connections = 4000000;
@@ -255,6 +251,34 @@ int quic_policy_init(void) {
 
     __quic_new_token = env_get_int("http3_new_token", 1) != 0;
 
+    /* ---- Everything below is created once per process ---- *
+     *
+     * A reload calls this function again, and must not rebuild any of it.
+     *
+     * The keys are the reason §5 of docs/http3/07 asks for this: a stateless
+     * reset token is HMAC(reset_key, cid) and a NEW_TOKEN is sealed under
+     * token_key, both handed to peers that keep them. Rolling the keys turns
+     * every token already in the world into noise -- a peer that gets a reset
+     * no longer recognises one and retransmits into the void until its idle
+     * timeout, and a client presenting a NEW_TOKEN pays the Retry round trip it
+     * was given the token to avoid.
+     *
+     * The table is the reason it would have been a bug rather than a
+     * degradation. Endpoints borrow the pointer at creation, and a soft reload
+     * leaves the previous workers draining their connections through those
+     * endpoints -- so freeing it here would have pulled the routing table out
+     * from under live connections, and rebuilding it would have lost every
+     * mapping in it besides.
+     *
+     * What this costs: http3_max_connections no longer takes effect on a
+     * reload, because the table is sized from it. That is the honest trade --
+     * resizing means rehashing a structure other threads are reading -- and it
+     * is why nothing frees this. Process exit does not either: the shutdown
+     * grace window can expire with a worker still inside the endpoint, and
+     * freeing under that worker turns an orderly exit into a use-after-free.
+     * A static pointer is not a leak by LSan's definition. */
+    if (__quic_table != NULL) return 1;
+
     /* RAND_bytes rather than misc/random.h: these two are security inputs --
      * the reset key authenticates tokens a peer can collect, and the table seed
      * is what stops a peer from choosing colliding connection ids -- and
@@ -292,17 +316,13 @@ int quic_policy_init(void) {
         return 0;
     }
 
+    /* Printed once per process, never on a reload. That is the observable form
+     * of the paragraph above: seeing it twice would mean the keys rolled and
+     * every token in the world went stale. */
+    log_info("quic: connection table and keys created (%llu connections)\n",
+             (unsigned long long)max_connections);
+
     return 1;
-}
-
-void quic_policy_free(void) {
-    if (__quic_table != NULL) {
-        quiccidtable_free(__quic_table);
-        __quic_table = NULL;
-    }
-
-    explicit_bzero(__quic_reset_key, sizeof __quic_reset_key);
-    explicit_bzero(__quic_token_key, sizeof __quic_token_key);
 }
 
 /* ---- Token buckets ----

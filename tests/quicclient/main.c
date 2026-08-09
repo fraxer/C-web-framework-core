@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "h3client.h"
 #include "h3frame.h"
@@ -11,7 +12,7 @@
  *
  *   quicclient [host] [port] [-q] [-p /path] [-a authority] [-n N] [--expect]
  *              [--handshake-only] [--path-challenge] [--key-update] [--cid]
- *              [--migrate] [--new-token]
+ *              [--migrate] [--new-token [--pause N]]
  *
  * `-a` sets both the TLS server name and the :authority pseudo-header. They are
  * one flag because a server matches the virtual host on one and validates it
@@ -39,6 +40,7 @@ int main(int argc, char* argv[]) {
     int cid_test = 0;
     int migrate = 0;
     int new_token = 0;
+    int pause_ms = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) verbose = 0;
         else if (strcmp(argv[i], "--handshake-only") == 0) handshake_only = 1;
@@ -51,6 +53,7 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--cid") == 0) cid_test = 1;
         else if (strcmp(argv[i], "--migrate") == 0) migrate = 1;
         else if (strcmp(argv[i], "--new-token") == 0) new_token = 1;
+        else if (strcmp(argv[i], "--pause") == 0 && i + 1 < argc) pause_ms = atoi(argv[++i]);
     }
 
     if (concurrent < 1) concurrent = 1;
@@ -85,6 +88,14 @@ int main(int argc, char* argv[]) {
         if (token_len == 0) {
             printf("\nFAIL: no token to present\n");
             return 1;
+        }
+
+        /* Room for something to happen to the server in between -- a reload,
+         * say. A token that survives one proves the keys did. */
+        if (pause_ms > 0) {
+            printf("pausing %d ms\n", pause_ms);
+            fflush(stdout);
+            usleep((useconds_t)pause_ms * 1000);
         }
 
         quicclient_t second;
