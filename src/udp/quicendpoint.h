@@ -91,12 +91,49 @@ typedef struct quicendpoint {
     struct quicendpoint* next;
 } quicendpoint_t;
 
+/* What a new connection starts with (docs/http3/07-integration.md §1.2).
+ *
+ * These are transport parameters, so by rights they belong to quicconn -- but
+ * they are read from main.env, and reading env from the transport layer would
+ * put a config dependency under every unit test that builds a connection. They
+ * are read here instead, in the one function that already does exactly this at
+ * exactly the right moment, and quicconn_accept asks for them. Everything below
+ * is advertised to the peer in the ClientHello answer, so a value that is wrong
+ * is wrong for the whole connection: there is no renegotiating it.
+ *
+ * Sizes are in the units the RFC uses (bytes, milliseconds, counts), not the
+ * units the config uses, so the conversion happens once, here. */
+typedef struct {
+    uint64_t idle_timeout_ms;
+    uint64_t max_udp_payload_size;
+    uint64_t initial_max_data;
+    uint64_t initial_max_stream_data;
+    uint64_t max_streams_bidi;
+    uint64_t max_streams_uni;
+    /* The ceiling the connection receive window may be auto-tuned up to. Its
+     * own key rather than a multiple of initial_max_data, because the two
+     * answer different questions: how much an idle peer may send before we say
+     * anything, and how much memory one connection may ever cost us. */
+    uint64_t recv_window_max;
+    uint64_t active_cid_limit;
+    uint64_t ack_delay_ms;
+    int      pacing;
+    /* §8.1 says three. Configurable only so a test can make the limit fire
+     * without sending megabytes; anything but 3 is logged as the deviation it
+     * is. */
+    uint64_t amplification_factor;
+} quic_conn_policy_t;
+
 /* Read the process-wide QUIC policy from main.env and create the shared
  * connection table and endpoint keys. Call once per config load, after the
  * config is readable and BEFORE any worker thread exists -- the values are
  * plain globals, and that ordering is what makes them safe to read from every
  * worker afterwards. Mirrors h2_policy_init(). Returns 0 on failure. */
 int quic_policy_init(void);
+
+/* The connection defaults, never NULL: before quic_policy_init() runs it
+ * returns the built-in ones, which is what a unit test gets. */
+const quic_conn_policy_t* quic_policy_conn(void);
 
 /* Release what quic_policy_init() created.
  *

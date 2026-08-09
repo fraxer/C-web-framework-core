@@ -117,6 +117,10 @@ typedef struct quicconn {
      * unlike Retry, which is a policy. */
     uint64_t amplification_budget;
     int      address_validated;
+    /* Copied from the policy at accept, not read from it later: the budget
+     * below is spent against this multiplier for the life of the connection,
+     * and a reload halfway through must not change the arithmetic. */
+    uint64_t amplification_factor;
 
     quicconn_state_e state;
     uint64_t error_code;

@@ -14,9 +14,6 @@
 #include "quictime.h"
 #include "varint.h"
 
-/* §8.1: three times what the peer has sent, until its address is validated. */
-#define QUICCONN_AMPLIFICATION_FACTOR 3
-
 /* Largest packet we build. Below the path MTU with room to spare -- phase 9
  * adds discovery; until then a conservative fixed size beats a datagram that
  * is silently dropped by a tunnel. */
@@ -577,7 +574,7 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
     /* Every byte received raises what may be sent back before the address is
      * validated (§8.1). */
     if (!conn->address_validated)
-        conn->amplification_budget += (uint64_t)len * QUICCONN_AMPLIFICATION_FACTOR;
+        conn->amplification_budget += (uint64_t)len * conn->amplification_factor;
 
     (void)path;   /* migration is phase 9; the path is recorded at accept */
 
@@ -1078,9 +1075,16 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
         return NULL;
     }
 
+    /* Read once, here: everything below is decided at accept time and never
+     * revisited, so a reload cannot change a live connection's parameters --
+     * which is correct, since they were already advertised to the peer. */
+    const quic_conn_policy_t* policy = quic_policy_conn();
+
+    conn->amplification_factor = policy->amplification_factor;
+
     quiccc_init(&conn->cc, QUICCONN_MAX_PACKET);
-    quicpacer_init(&conn->pacer, QUICCONN_MAX_PACKET, 1);
-    quicloss_init(&conn->loss, &conn->cc, 25000);
+    quicpacer_init(&conn->pacer, QUICCONN_MAX_PACKET, policy->pacing);
+    quicloss_init(&conn->loss, &conn->cc, policy->ack_delay_ms * 1000);
 
     for (int i = 0; i < QUIC_ENC_COUNT; i++) {
         quicack_init(&conn->ack[i]);
@@ -1092,14 +1096,15 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
      * client checks them against the ids it actually saw, and that is what
      * binds this handshake to this connection. */
     quictp_defaults(&conn->local_params);
-    conn->local_params.max_idle_timeout = 30000;
-    conn->local_params.max_udp_payload_size = QUICCONN_MAX_PACKET;
-    conn->local_params.initial_max_data = 1048576;
-    conn->local_params.initial_max_stream_data_bidi_remote = 262144;
-    conn->local_params.initial_max_stream_data_uni = 262144;
-    conn->local_params.initial_max_streams_bidi = 100;
-    conn->local_params.initial_max_streams_uni = 8;
-    conn->local_params.active_connection_id_limit = 4;
+    conn->local_params.max_idle_timeout = policy->idle_timeout_ms;
+    conn->local_params.max_udp_payload_size = policy->max_udp_payload_size;
+    conn->local_params.initial_max_data = policy->initial_max_data;
+    conn->local_params.initial_max_stream_data_bidi_remote = policy->initial_max_stream_data;
+    conn->local_params.initial_max_stream_data_uni = policy->initial_max_stream_data;
+    conn->local_params.initial_max_streams_bidi = policy->max_streams_bidi;
+    conn->local_params.initial_max_streams_uni = policy->max_streams_uni;
+    conn->local_params.active_connection_id_limit = policy->active_cid_limit;
+    conn->local_params.max_ack_delay = policy->ack_delay_ms;
     conn->local_params.has_original_dcid = 1;
     conn->local_params.original_dcid = *odcid;
     conn->local_params.has_initial_scid = 1;
@@ -1108,7 +1113,7 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     conn->idle_timeout_us = conn->local_params.max_idle_timeout * 1000;
 
     quicflow_init_recv(&conn->recv_flow, conn->local_params.initial_max_data,
-                       conn->local_params.initial_max_data * 16);
+                       policy->recv_window_max);
     quicflow_init_send(&conn->send_flow, 0);
 
     conn->next_local_uni = 0;

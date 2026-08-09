@@ -39,6 +39,25 @@
 #define QUIC_DEFAULT_VN_BURST        200
 #define QUIC_DEFAULT_RESET_RATE      100
 #define QUIC_DEFAULT_RESET_BURST     200
+/* New connections per second, and how many may arrive at once. A handshake is
+ * the most expensive thing an unauthenticated peer can ask for -- a signature,
+ * a certificate chain on the wire, and per-connection state that lives until
+ * the idle timeout -- so it gets a bucket of its own, above and beyond the
+ * ceiling on how many connections may exist at all. */
+#define QUIC_DEFAULT_HANDSHAKE_RATE  500
+#define QUIC_DEFAULT_HANDSHAKE_BURST 1000
+
+/* Connection defaults. The same figures quicconn_accept used to hold inline,
+ * kept as the fallback so a build with no config -- a unit test -- behaves as
+ * it did before there were keys at all. */
+#define QUIC_DEFAULT_IDLE_TIMEOUT_SEC   30
+#define QUIC_DEFAULT_INITIAL_MAX_DATA   1048576
+#define QUIC_DEFAULT_STREAM_DATA        262144
+#define QUIC_DEFAULT_MAX_STREAMS_BIDI   100
+#define QUIC_DEFAULT_MAX_STREAMS_UNI    8
+#define QUIC_DEFAULT_ACTIVE_CID_LIMIT   4
+#define QUIC_DEFAULT_ACK_DELAY_MS       25
+#define QUIC_DEFAULT_AMPLIFICATION      3
 
 /* ---- Process-wide policy ----
  *
@@ -65,6 +84,98 @@ static int64_t  __quic_vn_rate = QUIC_DEFAULT_VN_RATE;
 static int64_t  __quic_vn_burst = QUIC_DEFAULT_VN_BURST;
 static int64_t  __quic_reset_rate = QUIC_DEFAULT_RESET_RATE;
 static int64_t  __quic_reset_burst = QUIC_DEFAULT_RESET_BURST;
+static int64_t  __quic_handshake_rate = QUIC_DEFAULT_HANDSHAKE_RATE;
+static int64_t  __quic_handshake_burst = QUIC_DEFAULT_HANDSHAKE_BURST;
+
+static quic_conn_policy_t __quic_conn_policy = {
+    .idle_timeout_ms        = QUIC_DEFAULT_IDLE_TIMEOUT_SEC * 1000,
+    .max_udp_payload_size   = QUIC_DEFAULT_UDP_PAYLOAD,
+    .initial_max_data       = QUIC_DEFAULT_INITIAL_MAX_DATA,
+    .initial_max_stream_data = QUIC_DEFAULT_STREAM_DATA,
+    .max_streams_bidi       = QUIC_DEFAULT_MAX_STREAMS_BIDI,
+    .max_streams_uni        = QUIC_DEFAULT_MAX_STREAMS_UNI,
+    .recv_window_max        = QUIC_DEFAULT_INITIAL_MAX_DATA * 16,
+    .active_cid_limit       = QUIC_DEFAULT_ACTIVE_CID_LIMIT,
+    .ack_delay_ms           = QUIC_DEFAULT_ACK_DELAY_MS,
+    .pacing                 = 1,
+    .amplification_factor   = QUIC_DEFAULT_AMPLIFICATION
+};
+
+const quic_conn_policy_t* quic_policy_conn(void) {
+    return &__quic_conn_policy;
+}
+
+/* One key, clamped into a range it cannot break the protocol from. Every bound
+ * here is a real limit of the code below it, not a taste: a receive window
+ * under a packet stalls the connection on its first datagram, and a payload
+ * size over the build's packet buffer would advertise room we cannot use. */
+static uint64_t __policy_u64(const char* key, uint64_t fallback,
+                             uint64_t min, uint64_t max) {
+    /* env_get_llong, not env_get_int: these are byte counts, and a value past
+     * 2^31 must clamp to the ceiling below rather than fall back to the default
+     * because the parse overflowed. */
+    const long long v = env_get_llong(key, (long long)fallback);
+
+    if (v < 0 || (uint64_t)v < min) return min;
+    if ((uint64_t)v > max) return max;
+
+    return (uint64_t)v;
+}
+
+static void __conn_policy_init(void) {
+    quic_conn_policy_t* p = &__quic_conn_policy;
+
+    /* §10.1 puts no ceiling on the idle timeout, but the connection state it
+     * keeps alive is ours, so an hour is where this one stops. */
+    p->idle_timeout_ms =
+        __policy_u64("http3_idle_timeout_sec", QUIC_DEFAULT_IDLE_TIMEOUT_SEC, 1, 3600) * 1000;
+
+    /* The floor is §14's minimum; the ceiling is the packet buffer quicconn
+     * builds into, and advertising more than that would promise room the code
+     * does not have. */
+    p->max_udp_payload_size =
+        __policy_u64("http3_max_udp_payload_size", QUIC_DEFAULT_UDP_PAYLOAD,
+                     QUIC_MIN_INITIAL_DATAGRAM, QUIC_DEFAULT_UDP_PAYLOAD);
+
+    p->initial_max_data =
+        __policy_u64("http3_initial_max_data", QUIC_DEFAULT_INITIAL_MAX_DATA,
+                     QUIC_MIN_INITIAL_DATAGRAM, 1073741824ULL);
+
+    p->initial_max_stream_data =
+        __policy_u64("http3_initial_max_stream_data", QUIC_DEFAULT_STREAM_DATA,
+                     QUIC_MIN_INITIAL_DATAGRAM, 1073741824ULL);
+
+    /* Zero would be legal on the wire and useless here: a client that may open
+     * no request stream has no way to ask for anything. */
+    p->max_streams_bidi =
+        __policy_u64("http3_max_streams_bidi", QUIC_DEFAULT_MAX_STREAMS_BIDI, 1, 65536);
+
+    /* HTTP/3 needs three of these before a request can be served (control and
+     * both QPACK streams), so the floor is what the protocol itself costs. */
+    p->max_streams_uni =
+        __policy_u64("http3_max_streams_uni", QUIC_DEFAULT_MAX_STREAMS_UNI, 3, 65536);
+
+    p->recv_window_max =
+        __policy_u64("http3_recv_window_max", QUIC_DEFAULT_INITIAL_MAX_DATA * 16,
+                     p->initial_max_data, 1073741824ULL);
+
+    p->active_cid_limit =
+        __policy_u64("http3_active_cid_limit", QUIC_DEFAULT_ACTIVE_CID_LIMIT, 2, 8);
+
+    /* §18.2 caps the parameter itself at 2^14 ms. */
+    p->ack_delay_ms =
+        __policy_u64("http3_ack_delay_ms", QUIC_DEFAULT_ACK_DELAY_MS, 0, 16383);
+
+    p->pacing = env_get_int("http3_pacing", 1) != 0;
+
+    p->amplification_factor =
+        __policy_u64("http3_amplification_factor", QUIC_DEFAULT_AMPLIFICATION, 1, 16);
+
+    if (p->amplification_factor != QUIC_DEFAULT_AMPLIFICATION)
+        log_error("quic: http3_amplification_factor is %llu, not the %d RFC 9000 §8.1 "
+                  "requires -- this server can be used to amplify traffic at a spoofed address\n",
+                  (unsigned long long)p->amplification_factor, QUIC_DEFAULT_AMPLIFICATION);
+}
 
 int quic_policy_init(void) {
     /* A reload calls this again; drop the previous table rather than leak it.
@@ -83,6 +194,8 @@ int quic_policy_init(void) {
 
     __quic_rcvbuf = env_get_int("http3_so_rcvbuf", 0);
     __quic_sndbuf = env_get_int("http3_so_sndbuf", 0);
+
+    __conn_policy_init();
 
     /* 0 disables a limit. Every one of these guesses a threshold, and an
      * operator needs a way to prove a limit is the cause of an incident --

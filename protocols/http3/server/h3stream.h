@@ -140,7 +140,17 @@ typedef struct h3stream {
      * memory (docs/http2/08 phase A.4, the same budget h2 applies). 0 = no
      * limit, which is what the unit harness uses. */
     size_t   max_field_section_size;
+    /* Where decoding stops instead of answering. Above the advertised limit the
+     * client is told 431 and keeps its connection; above this one there is no
+     * answer worth making, so the decoder abandons the block mid-way and the
+     * connection ends with H3_EXCESSIVE_LOAD. 0 = no limit. */
+    size_t   max_field_section_hard;
 } h3stream_t;
+
+/* How far above the advertised field-section limit decoding still happens. The
+ * figure HTTP/2 arrived at (docs/http2/08 phase A); shared so that raising one
+ * protocol's limit does not silently change the shape of the other's. */
+#define H3STREAM_FIELD_SECTION_HARD_FACTOR 8
 
 /* Create a stream with its own (empty) request. `connection` is the one the
  * request arrived on: it goes on the request, where the routing, redirect and

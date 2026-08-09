@@ -11,6 +11,8 @@
 #include "httpresponse.h"       /* httpresponse_free -- the stream owns its response */
 #include "httprequestparser.h"  /* httpparser_select_server */
 #include "httpparsercommon.h"   /* HTTP1PARSER_CONTINUE */
+#include "log.h"
+#include "metrics.h"
 #include "qpack.h"
 
 _Static_assert(sizeof(qpack_header_t) == sizeof(httpfields_field_t),
@@ -52,6 +54,16 @@ h3stream_t* h3stream_create(connection_t* connection, size_t max_field_section_s
     st->content_length = -1;
     st->req_body_len = 0;
     st->max_field_section_size = max_field_section_size;
+
+    /* The factor HTTP/2 uses, not the ×2 the plan first guessed at: an operator
+     * tunes one idea of "too many headers" across both protocols, and two
+     * different multipliers behind the same idea is a trap. "No limit" stays no
+     * limit -- 0 times anything must not become a cap of 0, which would reject
+     * every field section there is. */
+    st->max_field_section_hard =
+        max_field_section_size == 0 ? 0
+                                    : max_field_section_size * H3STREAM_FIELD_SECTION_HARD_FACTOR;
+
     return st;
 }
 
@@ -93,22 +105,61 @@ static h3stream_status_e body_append(h3stream_t* st, const uint8_t* data, size_t
     return H3STREAM_OK;
 }
 
+/* A field section's size as RFC 9114 §4.2.2 counts it -- the same formula HPACK
+ * and HTTP/2 use, which is why the two protocols can share one operator-facing
+ * idea of "too many headers" even with different limits behind it. */
+static size_t field_section_size(const qpack_header_t* fields, size_t count) {
+    size_t total = 0;
+
+    for (size_t i = 0; i < count; i++)
+        total += fields[i].name_len + fields[i].value_len + 32;
+
+    return total;
+}
+
 /* Decode a field section. QPACK_DECOMPRESSION_FAILED is connection-fatal: the
  * dynamic-table context is shared and unrecoverable, so it cannot be a stream
- * error. TOO_LARGE is the opposite -- the stream is fine, the client just sent
- * too much, and gets 431. Returns H3STREAM_OK when *fields is usable. */
+ * error. Returns H3STREAM_OK when *fields is usable.
+ *
+ * Two limits, not one, exactly as HTTP/2 settled on (docs/http2/08 phase A):
+ *
+ *   - the **hard** cap goes to the decoder, which stops the moment it is
+ *     passed. A block that big is decoded only as far as proving it is that
+ *     big, and the connection ends -- a peer that sends one is not going to
+ *     send a smaller one next;
+ *   - the **advertised** limit is checked afterwards, over a section that
+ *     decoded in full. That one is a 431: the message is well-formed and the
+ *     client can be told what was wrong with it, which it cannot be if the
+ *     connection is gone.
+ *
+ * Without the first, the advertised limit was doing both jobs, and the only
+ * outcome available for a field section of any size at all was to answer it. */
 static h3stream_status_e decode_fields(h3stream_t* st, qpack_decoder_t* qdec,
                                        const uint8_t* block, size_t len,
                                        qpack_header_t** fields, size_t* count) {
     const qpack_status_e qst = qpack_decode_block(qdec, block, len,
-                                                  st->max_field_section_size, fields, count);
+                                                  st->max_field_section_hard, fields, count);
     switch (qst) {
-    case QPACK_OK:               return H3STREAM_OK;
-    case QPACK_ERR_TOO_LARGE:    return H3STREAM_ERR_FIELDS_TOO_LARGE;
+    case QPACK_OK:               break;
+    case QPACK_ERR_TOO_LARGE:
+        metrics_h3(METRICS_H3_FIELD_SECTION_HARD);
+        log_error("h3: field section over the hard cap (%zu) -- closing connection\n",
+                  st->max_field_section_hard);
+        return H3STREAM_ERR_EXCESSIVE_LOAD;
     case QPACK_ERR_DECOMPRESSION:
     case QPACK_ERR_ENCODER_STREAM: return H3STREAM_ERR_QPACK_DECOMPRESSION;
     default:                     return H3STREAM_ERR_INTERNAL;
     }
+
+    if (st->max_field_section_size != 0 &&
+        field_section_size(*fields, *count) > st->max_field_section_size) {
+        qpack_headers_free(*fields, *count);
+        *fields = NULL;
+        *count = 0;
+        return H3STREAM_ERR_FIELDS_TOO_LARGE;
+    }
+
+    return H3STREAM_OK;
 }
 
 /* First HEADERS → request. */

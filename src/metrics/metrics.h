@@ -218,6 +218,7 @@ typedef enum {
     METRICS_H3_ABUSE_ABORT_BUDGET,
     METRICS_H3_ABUSE_CTRL_BUDGET,
     METRICS_H3_FIELD_SECTION_TOO_LARGE,  /* → 431 */
+    METRICS_H3_FIELD_SECTION_HARD,       /* → connection, decode abandoned */
     METRICS_H3_BODY_TOO_LARGE,           /* → 413 */
 
     METRICS_H3_STREAM_ERROR,        /* malformed message; the stream is reset */

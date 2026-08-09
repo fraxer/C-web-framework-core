@@ -54,10 +54,27 @@ static int __on_crypto(void* ctx, quic_enc_level_e level,
 static int __on_params(void* ctx, const quictp_t* params) {
     quicclient_t* c = ctx;
 
-    __log(c, "  [client] server transport parameters: initial_max_data %llu, "
-             "streams_bidi %llu\n",
+    /* Every parameter the server takes from main.env (docs/http3/07 §1.2).
+     * Printed in full because this is the only place they are observable: they
+     * ride inside the encrypted handshake, so a key that never reached the wire
+     * looks exactly like a key that was never read. */
+    __log(c, "  [client] server transport parameters:\n"
+             "  [client]   max_idle_timeout          %llu ms\n"
+             "  [client]   max_udp_payload_size      %llu\n"
+             "  [client]   initial_max_data          %llu\n"
+             "  [client]   initial_max_stream_data   %llu bidi_remote / %llu uni\n"
+             "  [client]   initial_max_streams       %llu bidi / %llu uni\n"
+             "  [client]   active_connection_id_limit %llu\n"
+             "  [client]   max_ack_delay             %llu ms\n",
+          (unsigned long long)params->max_idle_timeout,
+          (unsigned long long)params->max_udp_payload_size,
           (unsigned long long)params->initial_max_data,
-          (unsigned long long)params->initial_max_streams_bidi);
+          (unsigned long long)params->initial_max_stream_data_bidi_remote,
+          (unsigned long long)params->initial_max_stream_data_uni,
+          (unsigned long long)params->initial_max_streams_bidi,
+          (unsigned long long)params->initial_max_streams_uni,
+          (unsigned long long)params->active_connection_id_limit,
+          (unsigned long long)params->max_ack_delay);
 
     return 1;
 }
