@@ -927,6 +927,18 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
     metrics_quic(METRICS_QUIC_DGRAM_RECEIVED);
     metrics_quic_add(METRICS_QUIC_BYTES_RECEIVED, (unsigned long long)dgram->len);
 
+    /* The kernel's own drop counter is cumulative, so what is reported is the
+     * step since the last datagram that carried it. Wrap-around is handled by
+     * unsigned arithmetic; a step that huge means something else is wrong
+     * anyway. */
+    if (dgram->drops_valid) {
+        if (dgram->drops != ep->kernel_drops) {
+            metrics_quic_add(METRICS_QUIC_DROP_KERNEL_OVERFLOW,
+                             (uint32_t)(dgram->drops - ep->kernel_drops));
+            ep->kernel_drops = dgram->drops;
+        }
+    }
+
     quicinvariants_t inv;
     switch (quic_invariants_parse(dgram->data, dgram->len, QUIC_LOCAL_CID_LEN, &inv)) {
     case QUICINV_OK:

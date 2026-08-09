@@ -59,6 +59,19 @@ typedef struct udp_datagram {
      * IPV6_RECVTCLASS -- the field is here so the datagram struct does not have
      * to change shape then, not because it carries anything today. */
     uint8_t   ecn;
+
+    /* Datagrams the kernel dropped because this socket's receive queue was
+     * full, as a running total (SO_RXQ_OVFL). Present only on the datagram that
+     * follows a drop, so the caller reports the *difference* from the last one
+     * it saw.
+     *
+     * Without this the loss is invisible: recvmmsg cannot report what it never
+     * received, and the endpoint's own drop counters only count datagrams it
+     * decided to reject. Under a burst of handshakes that showed up as
+     * connections that simply never completed -- 41 datagrams gone and every
+     * server-side counter at zero (docs/http3/08 §7a). */
+    uint32_t  drops;
+    int       drops_valid;
 } udp_datagram_t;
 
 /* ---- Batched receive ----

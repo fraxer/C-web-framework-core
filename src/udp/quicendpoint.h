@@ -44,6 +44,10 @@ typedef struct quicendpoint {
 
     udp_rx_batch_t* rx;
 
+    /* Last value of the kernel's receive-overflow counter for this socket, so
+     * the metric can report the step rather than the running total. */
+    uint32_t kernel_drops;
+
     /* The endpoint's own deadline timer (docs/http3/01 §6).
      *
      * QUIC's timers are PTO, ack delay and pacing -- tens of milliseconds and

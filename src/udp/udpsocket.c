@@ -9,8 +9,10 @@
 #include "log.h"
 #include "udpsocket.h"
 
-/* Room for the local-address cmsg of either family plus the ECN byte. */
-#define UDP_CONTROL_SIZE (CMSG_SPACE(sizeof(struct in6_pktinfo)) + CMSG_SPACE(sizeof(int)))
+/* Room for the local-address cmsg of either family, the ECN byte and the
+ * receive-queue overflow counter. */
+#define UDP_CONTROL_SIZE (CMSG_SPACE(sizeof(struct in6_pktinfo)) + \
+                          CMSG_SPACE(sizeof(int)) + CMSG_SPACE(sizeof(uint32_t)))
 
 struct udp_rx_batch {
     size_t count;
@@ -89,6 +91,12 @@ int udp_socket_create(const struct sockaddr* addr, socklen_t addrlen,
         if (setsockopt(fd, IPPROTO_IP, IP_MTU_DISCOVER, &mtu, sizeof mtu) == -1)
             log_error("Udp socket error: IP_MTU_DISCOVER failed (errno %d)\n", errno);
     }
+
+    /* Ask the kernel to tell us what it drops. A failure here is not fatal:
+     * the counter is diagnostics, and a kernel without it (or a container that
+     * forbids it) should still serve traffic. */
+    if (setsockopt(fd, SOL_SOCKET, SO_RXQ_OVFL, &on, sizeof on) == -1)
+        log_error("Udp socket error: SO_RXQ_OVFL failed (errno %d)\n", errno);
 
     if (options != NULL && options->rcvbuf > 0)
         if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &options->rcvbuf,
@@ -177,6 +185,8 @@ void udp_rx_batch_free(udp_rx_batch_t* batch) {
 static void __parse_control(struct msghdr* hdr, udp_datagram_t* dgram) {
     dgram->local_valid = 0;
     dgram->ecn = 0;
+    dgram->drops = 0;
+    dgram->drops_valid = 0;
 
     for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(hdr); cmsg != NULL;
          cmsg = CMSG_NXTHDR(hdr, cmsg)) {
@@ -204,6 +214,10 @@ static void __parse_control(struct msghdr* hdr, udp_datagram_t* dgram) {
             sa->sin6_addr = info.ipi6_addr;
             sa->sin6_scope_id = info.ipi6_ifindex;
             dgram->local_valid = 1;
+        }
+        else if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_RXQ_OVFL) {
+            memcpy(&dgram->drops, CMSG_DATA(cmsg), sizeof dgram->drops);
+            dgram->drops_valid = 1;
         }
         /* ECN (IP_RECVTOS / IPV6_RECVTCLASS) is phase 9. The socket does not ask
          * for it, so there is deliberately no branch here: a placeholder that

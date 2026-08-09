@@ -127,7 +127,12 @@ typedef enum {
     METRICS_QUIC_DROP_SHORT_INITIAL,  /* long header in a datagram under 1200 bytes */
     METRICS_QUIC_DROP_UNKNOWN_CID,    /* no connection, and nothing owed in reply */
     METRICS_QUIC_DROP_NO_BUDGET,      /* a reply was owed but the rate limit said no */
-    METRICS_QUIC_DROP_PEER_VN,        /* a peer sent US a Version Negotiation packet */
+    METRICS_QUIC_DROP_PEER_VN,
+    /* Dropped by the kernel before we ever saw them, because the socket's
+     * receive queue was full (SO_RXQ_OVFL). The only drop counter here that is
+     * not our own decision, and the only one that says the machine, not the
+     * peer, is the problem: raise http3_so_rcvbuf. */
+    METRICS_QUIC_DROP_KERNEL_OVERFLOW,        /* a peer sent US a Version Negotiation packet */
 
     METRICS_QUIC_VERSION_NEGOTIATION, /* Version Negotiation packets sent */
     METRICS_QUIC_STATELESS_RESET,     /* stateless resets sent */
