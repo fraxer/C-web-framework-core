@@ -211,6 +211,55 @@ static const quictls_ops_t __tls_ops = {
     .alert = __on_alert
 };
 
+/* Put the information a lost packet carried back on the queues that produced
+ * it, and release the references.
+ *
+ * One function because there are two ways to learn a packet was lost -- an
+ * acknowledgement of a later one, and the loss timer -- and they must agree.
+ * They did not: the timer path handled only CRYPTO and STREAM and dropped the
+ * rest on the floor, so an announcement lost on a quiet connection (where no
+ * later acknowledgement ever comes, and the timer is therefore the only path)
+ * was never re-sent. That is a bug duplicated handling invites, so the
+ * duplication is what got removed.
+ *
+ * The frames are rebuilt from current state rather than replayed: a
+ * retransmitted MAX_DATA must carry today's limit, not yesterday's. */
+static void __requeue_lost(quicconn_t* conn, quic_enc_level_e level,
+                           quicframe_ref_t* lost) {
+    for (quicframe_ref_t* ref = lost; ref != NULL; ref = ref->next) {
+        if (ref->type == QUIC_FRAME_CRYPTO) {
+            quicsendbuf_lost(&conn->crypto_out[level], ref->offset,
+                             (size_t)ref->len, 0);
+        }
+        else if (ref->type >= QUIC_FRAME_STREAM && ref->type < QUIC_FRAME_STREAM + 8) {
+            quicstream_t* s = __stream_find(conn, ref->stream_id);
+            if (s != NULL)
+                quicsendbuf_lost(&s->send, ref->offset, (size_t)ref->len, ref->fin);
+        }
+        else if (ref->type == QUIC_FRAME_NEW_TOKEN) {
+            conn->new_token_sent = 0;
+            atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+        }
+        else if (ref->type == QUIC_FRAME_NEW_CONNECTION_ID) {
+            /* §13.3: unlike a limit, an id the peer never heard of cannot be
+             * re-derived from anything, so the announcement is queued again.
+             * The entry may have been retired meanwhile, in which case there is
+             * nothing to announce and nothing to do. */
+            for (size_t i = 0; i < QUICCONN_MAX_LOCAL_CIDS; i++)
+                if (conn->local_cids[i].active && conn->local_cids[i].seq == ref->offset) {
+                    conn->local_cids[i].announced = 0;
+                    atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+                    break;
+                }
+        }
+        /* Other control frames carry a limit and are not queued for
+         * retransmission: the next packet carries the current value anyway,
+         * which is both simpler and more correct than resending a stale one. */
+    }
+
+    quicframe_ref_free(lost);
+}
+
 /* ---- Frame handling ---- */
 
 static int __on_crypto_frame(quicconn_t* conn, quic_enc_level_e level,
@@ -265,41 +314,7 @@ static int __on_ack_frame(quicconn_t* conn, quic_enc_level_e level,
         quicrange_max(&acked) >= conn->key_update_tx_pn)
         conn->key_update_unconfirmed = 0;
 
-    /* Put the lost frames' information back on the queues that produced it.
-     * The frames themselves are rebuilt from current state, not replayed --
-     * a retransmitted MAX_DATA must carry today's limit, not yesterday's. */
-    for (quicframe_ref_t* ref = lost; ref != NULL; ref = ref->next) {
-        if (ref->type == QUIC_FRAME_CRYPTO) {
-            quicsendbuf_lost(&conn->crypto_out[level], ref->offset,
-                             (size_t)ref->len, 0);
-        }
-        else if (ref->type >= QUIC_FRAME_STREAM && ref->type < QUIC_FRAME_STREAM + 8) {
-            quicstream_t* s = __stream_find(conn, ref->stream_id);
-            if (s != NULL)
-                quicsendbuf_lost(&s->send, ref->offset, (size_t)ref->len, ref->fin);
-        }
-        else if (ref->type == QUIC_FRAME_NEW_TOKEN) {
-            conn->new_token_sent = 0;
-            atomic_store_explicit(&conn->want_write, 1, memory_order_release);
-        }
-        else if (ref->type == QUIC_FRAME_NEW_CONNECTION_ID) {
-            /* §13.3: unlike a limit, an id the peer never heard of cannot be
-             * re-derived from anything, so the announcement is queued again.
-             * The entry may have been retired meanwhile, in which case there is
-             * nothing to announce and nothing to do. */
-            for (size_t i = 0; i < QUICCONN_MAX_LOCAL_CIDS; i++)
-                if (conn->local_cids[i].active && conn->local_cids[i].seq == ref->offset) {
-                    conn->local_cids[i].announced = 0;
-                    atomic_store_explicit(&conn->want_write, 1, memory_order_release);
-                    break;
-                }
-        }
-        /* Other control frames carry a limit and are not queued for
-         * retransmission: the next packet carries the current value anyway,
-         * which is both simpler and more correct than resending a stale one. */
-    }
-
-    quicframe_ref_free(lost);
+    __requeue_lost(conn, level, lost);
     quicrange_free(&acked);
 
     atomic_store_explicit(&conn->want_write, 1, memory_order_release);
@@ -1927,21 +1942,8 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
             conn->pto_probes = 2;
             conn->pto_level = level;
         }
-        else {
-            for (quicframe_ref_t* ref = lost; ref != NULL; ref = ref->next) {
-                if (ref->type == QUIC_FRAME_CRYPTO)
-                    quicsendbuf_lost(&conn->crypto_out[level], ref->offset,
-                                     (size_t)ref->len, 0);
-                else if (ref->type >= QUIC_FRAME_STREAM &&
-                         ref->type < QUIC_FRAME_STREAM + 8) {
-                    quicstream_t* s = __stream_find(conn, ref->stream_id);
-                    if (s != NULL)
-                        quicsendbuf_lost(&s->send, ref->offset, (size_t)ref->len,
-                                         ref->fin);
-                }
-            }
-            quicframe_ref_free(lost);
-        }
+        else
+            __requeue_lost(conn, level, lost);
 
         atomic_store_explicit(&conn->want_write, 1, memory_order_release);
     }

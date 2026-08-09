@@ -397,6 +397,88 @@ TEST(test_quic_loss_pto) {
     quic_time_set_source(NULL);
 }
 
+/* The shape a live failure had: one packet lost while the connection carries on
+ * (docs/http3/08 §2a). Reproduced here because the live version could only say
+ * "the announcement never came back", and a deterministic clock can say which
+ * of the three recovery paths was supposed to fire. */
+TEST(test_quic_loss_stranded_packet) {
+    TEST_SUITE("quic_loss");
+
+    quic_time_set_source(__clock);
+    __now = 1000000;
+
+    quiccc_t cc;
+    quiccc_init(&cc, MTU);
+
+    quicloss_t loss;
+    quicloss_init(&loss, &cc, 25000);
+    loss.handshake_confirmed = 1;
+
+    quicrange_t acked;
+    quicrange_init(&acked, 0);
+    quicframe_ref_t* lost = NULL;
+
+    TEST_CASE("a later acknowledgement declares the stranded packet lost");
+    /* The ordinary path, and the one the live failure never reached: something
+     * newer is acknowledged, so the gap becomes visible.
+     *
+     * The lost packet carries a frame reference on purpose. Without one a
+     * declared loss produces an empty `out_lost`, and "nothing came back" reads
+     * identically to "nothing was lost" -- which is how the first version of
+     * this test managed to assert the opposite of what happened. */
+    quicframe_ref_t* carried = quicframe_ref_new(QUIC_FRAME_NEW_CONNECTION_ID);
+    TEST_REQUIRE(carried != NULL, "reference");
+
+    quicloss_on_sent(&loss, QUIC_ENC_APP, 0, 1200, 1, 1, carried, __now);
+    __now += 10000;
+    quicloss_on_sent(&loss, QUIC_ENC_APP, 1, 1200, 1, 1, NULL, __now);
+    __now += 10000;
+
+    quicrange_add(&acked, 1, 1);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost);
+
+    /* One acknowledgement of a newer packet is enough: the time threshold is
+     * 9/8 of the RTT, and 20 ms of it has passed. */
+    TEST_ASSERT(lost != NULL && lost->type == QUIC_FRAME_NEW_CONNECTION_ID,
+                "the stranded packet came back for retransmission");
+    quicframe_ref_free(lost);
+    lost = NULL;
+
+    quic_enc_level_e level = QUIC_ENC_INITIAL;
+
+    TEST_CASE("and with nothing left in flight the timers disarm");
+    TEST_ASSERT(quicloss_timeout(&loss, __now) == 0, "disarmed");
+
+    TEST_CASE("a packet nobody acknowledges past is reached by the PTO");
+    /* The live case: the peer has nothing ack-eliciting to acknowledge, so no
+     * later acknowledgement ever arrives and the branch above never runs. The
+     * PTO is the only thing left, and it must arm. */
+    quicloss_free(&loss);
+    quicloss_init(&loss, &cc, 25000);
+    loss.handshake_confirmed = 1;
+
+    quicloss_on_sent(&loss, QUIC_ENC_APP, 0, 1200, 1, 1, NULL, __now);
+
+    const uint64_t pto = quicloss_timeout(&loss, __now);
+    TEST_ASSERT(pto > __now, "PTO armed with one packet in flight");
+
+    __now = pto + 1;
+    TEST_ASSERT(quicloss_on_timeout(&loss, __now, &lost, &level) == 0, "a PTO");
+    TEST_ASSERT(level == QUIC_ENC_APP, "naming the application space");
+    TEST_ASSERT(loss.pto_count == 1, "backoff moved");
+
+    TEST_CASE("sending the probe does not disarm the PTO");
+    /* The probe is itself ack-eliciting and in flight, so the timer has to stay
+     * armed -- otherwise one lost probe strands the connection exactly as the
+     * original packet did. */
+    quicloss_on_sent(&loss, QUIC_ENC_APP, 1, 30, 1, 1, NULL, __now);
+    TEST_ASSERT(quicloss_timeout(&loss, __now) > __now, "still armed after the probe");
+
+    quicrange_free(&acked);
+    quicloss_free(&loss);
+    quic_time_set_source(NULL);
+}
+
 TEST(test_quic_loss_spaces) {
     TEST_SUITE("quic_loss");
 

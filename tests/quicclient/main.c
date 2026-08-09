@@ -244,12 +244,7 @@ int main(int argc, char* argv[]) {
 
             printf("replacement after retire:  %s\n", replaced ? "yes" : "no");
 
-            /* Only required on a clean path. Over a lossy one the announcement
-             * itself can be the packet that vanishes, and the server does not
-             * currently recover it -- see docs/http3/08 §2a, "Открытый вопрос".
-             * Asserting it here would report that known gap as a new failure on
-             * every seed that happens to drop the right packet. */
-            if (!replaced && loss_in == 0) ok = 0;
+            if (!replaced) ok = 0;
 
             /* §19.16 makes retiring a sequence number that was never issued a
              * protocol violation -- a MUST, and the only way to notice a peer

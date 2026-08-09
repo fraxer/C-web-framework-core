@@ -872,6 +872,23 @@ static void __route(quicendpoint_t* ep, quicconn_t* conn, udp_datagram_t* dgram)
     if (was_handshaking && conn->state != QUICCONN_HANDSHAKE &&
         ep->handshakes_in_flight > 0)
         ep->handshakes_in_flight--;
+
+    /* Run this connection's timers here as well as on the worker sweep.
+     *
+     * The sweep is a once-a-second walk of every connection; QUIC's timers are
+     * a PTO, and on any real path that is tens of milliseconds. A deadline that
+     * falls between two sweeps is a deadline that fires up to a second late --
+     * measured, not supposed: a probe armed 27 ms out was still unfired when
+     * the test gave up two seconds later, and the connection that was waiting
+     * on it stalled for good.
+     *
+     * Doing it on the receive path costs nothing (the connection is locked and
+     * being worked on already) and gives every connection that is exchanging
+     * anything at all timer resolution equal to its traffic. A connection that
+     * has gone completely silent still depends on the sweep -- closing that gap
+     * needs the endpoint timerfd of docs/http3/01 §7, armed from
+     * quicconn_next_timeout(). */
+    if (alive) alive = quicconn_tick(conn, now);
     /* Streams first, packets after: a response produced here goes out in the
      * very packet this call builds instead of waiting for the next event. */
     if (alive) alive = __h3_turn(conn, now);
