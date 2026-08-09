@@ -30,6 +30,15 @@ void quicflow_consume(quicflow_t* flow, uint64_t bytes) {
     flow->used += bytes;
 }
 
+uint64_t quicflow_consume_to(quicflow_t* flow, uint64_t end) {
+    if (flow == NULL || end <= flow->used) return 0;
+
+    const uint64_t added = end - flow->used;
+    flow->used = end;
+
+    return added;
+}
+
 int quicflow_update_limit(quicflow_t* flow, uint64_t limit) {
     if (flow == NULL) return 0;
 

@@ -1679,10 +1679,47 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
             if (room == 0 && !(s->send.fin && !s->send.fin_sent)) {
                 /* Only a closed window is counted, not a full packet: the
                  * second is the loop doing its job and would bury the first,
-                 * which is a stall the peer has to end. */
-                if (allowed == 0)
-                    metrics_quic(conn_allowed == 0 ? METRICS_QUIC_FLOW_BLOCKED_CONN
-                                                   : METRICS_QUIC_FLOW_BLOCKED_STREAM);
+                 * which is a stall the peer has to end.
+                 *
+                 * And it has to be told, or it never will (§4.1). A sender that
+                 * is blocked and silent looks to the peer exactly like one with
+                 * nothing to say: the peer sees no reason to raise a limit it
+                 * does not know is in the way, we stop building packets, our
+                 * want_write goes down, and nothing is left in flight to arm a
+                 * timer. That is a connection that is up, idle and finished,
+                 * and it is what a lossy 500 KB transfer used to end as.
+                 *
+                 * Once per limit value, which is what quicflow_should_send_blocked
+                 * is for -- a frame per blocked packet would be a flood. */
+                if (allowed == 0) {
+                    const int conn_level = conn_allowed == 0;
+
+                    metrics_quic(conn_level ? METRICS_QUIC_FLOW_BLOCKED_CONN
+                                            : METRICS_QUIC_FLOW_BLOCKED_STREAM);
+
+                    quicflow_t* blocked = conn_level ? &conn->send_flow : &s->send_flow;
+
+                    if (quicflow_should_send_blocked(blocked) && p + 24 < payload_cap) {
+                        quicframe_t bf;
+                        memset(&bf, 0, sizeof bf);
+
+                        if (conn_level) {
+                            bf.type = QUIC_FRAME_DATA_BLOCKED;
+                            bf.u.data_blocked.limit = blocked->limit;
+                        }
+                        else {
+                            bf.type = QUIC_FRAME_STREAM_DATA_BLOCKED;
+                            bf.u.stream_data_blocked.id = s->id;
+                            bf.u.stream_data_blocked.limit = blocked->limit;
+                        }
+
+                        const size_t bn = quicframe_write(payload + p, payload_cap - p, &bf);
+                        if (bn > 0) {
+                            p += bn;
+                            ack_eliciting = 1;
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -1706,8 +1743,12 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
             ack_eliciting = 1;
 
             quicsendbuf_mark_sent(&s->send, offset, dlen, fin);
-            quicflow_consume(&s->send_flow, dlen);
-            quicflow_consume(&conn->send_flow, dlen);
+
+            /* By offset, not by bytes written -- see quicflow_consume_to. The
+             * connection-level window is charged the same advance, because it
+             * is the sum of the streams' highest offsets and nothing else. */
+            quicflow_consume(&conn->send_flow,
+                             quicflow_consume_to(&s->send_flow, offset + dlen));
 
             if (fin) s->send_state = QUIC_SEND_DATA_SENT;
 

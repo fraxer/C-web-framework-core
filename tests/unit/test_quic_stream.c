@@ -138,6 +138,26 @@ TEST(test_quic_flow) {
     quicflow_consume(&flow, 400);
     TEST_ASSERT(quicflow_available(&flow) == 0, "exhausted");
 
+    TEST_CASE("the send window is spent by offset, not by traffic (§4.1)");
+    /* A retransmission reoccupies offsets it has already paid for. Charging it
+     * again spends a window the peer never saw used -- and on a lossy path that
+     * window shrinks with every loss until the transfer stops with data still
+     * to send. Found by the interop runner: a 500 KB transfer at 30 % loss
+     * stalled at 372 KB with the stream window "exhausted" (docs/http3/08 §3f). */
+    quicflow_init_send(&flow, 1000);
+    TEST_ASSERT(quicflow_consume_to(&flow, 400) == 400, "first send advances by all of it");
+    TEST_ASSERT(quicflow_available(&flow) == 600, "600 left");
+    TEST_ASSERT(quicflow_consume_to(&flow, 400) == 0, "resending the same range costs nothing");
+    TEST_ASSERT(quicflow_available(&flow) == 600, "still 600");
+    TEST_ASSERT(quicflow_consume_to(&flow, 250) == 0, "nor does resending part of it");
+    TEST_ASSERT(quicflow_available(&flow) == 600, "still 600");
+    TEST_ASSERT(quicflow_consume_to(&flow, 700) == 300, "only the new offsets are charged");
+    TEST_ASSERT(quicflow_available(&flow) == 300, "300 left");
+
+    /* Back to where the first case left it: limit 1000, fully spent. */
+    quicflow_init_send(&flow, 1000);
+    quicflow_consume(&flow, 1000);
+
     TEST_CASE("limits only ever grow (§4.1)");
     /* A reordered MAX_DATA carrying an older value must not shrink the window:
      * shrinking below what has already been sent is unrecoverable. */

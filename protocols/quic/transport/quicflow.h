@@ -52,6 +52,19 @@ uint64_t quicflow_available(const quicflow_t* flow);
 /* Account for bytes about to be sent. */
 void quicflow_consume(quicflow_t* flow, uint64_t bytes);
 
+/* Account for a stream reaching `end`, its highest offset sent.
+ *
+ * §4.1 puts the limit on the offset, not on the traffic: retransmitted data
+ * reoccupies offsets it has already paid for, and charging it again spends a
+ * window the peer never saw used. The receive side has always counted this way
+ * (quicflow_record_received); the send side counted bytes, and on a lossy path
+ * that is a window that shrinks with every loss until the transfer stops with
+ * data still to send and no timer left to wake it.
+ *
+ * Returns how far the offset advanced -- which is exactly what the
+ * connection-level window must be charged as well. */
+uint64_t quicflow_consume_to(quicflow_t* flow, uint64_t end);
+
 /* The peer raised the limit (MAX_DATA / MAX_STREAM_DATA). A limit that does not
  * grow is ignored: §4.1 requires limits to be monotonic, and a reordered frame
  * carrying an older value must not shrink the window. Returns 1 if it grew. */

@@ -30,6 +30,11 @@ typedef struct hq_stream {
      * nothing at all, because there is no way to say anything else. */
     FILE*    file;
 
+    /* Bytes handed to the send buffer. Only for the log line that tells "we
+     * never wrote it" apart from "we wrote it and the transport did not get it
+     * there" -- which is the whole question when a transfer stalls. */
+    uint64_t sent;
+
     unsigned answered : 1;    /* the request line is dealt with, one way or another */
     unsigned finished : 1;    /* our side of the stream is closed */
 } hq_stream_t;
@@ -116,9 +121,14 @@ static void __answer(quicstream_t* qs, hq_stream_t* st, const server_t* server) 
     const size_t path_len = len - (sizeof get - 1);
 
     st->file = __open_under_root(server, path, path_len);
-    if (st->file == NULL)
+    if (st->file == NULL) {
         log_info("hq: stream %llu: no such file \"%.*s\"\n",
                  (unsigned long long)qs->id, (int)path_len, path);
+        return;
+    }
+
+    log_info("hq: stream %llu: GET \"%.*s\"\n",
+             (unsigned long long)qs->id, (int)path_len, path);
 }
 
 /* Read what has arrived and, if the line is complete, answer it. */
@@ -160,13 +170,18 @@ static void __write(quicconn_t* conn, quicstream_t* qs, hq_stream_t* st) {
 
     while (st->file != NULL) {
         const size_t room = quicconn_write_room(conn);
-        if (room == 0) return;   /* asked for again next turn */
+        if (room == 0) {
+            log_info("hq: stream %llu: no write room at %llu bytes\n",
+                     (unsigned long long)qs->id, (unsigned long long)st->sent);
+            return;   /* asked for again next turn */
+        }
 
         uint8_t buf[HQ_CHUNK];
         const size_t want = room < sizeof buf ? room : sizeof buf;
         const size_t n = fread(buf, 1, want, st->file);
 
         if (n > 0 && !quicstream_write(qs, buf, n)) return;
+        st->sent += n;
 
         if (n < want) {
             fclose(st->file);
@@ -177,6 +192,9 @@ static void __write(quicconn_t* conn, quicstream_t* qs, hq_stream_t* st) {
 
     quicstream_finish(qs);
     st->finished = 1;
+
+    log_info("hq: stream %llu: handed %llu bytes to the transport\n",
+             (unsigned long long)qs->id, (unsigned long long)st->sent);
 }
 
 /* ---- The turn ---- */
