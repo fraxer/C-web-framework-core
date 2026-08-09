@@ -28,6 +28,8 @@
 
 static int __key_update_arm(quicconn_t* conn);
 static void __cids_replenish(quicconn_t* conn);
+static int __path_same(const quicpath_t* a, const quicpath_t* b);
+static void __path_probe_succeed(quicconn_t* conn);
 
 static quicconn_t* __conn_of(connection_t* connection) {
     /* Safe because conn is the first member of quicconn_t, which is also why
@@ -492,6 +494,15 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
         return 1;
 
     case QUIC_FRAME_PATH_RESPONSE:
+        /* §8.2.3 validates on the data, and only on the path the challenge was
+         * sent to: an answer that comes back by the old route says nothing
+         * about the new one, and accepting it would be exactly the confusion an
+         * off-path attacker wants (§9.3.3). */
+        if (conn->probe_active && conn->recv_path != NULL &&
+            __path_same(conn->recv_path, &conn->probe_path) &&
+            memcmp(frame->u.path.data, conn->probe_data, sizeof conn->probe_data) == 0)
+            __path_probe_succeed(conn);
+
         return 1;
 
     case QUIC_FRAME_CONNECTION_CLOSE:
@@ -597,6 +608,74 @@ static void __cids_replenish(quicconn_t* conn) {
 
     while (__cid_active_count(conn) < want)
         if (!__cid_issue(conn)) break;
+}
+
+/* ---- Path validation and migration (RFC 9000 §8.2, §9) ---- */
+
+/* How many times a challenge is repeated before the new path is given up on.
+ * §8.2.4 leaves the number open and asks only that it be bounded; three PTOs is
+ * the same shape as the loss detector's own patience. */
+#define QUICCONN_PROBE_ATTEMPTS 3
+
+static int __path_same(const quicpath_t* a, const quicpath_t* b) {
+    if (a->remote_len != b->remote_len) return 0;
+
+    /* Compared as bytes of sockaddr_storage rather than field by field: the
+     * family decides which fields exist, and getting that wrong silently
+     * compares padding instead of the port. */
+    return memcmp(&a->remote, &b->remote, a->remote_len) == 0;
+}
+
+/* Begin validating an address the peer has started sending from. */
+static void __path_probe_start(quicconn_t* conn, const quicpath_t* path, uint64_t now_us) {
+    /* §9.3: not more often than one validation per 3xPTO. An attacker able to
+     * forge a source address on packets it captured could otherwise make us
+     * probe an address of its choosing as fast as it can replay. */
+    const uint64_t pto = quicloss_pto_us(&conn->loss, QUIC_ENC_APP);
+
+    if (conn->probe_active && now_us < conn->probe_started_us + pto * 3) return;
+    if (conn->probe_active && __path_same(&conn->probe_path, path)) return;
+
+    if (RAND_bytes(conn->probe_data, sizeof conn->probe_data) != 1) return;
+
+    conn->probe_path = *path;
+    conn->probe_active = 1;
+    conn->probe_pending = 1;
+    conn->probe_attempts = 0;
+    conn->probe_started_us = now_us;
+    conn->probe_next_us = now_us + pto;
+
+    metrics_quic(METRICS_QUIC_MIGRATION_ATTEMPTED);
+
+    atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+}
+
+/* The peer answered on the path being validated: move to it (§9.3). */
+static void __path_probe_succeed(quicconn_t* conn) {
+    conn->path = conn->probe_path;
+    conn->probe_active = 0;
+    conn->probe_pending = 0;
+
+    /* §9.4: the new path is a different network. Carrying over a congestion
+     * window and an RTT earned somewhere else is how a migration turns into a
+     * burst of loss on the first packet.
+     *
+     * The estimator is cleared field by field rather than by re-running
+     * quicloss_init: that would drop the sent lists on the floor, and they hold
+     * packets still waiting to be acknowledged -- on the old path, but their
+     * acknowledgements are still coming. */
+    quiccc_init(&conn->cc, QUICCONN_MAX_PACKET);
+
+    conn->loss.have_rtt_sample = 0;
+    conn->loss.latest_rtt_us = 0;
+    conn->loss.smoothed_rtt_us = 0;
+    conn->loss.rttvar_us = 0;
+    conn->loss.min_rtt_us = 0;
+    conn->loss.pto_count = 0;
+
+    metrics_quic(METRICS_QUIC_MIGRATION_VALIDATED);
+
+    log_info("quic: migrated to a new peer address\n");
 }
 
 /* ---- Key update (RFC 9001 §6) ---- */
@@ -752,12 +831,26 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
     }
 
     int ack_eliciting = 0;
+    /* §9.1: a packet carrying nothing but probing frames says the peer is
+     * testing a path, not using it, and must not move the connection onto that
+     * path by itself. */
+    int non_probing = 0;
     size_t off = 0;
     quicframe_t frame;
     quicframe_status_e st;
 
     while ((st = quicframe_next(plain, plain_len, &off, &frame)) == QUICFRAME_OK) {
         if (quicframe_is_ack_eliciting(frame.type)) ack_eliciting = 1;
+
+        switch (frame.type) {
+        case QUIC_FRAME_PADDING:
+        case QUIC_FRAME_PATH_CHALLENGE:
+        case QUIC_FRAME_PATH_RESPONSE:
+        case QUIC_FRAME_NEW_CONNECTION_ID:
+            break;
+        default:
+            non_probing = 1;
+        }
 
         if (!__handle_frame(conn, level, &frame, now_us)) return 0;
     }
@@ -767,8 +860,19 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
         return 0;
     }
 
+    /* §9.3: the address only moves on a non-probing packet that is *newer*
+     * than anything seen before. Without the packet-number test a replayed old
+     * packet, injected from an address of the attacker's choosing, would drag
+     * the connection back and forth. Read before quicack_on_received, which is
+     * what makes this packet the largest. */
+    const int newest = !conn->ack[level].any_received || pn > conn->ack[level].largest;
+
     quicack_on_received(&conn->ack[level], level, pn, ack_eliciting, now_us,
                         conn->local_params.max_ack_delay * 1000);
+
+    if (level == QUIC_ENC_APP && non_probing && newest &&
+        conn->recv_path != NULL && !__path_same(conn->recv_path, &conn->path))
+        __path_probe_start(conn, conn->recv_path, now_us);
 
     if (ack_eliciting) atomic_store_explicit(&conn->want_write, 1, memory_order_release);
 
@@ -796,12 +900,18 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
     if (!conn->address_validated)
         conn->amplification_budget += (uint64_t)len * conn->amplification_factor;
 
-    (void)path;   /* migration is phase 9; the path is recorded at accept */
+    /* Where this datagram came from, for the frame handlers and the migration
+     * check below. Cleared on the way out: a stale pointer here would be read
+     * on a later call with nothing behind it. */
+    conn->recv_path = path;
 
     /* A datagram may carry several packets (§12.2). The buffer is copied
      * because header protection and decryption work in place. */
     uint8_t copy[2048];
-    if (len > sizeof copy) return 1;
+    if (len > sizeof copy) {
+        conn->recv_path = NULL;
+        return 1;
+    }
     memcpy(copy, datagram, len);
 
     size_t off = 0;
@@ -809,11 +919,15 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
     quicpkt_status_e st;
 
     while (quicpkt_next(copy, len, &off, QUIC_LOCAL_CID_LEN, &pkt, &st)) {
-        if (!__process_packet(conn, copy + off - pkt.pkt_len, pkt.pkt_len, &pkt, now_us))
+        if (!__process_packet(conn, copy + off - pkt.pkt_len, pkt.pkt_len, &pkt, now_us)) {
+            conn->recv_path = NULL;
             return 0;
+        }
 
         if (conn->state == QUICCONN_DRAINING) break;
     }
+
+    conn->recv_path = NULL;
 
     /* Drive the handshake with whatever CRYPTO arrived. */
     if (conn->state == QUICCONN_HANDSHAKE) {
@@ -1167,6 +1281,78 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
     return total;
 }
 
+/* One datagram carrying nothing but the outstanding PATH_CHALLENGE, sent to the
+ * address being validated rather than to the connection's current one.
+ *
+ * Its own function, and its own datagram, because everything else in the send
+ * path is addressed to conn->path. Mixing the two would either send the
+ * challenge where it proves nothing or send the connection's data to an
+ * unvalidated address. */
+static void __path_probe_send(quicconn_t* conn, uint64_t now_us) {
+    quickeys_t* keys = &conn->tx[QUIC_ENC_APP];
+    if (!keys->valid) return;
+
+    uint8_t payload[QUICCONN_MAX_PACKET];
+    quicframe_t f;
+    memset(&f, 0, sizeof f);
+    f.type = QUIC_FRAME_PATH_CHALLENGE;
+    memcpy(f.u.path.data, conn->probe_data, sizeof f.u.path.data);
+
+    size_t p = quicframe_write(payload, sizeof payload, &f);
+    if (p == 0) return;
+
+    quiccid_t* dcid = conn->peer_cid_count > 0 ? &conn->peer_cids[0] : NULL;
+    if (dcid == NULL) return;
+
+    const uint64_t pn = conn->loss.space[QUIC_ENC_APP].next_pn;
+    const size_t pn_len = quicpkt_pn_length(pn, conn->loss.space[QUIC_ENC_APP].largest_acked);
+
+    quicpkt_hdr_out_t hdr;
+    memset(&hdr, 0, sizeof hdr);
+    hdr.type = QUIC_PKT_SHORT;
+    hdr.version = QUIC_VERSION_1;
+    hdr.dcid = dcid;
+    hdr.scid = &conn->local_cids[0].cid;
+    hdr.pn = pn;
+    hdr.pn_len = pn_len;
+    hdr.key_phase = conn->key_phase;
+
+    /* §8.2.1: the datagram is padded to 1200 bytes, because a path that cannot
+     * carry that much is not a path QUIC can use, and validating it would only
+     * move the failure later. The padding goes in before sealing so it is
+     * covered by the AEAD like any other payload. */
+    if (p < QUIC_MIN_INITIAL_DATAGRAM - 64) {
+        memset(payload + p, 0, QUIC_MIN_INITIAL_DATAGRAM - 64 - p);
+        p = QUIC_MIN_INITIAL_DATAGRAM - 64;
+    }
+
+    hdr.payload_len = p + QUIC_AEAD_TAG_LEN;
+
+    uint8_t datagram[QUICCONN_MAX_PACKET];
+    size_t pn_offset = 0;
+    const size_t header_len = quicpkt_write_header(datagram, sizeof datagram, &hdr, &pn_offset);
+    if (header_len == 0) return;
+
+    size_t sealed_len = 0;
+    if (!quiccrypto_seal(keys, pn, datagram, header_len, payload, p,
+                         datagram + header_len, &sealed_len))
+        return;
+
+    const size_t total = header_len + sealed_len;
+    if (!quichp_apply(keys, datagram, total, pn_offset, pn_len)) return;
+
+    /* Recorded as sent but **not in flight**: the congestion window belongs to
+     * the path in use, and a probe on a different one must neither consume it
+     * nor be treated as loss on it when the new path turns out to be dead. */
+    quicloss_on_sent(&conn->loss, QUIC_ENC_APP, pn, total, 1, 0, NULL, now_us);
+
+    quicendpoint_send(conn->endpoint, datagram, total, &conn->probe_path);
+
+    conn->probe_pending = 0;
+    conn->probe_attempts++;
+    conn->probe_next_us = now_us + quicloss_pto_us(&conn->loss, QUIC_ENC_APP);
+}
+
 int quicconn_send(quicconn_t* conn, uint64_t now_us) {
     if (conn == NULL) return 0;
     if (conn->state == QUICCONN_DRAINING || conn->state == QUICCONN_DEAD) return 1;
@@ -1179,6 +1365,11 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
         atomic_store_explicit(&conn->want_write, 0, memory_order_release);
         return 1;
     }
+
+    /* Ahead of the connection's own datagram: §8.2.2 will not have the answer
+     * delayed, and the same urgency applies to the question. */
+    if (conn->probe_active && conn->probe_pending)
+        __path_probe_send(conn, now_us);
 
     uint8_t datagram[QUICCONN_MAX_PACKET];
     int sent_anything = 0;
@@ -1608,6 +1799,23 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
 
         conn->state = QUICCONN_DEAD;
         return 0;
+    }
+
+    /* Repeat or abandon an outstanding path validation (§8.2.4). Abandoning is
+     * not an error: the connection carries on where it was, which is exactly
+     * what should happen when a spoofed address, or a NAT that closed again,
+     * turns out not to answer. */
+    if (conn->probe_active && !conn->probe_pending && now_us >= conn->probe_next_us) {
+        if (conn->probe_attempts >= QUICCONN_PROBE_ATTEMPTS) {
+            conn->probe_active = 0;
+            metrics_quic(METRICS_QUIC_MIGRATION_REJECTED);
+            log_info("quic: path validation abandoned after %u attempts\n",
+                     conn->probe_attempts);
+        }
+        else {
+            conn->probe_pending = 1;
+            atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+        }
     }
 
     const uint64_t timeout = quicloss_timeout(&conn->loss, now_us);

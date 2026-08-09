@@ -188,6 +188,15 @@ typedef enum {
     METRICS_QUIC_AT_CAPACITY,
     METRICS_QUIC_HANDSHAKE_RATE_LIMITED,
 
+    /* Peer address changes (§9). Three counters rather than one because they
+     * are three different stories: attempted is how often clients move
+     * (mobile networks, NAT rebinding), validated is how often that worked, and
+     * the difference is either a broken path or someone spoofing addresses at
+     * us -- and only the ratio distinguishes them. */
+    METRICS_QUIC_MIGRATION_ATTEMPTED,
+    METRICS_QUIC_MIGRATION_VALIDATED,
+    METRICS_QUIC_MIGRATION_REJECTED,
+
     METRICS_QUIC__COUNT
 } metrics_quic_t;
 

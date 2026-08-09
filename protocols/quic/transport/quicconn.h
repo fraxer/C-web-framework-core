@@ -167,6 +167,34 @@ typedef struct quicconn {
     uint8_t  path_response_data[8];
     int      path_response_pending;
 
+    /* ---- Migration (RFC 9000 §9) ---- *
+     *
+     * The address a peer sends from can change under it -- a NAT rebinding, a
+     * phone leaving wifi -- and QUIC is meant to survive that, because it
+     * routes by connection id rather than by the 4-tuple. What it must not do
+     * is believe the new address on sight: anyone able to spoof a source
+     * address could otherwise redirect a connection's whole output at a victim.
+     * So a changed address starts a path validation (§8.2), and nothing moves
+     * until the peer answers on the new path.
+     *
+     * Data keeps flowing to the old address meanwhile. That is the conservative
+     * half of §9.3 -- an unvalidated path may carry data under a 3x limit, but
+     * the old path has no such limit and, if the peer really moved, one round
+     * trip of delay is all it costs. */
+    quicpath_t probe_path;
+    uint8_t    probe_data[8];
+    int        probe_active;
+    int        probe_pending;        /* the challenge still has to go out */
+    unsigned   probe_attempts;
+    uint64_t   probe_next_us;        /* when to repeat it */
+    uint64_t   probe_started_us;     /* for the once-per-3xPTO floor below */
+
+    /* Where the datagram being processed came from. Set once per
+     * quicconn_recv; the frame handlers need it to tell a PATH_RESPONSE that
+     * arrived on the path being validated from one that took the old one, and
+     * threading it through every signature to say so would be worse. */
+    const quicpath_t* recv_path;
+
     quicconn_state_e state;
     uint64_t error_code;
     int      error_is_app;

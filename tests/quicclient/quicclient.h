@@ -123,8 +123,26 @@ typedef struct quicclient {
     int     path_response_received;
     int     path_response_matched;   /* the echo came back byte for byte */
 
+    /* And the other direction: the server challenges us after a rebinding, and
+     * the migration only completes if we answer. */
+    uint8_t path_challenge_in[8];
+    int     path_challenge_received;
+    int     path_response_queued;
+
+    int      ping_queued;
+    uint64_t datagrams_received;
+
     int verbose;
 } quicclient_t;
+
+/* Queue a PING: the smallest non-probing frame there is, which is what §9.3
+ * requires before a server will treat a new address as the peer's. */
+int quicclient_ping(quicclient_t* client);
+
+/* Move to a new source port, as a NAT rebinding would (RFC 9000 §9). The old
+ * socket is closed and a fresh one bound, so the server sees the connection
+ * arriving from an address it has never validated. Returns 0 on failure. */
+int quicclient_rebind(quicclient_t* client);
 
 /* Address the server by one of the ids it issued, instead of the one from the
  * handshake. Returns 0 if there is no such id. */

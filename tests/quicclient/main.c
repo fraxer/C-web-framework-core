@@ -11,6 +11,7 @@
  *
  *   quicclient [host] [port] [-q] [-p /path] [-a authority] [-n N] [--expect]
  *              [--handshake-only] [--path-challenge] [--key-update] [--cid]
+ *              [--migrate]
  *
  * `-a` sets both the TLS server name and the :authority pseudo-header. They are
  * one flag because a server matches the virtual host on one and validates it
@@ -36,6 +37,7 @@ int main(int argc, char* argv[]) {
     int path_challenge = 0;
     int key_update = 0;
     int cid_test = 0;
+    int migrate = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) verbose = 0;
         else if (strcmp(argv[i], "--handshake-only") == 0) handshake_only = 1;
@@ -46,6 +48,7 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--path-challenge") == 0) path_challenge = 1;
         else if (strcmp(argv[i], "--key-update") == 0) key_update = 1;
         else if (strcmp(argv[i], "--cid") == 0) cid_test = 1;
+        else if (strcmp(argv[i], "--migrate") == 0) migrate = 1;
     }
 
     if (concurrent < 1) concurrent = 1;
@@ -157,6 +160,43 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    /* Migration (RFC 9000 §9). The server must notice the new address, validate
+     * it before trusting it, and only then move -- so what is checked is not
+     * "did anything arrive" but the whole sequence, in order. */
+    if (ok && migrate) {
+        printf("\nMIGRATION\n");
+
+        for (int i = 0; i < 20 && client.server_cid_count == 0; i++)
+            quicclient_pump(&client, 100);
+
+        if (!quicclient_rebind(&client))
+            printf("FAIL: could not rebind\n");
+
+        /* Something non-probing from the new address, or §9.3 says the server
+         * is right to ignore it: a probing packet tests a path, it does not
+         * claim one. A PING is the smallest thing that qualifies. */
+        quicclient_ping(&client);
+
+        for (int i = 0; i < 30 && !client.path_challenge_received; i++)
+            quicclient_pump(&client, 100);
+
+        printf("challenged on the new path: %s\n",
+               client.path_challenge_received ? "yes" : "no");
+        if (!client.path_challenge_received) ok = 0;
+
+        /* Our answer to it is what completes the validation; then the server's
+         * next response must arrive at the new address, which it can only do
+         * if it moved. */
+        const uint64_t before = client.datagrams_received;
+
+        for (int i = 0; i < 30 && client.datagrams_received == before; i++)
+            quicclient_pump(&client, 100);
+
+        printf("server answers the new one: %s\n",
+               client.datagrams_received > before ? "yes" : "no");
+        if (client.datagrams_received <= before) ok = 0;
+    }
+
     /* Key update (RFC 9001 §6). Like the challenge above, this belongs before
      * HTTP/3: it is a transport obligation, and the exchange that proves it has
      * to be one the application layer plays no part in. */
@@ -182,12 +222,18 @@ int main(int argc, char* argv[]) {
         if (!client.read_after_update || !client.path_response_matched) ok = 0;
     }
 
+    /* --migrate deliberately falls through to the HTTP/3 exchange below when it
+     * succeeded: "a datagram came back" only proves the server answered, and
+     * what the migration is for is carrying requests. The failure path still
+     * stops here, with the message that names the step that failed. */
     if (!ok || handshake_only || path_challenge || key_update || cid_test) {
-        const char* what = cid_test     ? "the alternate connection ids work"
+        const char* what = migrate      ? "the connection migrated"
+                         : cid_test     ? "the alternate connection ids work"
                          : key_update   ? "the key update was followed"
                          : path_challenge ? "the path challenge was answered"
                                           : "the handshake completed end to end";
-        const char* why = cid_test     ? "the alternate connection ids do not work"
+        const char* why = migrate      ? "the connection did not migrate"
+                        : cid_test     ? "the alternate connection ids do not work"
                         : key_update   ? "the key update was not followed"
                         : path_challenge ? "the path challenge went unanswered"
                                          : "the handshake did not complete";

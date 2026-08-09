@@ -154,6 +154,37 @@ size_t quicclient_stream_read(quicclient_t* client, uint64_t id,
     return s == NULL ? 0 : quicrecvbuf_read(&s->in, dst, cap);
 }
 
+int quicclient_ping(quicclient_t* client) {
+    if (client == NULL) return 0;
+
+    client->ping_queued = 1;
+
+    return 1;
+}
+
+int quicclient_rebind(quicclient_t* client) {
+    if (client == NULL || client->fd < 0) return 0;
+
+    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return 0;
+
+    /* Not bound explicitly: the first sendto picks an ephemeral port, and any
+     * port different from the last one is what the test needs. */
+    close(client->fd);
+    client->fd = fd;
+
+    /* §9.5 asks a migrating endpoint to use a connection id the peer has not
+     * seen on the old path, so that the two cannot be linked by an observer.
+     * Done here rather than left to the caller because a rebind without it is
+     * not the case anyone actually wants to test. */
+    if (client->server_cid_count > 0)
+        client->dcid = client->server_cids[client->server_cid_count - 1].cid;
+
+    __log(client, "  [client] rebound to a new source port\n");
+
+    return 1;
+}
+
 int quicclient_use_cid(quicclient_t* client, size_t index) {
     if (client == NULL || index >= client->server_cid_count) return 0;
 
@@ -253,6 +284,33 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
             c->retire_queued = 0;
             __log(c, "  [client] -> RETIRE_CONNECTION_ID seq %llu\n",
                   (unsigned long long)c->retire_seq);
+        }
+    }
+
+    if (level == QUIC_ENC_APP && c->path_response_queued) {
+        quicframe_t f;
+        memset(&f, 0, sizeof f);
+        f.type = QUIC_FRAME_PATH_RESPONSE;
+        memcpy(f.u.path.data, c->path_challenge_in, sizeof f.u.path.data);
+
+        const size_t n = quicframe_write(payload + p, sizeof payload - p, &f);
+        if (n > 0) {
+            p += n;
+            c->path_response_queued = 0;
+            __log(c, "  [client] -> PATH_RESPONSE\n");
+        }
+    }
+
+    if (level == QUIC_ENC_APP && c->ping_queued) {
+        quicframe_t f;
+        memset(&f, 0, sizeof f);
+        f.type = QUIC_FRAME_PING;
+
+        const size_t n = quicframe_write(payload + p, sizeof payload - p, &f);
+        if (n > 0) {
+            p += n;
+            c->ping_queued = 0;
+            __log(c, "  [client] -> PING\n");
         }
     }
 
@@ -471,6 +529,13 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
                   (unsigned long long)f.u.stop_sending.error);
             break;
 
+        case QUIC_FRAME_PATH_CHALLENGE:
+            memcpy(c->path_challenge_in, f.u.path.data, sizeof c->path_challenge_in);
+            c->path_challenge_received = 1;
+            c->path_response_queued = 1;
+            __log(c, "  [client] <- PATH_CHALLENGE\n");
+            break;
+
         case QUIC_FRAME_NEW_CONNECTION_ID:
             if (c->server_cid_count <
                 sizeof c->server_cids / sizeof c->server_cids[0]) {
@@ -522,6 +587,8 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
 }
 
 static int __recv_datagram(quicclient_t* c, uint8_t* buf, size_t len) {
+    c->datagrams_received++;
+
     size_t off = 0;
     quicpkt_t pkt;
     quicpkt_status_e st;

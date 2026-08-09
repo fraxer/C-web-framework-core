@@ -53,7 +53,8 @@ static const char* const __quic_name[METRICS_QUIC__COUNT] = {
     "flow_blocked.connection", "flow_blocked.stream", "amplification_limited",
     "streams_opened", "streams_reset_sent", "streams_reset_received",
     "closed.idle_timeout", "closed.local_error", "closed.peer",
-    "refused.at_capacity", "refused.handshake_rate"
+    "refused.at_capacity", "refused.handshake_rate",
+    "migrations.attempted", "migrations.validated", "migrations.rejected"
 };
 
 /* Index-matched to metrics_h3_t. */
