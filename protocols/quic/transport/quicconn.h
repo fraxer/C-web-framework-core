@@ -122,6 +122,21 @@ typedef struct quicconn {
      * and a reload halfway through must not change the arithmetic. */
     uint64_t amplification_factor;
 
+    /* RFC 9000 §8.2.2: the eight bytes of the most recent PATH_CHALLENGE,
+     * waiting to be echoed back in a PATH_RESPONSE.
+     *
+     * One slot, not a queue. The endpoint builds packets immediately after
+     * every datagram it processes (__route), so challenges that arrive in
+     * separate datagrams -- which is what §8.2.1's "send multiple to guard
+     * against loss" produces -- each get their own answer. Only a burst inside
+     * one datagram coalesces, and that is the case worth bounding: a 1200-byte
+     * datagram holds over a hundred challenges, and answering all of them would
+     * make PATH_CHALLENGE a way to buy packets from us. §8.2.2 anticipates
+     * exactly this -- "the peer is expected to send more PATH_CHALLENGE frames
+     * as necessary to evoke additional PATH_RESPONSE frames". */
+    uint8_t  path_response_data[8];
+    int      path_response_pending;
+
     quicconn_state_e state;
     uint64_t error_code;
     int      error_is_app;

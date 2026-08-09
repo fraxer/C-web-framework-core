@@ -10,7 +10,7 @@
  * what happened.
  *
  *   quicclient [host] [port] [-q] [-p /path] [-a authority] [-n N] [--expect]
- *              [--handshake-only]
+ *              [--handshake-only] [--path-challenge]
  *
  * `-a` sets both the TLS server name and the :authority pseudo-header. They are
  * one flag because a server matches the virtual host on one and validates it
@@ -33,6 +33,7 @@ int main(int argc, char* argv[]) {
     const char* authority = "localhost";
     int concurrent = 1;
     int expect_continue = 0;
+    int path_challenge = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) verbose = 0;
         else if (strcmp(argv[i], "--handshake-only") == 0) handshake_only = 1;
@@ -40,6 +41,7 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "-a") == 0 && i + 1 < argc) authority = argv[++i];
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) concurrent = atoi(argv[++i]);
         else if (strcmp(argv[i], "--expect") == 0) expect_continue = 1;
+        else if (strcmp(argv[i], "--path-challenge") == 0) path_challenge = 1;
     }
 
     if (concurrent < 1) concurrent = 1;
@@ -53,7 +55,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const int ok = quicclient_run(&client, 5000);
+    int ok = quicclient_run(&client, 5000);
 
     printf("\n");
     printf("handshake complete:        %s\n", client.handshake_complete ? "yes" : "no");
@@ -74,10 +76,38 @@ int main(int argc, char* argv[]) {
                cipher != NULL ? SSL_CIPHER_get_name(cipher) : "(none)");
     }
 
-    if (!ok || handshake_only) {
+    /* Path validation, before HTTP/3: RFC 9000 §8.2.2 makes answering a
+     * challenge unconditional, so it must work on a connection that has done
+     * nothing else. Driven from here rather than from the h3 layer for the
+     * same reason -- it is a transport obligation, not an HTTP one. */
+    if (ok && path_challenge) {
+        printf("\nPATH_CHALLENGE\n");
+
+        if (!quicclient_path_challenge(&client))
+            printf("FAIL: could not queue a challenge\n");
+        else {
+            /* §8.2.2 forbids delaying the response, so a couple of pumps is
+             * already generous; anything slower is the bug being looked for. */
+            for (int i = 0; i < 20 && !client.path_response_received; i++)
+                quicclient_pump(&client, 100);
+        }
+
+        printf("PATH_RESPONSE received:    %s\n",
+               client.path_response_received ? "yes" : "no");
+        printf("echoed data matches:       %s\n",
+               client.path_response_matched ? "yes" : "no");
+
+        if (!client.path_response_matched) ok = 0;
+    }
+
+    if (!ok || handshake_only || path_challenge) {
+        const char* what = path_challenge ? "the path challenge was answered"
+                                          : "the handshake completed end to end";
+        const char* why = path_challenge ? "the path challenge went unanswered"
+                                         : "the handshake did not complete";
+
         quicclient_free(&client);
-        printf("\n%s\n", ok ? "OK: the handshake completed end to end"
-                            : "FAIL: the handshake did not complete");
+        printf("\n%s: %s\n", ok ? "OK" : "FAIL", ok ? what : why);
         return ok ? 0 : 1;
     }
 

@@ -82,8 +82,22 @@ typedef struct quicclient {
 
     clientstream_t streams[CLIENT_MAX_STREAMS];
 
+    /* Path validation (RFC 9000 §8.2), from the challenging side. The server
+     * has no way to show that it answers a PATH_CHALLENGE other than by
+     * answering one, so the client has to be able to ask. */
+    uint8_t path_challenge_data[8];
+    int     path_challenge_queued;   /* built into the next packet */
+    int     path_challenge_sent;
+    int     path_response_received;
+    int     path_response_matched;   /* the echo came back byte for byte */
+
     int verbose;
 } quicclient_t;
+
+/* Queue a PATH_CHALLENGE with random data. Only meaningful once 1-RTT keys
+ * exist -- the frame is not permitted at any earlier level. Returns 0 if the
+ * connection is not ready or a challenge is already outstanding. */
+int quicclient_path_challenge(quicclient_t* client);
 
 /* Set up and send the first Initial. Returns 0 on failure. */
 int quicclient_connect(quicclient_t* client, const char* host, uint16_t port,

@@ -154,6 +154,19 @@ size_t quicclient_stream_read(quicclient_t* client, uint64_t id,
     return s == NULL ? 0 : quicrecvbuf_read(&s->in, dst, cap);
 }
 
+int quicclient_path_challenge(quicclient_t* client) {
+    if (client == NULL || !client->tx[QUIC_ENC_APP].valid) return 0;
+    if (client->path_challenge_queued || client->path_challenge_sent) return 0;
+
+    if (RAND_bytes(client->path_challenge_data,
+                   (int)sizeof client->path_challenge_data) != 1)
+        return 0;
+
+    client->path_challenge_queued = 1;
+
+    return 1;
+}
+
 int quicclient_stream_fin(quicclient_t* client, uint64_t id) {
     clientstream_t* s = __stream_get(client, id, 0);
 
@@ -187,6 +200,24 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
         if (n > 0) {
             p += n;
             c->ack_pending[level] = 0;
+        }
+    }
+
+    /* A queued PATH_CHALLENGE, in the application space only: §12.4 does not
+     * permit it at any earlier level, and the server would be right to close
+     * the connection for one that arrived there. */
+    if (level == QUIC_ENC_APP && c->path_challenge_queued) {
+        quicframe_t f;
+        memset(&f, 0, sizeof f);
+        f.type = QUIC_FRAME_PATH_CHALLENGE;
+        memcpy(f.u.path.data, c->path_challenge_data, sizeof f.u.path.data);
+
+        const size_t n = quicframe_write(payload + p, sizeof payload - p, &f);
+        if (n > 0) {
+            p += n;
+            c->path_challenge_queued = 0;
+            c->path_challenge_sent = 1;
+            __log(c, "  [client] -> PATH_CHALLENGE\n");
         }
     }
 
@@ -389,6 +420,19 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
         case QUIC_FRAME_HANDSHAKE_DONE:
             c->handshake_done_received = 1;
             __log(c, "  [client] <- HANDSHAKE_DONE\n");
+            break;
+
+        case QUIC_FRAME_PATH_RESPONSE:
+            /* memcmp, not "we got one": §8.2.3 validates the path only on the
+             * data it sent, so an echo of the wrong bytes is a failure that
+             * would otherwise read as a success. */
+            c->path_response_received = 1;
+            c->path_response_matched =
+                memcmp(f.u.path.data, c->path_challenge_data,
+                       sizeof c->path_challenge_data) == 0;
+
+            __log(c, "  [client] <- PATH_RESPONSE, data %s\n",
+                  c->path_response_matched ? "matches the challenge" : "DOES NOT MATCH");
             break;
 
         case QUIC_FRAME_CONNECTION_CLOSE:

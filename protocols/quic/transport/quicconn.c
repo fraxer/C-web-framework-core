@@ -425,9 +425,19 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
         return 1;
 
     case QUIC_FRAME_PATH_CHALLENGE:
-        /* Must be answered on the path it arrived on (§8.2). Path validation
-         * proper -- probing a new address before migrating to it -- is phase 9;
-         * answering a challenge costs nothing and is required regardless. */
+        /* §8.2.2: echo the data back. Answering a challenge and validating a
+         * path of our own are different jobs -- the second one (probing a new
+         * address before migrating to it) is docs/http3/09 §1.4 -- and this one
+         * is required regardless of whether we ever do the first.
+         *
+         * The answer goes out on conn->path, which is the path recorded at
+         * accept. Until migration exists that is the only path we have; a
+         * challenge from a new address is answered to the old one, and fixing
+         * that is part of §1.4, not of this. */
+        memcpy(conn->path_response_data, frame->u.path.data,
+               sizeof conn->path_response_data);
+        conn->path_response_pending = 1;
+
         atomic_store_explicit(&conn->want_write, 1, memory_order_release);
         return 1;
 
@@ -659,6 +669,30 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
         if (n > 0) {
             p += n;
             quicack_on_sent(&conn->ack[level]);
+        }
+    }
+
+    /* A pending PATH_RESPONSE next, ahead of everything that may be deferred:
+     * §8.2.2 forbids delaying the packet that carries it for any reason but
+     * congestion control. Only in the application space -- the peer cannot
+     * challenge a path before it has 1-RTT keys, and a server never sends
+     * 0-RTT.
+     *
+     * Not registered for loss recovery, on purpose: §13.3 says a PATH_RESPONSE
+     * is not retransmitted, because a peer that did not get one sends another
+     * challenge, and a stale echo would validate a path that may no longer
+     * exist. */
+    if (level == QUIC_ENC_APP && conn->path_response_pending && p + 16 < payload_cap) {
+        quicframe_t f;
+        memset(&f, 0, sizeof f);
+        f.type = QUIC_FRAME_PATH_RESPONSE;
+        memcpy(f.u.path.data, conn->path_response_data, sizeof f.u.path.data);
+
+        const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
+        if (n > 0) {
+            p += n;
+            ack_eliciting = 1;
+            conn->path_response_pending = 0;
         }
     }
 
