@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "metrics.h"
 #include "quicloss.h"
 #include "quicpacket.h"
 
@@ -103,6 +104,10 @@ int quicloss_on_sent(quicloss_t* loss, quic_enc_level_e level, uint64_t pn,
  * slow on a steady one. */
 static void __update_rtt(quicloss_t* loss, uint64_t latest_rtt, uint64_t ack_delay) {
     loss->latest_rtt_us = latest_rtt;
+
+    /* The raw sample, not the smoothed estimate: the histogram is meant to show
+     * the spread, and a moving average is the one thing guaranteed to hide it. */
+    metrics_quic_rtt(latest_rtt);
 
     if (!loss->have_rtt_sample) {
         loss->min_rtt_us = latest_rtt;
@@ -220,6 +225,8 @@ static void __detect_lost(quicloss_t* loss, quic_enc_level_e level,
             lost_ack_eliciting = 1;
         }
 
+        metrics_quic(METRICS_QUIC_PACKETS_LOST);
+
         if (sent->in_flight && loss->cc != NULL)
             loss->cc->ops->on_loss(loss->cc, sent->size, sent->sent_us, now_us);
 
@@ -247,8 +254,10 @@ static void __detect_lost(quicloss_t* loss, quic_enc_level_e level,
         const uint64_t pto = quicloss_pto_us(loss, level);
         const uint64_t threshold = pto * QUICCC_PERSISTENT_CONGESTION_THRESHOLD;
 
-        if (latest_lost > earliest_lost && latest_lost - earliest_lost > threshold)
+        if (latest_lost > earliest_lost && latest_lost - earliest_lost > threshold) {
+            metrics_quic(METRICS_QUIC_PERSISTENT_CONGESTION);
             loss->cc->ops->on_persistent_congestion(loss->cc);
+        }
     }
 }
 
@@ -312,6 +321,11 @@ int quicloss_on_ack(quicloss_t* loss, quic_enc_level_e level,
     loss->pto_count = 0;
 
     __detect_lost(loss, level, now_us, out_lost);
+
+    /* Sampled after the loss detection above, so a window that an ACK grew and
+     * the losses in the same ACK then cut is recorded once, at the value the
+     * next packet will actually be sent under. */
+    if (loss->cc != NULL) metrics_quic_cwnd(loss->cc->cwnd);
 
     return 1;
 }

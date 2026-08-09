@@ -21,6 +21,13 @@ static const char* const __wait_bucket_name[METRICS_WAIT_BUCKETS] = {
     "<1us", "<10us", "<100us", "<1ms", "<10ms", ">=10ms"
 };
 
+#ifdef CWFR_HTTP3
+/* One measured quantity: how many samples, their sum for the average, the two
+ * extremes and the shape. Six buckets, like the wait histogram, and for the
+ * same reason -- enough to say where the mass is, few enough to read at once. */
+#define METRICS_SAMPLE_BUCKETS 6
+#endif
+
 /* Index-matched to metrics_h2_abuse_t. */
 static const char* const __h2_abuse_name[METRICS_H2_ABUSE__COUNT] = {
     "flow_control.connection", "flow_control.stream",
@@ -39,7 +46,37 @@ static const char* const __quic_name[METRICS_QUIC__COUNT] = {
     "drop.short_initial", "drop.unknown_cid", "drop.no_budget", "drop.peer_version_negotiation",
     "version_negotiation_sent", "stateless_reset_sent",
     "connections_accepted", "connections_closed",
-    "send_error"
+    "send_error",
+    "handshakes_completed", "handshakes_failed.tls", "handshakes_failed.timeout",
+    "decrypt_failures", "aead_limit_reached",
+    "packets_lost", "pto_fired", "persistent_congestion",
+    "flow_blocked.connection", "flow_blocked.stream", "amplification_limited",
+    "streams_opened", "streams_reset_sent", "streams_reset_received",
+    "closed.idle_timeout", "closed.local_error", "closed.peer"
+};
+
+/* Index-matched to metrics_h3_t. */
+static const char* const __h3_name[METRICS_H3__COUNT] = {
+    "requests",
+    "responses.1xx", "responses.2xx", "responses.3xx", "responses.4xx", "responses.5xx",
+    "streams_cancelled", "requests_rejected", "goaway_sent",
+    "abuse.abort_budget", "abuse.ctrl_budget",
+    "abuse.field_section_too_large", "abuse.body_too_large",
+    "stream_errors", "connection_errors"
+};
+
+/* Round-trip times span decades and the interesting boundaries are not decades:
+ * a local test path is tens of microseconds, a healthy internet path tens of
+ * milliseconds, and anything past a fifth of a second is what a user notices. */
+static const char* const __rtt_bucket_name[METRICS_SAMPLE_BUCKETS] = {
+    "<100us", "<1ms", "<10ms", "<50ms", "<200ms", ">=200ms"
+};
+
+/* The first bucket is the initial congestion window (§7.2 puts it at ten
+ * packets, so ~12-15 KB): mass sitting there means the window never grew, which
+ * is a different problem from a window that grew and then collapsed. */
+static const char* const __cwnd_bucket_name[METRICS_SAMPLE_BUCKETS] = {
+    "<16k", "<64k", "<256k", "<1M", "<4M", ">=4M"
 };
 #endif
 
@@ -71,6 +108,19 @@ typedef struct {
     atomic_ullong wait_hist[METRICS_WAIT_BUCKETS];
 } lock_site_metrics_t;
 
+#ifdef CWFR_HTTP3
+/* No minimum: it would need a sentinel that only an initialiser can install,
+ * and it answers nothing here. The smallest RTT across every connection is the
+ * closest client, not a property of this server -- the per-connection minimum,
+ * which is the figure §5 of RFC 9002 cares about, lives in quicloss. */
+typedef struct {
+    atomic_ullong count;
+    atomic_ullong sum;
+    atomic_ullong max;
+    atomic_ullong hist[METRICS_SAMPLE_BUCKETS];
+} sample_series_t;
+#endif
+
 typedef struct {
     lock_site_metrics_t lock_site[LOCK_SITE__COUNT];
     /* Same shape, different question: indexed by the site that was holding the
@@ -94,6 +144,9 @@ typedef struct {
 
 #ifdef CWFR_HTTP3
     atomic_ullong quic[METRICS_QUIC__COUNT];
+    atomic_ullong h3[METRICS_H3__COUNT];
+    sample_series_t rtt_us;
+    sample_series_t cwnd_bytes;
 #endif
 
     atomic_ullong window_started_ns;
@@ -119,6 +172,28 @@ static int __wait_bucket(unsigned long long ns) {
 
     return METRICS_WAIT_BUCKETS - 1;
 }
+
+#ifdef CWFR_HTTP3
+static int __rtt_bucket(unsigned long long us) {
+    if (us < 100ULL) return 0;
+    if (us < 1000ULL) return 1;
+    if (us < 10000ULL) return 2;
+    if (us < 50000ULL) return 3;
+    if (us < 200000ULL) return 4;
+
+    return METRICS_SAMPLE_BUCKETS - 1;
+}
+
+static int __cwnd_bucket(unsigned long long bytes) {
+    if (bytes < 16384ULL) return 0;
+    if (bytes < 65536ULL) return 1;
+    if (bytes < 262144ULL) return 2;
+    if (bytes < 1048576ULL) return 3;
+    if (bytes < 4194304ULL) return 4;
+
+    return METRICS_SAMPLE_BUCKETS - 1;
+}
+#endif
 
 /* Peak counters: a plain store would let a smaller value from a slower thread
  * overwrite a larger one, so the update is a CAS that only ever moves up. */
@@ -238,6 +313,42 @@ void metrics_quic_add(metrics_quic_t kind, unsigned long long amount) {
 
     atomic_fetch_add_explicit(&__m.quic[kind], amount, memory_order_relaxed);
 }
+
+static void __sample_add(sample_series_t* s, unsigned long long value, int bucket) {
+    atomic_fetch_add_explicit(&s->count, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s->sum, value, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s->hist[bucket], 1, memory_order_relaxed);
+    __max_ull(&s->max, value);
+}
+
+void metrics_quic_rtt(uint64_t rtt_us) {
+    if (!metrics_enabled()) return;
+
+    __sample_add(&__m.rtt_us, rtt_us, __rtt_bucket(rtt_us));
+}
+
+void metrics_quic_cwnd(uint64_t bytes) {
+    if (!metrics_enabled()) return;
+
+    __sample_add(&__m.cwnd_bytes, bytes, __cwnd_bucket(bytes));
+}
+
+void metrics_h3(metrics_h3_t kind) {
+    if (!metrics_enabled()) return;
+    if (kind < 0 || kind >= METRICS_H3__COUNT) return;
+
+    atomic_fetch_add_explicit(&__m.h3[kind], 1, memory_order_relaxed);
+}
+
+void metrics_h3_status(int status_code) {
+    if (!metrics_enabled()) return;
+
+    /* Anything outside 100..599 is not a status this server produced; counting
+     * it as 5xx would put our own bug in the bucket operators page on. */
+    if (status_code < 100 || status_code > 599) return;
+
+    metrics_h3((metrics_h3_t)(METRICS_H3_RESPONSE_1XX + status_code / 100 - 1));
+}
 #endif
 
 static unsigned long long __load(atomic_ullong* slot) {
@@ -253,6 +364,22 @@ static json_token_t* __hist_json(atomic_ullong* values, const char* const* names
 
     return object;
 }
+
+#ifdef CWFR_HTTP3
+static json_token_t* __sample_json(sample_series_t* s, const char* const* bucket_name) {
+    json_token_t* object = json_create_object();
+    if (object == NULL) return NULL;
+
+    const unsigned long long count = __load(&s->count);
+
+    json_object_set(object, "samples", json_create_number((long double)count));
+    json_object_set(object, "avg", json_create_number(count == 0 ? 0.0L : (long double)__load(&s->sum) / (long double)count));
+    json_object_set(object, "max", json_create_number((long double)__load(&s->max)));
+    json_object_set(object, "hist", __hist_json(s->hist, bucket_name, METRICS_SAMPLE_BUCKETS));
+
+    return object;
+}
+#endif
 
 /* One lock object's numbers, loaded: a single site, a single blocker, or a sum
  * over either. */
@@ -417,7 +544,25 @@ json_doc_t* metrics_snapshot_json(void) {
     for (int i = 0; i < METRICS_QUIC__COUNT; i++)
         json_object_set(quic, __quic_name[i], json_create_number((long double)__load(&__m.quic[i])));
 
+    json_object_set(quic, "rtt_us", __sample_json(&__m.rtt_us, __rtt_bucket_name));
+    json_object_set(quic, "cwnd_bytes", __sample_json(&__m.cwnd_bytes, __cwnd_bucket_name));
+
     json_object_set(root, "quic", quic);
+
+    /* Zeroes reported here too, and for the same reason as the quic section:
+     * "no request has arrived over h3 yet" is the answer being looked for at
+     * least as often as any non-zero one, and it is the answer an operator gets
+     * wrong when the key is simply missing. */
+    json_token_t* h3 = json_create_object();
+    if (h3 == NULL) {
+        json_free(doc);
+        return NULL;
+    }
+
+    for (int i = 0; i < METRICS_H3__COUNT; i++)
+        json_object_set(h3, __h3_name[i], json_create_number((long double)__load(&__m.h3[i])));
+
+    json_object_set(root, "http3", h3);
 #endif
 
     return doc;
@@ -462,6 +607,20 @@ void metrics_reset(void) {
 #ifdef CWFR_HTTP3
     for (int i = 0; i < METRICS_QUIC__COUNT; i++)
         atomic_store_explicit(&__m.quic[i], 0, memory_order_relaxed);
+
+    for (int i = 0; i < METRICS_H3__COUNT; i++)
+        atomic_store_explicit(&__m.h3[i], 0, memory_order_relaxed);
+
+    sample_series_t* series[2] = { &__m.rtt_us, &__m.cwnd_bytes };
+
+    for (int s = 0; s < 2; s++) {
+        atomic_store_explicit(&series[s]->count, 0, memory_order_relaxed);
+        atomic_store_explicit(&series[s]->sum, 0, memory_order_relaxed);
+        atomic_store_explicit(&series[s]->max, 0, memory_order_relaxed);
+
+        for (int i = 0; i < METRICS_SAMPLE_BUCKETS; i++)
+            atomic_store_explicit(&series[s]->hist[i], 0, memory_order_relaxed);
+    }
 #endif
 
     atomic_store_explicit(&__m.window_started_ns, metrics_now_ns(), memory_order_relaxed);

@@ -13,4 +13,4 @@ cmake_minimum_required(VERSION 3.12.4)
 # h3conn is the one module here that touches the transport: it reads QUIC
 # streams and turns h3 verdicts into RESET_STREAM / STOP_SENDING, hence
 # quic_transport. The others stay free of it on purpose.
-cwfr_add_lib(h3server LINK_LIBS h3frame quic_common quic_transport qpack http config)
+cwfr_add_lib(h3server LINK_LIBS h3frame quic_common quic_transport qpack http config metrics)

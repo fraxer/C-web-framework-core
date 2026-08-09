@@ -5,6 +5,7 @@
 
 #include "appconfig.h"
 #include "log.h"
+#include "metrics.h"
 #include "qpack.h"
 #include "quictime.h"
 #include "varint.h"
@@ -77,18 +78,31 @@ static int __budget_spend(int64_t* tokens, uint64_t* epoch_ms,
     return 1;
 }
 
+/* Both budgets are counted here rather than at the call sites: exhaustion is
+ * one event with four ways to reach it, and a counter per call site would only
+ * split the number an operator has to add back up. */
 int h3session_abort_spend(h3session_t* s) {
     if (s == NULL) return 1;
 
-    return __budget_spend(&s->abort_tokens, &s->abort_epoch_ms,
-                          h3_abort_rate, h3_abort_burst);
+    if (__budget_spend(&s->abort_tokens, &s->abort_epoch_ms,
+                       h3_abort_rate, h3_abort_burst))
+        return 1;
+
+    metrics_h3(METRICS_H3_ABUSE_ABORT_BUDGET);
+
+    return 0;
 }
 
 int h3session_ctrl_spend(h3session_t* s) {
     if (s == NULL) return 1;
 
-    return __budget_spend(&s->ctrl_tokens, &s->ctrl_epoch_ms,
-                          h3_ctrl_rate, h3_ctrl_burst);
+    if (__budget_spend(&s->ctrl_tokens, &s->ctrl_epoch_ms,
+                       h3_ctrl_rate, h3_ctrl_burst))
+        return 1;
+
+    metrics_h3(METRICS_H3_ABUSE_CTRL_BUDGET);
+
+    return 0;
 }
 
 /* ---- Verdict helpers ---- */
@@ -217,6 +231,8 @@ size_t h3session_goaway_encode(h3session_t* s, uint8_t* dst, size_t cap, uint64_
 
     s->goaway_sent = 1;
     s->goaway_id = stream_id;
+
+    metrics_h3(METRICS_H3_GOAWAY_SENT);
 
     return n;
 }

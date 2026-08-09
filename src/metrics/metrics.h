@@ -132,10 +132,50 @@ typedef enum {
     METRICS_QUIC_VERSION_NEGOTIATION, /* Version Negotiation packets sent */
     METRICS_QUIC_STATELESS_RESET,     /* stateless resets sent */
 
+    /* A connection is created by the first Initial that gets that far, so this
+     * is also "handshakes started" -- the denominator of everything below. A
+     * second counter for it would only be a second name for the same event. */
     METRICS_QUIC_CONN_ACCEPTED,
     METRICS_QUIC_CONN_CLOSED,
 
     METRICS_QUIC_SEND_ERROR,
+
+    /* ---- Connection-level counters (docs/http3/07-integration.md §3) ----
+     *
+     * The endpoint counters above say whether datagrams arrive. These say what
+     * happens to them afterwards, and they exist because the debugging that
+     * closed phase 6 had to be done without them: three unrelated causes all
+     * showed as ERR_QUIC_PROTOCOL_ERROR in the browser, and telling them apart
+     * took a byte count read off a log. `handshakes_failed.tls` alone would
+     * have named the certificate rejection immediately (docs/http3/05 §10). */
+    METRICS_QUIC_HANDSHAKE_COMPLETED,
+    METRICS_QUIC_HANDSHAKE_FAILED_TLS,      /* the TLS stack refused the flight */
+    METRICS_QUIC_HANDSHAKE_FAILED_TIMEOUT,  /* idle timeout before completion */
+
+    METRICS_QUIC_DECRYPT_FAILURE,           /* AEAD open failed; usually harmless */
+    METRICS_QUIC_AEAD_LIMIT,                /* §6.6 confidentiality limit reached */
+
+    METRICS_QUIC_PACKETS_LOST,
+    METRICS_QUIC_PTO_FIRED,
+    METRICS_QUIC_PERSISTENT_CONGESTION,
+
+    /* Why the send loop stopped short. Congestion is expected; the other two
+     * are the ones that turn into "the server is slow" reports. */
+    METRICS_QUIC_FLOW_BLOCKED_CONN,
+    METRICS_QUIC_FLOW_BLOCKED_STREAM,
+    METRICS_QUIC_AMPLIFICATION_LIMITED,
+
+    METRICS_QUIC_STREAMS_OPENED,
+    METRICS_QUIC_STREAMS_RESET_SENT,
+    METRICS_QUIC_STREAMS_RESET_RECEIVED,
+
+    /* How connections end. Split because they mean opposite things: an idle
+     * timeout is a client that walked away, a local error is our own refusal,
+     * and a peer close is theirs. `connections_closed` is their total. */
+    METRICS_QUIC_CLOSED_IDLE,
+    METRICS_QUIC_CLOSED_LOCAL,
+    METRICS_QUIC_CLOSED_PEER,
+
     METRICS_QUIC__COUNT
 } metrics_quic_t;
 
@@ -143,6 +183,53 @@ typedef enum {
  * spread across the datagram path and would otherwise each repeat the test. */
 void metrics_quic(metrics_quic_t kind);
 void metrics_quic_add(metrics_quic_t kind, unsigned long long amount);
+
+/* Path samples, one per acknowledgement that produced a new estimate.
+ *
+ * Reported as a histogram rather than as percentiles: exact quantiles need the
+ * samples kept, and keeping them would mean either a bound that silently drops
+ * the tail or an allocation on the ACK path. The questions these are asked --
+ * "is the path slow" and "is the window stuck at the initial one" -- are
+ * answered by which bucket the mass sits in, and that costs one add. */
+void metrics_quic_rtt(uint64_t rtt_us);
+void metrics_quic_cwnd(uint64_t bytes);
+
+/* HTTP/3 application counters (docs/http3/07-integration.md §3).
+ *
+ * Kept apart from the quic ones because they answer a different question: quic
+ * says whether the transport works, these say what it is carrying. A request
+ * that never becomes a response is visible only as the difference between the
+ * first two. */
+typedef enum {
+    METRICS_H3_REQUESTS = 0,
+    METRICS_H3_RESPONSE_1XX,
+    METRICS_H3_RESPONSE_2XX,
+    METRICS_H3_RESPONSE_3XX,
+    METRICS_H3_RESPONSE_4XX,
+    METRICS_H3_RESPONSE_5XX,
+
+    METRICS_H3_STREAMS_CANCELLED,   /* peer RESET_STREAM on a request stream */
+    METRICS_H3_REQUESTS_REJECTED,   /* arrived after our GOAWAY named it (§5.2) */
+    METRICS_H3_GOAWAY_SENT,
+
+    /* Limits that fired. As in HTTP/2, each one guesses a threshold, and
+     * without a counter per limit an operator cannot tell an attack from a
+     * client this server has started rejecting wrongly. */
+    METRICS_H3_ABUSE_ABORT_BUDGET,
+    METRICS_H3_ABUSE_CTRL_BUDGET,
+    METRICS_H3_FIELD_SECTION_TOO_LARGE,  /* → 431 */
+    METRICS_H3_BODY_TOO_LARGE,           /* → 413 */
+
+    METRICS_H3_STREAM_ERROR,        /* malformed message; the stream is reset */
+    METRICS_H3_CONN_ERROR,          /* an h3 error that ends the connection */
+    METRICS_H3__COUNT
+} metrics_h3_t;
+
+void metrics_h3(metrics_h3_t kind);
+
+/* One final response, counted by class. The mapping from status code to class
+ * lives here so the call sites cannot disagree about where 1xx ends. */
+void metrics_h3_status(int status_code);
 #endif
 
 /* Not for direct use — read it through metrics_enabled(). */

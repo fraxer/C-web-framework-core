@@ -361,6 +361,8 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
         quicstream_t* s = __stream_find(conn, frame->u.reset_stream.id);
         if (s == NULL) return 1;
 
+        metrics_quic(METRICS_QUIC_STREAMS_RESET_RECEIVED);
+
         const quicstream_err_t err =
             quicstream_on_reset(s, frame->u.reset_stream.error,
                                 frame->u.reset_stream.final_size);
@@ -448,6 +450,8 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
                   (int)frame->u.close.reason_len,
                   frame->u.close.reason != NULL ? frame->u.close.reason : "");
 
+        metrics_quic(METRICS_QUIC_CLOSED_PEER);
+
         /* §10.2.2: enter draining and send nothing further -- not even an
          * acknowledgement. Answering would keep the exchange alive after both
          * ends have finished with it. */
@@ -510,7 +514,10 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
                          plain, &plain_len)) {
         /* Ordinary: a packet from a dead connection, or one that crossed a key
          * update. Only the §6.6 limit turns it into an error. */
+        metrics_quic(METRICS_QUIC_DECRYPT_FAILURE);
+
         if (quiccrypto_open_limit_reached(keys)) {
+            metrics_quic(METRICS_QUIC_AEAD_LIMIT);
             quicconn_close(conn, QUIC_AEAD_LIMIT_REACHED, 0, now_us);
             return 0;
         }
@@ -594,6 +601,11 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
     /* Drive the handshake with whatever CRYPTO arrived. */
     if (conn->state == QUICCONN_HANDSHAKE) {
         if (!quictls_advance(&conn->tls)) {
+            /* The one counter that would have shortened phase 6 by a day: a
+             * peer that rejects our certificate and one that never reached us
+             * are the same silence otherwise (docs/http3/05 §10). */
+            metrics_quic(METRICS_QUIC_HANDSHAKE_FAILED_TLS);
+
             if (conn->state != QUICCONN_CLOSING)
                 quicconn_close(conn, QUIC_CRYPTO_ERROR(0x28), 0, now_us);
             return 0;
@@ -606,6 +618,8 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
                       (unsigned long long)conn->peer_params.initial_max_streams_bidi,
                       (unsigned long long)conn->peer_params.initial_max_data,
                       (unsigned long long)conn->peer_params.initial_max_stream_data_uni);
+
+            metrics_quic(METRICS_QUIC_HANDSHAKE_COMPLETED);
 
             conn->state = QUICCONN_ACTIVE;
             /* Completing the handshake proves the peer received our packets,
@@ -754,7 +768,15 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
             size_t room = payload_cap - p - 24;
             if (allowed < room) room = (size_t)allowed;
 
-            if (room == 0 && !(s->send.fin && !s->send.fin_sent)) continue;
+            if (room == 0 && !(s->send.fin && !s->send.fin_sent)) {
+                /* Only a closed window is counted, not a full packet: the
+                 * second is the loop doing its job and would bury the first,
+                 * which is a stall the peer has to end. */
+                if (allowed == 0)
+                    metrics_quic(conn_allowed == 0 ? METRICS_QUIC_FLOW_BLOCKED_CONN
+                                                   : METRICS_QUIC_FLOW_BLOCKED_STREAM);
+                continue;
+            }
 
             if (!quicsendbuf_next(&s->send, room, &offset, &data, &dlen, &fin))
                 continue;
@@ -893,7 +915,14 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
             /* Anti-amplification: until the address is validated, nothing may
              * be sent beyond three times what arrived. */
             if (!conn->address_validated &&
-                total >= conn->amplification_budget) break;
+                total >= conn->amplification_budget) {
+                /* Counted because it is invisible from outside and looks like a
+                 * stalled handshake: a long certificate chain hits it against
+                 * an honest client, and that is a certificate problem, not a
+                 * network one (docs/http3/04 §8). */
+                metrics_quic(METRICS_QUIC_AMPLIFICATION_LIMITED);
+                break;
+            }
 
             size_t room = sizeof datagram - total;
             if (!conn->address_validated) {
@@ -1181,6 +1210,8 @@ void quicconn_close(quicconn_t* conn, uint64_t error_code, int is_app,
     log_error("quic: closing, %s error 0x%llx\n",
               is_app ? "application" : "transport", (unsigned long long)error_code);
 
+    metrics_quic(METRICS_QUIC_CLOSED_LOCAL);
+
     conn->state = QUICCONN_CLOSING;
     conn->error_code = error_code;
     conn->error_is_app = is_app;
@@ -1266,6 +1297,14 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
      * connection, with no close frame -- there is nobody to tell. */
     if (conn->idle_timeout_us > 0 &&
         now_us > conn->last_activity_us + conn->idle_timeout_us) {
+        metrics_quic(METRICS_QUIC_CLOSED_IDLE);
+
+        /* Timing out mid-handshake is a different failure: the peer never got
+         * far enough to say anything, which is what a blocked UDP path and a
+         * rejected certificate both look like from here. */
+        if (conn->state == QUICCONN_HANDSHAKE)
+            metrics_quic(METRICS_QUIC_HANDSHAKE_FAILED_TIMEOUT);
+
         conn->state = QUICCONN_DEAD;
         return 0;
     }
@@ -1275,7 +1314,13 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
         quicframe_ref_t* lost = NULL;
         quic_enc_level_e level = QUIC_ENC_INITIAL;
 
-        if (quicloss_on_timeout(&conn->loss, now_us, &lost, &level)) {
+        /* Returns 1 for a loss timer, 0 for a PTO -- and a PTO is the signal
+         * that matters here: it means a whole round trip passed with nothing
+         * acknowledged, which is what a path problem looks like before it
+         * becomes packet loss. */
+        if (!quicloss_on_timeout(&conn->loss, now_us, &lost, &level))
+            metrics_quic(METRICS_QUIC_PTO_FIRED);
+        else {
             for (quicframe_ref_t* ref = lost; ref != NULL; ref = ref->next) {
                 if (ref->type == QUIC_FRAME_CRYPTO)
                     quicsendbuf_lost(&conn->crypto_out[level], ref->offset,

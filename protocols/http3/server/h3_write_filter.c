@@ -10,6 +10,7 @@
 #include "httprequest.h"
 #include "httpresponse.h"
 #include "log.h"
+#include "metrics.h"
 #include "qpack.h"
 
 /* Terminal stage of the h3 filter chain. See h3_write_filter.h. */
@@ -100,6 +101,11 @@ static int __header(httprequest_t* request, httpresponse_t* response) {
             return CWF_ERROR;
         }
         module->head_sent = 1;
+
+        /* Counted where the field section reaches the stream, not where the
+         * response was built: everything before this point can still fail into
+         * a reset, and a response nobody received is not one. */
+        metrics_h3_status(response->status_code);
 
         /* From here on an informational response would be out of order: 1xx
          * precedes the final status by definition. */

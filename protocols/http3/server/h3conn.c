@@ -208,6 +208,7 @@ static h3conn_result_t __apply_uni_verdict(quicstream_t* qs, h3app_t* app,
         return __ok();
 
     case H3SESSION_CONN_ERROR:
+        metrics_h3(METRICS_H3_CONN_ERROR);
         return __closed(v.error);
     }
 
@@ -217,12 +218,16 @@ static h3conn_result_t __apply_uni_verdict(quicstream_t* qs, h3app_t* app,
 /* Map an h3stream status onto transport actions. */
 static h3conn_result_t __apply_stream_status(quicstream_t* qs, h3app_t* app,
                                              h3stream_status_e st) {
-    if (h3stream_status_is_connection(st))
+    if (h3stream_status_is_connection(st)) {
+        metrics_h3(METRICS_H3_CONN_ERROR);
         return __closed(h3stream_status_error(st));
+    }
 
     switch (st) {
     case H3STREAM_ERR_MESSAGE:
     case H3STREAM_ERR_REQUEST_INCOMPLETE: {
+        metrics_h3(METRICS_H3_STREAM_ERROR);
+
         /* A stream error kills the stream in both directions: RESET_STREAM
          * abandons what we would have sent, STOP_SENDING what they would still
          * send. Sending only the first leaves a client uploading a body nobody
@@ -236,8 +241,16 @@ static h3conn_result_t __apply_stream_status(quicstream_t* qs, h3app_t* app,
 
     /* The three that are answered rather than reset. The stream stays
      * well-formed, so the response goes out on it normally. */
-    case H3STREAM_ERR_BODY_TOO_LARGE:   app->drained = 1; return __refused(413);
-    case H3STREAM_ERR_FIELDS_TOO_LARGE: app->drained = 1; return __refused(431);
+    case H3STREAM_ERR_BODY_TOO_LARGE:
+        metrics_h3(METRICS_H3_BODY_TOO_LARGE);
+        app->drained = 1;
+        return __refused(413);
+
+    case H3STREAM_ERR_FIELDS_TOO_LARGE:
+        metrics_h3(METRICS_H3_FIELD_SECTION_TOO_LARGE);
+        app->drained = 1;
+        return __refused(431);
+
     case H3STREAM_ERR_INTERNAL:         app->drained = 1; return __refused(500);
 
     default:
@@ -263,6 +276,8 @@ static h3conn_result_t __on_reset(h3conn_t* c, quicstream_t* qs, h3app_t* app) {
      * optional here. */
     const int answered = app->req != NULL && app->req->response_done;
     app->drained = 1;
+
+    metrics_h3(METRICS_H3_STREAMS_CANCELLED);
 
     if (!answered && !h3session_abort_spend(c->session))
         return __closed(H3_EXCESSIVE_LOAD);
@@ -321,11 +336,20 @@ static h3conn_result_t __read_request(h3conn_t* c, quicstream_t* qs, h3app_t* ap
             if (st == H3STREAM_REQUEST_READY) {
                 headers_became_ready = 1;
 
+                /* A request exists from here: the field section decoded into
+                 * one. The outcomes that replace this event rather than follow
+                 * it -- a field section over the limit, a malformed message --
+                 * are counted by their own limits instead, so in a 431 storm
+                 * the response classes can outnumber the requests. That is the
+                 * honest reading: those responses answered no request. */
+                metrics_h3(METRICS_H3_REQUESTS);
+
                 /* §5.2: once we have said we will not serve this stream, the
                  * honest answer is to say so at once. H3_REQUEST_REJECTED is
                  * the code that tells a client the request was untouched and is
                  * safe to retry on another connection. */
                 if (!h3session_accepts_request(c->session, qs->id)) {
+                    metrics_h3(METRICS_H3_REQUESTS_REJECTED);
                     quicstream_reset(qs, H3_REQUEST_REJECTED);
                     quicstream_stop_sending(qs, H3_REQUEST_REJECTED);
                     app->drained = 1;
@@ -589,6 +613,10 @@ static int __write_informational(h3conn_t* c, quicstream_t* qs, int status,
 
     const int ok = quicstream_write(qs, frame, flen);
     free(frame);
+
+    /* The only place a 1xx is counted: informational responses bypass the write
+     * filter entirely, which is where every final status is counted. */
+    if (ok) metrics_h3(METRICS_H3_RESPONSE_1XX);
 
     return ok;
 }

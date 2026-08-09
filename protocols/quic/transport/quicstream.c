@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "metrics.h"
 #include "quicstream.h"
 
 quicstream_t* quicstream_create(uint64_t id,
@@ -8,6 +9,8 @@ quicstream_t* quicstream_create(uint64_t id,
                                 uint64_t send_initial) {
     quicstream_t* stream = malloc(sizeof * stream);
     if (stream == NULL) return NULL;
+
+    metrics_quic(METRICS_QUIC_STREAMS_OPENED);
 
     memset(stream, 0, sizeof * stream);
     stream->id = id;
@@ -157,6 +160,11 @@ void quicstream_reset(quicstream_t* stream, uint64_t error_code) {
     if (stream == NULL) return;
     if (stream->send_state == QUIC_SEND_RESET_SENT ||
         stream->send_state == QUIC_SEND_RESET_RECVD) return;
+
+    /* Counted here rather than where the frame is written: the early return
+     * above is what makes a reset idempotent, and counting past it would report
+     * one abandoned stream twice. */
+    metrics_quic(METRICS_QUIC_STREAMS_RESET_SENT);
 
     stream->send_state = QUIC_SEND_RESET_SENT;
     stream->send_reset_code = error_code;
