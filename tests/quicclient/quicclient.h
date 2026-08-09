@@ -146,8 +146,49 @@ typedef struct quicclient {
     quiccid_t retry_scid;            /* what the server chose in the Retry */
     int      retry_scid_confirmed;   /* it matched retry_source_connection_id */
 
+    /* ---- Network impairment (docs/http3/08-testing.md §2) ---- *
+     *
+     * Loss recovery is defined entirely in elapsed time and packet ordering, so
+     * the interesting cases only happen on a path that loses and reorders.
+     * Nothing on a loopback ever does, which means every recovery path in the
+     * server has so far been exercised only by argument.
+     *
+     * Seeded on purpose: a failure that cannot be repeated is a failure that
+     * cannot be debugged, and "it passed last time" is the characteristic
+     * property of a randomised protocol test that is quietly broken. */
+    /* Split by direction, because the two test different things and only one of
+     * them tests the server.
+     *
+     * **Inbound** loss makes the *server* recover: it must notice, retransmit
+     * and keep the exchange going. That is the interesting direction.
+     *
+     * **Outbound** loss makes the *client* recover -- and this client has no
+     * loss recovery at all (no quicloss, by design: see the header comment).
+     * Anything it loses is gone for good, so outbound loss is a way to test
+     * that the server survives a peer that goes quiet, not a way to test
+     * recovery. Worth having, worth not confusing with the other. */
+    unsigned net_loss_in_pct;
+    unsigned net_loss_pct;
+    unsigned net_dup_pct;
+    unsigned net_reorder_pct;
+    uint64_t net_rng;
+
+    /* One datagram held back to be sent after the next one. */
+    uint8_t  net_held[2048];
+    size_t   net_held_len;
+
+    uint64_t net_dropped_out;
+    uint64_t net_dropped_in;
+    uint64_t net_reordered;
+    uint64_t net_duplicated;
+
     int verbose;
 } quicclient_t;
+
+/* Impair the path in both directions. Percentages are per datagram; `seed` of 0
+ * picks a fixed default, never a time-based one. Call before connecting. */
+void quicclient_impair(quicclient_t* client, unsigned loss_out_pct, unsigned loss_in_pct,
+                       unsigned reorder_pct, unsigned dup_pct, uint64_t seed);
 
 /* Queue a PING: the smallest non-probing frame there is, which is what §9.3
  * requires before a server will treat a new address as the peer's. */
@@ -177,6 +218,14 @@ int quicclient_path_challenge(quicclient_t* client);
 /* Set up and send the first Initial. Returns 0 on failure. */
 int quicclient_connect(quicclient_t* client, const char* host, uint16_t port,
                        const char* server_name, int verbose);
+
+/* The same, with the path impaired from the very first Initial: impairment set
+ * after connecting would leave the handshake -- where recovery is least
+ * forgiving, since there is no data to carry retransmissions -- untouched. */
+int quicclient_connect_impaired(quicclient_t* client, const char* host, uint16_t port,
+                                const char* server_name, int verbose,
+                                unsigned loss_out_pct, unsigned loss_in_pct,
+                                unsigned reorder_pct, unsigned dup_pct, uint64_t seed);
 
 /* The same, presenting an address validation token the server handed out on an
  * earlier connection (a NEW_TOKEN). What it buys is visible only against a

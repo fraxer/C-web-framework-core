@@ -49,7 +49,7 @@ static const char* const __quic_name[METRICS_QUIC__COUNT] = {
     "send_error",
     "handshakes_completed", "handshakes_failed.tls", "handshakes_failed.timeout",
     "decrypt_failures", "aead_limit_reached", "key_updates",
-    "packets_lost", "pto_fired", "persistent_congestion",
+    "packets_lost", "pto_fired", "pto_probes_sent", "persistent_congestion",
     "flow_blocked.connection", "flow_blocked.stream", "amplification_limited",
     "streams_opened", "streams_reset_sent", "streams_reset_received",
     "closed.idle_timeout", "closed.local_error", "closed.peer",

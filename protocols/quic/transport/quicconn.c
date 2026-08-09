@@ -1014,6 +1014,24 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
         }
     }
 
+    /* A PTO probe, if one is owed at this level. PING is the whole of it: the
+     * frame exists to be acknowledged and carries nothing else. Real data, if
+     * there is any, follows in the same packet -- so a probe costs an extra
+     * frame, not an extra round trip. */
+    if (conn->pto_probes > 0 && level == conn->pto_level && p + 8 < payload_cap) {
+        quicframe_t f;
+        memset(&f, 0, sizeof f);
+        f.type = QUIC_FRAME_PING;
+
+        const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
+        if (n > 0) {
+            p += n;
+            ack_eliciting = 1;
+            conn->pto_probes--;
+            metrics_quic(METRICS_QUIC_PTO_PROBE_SENT);
+        }
+    }
+
     /* A pending PATH_RESPONSE next, ahead of everything that may be deferred:
      * §8.2.2 forbids delaying the packet that carries it for any reason but
      * congestion control. Only in the application space -- the peer cannot
@@ -1250,6 +1268,22 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
     if (p == 0) {
         quicframe_ref_free(refs);
         return 0;
+    }
+
+    /* Header protection samples 16 bytes starting four bytes past the packet
+     * number (RFC 9001 §5.4.2), so the ciphertext after that point must be at
+     * least that long: pn_len + payload + tag >= 4 + 16, i.e. a payload of at
+     * least 4 - pn_len bytes. PADDING is the frame for it (§19.1).
+     *
+     * Not hypothetical, and not visible without counting: a packet carrying
+     * only a PING -- which is exactly what a PTO probe is -- came to one
+     * payload byte, quichp_apply failed, and __build_packet returned 0. The
+     * probe was built and silently never sent, so a connection that lost its
+     * last packet stalled for good while the PTO fired on forever. Found by
+     * dropping one response in the test client (docs/http3/08 §2). */
+    if (p < 4 && p + 4 <= payload_cap) {
+        memset(payload + p, 0, 4 - p);
+        p = 4;
     }
 
     /* An Initial packet must travel in a datagram of at least 1200 bytes
@@ -1878,8 +1912,18 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
          * that matters here: it means a whole round trip passed with nothing
          * acknowledged, which is what a path problem looks like before it
          * becomes packet loss. */
-        if (!quicloss_on_timeout(&conn->loss, now_us, &lost, &level))
+        if (!quicloss_on_timeout(&conn->loss, now_us, &lost, &level)) {
             metrics_quic(METRICS_QUIC_PTO_FIRED);
+
+            /* §6.2.4 requires at least one ack-eliciting packet here, and two
+             * is what the RFC suggests so that one loss does not cost another
+             * whole PTO. The point is not the payload -- it is that the peer
+             * acknowledges *something* newer, which is what lets the loss
+             * detector finally declare the vanished packet lost and resend the
+             * information it carried. */
+            conn->pto_probes = 2;
+            conn->pto_level = level;
+        }
         else {
             for (quicframe_ref_t* ref = lost; ref != NULL; ref = ref->next) {
                 if (ref->type == QUIC_FRAME_CRYPTO)

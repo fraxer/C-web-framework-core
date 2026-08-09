@@ -13,6 +13,12 @@
  *   quicclient [host] [port] [-q] [-p /path] [-a authority] [-n N] [--expect]
  *              [--handshake-only] [--path-challenge] [--key-update] [--cid]
  *              [--migrate] [--new-token [--pause N]]
+ *              [--loss N] [--loss-in N] [--reorder N] [--dup N] [--seed N]
+ *
+ * --loss impairs what this client sends and --loss-in what it receives. Only
+ * the second tests the server's loss recovery; the first tests that the server
+ * survives a peer that goes quiet, because this client has no recovery of its
+ * own (see quicclient.h).
  *
  * `-a` sets both the TLS server name and the :authority pseudo-header. They are
  * one flag because a server matches the virtual host on one and validates it
@@ -41,6 +47,8 @@ int main(int argc, char* argv[]) {
     int migrate = 0;
     int new_token = 0;
     int pause_ms = 0;
+    unsigned loss = 0, loss_in = 0, reorder = 0, dup = 0;
+    unsigned long long seed = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) verbose = 0;
         else if (strcmp(argv[i], "--handshake-only") == 0) handshake_only = 1;
@@ -54,6 +62,11 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--migrate") == 0) migrate = 1;
         else if (strcmp(argv[i], "--new-token") == 0) new_token = 1;
         else if (strcmp(argv[i], "--pause") == 0 && i + 1 < argc) pause_ms = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--loss") == 0 && i + 1 < argc) loss = (unsigned)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--loss-in") == 0 && i + 1 < argc) loss_in = (unsigned)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--reorder") == 0 && i + 1 < argc) reorder = (unsigned)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--dup") == 0 && i + 1 < argc) dup = (unsigned)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) seed = strtoull(argv[++i], NULL, 10);
     }
 
     if (concurrent < 1) concurrent = 1;
@@ -117,7 +130,17 @@ int main(int argc, char* argv[]) {
     }
 
     quicclient_t client;
-    if (!quicclient_connect(&client, host, port, authority, verbose)) {
+
+    /* Impairment has to be installed before the first Initial goes out, so the
+     * handshake itself is exposed to it -- that is where loss recovery is
+     * least forgiving, because there is no data to piggyback retransmissions
+     * on. quicclient_connect zeroes the struct, hence the ordering dance. */
+    if (loss > 0 || loss_in > 0 || reorder > 0 || dup > 0)
+        printf("network: %u%% loss out, %u%% loss in, %u%% reorder, %u%% duplicate (seed %llu)\n",
+               loss, loss_in, reorder, dup, seed);
+
+    if (!quicclient_connect_impaired(&client, host, port, authority, verbose,
+                                     loss, loss_in, reorder, dup, seed)) {
         printf("FAIL: could not send the first Initial\n");
         quicclient_free(&client);
         return 1;
@@ -212,8 +235,16 @@ int main(int argc, char* argv[]) {
              * that is guessing. Deliberately last: it ends the connection. */
             quicclient_retire_cid(&client, 4242);
 
-            for (int i = 0; i < 20 && !client.close_received; i++)
+            /* A PING each turn, because §10.2.1 has a closing endpoint re-send
+             * its CONNECTION_CLOSE *in response to an incoming packet* rather
+             * than on a timer. A client that goes quiet after provoking the
+             * error would wait forever if that one packet were lost -- which is
+             * exactly what happened the first time this ran over a lossy
+             * path. */
+            for (int i = 0; i < 20 && !client.close_received; i++) {
+                quicclient_ping(&client);
                 quicclient_pump(&client, 100);
+            }
 
             printf("unissued retire refused:   %s\n",
                    client.close_received && client.close_error == 0x0a ? "yes" : "no");
@@ -224,6 +255,15 @@ int main(int argc, char* argv[]) {
     /* Migration (RFC 9000 §9). The server must notice the new address, validate
      * it before trusting it, and only then move -- so what is checked is not
      * "did anything arrive" but the whole sequence, in order. */
+    if ((loss > 0 || loss_in > 0 || reorder > 0 || dup > 0) && verbose == 0) {
+        printf("dropped out/in:            %llu / %llu\n",
+               (unsigned long long)client.net_dropped_out,
+               (unsigned long long)client.net_dropped_in);
+        printf("reordered / duplicated:    %llu / %llu\n",
+               (unsigned long long)client.net_reordered,
+               (unsigned long long)client.net_duplicated);
+    }
+
     if (ok && migrate) {
         printf("\nMIGRATION\n");
 
@@ -247,11 +287,19 @@ int main(int argc, char* argv[]) {
 
         /* Our answer to it is what completes the validation; then the server's
          * next response must arrive at the new address, which it can only do
-         * if it moved. */
+         * if it moved.
+         *
+         * Provoked with a PING rather than waited for: once the path is
+         * validated the server has nothing of its own to send, so "a datagram
+         * arrived" would be measuring whatever incidental traffic happened to
+         * be in flight -- which is why this check passed or failed by seed
+         * before the PING was added. */
         const uint64_t before = client.datagrams_received;
 
-        for (int i = 0; i < 30 && client.datagrams_received == before; i++)
+        for (int i = 0; i < 30 && client.datagrams_received == before; i++) {
+            quicclient_ping(&client);
             quicclient_pump(&client, 100);
+        }
 
         printf("server answers the new one: %s\n",
                client.datagrams_received > before ? "yes" : "no");

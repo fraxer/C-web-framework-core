@@ -111,6 +111,95 @@ static const quictls_ops_t __ops = {
     .alert = __on_alert
 };
 
+/* ---- Network impairment ---- */
+
+/* xorshift64*, inline: the sequence has to be reproducible from the seed alone,
+ * which rules out rand() (process-global, and whatever else calls it changes
+ * this test's outcome). */
+static unsigned __net_roll(quicclient_t* c) {
+    uint64_t x = c->net_rng;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    c->net_rng = x;
+
+    return (unsigned)((x * 2685821657736338717ULL) >> 33) % 100u;
+}
+
+static int __net_impaired(const quicclient_t* c) {
+    return c->net_loss_pct > 0 || c->net_dup_pct > 0 || c->net_reorder_pct > 0;
+}
+
+static ssize_t __net_write(quicclient_t* c, const uint8_t* buf, size_t len) {
+    return sendto(c->fd, buf, len, 0,
+                  (struct sockaddr*)&c->server, sizeof c->server);
+}
+
+/* Send, or lose, or hold back, or send twice. */
+static int __net_send(quicclient_t* c, const uint8_t* buf, size_t len) {
+    if (!__net_impaired(c)) return __net_write(c, buf, len) >= 0;
+
+    if (c->net_loss_pct > 0 && __net_roll(c) < c->net_loss_pct) {
+        c->net_dropped_out++;
+        __log(c, "  [net] dropped an outgoing datagram (%zu bytes)\n", len);
+        return 1;   /* a lost packet is not an error; that is the point */
+    }
+
+    /* Held back, and released after the next one goes out -- which is what
+     * "reordered" means from the receiver's side. */
+    if (c->net_reorder_pct > 0 && c->net_held_len == 0 &&
+        len <= sizeof c->net_held && __net_roll(c) < c->net_reorder_pct) {
+        memcpy(c->net_held, buf, len);
+        c->net_held_len = len;
+        c->net_reordered++;
+        __log(c, "  [net] holding a datagram back (%zu bytes)\n", len);
+        return 1;
+    }
+
+    if (__net_write(c, buf, len) < 0) return 0;
+
+    if (c->net_dup_pct > 0 && __net_roll(c) < c->net_dup_pct) {
+        c->net_duplicated++;
+        (void)__net_write(c, buf, len);
+    }
+
+    if (c->net_held_len > 0) {
+        const size_t held = c->net_held_len;
+        c->net_held_len = 0;
+        if (__net_write(c, c->net_held, held) < 0) return 0;
+    }
+
+    return 1;
+}
+
+/* Receive, or pretend the datagram never arrived. Both directions are impaired
+ * because they fail differently: a lost request stalls the peer's stream, a
+ * lost response stalls ours, and only one of the two exercises our own ACK
+ * and retransmission logic. */
+static ssize_t __net_recv(quicclient_t* c, uint8_t* buf, size_t cap) {
+    const ssize_t n = recv(c->fd, buf, cap, 0);
+    if (n <= 0 || c->net_loss_in_pct == 0) return n;
+
+    if (c->net_loss_in_pct > 0 && __net_roll(c) < c->net_loss_in_pct) {
+        c->net_dropped_in++;
+        __log(c, "  [net] dropped an incoming datagram (%zd bytes)\n", n);
+        return -2;   /* distinct from an error: the caller keeps polling */
+    }
+
+    return n;
+}
+
+void quicclient_impair(quicclient_t* client, unsigned loss_out_pct, unsigned loss_in_pct,
+                       unsigned reorder_pct, unsigned dup_pct, uint64_t seed) {
+    if (client == NULL) return;
+
+    client->net_loss_pct = loss_out_pct > 100 ? 100 : loss_out_pct;
+    client->net_loss_in_pct = loss_in_pct > 100 ? 100 : loss_in_pct;
+    client->net_reorder_pct = reorder_pct > 100 ? 100 : reorder_pct;
+    client->net_dup_pct = dup_pct > 100 ? 100 : dup_pct;
+    client->net_rng = seed != 0 ? seed : 0x9e3779b97f4a7c15ULL;
+}
+
 /* ---- Packet building ---- */
 
 /* Build one packet at `level`, carrying an ACK if one is owed and as much
@@ -512,10 +601,23 @@ static int __flush(quicclient_t* c) {
         if (i == QUIC_ENC_APP) break;   /* a short header ends the datagram */
     }
 
-    if (total == 0) return 1;
+    if (total == 0) {
+        /* Nothing new to send, so the held datagram has waited as long as it
+         * usefully can: release it. Without this, "reorder" quietly means
+         * "drop" whenever the held packet is the last one the client had to
+         * send -- which is precisely the request it is then waiting for a
+         * response to, so the whole exchange deadlocks and looks like a server
+         * that stopped answering. */
+        if (c->net_held_len > 0) {
+            const size_t held = c->net_held_len;
+            c->net_held_len = 0;
+            if (__net_write(c, c->net_held, held) < 0) return 0;
+        }
 
-    if (sendto(c->fd, datagram, total, 0,
-               (struct sockaddr*)&c->server, sizeof c->server) < 0) {
+        return 1;
+    }
+
+    if (!__net_send(c, datagram, total)) {
         printf("  [client] sendto failed: %s\n", strerror(errno));
         return 0;
     }
@@ -578,6 +680,10 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
             __log(c, "  [client] <- STOP_SENDING %llu, error 0x%llx\n",
                   (unsigned long long)f.u.stop_sending.id,
                   (unsigned long long)f.u.stop_sending.error);
+            break;
+
+        case QUIC_FRAME_PING:
+            __log(c, "  [client] <- PING\n");
             break;
 
         case QUIC_FRAME_NEW_TOKEN:
@@ -836,9 +942,28 @@ static int __recv_datagram(quicclient_t* c, uint8_t* buf, size_t len) {
 
 /* ---- Lifecycle ---- */
 
+static int __connect(quicclient_t* client, const char* host, uint16_t port,
+                     const char* server_name, int verbose,
+                     const uint8_t* token, size_t token_len,
+                     unsigned loss_out_pct, unsigned loss_in_pct,
+                     unsigned reorder_pct, unsigned dup_pct, uint64_t seed);
+
 int quicclient_connect(quicclient_t* client, const char* host, uint16_t port,
                        const char* server_name, int verbose) {
     return quicclient_connect_token(client, host, port, server_name, verbose, NULL, 0);
+}
+
+int quicclient_connect_impaired(quicclient_t* client, const char* host, uint16_t port,
+                                const char* server_name, int verbose,
+                                unsigned loss_out_pct, unsigned loss_in_pct,
+                                unsigned reorder_pct, unsigned dup_pct, uint64_t seed) {
+    if (client == NULL) return 0;
+
+    /* The struct is zeroed inside, so the impairment cannot be set before the
+     * call; it is installed at the one point in the sequence where the socket
+     * exists and nothing has been sent yet. */
+    return __connect(client, host, port, server_name, verbose, NULL, 0,
+                     loss_out_pct, loss_in_pct, reorder_pct, dup_pct, seed);
 }
 
 size_t quicclient_take_token(const quicclient_t* client, uint8_t* out, size_t cap) {
@@ -853,6 +978,15 @@ size_t quicclient_take_token(const quicclient_t* client, uint8_t* out, size_t ca
 int quicclient_connect_token(quicclient_t* client, const char* host, uint16_t port,
                              const char* server_name, int verbose,
                              const uint8_t* token, size_t token_len) {
+    return __connect(client, host, port, server_name, verbose, token, token_len,
+                     0, 0, 0, 0, 0);
+}
+
+static int __connect(quicclient_t* client, const char* host, uint16_t port,
+                     const char* server_name, int verbose,
+                     const uint8_t* token, size_t token_len,
+                     unsigned loss_out_pct, unsigned loss_in_pct,
+                     unsigned reorder_pct, unsigned dup_pct, uint64_t seed) {
     if (client == NULL) return 0;
 
     memset(client, 0, sizeof * client);
@@ -881,6 +1015,8 @@ int quicclient_connect_token(quicclient_t* client, const char* host, uint16_t po
     SSL_CTX_set_verify(client->ssl_ctx, SSL_VERIFY_NONE, NULL);
 
     client->server_name = server_name;
+
+    quicclient_impair(client, loss_out_pct, loss_in_pct, reorder_pct, dup_pct, seed);
 
     /* Presented on the very first Initial, before anything is negotiated: that
      * is the whole point of a NEW_TOKEN -- the server decides whether to ask
@@ -967,7 +1103,8 @@ int quicclient_pump(quicclient_t* client, int timeout_ms) {
         if (r == 0) break;
 
         uint8_t buf[2048];
-        const ssize_t n = recv(client->fd, buf, sizeof buf, 0);
+        const ssize_t n = __net_recv(client, buf, sizeof buf);
+        if (n == -2) continue;   /* dropped on purpose */
         if (n <= 0) break;
 
         if (!__recv_datagram(client, buf, (size_t)n)) return 0;

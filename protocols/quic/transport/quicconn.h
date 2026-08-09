@@ -182,6 +182,18 @@ typedef struct quicconn {
      * half of §9.3 -- an unvalidated path may carry data under a 3x limit, but
      * the old path has no such limit and, if the peer really moved, one round
      * trip of delay is all it costs. */
+    /* Probes owed after a PTO (RFC 9002 §6.2.4).
+     *
+     * A PTO does not declare anything lost -- it says a round trip passed with
+     * nothing acknowledged -- and the only way out is to make the peer say
+     * something. Without a probe the connection can stall for good: loss
+     * detection needs an acknowledgement of a *later* packet to declare an
+     * earlier one lost, and if the last packet we sent was the one that
+     * vanished, no later packet exists to be acknowledged. Found exactly that
+     * way, by a client dropping one response (docs/http3/08 §2). */
+    unsigned pto_probes;
+    quic_enc_level_e pto_level;
+
     /* A NEW_TOKEN to hand the peer once its address is proven (§8.1.3), so its
      * next connection skips the Retry round trip. Retransmitted if lost, like
      * NEW_CONNECTION_ID and for the same reason: nothing else can reproduce it. */

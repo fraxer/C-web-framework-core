@@ -161,6 +161,11 @@ typedef enum {
 
     METRICS_QUIC_PACKETS_LOST,
     METRICS_QUIC_PTO_FIRED,
+    /* Probes actually put on the wire. Separate from pto_fired because the two
+     * came apart in practice: a PTO that arms a probe which is then never built
+     * leaves the connection stalled exactly as if nothing had fired, and the
+     * first counter alone cannot tell the two apart (docs/http3/08 §2). */
+    METRICS_QUIC_PTO_PROBE_SENT,
     METRICS_QUIC_PERSISTENT_CONGESTION,
 
     /* Why the send loop stopped short. Congestion is expected; the other two
