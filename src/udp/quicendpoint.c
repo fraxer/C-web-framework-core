@@ -965,6 +965,15 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
      * connection we never had would also land here, and quicconn_accept will
      * fail to make sense of it -- which is the right disposition for it
      * anyway, since without the Initial there are no keys to read it with. */
+    if (ep->draining) {
+        /* §5 of docs/http3/07: a server on its way out says so rather than
+         * going quiet, so the client can go elsewhere immediately instead of
+         * retransmitting its Initial for a handshake timeout. */
+        metrics_quic(METRICS_QUIC_AT_CAPACITY);
+        __send_initial_close(ep, dgram, &inv, QUIC_CONNECTION_REFUSED);
+        return;
+    }
+
     if (ep->conn_count >= __quic_max_connections) {
         metrics_quic(METRICS_QUIC_AT_CAPACITY);
         /* Told, not dropped. Being full is not an attack, and a client that
@@ -1314,8 +1323,29 @@ static void __endpoint_tick(quicendpoint_t* ep, int shutdown_now) {
             continue;
         }
 
-        if (shutdown_now && conn->state == QUICCONN_ACTIVE)
-            quicconn_close(conn, QUIC_NO_ERROR, 0, now);
+        if (shutdown_now && conn->state == QUICCONN_ACTIVE) {
+            connection_server_ctx_t* cctx = conn->conn.ctx;
+            h3conn_t* h3 = cctx != NULL ? cctx->parser : NULL;
+
+            if (h3 == NULL) {
+                /* Bare QUIC with nothing above it: there is no request to
+                 * finish, so there is nothing to wait for. */
+                quicconn_close(conn, QUIC_NO_ERROR, 0, now);
+            }
+            else {
+                /* Told once, then given time. h3session_accepts_request already
+                 * refuses anything past the id in the GOAWAY, so the drain is
+                 * bounded by the requests that were already running -- and by
+                 * the worker's own grace window, which closes the socket under
+                 * us if they take too long. */
+                (void)h3conn_goaway(h3, conn);
+
+                if (h3conn_requests_in_flight(h3, conn) == 0)
+                    quicconn_close(conn, QUIC_NO_ERROR, 0, now);
+                else
+                    atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+            }
+        }
 
         int alive = quicconn_tick(conn, now);
         if (alive && atomic_load_explicit(&conn->want_write, memory_order_acquire)) alive = quicconn_send(conn, now);
@@ -1335,6 +1365,25 @@ static void __endpoint_tick(quicendpoint_t* ep, int shutdown_now) {
 void quicendpoints_tick(quicendpoint_t* endpoints, int shutdown_now) {
     while (endpoints != NULL) {
         __endpoint_tick(endpoints, shutdown_now);
+
+        /* The drain is over for this endpoint: nothing is left to serve, so the
+         * socket can go. Until it does the worker's connection_count cannot
+         * reach zero, which is precisely what keeps the loop running long
+         * enough for the drain to happen. */
+        if (endpoints->draining && endpoints->conn_count == 0 &&
+            endpoints->listener.connection != NULL) {
+            endpoints->listener.connection->close(endpoints->listener.connection);
+            endpoints->listener.connection = NULL;
+            endpoints->listening = 0;
+        }
+
+        endpoints = endpoints->next;
+    }
+}
+
+void quicendpoints_drain(quicendpoint_t* endpoints) {
+    while (endpoints != NULL) {
+        endpoints->draining = 1;
         endpoints = endpoints->next;
     }
 }

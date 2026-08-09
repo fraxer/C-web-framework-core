@@ -191,4 +191,19 @@ int h3conn_write(h3conn_t* c, quicconn_t* qc);
  * and the edge -- the handler finishing -- has already passed. */
 int h3conn_has_pending(const h3conn_t* c, const quicconn_t* qc);
 
+/* ---- Graceful shutdown (docs/http3/07-integration.md §5) ---- */
+
+/* Tell the peer that no request after `qc`'s current high-water mark will be
+ * served: an h3 GOAWAY on our control stream (§5.2). Idempotent -- a second
+ * call writes nothing, because §5.2 lets the id only shrink and repeating it
+ * would be the control-frame flood the budget next door exists to stop.
+ *
+ * Returns 0 only if the frame could not be written at all. */
+int h3conn_goaway(h3conn_t* c, quicconn_t* qc);
+
+/* Requests still being served: a stream that has a request and has not finished
+ * answering it. This is what a drain waits for -- not the stream count, which
+ * includes our own service streams and stays non-zero forever. */
+size_t h3conn_requests_in_flight(const h3conn_t* c, const quicconn_t* qc);
+
 #endif

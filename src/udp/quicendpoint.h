@@ -92,6 +92,17 @@ typedef struct quicendpoint {
      * half-open ones is being attacked, and only the second calls for Retry. */
     size_t handshakes_in_flight;
 
+    /* A graceful shutdown is in progress: no new connections, existing ones
+     * are being drained.
+     *
+     * A flag rather than closing the socket, and that is the whole difference
+     * from TCP. There, closing the listener stops new connections while the
+     * established ones carry on with their own descriptors. Here one socket
+     * carries both, so closing it would strand exactly the connections the
+     * drain is supposed to finish serving. The socket goes when the last
+     * connection does. */
+    int draining;
+
     /* Connections with something to send. Unlike `conns`, this is reachable
      * from a handler thread finishing a response, so it has a lock of its own
      * -- a leaf one, held for a few instructions and never while
@@ -166,6 +177,13 @@ void quic_policy_free(void);
 quicendpoint_t* quicendpoints_create(mpxapi_t* api, server_t* first_server, int* ok);
 
 int  quicendpoints_listen(quicendpoint_t* endpoints);
+
+/* Begin a graceful shutdown: refuse new connections, GOAWAY the existing ones
+ * and let them finish what they are serving. Each endpoint unlistens itself
+ * once its last connection is gone, which is what eventually lets the worker
+ * loop's connection_count reach zero. */
+void quicendpoints_drain(quicendpoint_t* endpoints);
+
 void quicendpoints_unlisten(quicendpoint_t* endpoints);
 void quicendpoints_free(quicendpoint_t* endpoints);
 

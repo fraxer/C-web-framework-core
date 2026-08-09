@@ -78,9 +78,12 @@ int mpxserver_run(appconfig_t* appconfig) {
                 appconfig_terminating()) {
                 __listeners_unlisten(listeners);
 #ifdef CWFR_HTTP3
-                /* Endpoints hold a reference in connection_count like listeners
-                 * do, so the drain below cannot reach zero until they are gone. */
-                quicendpoints_unlisten(endpoints);
+                /* Not unlisten: a QUIC endpoint's socket carries its
+                 * connections as well as new arrivals, so closing it would
+                 * strand the very connections being drained. The endpoint
+                 * refuses new ones and closes itself when its last connection
+                 * is gone (docs/http3/07 §5). */
+                quicendpoints_drain(endpoints);
 #endif
             }
 

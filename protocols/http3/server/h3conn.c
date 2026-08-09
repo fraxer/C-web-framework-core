@@ -725,6 +725,46 @@ int h3conn_has_pending(const h3conn_t* c, const quicconn_t* qc) {
     return 0;
 }
 
+/* ---- Graceful shutdown ---- */
+
+int h3conn_goaway(h3conn_t* c, quicconn_t* qc) {
+    if (c == NULL || qc == NULL) return 0;
+    if (c->session->goaway_sent) return 1;
+
+    quicstream_t* ctrl = quicconn_stream_find(qc, c->session->ctrl_send_id);
+    if (ctrl == NULL) return 0;
+
+    /* The first client bidi stream id we will not serve. next_peer_bidi counts
+     * the ones opened so far, so this names the next one -- everything already
+     * in flight is below it and still gets answered, which is the whole
+     * difference between GOAWAY and hanging up. */
+    const uint64_t stream_id = qc->next_peer_bidi << 2;
+
+    uint8_t frame[32];
+    const size_t n = h3session_goaway_encode(c->session, frame, sizeof frame, stream_id);
+    if (n == 0) return 0;
+
+    if (!quicstream_write(ctrl, frame, n)) return 0;
+
+    log_info("h3: GOAWAY sent, no requests past stream %llu\n",
+             (unsigned long long)stream_id);
+
+    return 1;
+}
+
+size_t h3conn_requests_in_flight(const h3conn_t* c, const quicconn_t* qc) {
+    if (c == NULL || qc == NULL) return 0;
+
+    size_t n = 0;
+
+    for (const quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
+        const h3stream_t* st = h3conn_request_of((quicstream_t*)qs);
+        if (st != NULL && !st->response_done) n++;
+    }
+
+    return n;
+}
+
 h3conn_result_t h3conn_stream_read(h3conn_t* c, quicstream_t* qs) {
     if (c == NULL || qs == NULL) return __closed(H3_INTERNAL_ERROR);
 
