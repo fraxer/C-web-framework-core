@@ -231,6 +231,27 @@ static int __on_crypto(void* ctx, quic_enc_level_e level,
 static int __on_peer_params(void* ctx, const quictp_t* params) {
     quicconn_t* conn = ctx;
 
+    /* §7.3: the client MUST send initial_source_connection_id, and it must be
+     * the Source Connection ID of the Initial it actually sent. The check is
+     * what stops a handshake being spliced between two connections -- an
+     * attacker relaying our flight into a connection of its own is caught here
+     * and nowhere else, because every other field it can copy verbatim.
+     *
+     * Compared against the id remembered at accept rather than peer_cids[0]:
+     * the two agree today, but the CID list is the peer's to rewrite, and this
+     * comparison must be against what arrived in that first packet. */
+    if (!params->has_initial_scid) {
+        log_error("quic: peer sent no initial_source_connection_id\n");
+        return 0;
+    }
+
+    if (params->initial_scid.len != conn->peer_initial_scid.len ||
+        memcmp(params->initial_scid.data, conn->peer_initial_scid.data,
+               params->initial_scid.len) != 0) {
+        log_error("quic: initial_source_connection_id does not match the packet\n");
+        return 0;
+    }
+
     conn->peer_params = *params;
     conn->peer_params_seen = 1;
 
@@ -253,6 +274,15 @@ static int __on_peer_params(void* ctx, const quictp_t* params) {
 
 static void __on_alert(void* ctx, uint8_t alert) {
     quicconn_t* conn = ctx;
+
+    /* A transport parameter we refused reaches TLS as a handshake failure, and
+     * the alert for it arrives here first -- so without this the connection
+     * would already be CLOSING with CRYPTO_ERROR by the time the caller of
+     * quictls_advance gets to name the real reason. */
+    if (conn->tls.transport_error != 0) {
+        quicconn_close(conn, conn->tls.transport_error, 0, quic_now_us());
+        return;
+    }
 
     quicconn_close(conn, QUIC_CRYPTO_ERROR(alert), 0, quic_now_us());
 }
@@ -317,6 +347,23 @@ static void __requeue_lost(quicconn_t* conn, quic_enc_level_e level,
 
 static int __on_crypto_frame(quicconn_t* conn, quic_enc_level_e level,
                              const quicframe_t* frame) {
+    /* RFC 9001 §6: QUIC does its own key updates, so a TLS KeyUpdate message is
+     * not merely redundant here -- acting on it would move the TLS key schedule
+     * out from under a packet protection that does not follow it. §6 names the
+     * error exactly: CRYPTO_ERROR with unexpected_message.
+     *
+     * Read off the first byte of the message rather than left to the TLS stack:
+     * OpenSSL's QUIC bridge hands post-handshake messages back without comment,
+     * and a KeyUpdate arriving at 1-RTT was being accepted in silence. Only the
+     * start of a message can be tested, which is what offset 0 means -- a
+     * KeyUpdate is four bytes and never split. */
+    if (level == QUIC_ENC_APP && frame->u.crypto.offset == 0 &&
+        frame->u.crypto.len > 0 && frame->u.crypto.data[0] == 24 /* key_update */) {
+        quicconn_close(conn, QUIC_CRYPTO_ERROR(10 /* unexpected_message */), 0,
+                       quic_now_us());
+        return 0;
+    }
+
     if (!quictls_recv_crypto(&conn->tls, level, frame->u.crypto.offset,
                              frame->u.crypto.data, (size_t)frame->u.crypto.len)) {
         quicconn_close(conn, QUIC_CRYPTO_BUFFER_EXCEEDED, 0, quic_now_us());
@@ -400,6 +447,74 @@ static int __on_ack_frame(quicconn_t* conn, quic_enc_level_e level,
     return 1;
 }
 
+/* The stream a STOP_SENDING or MAX_STREAM_DATA names.
+ *
+ * Both frames talk about *our* send side, which is what makes this different
+ * from an ordinary lookup -- there are four cases and only one of them is a
+ * stream:
+ *
+ *  - a stream we cannot send on at all, meaning one of the peer's
+ *    unidirectional ones: STREAM_STATE_ERROR whatever its state (§19.5, §19.10).
+ *    Neither frame has any meaning there;
+ *  - an id only we could have opened, which we have not: also STREAM_STATE_ERROR
+ *    (§19.5). The peer is describing a stream that does not exist and that it
+ *    cannot bring into existence;
+ *  - a peer-initiated id we have not seen yet: legal, and it opens the stream,
+ *    under the same limit a STREAM frame would face;
+ *  - one we opened and have already released: gone, and the frame is late
+ *    rather than wrong. Ignored, as §3.2 asks.
+ *
+ * Returns the stream, or NULL with `*ignore` telling the caller which of the
+ * last two it was: 1 to carry on, 0 because the connection is now closing. */
+static quicstream_t* __stream_for_send_frame(quicconn_t* conn, uint64_t id,
+                                             uint64_t now_us, int* ignore) {
+    *ignore = 0;
+
+    quicstream_t* s = __stream_find(conn, id);
+    if (s != NULL) return s;
+
+    if (!quicstream_can_send(id)) {
+        quicconn_close(conn, QUIC_STREAM_STATE_ERROR, 0, now_us);
+        return NULL;
+    }
+
+    if (!quic_stream_is_peer_initiated(id)) {
+        /* Ours to open. Below the count we have opened it is a released stream;
+         * at or above it, one that never existed. */
+        const uint64_t opened = quic_stream_is_uni(id) ? conn->next_local_uni : 0;
+
+        if (quic_stream_index(id) >= opened) {
+            quicconn_close(conn, QUIC_STREAM_STATE_ERROR, 0, now_us);
+            return NULL;
+        }
+
+        *ignore = 1;
+        return NULL;
+    }
+
+    /* Peer-initiated and unseen: the frame opens it, exactly as a STREAM frame
+     * would, and the same limit applies. */
+    const uint64_t opened = quic_stream_is_uni(id) ? conn->next_peer_uni
+                                                   : conn->next_peer_bidi;
+    if (quic_stream_index(id) < opened) {
+        *ignore = 1;
+        return NULL;
+    }
+
+    if (quic_stream_index(id) >= __streams_limit(conn, quic_stream_is_uni(id))) {
+        quicconn_close(conn, QUIC_STREAM_LIMIT_ERROR, 0, now_us);
+        return NULL;
+    }
+
+    s = __stream_open_peer(conn, id);
+    if (s == NULL) {
+        quicconn_close(conn, QUIC_INTERNAL_ERROR, 0, now_us);
+        return NULL;
+    }
+
+    return s;
+}
+
 static int __on_stream_frame(quicconn_t* conn, const quicframe_t* frame,
                              uint64_t now_us) {
     const uint64_t id = frame->u.stream.id;
@@ -472,6 +587,8 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
     /* §12.4: a frame in a packet number space that does not admit it is a
      * protocol violation -- a STREAM frame in an Initial packet, say. */
     if (!quicframe_allowed_in(frame->type, level)) {
+        log_error("quic: frame 0x%llx not allowed at level %d\n",
+                  (unsigned long long)frame->type, (int)level);
         quicconn_close(conn, QUIC_PROTOCOL_VIOLATION, 0, now_us);
         return 0;
     }
@@ -508,8 +625,10 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
     }
 
     case QUIC_FRAME_STOP_SENDING: {
-        quicstream_t* s = __stream_find(conn, frame->u.stop_sending.id);
-        if (s == NULL) return 1;
+        int ignore = 0;
+        quicstream_t* s = __stream_for_send_frame(conn, frame->u.stop_sending.id,
+                                                  now_us, &ignore);
+        if (s == NULL) return ignore;
 
         const quicstream_err_t err =
             quicstream_on_stop_sending(s, frame->u.stop_sending.error);
@@ -527,8 +646,10 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
         return 1;
 
     case QUIC_FRAME_MAX_STREAM_DATA: {
-        quicstream_t* s = __stream_find(conn, frame->u.max_stream_data.id);
-        if (s == NULL) return 1;
+        int ignore = 0;
+        quicstream_t* s = __stream_for_send_frame(conn, frame->u.max_stream_data.id,
+                                                  now_us, &ignore);
+        if (s == NULL) return ignore;
 
         const quicstream_err_t err =
             quicstream_on_max_data(s, frame->u.max_stream_data.max);
@@ -636,7 +757,12 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
         return 1;
 
     case QUIC_FRAME_HANDSHAKE_DONE:
-        /* Server-only frame; a client sending it is confused (§19.20). */
+    /* Both are server-only, and a client sending either is confused about which
+     * end it is (§19.20, §19.7). NEW_TOKEN needs saying explicitly: without a
+     * case of its own it reached the default below and came back as
+     * FRAME_ENCODING_ERROR, which blames the encoding for what is a role
+     * mistake -- the frame parsed perfectly well. */
+    case QUIC_FRAME_NEW_TOKEN:
         quicconn_close(conn, QUIC_PROTOCOL_VIOLATION, 0, now_us);
         return 0;
 
@@ -965,6 +1091,19 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
     if (!quichp_remove(keys, buf, len, pkt->pn_offset, &pn_len, &truncated, &key_phase))
         return 1;
 
+    /* §17.2/§17.3: the reserved bits must be zero once protection is off. They
+     * are two bits that carry nothing, which is exactly why they are worth
+     * checking -- a peer that gets them wrong has a header-protection bug, and
+     * every other field it produces is suspect. The mask differs by header
+     * form: 0x0c in a long header, 0x18 in a short one, where the extra bits
+     * are the spin bit and the key phase. */
+    const uint8_t reserved_mask = (buf[0] & 0x80) != 0 ? 0x0c : 0x18;
+    if ((buf[0] & reserved_mask) != 0) {
+        log_error("quic: reserved bits set at level %d\n", (int)level);
+        quicconn_close(conn, QUIC_PROTOCOL_VIOLATION, 0, now_us);
+        return 0;
+    }
+
     const uint64_t largest = conn->ack[level].any_received
                              ? conn->ack[level].largest : QUICPKT_NO_ACKED;
     const uint64_t pn = quicpkt_decode_pn(
@@ -1154,17 +1293,42 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
             metrics_quic(METRICS_QUIC_HANDSHAKE_FAILED_TLS);
 
             if (conn->state != QUICCONN_CLOSING)
-                quicconn_close(conn, QUIC_CRYPTO_ERROR(0x28), 0, now_us);
+                quicconn_close(conn,
+                               conn->tls.transport_error != 0
+                                   ? conn->tls.transport_error
+                                   : QUIC_CRYPTO_ERROR(0x28),
+                               0, now_us);
+            return 0;
+        }
+
+        /* RFC 9001 §8.2: a ClientHello without quic_transport_parameters is a
+         * connection error equivalent to a fatal missing_extension alert.
+         * OpenSSL does not treat the extension as required -- it simply never
+         * calls the callback -- so without this check the handshake completed
+         * against a peer that had agreed to nothing, and every limit stayed at
+         * zero. The failure then surfaced three layers up as "h3: could not
+         * open the service streams", which names the symptom and not one thing
+         * about the cause.
+         *
+         * Tested here rather than at completion, and the difference is not
+         * cosmetic: handshake keys exist only once TLS has read the
+         * ClientHello, so their absence is already decided, and refusing now
+         * saves signing a certificate for a connection we are about to refuse.
+         * The peer also learns why while it is still listening at this level. */
+        if (conn->tx[QUIC_ENC_HANDSHAKE].valid && !conn->peer_params_seen) {
+            log_error("quic: peer sent no transport parameters\n");
+            quicconn_close(conn, QUIC_CRYPTO_ERROR(109 /* missing_extension */),
+                           0, now_us);
             return 0;
         }
 
         if (conn->tls.handshake_complete) {
-            log_error("quic: handshake complete; peer streams_uni=%llu streams_bidi=%llu "
-                      "max_data=%llu max_stream_data_uni=%llu\n",
-                      (unsigned long long)conn->peer_params.initial_max_streams_uni,
-                      (unsigned long long)conn->peer_params.initial_max_streams_bidi,
-                      (unsigned long long)conn->peer_params.initial_max_data,
-                      (unsigned long long)conn->peer_params.initial_max_stream_data_uni);
+            log_info("quic: handshake complete; peer streams_uni=%llu streams_bidi=%llu "
+                     "max_data=%llu max_stream_data_uni=%llu\n",
+                     (unsigned long long)conn->peer_params.initial_max_streams_uni,
+                     (unsigned long long)conn->peer_params.initial_max_streams_bidi,
+                     (unsigned long long)conn->peer_params.initial_max_data,
+                     (unsigned long long)conn->peer_params.initial_max_stream_data_uni);
 
             metrics_quic(METRICS_QUIC_HANDSHAKE_COMPLETED);
 
@@ -1889,6 +2053,9 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     /* The client's Source Connection ID is where our packets are addressed. */
     conn->peer_cids[0] = *peer_scid;
     conn->peer_cid_count = 1;
+    /* And the same value again, as the record of what that first packet said --
+     * §7.3 checks the transport parameter against it (__on_peer_params). */
+    conn->peer_initial_scid = *peer_scid;
 
     /* Ours, which the client will use from its next packet onwards. Random so
      * that two connections of the same client cannot be linked by an observer
@@ -2076,6 +2243,74 @@ void quicconn_free(quicconn_t* conn) {
     free(conn);
 }
 
+/* One CONNECTION_CLOSE packet at one encryption level, written into `dst`.
+ *
+ * Returns bytes written, or 0 if the level has no keys or the room runs out --
+ * both of which the caller treats the same way, as "this level contributes
+ * nothing to the datagram". */
+static size_t __write_close_packet(quicconn_t* conn, quic_enc_level_e level,
+                                   uint8_t* dst, size_t cap) {
+    if (!conn->tx[level].valid) return 0;
+
+    quiccid_t* dcid = conn->peer_cid_count > 0 ? &conn->peer_cids[0] : NULL;
+    if (dcid == NULL) return 0;
+
+    uint8_t payload[64];
+    quicframe_t f;
+    memset(&f, 0, sizeof f);
+    /* An application error code cannot be sent before the handshake keys
+     * exist, so it becomes APPLICATION_ERROR at the transport level (§10.2.3). */
+    f.type = (conn->error_is_app && level == QUIC_ENC_APP)
+             ? QUIC_FRAME_CONNECTION_CLOSE_APP : QUIC_FRAME_CONNECTION_CLOSE;
+    f.u.close.error = (conn->error_is_app && level != QUIC_ENC_APP)
+                      ? QUIC_APPLICATION_ERROR : conn->error_code;
+
+    const size_t plen = quicframe_write(payload, sizeof payload, &f);
+    if (plen == 0) return 0;
+
+    const uint64_t pn = conn->loss.space[level].next_pn;
+    const size_t pn_len = quicpkt_pn_length(pn, conn->loss.space[level].largest_acked);
+
+    quicpkt_hdr_out_t hdr;
+    memset(&hdr, 0, sizeof hdr);
+    hdr.type = level == QUIC_ENC_APP       ? QUIC_PKT_SHORT
+             : level == QUIC_ENC_HANDSHAKE ? QUIC_PKT_HANDSHAKE
+                                           : QUIC_PKT_INITIAL;
+    hdr.version = QUIC_VERSION_1;
+    hdr.dcid = dcid;
+    hdr.scid = &conn->local_cids[0].cid;
+    hdr.pn = pn;
+    hdr.pn_len = pn_len;
+    hdr.payload_len = plen + QUIC_AEAD_TAG_LEN;
+
+    size_t pn_offset = 0;
+    const size_t header_len = quicpkt_write_header(dst, cap, &hdr, &pn_offset);
+    if (header_len == 0) return 0;
+
+    size_t sealed = 0;
+    if (!quiccrypto_seal(&conn->tx[level], pn, dst, header_len,
+                         payload, plen, dst + header_len, &sealed))
+        return 0;
+
+    size_t total = header_len + sealed;
+
+    /* Header protection needs a sample four bytes past the packet number, so a
+     * short packet has to be padded to reach it. Only ever the last packet in
+     * the datagram: a long header carries a length, so padding one would put
+     * the bytes outside it. */
+    if (level == QUIC_ENC_APP && total < pn_offset + QUICHP_MIN_AFTER_PN &&
+        pn_offset + QUICHP_MIN_AFTER_PN <= cap) {
+        memset(dst + total, 0, pn_offset + QUICHP_MIN_AFTER_PN - total);
+        total = pn_offset + QUICHP_MIN_AFTER_PN;
+    }
+
+    if (!quichp_apply(&conn->tx[level], dst, total, pn_offset, pn_len)) return 0;
+
+    conn->loss.space[level].next_pn++;
+
+    return total;
+}
+
 void quicconn_close(quicconn_t* conn, uint64_t error_code, int is_app,
                     uint64_t now_us) {
     if (conn == NULL) return;
@@ -2092,68 +2327,39 @@ void quicconn_close(quicconn_t* conn, uint64_t error_code, int is_app,
     conn->error_is_app = is_app;
     conn->close_deadline_us = now_us + quicloss_pto_us(&conn->loss, QUIC_ENC_APP) * 3;
 
-    /* Build the close packet once and keep it: §10.2.1 has it re-sent in
+    /* Build the close datagram once and keep it: §10.2.1 has it re-sent in
      * answer to anything that arrives during the closing period, and rebuilding
-     * it each time would need state we are about to stop maintaining. */
-    const quic_enc_level_e level = conn->tx[QUIC_ENC_APP].valid
-                                   ? QUIC_ENC_APP : QUIC_ENC_INITIAL;
-    if (!conn->tx[level].valid) return;
+     * it each time would need state we are about to stop maintaining.
+     *
+     * Once 1-RTT keys exist the peer certainly reads them, and one short-header
+     * packet is the whole datagram. Before that, §10.2.3: we cannot know which
+     * level the peer can still read, so the frame goes out at *every* level we
+     * hold keys for, coalesced. Sending only the lowest one -- which is what
+     * this did -- makes every handshake-time error invisible to a peer that has
+     * already moved on and discarded those keys. h3spec sees the connection
+     * simply stop; a real client sees a handshake that hangs to its timeout
+     * with no reason given, which is the worst failure mode this protocol has. */
+    size_t total = 0;
 
-    uint8_t payload[64];
-    quicframe_t f;
-    memset(&f, 0, sizeof f);
-    /* An application error code cannot be sent before the handshake keys
-     * exist, so it becomes APPLICATION_ERROR at the transport level (§10.2.3). */
-    f.type = (is_app && level == QUIC_ENC_APP)
-             ? QUIC_FRAME_CONNECTION_CLOSE_APP : QUIC_FRAME_CONNECTION_CLOSE;
-    f.u.close.error = (is_app && level != QUIC_ENC_APP) ? QUIC_APPLICATION_ERROR
-                                                        : error_code;
-
-    const size_t plen = quicframe_write(payload, sizeof payload, &f);
-    if (plen == 0) return;
-
-    quiccid_t* dcid = conn->peer_cid_count > 0 ? &conn->peer_cids[0] : NULL;
-    if (dcid == NULL) return;
-
-    const uint64_t pn = conn->loss.space[level].next_pn;
-    const size_t pn_len = quicpkt_pn_length(pn, conn->loss.space[level].largest_acked);
-
-    quicpkt_hdr_out_t hdr;
-    memset(&hdr, 0, sizeof hdr);
-    hdr.type = level == QUIC_ENC_APP ? QUIC_PKT_SHORT : QUIC_PKT_INITIAL;
-    hdr.version = QUIC_VERSION_1;
-    hdr.dcid = dcid;
-    hdr.scid = &conn->local_cids[0].cid;
-    hdr.pn = pn;
-    hdr.pn_len = pn_len;
-    hdr.payload_len = plen + QUIC_AEAD_TAG_LEN;
-
-    size_t pn_offset = 0;
-    const size_t header_len = quicpkt_write_header(conn->close_packet,
-                                                   sizeof conn->close_packet,
-                                                   &hdr, &pn_offset);
-    if (header_len == 0) return;
-
-    size_t sealed = 0;
-    if (!quiccrypto_seal(&conn->tx[level], pn, conn->close_packet, header_len,
-                         payload, plen, conn->close_packet + header_len, &sealed))
-        return;
-
-    size_t total = header_len + sealed;
-
-    /* Header protection needs a sample four bytes past the packet number, so a
-     * short packet has to be padded to reach it. */
-    if (total < pn_offset + QUICHP_MIN_AFTER_PN &&
-        pn_offset + QUICHP_MIN_AFTER_PN <= sizeof conn->close_packet) {
-        memset(conn->close_packet + total, 0, pn_offset + QUICHP_MIN_AFTER_PN - total);
-        total = pn_offset + QUICHP_MIN_AFTER_PN;
+    /* "The peer can read 1-RTT" is not the same as "we can write it", and the
+     * difference is a whole flight wide: a server holds 1-RTT keys from the
+     * moment it sends its Finished, while the client cannot read them until it
+     * has processed that flight. Choosing the level by our own keys sent every
+     * handshake-time error into a packet the peer had no way to open. */
+    if (conn->tls.handshake_complete && conn->tx[QUIC_ENC_APP].valid)
+        total = __write_close_packet(conn, QUIC_ENC_APP, conn->close_packet,
+                                     sizeof conn->close_packet);
+    else {
+        total = __write_close_packet(conn, QUIC_ENC_INITIAL, conn->close_packet,
+                                     sizeof conn->close_packet);
+        total += __write_close_packet(conn, QUIC_ENC_HANDSHAKE,
+                                      conn->close_packet + total,
+                                      sizeof conn->close_packet - total);
     }
 
-    if (!quichp_apply(&conn->tx[level], conn->close_packet, total, pn_offset, pn_len))
-        return;
+    if (total == 0) return;
 
     conn->close_packet_len = total;
-    conn->loss.space[level].next_pn++;
     atomic_store_explicit(&conn->want_write, 1, memory_order_release);
 }
 

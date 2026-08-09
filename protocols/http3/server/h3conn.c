@@ -186,17 +186,33 @@ int h3conn_open_service_streams(h3conn_t* c, quicconn_t* qc) {
 
     /* And one grease stream (RFC 9287), which exists only to be ignored. Sent
      * because a peer's handling of the unknown is otherwise exercised by
-     * nobody, and the cost is one stream that never carries a byte. */
+     * nobody, and the cost is one stream that never carries a byte.
+     *
+     * Best effort, and that is the whole point: §6.2 obliges a peer to allow
+     * only the three streams above, so a fourth is a courtesy it may refuse.
+     * Treating the refusal as failure killed every connection from a peer that
+     * granted exactly three -- immediately after the handshake, with
+     * H3_INTERNAL_ERROR, which names nothing. h3spec grants exactly three, and
+     * this one bug accounted for all 31 of its transport failures: the
+     * connection was dead before any of them could be tested. */
+    c->session->grease_send_id = H3_STREAM_ID_NONE;
     n = h3session_uni_preamble(buf, sizeof buf, 0x21);
-    if (n == 0 || !__open_uni(qc, buf, n, &c->session->grease_send_id)) return 0;
+    if (n > 0) __open_uni(qc, buf, n, &c->session->grease_send_id);
 
     c->service_streams_open = 1;
 
-    log_error("h3: service streams opened: control %llu, qpack %llu/%llu, grease %llu\n",
-              (unsigned long long)c->session->ctrl_send_id,
-              (unsigned long long)c->session->qpack_enc_send_id,
-              (unsigned long long)c->session->qpack_dec_send_id,
-              (unsigned long long)c->session->grease_send_id);
+    if (c->session->grease_send_id == H3_STREAM_ID_NONE)
+        log_info("h3: service streams opened: control %llu, qpack %llu/%llu, no grease "
+                 "(the peer granted exactly three)\n",
+                 (unsigned long long)c->session->ctrl_send_id,
+                 (unsigned long long)c->session->qpack_enc_send_id,
+                 (unsigned long long)c->session->qpack_dec_send_id);
+    else
+        log_info("h3: service streams opened: control %llu, qpack %llu/%llu, grease %llu\n",
+                 (unsigned long long)c->session->ctrl_send_id,
+                 (unsigned long long)c->session->qpack_enc_send_id,
+                 (unsigned long long)c->session->qpack_dec_send_id,
+                 (unsigned long long)c->session->grease_send_id);
 
     return 1;
 }

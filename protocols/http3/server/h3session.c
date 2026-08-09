@@ -403,6 +403,17 @@ static h3session_verdict_t __qpack_encoder_feed(h3session_t* s,
     return __ok();
 }
 
+static h3session_verdict_t __qpack_decoder_feed(h3session_t* s,
+                                                const uint8_t* data, size_t len) {
+    (void)s;
+
+    size_t consumed = 0;
+    if (qpack_encoder_read_decoder(data, len, &consumed) != QPACK_OK)
+        return __conn(QPACK_DECODER_STREAM_ERROR);
+
+    return __ok();
+}
+
 /* ---- Feeding ---- */
 
 h3session_verdict_t h3session_uni_closed(h3session_t* s, h3uni_recv_t* uni) {
@@ -485,9 +496,12 @@ h3session_verdict_t h3session_uni_feed(h3session_t* s, h3uni_recv_t* uni,
     case H3_UNI_STREAM_QPACK_DECODER:
         /* Acknowledgements for an encoder that never inserts anything. With a
          * Required Insert Count of 0 on every section we emit, RFC 9204 §2.2.2
-         * leaves the peer nothing it must say, and nothing it may say that we
-         * would act on -- so the stream is drained, not parsed. Full QPACK
-         * (6.2) is where these instructions start to matter. */
+         * leaves the peer nothing it must say and almost nothing it may -- but
+         * "almost" is the point: an Insert Count Increment is a connection
+         * error whatever its value (§4.4.3), so the stream is parsed to that
+         * depth rather than drained. Full QPACK (6.2) is where the rest of
+         * these instructions start to matter. */
+        v = __qpack_decoder_feed(s, p, (size_t)(end - p));
         break;
 
     default:

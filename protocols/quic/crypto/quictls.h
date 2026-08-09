@@ -132,6 +132,15 @@ typedef struct quictls {
     int handshake_complete;
     int alert_raised;
     uint8_t alert_code;
+
+    /* A QUIC transport error code the connection must close with, set when the
+     * TLS stack's own way of failing would name the wrong thing. Refusing a
+     * transport parameter can only be done by failing the handshake, and that
+     * reaches the peer as a bare close_notify -- which says nothing about which
+     * parameter, or even that a parameter was the reason. §18.2 asks for
+     * TRANSPORT_PARAMETER_ERROR, so the code travels out of here and the
+     * connection layer sends it. 0 when unset. */
+    uint64_t transport_error;
 } quictls_t;
 
 /* Cap on buffered CRYPTO data per level. A peer that sends a hole and then

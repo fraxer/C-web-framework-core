@@ -67,6 +67,43 @@ qpack_status_e qpack_decoder_read_encoder(qpack_decoder_t* d, const uint8_t* dat
     return QPACK_OK;
 }
 
+qpack_status_e qpack_encoder_read_decoder(const uint8_t* data, size_t len,
+                                          size_t* consumed) {
+    if (consumed != NULL) *consumed = 0;
+    if (data == NULL && len != 0) return QPACK_ERR_DECODER_STREAM;
+
+    size_t p = 0;
+    while (p < len) {
+        const uint8_t octet = data[p];
+
+        /* Section Acknowledgment is `1sssssss`, Stream Cancellation `01ssssss`.
+         * Both name a stream and neither asks anything of an encoder that has
+         * inserted nothing, so they are read past. */
+        if ((octet & 0x80) != 0 || (octet & 0xc0) == 0x40) {
+            uint64_t id = 0;
+            const size_t n = prefix_int_decode(data + p, len - p,
+                                               (octet & 0x80) != 0 ? 7 : 6, &id);
+            if (n == 0) break;   /* split across feeds; the tail comes back */
+            p += n;
+            continue;
+        }
+
+        /* What is left is Insert Count Increment, `00iiiiii`. §4.4.3 makes an
+         * increment of zero a connection error outright, and any other value is
+         * one too against this encoder: the count may not pass the number of
+         * insertions, and a static-only encoder has made none. Both are the
+         * peer describing a dynamic table that does not exist. */
+        uint64_t increment = 0;
+        const size_t n = prefix_int_decode(data + p, len - p, 6, &increment);
+        if (n == 0) break;
+
+        return QPACK_ERR_DECODER_STREAM;
+    }
+
+    if (consumed != NULL) *consumed = p;
+    return QPACK_OK;
+}
+
 /* ======================================================================= *
  *  Encoder (lite)
  * ======================================================================= *

@@ -82,6 +82,10 @@ typedef struct quicconn {
      * first Initial -- the Initial keys derive from it, and the client checks
      * it against the transport parameters we send. */
     quiccid_t odcid;
+    /* The Source Connection ID of the client's first Initial, kept apart from
+     * the list below because §7.3 compares initial_source_connection_id against
+     * *that* packet, and the list is the peer's to rewrite at will. */
+    quiccid_t peer_initial_scid;
     quiccid_entry_t local_cids[QUICCONN_MAX_LOCAL_CIDS];
     quiccid_t peer_cids[QUICCONN_MAX_PEER_CIDS];
     size_t    peer_cid_count;

@@ -30,6 +30,11 @@ typedef enum {
      * capacity), which it may not when we advertised capacity 0. Connection
      * error QPACK_ENCODER_STREAM_ERROR. Reserved for phase 6.2's read path. */
     QPACK_ERR_ENCODER_STREAM,
+    /* The peer sent a decoder-stream instruction our encoder cannot make sense
+     * of: an Insert Count Increment, which §4.4.3 forbids at zero and which any
+     * value of describes a dynamic table a static-only encoder never built.
+     * Connection error QPACK_DECODER_STREAM_ERROR. */
+    QPACK_ERR_DECODER_STREAM,
     QPACK_ERR_MEMORY,
     /* The decoded field section exceeded max_list_size. The caller answers 431
      * on the stream; the connection stays usable. */
@@ -90,6 +95,17 @@ void qpack_headers_free(qpack_header_t* headers, size_t count);
  * re-feeds the remainder. */
 qpack_status_e qpack_decoder_read_encoder(qpack_decoder_t* d, const uint8_t* data,
                                           size_t len, size_t* consumed);
+
+/* The mirror of the above for the peer's decoder stream, which talks to our
+ * encoder. Section Acknowledgment and Stream Cancellation are read past: they
+ * name a stream and ask nothing of an encoder that inserts nothing. An Insert
+ * Count Increment is QPACK_ERR_DECODER_STREAM -- §4.4.3 forbids the value zero
+ * outright, and every other value claims we made insertions we did not.
+ *
+ * Takes no decoder: there is no encoder state to keep while the dynamic table
+ * does not exist. Resumable on the same terms as the encoder-stream reader. */
+qpack_status_e qpack_encoder_read_decoder(const uint8_t* data, size_t len,
+                                          size_t* consumed);
 
 /* ---- Encoder (lite) ---- *
  *

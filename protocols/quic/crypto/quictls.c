@@ -5,6 +5,7 @@
 #include "log.h"
 #include <openssl/err.h>
 
+#include "quicerror.h"
 #include "quictls.h"
 
 /* OpenSSL's protection levels, mapped onto ours. They agree on order but not on
@@ -203,10 +204,19 @@ static int __cb_got_transport_params(SSL* ssl, const unsigned char* params,
      * conforming server or accept a client impersonating one. */
     if (quictp_decode(params, params_len, tls->is_server, &tp) != QUICTP_OK) {
         log_error("quictls: peer transport parameters rejected\n");
+        tls->transport_error = QUIC_TRANSPORT_PARAMETER_ERROR;
         return 0;
     }
 
-    return tls->ops->peer_params(tls->ctx, &tp);
+    /* The connection layer gets the last word: §7.3's identity checks need the
+     * packet the handshake arrived in, which this module never sees. Its
+     * refusal is about a parameter too, so it carries the same code. */
+    if (!tls->ops->peer_params(tls->ctx, &tp)) {
+        tls->transport_error = QUIC_TRANSPORT_PARAMETER_ERROR;
+        return 0;
+    }
+
+    return 1;
 }
 
 static int __cb_alert(SSL* ssl, unsigned char alert_code, void* arg) {

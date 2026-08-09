@@ -8,6 +8,10 @@
 #include "h3frame.h"
 #include "h3unistream.h"
 
+/* "No stream". Stream ids are 62-bit (RFC 9000 §2.1), so the top of the range
+ * cannot collide with a real one. */
+#define H3_STREAM_ID_NONE UINT64_MAX
+
 struct qpack_decoder;
 struct qpack_encoder;
 
@@ -105,7 +109,9 @@ typedef struct h3session {
     h3uni_seen_t peer_uni;
     uint64_t     ctrl_recv_id, qpack_enc_recv_id, qpack_dec_recv_id;
 
-    /* Our own, assigned when the glue opens them (phase 7). */
+    /* Our own, assigned when the glue opens them (phase 7). The grease stream
+     * is optional and may be H3_STREAM_ID_NONE -- the peer is entitled to grant
+     * only the three the protocol requires. */
     uint64_t     ctrl_send_id, qpack_enc_send_id, qpack_dec_send_id, grease_send_id;
 
     /* §7.2.7: a client may raise MAX_PUSH_ID but never lower it. We never push,

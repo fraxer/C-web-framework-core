@@ -321,12 +321,38 @@ TEST(test_h3session_qpack_streams) {
     h3uni_recv_free(uni);
     h3session_free(s);
 
-    TEST_CASE("the peer's decoder stream is drained, not parsed");
+    /* The decoder stream used to be drained without being read at all. It is
+     * parsed to one depth now: acknowledgements still say nothing to an encoder
+     * that inserts nothing, but an Insert Count Increment is a connection error
+     * whatever it carries (RFC 9204 §4.4.3) -- found by h3spec. */
+    TEST_CASE("the peer's decoder stream: acknowledgements pass");
     s = h3session_create(65536, 0);
     uni = h3uni_recv_create(10);
-    const uint8_t dec_stream[] = { 0x03, 0x80, 0x40, 0x00 };
-    TEST_ASSERT(feed(s, uni, dec_stream, sizeof dec_stream, 0).action == H3SESSION_OK,
+    /* stream type 3, Section Acknowledgment (1sssssss), Stream Cancellation (01ssssss) */
+    const uint8_t dec_acks[] = { 0x03, 0x80, 0x40 };
+    TEST_ASSERT(feed(s, uni, dec_acks, sizeof dec_acks, 0).action == H3SESSION_OK,
                 "acks ignored in lite");
+    h3uni_recv_free(uni);
+    h3session_free(s);
+
+    TEST_CASE("Insert Count Increment on the decoder stream is a connection error");
+    s = h3session_create(65536, 0);
+    uni = h3uni_recv_create(10);
+    /* stream type 3, Insert Count Increment 0 -- the value §4.4.3 names */
+    const uint8_t dec_zero[] = { 0x03, 0x00 };
+    v = feed(s, uni, dec_zero, sizeof dec_zero, 0);
+    TEST_ASSERT(v.action == H3SESSION_CONN_ERROR && v.error == QPACK_DECODER_STREAM_ERROR,
+                "increment 0");
+    h3uni_recv_free(uni);
+    h3session_free(s);
+
+    TEST_CASE("a non-zero increment is refused too: this encoder never inserts");
+    s = h3session_create(65536, 0);
+    uni = h3uni_recv_create(10);
+    const uint8_t dec_one[] = { 0x03, 0x01 };
+    v = feed(s, uni, dec_one, sizeof dec_one, 0);
+    TEST_ASSERT(v.action == H3SESSION_CONN_ERROR && v.error == QPACK_DECODER_STREAM_ERROR,
+                "increment 1");
     h3uni_recv_free(uni);
     h3session_free(s);
 }
