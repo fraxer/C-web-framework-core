@@ -72,6 +72,11 @@ typedef struct appconfig {
 } appconfig_t;
 
 int appconfig_init(int argc, char* argv[]);
+
+/* Whether -f was given: keep the process in the foreground instead of
+ * daemonising. Meaningful only to the executables, which is why it is a
+ * question about the command line and not a field of the configuration. */
+int appconfig_foreground(void);
 appconfig_t* appconfig_create(const char* path);
 appconfig_t* appconfig(void);
 env_t* env(void);

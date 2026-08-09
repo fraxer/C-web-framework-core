@@ -245,6 +245,15 @@ void __appconfig_env_gzip_free(env_gzip_str_t* item) {
     }
 }
 
+/* Whether -f was given. Read once at start-up and never written again, so a
+ * plain global is enough -- and it has to be readable from main() before any
+ * of the configuration exists. */
+static int __appconfig_foreground = 0;
+
+int appconfig_foreground(void) {
+    return __appconfig_foreground;
+}
+
 const char* __appconfig_get_path(int argc, char* argv[]) {
     int opt = 0;
     const char* path = NULL;
@@ -255,7 +264,7 @@ const char* __appconfig_get_path(int argc, char* argv[]) {
     optind = 0;
     optarg = NULL;
 
-    while ((opt = getopt(argc, argv, "c:")) != -1) {
+    while ((opt = getopt(argc, argv, "c:f")) != -1) {
         switch (opt) {
             case 'c':
                 if (optarg == NULL) {
@@ -266,21 +275,29 @@ const char* __appconfig_get_path(int argc, char* argv[]) {
                 path = optarg;
                 c_found = 1;
                 break;
+            /* Stay in the foreground. A Release build daemonises, which is
+             * right for a service started from a shell and wrong for every
+             * container runtime there is: the supervisor watches the process it
+             * started, and a process that forks and exits reads as one that
+             * died immediately. */
+            case 'f':
+                __appconfig_foreground = 1;
+                break;
             default:
                 printf("Error: Unknown option '-%c'\n", optopt);
-                printf("Usage: %s -c <path to config file>\n", argv[0]);
+                printf("Usage: %s -c <path to config file> [-f]\n", argv[0]);
                 return NULL;
         }
     }
 
     if (!c_found) {
         printf("Error: Config file path is required\n");
-        printf("Usage: %s -c <path to config file>\n", argv[0]);
+        printf("Usage: %s -c <path to config file> [-f]\n", argv[0]);
         return NULL;
     }
     if (argc < 3) {
         printf("Error: Invalid arguments\n");
-        printf("Usage: %s -c <path to config file>\n", argv[0]);
+        printf("Usage: %s -c <path to config file> [-f]\n", argv[0]);
         return NULL;
     }
 
