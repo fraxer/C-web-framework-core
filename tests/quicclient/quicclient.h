@@ -102,6 +102,18 @@ typedef struct quicclient {
     int      close_received;
     uint64_t close_error;
 
+    /* A stateless reset arrived (RFC 9000 §10.3): the server has no state for
+     * this connection any more. Recognised by the 16-byte token at the end,
+     * matched against the ones it handed out in NEW_CONNECTION_ID -- the packet
+     * itself is indistinguishable from a 1-RTT packet with a short id, which is
+     * the entire design.
+     *
+     * Worth having in a test client for two reasons: without it a reset reads
+     * as "decryption failed" and sends the reader hunting for a crypto bug, and
+     * nothing else in this project ever checked that the tokens we advertise
+     * are the ones we later send. */
+    int      reset_received;
+
     /* Key update (RFC 9001 §6), from the initiating side. The server only ever
      * responds to one, so the client has to be the one that starts it.
      *

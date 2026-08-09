@@ -331,7 +331,19 @@ int quicclient_key_update(quicclient_t* client) {
 
 int quicclient_path_challenge(quicclient_t* client) {
     if (client == NULL || !client->tx[QUIC_ENC_APP].valid) return 0;
-    if (client->path_challenge_queued || client->path_challenge_sent) return 0;
+    if (client->path_challenge_queued) return 0;   /* one is already waiting */
+
+    /* Already sent and still unanswered: queue the *same* data again rather
+     * than refusing. §8.2.1 expects exactly this -- "an endpoint MAY send
+     * multiple PATH_CHALLENGE frames to guard against packet loss" -- and the
+     * data is reused so that whichever copy is answered still matches. */
+    if (client->path_challenge_sent) {
+        if (client->path_response_received) return 0;
+
+        client->path_challenge_queued = 1;
+
+        return 1;
+    }
 
     if (RAND_bytes(client->path_challenge_data,
                    (int)sizeof client->path_challenge_data) != 1)
@@ -838,8 +850,27 @@ static int __on_retry(quicclient_t* c, const quicpkt_t* pkt) {
     return __handshake_start(c, &c->retry_scid);
 }
 
+/* Does this datagram end with a reset token the server gave us? */
+static int __is_stateless_reset(const quicclient_t* c, const uint8_t* buf, size_t len) {
+    if (len < 21) return 0;   /* §10.3: shorter cannot be one */
+
+    for (size_t i = 0; i < c->server_cid_count; i++)
+        if (memcmp(buf + len - 16, c->server_cids[i].token, 16) == 0) return 1;
+
+    return 0;
+}
+
 static int __recv_datagram(quicclient_t* c, uint8_t* buf, size_t len) {
     c->datagrams_received++;
+
+    /* Checked before parsing, not after failing to: a reset is *designed* to
+     * parse as a short-header packet, so "it did not decrypt" is the only
+     * symptom it ever has. */
+    if (__is_stateless_reset(c, buf, len)) {
+        c->reset_received = 1;
+        __log(c, "  [client] <- STATELESS RESET (%zu bytes)\n", len);
+        return 0;
+    }
 
     size_t off = 0;
     quicpkt_t pkt;

@@ -589,6 +589,8 @@ static int __cid_issue(quicconn_t* conn) {
     slot->active = 1;
     slot->announced = 0;
 
+    metrics_quic(METRICS_QUIC_CIDS_ISSUED);
+
     atomic_store_explicit(&conn->want_write, 1, memory_order_release);
 
     return 1;
@@ -1102,6 +1104,7 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
             p += n;
             ack_eliciting = 1;
             e->announced = 1;
+            metrics_quic(METRICS_QUIC_CIDS_ANNOUNCED);
 
             /* §13.3 has this frame retransmitted when lost. The reference
                 carries the sequence number in `offset`, which is what

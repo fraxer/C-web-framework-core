@@ -174,6 +174,12 @@ typedef enum {
     METRICS_QUIC_FLOW_BLOCKED_STREAM,
     METRICS_QUIC_AMPLIFICATION_LIMITED,
 
+    /* Connection ids issued and announced. The two differ when an announcement
+     * is lost and not retransmitted, which is invisible from either side
+     * otherwise. */
+    METRICS_QUIC_CIDS_ISSUED,
+    METRICS_QUIC_CIDS_ANNOUNCED,
+
     METRICS_QUIC_STREAMS_OPENED,
     METRICS_QUIC_STREAMS_RESET_SENT,
     METRICS_QUIC_STREAMS_RESET_RECEIVED,
