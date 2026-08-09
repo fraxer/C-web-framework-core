@@ -44,6 +44,22 @@ typedef struct quicendpoint {
 
     udp_rx_batch_t* rx;
 
+    /* The endpoint's own deadline timer (docs/http3/01 §6).
+     *
+     * QUIC's timers are PTO, ack delay and pacing -- tens of milliseconds and
+     * below -- while the worker sweep is once a second. A deadline that falls
+     * between two sweeps fires up to a second late, which for a PTO means loss
+     * recovery that does not happen; that was measured, not supposed
+     * (docs/http3/08 §2a).
+     *
+     * Registered as an ordinary connection with a read callback rather than as
+     * a tagged fd: the epoll dispatcher already tells connections apart by
+     * their callbacks, and a second sentinel tag would have to be understood by
+     * a layer that otherwise knows nothing about QUIC. */
+    int timerfd;
+    connection_t* timer_connection;
+    uint64_t timer_deadline_us;   /* what it is currently armed for; 0 = idle */
+
     /* The endpoint's connection is registered in epoll by quicendpoints_listen,
      * not by creation. Teardown has to know which happened: a registered
      * connection is released through connection->close (control_del, fd close,

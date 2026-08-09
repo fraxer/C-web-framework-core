@@ -5,6 +5,7 @@
 #include <openssl/rand.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 
 #include "appconfig.h"
@@ -79,6 +80,7 @@
  * holds (moduleloader.c). */
 
 static void __route(quicendpoint_t* ep, struct quicconn* conn, udp_datagram_t* dgram);
+static void __endpoint_tick(quicendpoint_t* ep, int shutdown_now);
 
 /* Called by the CID table under its shard lock, on the value it is about to
  * return. One atomic increment, which is what stops the connection being freed
@@ -1091,6 +1093,101 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
     __accept(ep, dgram, &inv, validated, have_retry_odcid ? &retry_odcid : NULL);
 }
 
+/* Arm the endpoint's timer for the earliest deadline any of its connections
+ * has, or disarm it when none has one.
+ *
+ * A walk of the connection list rather than a heap. The plan (`01` §6) calls
+ * for a heap keyed by deadline, and at a hundred thousand connections it will
+ * be needed; at the scale this has been run to, a walk over a list the worker
+ * already owns costs less than maintaining the heap would, and it cannot go out
+ * of step with the connections the way a cached key can. The moment to swap is
+ * when this shows up in a profile, and the counter that would show it is the
+ * lock-wait histogram on quic.send. */
+static void __endpoint_timer_arm(quicendpoint_t* ep) {
+    if (ep->timerfd < 0) return;
+
+    uint64_t earliest = 0;
+
+    for (quicconn_t* conn = ep->conns; conn != NULL; conn = conn->ep_next) {
+        const uint64_t when = quicconn_next_timeout(conn);
+        if (when != 0 && (earliest == 0 || when < earliest)) earliest = when;
+    }
+
+    if (earliest == ep->timer_deadline_us) return;   /* already armed for it */
+
+    struct itimerspec its;
+    memset(&its, 0, sizeof its);
+
+    if (earliest != 0) {
+        /* Absolute, on the same clock quic_now_us reads, so no drift creeps in
+         * between computing the deadline and arming for it. A deadline already
+         * in the past must still fire, and a zero it_value would disarm the
+         * timer instead -- hence the one-nanosecond floor. */
+        const uint64_t now = quic_now_us();
+        const uint64_t delay_us = earliest > now ? earliest - now : 0;
+
+        its.it_value.tv_sec = (time_t)(delay_us / 1000000ULL);
+        its.it_value.tv_nsec = (long)((delay_us % 1000000ULL) * 1000ULL);
+        if (its.it_value.tv_sec == 0 && its.it_value.tv_nsec == 0)
+            its.it_value.tv_nsec = 1;
+    }
+
+    if (timerfd_settime(ep->timerfd, 0, &its, NULL) == -1) {
+        log_error("quicendpoint: timerfd_settime failed (errno %d)\n", errno);
+        return;
+    }
+
+    ep->timer_deadline_us = earliest;
+}
+
+/* The endpoint's timer fired: run every connection's timers, then re-arm. */
+static int __endpoint_timer_read(connection_t* connection) {
+    connection_server_ctx_t* ctx = connection->ctx;
+    quicendpoint_t* ep = (quicendpoint_t*)ctx->listener;
+
+    uint64_t expirations;
+    while (read(ep->timerfd, &expirations, sizeof expirations) == sizeof expirations) {
+        /* drain -- level-triggered, and an unread timerfd refires forever */
+    }
+
+    ep->timer_deadline_us = 0;
+    __endpoint_tick(ep, 0);
+    __endpoint_timer_arm(ep);
+
+    return 1;
+}
+
+/* The same teardown __endpoint_close performs, for the same reason: the close
+ * callback is what removes the connection from epoll, closes its descriptor and
+ * drops the base reference. A callback that only forgets the pointer leaves the
+ * reference held, and the worker's shutdown loop -- which waits for
+ * connection_count to reach zero -- then runs out its whole grace window every
+ * time. That is exactly what it did. */
+static int __endpoint_timer_close(connection_t* connection) {
+    connection_server_ctx_t* ctx = connection->ctx;
+    quicendpoint_t* ep = (quicendpoint_t*)ctx->listener;
+
+    connection_s_lock(connection, LOCK_SITE_CLOSE);
+
+    if (ep->timer_connection == connection) ep->timer_connection = NULL;
+
+    if (!ep->listener.api->control_del(connection))
+        log_error("Quic endpoint: timer not removed from api\n");
+
+    atomic_store(&ctx->detached, 1);
+
+    close(connection->fd);
+    ep->timerfd = -1;
+    ep->timer_deadline_us = 0;
+
+    atomic_store(&ctx->destroyed, 1);
+
+    if (connection_s_dec(connection) == CONNECTION_DEC_RESULT_DECREMENT)
+        connection_s_unlock(connection);
+
+    return 1;
+}
+
 static int __endpoint_read(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
     quicendpoint_t* ep = (quicendpoint_t*)ctx->listener;
@@ -1111,6 +1208,11 @@ static int __endpoint_read(connection_t* connection) {
         /* A short batch means the socket is drained. */
         if ((size_t)n < __quic_rx_batch) break;
     }
+
+    /* Deadlines move with every datagram -- an acknowledgement disarms a PTO, a
+     * new packet arms one -- so the timer is re-armed once the batch is done
+     * rather than per datagram. */
+    __endpoint_timer_arm(ep);
 
     return 1;
 }
@@ -1170,6 +1272,18 @@ static quicendpoint_t* __endpoint_get(quicendpoint_t* endpoints, in_addr_t ip,
 static void __endpoint_free(quicendpoint_t* ep) {
     if (ep == NULL) return;
 
+    if (ep->timer_connection != NULL) {
+        if (ep->listening) ep->timer_connection->close(ep->timer_connection);
+        else               connection_free(ep->timer_connection);
+
+        ep->timer_connection = NULL;
+    }
+
+    if (ep->timerfd != -1) {
+        close(ep->timerfd);
+        ep->timerfd = -1;
+    }
+
     if (ep->listener.connection != NULL) {
         if (ep->listening) {
             ep->listener.connection->close(ep->listener.connection);
@@ -1200,6 +1314,7 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server) {
 
     memset(ep, 0, sizeof * ep);
     ep->fd = -1;
+    ep->timerfd = -1;
     ep->table = __quic_table;
     ep->reset_key = __quic_reset_key;
     cqueue_init(&ep->listener.servers);
@@ -1238,6 +1353,20 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server) {
     ep->listener.connection = connection;
     ep->listener.api = api;
     ep->listener.next = NULL;
+
+    /* The deadline timer, as a second connection on the same listener. Created
+     * disarmed: there is nothing to wait for until a connection exists. */
+    ep->timerfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (ep->timerfd == -1) goto failed;
+
+    ep->timer_connection = connection_s_alloc(&ep->listener, ep->timerfd,
+                                              server->ip, server->http3.port,
+                                              server->ip, server->http3.port, NULL, 0);
+    if (ep->timer_connection == NULL) goto failed;
+
+    ep->timer_connection->read = __endpoint_timer_read;
+    ep->timer_connection->write = NULL;
+    ep->timer_connection->close = __endpoint_timer_close;
 
     if (!cqueue_append(&ep->listener.servers, server)) goto failed;
 
@@ -1402,6 +1531,7 @@ static void __endpoint_tick(quicendpoint_t* ep, int shutdown_now) {
 void quicendpoints_tick(quicendpoint_t* endpoints, int shutdown_now) {
     while (endpoints != NULL) {
         __endpoint_tick(endpoints, shutdown_now);
+        __endpoint_timer_arm(endpoints);
 
         /* The drain is over for this endpoint: nothing is left to serve, so the
          * socket can go. Until it does the worker's connection_count cannot
@@ -1409,6 +1539,11 @@ void quicendpoints_tick(quicendpoint_t* endpoints, int shutdown_now) {
          * enough for the drain to happen. */
         if (endpoints->draining && endpoints->conn_count == 0 &&
             endpoints->listener.connection != NULL) {
+            if (endpoints->timer_connection != NULL) {
+                endpoints->timer_connection->close(endpoints->timer_connection);
+                endpoints->timer_connection = NULL;
+            }
+
             endpoints->listener.connection->close(endpoints->listener.connection);
             endpoints->listener.connection = NULL;
             endpoints->listening = 0;
@@ -1436,6 +1571,10 @@ int quicendpoints_listen(quicendpoint_t* endpoints) {
                                                   MPXIN))
             return 0;
 
+        if (endpoints->timer_connection != NULL &&
+            !endpoints->listener.api->control_add(endpoints->timer_connection, MPXIN))
+            return 0;
+
         endpoints->listening = 1;
         endpoints = endpoints->next;
     }
@@ -1445,6 +1584,11 @@ int quicendpoints_listen(quicendpoint_t* endpoints) {
 
 void quicendpoints_unlisten(quicendpoint_t* endpoints) {
     while (endpoints != NULL) {
+        if (endpoints->timer_connection != NULL) {
+            endpoints->timer_connection->close(endpoints->timer_connection);
+            endpoints->timer_connection = NULL;
+        }
+
         if (endpoints->listener.connection != NULL) {
             endpoints->listener.connection->close(endpoints->listener.connection);
             endpoints->listener.connection = NULL;
