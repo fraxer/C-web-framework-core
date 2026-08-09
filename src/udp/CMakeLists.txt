@@ -13,3 +13,9 @@ endif()
 # multiplexingserver.h), so udp does not name multiplexing itself -- that would
 # declare a cycle, since multiplexingserver.c calls into this library.
 cwfr_add_lib(udp LINK_LIBS misc quic_common quic_crypto quic_transport connection server config openssl metrics)
+
+# The interop shim is a second application protocol on the same streams, chosen
+# by ALPN; the endpoint's turn branches into it (docs/http3/08 §3e).
+if(INCLUDE_HQ_INTEROP STREQUAL yes)
+	target_link_libraries(udp hq)
+endif()

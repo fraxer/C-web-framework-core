@@ -55,6 +55,31 @@ int main(void) {
 	message(STATUS "HTTP/3 enabled (OpenSSL ${OPENSSL_VERSION})")
 endif()
 
+# HTTP/0.9 over QUIC, for the interop runner and for nothing else.
+#
+# Almost every quic-interop-runner test case moves its files with HTTP/0.9 under
+# ALPN `hq-interop` rather than with HTTP/3 -- so without this, one case of the
+# matrix is reachable and the transport half of it (loss, corruption, Retry,
+# resumption, rebinding) is not. Every implementation in the matrix carries the
+# same shim.
+#
+# A build flag rather than a configuration key, deliberately: HTTP/0.9 has no
+# headers, no host, no length and no status. It must not be one careless setting
+# away from being served by a production binary (docs/http3/08 §3e).
+set(INCLUDE_HQ_INTEROP "no" CACHE STRING "Build the HTTP/0.9 interop shim: yes|no")
+set_property(CACHE INCLUDE_HQ_INTEROP PROPERTY STRINGS yes no)
+
+if(INCLUDE_HQ_INTEROP STREQUAL yes)
+	if(NOT INCLUDE_HTTP3 STREQUAL yes)
+		message(FATAL_ERROR
+			"INCLUDE_HQ_INTEROP=yes needs INCLUDE_HTTP3=yes: the shim rides on "
+			"QUIC streams and has nothing to run on otherwise.")
+	endif()
+
+	add_compile_definitions(CWFR_HQ_INTEROP)
+	message(STATUS "HTTP/0.9 interop shim enabled -- NOT for production builds")
+endif()
+
 add_subdirectory(framework)
 add_subdirectory(misc)
 add_subdirectory(protocols)

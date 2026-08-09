@@ -12,6 +12,10 @@
 #include "appconfig.h"
 #include "log.h"
 #include "metrics.h"
+#ifdef CWFR_HQ_INTEROP
+#include "hq.h"
+#include "quictls.h"
+#endif
 /* The full connection type: the header pair is deliberately opaque in both
  * directions (quicconn.h holds a `struct quicendpoint*`, quicendpoint.h a
  * `struct quicconn*`), so exactly one of the two .c files has to see both. */
@@ -827,6 +831,14 @@ static int __h3_attach(quicconn_t* conn) {
 /* Ask for another turn if a response is still only partly written. */
 static void __h3_rearm(quicconn_t* conn) {
     const connection_server_ctx_t* ctx = conn->conn.ctx;
+
+#ifdef CWFR_HQ_INTEROP
+    if (quictls_alpn_is_hq(&conn->tls)) {
+        if (hq_has_pending(conn)) quicconn_want_write(&conn->conn);
+        return;
+    }
+#endif
+
     if (ctx->parser == NULL) return;
 
     if (h3conn_has_pending(ctx->parser, conn)) quicconn_want_write(&conn->conn);
@@ -836,6 +848,22 @@ static void __h3_rearm(quicconn_t* conn) {
  * held, which is what makes the dispatch inside reach the inline publish path
  * rather than the handler-thread one. Returns 0 if the connection must close. */
 static int __h3_turn(quicconn_t* conn, uint64_t now) {
+#ifdef CWFR_HQ_INTEROP
+    /* The interop shim: a different application protocol on the same streams,
+     * chosen by ALPN at the handshake. It keeps no connection object, so it
+     * bypasses the attach above entirely -- and ctx->parser stays NULL, which
+     * matters because that pointer's type is protocol-dependent and everything
+     * that reads it assumes h3. */
+    if (conn->state == QUICCONN_ACTIVE && quictls_alpn_is_hq(&conn->tls)) {
+        uint64_t hq_error = 0;
+        if (!hq_turn(conn, &hq_error)) {
+            quicconn_close(conn, hq_error, 1, now);
+            return 0;
+        }
+        return 1;
+    }
+#endif
+
     if (!__h3_attach(conn)) {
         quicconn_close(conn, H3_INTERNAL_ERROR, 1, now);
         return 0;

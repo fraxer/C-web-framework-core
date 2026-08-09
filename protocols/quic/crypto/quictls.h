@@ -195,4 +195,9 @@ int quictls_advance(quictls_t* tls);
  * protocol policy differs. */
 int quictls_configure_ctx(SSL_CTX* ssl_ctx);
 
+/* Whether the handshake settled on `hq-interop` rather than h3. Always 0 unless
+ * the interop shim was built in, which is what keeps the caller's branch honest
+ * without it having to know about the flag. */
+int quictls_alpn_is_hq(const quictls_t* tls);
+
 #endif

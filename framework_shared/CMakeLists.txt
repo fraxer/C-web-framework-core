@@ -25,6 +25,11 @@ if(INCLUDE_HTTP3 STREQUAL yes)
 	list(APPEND FW_LIBS quic_common quic_crypto quic_transport h3frame h3server qpack udp)
 endif()
 
+# The HTTP/0.9 interop shim, when it is built at all (core/CMakeLists.txt).
+if(INCLUDE_HQ_INTEROP STREQUAL yes)
+	list(APPEND FW_LIBS hq)
+endif()
+
 # The embedding application may inject its own static archives (models,
 # middlewares implementing the middlewares_init() hook, contexts, ...) by
 # setting CWFR_EXTRA_FW_LIBS before add_subdirectory(core). They are aggregated

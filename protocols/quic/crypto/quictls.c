@@ -250,9 +250,13 @@ static const OSSL_DISPATCH __quic_tls_dispatch[] = {
 
 /* ---- ALPN ---- */
 
-/* QUIC offers h3 and nothing else. The vhost's TCP callback offers h2 and
- * http/1.1, and a QUIC connection that negotiated either would be a protocol
- * error -- so this callback replaces it on QUIC SSLs rather than extending it. */
+/* QUIC offers h3 and nothing else -- except in an interop build, where it also
+ * offers hq-interop. The vhost's TCP callback offers h2 and http/1.1, and a QUIC
+ * connection that negotiated either would be a protocol error, so this callback
+ * replaces it on QUIC SSLs rather than extending it.
+ *
+ * h3 is preferred whenever the peer offers it: hq-interop exists for the runner,
+ * and a peer that can speak both is not the runner. */
 static int __alpn_select_h3(SSL* ssl, const unsigned char** out,
                             unsigned char* outlen,
                             const unsigned char* in, unsigned int inlen,
@@ -261,6 +265,11 @@ static int __alpn_select_h3(SSL* ssl, const unsigned char** out,
     (void)arg;
 
     static const unsigned char h3[] = { 'h', '3' };
+#ifdef CWFR_HQ_INTEROP
+    static const unsigned char hq[] = { 'h', 'q', '-', 'i', 'n', 't', 'e', 'r', 'o', 'p' };
+    const unsigned char* hq_at = NULL;
+    unsigned int hq_len = 0;
+#endif
 
     for (unsigned int i = 0; i + 1 <= inlen; ) {
         const unsigned int len = in[i];
@@ -272,12 +281,42 @@ static int __alpn_select_h3(SSL* ssl, const unsigned char** out,
             return SSL_TLSEXT_ERR_OK;
         }
 
+#ifdef CWFR_HQ_INTEROP
+        if (len == sizeof hq && memcmp(in + i + 1, hq, len) == 0) {
+            hq_at = in + i + 1;
+            hq_len = len;
+        }
+#endif
+
         i += 1 + len;
     }
+
+#ifdef CWFR_HQ_INTEROP
+    if (hq_at != NULL) {
+        *out = hq_at;
+        *outlen = (unsigned char)hq_len;
+        return SSL_TLSEXT_ERR_OK;
+    }
+#endif
 
     /* No h3 on offer. Unlike TCP, where falling back to http/1.1 is sensible,
      * there is nothing else this connection could be for. */
     return SSL_TLSEXT_ERR_ALERT_FATAL;
+}
+
+int quictls_alpn_is_hq(const quictls_t* tls) {
+#ifdef CWFR_HQ_INTEROP
+    if (tls == NULL || tls->ssl == NULL) return 0;
+
+    const unsigned char* proto = NULL;
+    unsigned int len = 0;
+    SSL_get0_alpn_selected(tls->ssl, &proto, &len);
+
+    return len == 10 && memcmp(proto, "hq-interop", 10) == 0;
+#else
+    (void)tls;
+    return 0;
+#endif
 }
 
 int quictls_configure_ctx(SSL_CTX* ssl_ctx) {
