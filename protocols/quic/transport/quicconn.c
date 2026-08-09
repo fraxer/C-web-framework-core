@@ -904,6 +904,46 @@ static int __key_update_commit(quicconn_t* conn, uint64_t pn, uint64_t now_us) {
 
 /* ---- Receive path ---- */
 
+/* §4.9: throw away a packet number space whose keys are gone.
+ *
+ * Four pieces of state go together, and leaving any of them behind is a live
+ * protocol failure rather than a leak: the keys (nothing may be sealed or
+ * opened at that level again), the loss recovery space (nothing in it can ever
+ * be acknowledged, so its bytes must leave the congestion window and its PTO
+ * must stop), the pending acknowledgement (one we would no longer have the keys
+ * to send), and any probe owed at that level (it could never be built, so the
+ * counter would never come back down).
+ *
+ * What it looks like when this is missing -- it was, until Chrome's netlog said
+ * so: the level stays armed for the life of the connection, its PTO keeps
+ * firing, and every probe leaves as an *Initial* packet, padded to 1200 bytes
+ * by §14.1 and therefore crowding the real datagram out of the send round. The
+ * peer discarded those keys the moment the handshake moved on, so it counts
+ * them as undecryptable and drops them: 396 packets at ENCRYPTION_INITIAL
+ * against 264 that opened, on a single page load. The connection stays up and
+ * the page simply never finishes.
+ *
+ * Outstanding CRYPTO frames are freed rather than requeued at the next level:
+ * the handshake having moved on is itself the proof the peer no longer needs
+ * them. */
+static void __discard_space(quicconn_t* conn, quic_enc_level_e level) {
+    if (!conn->tx[level].valid && !conn->rx[level].valid) return;
+
+    quicframe_ref_free(quicloss_discard_space(&conn->loss, level));
+
+    quickeys_free(&conn->tx[level]);
+    quickeys_free(&conn->rx[level]);
+
+    quicack_init(&conn->ack[level]);
+
+    /* The certificate chain lives in here; on a server it is the largest single
+     * allocation the handshake makes. */
+    quicsendbuf_free(&conn->crypto_out[level]);
+    quicsendbuf_init(&conn->crypto_out[level]);
+
+    if (conn->pto_level == level) conn->pto_probes = 0;
+}
+
 static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
                             const quicpkt_t* pkt, uint64_t now_us) {
     const quic_enc_level_e level = quicpkt_level(pkt->type);
@@ -979,6 +1019,13 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
         }
         return 1;
     }
+
+    /* §4.9.1: the first Handshake packet that opens is what tells a server the
+     * client has the Handshake keys, and therefore that the Initial space is
+     * finished. Here rather than at handshake completion: the client stops
+     * reading Initial packets at this same moment, so everything we send at
+     * that level from now on is noise it will drop. */
+    if (level == QUIC_ENC_HANDSHAKE) __discard_space(conn, QUIC_ENC_INITIAL);
 
     /* A replayed packet is bit-identical to the original, so the AEAD cannot
      * tell them apart -- this check is the only thing that can. */
@@ -1122,6 +1169,13 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
             metrics_quic(METRICS_QUIC_HANDSHAKE_COMPLETED);
 
             conn->state = QUICCONN_ACTIVE;
+
+            /* §4.9.2: for a server the handshake is confirmed by its own
+             * completion -- the client's Finished cannot exist unless the
+             * client processed our whole flight. The price, which the RFC
+             * accepts, is that a client Handshake packet retransmitted after
+             * this point can no longer be acknowledged. */
+            __discard_space(conn, QUIC_ENC_HANDSHAKE);
 
             /* Address proven by the handshake itself, so the peer has earned a
              * token for next time (§8.1.3). */
