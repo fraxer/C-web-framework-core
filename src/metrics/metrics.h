@@ -176,6 +176,14 @@ typedef enum {
     METRICS_QUIC_CLOSED_LOCAL,
     METRICS_QUIC_CLOSED_PEER,
 
+    /* Why a connection was not created. Split from the generic drop counters
+     * because these two are the ones an operator acts on: at_capacity means
+     * raise http3_max_connections (or add memory), rate_limited means either an
+     * attack or a limit set below what this service actually sees. Reading them
+     * as one number tells you neither. */
+    METRICS_QUIC_AT_CAPACITY,
+    METRICS_QUIC_HANDSHAKE_RATE_LIMITED,
+
     METRICS_QUIC__COUNT
 } metrics_quic_t;
 

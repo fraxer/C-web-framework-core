@@ -74,6 +74,13 @@ typedef struct quicendpoint {
     uint64_t vn_epoch_us;
     int64_t  reset_tokens;
     uint64_t reset_epoch_us;
+    /* And a third, for the one reply that is not a reply at all: accepting a
+     * connection. Separate from the connection ceiling next to it because the
+     * two say different things -- the ceiling is how many may exist, this is
+     * how fast they may appear, and a flood exhausts the second long before it
+     * reaches the first. */
+    int64_t  handshake_tokens;
+    uint64_t handshake_epoch_us;
 
     /* Connections on this endpoint, for the timer sweep and the shutdown drain.
      * Touched only by the owning worker. */

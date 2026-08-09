@@ -210,6 +210,11 @@ int quic_policy_init(void) {
     __quic_reset_burst = env_get_int("http3_stateless_reset_burst", QUIC_DEFAULT_RESET_BURST);
     if (__quic_reset_burst < 1) __quic_reset_burst = 1;
 
+    __quic_handshake_rate = env_get_int("http3_handshake_rate", QUIC_DEFAULT_HANDSHAKE_RATE);
+    if (__quic_handshake_rate < 0) __quic_handshake_rate = 0;
+    __quic_handshake_burst = env_get_int("http3_handshake_burst", QUIC_DEFAULT_HANDSHAKE_BURST);
+    if (__quic_handshake_burst < 1) __quic_handshake_burst = 1;
+
     /* RAND_bytes rather than misc/random.h: these two are security inputs --
      * the reset key authenticates tokens a peer can collect, and the table seed
      * is what stops a peer from choosing colliding connection ids -- and
@@ -750,7 +755,21 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
      * fail to make sense of it -- which is the right disposition for it
      * anyway, since without the Initial there are no keys to read it with. */
     if (ep->conn_count >= __quic_max_connections) {
-        metrics_quic(METRICS_QUIC_DROP_NO_BUDGET);
+        metrics_quic(METRICS_QUIC_AT_CAPACITY);
+        return;
+    }
+
+    /* Spent last, after every cheaper reason to drop this datagram: a packet
+     * that was never going to open a connection must not consume the budget
+     * that decides whether real ones can.
+     *
+     * Dropped, not refused. CONNECTION_REFUSED would be kinder to an honest
+     * client, but it costs an Initial key derivation and a packet per arriving
+     * datagram -- work performed for whoever is flooding us, at an address we
+     * have not validated. The client's own retransmissions handle the rest. */
+    if (!__budget_spend(&ep->handshake_tokens, &ep->handshake_epoch_us,
+                        __quic_handshake_rate, __quic_handshake_burst)) {
+        metrics_quic(METRICS_QUIC_HANDSHAKE_RATE_LIMITED);
         return;
     }
 

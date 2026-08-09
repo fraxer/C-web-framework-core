@@ -17,7 +17,10 @@
 
 static size_t headers_frame(qpack_encoder_t* enc, const qpack_header_t* f, size_t n,
                             uint8_t* out, size_t cap) {
-    uint8_t block[512];
+    /* Big enough for the oversized sections the field-limit cases build: a
+     * block that does not fit encodes as zero bytes, and the test would then be
+     * feeding an empty HEADERS frame while claiming to feed a huge one. */
+    uint8_t block[8192];
     const size_t blen = qpack_encode_block(enc, f, n, block, sizeof block);
     return h3frame_write(out, cap, H3_FRAME_HEADERS, block, blen);
 }
@@ -258,6 +261,44 @@ TEST(test_h3stream_field_limit) {
     TEST_CASE("the same section under a generous limit passes");
     st = h3stream_create(NULL, 4096);
     TEST_ASSERT(feed(st, qdec, buf, n, 0) == H3STREAM_REQUEST_READY, "ready");
+    h3stream_free(st);
+
+    TEST_CASE("past the hard cap the connection ends instead of being answered");
+    /* The point of the second limit: 431 tells a client what was wrong, which
+     * is worth doing for a section slightly over the budget and pointless for
+     * one that is orders of magnitude over -- there the decode itself is the
+     * attack. The boundary is the advertised limit times the factor. */
+    char big[2048];
+    memset(big, 'x', sizeof big - 1);
+    big[sizeof big - 1] = '\0';
+
+    const qpack_header_t huge[] = {
+        QF(":method", "GET"), QF(":path", "/"), QF(":scheme", "https"),
+        QF(":authority", "example.com"), QF("x-pad", big),
+    };
+    uint8_t hbuf[4096];
+    const size_t hn = headers_frame(enc, huge, sizeof huge / sizeof huge[0], hbuf, sizeof hbuf);
+    TEST_REQUIRE(hn > 0, "oversized HEADERS frame built");
+
+    st = h3stream_create(NULL, 32);   /* hard cap = 32 * 8 = 256 */
+    TEST_ASSERT(feed(st, qdec, hbuf, hn, 0) == H3STREAM_ERR_EXCESSIVE_LOAD, "over the hard cap");
+    TEST_ASSERT(h3stream_status_is_connection(H3STREAM_ERR_EXCESSIVE_LOAD), "connection error");
+    TEST_ASSERT(h3stream_status_error(H3STREAM_ERR_EXCESSIVE_LOAD) == H3_EXCESSIVE_LOAD,
+                "H3_EXCESSIVE_LOAD");
+    h3stream_free(st);
+
+    TEST_CASE("between the two limits it is still only a 431");
+    /* The same oversized section, with a limit high enough that the hard cap is
+     * above it: the whole point is that the band between the two exists. */
+    st = h3stream_create(NULL, 2048);   /* section ~2.2 KB, hard cap 16 KB */
+    TEST_ASSERT(feed(st, qdec, hbuf, hn, 0) == H3STREAM_ERR_FIELDS_TOO_LARGE, "431, not fatal");
+    h3stream_free(st);
+
+    TEST_CASE("no advertised limit means no hard cap either");
+    /* 0 is "unlimited", and multiplying it by the factor must not turn it into
+     * a cap of zero -- which would reject every field section there is. */
+    st = h3stream_create(NULL, 0);
+    TEST_ASSERT(feed(st, qdec, hbuf, hn, 0) == H3STREAM_REQUEST_READY, "unlimited stays unlimited");
     h3stream_free(st);
 
     qpack_encoder_free(enc);
