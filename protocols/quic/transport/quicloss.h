@@ -104,14 +104,25 @@ int quicloss_on_sent(quicloss_t* loss, quic_enc_level_e level, uint64_t pn,
 
 /* What an ACK frame told us. `acked` is the set of packet numbers it covers.
  *
- * `out_lost` receives the frame references of every packet declared lost,
- * chained together, for the caller to put back on its send queues; ownership
- * passes to the caller. Newly acknowledged packets' references are freed here.
+ * Both outcomes hand their frame references back, chained, and ownership passes
+ * to the caller:
+ *
+ *   `out_lost`  -- packets declared lost, to be put back on the send queues;
+ *   `out_acked` -- packets confirmed, so the sender can release what they
+ *                  carried. May be NULL, and then those references are freed
+ *                  here.
+ *
+ * The second one is not symmetry for its own sake. Stream data lives in a send
+ * buffer until it is known to have arrived; without the acknowledgements coming
+ * back the buffer never releases anything, the stream never reaches a terminal
+ * state, and the connection's stream credit is never returned to the peer. All
+ * three were true until this parameter existed (docs/http3/08 §7a).
  *
  * `ack_delay_us` is the peer's reported delay, already unscaled. */
 int quicloss_on_ack(quicloss_t* loss, quic_enc_level_e level,
                     const quicrange_t* acked, uint64_t ack_delay_us,
-                    uint64_t now_us, quicframe_ref_t** out_lost);
+                    uint64_t now_us, quicframe_ref_t** out_lost,
+                    quicframe_ref_t** out_acked);
 
 /* Run the loss detection timer. Returns 1 if it was a loss timer (frames are in
  * `out_lost`), 0 if it was a PTO -- in which case the caller must send one or

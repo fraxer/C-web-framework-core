@@ -186,6 +186,10 @@ typedef enum {
     METRICS_QUIC_CIDS_ANNOUNCED,
 
     METRICS_QUIC_STREAMS_OPENED,
+    /* Released once finished in both directions. The gap against
+     * streams_opened is how much of a connection's stream credit is stuck: the
+     * peer cannot open more until the credit comes back as MAX_STREAMS. */
+    METRICS_QUIC_STREAMS_RELEASED,
     METRICS_QUIC_STREAMS_RESET_SENT,
     METRICS_QUIC_STREAMS_RESET_RECEIVED,
 

@@ -30,18 +30,27 @@ int quicsendbuf_write(quicsendbuf_t* buf, const uint8_t* data, size_t len) {
     if (len == 0) return 1;
     if (data == NULL) return 0;
 
-    if (buf->len + len > buf->cap) {
-        size_t cap = buf->cap == 0 ? 4096 : buf->cap;
-        while (cap < buf->len + len) cap *= 2;
+    if (buf->head + buf->len + len > buf->cap) {
+        /* Reclaim the dead prefix before growing: a buffer that is only being
+         * drained from the front would otherwise double forever. */
+        if (buf->head > 0) {
+            memmove(buf->data, buf->data + buf->head, buf->len);
+            buf->head = 0;
+        }
 
-        uint8_t* grown = realloc(buf->data, cap);
-        if (grown == NULL) return 0;
+        if (buf->len + len > buf->cap) {
+            size_t cap = buf->cap == 0 ? 4096 : buf->cap;
+            while (cap < buf->len + len) cap *= 2;
 
-        buf->data = grown;
-        buf->cap = cap;
+            uint8_t* grown = realloc(buf->data, cap);
+            if (grown == NULL) return 0;
+
+            buf->data = grown;
+            buf->cap = cap;
+        }
     }
 
-    memcpy(buf->data + buf->len, data, len);
+    memcpy(buf->data + buf->head + buf->len, data, len);
     buf->len += len;
     buf->write_off += len;
 
@@ -69,10 +78,25 @@ static void __slide(quicsendbuf_t* buf) {
     const size_t drop = (size_t)(new_base - buf->base);
     if (drop >= buf->len) {
         buf->len = 0;
+        buf->head = 0;
     }
     else {
-        memmove(buf->data, buf->data + drop, buf->len - drop);
+        /* Move the read point rather than the data, and compact only when the
+         * dead prefix has grown to half the buffer.
+         *
+         * Compacting on every acknowledgement meant memmoving whatever was left
+         * -- up to the write-ahead budget, a quarter of a megabyte -- for the
+         * two packets an acknowledgement typically covers. Over a large
+         * transfer that is quadratic in bytes, and it showed: CPU per megabyte
+         * grew with the size of the file (docs/http3/08 §7a). Amortised, each
+         * byte is now moved at most once per doubling. */
+        buf->head += drop;
         buf->len -= drop;
+
+        if (buf->head >= buf->cap / 2) {
+            memmove(buf->data, buf->data + buf->head, buf->len);
+            buf->head = 0;
+        }
     }
 
     buf->base = new_base;
@@ -129,7 +153,7 @@ int quicsendbuf_next(quicsendbuf_t* buf, size_t max_len,
     if (len == 0) return 0;
 
     if (out_offset != NULL) *out_offset = offset;
-    if (out_data != NULL) *out_data = buf->data + within;
+    if (out_data != NULL) *out_data = buf->data + buf->head + within;
     if (out_len != NULL) *out_len = len;
     /* The FIN rides along only if this chunk really reaches the end. */
     if (out_fin != NULL)

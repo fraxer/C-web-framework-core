@@ -125,10 +125,10 @@ TEST(test_h3budget_abort) {
     for (int i = 1; i <= 5000 && closed_at == 0; i++) {
         quicstream_t* qs = request_stream((uint64_t)i);
         quicstream_on_data(qs, 0, req, rlen, 0);
-        h3conn_stream_read(c, qs);
+        h3conn_stream_read(c, NULL, qs);
 
         quicstream_on_reset(qs, H3_REQUEST_CANCELLED, rlen);
-        const h3conn_result_t r = h3conn_stream_read(c, qs);
+        const h3conn_result_t r = h3conn_stream_read(c, NULL, qs);
 
         if (r.status == H3CONN_CLOSED) { closed_at = i; error = r.h3_error; }
 
@@ -149,10 +149,10 @@ TEST(test_h3budget_abort) {
     for (int i = 1; i <= 20; i++) {
         quicstream_t* qs = request_stream((uint64_t)i);
         quicstream_on_data(qs, 0, req, rlen, 0);
-        h3conn_stream_read(c, qs);
+        h3conn_stream_read(c, NULL, qs);
 
         quicstream_on_reset(qs, H3_REQUEST_CANCELLED, rlen);
-        const h3conn_result_t r = h3conn_stream_read(c, qs);
+        const h3conn_result_t r = h3conn_stream_read(c, NULL, qs);
         TEST_ASSERT(r.status == H3CONN_REQUEST_RESET, "cancelled, connection intact");
 
         h3conn_stream_release(qs);

@@ -65,6 +65,16 @@ void h3conn_free(h3conn_t* c) {
     free(c);
 }
 
+/* Whether the transport may release the stream: for a request, once the
+ * response has been written in full. Service streams say no by never finishing,
+ * which is what keeps the control stream alive for the connection. */
+static int __app_done(h3app_t* app) {
+    if (app == NULL) return 1;
+    if (!app->is_request) return 0;
+
+    return app->req == NULL || app->req->response_done;
+}
+
 static void __app_free(h3app_t* app) {
     if (app == NULL) return;
 
@@ -131,6 +141,7 @@ static h3app_t* __app_of(h3conn_t* c, quicstream_t* qs) {
     /* The transport owns when a stream dies and frees it without knowing what
      * `app` is, so it is told here how to let go of it. */
     qs->app_free = (void(*)(void*))__app_free;
+    qs->app_done = (int(*)(void*))__app_done;
 
     return app;
 }
@@ -285,11 +296,12 @@ static h3conn_result_t __on_reset(h3conn_t* c, quicstream_t* qs, h3app_t* app) {
     return __reset(H3_REQUEST_CANCELLED);
 }
 
-static h3conn_result_t __read_uni(h3conn_t* c, quicstream_t* qs, h3app_t* app) {
+static h3conn_result_t __read_uni(h3conn_t* c, quicconn_t* qc, quicstream_t* qs, h3app_t* app) {
     uint8_t buf[H3CONN_READ_CHUNK];
 
     for (;;) {
         const size_t n = quicstream_read(qs, buf, sizeof buf);
+        quicconn_consumed(qc, n);
         const int fin = (qs->recv_state == QUIC_RECV_DATA_READ);
 
         if (n == 0 && !fin) return __ok();
@@ -310,12 +322,13 @@ static h3conn_result_t __read_uni(h3conn_t* c, quicstream_t* qs, h3app_t* app) {
     }
 }
 
-static h3conn_result_t __read_request(h3conn_t* c, quicstream_t* qs, h3app_t* app) {
+static h3conn_result_t __read_request(h3conn_t* c, quicconn_t* qc, quicstream_t* qs, h3app_t* app) {
     uint8_t buf[H3CONN_READ_CHUNK];
     int headers_became_ready = 0;
 
     for (;;) {
         const size_t n = quicstream_read(qs, buf, sizeof buf);
+        quicconn_consumed(qc, n);
         const int fin = (qs->recv_state == QUIC_RECV_DATA_READ);
 
         if (n == 0 && !fin) break;
@@ -425,7 +438,7 @@ int h3conn_read(h3conn_t* c, quicconn_t* qc, uint64_t* error) {
             qs->recv_state != QUIC_RECV_RESET_RECVD)
             continue;
 
-        const h3conn_result_t r = h3conn_stream_read(c, qs);
+        const h3conn_result_t r = h3conn_stream_read(c, qc, qs);
 
         switch (r.status) {
         case H3CONN_OK:
@@ -765,7 +778,7 @@ size_t h3conn_requests_in_flight(const h3conn_t* c, const quicconn_t* qc) {
     return n;
 }
 
-h3conn_result_t h3conn_stream_read(h3conn_t* c, quicstream_t* qs) {
+h3conn_result_t h3conn_stream_read(h3conn_t* c, quicconn_t* qc, quicstream_t* qs) {
     if (c == NULL || qs == NULL) return __closed(H3_INTERNAL_ERROR);
 
     h3app_t* app = __app_of(c, qs);
@@ -776,5 +789,5 @@ h3conn_result_t h3conn_stream_read(h3conn_t* c, quicstream_t* qs) {
         return __on_reset(c, qs, app);
     }
 
-    return app->is_request ? __read_request(c, qs, app) : __read_uni(c, qs, app);
+    return app->is_request ? __read_request(c, qc, qs, app) : __read_uni(c, qc, qs, app);
 }

@@ -26,6 +26,11 @@
 
 typedef struct quicsendbuf {
     uint8_t* data;
+    /* Where the live bytes start inside `data`. Acknowledging the front moves
+     * this rather than the data; the buffer is compacted only when the dead
+     * prefix reaches half the capacity, so each byte is memmoved at most once
+     * per doubling instead of once per acknowledgement. */
+    size_t   head;
     size_t   len;         /* bytes held, from base */
     size_t   cap;
 

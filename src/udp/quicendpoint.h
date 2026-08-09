@@ -64,6 +64,21 @@ typedef struct quicendpoint {
     connection_t* timer_connection;
     uint64_t timer_deadline_us;   /* what it is currently armed for; 0 = idle */
 
+    /* How a handler thread gets the worker's attention.
+     *
+     * quicendpoint_wake() queues the connection, but the worker is asleep in
+     * epoll_wait and a queue is not a descriptor -- so before this existed the
+     * response sat there until something else woke the loop, which in practice
+     * meant the acknowledgement timer. Measured with a third-party client: 25 ms
+     * per request, exactly http3_ack_delay_ms, and a single connection capped at
+     * 40 requests a second (docs/http3/08 §7a).
+     *
+     * An eventfd rather than re-arming the timer: writing it is thread-safe and
+     * says what it means, while a timer re-armed from another thread races with
+     * the worker's own arming. */
+    int eventfd;
+    connection_t* wake_connection;
+
     /* The endpoint's connection is registered in epoll by quicendpoints_listen,
      * not by creation. Teardown has to know which happened: a registered
      * connection is released through connection->close (control_del, fd close,

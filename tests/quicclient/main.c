@@ -14,6 +14,7 @@
  *              [--handshake-only] [--path-challenge] [--key-update] [--cid]
  *              [--migrate] [--new-token [--pause N]]
  *              [--loss N] [--loss-in N] [--reorder N] [--dup N] [--seed N]
+ *              [--timeout MS]
  *
  * --loss impairs what this client sends and --loss-in what it receives. Only
  * the second tests the server's loss recovery; the first tests that the server
@@ -49,6 +50,12 @@ int main(int argc, char* argv[]) {
     int pause_ms = 0;
     unsigned loss = 0, loss_in = 0, reorder = 0, dup = 0;
     unsigned long long seed = 0;
+    /* How long to wait for a response. Five seconds is generous for the small
+     * replies most runs fetch and far too little for a large one in a
+     * sanitised build -- 2 MB takes half a second there, so 16 MB does not
+     * fit. Raised per run rather than globally, so an ordinary failure is still
+     * reported in five seconds instead of thirty. */
+    int timeout_ms = 5000;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) verbose = 0;
         else if (strcmp(argv[i], "--handshake-only") == 0) handshake_only = 1;
@@ -67,6 +74,7 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--reorder") == 0 && i + 1 < argc) reorder = (unsigned)atoi(argv[++i]);
         else if (strcmp(argv[i], "--dup") == 0 && i + 1 < argc) dup = (unsigned)atoi(argv[++i]);
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) seed = strtoull(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) timeout_ms = atoi(argv[++i]);
     }
 
     if (concurrent < 1) concurrent = 1;
@@ -397,7 +405,7 @@ int main(int argc, char* argv[]) {
         many = calloc((size_t)concurrent, sizeof * many);
         h3_ok = many != NULL &&
                 h3client_get_many(&client, (size_t)concurrent, authority, path,
-                                  15000, many);
+                                  timeout_ms > 15000 ? timeout_ms : 15000, many);
         if (!h3_ok) printf("FAIL: not every response completed\n");
         else response = many[0];
     }
@@ -407,7 +415,7 @@ int main(int argc, char* argv[]) {
         if (!h3_ok) printf("FAIL: no response\n");
     }
     else if (h3_ok) {
-        h3_ok = h3client_get(&client, 0, authority, path, 5000, &response);
+        h3_ok = h3client_get(&client, 0, authority, path, timeout_ms, &response);
         if (!h3_ok) printf("FAIL: no response\n");
     }
 

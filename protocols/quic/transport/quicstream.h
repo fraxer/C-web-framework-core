@@ -101,6 +101,11 @@ typedef struct quicstream {
      * request, response and parsers. */
     void*    app;
     void   (*app_free)(void*);
+    /* Whether the layer above has finished with this stream. The transport can
+     * see that both directions are closed and acknowledged, but not that h3 is
+     * still writing a response onto it -- so it asks. NULL means "no opinion",
+     * which counts as finished. */
+    int    (*app_done)(void*);
 
     struct quicstream* next;
     struct quicstream* send_next;   /* round-robin list of streams with data */

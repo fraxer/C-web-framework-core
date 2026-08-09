@@ -52,7 +52,7 @@ static const char* const __quic_name[METRICS_QUIC__COUNT] = {
     "decrypt_failures", "aead_limit_reached", "key_updates",
     "packets_lost", "pto_fired", "pto_probes_sent", "persistent_congestion",
     "flow_blocked.connection", "flow_blocked.stream", "amplification_limited",
-    "cids_issued", "cids_announced", "streams_opened", "streams_reset_sent", "streams_reset_received",
+    "cids_issued", "cids_announced", "streams_opened", "streams_released", "streams_reset_sent", "streams_reset_received",
     "closed.idle_timeout", "closed.local_error", "closed.peer",
     "refused.at_capacity", "refused.handshake_rate",
     "retry_sent", "token_valid", "token_invalid",

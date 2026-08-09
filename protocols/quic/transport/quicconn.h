@@ -135,6 +135,18 @@ typedef struct quicconn {
     uint64_t  next_peer_uni;
     uint64_t  next_local_uni;
 
+    /* Peer-initiated streams that have finished in both directions and been
+     * released. Their slots are credit the peer may reuse, and §4.6 says so
+     * with a MAX_STREAMS frame -- without one the peer is capped at the initial
+     * allowance for the life of the connection, which is not a slow path but a
+     * wall: a hundred requests and the connection is spent (found with a
+     * third-party client, docs/http3/08 §7a).
+     *
+     * Releasing them also keeps the per-packet walk over conn->streams short.
+     * Before this the list only ever grew. */
+    uint64_t  peer_bidi_closed;
+    uint64_t  max_streams_bidi_sent;
+
     quicflow_t recv_flow;       /* connection-level, what we allow */
     quicflow_t send_flow;       /* connection-level, what the peer allows */
 
@@ -307,6 +319,12 @@ void quicconn_close(quicconn_t* conn, uint64_t error_code, int is_app,
 
 /* Find an open stream by id, or NULL. */
 quicstream_t* quicconn_stream_find(quicconn_t* conn, uint64_t id);
+
+/* The application took `bytes` off a stream, so that much of the
+ * connection-level receive window is free again. The stream's own window is
+ * credited inside quicstream_read; this half needs the connection, which the
+ * stream deliberately does not know. */
+void quicconn_consumed(quicconn_t* conn, uint64_t bytes);
 
 /* ---- Write-ahead back pressure ---- *
  *

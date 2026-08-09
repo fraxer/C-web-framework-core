@@ -211,6 +211,13 @@ size_t quicstream_read(quicstream_t* stream, uint8_t* dst, size_t len) {
 
     const size_t n = quicrecvbuf_read(&stream->recv, dst, len);
 
+    /* Taking the bytes out is what frees the window they occupied; until the
+     * flow object is told, the credit stays spent and the peer eventually runs
+     * out of it for good. The connection-level half is the caller's, which is
+     * why it is returned rather than done here -- this object does not know its
+     * connection. */
+    if (n > 0) quicflow_consumed(&stream->recv_flow, n, 0, 0);
+
     if (stream->recv_state == QUIC_RECV_DATA_RECVD &&
         quicrecvbuf_complete(&stream->recv))
         stream->recv_state = QUIC_RECV_DATA_READ;

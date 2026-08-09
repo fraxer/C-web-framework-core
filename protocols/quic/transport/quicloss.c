@@ -263,7 +263,8 @@ static void __detect_lost(quicloss_t* loss, quic_enc_level_e level,
 
 int quicloss_on_ack(quicloss_t* loss, quic_enc_level_e level,
                     const quicrange_t* acked, uint64_t ack_delay_us,
-                    uint64_t now_us, quicframe_ref_t** out_lost) {
+                    uint64_t now_us, quicframe_ref_t** out_lost,
+                    quicframe_ref_t** out_acked) {
     if (loss == NULL || acked == NULL || out_lost == NULL) return 0;
     if (level >= QUIC_ENC_COUNT) return 0;
     if (quicrange_empty(acked)) return 1;
@@ -278,6 +279,19 @@ int quicloss_on_ack(quicloss_t* loss, quic_enc_level_e level,
     quicsent_t** link = &space->sent;
     while (*link != NULL) {
         quicsent_t* sent = *link;
+
+        /* The list is ascending by packet number, so everything past the
+         * largest acknowledged one is unreachable for this acknowledgement.
+         *
+         * Without the stop this loop walked every unacknowledged packet on
+         * every acknowledgement, testing each against the range set -- work
+         * proportional to the congestion window, repeated once per
+         * acknowledgement, which is quadratic in the size of a transfer. On a
+         * 16 MB file that was most of the server's CPU: 16.2 ms per megabyte
+         * against 4.6 for HTTP/2, growing with the transfer (docs/http3/08
+         * §7a). The packets are ordered and so is the answer; the loop just was
+         * not using it. */
+        if (sent->pn > largest) break;
 
         if (!quicrange_contains(acked, sent->pn)) {
             link = &sent->next;
@@ -298,6 +312,17 @@ int quicloss_on_ack(quicloss_t* loss, quic_enc_level_e level,
 
         *link = sent->next;
         space->sent_count--;
+
+        /* Hand the frames to the caller so it can release what they carried;
+         * with nowhere to put them they are freed as before. */
+        if (out_acked != NULL && sent->frames != NULL) {
+            quicframe_ref_t* tail = sent->frames;
+            while (tail->next != NULL) tail = tail->next;
+            tail->next = *out_acked;
+            *out_acked = sent->frames;
+            sent->frames = NULL;
+        }
+
         __sent_free(sent);
     }
 

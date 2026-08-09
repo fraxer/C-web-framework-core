@@ -101,7 +101,7 @@ int h3conn_open_service_streams(h3conn_t* c, quicconn_t* qc);
 
 /* Drive one stream that has readable bytes, has ended, or has been reset.
  * Safe to call on a stream with nothing new. */
-h3conn_result_t h3conn_stream_read(h3conn_t* c, quicstream_t* qs);
+h3conn_result_t h3conn_stream_read(h3conn_t* c, quicconn_t* qc, quicstream_t* qs);
 
 /* Read every stream of the connection that has something new, dispatching the
  * requests that completed and answering the ones that were refused. This is

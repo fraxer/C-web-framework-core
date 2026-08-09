@@ -185,7 +185,7 @@ TEST(test_quic_loss_rtt) {
     quicrange_add(&acked, 0, 0);
 
     quicframe_ref_t* lost = NULL;
-    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost, NULL);
 
     TEST_ASSERT(loss.smoothed_rtt_us == 100000, "smoothed");
     TEST_ASSERT(loss.rttvar_us == 50000, "variance is half");
@@ -198,7 +198,7 @@ TEST(test_quic_loss_rtt) {
     __now += 200000;
     quicrange_clear(&acked);
     quicrange_add(&acked, 1, 1);
-    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost, NULL);
 
     TEST_ASSERT(loss.smoothed_rtt_us > 100000 && loss.smoothed_rtt_us < 130000,
                 "moved a fraction of the way");
@@ -209,7 +209,7 @@ TEST(test_quic_loss_rtt) {
     __now += 20000;
     quicrange_clear(&acked);
     quicrange_add(&acked, 2, 2);
-    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost, NULL);
     TEST_ASSERT(loss.min_rtt_us == 20000, "the new minimum");
 
     TEST_CASE("a peer cannot drive the estimate below min_rtt with ack_delay");
@@ -221,7 +221,7 @@ TEST(test_quic_loss_rtt) {
     __now += 30000;
     quicrange_clear(&acked);
     quicrange_add(&acked, 3, 3);
-    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 10000000, __now, &lost);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 10000000, __now, &lost, NULL);
 
     TEST_ASSERT(loss.smoothed_rtt_us > 0, "still a sane estimate");
     TEST_ASSERT(loss.smoothed_rtt_us <= before, "and it did not blow up");
@@ -263,7 +263,7 @@ TEST(test_quic_loss_detection) {
     /* Packets 1..4 acknowledged, 0 missing: 4 - 0 >= 3, so 0 is lost. */
     quicrange_add(&acked, 1, 4);
     __now += 10000;
-    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost, NULL);
 
     TEST_ASSERT(lost != NULL, "something was declared lost");
     TEST_ASSERT(lost->type == QUIC_FRAME_STREAM, "the frame reference came back");
@@ -285,7 +285,7 @@ TEST(test_quic_loss_detection) {
     quicloss_on_sent(&loss, QUIC_ENC_APP, 0, 1200, 1, 1, NULL, __now);
     __now += 100000;
     quicrange_add(&acked, 0, 0);
-    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost, NULL);
     TEST_REQUIRE(loss.smoothed_rtt_us == 100000, "100 ms round trip established");
 
     quicrange_clear(&acked);
@@ -299,7 +299,7 @@ TEST(test_quic_loss_detection) {
      * against a 112 ms time threshold. */
     __now += 100000;
     quicrange_add(&acked, 2, 3);
-    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost, NULL);
     TEST_ASSERT(lost == NULL, "nothing declared lost");
     TEST_ASSERT(loss.space[QUIC_ENC_APP].loss_time_us != 0,
                 "but a timer is armed for the time threshold");
@@ -345,7 +345,7 @@ TEST(test_quic_loss_pto) {
     quicrange_init(&acked, 0);
     quicrange_add(&acked, 0, 0);
     quicframe_ref_t* lost = NULL;
-    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost, NULL);
 
     /* 100000 + 4*50000 + 25000 */
     TEST_ASSERT(quicloss_pto_us(&loss, QUIC_ENC_APP) == 325000, "computed");
@@ -386,7 +386,7 @@ TEST(test_quic_loss_pto) {
     TEST_CASE("an acknowledgement resets the backoff");
     quicrange_clear(&acked);
     quicrange_add(&acked, 1, 1);
-    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost, NULL);
     TEST_ASSERT(loss.pto_count == 0, "reset");
 
     TEST_CASE("no timer with nothing in flight");
@@ -435,7 +435,7 @@ TEST(test_quic_loss_stranded_packet) {
     __now += 10000;
 
     quicrange_add(&acked, 1, 1);
-    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost, NULL);
 
     /* One acknowledgement of a newer packet is enough: the time threshold is
      * 9/8 of the RTT, and 20 ms of it has passed. */
@@ -502,7 +502,7 @@ TEST(test_quic_loss_spaces) {
     quicrange_add(&acked, 0, 0);
     quicframe_ref_t* lost = NULL;
 
-    quicloss_on_ack(&loss, QUIC_ENC_INITIAL, &acked, 0, __now, &lost);
+    quicloss_on_ack(&loss, QUIC_ENC_INITIAL, &acked, 0, __now, &lost, NULL);
     TEST_ASSERT(loss.space[QUIC_ENC_INITIAL].sent_count == 0, "Initial acknowledged");
     TEST_ASSERT(loss.space[QUIC_ENC_HANDSHAKE].sent_count == 1,
                 "Handshake untouched by the same packet number");

@@ -78,7 +78,7 @@ static quicstream_t* add_request(h3fixture_t* f, uint64_t index) {
     const size_t rlen = h3frame_write(req, sizeof req, H3_FRAME_HEADERS, block, blen);
     quicstream_on_data(qs, 0, req, rlen, 1);
 
-    h3conn_stream_read(f->c, qs);
+    h3conn_stream_read(f->c, NULL, qs);
 
     return qs;
 }

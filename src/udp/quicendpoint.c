@@ -5,6 +5,7 @@
 #include <openssl/rand.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
@@ -642,6 +643,16 @@ void quicendpoint_wake(quicendpoint_t* endpoint, struct quicconn* conn) {
     }
 
     atomic_flag_clear_explicit(&endpoint->tx_lock, memory_order_release);
+
+    /* And wake the worker. Outside the lock: the write is a syscall, and the
+     * queue must not be held across one. */
+    if (endpoint->eventfd >= 0) {
+        const uint64_t one = 1;
+        if (write(endpoint->eventfd, &one, sizeof one) != (ssize_t)sizeof one) {
+            /* EAGAIN means the counter is saturated, which already means the
+             * worker has a wakeup coming. Nothing else is worth doing here. */
+        }
+    }
 }
 
 listener_t* quicendpoint_listener(quicendpoint_t* endpoint) {
@@ -1175,6 +1186,47 @@ static int __endpoint_timer_read(connection_t* connection) {
  * reference held, and the worker's shutdown loop -- which waits for
  * connection_count to reach zero -- then runs out its whole grace window every
  * time. That is exactly what it did. */
+/* A handler thread finished a response: drain the send queue now rather than at
+ * the next timer. */
+static int __endpoint_wake_read(connection_t* connection) {
+    connection_server_ctx_t* ctx = connection->ctx;
+    quicendpoint_t* ep = (quicendpoint_t*)ctx->listener;
+
+    uint64_t ticks;
+    while (read(ep->eventfd, &ticks, sizeof ticks) == sizeof ticks) {
+        /* drain -- level-triggered */
+    }
+
+    __endpoint_tick(ep, 0);
+    __endpoint_timer_arm(ep);
+
+    return 1;
+}
+
+static int __endpoint_wake_close(connection_t* connection) {
+    connection_server_ctx_t* ctx = connection->ctx;
+    quicendpoint_t* ep = (quicendpoint_t*)ctx->listener;
+
+    connection_s_lock(connection, LOCK_SITE_CLOSE);
+
+    if (ep->wake_connection == connection) ep->wake_connection = NULL;
+
+    if (!ep->listener.api->control_del(connection))
+        log_error("Quic endpoint: wake not removed from api\n");
+
+    atomic_store(&ctx->detached, 1);
+
+    close(connection->fd);
+    ep->eventfd = -1;
+
+    atomic_store(&ctx->destroyed, 1);
+
+    if (connection_s_dec(connection) == CONNECTION_DEC_RESULT_DECREMENT)
+        connection_s_unlock(connection);
+
+    return 1;
+}
+
 static int __endpoint_timer_close(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
     quicendpoint_t* ep = (quicendpoint_t*)ctx->listener;
@@ -1284,6 +1336,18 @@ static quicendpoint_t* __endpoint_get(quicendpoint_t* endpoints, in_addr_t ip,
 static void __endpoint_free(quicendpoint_t* ep) {
     if (ep == NULL) return;
 
+    if (ep->wake_connection != NULL) {
+        if (ep->listening) ep->wake_connection->close(ep->wake_connection);
+        else               connection_free(ep->wake_connection);
+
+        ep->wake_connection = NULL;
+    }
+
+    if (ep->eventfd != -1) {
+        close(ep->eventfd);
+        ep->eventfd = -1;
+    }
+
     if (ep->timer_connection != NULL) {
         if (ep->listening) ep->timer_connection->close(ep->timer_connection);
         else               connection_free(ep->timer_connection);
@@ -1327,6 +1391,7 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server) {
     memset(ep, 0, sizeof * ep);
     ep->fd = -1;
     ep->timerfd = -1;
+    ep->eventfd = -1;
     ep->table = __quic_table;
     ep->reset_key = __quic_reset_key;
     cqueue_init(&ep->listener.servers);
@@ -1379,6 +1444,18 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server) {
     ep->timer_connection->read = __endpoint_timer_read;
     ep->timer_connection->write = NULL;
     ep->timer_connection->close = __endpoint_timer_close;
+
+    ep->eventfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (ep->eventfd == -1) goto failed;
+
+    ep->wake_connection = connection_s_alloc(&ep->listener, ep->eventfd,
+                                             server->ip, server->http3.port,
+                                             server->ip, server->http3.port, NULL, 0);
+    if (ep->wake_connection == NULL) goto failed;
+
+    ep->wake_connection->read = __endpoint_wake_read;
+    ep->wake_connection->write = NULL;
+    ep->wake_connection->close = __endpoint_wake_close;
 
     if (!cqueue_append(&ep->listener.servers, server)) goto failed;
 
@@ -1551,6 +1628,11 @@ void quicendpoints_tick(quicendpoint_t* endpoints, int shutdown_now) {
          * enough for the drain to happen. */
         if (endpoints->draining && endpoints->conn_count == 0 &&
             endpoints->listener.connection != NULL) {
+            if (endpoints->wake_connection != NULL) {
+                endpoints->wake_connection->close(endpoints->wake_connection);
+                endpoints->wake_connection = NULL;
+            }
+
             if (endpoints->timer_connection != NULL) {
                 endpoints->timer_connection->close(endpoints->timer_connection);
                 endpoints->timer_connection = NULL;
@@ -1587,6 +1669,10 @@ int quicendpoints_listen(quicendpoint_t* endpoints) {
             !endpoints->listener.api->control_add(endpoints->timer_connection, MPXIN))
             return 0;
 
+        if (endpoints->wake_connection != NULL &&
+            !endpoints->listener.api->control_add(endpoints->wake_connection, MPXIN))
+            return 0;
+
         endpoints->listening = 1;
         endpoints = endpoints->next;
     }
@@ -1596,6 +1682,11 @@ int quicendpoints_listen(quicendpoint_t* endpoints) {
 
 void quicendpoints_unlisten(quicendpoint_t* endpoints) {
     while (endpoints != NULL) {
+        if (endpoints->wake_connection != NULL) {
+            endpoints->wake_connection->close(endpoints->wake_connection);
+            endpoints->wake_connection = NULL;
+        }
+
         if (endpoints->timer_connection != NULL) {
             endpoints->timer_connection->close(endpoints->timer_connection);
             endpoints->timer_connection = NULL;

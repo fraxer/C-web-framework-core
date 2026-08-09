@@ -95,6 +95,16 @@ quicstream_t* quicconn_stream_find(quicconn_t* conn, uint64_t id) {
     return __stream_find(conn, id);
 }
 
+void quicconn_consumed(quicconn_t* conn, uint64_t bytes) {
+    if (conn == NULL || bytes == 0) return;
+
+    quicflow_consumed(&conn->recv_flow, bytes, conn->loss.smoothed_rtt_us, 0);
+
+    /* The credit is only real once the peer is told, and the frame that carries
+     * it is built on the next send turn. */
+    atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+}
+
 uint64_t quicconn_unsent_bytes(const quicconn_t* conn) {
     if (conn == NULL) return 0;
 
@@ -305,7 +315,32 @@ static int __on_ack_frame(quicconn_t* conn, quic_enc_level_e level,
                                ? 20 : conn->local_params.ack_delay_exponent);
 
     quicframe_ref_t* lost = NULL;
-    quicloss_on_ack(&conn->loss, level, &acked, delay, now_us, &lost);
+    quicframe_ref_t* confirmed = NULL;
+    quicloss_on_ack(&conn->loss, level, &acked, delay, now_us, &lost, &confirmed);
+
+    /* Release what the peer has confirmed. Until this existed the send buffers
+     * kept every byte ever written for the life of the connection, no stream
+     * ever reached a terminal state, and the stream credit never came back --
+     * a connection was spent after initial_max_streams_bidi requests. */
+    for (quicframe_ref_t* ref = confirmed; ref != NULL; ref = ref->next) {
+        if (ref->type == QUIC_FRAME_CRYPTO) {
+            quicsendbuf_ack(&conn->crypto_out[level], ref->offset,
+                            (size_t)ref->len, 0);
+        }
+        else if (ref->type >= QUIC_FRAME_STREAM && ref->type < QUIC_FRAME_STREAM + 8) {
+            quicstream_t* s = __stream_find(conn, ref->stream_id);
+            if (s != NULL) {
+                quicsendbuf_ack(&s->send, ref->offset, (size_t)ref->len, ref->fin);
+
+                /* §3.1: everything sent, and now everything acknowledged. */
+                if (s->send_state == QUIC_SEND_DATA_SENT &&
+                    quicsendbuf_complete(&s->send))
+                    s->send_state = QUIC_SEND_DATA_RECVD;
+            }
+        }
+    }
+
+    quicframe_ref_free(confirmed);
 
     /* §6.5: the peer has read something we sent in the current key phase, so a
      * further update from it is no longer a way to make us derive key schedules
@@ -347,6 +382,19 @@ static int __on_stream_frame(quicconn_t* conn, const quicframe_t* frame,
 
         s = __stream_open_peer(conn, id);
         if (s == NULL) {
+            /* Not a failure if the stream simply no longer exists: it finished,
+             * was released, and this is a retransmission of something already
+             * delivered. §3.2 has a frame for a stream in a terminal state
+             * ignored, and the open counter is what tells "gone" from "never
+             * was".
+             *
+             * Releasing finished streams made this reachable for the first
+             * time: before it every stream lived as long as the connection, so
+             * a late frame always found its stream. */
+            const uint64_t opened = quic_stream_is_uni(id) ? conn->next_peer_uni
+                                                           : conn->next_peer_bidi;
+            if (quic_stream_index(id) < opened) return 1;
+
             quicconn_close(conn, QUIC_INTERNAL_ERROR, 0, now_us);
             return 0;
         }
@@ -554,6 +602,65 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
     default:
         quicconn_close(conn, QUIC_FRAME_ENCODING_ERROR, 0, now_us);
         return 0;
+    }
+}
+
+/* Release peer-initiated streams that are finished in both directions.
+ *
+ * "Finished" is strict on the send side: everything written must be
+ * acknowledged, because until then a loss may still require the data back. A
+ * stream freed early would take its send buffer with it and the retransmission
+ * would find nothing.
+ *
+ * Called after each turn of the connection rather than from the stream code
+ * itself: the h3 layer holds a pointer to the stream while it answers, and the
+ * one place that knows both halves are done is here. */
+static void __streams_reap(quicconn_t* conn) {
+    quicstream_t** link = &conn->streams;
+
+    while (*link != NULL) {
+        quicstream_t* s = *link;
+
+        const int send_done = s->send_state == QUIC_SEND_DATA_RECVD ||
+                              s->send_state == QUIC_SEND_RESET_RECVD ||
+                              (s->send_state == QUIC_SEND_RESET_SENT && !s->send_reset_pending) ||
+                              quicsendbuf_complete(&s->send);
+
+        const int recv_done = s->recv_state == QUIC_RECV_DATA_READ ||
+                              s->recv_state == QUIC_RECV_RESET_READ ||
+                              s->recv_state == QUIC_RECV_RESET_RECVD ||
+                              !quicstream_can_receive(s->id);
+
+        if (!send_done || !recv_done) {
+            link = &s->next;
+            continue;
+        }
+
+        /* The application layer may still be holding this stream: h3 keeps the
+         * request and response on it until the response is done. */
+        if (s->app != NULL && s->app_done != NULL && !s->app_done(s->app)) {
+            link = &s->next;
+            continue;
+        }
+
+        *link = s->next;
+        conn->stream_count--;
+
+        if (quic_stream_is_peer_initiated(s->id) && !quic_stream_is_uni(s->id)) {
+            conn->peer_bidi_closed++;
+
+            /* The credit is worth nothing until the peer hears about it, and
+             * the frame that carries it only gets built when there is a reason
+             * to build a packet. Without this the first MAX_STREAMS rode along
+             * with the last response and the rest were never sent -- a peer
+             * that had used its allowance then waited for credit that was
+             * sitting here. */
+            atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+        }
+
+        metrics_quic(METRICS_QUIC_STREAMS_RELEASED);
+
+        quicstream_free(s);
     }
 }
 
@@ -1095,6 +1202,73 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
         }
     }
 
+    /* §4.1: hand back the receive window the application has drained. Without
+     * it the peer's connection-level allowance is spent once and never
+     * replenished -- a connection dies with FLOW_CONTROL_ERROR after
+     * initial_max_data bytes of requests, whatever it was doing. */
+    if (level == QUIC_ENC_APP && p + 16 < payload_cap) {
+        uint64_t limit = 0;
+
+        if (quicflow_should_update(&conn->recv_flow, &limit)) {
+            quicframe_t f;
+            memset(&f, 0, sizeof f);
+            f.type = QUIC_FRAME_MAX_DATA;
+            f.u.max_data.max = limit;
+
+            const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
+            if (n > 0) {
+                p += n;
+                ack_eliciting = 1;
+                quicflow_update_sent(&conn->recv_flow, limit);
+            }
+        }
+    }
+
+    /* The same for each stream that has been drained (§4.1). */
+    if (level == QUIC_ENC_APP) {
+        for (quicstream_t* s = conn->streams; s != NULL && p + 24 < payload_cap;
+             s = s->next) {
+            uint64_t limit = 0;
+            if (!quicflow_should_update(&s->recv_flow, &limit)) continue;
+
+            quicframe_t f;
+            memset(&f, 0, sizeof f);
+            f.type = QUIC_FRAME_MAX_STREAM_DATA;
+            f.u.max_stream_data.id = s->id;
+            f.u.max_stream_data.max = limit;
+
+            const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
+            if (n > 0) {
+                p += n;
+                ack_eliciting = 1;
+                quicflow_update_sent(&s->recv_flow, limit);
+            }
+        }
+    }
+
+    /* §4.6: hand back the credit of streams that have finished. Sent when it
+     * has actually moved -- a frame repeating the current limit is the kind of
+     * free-to-send, nothing-to-do traffic the control budget next door exists
+     * to stop. */
+    if (level == QUIC_ENC_APP && p + 16 < payload_cap) {
+        const uint64_t allow = conn->local_params.initial_max_streams_bidi +
+                               conn->peer_bidi_closed;
+
+        if (allow > conn->max_streams_bidi_sent) {
+            quicframe_t f;
+            memset(&f, 0, sizeof f);
+            f.type = QUIC_FRAME_MAX_STREAMS_BIDI;
+            f.u.max_streams.max = allow;
+
+            const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
+            if (n > 0) {
+                p += n;
+                ack_eliciting = 1;
+                conn->max_streams_bidi_sent = allow;
+            }
+        }
+    }
+
     /* Connection ids the peer has not been told about yet (§5.1.1). One frame
      * per id, each about 40 bytes, and at most a handful ever exist. */
     if (level == QUIC_ENC_APP) {
@@ -1528,6 +1702,10 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
          * peer to nudge us. */
         if (round + 1 == QUICCONN_SEND_ROUNDS) more_pending = 1;
     }
+
+    /* After the turn, not during it: the loop above walks conn->streams, and a
+     * stream freed underneath it would be a use-after-free. */
+    __streams_reap(conn);
 
     if (!more_pending)
         atomic_store_explicit(&conn->want_write, 0, memory_order_release);

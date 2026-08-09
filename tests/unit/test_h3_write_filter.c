@@ -86,8 +86,8 @@ TEST(test_h3_write_filter_lookup) {
 
     quicstream_on_data(a, 0, req, rlen, 0);
     quicstream_on_data(b, 0, req, rlen, 0);
-    TEST_ASSERT(h3conn_stream_read(c, a).status == H3CONN_REQUEST_HEADERS, "stream a");
-    TEST_ASSERT(h3conn_stream_read(c, b).status == H3CONN_REQUEST_HEADERS, "stream b");
+    TEST_ASSERT(h3conn_stream_read(c, NULL, a).status == H3CONN_REQUEST_HEADERS, "stream a");
+    TEST_ASSERT(h3conn_stream_read(c, NULL, b).status == H3CONN_REQUEST_HEADERS, "stream b");
 
     httpresponse_t* ra = httpresponse_create_h3(NULL);
     httpresponse_t* rb = httpresponse_create_h3(NULL);

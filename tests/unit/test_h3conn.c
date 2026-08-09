@@ -66,7 +66,7 @@ TEST(test_h3conn_request) {
 
     /* Headers first, no FIN: the request is known but not complete. */
     deliver(qs, 0, req, n, 0);
-    h3conn_result_t r = h3conn_stream_read(c, qs);
+    h3conn_result_t r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_REQUEST_HEADERS, "headers reported");
 
     h3stream_t* st = h3conn_request_of(qs);
@@ -76,7 +76,7 @@ TEST(test_h3conn_request) {
 
     /* Then the FIN, with no bytes -- the shape a bodyless request really takes. */
     deliver(qs, n, NULL, 0, 1);
-    r = h3conn_stream_read(c, qs);
+    r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_REQUEST_DONE, "done on FIN");
 
     stream_free(qs);
@@ -86,7 +86,7 @@ TEST(test_h3conn_request) {
     c = h3conn_create(NULL, 65536, 0);
     qs = request_stream(0);
     deliver(qs, 0, req, n, 1);
-    r = h3conn_stream_read(c, qs);
+    r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_REQUEST_DONE, "done wins");
     TEST_ASSERT(h3conn_request_of(qs)->headers_done, "headers were built");
     stream_free(qs);
@@ -102,7 +102,7 @@ TEST(test_h3conn_request) {
     deliver(qs, 0, req, n, 0);
     deliver(qs, n, body, blen, 1);
 
-    r = h3conn_stream_read(c, qs);
+    r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_REQUEST_DONE, "done");
     TEST_ASSERT(h3conn_request_of(qs)->req_body_len == 5, "5 bytes spooled");
     stream_free(qs);
@@ -118,16 +118,16 @@ TEST(test_h3conn_request) {
     c = h3conn_create(NULL, 65536, 0);
     qs = request_stream(0);
     deliver(qs, 0, req, n, 1);
-    TEST_ASSERT(h3conn_stream_read(c, qs).status == H3CONN_REQUEST_DONE, "done once");
-    TEST_ASSERT(h3conn_stream_read(c, qs).status == H3CONN_OK, "and not again");
-    TEST_ASSERT(h3conn_stream_read(c, qs).status == H3CONN_OK, "however often it is read");
+    TEST_ASSERT(h3conn_stream_read(c, NULL, qs).status == H3CONN_REQUEST_DONE, "done once");
+    TEST_ASSERT(h3conn_stream_read(c, NULL, qs).status == H3CONN_OK, "and not again");
+    TEST_ASSERT(h3conn_stream_read(c, NULL, qs).status == H3CONN_OK, "however often it is read");
     stream_free(qs);
     h3conn_free(c);
 
     TEST_CASE("reading a stream with nothing new is a no-op");
     c = h3conn_create(NULL, 65536, 0);
     qs = request_stream(0);
-    TEST_ASSERT(h3conn_stream_read(c, qs).status == H3CONN_OK, "nothing to do");
+    TEST_ASSERT(h3conn_stream_read(c, NULL, qs).status == H3CONN_OK, "nothing to do");
     stream_free(qs);
     h3conn_free(c);
 }
@@ -150,7 +150,7 @@ TEST(test_h3conn_request_errors) {
     const size_t flen = h3frame_write(frame, sizeof frame, H3_FRAME_HEADERS, block, blen);
     deliver(qs, 0, frame, flen, 0);
 
-    h3conn_result_t r = h3conn_stream_read(c, qs);
+    h3conn_result_t r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_REQUEST_RESET, "reset");
     TEST_ASSERT(r.h3_error == H3_MESSAGE_ERROR, "H3_MESSAGE_ERROR");
     TEST_ASSERT(qs->send_reset_pending, "RESET_STREAM queued");
@@ -165,7 +165,7 @@ TEST(test_h3conn_request_errors) {
     const size_t n = get_request(req, sizeof req);
     deliver(qs, 0, req, n, 0);
 
-    r = h3conn_stream_read(c, qs);
+    r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_REQUEST_REFUSED, "refused");
     TEST_ASSERT(r.http_status == 431, "431");
     TEST_ASSERT(!qs->send_reset_pending, "the stream is still usable");
@@ -178,7 +178,7 @@ TEST(test_h3conn_request_errors) {
     const uint8_t h2_ping[] = { 0x06, 0x00 };
     deliver(qs, 0, h2_ping, sizeof h2_ping, 0);
 
-    r = h3conn_stream_read(c, qs);
+    r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_CLOSED, "connection error");
     TEST_ASSERT(r.h3_error == H3_FRAME_UNEXPECTED, "H3_FRAME_UNEXPECTED");
     stream_free(qs);
@@ -188,10 +188,10 @@ TEST(test_h3conn_request_errors) {
     c = h3conn_create(NULL, 65536, 0);
     qs = request_stream(0);
     deliver(qs, 0, req, n, 0);
-    TEST_ASSERT(h3conn_stream_read(c, qs).status == H3CONN_REQUEST_HEADERS, "headers");
+    TEST_ASSERT(h3conn_stream_read(c, NULL, qs).status == H3CONN_REQUEST_HEADERS, "headers");
 
     quicstream_on_reset(qs, H3_REQUEST_CANCELLED, n);
-    r = h3conn_stream_read(c, qs);
+    r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_REQUEST_RESET, "cancelled");
     TEST_ASSERT(!qs->send_reset_pending, "nothing owed back -- they asked for it");
     stream_free(qs);
@@ -204,7 +204,7 @@ TEST(test_h3conn_request_errors) {
 
     qs = request_stream(0);
     deliver(qs, 0, req, n, 0);
-    r = h3conn_stream_read(c, qs);
+    r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_REQUEST_RESET, "reset");
     TEST_ASSERT(r.h3_error == H3_REQUEST_REJECTED, "H3_REQUEST_REJECTED -- safe to retry");
     stream_free(qs);
@@ -223,7 +223,7 @@ TEST(test_h3conn_uni_streams) {
     const size_t n = 1 + h3frame_write(ctrl + 1, sizeof ctrl - 1, H3_FRAME_SETTINGS, NULL, 0);
     deliver(qs, 0, ctrl, n, 0);
 
-    TEST_ASSERT(h3conn_stream_read(c, qs).status == H3CONN_OK, "accepted");
+    TEST_ASSERT(h3conn_stream_read(c, NULL, qs).status == H3CONN_OK, "accepted");
     TEST_ASSERT(c->session->peer_settings_seen, "settings recorded");
     TEST_ASSERT(c->session->ctrl_recv_id == qs->id, "stream id recorded");
     stream_free(qs);
@@ -235,7 +235,7 @@ TEST(test_h3conn_uni_streams) {
     const uint8_t unknown[] = { 0x09, 0xde, 0xad };
     deliver(qs, 0, unknown, sizeof unknown, 0);
 
-    h3conn_result_t r = h3conn_stream_read(c, qs);
+    h3conn_result_t r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_OK, "not fatal");
     TEST_ASSERT(qs->send_stop_sending_pending, "STOP_SENDING queued");
     TEST_ASSERT(qs->send_stop_sending_code == H3_STREAM_CREATION_ERROR, "the h3 code");
@@ -244,7 +244,7 @@ TEST(test_h3conn_uni_streams) {
     /* Later bytes are drained without being looked at. */
     const uint8_t more[] = { 0xff, 0xff };
     deliver(qs, sizeof unknown, more, sizeof more, 1);
-    TEST_ASSERT(h3conn_stream_read(c, qs).status == H3CONN_OK, "drained");
+    TEST_ASSERT(h3conn_stream_read(c, NULL, qs).status == H3CONN_OK, "drained");
     stream_free(qs);
     h3conn_free(c);
 
@@ -253,7 +253,7 @@ TEST(test_h3conn_uni_streams) {
     qs = uni_stream(0);
     deliver(qs, 0, ctrl, n, 1);
 
-    r = h3conn_stream_read(c, qs);
+    r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_CLOSED, "fatal");
     TEST_ASSERT(r.h3_error == H3_CLOSED_CRITICAL_STREAM, "H3_CLOSED_CRITICAL_STREAM");
     stream_free(qs);
@@ -263,10 +263,10 @@ TEST(test_h3conn_uni_streams) {
     c = h3conn_create(NULL, 65536, 0);
     qs = uni_stream(0);
     deliver(qs, 0, ctrl, n, 0);
-    TEST_ASSERT(h3conn_stream_read(c, qs).status == H3CONN_OK, "opened");
+    TEST_ASSERT(h3conn_stream_read(c, NULL, qs).status == H3CONN_OK, "opened");
 
     quicstream_on_reset(qs, 0, n);
-    r = h3conn_stream_read(c, qs);
+    r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_CLOSED, "fatal");
     TEST_ASSERT(r.h3_error == H3_CLOSED_CRITICAL_STREAM, "same code as a clean close");
     stream_free(qs);
@@ -279,8 +279,8 @@ TEST(test_h3conn_uni_streams) {
     deliver(a, 0, ctrl, n, 0);
     deliver(b, 0, ctrl, n, 0);
 
-    TEST_ASSERT(h3conn_stream_read(c, a).status == H3CONN_OK, "first");
-    r = h3conn_stream_read(c, b);
+    TEST_ASSERT(h3conn_stream_read(c, NULL, a).status == H3CONN_OK, "first");
+    r = h3conn_stream_read(c, NULL, b);
     TEST_ASSERT(r.status == H3CONN_CLOSED, "second is fatal");
     TEST_ASSERT(r.h3_error == H3_STREAM_CREATION_ERROR, "H3_STREAM_CREATION_ERROR");
     stream_free(a);
@@ -293,9 +293,9 @@ TEST(test_h3conn_uni_streams) {
     const uint8_t half1[] = { 0x40 };   /* two-byte varint for 0x21 (grease) */
     const uint8_t half2[] = { 0x21 };
     deliver(qs, 0, half1, 1, 0);
-    TEST_ASSERT(h3conn_stream_read(c, qs).status == H3CONN_OK, "half");
+    TEST_ASSERT(h3conn_stream_read(c, NULL, qs).status == H3CONN_OK, "half");
     deliver(qs, 1, half2, 1, 0);
-    TEST_ASSERT(h3conn_stream_read(c, qs).status == H3CONN_OK, "resolved");
+    TEST_ASSERT(h3conn_stream_read(c, NULL, qs).status == H3CONN_OK, "resolved");
     TEST_ASSERT(!qs->send_stop_sending_pending, "grease is ignored, not refused");
     stream_free(qs);
     h3conn_free(c);
