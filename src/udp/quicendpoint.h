@@ -197,6 +197,25 @@ int quicendpoint_fd(quicendpoint_t* endpoint);
 in_addr_t quicendpoint_ip(quicendpoint_t* endpoint);
 unsigned short quicendpoint_port(quicendpoint_t* endpoint);
 
+/* Register one more connection id for a connection that already exists, and
+ * drop one. A QUIC connection answers to several ids at once (RFC 9000 §5.1),
+ * and issuing them is the connection's business while the table they live in is
+ * the endpoint's -- these two are the seam.
+ *
+ * quicendpoint_cid_register returns 0 if the id could not be added, in which
+ * case the caller must not treat it as issued. */
+int  quicendpoint_cid_register(quicendpoint_t* endpoint, const quiccid_t* cid,
+                               struct quicconn* conn);
+void quicendpoint_cid_forget(quicendpoint_t* endpoint, const quiccid_t* cid);
+
+/* The stateless reset token for an id (§10.3), from the process-wide key.
+ *
+ * Needed by two callers that never meet: the endpoint, answering a datagram for
+ * a connection it no longer has, and the connection, telling the peer in
+ * advance what the token for a new id will be. Both must produce the same 16
+ * bytes or the peer cannot recognise a reset, so there is one derivation. */
+int  quicendpoint_reset_token(const quiccid_t* cid, uint8_t out[16]);
+
 /* Take a connection out of the routing table and the endpoint's lists. Called
  * from the connection's close path; after it, no datagram can reach it. */
 void quicendpoint_detach(quicendpoint_t* endpoint, struct quicconn* conn);

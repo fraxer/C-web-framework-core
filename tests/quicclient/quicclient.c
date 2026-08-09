@@ -154,6 +154,23 @@ size_t quicclient_stream_read(quicclient_t* client, uint64_t id,
     return s == NULL ? 0 : quicrecvbuf_read(&s->in, dst, cap);
 }
 
+int quicclient_use_cid(quicclient_t* client, size_t index) {
+    if (client == NULL || index >= client->server_cid_count) return 0;
+
+    client->dcid = client->server_cids[index].cid;
+
+    return 1;
+}
+
+int quicclient_retire_cid(quicclient_t* client, uint64_t seq) {
+    if (client == NULL) return 0;
+
+    client->retire_seq = seq;
+    client->retire_queued = 1;
+
+    return 1;
+}
+
 int quicclient_key_update(quicclient_t* client) {
     if (client == NULL) return 0;
     if (!client->tx[QUIC_ENC_APP].valid || !client->rx[QUIC_ENC_APP].valid) return 0;
@@ -221,6 +238,21 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
         if (n > 0) {
             p += n;
             c->ack_pending[level] = 0;
+        }
+    }
+
+    if (level == QUIC_ENC_APP && c->retire_queued) {
+        quicframe_t f;
+        memset(&f, 0, sizeof f);
+        f.type = QUIC_FRAME_RETIRE_CONNECTION_ID;
+        f.u.retire_cid.seq = c->retire_seq;
+
+        const size_t n = quicframe_write(payload + p, sizeof payload - p, &f);
+        if (n > 0) {
+            p += n;
+            c->retire_queued = 0;
+            __log(c, "  [client] -> RETIRE_CONNECTION_ID seq %llu\n",
+                  (unsigned long long)c->retire_seq);
         }
     }
 
@@ -439,6 +471,19 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
                   (unsigned long long)f.u.stop_sending.error);
             break;
 
+        case QUIC_FRAME_NEW_CONNECTION_ID:
+            if (c->server_cid_count <
+                sizeof c->server_cids / sizeof c->server_cids[0]) {
+                const size_t i = c->server_cid_count++;
+                c->server_cids[i].seq = f.u.new_cid.seq;
+                c->server_cids[i].cid = f.u.new_cid.cid;
+                memcpy(c->server_cids[i].token, f.u.new_cid.token, 16);
+            }
+
+            __log(c, "  [client] <- NEW_CONNECTION_ID seq %llu, %u bytes\n",
+                  (unsigned long long)f.u.new_cid.seq, (unsigned)f.u.new_cid.cid.len);
+            break;
+
         case QUIC_FRAME_HANDSHAKE_DONE:
             c->handshake_done_received = 1;
             __log(c, "  [client] <- HANDSHAKE_DONE\n");
@@ -459,6 +504,8 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
 
         case QUIC_FRAME_CONNECTION_CLOSE:
         case QUIC_FRAME_CONNECTION_CLOSE_APP:
+            c->close_received = 1;
+            c->close_error = f.u.close.error;
             printf("  [client] <- CONNECTION_CLOSE, error 0x%llx%s%.*s\n",
                    (unsigned long long)f.u.close.error,
                    f.u.close.reason_len > 0 ? ": " : "",
@@ -629,6 +676,9 @@ int quicclient_connect(quicclient_t* client, const char* host, uint16_t port,
     params.initial_max_streams_bidi = 16;
     params.initial_max_streams_uni = 16;
     params.max_idle_timeout = 30000;
+    /* Above the RFC minimum of 2, so the server issuing spares is visible as a
+     * count rather than as a single id that could be a coincidence. */
+    params.active_connection_id_limit = 4;
     params.has_initial_scid = 1;
     params.initial_scid = client->scid;
 

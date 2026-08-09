@@ -294,7 +294,20 @@ static int __budget_spend(int64_t* tokens, uint64_t* epoch_us,
 
 /* RFC 9000 §10.3. The token must be derivable without any per-connection state:
  * the whole point is to answer for a connection we no longer have. */
-static int __reset_token(const quiccid_t* cid, uint8_t out[16]) {
+int quicendpoint_cid_register(quicendpoint_t* endpoint, const quiccid_t* cid,
+                              quicconn_t* conn) {
+    if (endpoint == NULL || cid == NULL || conn == NULL) return 0;
+
+    return quiccidtable_insert(endpoint->table, cid, conn) == QUICCIDTABLE_OK;
+}
+
+void quicendpoint_cid_forget(quicendpoint_t* endpoint, const quiccid_t* cid) {
+    if (endpoint == NULL || cid == NULL) return;
+
+    quiccidtable_remove(endpoint->table, cid);
+}
+
+int quicendpoint_reset_token(const quiccid_t* cid, uint8_t out[16]) {
     unsigned char mac[EVP_MAX_MD_SIZE];
     unsigned int mac_len = 0;
 
@@ -337,7 +350,7 @@ static void __send_stateless_reset(quicendpoint_t* ep, const udp_datagram_t* dgr
      * packet is indistinguishable from a 1-RTT packet with a short id. */
     packet[0] = (uint8_t)(0x40 | (packet[0] & 0x3f));
 
-    if (!__reset_token(&inv->dcid, packet + len - 16)) {
+    if (!quicendpoint_reset_token(&inv->dcid, packet + len - 16)) {
         metrics_quic(METRICS_QUIC_DROP_UNKNOWN_CID);
         return;
     }

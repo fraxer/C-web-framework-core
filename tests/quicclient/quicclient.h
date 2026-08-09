@@ -82,6 +82,26 @@ typedef struct quicclient {
 
     clientstream_t streams[CLIENT_MAX_STREAMS];
 
+    /* Connection ids the server issued (RFC 9000 §5.1.1). Kept so the test can
+     * address the server by one of them: an id that does not route is
+     * indistinguishable from one that was never issued, and only using it
+     * tells the two apart. */
+    struct {
+        uint64_t  seq;
+        quiccid_t cid;
+        uint8_t   token[16];
+    } server_cids[8];
+    size_t server_cid_count;
+
+    uint64_t retire_seq;
+    int      retire_queued;
+
+    /* The server sent CONNECTION_CLOSE. A test that provokes a protocol error
+     * on purpose needs to tell "it closed" from "it stopped answering", and
+     * those look identical without this. */
+    int      close_received;
+    uint64_t close_error;
+
     /* Key update (RFC 9001 §6), from the initiating side. The server only ever
      * responds to one, so the client has to be the one that starts it.
      *
@@ -105,6 +125,13 @@ typedef struct quicclient {
 
     int verbose;
 } quicclient_t;
+
+/* Address the server by one of the ids it issued, instead of the one from the
+ * handshake. Returns 0 if there is no such id. */
+int quicclient_use_cid(quicclient_t* client, size_t index);
+
+/* Queue a RETIRE_CONNECTION_ID for `seq`. */
+int quicclient_retire_cid(quicclient_t* client, uint64_t seq);
 
 /* Move both directions to the next key generation and flip the Key Phase bit
  * (§6.1). Only meaningful once 1-RTT keys exist. Returns 0 on failure. */

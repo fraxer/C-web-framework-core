@@ -10,7 +10,7 @@
  * what happened.
  *
  *   quicclient [host] [port] [-q] [-p /path] [-a authority] [-n N] [--expect]
- *              [--handshake-only] [--path-challenge] [--key-update]
+ *              [--handshake-only] [--path-challenge] [--key-update] [--cid]
  *
  * `-a` sets both the TLS server name and the :authority pseudo-header. They are
  * one flag because a server matches the virtual host on one and validates it
@@ -35,6 +35,7 @@ int main(int argc, char* argv[]) {
     int expect_continue = 0;
     int path_challenge = 0;
     int key_update = 0;
+    int cid_test = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) verbose = 0;
         else if (strcmp(argv[i], "--handshake-only") == 0) handshake_only = 1;
@@ -44,6 +45,7 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--expect") == 0) expect_continue = 1;
         else if (strcmp(argv[i], "--path-challenge") == 0) path_challenge = 1;
         else if (strcmp(argv[i], "--key-update") == 0) key_update = 1;
+        else if (strcmp(argv[i], "--cid") == 0) cid_test = 1;
     }
 
     if (concurrent < 1) concurrent = 1;
@@ -102,6 +104,59 @@ int main(int argc, char* argv[]) {
         if (!client.path_response_matched) ok = 0;
     }
 
+    /* Alternate connection ids (RFC 9000 §5.1.1). An id the server announced
+     * but does not route is indistinguishable from one it never announced, so
+     * the check is to address it by one and see an answer come back. */
+    if (ok && cid_test) {
+        printf("\nCONNECTION IDS\n");
+
+        /* They ride in 1-RTT packets, which may not have arrived by the time
+         * the handshake reports done. */
+        for (int i = 0; i < 20 && client.server_cid_count == 0; i++)
+            quicclient_pump(&client, 100);
+
+        printf("ids issued:                %zu\n", client.server_cid_count);
+
+        if (client.server_cid_count == 0) ok = 0;
+        else {
+            quicclient_use_cid(&client, 0);
+            quicclient_path_challenge(&client);
+
+            for (int i = 0; i < 20 && !client.path_response_received; i++)
+                quicclient_pump(&client, 100);
+
+            printf("answers on the new id:     %s\n",
+                   client.path_response_matched ? "yes" : "no");
+            if (!client.path_response_matched) ok = 0;
+
+            /* §5.1.1: retiring one is also a request for a replacement.
+             * Sequence 0 -- the id from the handshake -- because §19.16 forbids
+             * retiring the id the packet carrying the frame is addressed to,
+             * and that is now the one we just switched to. */
+            const size_t before = client.server_cid_count;
+            quicclient_retire_cid(&client, 0);
+
+            for (int i = 0; i < 20 && client.server_cid_count == before; i++)
+                quicclient_pump(&client, 100);
+
+            printf("replacement after retire:  %s\n",
+                   client.server_cid_count > before ? "yes" : "no");
+            if (client.server_cid_count <= before) ok = 0;
+
+            /* §19.16 makes retiring a sequence number that was never issued a
+             * protocol violation -- a MUST, and the only way to notice a peer
+             * that is guessing. Deliberately last: it ends the connection. */
+            quicclient_retire_cid(&client, 4242);
+
+            for (int i = 0; i < 20 && !client.close_received; i++)
+                quicclient_pump(&client, 100);
+
+            printf("unissued retire refused:   %s\n",
+                   client.close_received && client.close_error == 0x0a ? "yes" : "no");
+            if (!client.close_received || client.close_error != 0x0a) ok = 0;
+        }
+    }
+
     /* Key update (RFC 9001 §6). Like the challenge above, this belongs before
      * HTTP/3: it is a transport obligation, and the exchange that proves it has
      * to be one the application layer plays no part in. */
@@ -127,11 +182,13 @@ int main(int argc, char* argv[]) {
         if (!client.read_after_update || !client.path_response_matched) ok = 0;
     }
 
-    if (!ok || handshake_only || path_challenge || key_update) {
-        const char* what = key_update   ? "the key update was followed"
+    if (!ok || handshake_only || path_challenge || key_update || cid_test) {
+        const char* what = cid_test     ? "the alternate connection ids work"
+                         : key_update   ? "the key update was followed"
                          : path_challenge ? "the path challenge was answered"
                                           : "the handshake completed end to end";
-        const char* why = key_update   ? "the key update was not followed"
+        const char* why = cid_test     ? "the alternate connection ids do not work"
+                        : key_update   ? "the key update was not followed"
                         : path_challenge ? "the path challenge went unanswered"
                                          : "the handshake did not complete";
 

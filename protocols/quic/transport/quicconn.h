@@ -43,6 +43,12 @@ typedef struct quiccid_entry {
     uint64_t  seq;
     uint8_t   reset_token[16];
     int       active;
+    /* The NEW_CONNECTION_ID frame for this entry has gone out. Cleared again if
+     * the packet carrying it is declared lost: §13.3 puts this frame among the
+     * information that must be retransmitted, unlike the limits next door,
+     * whose current value the next packet carries anyway. Entry 0 is born
+     * announced -- the peer learned it from the packet header itself. */
+    int       announced;
 } quiccid_entry_t;
 
 #define QUICCONN_MAX_LOCAL_CIDS 8

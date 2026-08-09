@@ -27,6 +27,7 @@
 /* ---- Small helpers ---- */
 
 static int __key_update_arm(quicconn_t* conn);
+static void __cids_replenish(quicconn_t* conn);
 
 static quicconn_t* __conn_of(connection_t* connection) {
     /* Safe because conn is the first member of quicconn_t, which is also why
@@ -275,9 +276,21 @@ static int __on_ack_frame(quicconn_t* conn, quic_enc_level_e level,
             if (s != NULL)
                 quicsendbuf_lost(&s->send, ref->offset, (size_t)ref->len, ref->fin);
         }
-        /* Control frames carrying a limit are not queued for retransmission:
-         * the next packet carries the current value anyway, which is both
-         * simpler and more correct than resending a stale one. */
+        else if (ref->type == QUIC_FRAME_NEW_CONNECTION_ID) {
+            /* §13.3: unlike a limit, an id the peer never heard of cannot be
+             * re-derived from anything, so the announcement is queued again.
+             * The entry may have been retired meanwhile, in which case there is
+             * nothing to announce and nothing to do. */
+            for (size_t i = 0; i < QUICCONN_MAX_LOCAL_CIDS; i++)
+                if (conn->local_cids[i].active && conn->local_cids[i].seq == ref->offset) {
+                    conn->local_cids[i].announced = 0;
+                    atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+                    break;
+                }
+        }
+        /* Other control frames carry a limit and are not queued for
+         * retransmission: the next packet carries the current value anyway,
+         * which is both simpler and more correct than resending a stale one. */
     }
 
     quicframe_ref_free(lost);
@@ -433,10 +446,33 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
             conn->peer_cids[conn->peer_cid_count++] = frame->u.new_cid.cid;
         return 1;
 
-    case QUIC_FRAME_RETIRE_CONNECTION_ID:
-        /* Phase 9 retires the id for real, after 3xPTO. Accepting it silently
-         * is correct in the meantime: we simply keep using what we have. */
+    case QUIC_FRAME_RETIRE_CONNECTION_ID: {
+        const uint64_t seq = frame->u.retire_cid.seq;
+
+        /* §19.16: a sequence number we never issued is a protocol violation --
+         * a MUST, and the only way to notice a peer that is guessing. */
+        if (seq >= conn->next_cid_seq) {
+            quicconn_close(conn, QUIC_PROTOCOL_VIOLATION, 0, now_us);
+            return 0;
+        }
+
+        for (size_t i = 0; i < QUICCONN_MAX_LOCAL_CIDS; i++) {
+            quiccid_entry_t* e = &conn->local_cids[i];
+            if (!e->active || e->seq != seq) continue;
+
+            /* Out of the routing table first: after this no datagram can find
+             * the connection through it, which is the whole point of retiring. */
+            quicendpoint_cid_forget(conn->endpoint, &e->cid);
+            memset(e, 0, sizeof * e);
+            break;
+        }
+
+        /* §5.1.1: a retirement is also a request for a replacement, and a peer
+         * that retires without getting one runs out of ids to migrate with. */
+        __cids_replenish(conn);
+
         return 1;
+    }
 
     case QUIC_FRAME_PATH_CHALLENGE:
         /* §8.2.2: echo the data back. Answering a challenge and validating a
@@ -489,6 +525,78 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
         quicconn_close(conn, QUIC_FRAME_ENCODING_ERROR, 0, now_us);
         return 0;
     }
+}
+
+/* ---- Connection ids we answer to (RFC 9000 §5.1.1) ---- *
+ *
+ * A connection is reachable by several ids at once, and issuing spares is not a
+ * nicety: §9.5 requires a peer to use a *different* id after it migrates, so a
+ * peer with only the one it got at accept either cannot migrate or does so
+ * observably. The ids live in the endpoint's shared table; this side owns which
+ * ones exist. */
+
+static quiccid_entry_t* __cid_slot_free(quicconn_t* conn) {
+    for (size_t i = 0; i < QUICCONN_MAX_LOCAL_CIDS; i++)
+        if (!conn->local_cids[i].active) return &conn->local_cids[i];
+
+    return NULL;
+}
+
+static size_t __cid_active_count(const quicconn_t* conn) {
+    size_t n = 0;
+
+    for (size_t i = 0; i < QUICCONN_MAX_LOCAL_CIDS; i++)
+        if (conn->local_cids[i].active) n++;
+
+    return n;
+}
+
+/* One new id, registered and waiting to be announced. */
+static int __cid_issue(quicconn_t* conn) {
+    quiccid_entry_t* slot = __cid_slot_free(conn);
+    if (slot == NULL) return 0;
+
+    quiccid_t cid;
+    cid.len = QUIC_LOCAL_CID_LEN;
+    if (RAND_bytes(cid.data, QUIC_LOCAL_CID_LEN) != 1) return 0;
+
+    /* The token first: an id the peer cannot recognise a reset for is worse
+     * than no id at all, and this is the only step that can fail without
+     * leaving something behind. */
+    uint8_t token[16];
+    if (!quicendpoint_reset_token(&cid, token)) return 0;
+
+    if (!quicendpoint_cid_register(conn->endpoint, &cid, conn)) return 0;
+
+    slot->cid = cid;
+    slot->seq = conn->next_cid_seq++;
+    memcpy(slot->reset_token, token, sizeof slot->reset_token);
+    slot->active = 1;
+    slot->announced = 0;
+
+    atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+
+    return 1;
+}
+
+/* Keep the peer supplied up to what it said it would hold.
+ *
+ * §5.1.1 bounds this by the peer's active_connection_id_limit -- issuing past
+ * it is a CONNECTION_ID_LIMIT_ERROR against us -- and by our own array, which
+ * is what actually pays for them. */
+static void __cids_replenish(quicconn_t* conn) {
+    if (!conn->peer_params_seen) return;
+
+    /* §18.2 puts the floor at 2, and a peer that omits the parameter means 2.
+     * quictp_defaults already fills that in; the clamp is here because the
+     * value crosses the wire and a zero would otherwise retire the id the
+     * connection is running on. */
+    uint64_t want = conn->peer_params.active_connection_id_limit;
+    if (want < 2) want = 2;
+    if (want > QUICCONN_MAX_LOCAL_CIDS) want = QUICCONN_MAX_LOCAL_CIDS;
+
+    while (__cid_active_count(conn) < want)
+        if (!__cid_issue(conn)) break;
 }
 
 /* ---- Key update (RFC 9001 §6) ---- */
@@ -731,6 +839,13 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
             metrics_quic(METRICS_QUIC_HANDSHAKE_COMPLETED);
 
             conn->state = QUICCONN_ACTIVE;
+
+            /* Now that the peer's active_connection_id_limit is known, give it
+             * the spares it said it would hold (§5.1.1). Not earlier: before
+             * the transport parameters arrive the limit is a guess, and issuing
+             * past it is a CONNECTION_ID_LIMIT_ERROR against us. */
+            __cids_replenish(conn);
+
             /* Completing the handshake proves the peer received our packets,
              * which is exactly what the amplification limit was waiting for. */
             conn->address_validated = 1;
@@ -795,6 +910,43 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
             p += n;
             ack_eliciting = 1;
             conn->path_response_pending = 0;
+        }
+    }
+
+    /* Connection ids the peer has not been told about yet (§5.1.1). One frame
+     * per id, each about 40 bytes, and at most a handful ever exist. */
+    if (level == QUIC_ENC_APP) {
+        for (size_t i = 0; i < QUICCONN_MAX_LOCAL_CIDS && p + 64 < payload_cap; i++) {
+            quiccid_entry_t* e = &conn->local_cids[i];
+            if (!e->active || e->announced) continue;
+
+            quicframe_t f;
+            memset(&f, 0, sizeof f);
+            f.type = QUIC_FRAME_NEW_CONNECTION_ID;
+            f.u.new_cid.seq = e->seq;
+            /* Never asks the peer to retire anything: our ids stay valid until
+             * the connection ends, and a non-zero value here would force the
+             * peer to drop ids it may be about to migrate onto. */
+            f.u.new_cid.retire_prior_to = 0;
+            f.u.new_cid.cid = e->cid;
+            memcpy(f.u.new_cid.token, e->reset_token, sizeof f.u.new_cid.token);
+
+            const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
+            if (n == 0) continue;
+
+            p += n;
+            ack_eliciting = 1;
+            e->announced = 1;
+
+            /* §13.3 has this frame retransmitted when lost. The reference
+                carries the sequence number in `offset`, which is what
+             * __on_ack_frame looks the entry up by. */
+            quicframe_ref_t* ref = quicframe_ref_new(QUIC_FRAME_NEW_CONNECTION_ID);
+            if (ref != NULL) {
+                ref->offset = e->seq;
+                ref->next = refs;
+                refs = ref;
+            }
         }
     }
 
@@ -1191,6 +1343,9 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     }
     conn->local_cids[0].seq = 0;
     conn->local_cids[0].active = 1;
+    /* The peer reads this one out of our packet headers, so there is no
+     * NEW_CONNECTION_ID to send for it. */
+    conn->local_cids[0].announced = 1;
     conn->next_cid_seq = 1;
 
     /* Initial keys come from the client's original Destination Connection ID --
