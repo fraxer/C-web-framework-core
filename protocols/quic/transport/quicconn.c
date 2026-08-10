@@ -1323,8 +1323,39 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
     quicpkt_t pkt;
     quicpkt_status_e st;
 
+    /* Packets whose keys do not exist yet, kept for the retry below (§5.7).
+     *
+     * This is not the exotic reordering case the drop in __process_packet was
+     * written for. The keys for the application space are installed by
+     * quictls_advance, which runs *after* this loop -- so a 1-RTT packet
+     * coalesced behind the client's Finished, in the same datagram, is
+     * guaranteed to arrive before its keys exist. That is exactly what a client
+     * sends when it finishes the handshake and has a request ready, and
+     * dropping it costs a full retransmission of the request. On a path losing
+     * three packets at a time that was the difference between a request served
+     * and a connection that waits out its idle timeout with the client
+     * repeating itself (docs/http3/08 §3o).
+     *
+     * Four is the whole of the need: a datagram holds one packet per level, and
+     * nothing is held past this call, so there is no buffer for a peer to
+     * grow. */
+    struct { uint8_t* buf; size_t len; quicpkt_t pkt; } deferred[4];
+    size_t deferred_n = 0;
+
     while (quicpkt_next(copy, len, &off, QUIC_LOCAL_CID_LEN, &pkt, &st)) {
-        if (!__process_packet(conn, copy + off - pkt.pkt_len, pkt.pkt_len, &pkt, now_us)) {
+        uint8_t* start = copy + off - pkt.pkt_len;
+        const quic_enc_level_e lvl = quicpkt_level(pkt.type);
+
+        if (lvl < QUIC_ENC_COUNT && !conn->rx[lvl].valid &&
+            deferred_n < sizeof deferred / sizeof deferred[0]) {
+            deferred[deferred_n].buf = start;
+            deferred[deferred_n].len = pkt.pkt_len;
+            deferred[deferred_n].pkt = pkt;
+            deferred_n++;
+            continue;
+        }
+
+        if (!__process_packet(conn, start, pkt.pkt_len, &pkt, now_us)) {
             conn->recv_path = NULL;
             return 0;
         }
@@ -1413,6 +1444,25 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
             conn->loss.handshake_confirmed = 1;
             atomic_store_explicit(&conn->want_write, 1, memory_order_release);
         }
+    }
+
+    /* The keys the handshake just installed are what the packets held back
+     * above were waiting for. Retried once, here and nowhere else: if the level
+     * is still without keys the packet really did overtake its handshake, and
+     * then dropping it is right -- the peer will send it again. */
+    for (size_t i = 0; i < deferred_n; i++) {
+        const quic_enc_level_e lvl = quicpkt_level(deferred[i].pkt.type);
+        if (lvl >= QUIC_ENC_COUNT || !conn->rx[lvl].valid) continue;
+
+        log_debug("quic: deferred packet retried at level %d\n", (int)lvl);
+
+        conn->recv_path = path;
+        const int ok = __process_packet(conn, deferred[i].buf, deferred[i].len,
+                                        &deferred[i].pkt, now_us);
+        conn->recv_path = NULL;
+
+        if (!ok) return 0;
+        if (conn->state == QUICCONN_DRAINING) break;
     }
 
     return 1;
@@ -2110,12 +2160,19 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
         if (round + 1 == QUICCONN_SEND_ROUNDS) more_pending = 1;
     }
 
+    /* Cleared before the reaping below, never after: releasing a peer's
+     * bidirectional stream returns stream credit and raises want_write so the
+     * MAX_STREAMS carrying it gets built, and clearing the flag afterwards
+     * threw that away. It survived only because a busy connection always had
+     * another reason to build a packet; a connection whose last request has
+     * just finished has none, and stops at exactly initial_max_streams_bidi
+     * with the credit sitting here (docs/http3/08 §3p). */
+    if (!more_pending)
+        atomic_store_explicit(&conn->want_write, 0, memory_order_release);
+
     /* After the turn, not during it: the loop above walks conn->streams, and a
      * stream freed underneath it would be a use-after-free. */
     __streams_reap(conn);
-
-    if (!more_pending)
-        atomic_store_explicit(&conn->want_write, 0, memory_order_release);
 
     (void)sent_anything;
 

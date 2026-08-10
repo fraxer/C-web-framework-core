@@ -1024,6 +1024,14 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
      * far smaller than the datagram that triggered it. */
     if (dgram->len < QUIC_MIN_INITIAL_DATAGRAM) {
         metrics_quic(METRICS_QUIC_DROP_SHORT_INITIAL);
+
+        /* Counted and, at debug level, said out loud. The counter is the right
+         * instrument in production, but it needs `/metrics`, and the one place
+         * this question gets asked -- an interop endpoint serving no HTTP
+         * routes -- has nowhere to serve it from. Without a line here, "the
+         * server never saw that datagram" and "the server dropped it silently"
+         * look identical in a log (docs/http3/08 §3n). */
+        log_debug("quic: drop short_initial len=%zu\n", dgram->len);
         return;
     }
 
@@ -1138,6 +1146,7 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
     if (!__budget_spend(&ep->handshake_tokens, &ep->handshake_epoch_us,
                         __quic_handshake_rate, __quic_handshake_burst)) {
         metrics_quic(METRICS_QUIC_HANDSHAKE_RATE_LIMITED);
+        log_debug("quic: drop handshake_rate_limited\n");
         return;
     }
 
