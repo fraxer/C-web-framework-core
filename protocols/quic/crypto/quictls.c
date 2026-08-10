@@ -433,6 +433,16 @@ int quictls_recv_crypto(quictls_t* tls, quic_enc_level_e level,
     return __crypto_in_insert(&tls->in[level], offset, data, len);
 }
 
+int quictls_crypto_is_duplicate(const quictls_t* tls, quic_enc_level_e level,
+                                uint64_t offset, size_t len) {
+    if (tls == NULL || level >= QUIC_ENC_COUNT || len == 0) return 0;
+
+    /* Against the contiguous prefix rather than the ranges: a frame inside a
+     * hole is new data however much surrounds it, and the prefix is the only
+     * part this level has certainly finished with. */
+    return offset + len <= (uint64_t)tls->in[level].len;
+}
+
 int quictls_advance(quictls_t* tls) {
     if (tls == NULL || tls->ssl == NULL) return 0;
     if (tls->alert_raised) return 0;

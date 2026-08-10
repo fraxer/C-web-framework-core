@@ -172,6 +172,16 @@ void quictls_free(quictls_t* tls);
 int quictls_recv_crypto(quictls_t* tls, quic_enc_level_e level,
                         uint64_t offset, const uint8_t* data, size_t len);
 
+/* Whether this range is entirely data already held at this level -- that is, a
+ * pure retransmission by the peer.
+ *
+ * Worth distinguishing because of what it means during a handshake: a peer that
+ * sends its flight again is saying it did not get ours. Waiting out a PTO to
+ * work that out costs hundreds of milliseconds we were told about directly
+ * (docs/http3/08 §3l). */
+int quictls_crypto_is_duplicate(const quictls_t* tls, quic_enc_level_e level,
+                                uint64_t offset, size_t len);
+
 /* Drive the handshake as far as it will go with what has been fed.
  *
  * Returns 1 while the handshake is progressing or complete, 0 on failure -- in

@@ -374,10 +374,34 @@ static int __on_crypto_frame(quicconn_t* conn, quic_enc_level_e level,
         return 0;
     }
 
+    /* A flight we already hold, arriving again while the handshake is still
+     * running, is the peer telling us in so many words that it did not get
+     * ours. Answering it now instead of waiting out a PTO is the difference
+     * between a lost server flight costing a few milliseconds and costing 666
+     * ms doubling each time -- and with no RTT sample yet, that backoff is what
+     * a client's handshake timeout runs out of (docs/http3/08 §3l).
+     *
+     * Bounded by anti-amplification like everything else on this path, so a
+     * peer replaying its Initial cannot use this to make us send more than
+     * three times what it sent. */
+    const int duplicate = quictls_crypto_is_duplicate(&conn->tls, level,
+                                                      frame->u.crypto.offset,
+                                                      (size_t)frame->u.crypto.len);
+
     if (!quictls_recv_crypto(&conn->tls, level, frame->u.crypto.offset,
                              frame->u.crypto.data, (size_t)frame->u.crypto.len)) {
         quicconn_close(conn, QUIC_CRYPTO_BUFFER_EXCEEDED, 0, quic_now_us());
         return 0;
+    }
+
+    if (duplicate && conn->state == QUICCONN_HANDSHAKE) {
+        /* Every level we hold keys for: the flight the peer is missing spans
+         * Initial and Handshake, and which half was lost is not knowable from
+         * the level the duplicate arrived on. */
+        for (int l = 0; l < QUIC_ENC_COUNT; l++)
+            if (conn->tx[l].valid) quicsendbuf_requeue_unacked(&conn->crypto_out[l]);
+
+        atomic_store_explicit(&conn->want_write, 1, memory_order_release);
     }
 
     return 1;
@@ -2525,6 +2549,18 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
              * information it carried. */
             conn->pto_probes = 2;
             conn->pto_level = level;
+
+            /* The five numbers that named the cause in §3g, at the moment they
+             * are worth having: a stalled connection is diagnosed by what its
+             * state says now, not by what happened. Cheap because a PTO is a
+             * rare event by construction -- if it is not, that is the finding. */
+            log_debug("quic: pto level=%d count=%u in_flight=%zu cwnd=%llu "
+                      "unsent=%llu srtt=%llu\n",
+                      (int)level, conn->loss.pto_count,
+                      conn->cc.bytes_in_flight,
+                      (unsigned long long)conn->cc.cwnd,
+                      (unsigned long long)quicconn_unsent_bytes(conn),
+                      (unsigned long long)conn->loss.smoothed_rtt_us);
 
             /* §6.2.4: the probe should carry data, not just a PING. A PING only
              * asks the peer to acknowledge something so that loss detection can
