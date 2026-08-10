@@ -483,6 +483,11 @@ int h3conn_read(h3conn_t* c, quicconn_t* qc, uint64_t* error) {
             h3stream_t* st = h3conn_request_of(qs);
             if (st == NULL) break;
 
+            log_debug("h3: request cid=%02x%02x%02x%02x stream=%llu\n",
+                      qc->odcid.data[0], qc->odcid.data[1],
+                      qc->odcid.data[2], qc->odcid.data[3],
+                      (unsigned long long)qs->id);
+
             /* http_server_dispatch queues the handler and, for anything it can
              * answer itself (a static file, a 404, a redirect), publishes
              * inline -- which is why this has to run with the lock already
@@ -728,6 +733,11 @@ int h3conn_write(h3conn_t* c, quicconn_t* qc) {
         h3stream_t* st = h3conn_request_of(qs);
         if (st == NULL || st->response_done) continue;
         if (!atomic_load_explicit(&st->response_ready, memory_order_acquire)) continue;
+
+        log_debug("h3: response cid=%02x%02x%02x%02x stream=%llu\n",
+                  qc->odcid.data[0], qc->odcid.data[1],
+                  qc->odcid.data[2], qc->odcid.data[3],
+                  (unsigned long long)qs->id);
 
         if (!__write_stream(qs, st)) {
             log_error("h3: write failed on stream %llu\n", (unsigned long long)qs->id);

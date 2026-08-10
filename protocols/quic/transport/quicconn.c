@@ -1198,7 +1198,23 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
      * finished. Here rather than at handshake completion: the client stops
      * reading Initial packets at this same moment, so everything we send at
      * that level from now on is noise it will drop. */
-    if (level == QUIC_ENC_HANDSHAKE) __discard_space(conn, QUIC_ENC_INITIAL);
+    if (level == QUIC_ENC_HANDSHAKE) {
+        __discard_space(conn, QUIC_ENC_INITIAL);
+
+        /* §8.1: a Handshake packet that opens also validates the address, and
+         * waiting for the handshake to complete instead is a deadlock waiting
+         * to happen. The proof is already complete here -- Handshake keys can
+         * only be derived from the ServerHello we sent to this address, so the
+         * peer demonstrably received it.
+         *
+         * What the delay cost: with the client's Finished lost, the server
+         * still owes a flight but has spent its three-times budget, so the PTO
+         * fires with nothing it may send -- `in_flight` frozen across nine
+         * probes at `amp=110`. §6.2.2.1 says it is then the client's job to
+         * send more, and a client that believes the handshake finished has no
+         * reason to (docs/http3/08 §3n). */
+        conn->address_validated = 1;
+    }
 
     /* A replayed packet is bit-identical to the original, so the AEAD cannot
      * tell them apart -- this check is the only thing that can. */
@@ -1357,8 +1373,11 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
         }
 
         if (conn->tls.handshake_complete) {
-            log_info("quic: handshake complete; peer streams_uni=%llu streams_bidi=%llu "
+            log_info("quic: handshake complete cid=%02x%02x%02x%02x; "
+                     "peer streams_uni=%llu streams_bidi=%llu "
                      "max_data=%llu max_stream_data_uni=%llu\n",
+                     conn->odcid.data[0], conn->odcid.data[1],
+                     conn->odcid.data[2], conn->odcid.data[3],
                      (unsigned long long)conn->peer_params.initial_max_streams_uni,
                      (unsigned long long)conn->peer_params.initial_max_streams_bidi,
                      (unsigned long long)conn->peer_params.initial_max_data,
@@ -2163,6 +2182,12 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     conn->odcid = *odcid;
     conn->state = QUICCONN_HANDSHAKE;
 
+    /* The other end of the pair with "handshake complete": a handshake that
+     * never finishes leaves this line alone in the log, which is the only way
+     * to find it among the fifty a multiconnect test starts. */
+    log_debug("quic: accepted cid=%02x%02x%02x%02x\n",
+              odcid->data[0], odcid->data[1], odcid->data[2], odcid->data[3]);
+
     const uint64_t now = quic_now_us();
     conn->last_activity_us = now;
 
@@ -2553,14 +2578,24 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
             /* The five numbers that named the cause in §3g, at the moment they
              * are worth having: a stalled connection is diagnosed by what its
              * state says now, not by what happened. Cheap because a PTO is a
-             * rare event by construction -- if it is not, that is the finding. */
-            log_debug("quic: pto level=%d count=%u in_flight=%zu cwnd=%llu "
-                      "unsent=%llu srtt=%llu\n",
+             * rare event by construction -- if it is not, that is the finding.
+             *
+             * Tagged with the original DCID, and that is not decoration: a
+             * server under a multiconnect test interleaves these lines from
+             * fifty connections, and without the tag they cannot be told apart
+             * -- which is exactly the state the §3m residue was left in. */
+            log_debug("quic: pto cid=%02x%02x%02x%02x level=%d count=%u "
+                      "in_flight=%zu cwnd=%llu unsent=%llu srtt=%llu "
+                      "amp=%llu validated=%d\n",
+                      conn->odcid.data[0], conn->odcid.data[1],
+                      conn->odcid.data[2], conn->odcid.data[3],
                       (int)level, conn->loss.pto_count,
                       conn->cc.bytes_in_flight,
                       (unsigned long long)conn->cc.cwnd,
                       (unsigned long long)quicconn_unsent_bytes(conn),
-                      (unsigned long long)conn->loss.smoothed_rtt_us);
+                      (unsigned long long)conn->loss.smoothed_rtt_us,
+                      (unsigned long long)conn->amplification_budget,
+                      conn->address_validated);
 
             /* §6.2.4: the probe should carry data, not just a PING. A PING only
              * asks the peer to acknowledge something so that loss detection can
