@@ -323,6 +323,16 @@ static void __requeue_lost(quicconn_t* conn, quic_enc_level_e level,
             conn->new_token_sent = 0;
             atomic_store_explicit(&conn->want_write, 1, memory_order_release);
         }
+        else if (ref->type == QUIC_FRAME_HANDSHAKE_DONE) {
+            /* §13.3: retransmitted until acknowledged, and it is the one frame
+             * where losing it strands the peer rather than costing it a round
+             * trip. A client confirms the handshake on this frame and only then
+             * drops its Handshake keys; without it, it probes the Handshake
+             * space forever -- into a server that has already dropped those
+             * keys and cannot even acknowledge the probes (docs/http3/08 §3j). */
+            conn->handshake_done_sent = 0;
+            atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+        }
         else if (ref->type == QUIC_FRAME_NEW_CONNECTION_ID) {
             /* §13.3: unlike a limit, an id the peer never heard of cannot be
              * re-derived from anything, so the announcement is queued again.
@@ -1629,6 +1639,16 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
             p += n;
             ack_eliciting = 1;
             conn->handshake_done_sent = 1;
+
+            /* Registered for loss recovery like NEW_TOKEN above, and for a
+             * sharper reason: §13.3 requires this frame to be retransmitted
+             * until acknowledged, and the peer has no other way to learn the
+             * handshake is confirmed. */
+            quicframe_ref_t* ref = quicframe_ref_new(QUIC_FRAME_HANDSHAKE_DONE);
+            if (ref != NULL) {
+                ref->next = refs;
+                refs = ref;
+            }
         }
     }
 
@@ -2505,6 +2525,19 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
              * information it carried. */
             conn->pto_probes = 2;
             conn->pto_level = level;
+
+            /* §6.2.4: the probe should carry data, not just a PING. A PING only
+             * asks the peer to acknowledge something so that loss detection can
+             * finally act -- which costs a whole round trip, and during a
+             * handshake where nothing is getting through there is no round trip
+             * to spend. Queueing the outstanding bytes puts them in the probe
+             * itself, and the probe is the one packet allowed past a full
+             * congestion window (docs/http3/08 §3k). */
+            if (!quicsendbuf_requeue_unacked(&conn->crypto_out[level]) &&
+                level == QUIC_ENC_APP) {
+                for (quicstream_t* s = conn->streams; s != NULL; s = s->next)
+                    if (quicsendbuf_requeue_unacked(&s->send)) break;
+            }
         }
         else
             __requeue_lost(conn, level, lost);

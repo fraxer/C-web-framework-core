@@ -291,6 +291,33 @@ TEST(test_quic_sendbuf) {
     TEST_ASSERT(offset == 4 && len == 4, "only the unacknowledged half");
     quicsendbuf_free(&buf);
 
+    TEST_CASE("a PTO probe can pull back what is still unacknowledged (§6.2.4)");
+    /* A probe carrying only a PING asks the peer to say something so that loss
+     * detection can act a round trip later. In a handshake where nothing is
+     * getting through there is no round trip to spend, and the congestion
+     * window -- which only a probe may exceed -- lets nothing else out
+     * (docs/http3/08 §3k). */
+    quicsendbuf_init(&buf);
+    quicsendbuf_write(&buf, (const uint8_t*)"abcdefgh", 8);
+    quicsendbuf_next(&buf, 8, &offset, &data, &len, &fin);
+    quicsendbuf_mark_sent(&buf, 0, 8, 0);
+    TEST_ASSERT(!quicsendbuf_pending(&buf), "everything has been sent once");
+
+    TEST_ASSERT(quicsendbuf_requeue_unacked(&buf), "and all of it comes back");
+    TEST_ASSERT(quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin), "has data");
+    TEST_ASSERT(offset == 0 && len == 8, "from the earliest unacknowledged byte");
+
+    quicsendbuf_mark_sent(&buf, 0, 8, 0);
+    quicsendbuf_ack(&buf, 0, 4, 0);
+    TEST_ASSERT(quicsendbuf_requeue_unacked(&buf), "again");
+    TEST_ASSERT(quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin), "has data");
+    TEST_ASSERT(offset == 4 && len == 4, "and the confirmed half stays sent");
+
+    quicsendbuf_mark_sent(&buf, 4, 4, 0);
+    quicsendbuf_ack(&buf, 4, 4, 0);
+    TEST_ASSERT(!quicsendbuf_requeue_unacked(&buf), "nothing owed once all is acked");
+    quicsendbuf_free(&buf);
+
     TEST_CASE("the base slides only from the front");
     /* An unacknowledged byte at the start pins everything after it: it may
      * still have to be sent again. */

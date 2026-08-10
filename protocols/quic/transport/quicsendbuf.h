@@ -94,6 +94,16 @@ int quicsendbuf_pending(const quicsendbuf_t* buf);
  * must not hold it back -- see the stream loop in quicconn.c. */
 int quicsendbuf_has_lost(const quicsendbuf_t* buf);
 
+/* Queue the earliest sent-but-unacknowledged range for retransmission, so that
+ * a PTO probe carries it. Returns 1 if anything was queued.
+ *
+ * RFC 9002 §6.2.4: a probe SHOULD carry new data and, failing that, previously
+ * sent data -- because a bare PING only asks the peer to say something, and the
+ * information the peer is actually missing waits another round trip for the
+ * acknowledgement to arrive and loss detection to act on it. During a handshake
+ * that no acknowledgement ever reaches, that round trip never comes. */
+int quicsendbuf_requeue_unacked(quicsendbuf_t* buf);
+
 /* Everything written has been acknowledged, FIN included. */
 int quicsendbuf_complete(const quicsendbuf_t* buf);
 

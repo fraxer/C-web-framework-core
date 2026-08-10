@@ -230,6 +230,26 @@ int quicsendbuf_has_lost(const quicsendbuf_t* buf) {
     return !quicrange_empty(&buf->lost);
 }
 
+int quicsendbuf_requeue_unacked(quicsendbuf_t* buf) {
+    if (buf == NULL) return 0;
+    if (buf->sent_off <= buf->base) return 0;
+
+    /* The earliest unacknowledged byte, and everything unacknowledged after it
+     * up to what has been sent once. quicsendbuf_lost does the walk around
+     * already-acknowledged holes; this only has to find the start and hand it
+     * the range. A range already queued as lost is added again harmlessly --
+     * quicrange_add merges. */
+    for (uint64_t p = buf->base; p < buf->sent_off; p++) {
+        if (quicrange_contains(&buf->acked, p)) continue;
+
+        quicsendbuf_lost(buf, p, (size_t)(buf->sent_off - p), 0);
+
+        return 1;
+    }
+
+    return 0;
+}
+
 int quicsendbuf_complete(const quicsendbuf_t* buf) {
     if (buf == NULL) return 0;
 
