@@ -377,6 +377,25 @@ TEST(test_quic_stream_send) {
     TEST_ASSERT(quicflow_available(&s->send_flow) == 5000, "raised");
     quicstream_free(s);
 
+    TEST_CASE("a closed window still lets lost data be resent (§4.5)");
+    /* Retransmission is not charged to the window -- the offsets were paid for
+     * when they first went out. Holding it back is a deadlock, not a delay: the
+     * peer cannot deliver anything behind the hole, so it never raises the
+     * limit, and the limit is what is stopping us from filling the hole. Found
+     * by the interop runner: every client stalled a multi-megabyte transfer
+     * with data still queued and the connection silent (docs/http3/08 §3i). */
+    s = quicstream_create(0, 1000, 8000, 100);
+    TEST_ASSERT(quicstream_write(s, (const uint8_t*)"0123456789", 10), "written");
+    quicsendbuf_mark_sent(&s->send, 0, 10, 0);
+    quicflow_consume_to(&s->send_flow, 100);   /* the window is spent */
+    TEST_ASSERT(quicflow_available(&s->send_flow) == 0, "and closed");
+    TEST_ASSERT(!quicstream_wants_send(s), "new data waits for the peer");
+
+    quicsendbuf_lost(&s->send, 0, 10, 0);
+    TEST_ASSERT(quicsendbuf_has_lost(&s->send), "the range is queued again");
+    TEST_ASSERT(quicstream_wants_send(s), "and goes out despite the closed window");
+    quicstream_free(s);
+
     TEST_CASE("a stream is finished only when both directions are done");
     s = quicstream_create(0, 1000, 8000, 1000);
     TEST_ASSERT(!quicstream_is_finished(s), "neither side done");

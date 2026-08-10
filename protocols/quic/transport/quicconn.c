@@ -1370,9 +1370,19 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
 /* Build one packet at `level` into `dst`, returning its length or 0. */
 static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
                              uint8_t* dst, size_t cap, uint64_t now_us,
-                             int* out_ack_eliciting) {
+                             int cc_blocked, int* out_ack_eliciting) {
     quickeys_t* keys = &conn->tx[level];
     if (!keys->valid) return 0;
+
+    /* What a full congestion window forbids is putting more *data* in flight
+     * (§7). Acknowledgements are not congestion controlled at all, the frames
+     * that hand credit back to the peer are the opposite of congestion, and
+     * §7.5 lets a PTO probe exceed the window outright -- a probe exists to
+     * make a silent peer speak, and refusing to send it for want of window is
+     * how a stalled connection stays stalled. So the window gates the two
+     * volume producers below, CRYPTO and STREAM, and nothing else. */
+    const int cc_room = !cc_blocked ||
+                        (conn->pto_probes > 0 && level == conn->pto_level);
 
     /* Room for the tag, the header held back below, and a payload worth the
      * packet. The check is what keeps the subtraction that follows from
@@ -1574,7 +1584,7 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
     }
 
     /* Handshake data. */
-    if (quicsendbuf_pending(&conn->crypto_out[level]) && p + 16 < payload_cap) {
+    if (cc_room && quicsendbuf_pending(&conn->crypto_out[level]) && p + 16 < payload_cap) {
         uint64_t offset = 0;
         const uint8_t* data = NULL;
         size_t dlen = 0;
@@ -1661,20 +1671,36 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
                 continue;
             }
 
-            if (!quicstream_wants_send(s)) continue;
+            /* Stream data is what the congestion window is for; the terminal
+             * frames above are not, which is why the gate sits here and not at
+             * the top of the loop. */
+            if (!cc_room || !quicstream_wants_send(s)) continue;
 
             uint64_t offset = 0;
             const uint8_t* data = NULL;
             size_t dlen = 0;
             int fin = 0;
 
-            /* Both windows apply, and so does the space left in the packet. */
+            /* Both windows apply, and so does the space left in the packet --
+             * unless the next chunk is a retransmission. Resent data was
+             * charged to the window the first time it went out (§4.5), so it is
+             * sent regardless of what the window says now; quicsendbuf_next
+             * serves the lowest lost range whole before it looks at new data,
+             * so the chunk is one or the other and never a mix.
+             *
+             * This is not a nicety. Charging it again is a deadlock: the peer
+             * needs the missing bytes before it can deliver anything behind
+             * them, and it raises MAX_DATA only for what it has delivered -- so
+             * the window that is stopping the retransmission can only be opened
+             * by that same retransmission (docs/http3/08 §3i). */
+            const int resending = quicsendbuf_has_lost(&s->send);
+
             uint64_t allowed = quicflow_available(&s->send_flow);
             const uint64_t conn_allowed = quicflow_available(&conn->send_flow);
             if (conn_allowed < allowed) allowed = conn_allowed;
 
             size_t room = payload_cap - p - 24;
-            if (allowed < room) room = (size_t)allowed;
+            if (!resending && allowed < room) room = (size_t)allowed;
 
             if (room == 0 && !(s->send.fin && !s->send.fin_sent)) {
                 /* Only a closed window is counted, not a full packet: the
@@ -1948,6 +1974,16 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
     for (int round = 0; round < QUICCONN_SEND_ROUNDS; round++) {
         size_t total = 0;
 
+        /* §7: the window is asked *before* the packet is built. It used to be
+         * asked after one had already gone out, and only to break this loop
+         * while re-arming want_write -- which made it advisory, because the
+         * endpoint came straight back and sent the next packet anyway. The
+         * sender therefore ran at line rate: on the interop path (10 Mbps,
+         * 15 ms, a 25-packet queue) it emptied the whole flow-control window
+         * into a queue that could hold a twentieth of it, and the peer received
+         * under a tenth of what was sent (docs/http3/08 §3i). */
+        const int cc_blocked = quiccc_available(&conn->cc) < QUICCONN_MAX_PACKET;
+
         /* Coalesce the levels into one datagram where possible: an Initial and
          * a Handshake packet together is what makes a server flight fit in one
          * datagram rather than two (§12.2). */
@@ -1977,7 +2013,7 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
 
             int eliciting = 0;
             const size_t n = __build_packet(conn, level, datagram + total, room,
-                                            now_us, &eliciting);
+                                            now_us, cc_blocked, &eliciting);
             if (n == 0) continue;
 
             total += n;
@@ -1998,10 +2034,11 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
 
         sent_anything = 1;
 
-        if (quiccc_available(&conn->cc) < QUICCONN_MAX_PACKET) {
-            more_pending = 1;
-            break;
-        }
+        /* Out of window: stop, and do *not* ask for another turn. The window
+         * reopens on an acknowledgement or when the loss timer declares
+         * something lost, and both of those set want_write themselves. Asking
+         * again here is what turned the window into a suggestion. */
+        if (quiccc_available(&conn->cc) < QUICCONN_MAX_PACKET) break;
 
         /* The last round produced a full datagram, so there may well be
          * another: a server flight carrying a certificate chain runs to six or

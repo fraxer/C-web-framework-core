@@ -258,6 +258,14 @@ int quicstream_wants_send(const quicstream_t* stream) {
 
     if (!quicsendbuf_pending(&stream->send)) return 0;
 
+    /* Retransmission first, and unconditionally: data that has already been
+     * sent once was charged to the window then, so §4.5 does not charge it
+     * again and a closed window must not hold it back. Getting this wrong
+     * deadlocks the connection -- the peer cannot deliver the bytes behind the
+     * hole, so it never raises the limit that is stopping us from filling it
+     * (docs/http3/08 §3i). */
+    if (quicsendbuf_has_lost(&stream->send)) return 1;
+
     /* Blocked by flow control is not the same as having nothing to send, but
      * from the scheduler's point of view it is: there is no point picking this
      * stream until the peer raises the limit. */

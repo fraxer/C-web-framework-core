@@ -89,6 +89,11 @@ void quicsendbuf_lost(quicsendbuf_t* buf, uint64_t offset, size_t len, int fin);
 /* Anything left to send, new or retransmitted. */
 int quicsendbuf_pending(const quicsendbuf_t* buf);
 
+/* Whether the next chunk would be a retransmission. Flow control has to know:
+ * resent data is not charged to the window again (§4.5), so a closed window
+ * must not hold it back -- see the stream loop in quicconn.c. */
+int quicsendbuf_has_lost(const quicsendbuf_t* buf);
+
 /* Everything written has been acknowledged, FIN included. */
 int quicsendbuf_complete(const quicsendbuf_t* buf);
 

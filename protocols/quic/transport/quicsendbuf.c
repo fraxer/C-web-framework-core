@@ -224,6 +224,12 @@ int quicsendbuf_pending(const quicsendbuf_t* buf) {
     return 0;
 }
 
+int quicsendbuf_has_lost(const quicsendbuf_t* buf) {
+    if (buf == NULL) return 0;
+
+    return !quicrange_empty(&buf->lost);
+}
+
 int quicsendbuf_complete(const quicsendbuf_t* buf) {
     if (buf == NULL) return 0;
 
