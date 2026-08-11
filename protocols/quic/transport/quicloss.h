@@ -92,10 +92,21 @@ typedef struct quicloss {
      * max_ack_delay from the PTO until then, since the peer is not yet
      * obliged to honour it. */
     int      handshake_confirmed;
+
+    /* First four bytes of the connection's original DCID, for debug lines only.
+     * Recovery is where the questions of docs/http3/08 §3m–3t are asked, and its
+     * answers are unreadable without saying which of fifty interleaved
+     * connections produced them -- the same reason the PTO line carries the tag.
+     * A copy rather than a back-pointer: this module owes nothing upwards. */
+    uint8_t  cid_tag[4];
 } quicloss_t;
 
 void quicloss_init(quicloss_t* loss, quiccc_t* cc, uint64_t max_ack_delay_us);
 void quicloss_free(quicloss_t* loss);
+
+/* Label this connection's debug lines. `cid` may be shorter than four bytes;
+ * what is missing stays zero. Diagnostics only -- nothing branches on it. */
+void quicloss_set_cid_tag(quicloss_t* loss, const uint8_t* cid, size_t len);
 
 /* Record a packet as sent. Takes ownership of `frames`. */
 int quicloss_on_sent(quicloss_t* loss, quic_enc_level_e level, uint64_t pn,

@@ -1279,6 +1279,16 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
         conn->recv_path != NULL && !__path_same(conn->recv_path, &conn->path))
         __path_probe_start(conn, conn->recv_path, now_us);
 
+    /* The other half of `send`: what actually arrived. Without it a connection
+     * that goes quiet cannot be told apart from one whose peer went quiet -- and
+     * those want opposite fixes. `elic` is the part that obliges an answer, so
+     * an eliciting packet here with no ACK going back out is a bug on this side
+     * (docs/http3/08 §3v). */
+    log_debug("quic: recv cid=%02x%02x%02x%02x level=%d pn=%llu elic=%d\n",
+              conn->odcid.data[0], conn->odcid.data[1],
+              conn->odcid.data[2], conn->odcid.data[3],
+              (int)level, (unsigned long long)pn, ack_eliciting);
+
     if (ack_eliciting) atomic_store_explicit(&conn->want_write, 1, memory_order_release);
 
     return 1;
@@ -1883,6 +1893,17 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
 
             quicsendbuf_mark_sent(&s->send, offset, dlen, fin);
 
+            /* The response as the peer will see it. `rtx` is the half that
+             * matters: a retransmission at an offset the peer already holds is
+             * invisible to it and to us, and telling those apart from first
+             * transmissions is what §3t needed and did not have. */
+            log_debug("quic: send cid=%02x%02x%02x%02x stream=%llu off=%llu "
+                      "len=%zu fin=%d rtx=%d\n",
+                      conn->odcid.data[0], conn->odcid.data[1],
+                      conn->odcid.data[2], conn->odcid.data[3],
+                      (unsigned long long)s->id, (unsigned long long)offset,
+                      dlen, fin, resending);
+
             /* By offset, not by bytes written -- see quicflow_consume_to. The
              * connection-level window is charged the same advance, because it
              * is the sum of the streams' highest offsets and nothing else. */
@@ -2309,6 +2330,7 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     quiccc_init(&conn->cc, QUICCONN_MAX_PACKET);
     quicpacer_init(&conn->pacer, QUICCONN_MAX_PACKET, policy->pacing);
     quicloss_init(&conn->loss, &conn->cc, policy->ack_delay_ms * 1000);
+    quicloss_set_cid_tag(&conn->loss, conn->odcid.data, conn->odcid.len);
 
     for (int i = 0; i < QUIC_ENC_COUNT; i++) {
         quicack_init(&conn->ack[i]);

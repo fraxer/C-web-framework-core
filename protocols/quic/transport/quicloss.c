@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "log.h"
 #include "metrics.h"
 #include "quicloss.h"
 #include "quicpacket.h"
@@ -39,6 +40,14 @@ void quicloss_init(quicloss_t* loss, quiccc_t* cc, uint64_t max_ack_delay_us) {
 
     for (int i = 0; i < QUIC_ENC_COUNT; i++)
         loss->space[i].largest_acked = QUICPKT_NO_ACKED;
+}
+
+void quicloss_set_cid_tag(quicloss_t* loss, const uint8_t* cid, size_t len) {
+    if (loss == NULL || cid == NULL) return;
+
+    if (len > sizeof loss->cid_tag) len = sizeof loss->cid_tag;
+
+    memcpy(loss->cid_tag, cid, len);
 }
 
 void quicloss_free(quicloss_t* loss) {
@@ -102,7 +111,25 @@ int quicloss_on_sent(quicloss_t* loss, quic_enc_level_e level, uint64_t pn,
 /* §5.3. The estimator is a moving average with a separate variance term; the
  * variance is what makes the PTO tolerant of a jittery path without making it
  * slow on a steady one. */
-static void __update_rtt(quicloss_t* loss, uint64_t latest_rtt, uint64_t ack_delay) {
+static void __update_rtt(quicloss_t* loss, quic_enc_level_e level, uint64_t pn,
+                         uint64_t latest_rtt, uint64_t ack_delay) {
+    /* The first sample is the one worth watching: §5.3 puts it into
+     * smoothed_rtt whole, without the ack_delay adjustment, so everything
+     * downstream -- the PTO, the loss time threshold -- inherits it. A first
+     * sample of 1.2 s on a 33 ms path has been seen against quiche and makes the
+     * connection slow enough to fail a timed test (docs/http3/08 §3p), and the
+     * only way to tell a slow path from an acknowledgement that arrived late for
+     * its own reasons is to print which packet it came from and when that packet
+     * went out. */
+    log_debug("quic: rtt cid=%02x%02x%02x%02x level=%d pn=%llu sample=%llu "
+              "ack_delay=%llu srtt_prev=%llu min_prev=%llu first=%d\n",
+              loss->cid_tag[0], loss->cid_tag[1], loss->cid_tag[2], loss->cid_tag[3],
+              (int)level, (unsigned long long)pn,
+              (unsigned long long)latest_rtt, (unsigned long long)ack_delay,
+              (unsigned long long)loss->smoothed_rtt_us,
+              (unsigned long long)(loss->have_rtt_sample ? loss->min_rtt_us : 0),
+              !loss->have_rtt_sample);
+
     loss->latest_rtt_us = latest_rtt;
 
     /* The raw sample, not the smoothed estimate: the histogram is meant to show
@@ -227,6 +254,18 @@ static void __detect_lost(quicloss_t* loss, quic_enc_level_e level,
 
         metrics_quic(METRICS_QUIC_PACKETS_LOST);
 
+        /* Which of the two rules fired matters when reading a stalled
+         * connection: by_count means a later packet got through and this one
+         * did not, by_time means nothing has been heard for a loss delay and
+         * the declaration is a guess -- and a guess is what produces a
+         * retransmission of data the peer already holds (§3t). */
+        log_debug("quic: lost cid=%02x%02x%02x%02x level=%d pn=%llu age=%llu "
+                  "by=%s\n",
+                  loss->cid_tag[0], loss->cid_tag[1], loss->cid_tag[2],
+                  loss->cid_tag[3], (int)level, (unsigned long long)sent->pn,
+                  (unsigned long long)(now_us - sent->sent_us),
+                  by_count ? "count" : "time");
+
         if (sent->in_flight && loss->cc != NULL)
             loss->cc->ops->on_loss(loss->cc, sent->size, sent->sent_us, now_us);
 
@@ -340,7 +379,7 @@ int quicloss_on_ack(quicloss_t* loss, quic_enc_level_e level,
      * when it is newly acknowledged and was ack-eliciting. Sampling from any
      * other packet measures the peer's acknowledgement policy, not the path. */
     if (largest_newly_acked && largest_was_ack_eliciting && now_us >= largest_sent_us)
-        __update_rtt(loss, now_us - largest_sent_us, ack_delay_us);
+        __update_rtt(loss, level, largest, now_us - largest_sent_us, ack_delay_us);
 
     /* An acknowledgement means the peer is alive, so the backoff resets. */
     loss->pto_count = 0;
