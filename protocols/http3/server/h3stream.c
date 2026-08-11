@@ -26,8 +26,9 @@ uint64_t h3stream_status_error(h3stream_status_e st) {
     case H3STREAM_ERR_FRAME:               return H3_FRAME_ERROR;
     case H3STREAM_ERR_EXCESSIVE_LOAD:      return H3_EXCESSIVE_LOAD;
     case H3STREAM_ERR_QPACK_DECOMPRESSION: return QPACK_DECOMPRESSION_FAILED;
-    /* BODY_TOO_LARGE / FIELDS_TOO_LARGE / INTERNAL are answered with a status
-     * code on a stream that stays well-formed, so they carry no h3 error. */
+    /* BODY_TOO_LARGE / FIELDS_TOO_LARGE / MISDIRECTED / INTERNAL are answered
+     * with a status code on a stream that stays well-formed, so they carry no
+     * h3 error. */
     default:                               return H3_NO_ERROR;
     }
 }
@@ -201,9 +202,15 @@ static h3stream_status_e build_request(h3stream_t* st, qpack_decoder_t* qdec,
         const http_header_t* host = st->request->get_headern(st->request, "Host", 4);
         if (host == NULL) return H3STREAM_ERR_MESSAGE;
 
-        if (httpparser_select_server(st->request->connection, host->value,
-                                     host->value_length) != HTTP1PARSER_CONTINUE)
-            return H3STREAM_ERR_MESSAGE;
+        /* The two failures are not the same thing. A syntactically broken
+         * authority (BAD_REQUEST -- an empty one, an unterminated IPv6 literal)
+         * is malformed under §4.1.2 and gets the stream error. One that is
+         * merely addressed to a host we do not serve is a routing outcome, and
+         * §4.1.2 does not cover it; it is answered 404, as HTTP/1.1 does. */
+        const int sel = httpparser_select_server(st->request->connection,
+                                                 host->value, host->value_length);
+        if (sel == HTTP1PARSER_HOST_NOT_FOUND) return H3STREAM_ERR_MISDIRECTED;
+        if (sel != HTTP1PARSER_CONTINUE) return H3STREAM_ERR_MESSAGE;
     }
 
     return H3STREAM_REQUEST_READY;

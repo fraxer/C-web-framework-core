@@ -270,6 +270,13 @@ typedef enum {
     METRICS_H3_FIELD_SECTION_HARD,       /* → connection, decode abandoned */
     METRICS_H3_BODY_TOO_LARGE,           /* → 413 */
 
+    /* :authority named a host this listener does not serve → 404. Its own
+     * counter and not just a 4xx: a rising one means either a client addressing
+     * the wrong name or a vhost whose `domains` list is missing something the
+     * clients actually use, and neither is visible in responses.4xx next to
+     * every 404 a handler produces. */
+    METRICS_H3_MISDIRECTED,
+
     METRICS_H3_STREAM_ERROR,        /* malformed message; the stream is reset */
     METRICS_H3_CONN_ERROR,          /* an h3 error that ends the connection */
     METRICS_H3__COUNT

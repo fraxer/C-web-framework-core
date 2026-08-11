@@ -67,6 +67,7 @@ static const char* const __h3_name[METRICS_H3__COUNT] = {
     "abuse.abort_budget", "abuse.ctrl_budget",
     "abuse.field_section_too_large", "abuse.field_section_hard_cap",
     "abuse.body_too_large",
+    "misdirected",
     "stream_errors", "connection_errors"
 };
 

@@ -278,6 +278,11 @@ static h3conn_result_t __apply_stream_status(quicstream_t* qs, h3app_t* app,
         app->drained = 1;
         return __refused(431);
 
+    case H3STREAM_ERR_MISDIRECTED:
+        metrics_h3(METRICS_H3_MISDIRECTED);
+        app->drained = 1;
+        return __refused(404);
+
     case H3STREAM_ERR_INTERNAL:         app->drained = 1; return __refused(500);
 
     default:

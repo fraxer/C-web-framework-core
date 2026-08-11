@@ -742,6 +742,12 @@ typedef enum {
     H2_REQUEST_INTERNAL,
     H2_REQUEST_TOO_LARGE,   /* over the advertised header list size → 431 */
     H2_REQUEST_TOO_LARGE_HARD, /* over the hard cap: decode aborted mid-block */
+    /* :authority names a host this listener does not serve → 404. Not
+     * MALFORMED: §8.3.1 is about the shape of the field section, and a request
+     * addressed elsewhere has nothing wrong with its shape -- HTTP/1.1 has
+     * answered 404 to the same request all along, and the protocol carrying it
+     * should not change the answer into a stream error. */
+    H2_REQUEST_MISDIRECTED,
     H2_REQUEST_EXTENDED_CONNECT, /* RFC 8441 shape, protocol we do not serve → 501 */
     H2_REQUEST_WEBSOCKET,        /* RFC 8441 :protocol websocket — open a tunnel */
 } h2_request_status_e;
@@ -812,8 +818,12 @@ static h2_request_status_e h2_build_request(h2session_t* s, h2stream_t* stream,
      * deliberately does not take. */
     http_header_t* host = request->get_headern(request, "Host", 4);
     if (host == NULL) return H2_REQUEST_MALFORMED; /* §8.3.1: :authority or Host */
-    if (httpparser_select_server(s->connection, host->value, host->value_length) != HTTP1PARSER_CONTINUE)
-        return H2_REQUEST_MALFORMED;
+
+    /* A syntactically broken authority stays malformed (§8.3.1); one that names
+     * a host we do not serve is a routing outcome and gets an answer. */
+    const int sel = httpparser_select_server(s->connection, host->value, host->value_length);
+    if (sel == HTTP1PARSER_HOST_NOT_FOUND) return H2_REQUEST_MISDIRECTED;
+    if (sel != HTTP1PARSER_CONTINUE) return H2_REQUEST_MALFORMED;
 
     request->version = HTTP1_VER_1_1;
 
@@ -1393,6 +1403,8 @@ static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
     /* A tunnel request answered with a status: `rejected` makes whatever the
      * client already sent into the tunnel be credited and dropped rather than
      * treated as a request body (docs/http2/09, step 1). */
+    if (status == H2_REQUEST_MISDIRECTED)
+        return h2_reject_stream(s, stream, 404, end_stream);
     if (status == H2_REQUEST_EXTENDED_CONNECT)
         return h2_reject_stream(s, stream, 501, end_stream);
     if (status == H2_REQUEST_WEBSOCKET)

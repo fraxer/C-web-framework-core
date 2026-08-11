@@ -58,6 +58,15 @@ typedef enum {
     H3STREAM_ERR_BODY_TOO_LARGE,
     /* The field section exceeded our MAX_FIELD_SECTION_SIZE: answered 431. */
     H3STREAM_ERR_FIELDS_TOO_LARGE,
+    /* :authority names a host this listener does not serve: answered 404.
+     *
+     * Deliberately not H3STREAM_ERR_MESSAGE. §4.1.2 defines a malformed request
+     * by its shape -- a missing, repeated or syntactically invalid pseudo-header
+     * -- and this request has none of those problems: it is well formed and
+     * addressed elsewhere. Resetting it would also make the same request answer
+     * differently depending on the protocol that carried it, since HTTP/1.1 has
+     * answered 404 here since long before HTTP/3 existed. */
+    H3STREAM_ERR_MISDIRECTED,
     /* Allocation or spool failure → 500 on the stream. */
     H3STREAM_ERR_INTERNAL,
 
