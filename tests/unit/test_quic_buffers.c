@@ -378,6 +378,64 @@ TEST(test_quic_sendbuf) {
     TEST_ASSERT(!quicsendbuf_pending(&buf), "nothing left");
     quicsendbuf_free(&buf);
 
+    TEST_CASE("a retransmission does not carry the FIN (docs/http3/08 §3t)");
+    /* The sequence that stalled a request against quiche: the body was queued
+     * and packetised before the response was finished, so the FIN went out on
+     * its own; then both were declared lost -- spuriously, the peer had the data
+     * -- and the FIN came back attached to a retransmission of bytes the peer
+     * already held. A receiver that discards a wholly duplicate frame discards
+     * the end of the stream with it, and nothing ever resends it: the packet was
+     * acknowledged, so this side considers the stream complete while the peer
+     * waits for an end that, to it, never arrived. */
+    quicsendbuf_init(&buf);
+    quicsendbuf_write(&buf, (const uint8_t*)"0123456789", 10);
+
+    quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin);
+    TEST_ASSERT(len == 10 && !fin, "the body goes out before the FIN is set");
+    quicsendbuf_mark_sent(&buf, 0, 10, 0);
+
+    quicsendbuf_finish(&buf);
+    TEST_ASSERT(quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin), "then the FIN");
+    TEST_ASSERT(offset == 10 && len == 0 && fin, "alone, at the final offset");
+    quicsendbuf_mark_sent(&buf, 10, 0, 1);
+
+    quicsendbuf_lost(&buf, 0, 10, 0);
+    quicsendbuf_lost(&buf, 10, 0, 1);
+
+    TEST_ASSERT(quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin), "resent");
+    TEST_ASSERT(offset == 0 && len == 10, "the lost data");
+    TEST_ASSERT(!fin, "and NOT the FIN, which the peer could discard with it");
+    quicsendbuf_mark_sent(&buf, 0, 10, 0);
+
+    TEST_ASSERT(quicsendbuf_pending(&buf), "the FIN is still owed");
+    TEST_ASSERT(quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin), "and produced");
+    TEST_ASSERT(offset == 10 && len == 0 && fin,
+                "as an empty frame there is nothing to mistake for a duplicate");
+    quicsendbuf_free(&buf);
+
+    TEST_CASE("a pending FIN survives a zero budget");
+    /* The send loop lets a pending FIN past its closed-window check on purpose:
+     * an empty frame needs no room for data. This function refusing max_len == 0
+     * outright made that exception unreachable, and a stream whose window shut
+     * before the FIN went out could then never end (docs/http3/08 §3t). */
+    quicsendbuf_init(&buf);
+    quicsendbuf_write(&buf, (const uint8_t*)"0123456789", 10);
+    quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin);
+    quicsendbuf_mark_sent(&buf, 0, 10, 0);
+    quicsendbuf_finish(&buf);
+
+    TEST_ASSERT(quicsendbuf_next(&buf, 0, &offset, &data, &len, &fin),
+                "the fin comes out with no budget at all");
+    TEST_ASSERT(offset == 10 && len == 0 && fin, "an empty frame at the end");
+    quicsendbuf_free(&buf);
+
+    /* But a zero budget still means no data. */
+    quicsendbuf_init(&buf);
+    quicsendbuf_write(&buf, (const uint8_t*)"xyz", 3);
+    TEST_ASSERT(!quicsendbuf_next(&buf, 0, &offset, &data, &len, &fin),
+                "and data waits for room");
+    quicsendbuf_free(&buf);
+
     TEST_CASE("writes after finishing are refused");
     quicsendbuf_init(&buf);
     quicsendbuf_finish(&buf);

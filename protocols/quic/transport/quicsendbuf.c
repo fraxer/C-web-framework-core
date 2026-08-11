@@ -109,15 +109,23 @@ static void __slide(quicsendbuf_t* buf) {
 int quicsendbuf_next(quicsendbuf_t* buf, size_t max_len,
                      uint64_t* out_offset, const uint8_t** out_data,
                      size_t* out_len, int* out_fin) {
-    if (buf == NULL || max_len == 0) return 0;
+    /* max_len == 0 is not "nothing to do": the end-of-stream marker is an empty
+     * frame and needs no room for data at all. The send loop relies on this --
+     * it lets a pending FIN past the closed-window check on purpose, and this
+     * function refusing it there is a stream that can never end while the window
+     * stays shut. Only the data branches below care about the budget, and each
+     * one stops at `len == 0` on its own. */
+    if (buf == NULL) return 0;
 
     uint64_t offset;
     size_t len;
+    int retransmit = 0;
 
     /* Retransmission first: a hole in what the peer holds stalls the stream,
      * however much new data is queued behind it. */
     if (!quicrange_empty(&buf->lost)) {
         quicrange_span_t span;
+        retransmit = 1;
         /* The lowest lost range -- filling the earliest hole first is what lets
          * the peer's reassembly make progress. */
         if (!quicrange_at_desc(&buf->lost, quicrange_count(&buf->lost) - 1, &span))
@@ -155,9 +163,26 @@ int quicsendbuf_next(quicsendbuf_t* buf, size_t max_len,
     if (out_offset != NULL) *out_offset = offset;
     if (out_data != NULL) *out_data = buf->data + buf->head + within;
     if (out_len != NULL) *out_len = len;
-    /* The FIN rides along only if this chunk really reaches the end. */
+    /* The FIN rides along only if this chunk really reaches the end -- and only
+     * on data the peer has not been sent before.
+     *
+     * On a retransmission it is held back deliberately, and the empty-frame
+     * branch above delivers it a frame later. The reason is that loss detection
+     * is a heuristic: a range declared lost is often a range the peer already
+     * holds, and then the retransmission is, to the receiver, a frame whose data
+     * is duplicate from the first byte to the last. Attaching the end of the
+     * stream to such a frame makes the FIN only as reliable as the peer's
+     * willingness to look inside a frame it has every reason to discard -- and
+     * at least one implementation does not (docs/http3/08 §3t: the response
+     * arrived, the file on disk was correct, and the client sat waiting for an
+     * end-of-stream it had already been sent).
+     *
+     * The empty frame at the final offset carries no data to be duplicate, so
+     * there is nothing for the peer to discard it as. The cost is one small
+     * frame, and only when a tail was declared lost. */
     if (out_fin != NULL)
-        *out_fin = buf->fin && !buf->fin_sent && offset + len == buf->write_off;
+        *out_fin = !retransmit && buf->fin && !buf->fin_sent &&
+                   offset + len == buf->write_off;
 
     return 1;
 }
