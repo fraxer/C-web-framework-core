@@ -388,6 +388,18 @@ static int __on_crypto_frame(quicconn_t* conn, quic_enc_level_e level,
                                                       frame->u.crypto.offset,
                                                       (size_t)frame->u.crypto.len);
 
+    /* Every byte of handshake the peer sends us, and whether we had it already.
+     * A handshake that never completes is either data that did not arrive or
+     * data that arrived and did not move the TLS stack, and those two look the
+     * same from every other vantage point (docs/http3/08 §3v). Read together
+     * with the `tls advance` line below: offsets seen here and no completion
+     * there is the second case. */
+    log_debug("quic: crypto cid=%02x%02x%02x%02x level=%d off=%llu len=%llu dup=%d\n",
+              conn->odcid.data[0], conn->odcid.data[1],
+              conn->odcid.data[2], conn->odcid.data[3],
+              (int)level, (unsigned long long)frame->u.crypto.offset,
+              (unsigned long long)frame->u.crypto.len, duplicate);
+
     if (!quictls_recv_crypto(&conn->tls, level, frame->u.crypto.offset,
                              frame->u.crypto.data, (size_t)frame->u.crypto.len)) {
         quicconn_close(conn, QUIC_CRYPTO_BUFFER_EXCEEDED, 0, quic_now_us());
@@ -603,6 +615,18 @@ static int __on_stream_frame(quicconn_t* conn, const quicframe_t* frame,
             return 0;
         }
     }
+
+    /* The mirror of `send`: the request as it reaches the transport. A
+     * connection that completes its handshake, keeps receiving packets and
+     * never answers is either one whose request never arrived or one whose
+     * request arrived and stopped above this line, and until both sides of the
+     * stream are printed those two are the same picture (docs/http3/08 §3v). */
+    log_debug("quic: rstream cid=%02x%02x%02x%02x stream=%llu off=%llu len=%llu "
+              "fin=%d\n",
+              conn->odcid.data[0], conn->odcid.data[1],
+              conn->odcid.data[2], conn->odcid.data[3],
+              (unsigned long long)id, (unsigned long long)frame->u.stream.offset,
+              (unsigned long long)frame->u.stream.len, frame->u.stream.fin);
 
     const quicstream_err_t err =
         quicstream_on_data(s, frame->u.stream.offset, frame->u.stream.data,
@@ -1413,6 +1437,17 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
             return 0;
         }
 
+        /* What the stack made of it. `complete=0` on every pass while `crypto`
+         * lines keep arriving is a handshake stuck inside TLS rather than one
+         * waiting for bytes -- the distinction §3v could not make. */
+        log_debug("quic: tls advance cid=%02x%02x%02x%02x complete=%d "
+                  "keys_hs=%d keys_app=%d params_seen=%d\n",
+                  conn->odcid.data[0], conn->odcid.data[1],
+                  conn->odcid.data[2], conn->odcid.data[3],
+                  conn->tls.handshake_complete,
+                  conn->tx[QUIC_ENC_HANDSHAKE].valid,
+                  conn->tx[QUIC_ENC_APP].valid, conn->peer_params_seen);
+
         if (conn->tls.handshake_complete) {
             log_info("quic: handshake complete cid=%02x%02x%02x%02x; "
                      "peer streams_uni=%llu streams_bidi=%llu "
@@ -2107,6 +2142,7 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
 
     for (int round = 0; round < QUICCONN_SEND_ROUNDS; round++) {
         size_t total = 0;
+        int ack_levels = 0;
 
         /* §7: the window is asked *before* the packet is built. It used to be
          * asked after one had already gone out, and only to break this loop
@@ -2135,6 +2171,20 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
                  * an honest client, and that is a certificate problem, not a
                  * network one (docs/http3/04 §8). */
                 metrics_quic(METRICS_QUIC_AMPLIFICATION_LIMITED);
+
+                /* The counter says it happened somewhere; this says it happened
+                 * here, to this connection, with this much owed. It is the line
+                 * that decides whose deadlock it is when a handshake goes quiet
+                 * (docs/http3/08 §3w): a server stopped by its own §8.1 budget
+                 * is doing what the RFC tells it to and can only wait for the
+                 * peer, while a server stopped by anything else is our bug. */
+                log_debug("quic: amp-block cid=%02x%02x%02x%02x level=%d "
+                          "budget=%llu total=%zu unsent=%llu validated=%d\n",
+                          conn->odcid.data[0], conn->odcid.data[1],
+                          conn->odcid.data[2], conn->odcid.data[3], (int)level,
+                          (unsigned long long)conn->amplification_budget, total,
+                          (unsigned long long)quicconn_unsent_bytes(conn),
+                          conn->address_validated);
                 break;
             }
 
@@ -2145,10 +2195,16 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
                 if (budget < room) room = (size_t)budget;
             }
 
+            const int owed_ack = quicack_should_send(&conn->ack[i], now_us);
+
             int eliciting = 0;
             const size_t n = __build_packet(conn, level, datagram + total, room,
                                             now_us, cc_blocked, &eliciting);
             if (n == 0) continue;
+
+            /* Bit per level, so one line says which spaces the datagram
+             * acknowledged rather than merely that something went out. */
+            if (owed_ack) ack_levels |= 1 << i;
 
             total += n;
 
@@ -2162,6 +2218,14 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
             conn->amplification_budget = conn->amplification_budget > total
                                          ? conn->amplification_budget - total : 0;
         }
+
+        /* Every datagram that leaves, with what put it on the wire. The whole
+         * of §3x rested on counting the peer's *receipts* and calling the
+         * difference "not sent" -- which cannot tell an acknowledgement we never
+         * built from one the network ate. This can. */
+        log_debug("quic: dgram cid=%02x%02x%02x%02x bytes=%zu acked_levels=%d\n",
+                  conn->odcid.data[0], conn->odcid.data[1],
+                  conn->odcid.data[2], conn->odcid.data[3], total, ack_levels);
 
         if (quicendpoint_send(conn->endpoint, datagram, total, &conn->path) < 0)
             break;
@@ -2631,6 +2695,26 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
             conn->probe_pending = 1;
             atomic_store_explicit(&conn->want_write, 1, memory_order_release);
         }
+    }
+
+    /* A delayed acknowledgement that has come due (§13.2.1).
+     *
+     * quicconn_next_timeout already asks to be woken at this deadline, and the
+     * endpoint's sweep only calls quicconn_send when want_write is set -- so
+     * without this branch the wakeup arrived, found nothing to do, and the ACK
+     * waited for an unrelated event to build a packet for it. On a busy
+     * connection something always does, which is why this never showed; on a
+     * quiet one under loss the peer is left retransmitting data we hold and
+     * have simply not confirmed (docs/http3/08 §3x: nineteen ack-eliciting
+     * packets, one acknowledgement, and a client that gave up).
+     *
+     * Only the flag is raised here: what to put in the packet, and whether the
+     * ACK is due at all, stays quicack_should_send's decision at build time. */
+    for (int i = 0; i < QUIC_ENC_COUNT; i++) {
+        if (!quicack_should_send(&conn->ack[i], now_us)) continue;
+
+        atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+        break;
     }
 
     const uint64_t timeout = quicloss_timeout(&conn->loss, now_us);
