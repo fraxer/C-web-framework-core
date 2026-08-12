@@ -666,6 +666,73 @@ static int __flush_one(quicclient_t* c, size_t* out_total) {
     return 1;
 }
 
+/* ---- Probe timer (RFC 9002 §6.2.2.1; see the header for why it exists) ---- */
+
+/* Probes before giving up. Five doublings of the base is over ten seconds,
+ * which is past any server's patience anyway. */
+#define CLIENT_MAX_PROBES 5
+
+/* kInitialRtt (RFC 9002 §6.2.2) doubled, which is what a PTO is with no RTT
+ * sample. No estimator here on purpose: the client measures nothing, so a
+ * pretend estimate would only be a fixed number wearing a costume. */
+#define CLIENT_PTO_BASE_US 666000ULL
+
+static void __pto_disarm(quicclient_t* c) {
+    c->pto_deadline_us = 0;
+    c->pto_count = 0;
+}
+
+/* Armed after sending, while the handshake is unconfirmed. Re-armed from
+ * scratch rather than extended: this measures silence since our last packet,
+ * which is the only thing the client can measure. */
+static void __pto_arm(quicclient_t* c) {
+    if (c->handshake_done_received) {
+        __pto_disarm(c);
+        return;
+    }
+
+    if (c->pto_count >= CLIENT_MAX_PROBES) {
+        c->pto_deadline_us = 0;
+        return;
+    }
+
+    c->pto_deadline_us = quic_now_us() + (CLIENT_PTO_BASE_US << c->pto_count);
+}
+
+uint64_t quicclient_next_timeout(const quicclient_t* client) {
+    return client != NULL ? client->pto_deadline_us : 0;
+}
+
+static int __flush(quicclient_t* c);
+
+int quicclient_tick(quicclient_t* client) {
+    if (client == NULL) return 0;
+    if (client->pto_deadline_us == 0) return 1;
+    if (quic_now_us() < client->pto_deadline_us) return 1;
+
+    client->pto_count++;
+    client->pto_fired++;
+
+    /* §6.2.4: a probe should carry data the peer is missing, not a bare PING.
+     * For a client that is its handshake flight -- and during a handshake the
+     * acknowledgement that would otherwise drive retransmission may never
+     * arrive at all. */
+    int requeued = 0;
+    for (int i = 0; i < QUIC_ENC_COUNT; i++) {
+        if (i == QUIC_ENC_EARLY) continue;
+        if (!client->tx[i].valid) continue;
+        if (quicsendbuf_requeue_unacked(&client->crypto_out[i])) requeued = 1;
+    }
+
+    /* Nothing to resend and no keys to say anything with: a PING at least makes
+     * the peer answer, which is the minimum a probe owes (§6.2.4). */
+    if (!requeued && client->tx[QUIC_ENC_APP].valid) client->ping_queued = 1;
+
+    __log(client, "  [client] PTO %u, resending the flight\n", client->pto_count);
+
+    return __flush(client);
+}
+
 static int __flush(quicclient_t* c) {
     /* Keep building datagrams while handshake data is left over.
      *
@@ -686,6 +753,10 @@ static int __flush(quicclient_t* c) {
         if (!__flush_one(c, &total)) return 0;
         if (total == 0 || !__crypto_pending(c)) break;
     }
+
+    /* We have spoken; the clock on the peer's silence starts here. Disarms
+     * itself once the handshake is confirmed. */
+    __pto_arm(c);
 
     return 1;
 }
@@ -902,6 +973,10 @@ static int __on_retry(quicclient_t* c, const quicpkt_t* pkt) {
         c->ack_pending[i] = 0;
     }
 
+    /* The probe timer belongs to the flight that was just thrown away: a Retry
+     * is an answer, so the backoff has no reason to carry over. */
+    __pto_disarm(c);
+
     __log(c, "  [client] <- RETRY, %zu-byte token; restarting the handshake\n",
           pkt->token_len);
 
@@ -1025,6 +1100,12 @@ static int __recv_datagram(quicclient_t* c, uint8_t* buf, size_t len) {
          * fails outright when the flight does not survive being split. */
         if (!quictls_advance(&c->tls)) return 0;
     }
+
+    /* The peer is evidently not quiet, so the backoff starts over -- and once
+     * this datagram was the HANDSHAKE_DONE, __pto_arm retires the timer for
+     * good. */
+    c->pto_count = 0;
+    __pto_arm(c);
 
     return 1;
 }
@@ -1180,6 +1261,10 @@ int quicclient_run(quicclient_t* client, int timeout_ms) {
 
         if (!__flush(client)) return 0;
 
+        /* And the probe, which is what carries the handshake through a path
+         * that loses the server's first flight -- or ours. */
+        if (!quicclient_tick(client)) return 0;
+
         /* The handshake is only truly finished once the server confirms it --
          * that is what HANDSHAKE_DONE is for (§7.5). */
         if (client->handshake_complete && client->handshake_done_received)
@@ -1253,7 +1338,8 @@ int quicclient_pump(quicclient_t* client, int timeout_ms) {
     /* Acknowledge the burst in one go rather than per datagram. */
     if (got_anything && !__flush(client)) return 0;
 
-    return 1;
+    /* A pump that heard nothing is exactly when the probe matters. */
+    return quicclient_tick(client);
 }
 
 void quicclient_free(quicclient_t* client) {

@@ -112,6 +112,16 @@ typedef struct stand {
      * not a probability. */
     unsigned drop_next_to_client;
     unsigned drop_next_to_server;
+    /* And "lose exactly the second datagram", by ordinal (1-based, 0 = never).
+     * A ClientHello now spans two datagrams, and which of the two is lost makes
+     * a different case: the first leaves the server with a hole it can do
+     * nothing about, the second leaves it holding a prefix it cannot answer. */
+    uint64_t drop_nth_to_server;
+    /* Hold one datagram back by `reorder_extra_us`, again by ordinal, so a
+     * flight can be made to arrive in the wrong order exactly once. A
+     * percentage cannot express that: rolling on every datagram delays them
+     * all equally and reorders nothing. */
+    uint64_t delay_nth_to_server;
     int      blackhole_to_server;   /* everything, until cleared */
     int      blackhole_to_client;
 
@@ -208,7 +218,10 @@ static void __net_send(stand_t* s, const uint8_t* data, size_t len, int to_serve
     const int blackhole = to_server ? s->blackhole_to_server : s->blackhole_to_client;
     const unsigned loss = to_server ? s->loss_to_server_pct : s->loss_to_client_pct;
 
-    if (blackhole || *scripted > 0) {
+    const int nth_drop = to_server && s->drop_nth_to_server != 0 &&
+                         s->sent_to_server == s->drop_nth_to_server;
+
+    if (blackhole || *scripted > 0 || nth_drop) {
         if (*scripted > 0) (*scripted)--;
         if (to_server) s->lost_to_server++;
         else s->lost_to_client++;
@@ -232,6 +245,10 @@ static void __net_send(stand_t* s, const uint8_t* data, size_t len, int to_serve
      * successor to swap with, so it silently does nothing to the last datagram
      * of a flight -- which is the one whose reordering matters. */
     if (s->reorder_pct > 0 && __roll(s) < s->reorder_pct)
+        due += s->reorder_extra_us;
+
+    if (to_server && s->delay_nth_to_server != 0 &&
+        s->sent_to_server == s->delay_nth_to_server)
         due += s->reorder_extra_us;
 
     __schedule(s, data, len, to_server, due);
@@ -521,6 +538,13 @@ static uint64_t __next_event(stand_t* s) {
         if (timer != 0 && (t == 0 || timer < t)) t = timer;
     }
 
+    /* The client has one timer of its own -- the probe that §6.2.2.1 makes its
+     * responsibility. Without it in this list, a scenario that loses part of
+     * the client's flight tests a client that cannot recover rather than a
+     * server that has to. */
+    const uint64_t client_timer = quicclient_next_timeout(&s->client);
+    if (client_timer != 0 && (t == 0 || client_timer < t)) t = client_timer;
+
     /* "no connection" is spelled out rather than reported as a timer of zero.
      * The difference cost an hour: a zero here was read as "no probe timer is
      * armed" and sent the reader looking for a loss-recovery bug, when the
@@ -559,6 +583,21 @@ static int __step(stand_t* s, uint64_t limit_us) {
     standpkt_t* p = __earliest(s);
     if (p != NULL && p->due_us <= __now_us) {
         __deliver(s, p);
+        return 1;
+    }
+
+    /* The client's probe timer, before the server's: it is the side that has
+     * been told to unblock the other. */
+    const uint64_t client_timer = quicclient_next_timeout(&s->client);
+    if (client_timer != 0 && client_timer <= __now_us) {
+        __trace(s, "client PTO\n");
+
+        if (!quicclient_tick(&s->client)) s->client_failed = 1;
+
+        /* Same reason as the nudge below: a timer the tick did not move would
+         * be reported at this instant forever. */
+        if (quicclient_next_timeout(&s->client) == client_timer) __now_us = t + 1;
+
         return 1;
     }
 
@@ -794,6 +833,82 @@ TEST(test_quic_stand_handshake_loss) {
     TEST_ASSERT(elapsed >= 600000 && elapsed <= 900000, "one initial PTO, no more");
 
     TEST_REQUIRE_NOT_NULL(s->conn, "the connection survived");
+
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_clienthello_split_loss) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("the second datagram of a ClientHello is lost and the client unblocks the server");
+    /* The shape of the interop matrix's `handshakeloss`, and the one the stand
+     * was built to reach.
+     *
+     * A ClientHello no longer fits in a packet -- OpenSSL 3.5 offers a hybrid
+     * post-quantum key share by default, so it is ~1.5 KB over two datagrams.
+     * Lose the second and the server holds a prefix it cannot answer: it has
+     * nothing to say, therefore nothing ack-eliciting in flight, therefore no
+     * probe timer of its own. RFC 9002 §6.2.2.1 gives that case to the client
+     * by name, and this asserts that the division of labour actually works
+     * end to end rather than in principle. */
+    stand_t* s = __stand_create(10);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    s->drop_nth_to_server = 2;
+
+    TEST_ASSERT(__start(s), "the ClientHello went out in two datagrams");
+    TEST_ASSERT(s->sent_to_server == 2, "two, not one");
+    TEST_ASSERT(s->lost_to_server == 1, "and the second never arrived");
+
+    const uint64_t began = __now_us;
+
+    TEST_ASSERT(__run(s, 5000000, __handshake_done), "the handshake completed anyway");
+
+    /* By the client's probe, not the server's: with half a ClientHello the
+     * server had nothing in flight to time out on. That is the assertion worth
+     * having -- it says *whose* recovery saved the connection. */
+    TEST_ASSERT(s->client.pto_fired >= 1, "the client probed");
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+    TEST_ASSERT(s->conn->loss.pto_count == 0, "the server never needed to");
+
+    /* One probe at the client's base interval (kInitialRtt doubled), plus the
+     * handshake itself. */
+    const uint64_t elapsed = __now_us - began;
+    TEST_ASSERT(elapsed >= 600000 && elapsed <= 900000, "one client PTO, no more");
+
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_clienthello_reordered) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a ClientHello whose halves arrive in the wrong order still completes");
+    /* Nothing is lost here -- the two datagrams simply swap, which on any real
+     * path is ordinary. It exercises the part of the CRYPTO reassembly that
+     * only a reordering peer reaches: the second half arrives first and has to
+     * wait in the hole until the first fills it, because handing TLS a spliced
+     * message would fail in a way that looks like a broken codec. */
+    stand_t* s = __stand_create(11);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    s->delay_nth_to_server = 1;   /* the first half arrives 25 ms late */
+
+    TEST_ASSERT(__start(s), "the ClientHello went out");
+
+    const uint64_t began = __now_us;
+
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    TEST_ASSERT(s->lost_to_server == 0 && s->lost_to_client == 0, "nothing was lost");
+
+    /* No probe on either side: reordering is not loss, and treating it as loss
+     * is how a server turns a 25 ms hiccup into a 666 ms one. */
+    TEST_ASSERT(s->client.pto_fired == 0, "the client did not probe");
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+    TEST_ASSERT(s->conn->loss.pto_count == 0, "nor did the server");
+
+    /* Two round trips plus the swap itself, and nothing more. */
+    const uint64_t elapsed = __now_us - began;
+    TEST_ASSERT(elapsed <= 3 * 20000 + 25000, "it cost the reordering and no retransmission");
 
     __stand_free(s);
 }

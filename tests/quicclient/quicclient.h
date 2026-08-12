@@ -144,6 +144,28 @@ typedef struct quicclient {
     int      ping_queued;
     uint64_t datagrams_received;
 
+    /* ---- The one piece of loss recovery a client cannot do without ---- *
+     *
+     * RFC 9002 §6.2.2.1: "it is the client's responsibility to send packets to
+     * unblock the server until it is certain that the server has finished its
+     * address validation". The server genuinely cannot always help itself
+     * during a handshake -- with half a ClientHello it has nothing to say, so
+     * it has nothing ack-eliciting in flight, so it arms no probe timer of its
+     * own and waits. If the client waits too, both wait out the idle timeout.
+     *
+     * Deliberately not RFC loss recovery: there is no sent-packet list here and
+     * incoming ACKs are not matched against one (that is quicloss, and the
+     * client is minimal by design). It is the cruder rule that a probe exists
+     * for -- the peer has gone quiet, poke it -- with the flight resent rather
+     * than a bare PING, per §6.2.4.
+     *
+     * Bounded twice over, so it cannot become a machine that holds connections
+     * open: it is armed only until HANDSHAKE_DONE arrives, and it gives up
+     * after CLIENT_MAX_PROBES. */
+    uint64_t pto_deadline_us;        /* 0 = disarmed */
+    unsigned pto_count;              /* consecutive probes, for the backoff */
+    uint64_t pto_fired;              /* total, for tests to assert on */
+
     /* Retry (RFC 9000 §8.1.2). The token from a Retry packet, echoed in every
      * Initial afterwards, and the state needed to start the handshake over --
      * a Retry throws away everything derived from the first Destination
@@ -220,6 +242,19 @@ void quicclient_impair(quicclient_t* client, unsigned loss_out_pct, unsigned los
 /* Queue a PING: the smallest non-probing frame there is, which is what §9.3
  * requires before a server will treat a new address as the peer's. */
 int quicclient_ping(quicclient_t* client);
+
+/* ---- Probe timer ---- *
+ *
+ * Driven for you by quicclient_run and quicclient_pump. The in-process stand
+ * calls these directly, because there the caller owns the clock and there is no
+ * loop to hide them in. */
+
+/* When the probe timer next fires, or 0 if it is disarmed. */
+uint64_t quicclient_next_timeout(const quicclient_t* client);
+
+/* Fire it if it is due: resend the handshake flight and back the timer off.
+ * Returns 0 if the connection failed. Harmless at any other moment. */
+int quicclient_tick(quicclient_t* client);
 
 /* Move to a new source port, as a NAT rebinding would (RFC 9000 §9). The old
  * socket is closed and a fresh one bound, so the server sees the connection
