@@ -24,10 +24,24 @@ if(NOT INCLUDE_HTTP3 STREQUAL yes)
     list(FILTER UNIT_TEST_FILES EXCLUDE REGEX "/test_(quic|h3|qpack)")
 endif()
 
+# The test client, linked into the runner as well as into its own tool.
+#
+# test_quic_conn.c runs it against a real server connection in one process
+# (docs/http3/08-testing.md §2), which is the only way the timing-defined half
+# of RFC 9002 -- the PTO exponent, persistent congestion, the idle timeout --
+# is testable at all: those are minutes of wall clock and a lossy path, and
+# here they are an injected clock and a queue. h3client.c is deliberately not
+# included: the stand stops at the transport.
+set(QUIC_CLIENT_SOURCES "")
+if(INCLUDE_HTTP3 STREQUAL yes)
+    set(QUIC_CLIENT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/quicclient/quicclient.c)
+endif()
+
 add_executable(
     runner
     unit/runner.c
     ${UNIT_TEST_FILES}
+    ${QUIC_CLIENT_SOURCES}
     unit/httpclient_stubs.c
     unit/mail_stubs.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../framework/taskmanager/taskmanager_calc.c
@@ -62,6 +76,13 @@ if(INCLUDE_HTTP3 STREQUAL yes)
     target_compile_definitions(runner PRIVATE
         TEST_QUIC_CERT="${CMAKE_CURRENT_SOURCE_DIR}/data/quic_test_cert.pem"
         TEST_QUIC_KEY="${CMAKE_CURRENT_SOURCE_DIR}/data/quic_test_key.pem"
+    )
+
+    # The client's own header, and the endpoint's -- the stand builds a
+    # connection the way quicendpoint.c does, so it needs to see both sides.
+    target_include_directories(runner PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/quicclient
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/udp
     )
 endif()
 

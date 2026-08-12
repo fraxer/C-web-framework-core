@@ -1118,6 +1118,14 @@ static void __discard_space(quicconn_t* conn, quic_enc_level_e level) {
     quickeys_free(&conn->tx[level]);
     quickeys_free(&conn->rx[level]);
 
+    /* Freed before it is re-initialised: quicack_init memsets the struct, so
+     * the range array the space accumulated would simply be forgotten. Two
+     * spaces are discarded on every connection that completes a handshake, so
+     * this leaked a couple of hundred bytes per connection for the life of the
+     * process -- invisible to an ASan run against an idle server, and found by
+     * the deterministic stand, which opens and closes connections inside one
+     * (docs/http3/08-testing.md §2b). */
+    quicack_free(&conn->ack[level]);
     quicack_init(&conn->ack[level]);
 
     /* The certificate chain lives in here; on a server it is the largest single

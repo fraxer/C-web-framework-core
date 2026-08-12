@@ -31,6 +31,12 @@
  * arrives in phase 3. Everything that does not require connection state --
  * Version Negotiation, stateless reset, the drop rules -- is complete. */
 
+/* Declared before the endpoint rather than beside the functions below: the
+ * struct itself now names quicpath in a member's prototype, and a tag first
+ * seen inside a parameter list would be a different, incompatible type. */
+struct quicconn;
+struct quicpath;
+
 typedef struct quicendpoint {
     /* MUST be first: the endpoint's connection stores &endpoint->listener in
      * ctx->listener, which __mpx_epoll_control dereferences for its api. The
@@ -146,6 +152,21 @@ typedef struct quicendpoint {
     struct quicconn* tx_tail;
     atomic_flag tx_lock;
 
+    /* ---- Test seam (docs/http3/08-testing.md §2) ---- *
+     *
+     * Where the endpoint's datagrams go instead of the socket. NULL in every
+     * build that serves anything; set only by the in-process stand, which runs
+     * a real connection against a real client with a network emulator and an
+     * injected clock in between.
+     *
+     * A hook here rather than a fake fd because the socket is not what has to
+     * be faked: the stand needs to hold a datagram, drop it, duplicate it or
+     * deliver it late, and none of that is expressible to sendmsg(). The same
+     * argument quictime.h makes for quic_time_set_source. */
+    ssize_t (*send_hook)(void* arg, const uint8_t* data, size_t len,
+                         const struct quicpath* path);
+    void* send_hook_arg;
+
     struct quicendpoint* next;
 } quicendpoint_t;
 
@@ -218,9 +239,6 @@ void quicendpoints_drain(quicendpoint_t* endpoints);
 
 void quicendpoints_unlisten(quicendpoint_t* endpoints);
 void quicendpoints_free(quicendpoint_t* endpoints);
-
-struct quicconn;
-struct quicpath;
 
 /* Send one datagram from this endpoint's socket, with the source address
  * pinned to the one the peer sent to. Returns the bytes sent, 0 if the socket

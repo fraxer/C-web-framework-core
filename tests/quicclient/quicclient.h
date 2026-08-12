@@ -194,6 +194,21 @@ typedef struct quicclient {
     uint64_t net_reordered;
     uint64_t net_duplicated;
 
+    /* ---- In-process transport (docs/http3/08-testing.md §2) ---- *
+     *
+     * Set instead of `fd`: every datagram goes to this callback and every one
+     * that arrives comes in through quicclient_deliver, so the whole exchange
+     * is a sequence of calls the test makes in an order it chooses. That is
+     * what buys the two things a socket cannot give -- a clock the test winds
+     * forward (quic_time_set_source) and a path that loses, reorders and
+     * delays by a rule rather than by luck.
+     *
+     * The impairment fields above still work in this mode, but the stand does
+     * not use them: an emulator that sees both directions can delay, and delay
+     * is what turns "eventually" into a number. */
+    void (*out)(void* arg, const uint8_t* data, size_t len);
+    void*  out_arg;
+
     int verbose;
 } quicclient_t;
 
@@ -253,6 +268,31 @@ size_t quicclient_take_token(const quicclient_t* client, uint8_t* out, size_t ca
 /* Drive the exchange until the handshake completes or `timeout_ms` elapses.
  * Returns 1 if it completed. */
 int quicclient_run(quicclient_t* client, int timeout_ms);
+
+/* ---- In-process transport ---- *
+ *
+ * The same client with no socket under it, for the deterministic stand of
+ * docs/http3/08-testing.md §2. There is no loop here at all: the caller owns
+ * the clock and the order of events, and these three calls are the only way
+ * bytes move. */
+
+/* Start the handshake against a peer that is not on the network: the first
+ * Initial is handed to `out` instead of being sent. Returns 0 on failure. */
+int quicclient_connect_inproc(quicclient_t* client, const char* server_name, int verbose,
+                              void (*out)(void* arg, const uint8_t* data, size_t len),
+                              void* out_arg);
+
+/* One datagram from the peer. Returns 0 if the connection failed -- which
+ * includes a stateless reset, exactly as the socket path reports it. */
+int quicclient_deliver(quicclient_t* client, const uint8_t* data, size_t len);
+
+/* Put whatever is queued -- acknowledgements, CRYPTO, stream data, a PING --
+ * into a datagram and hand it to `out`. Returns 0 on failure.
+ *
+ * Separate from quicclient_deliver because the two are separate decisions for
+ * the caller: a stand that answers every datagram immediately is a stand where
+ * delayed acknowledgements never happen. */
+int quicclient_flush(quicclient_t* client);
 
 /* ---- Streams ---- *
  *

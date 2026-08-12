@@ -607,6 +607,12 @@ static void __send_version_negotiation(quicendpoint_t* ep, const udp_datagram_t*
 ssize_t quicendpoint_send(quicendpoint_t* endpoint, const uint8_t* data, size_t len,
                           const quicpath_t* path) {
     if (endpoint == NULL || data == NULL || path == NULL) return -1;
+
+    /* The in-process stand's network emulator, when there is one. Checked
+     * before the descriptor because that endpoint has none (quicendpoint.h). */
+    if (endpoint->send_hook != NULL)
+        return endpoint->send_hook(endpoint->send_hook_arg, data, len, path);
+
     if (endpoint->fd == -1) return -1;
 
     const ssize_t sent = udp_send(endpoint->fd, data, len,

@@ -131,6 +131,13 @@ static int __net_impaired(const quicclient_t* c) {
 }
 
 static ssize_t __net_write(quicclient_t* c, const uint8_t* buf, size_t len) {
+    /* The in-process stand's emulator, when there is one: it never fails, it
+     * only decides what the path does with the datagram. */
+    if (c->out != NULL) {
+        c->out(c->out_arg, buf, len);
+        return (ssize_t)len;
+    }
+
     return sendto(c->fd, buf, len, 0,
                   (struct sockaddr*)&c->server, sizeof c->server);
 }
@@ -269,15 +276,22 @@ int quicclient_ping(quicclient_t* client) {
 }
 
 int quicclient_rebind(quicclient_t* client) {
-    if (client == NULL || client->fd < 0) return 0;
+    if (client == NULL) return 0;
 
-    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) return 0;
+    /* In the in-process stand there is no port to change: the address the
+     * server sees is the one the emulator reports, so a rebind there is the
+     * emulator's move and only the connection id half belongs here. */
+    if (client->out == NULL) {
+        if (client->fd < 0) return 0;
 
-    /* Not bound explicitly: the first sendto picks an ephemeral port, and any
-     * port different from the last one is what the test needs. */
-    close(client->fd);
-    client->fd = fd;
+        const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) return 0;
+
+        /* Not bound explicitly: the first sendto picks an ephemeral port, and
+         * any port different from the last one is what the test needs. */
+        close(client->fd);
+        client->fd = fd;
+    }
 
     /* §9.5 asks a migrating endpoint to use a connection id the peer has not
      * seen on the old path, so that the two cannot be linked by an observer.
@@ -596,7 +610,20 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
     return total;
 }
 
-static int __flush(quicclient_t* c) {
+/* Is there handshake data still waiting for a packet to carry it?
+ *
+ * A ClientHello no longer fits in one packet: OpenSSL 3.5 offers a hybrid
+ * post-quantum key share by default, which puts the message at ~1.3 KB. */
+static int __crypto_pending(const quicclient_t* c) {
+    for (int i = 0; i < QUIC_ENC_COUNT; i++) {
+        if (i == QUIC_ENC_EARLY) continue;
+        if (quicsendbuf_pending(&c->crypto_out[i])) return 1;
+    }
+
+    return 0;
+}
+
+static int __flush_one(quicclient_t* c, size_t* out_total) {
     uint8_t datagram[CLIENT_MAX_PACKET];
     size_t total = 0;
 
@@ -612,6 +639,8 @@ static int __flush(quicclient_t* c) {
 
         if (i == QUIC_ENC_APP) break;   /* a short header ends the datagram */
     }
+
+    *out_total = total;
 
     if (total == 0) {
         /* Nothing new to send, so the held datagram has waited as long as it
@@ -632,6 +661,30 @@ static int __flush(quicclient_t* c) {
     if (!__net_send(c, datagram, total)) {
         printf("  [client] sendto failed: %s\n", strerror(errno));
         return 0;
+    }
+
+    return 1;
+}
+
+static int __flush(quicclient_t* c) {
+    /* Keep building datagrams while handshake data is left over.
+     *
+     * One datagram per flush was enough while a ClientHello fit in a packet.
+     * It no longer does, and the half that stayed behind waited for the next
+     * thing that happened to call this -- so the server sat on an incomplete
+     * ClientHello, answered it with a bare ACK, and the handshake cost an
+     * extra round trip. On a path that loses that ACK it cost the whole
+     * connection: neither side had anything to retransmit, because neither
+     * side had sent anything ack-eliciting. Found in the deterministic stand
+     * (docs/http3/08-testing.md §2b), where it is visible in one trace.
+     *
+     * Bounded: a flight of eight datagrams is far beyond anything this client
+     * has to say, and the loop stops as soon as a datagram comes out empty. */
+    for (int datagram = 0; datagram < 8; datagram++) {
+        size_t total = 0;
+
+        if (!__flush_one(c, &total)) return 0;
+        if (total == 0 || !__crypto_pending(c)) break;
     }
 
     return 1;
@@ -750,7 +803,12 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
         case QUIC_FRAME_CONNECTION_CLOSE_APP:
             c->close_received = 1;
             c->close_error = f.u.close.error;
-            printf("  [client] <- CONNECTION_CLOSE, error 0x%llx%s%.*s\n",
+            /* Logged rather than printed: a close is a normal outcome for
+             * several tests (they provoke one on purpose), and the stand runs
+             * inside a test runner where an unexplained line is noise. What
+             * happened is in close_received/close_error, which is what every
+             * caller actually reads. */
+            __log(c, "  [client] <- CONNECTION_CLOSE, error 0x%llx%s%.*s\n",
                    (unsigned long long)f.u.close.error,
                    f.u.close.reason_len > 0 ? ": " : "",
                    (int)f.u.close.reason_len,
@@ -977,7 +1035,9 @@ static int __connect(quicclient_t* client, const char* host, uint16_t port,
                      const char* server_name, int verbose,
                      const uint8_t* token, size_t token_len,
                      unsigned loss_out_pct, unsigned loss_in_pct,
-                     unsigned reorder_pct, unsigned dup_pct, uint64_t seed);
+                     unsigned reorder_pct, unsigned dup_pct, uint64_t seed,
+                     void (*out)(void* arg, const uint8_t* data, size_t len),
+                     void* out_arg);
 
 int quicclient_connect(quicclient_t* client, const char* host, uint16_t port,
                        const char* server_name, int verbose) {
@@ -994,7 +1054,17 @@ int quicclient_connect_impaired(quicclient_t* client, const char* host, uint16_t
      * call; it is installed at the one point in the sequence where the socket
      * exists and nothing has been sent yet. */
     return __connect(client, host, port, server_name, verbose, NULL, 0,
-                     loss_out_pct, loss_in_pct, reorder_pct, dup_pct, seed);
+                     loss_out_pct, loss_in_pct, reorder_pct, dup_pct, seed,
+                     NULL, NULL);
+}
+
+int quicclient_connect_inproc(quicclient_t* client, const char* server_name, int verbose,
+                              void (*out)(void* arg, const uint8_t* data, size_t len),
+                              void* out_arg) {
+    if (client == NULL || out == NULL) return 0;
+
+    return __connect(client, NULL, 0, server_name, verbose, NULL, 0,
+                     0, 0, 0, 0, 0, out, out_arg);
 }
 
 size_t quicclient_take_token(const quicclient_t* client, uint8_t* out, size_t cap) {
@@ -1010,19 +1080,23 @@ int quicclient_connect_token(quicclient_t* client, const char* host, uint16_t po
                              const char* server_name, int verbose,
                              const uint8_t* token, size_t token_len) {
     return __connect(client, host, port, server_name, verbose, token, token_len,
-                     0, 0, 0, 0, 0);
+                     0, 0, 0, 0, 0, NULL, NULL);
 }
 
 static int __connect(quicclient_t* client, const char* host, uint16_t port,
                      const char* server_name, int verbose,
                      const uint8_t* token, size_t token_len,
                      unsigned loss_out_pct, unsigned loss_in_pct,
-                     unsigned reorder_pct, unsigned dup_pct, uint64_t seed) {
+                     unsigned reorder_pct, unsigned dup_pct, uint64_t seed,
+                     void (*out)(void* arg, const uint8_t* data, size_t len),
+                     void* out_arg) {
     if (client == NULL) return 0;
 
     memset(client, 0, sizeof * client);
     client->verbose = verbose;
     client->fd = -1;
+    client->out = out;
+    client->out_arg = out_arg;
 
     for (int i = 0; i < QUIC_ENC_COUNT; i++) {
         quicsendbuf_init(&client->crypto_out[i]);
@@ -1059,13 +1133,17 @@ static int __connect(quicclient_t* client, const char* host, uint16_t port,
 
     if (!__handshake_start(client, &client->odcid)) return 0;
 
-    client->fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (client->fd < 0) return 0;
+    /* No socket in the in-process mode, and no address either: where the peer
+     * is, is the emulator's business. */
+    if (out == NULL) {
+        client->fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (client->fd < 0) return 0;
 
-    memset(&client->server, 0, sizeof client->server);
-    client->server.sin_family = AF_INET;
-    client->server.sin_port = htons(port);
-    if (inet_pton(AF_INET, host, &client->server.sin_addr) != 1) return 0;
+        memset(&client->server, 0, sizeof client->server);
+        client->server.sin_family = AF_INET;
+        client->server.sin_port = htons(port);
+        if (inet_pton(AF_INET, host, &client->server.sin_addr) != 1) return 0;
+    }
 
     /* Produces the ClientHello, which lands in crypto_out via the callback. */
     if (!quictls_advance(&client->tls)) return 0;
@@ -1109,6 +1187,36 @@ int quicclient_run(quicclient_t* client, int timeout_ms) {
     }
 
     return client->handshake_complete;
+}
+
+int quicclient_deliver(quicclient_t* client, const uint8_t* data, size_t len) {
+    if (client == NULL || data == NULL) return 0;
+
+    /* Copied because header protection is removed in place, and the caller's
+     * buffer belongs to the emulator -- which may still have to deliver the
+     * same bytes again as a duplicate. */
+    uint8_t buf[2048];
+    if (len == 0 || len > sizeof buf) return 0;
+    memcpy(buf, data, len);
+
+    if (!__recv_datagram(client, buf, len)) return 0;
+
+    /* Every datagram, not every burst: a server flight arrives coalesced and
+     * the handshake only moves when TLS has consumed it (see __recv_datagram). */
+    if (!quictls_advance(&client->tls)) return 0;
+
+    if (client->tls.handshake_complete && !client->handshake_complete) {
+        client->handshake_complete = 1;
+        __log(client, "  [client] handshake complete\n");
+    }
+
+    return 1;
+}
+
+int quicclient_flush(quicclient_t* client) {
+    if (client == NULL) return 0;
+
+    return __flush(client);
 }
 
 int quicclient_pump(quicclient_t* client, int timeout_ms) {
