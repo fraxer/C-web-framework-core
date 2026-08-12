@@ -374,6 +374,29 @@ int quicclient_stream_fin(quicclient_t* client, uint64_t id) {
     return s != NULL && s->in_fin;
 }
 
+int quicclient_stream_reset(const quicclient_t* client, uint64_t id,
+                            uint64_t* out_error, uint64_t* out_final_size) {
+    const clientstream_t* s = __stream_get((quicclient_t*)client, id, 0);
+    if (s == NULL || !s->in_reset) return 0;
+
+    if (out_error != NULL) *out_error = s->in_reset_error;
+    if (out_final_size != NULL) *out_final_size = s->in_final_size;
+
+    return 1;
+}
+
+int quicclient_stop_sending(quicclient_t* client, uint64_t id, uint64_t error) {
+    if (client == NULL) return 0;
+
+    clientstream_t* s = __stream_get(client, id, 1);
+    if (s == NULL) return 0;
+
+    s->stop_sending_queued = 1;
+    s->stop_sending_error = error;
+
+    return 1;
+}
+
 void quicclient_stream_release(quicclient_t* client, uint64_t id) {
     clientstream_t* s = __stream_get(client, id, 0);
     if (s == NULL) return;
@@ -519,6 +542,26 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
     /* Stream data, once the handshake keys exist. One frame per stream per
      * packet is enough for a test whose whole exchange is a few kilobytes. */
     if (level == QUIC_ENC_APP) {
+        for (size_t i = 0; i < CLIENT_MAX_STREAMS && p + 64 < payload_cap; i++) {
+            clientstream_t* st = &c->streams[i];
+            if (!st->used || !st->stop_sending_queued) continue;
+
+            quicframe_t f;
+            memset(&f, 0, sizeof f);
+            f.type = QUIC_FRAME_STOP_SENDING;
+            f.u.stop_sending.id = st->id;
+            f.u.stop_sending.error = st->stop_sending_error;
+
+            const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
+            if (n == 0) continue;
+
+            p += n;
+            st->stop_sending_queued = 0;
+            __log(c, "  [client] -> STOP_SENDING %llu, error 0x%llx\n",
+                  (unsigned long long)st->id,
+                  (unsigned long long)st->stop_sending_error);
+        }
+
         for (size_t i = 0; i < CLIENT_MAX_STREAMS && p + 64 < payload_cap; i++) {
             clientstream_t* st = &c->streams[i];
             if (!st->used || !quicsendbuf_pending(&st->out)) continue;
@@ -815,11 +858,23 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
                   (unsigned long long)f.u.ack.largest);
             break;
 
-        case QUIC_FRAME_RESET_STREAM:
-            printf("  [client] <- RESET_STREAM %llu, error 0x%llx\n",
-                   (unsigned long long)f.u.reset_stream.id,
-                   (unsigned long long)f.u.reset_stream.error);
+        case QUIC_FRAME_RESET_STREAM: {
+            /* Recorded rather than printed: a cancelled stream is an outcome a
+             * test asserts on, and "no more data is coming" is indistinguishable
+             * from a stall without it. */
+            clientstream_t* rs = __stream_get(c, f.u.reset_stream.id, 1);
+            if (rs != NULL) {
+                rs->in_reset = 1;
+                rs->in_reset_error = f.u.reset_stream.error;
+                rs->in_final_size = f.u.reset_stream.final_size;
+            }
+
+            __log(c, "  [client] <- RESET_STREAM %llu, error 0x%llx, final size %llu\n",
+                  (unsigned long long)f.u.reset_stream.id,
+                  (unsigned long long)f.u.reset_stream.error,
+                  (unsigned long long)f.u.reset_stream.final_size);
             break;
+        }
 
         case QUIC_FRAME_STOP_SENDING:
             __log(c, "  [client] <- STOP_SENDING %llu, error 0x%llx\n",

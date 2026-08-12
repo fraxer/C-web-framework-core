@@ -56,6 +56,18 @@ typedef struct clientstream {
 
     quicrecvbuf_t in;
     int           in_fin;
+
+    /* The peer abandoned its send side (RESET_STREAM, §19.4). Nothing more is
+     * coming, and `in_final_size` is how much was ever going to -- which is the
+     * only way to tell a cancelled response from a truncated one. */
+    int           in_reset;
+    uint64_t      in_reset_error;
+    uint64_t      in_final_size;
+
+    /* A STOP_SENDING we owe the peer (§19.5): we are not going to read this
+     * stream, and saying so is what stops it spending the window on us. */
+    int           stop_sending_queued;
+    uint64_t      stop_sending_error;
 } clientstream_t;
 
 typedef struct quicclient {
@@ -353,6 +365,15 @@ size_t quicclient_stream_read(quicclient_t* client, uint64_t id,
 
 /* Has the server finished its half of this stream? */
 int quicclient_stream_fin(quicclient_t* client, uint64_t id);
+
+/* Did the server abandon its half instead (§19.4)? `out_error` and
+ * `out_final_size` are filled when it did and may be NULL. */
+int quicclient_stream_reset(const quicclient_t* client, uint64_t id,
+                            uint64_t* out_error, uint64_t* out_final_size);
+
+/* Tell the server to stop sending on this stream (§19.5). It goes out with the
+ * next flush; §3.5 obliges the peer to answer with RESET_STREAM. */
+int quicclient_stop_sending(quicclient_t* client, uint64_t id, uint64_t error);
 
 /* Done with this stream: free its buffers and the slot.
  *

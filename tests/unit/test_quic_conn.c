@@ -829,6 +829,10 @@ static int __challenged(stand_t* s) {
     return s->client.path_challenge_received;
 }
 
+static int __stream0_reset(stand_t* s) {
+    return quicclient_stream_reset(&s->client, 0, NULL, NULL);
+}
+
 /* The server has accepted the new address as the peer's. */
 static int __migrated(stand_t* s) {
     if (s->conn == NULL) return 0;
@@ -1164,15 +1168,46 @@ TEST(test_quic_stand_stream_under_loss) {
     __stand_free(s);
 }
 
-/* Stream 0, opened the way a request opens it, with the server's side found and
- * returned. NULL if anything went wrong. */
+/* Stream 0, opened the way a request opens it -- with a FIN, because a request
+ * without a body ends where it starts, and a stream whose receive side never
+ * finishes can never be released. The server's side is found and returned. */
 static quicstream_t* __open_request_stream(stand_t* s) {
-    if (!quicclient_stream_write(&s->client, 0, (const uint8_t*)"GET", 3, 0)) return NULL;
+    if (!quicclient_stream_write(&s->client, 0, (const uint8_t*)"GET", 3, 1)) return NULL;
     if (!quicclient_flush(&s->client)) return NULL;
 
     __run(s, 200000, NULL);
 
     return s->conn != NULL ? quicconn_stream_find(s->conn, 0) : NULL;
+}
+
+/* What an application does before answering: take the request off the stream.
+ *
+ * Not a formality. The transport releases a peer's stream only once the
+ * application has read what arrived (recv_state DATA_READ), and the
+ * connection-level window is credited here and nowhere else -- quicstream_read
+ * credits the stream's own window, because a stream deliberately does not know
+ * its connection. A stand that only wrote would leave both untested. */
+static int __consume_request(stand_t* s, uint64_t id) {
+    if (s->conn == NULL) return 0;
+
+    quicstream_t* qs = quicconn_stream_find(s->conn, id);
+    if (qs == NULL) return 0;
+
+    connection_s_lock(&s->conn->conn, LOCK_SITE_QUIC_SEND);
+
+    uint8_t sink[256];
+    size_t taken = 0;
+    for (;;) {
+        const size_t n = quicstream_read(qs, sink, sizeof sink);
+        if (n == 0) break;
+        taken += n;
+    }
+
+    if (taken > 0) quicconn_consumed(s->conn, taken);
+
+    connection_s_unlock(&s->conn->conn);
+
+    return 1;
 }
 
 /* A body with a pattern rather than zeroes: a truncation, a duplicated
@@ -1187,18 +1222,23 @@ static uint8_t* __body_make(size_t total) {
     return body;
 }
 
-/* Put the whole body on the server's stream and end it. The FIN matters as much
- * as the bytes: §3t was two deadlocks in which every byte arrived and the stream
- * never finished. */
-static int __respond(stand_t* s, quicstream_t* qs, const uint8_t* body, size_t total) {
+/* Put the whole body on the server's stream, ending it unless the caller is
+ * about to cancel instead. The FIN matters as much as the bytes: §3t was two
+ * deadlocks in which every byte arrived and the stream never finished. */
+static int __respond_body(stand_t* s, quicstream_t* qs, const uint8_t* body,
+                          size_t total, int fin) {
     connection_s_lock(&s->conn->conn, LOCK_SITE_QUIC_SEND);
     const int written = quicstream_write(qs, body, total);
-    quicstream_finish(qs);
+    if (fin) quicstream_finish(qs);
     connection_s_unlock(&s->conn->conn);
 
     quicconn_want_write(&s->conn->conn);
 
     return written;
+}
+
+static int __respond(stand_t* s, quicstream_t* qs, const uint8_t* body, size_t total) {
+    return __respond_body(s, qs, body, total, 1);
 }
 
 /* Step the stand until the client has read `total` bytes, reading as it goes.
@@ -1224,34 +1264,12 @@ static size_t __drain(stand_t* s, uint8_t* got, size_t total) {
  * peer sent (which is what moves the stream to DATA_READ and lets the transport
  * release it), then answer and end it. Returns 0 if the stream is not there. */
 static int __serve(stand_t* s, uint64_t id, const uint8_t* body, size_t len) {
-    if (s->conn == NULL) return 0;
+    if (!__consume_request(s, id)) return 0;
 
     quicstream_t* qs = quicconn_stream_find(s->conn, id);
     if (qs == NULL) return 0;
 
-    connection_s_lock(&s->conn->conn, LOCK_SITE_QUIC_SEND);
-
-    uint8_t sink[256];
-    size_t taken = 0;
-    for (;;) {
-        const size_t n = quicstream_read(qs, sink, sizeof sink);
-        if (n == 0) break;
-        taken += n;
-    }
-
-    /* The connection-level half of the window, which quicstream_read cannot
-     * credit because a stream deliberately does not know its connection. An
-     * application that forgets it stalls after initial_max_data. */
-    if (taken > 0) quicconn_consumed(s->conn, taken);
-
-    const int ok = len == 0 || quicstream_write(qs, body, len);
-    quicstream_finish(qs);
-
-    connection_s_unlock(&s->conn->conn);
-
-    quicconn_want_write(&s->conn->conn);
-
-    return ok;
+    return __respond(s, qs, body, len);
 }
 
 TEST(test_quic_stand_parallel_streams) {
@@ -1435,6 +1453,142 @@ TEST(test_quic_stand_stream_credit) {
      * per-packet walk over conn->streams is only short if this happens. */
     TEST_ASSERT(s->conn->stream_count < allowance, "and released the finished ones");
 
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_stream_cancel) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a stream abandoned mid-body ends as cancelled, not as truncated");
+    /* The application changes its mind halfway through a response. What the
+     * peer must be able to tell apart is "cancelled" from "stalled" and from
+     * "truncated": RESET_STREAM carries both the reason and the final size, and
+     * without the final size the receiver cannot even close its own accounting
+     * of the flow-control window.
+     *
+     * The other half of the case is the transport's: a reset stream is finished
+     * in both directions, so it must be released and its slot returned to the
+     * concurrency limit -- the same credit machinery §2e exercises from the
+     * other side, reached here by a path that never sends a FIN. */
+    stand_t* s = __stand_create(16);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+
+    quicstream_t* qs = __open_request_stream(s);
+    TEST_REQUIRE_NOT_NULL(qs, "the server has the stream");
+    TEST_ASSERT(__consume_request(s, 0), "the request was read");
+
+    const size_t total = 128 * 1024;
+    uint8_t* body = __body_make(total);
+    TEST_REQUIRE_NOT_NULL(body, "body allocated");
+
+    /* No FIN: this response is going to be abandoned, and a stream that had
+     * already declared its end would be a different case. */
+    TEST_ASSERT(__respond_body(s, qs, body, total, 0), "queued on the stream");
+
+    /* Let a little of it out, so the cancellation lands in the middle of a
+     * transfer rather than before one. */
+    __run(s, 60000, NULL);
+
+    const size_t before = quicclient_stream_readable(&s->client, 0);
+    TEST_ASSERT(before > 0 && before < total, "part of the body is on its way");
+
+    TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
+    const size_t streams_before = s->conn->stream_count;
+
+    connection_s_lock(&s->conn->conn, LOCK_SITE_QUIC_SEND);
+    quicstream_reset(quicconn_stream_find(s->conn, 0), 0x10a);
+    connection_s_unlock(&s->conn->conn);
+    quicconn_want_write(&s->conn->conn);
+
+    TEST_ASSERT(__run(s, 1000000, __stream0_reset), "the client was told it was cancelled");
+
+    uint64_t error = 0;
+    uint64_t final_size = 0;
+    TEST_ASSERT(quicclient_stream_reset(&s->client, 0, &error, &final_size), "reset recorded");
+    TEST_ASSERT(error == 0x10a, "with the code the application chose");
+
+    if (s->trace)
+        printf("      cancelled: final size %llu, %zu written, %zu already readable\n",
+               (unsigned long long)final_size, total, before);
+
+    /* The final size is what was actually sent, not what was queued: a receiver
+     * that believed the queued figure would wait for bytes that were abandoned. */
+    TEST_ASSERT(final_size < total, "the final size is what was sent, not what was written");
+    TEST_ASSERT(final_size >= before, "and covers what already arrived");
+
+    TEST_ASSERT(!quicclient_stream_fin(&s->client, 0), "it was cancelled, not finished");
+
+    /* And the connection is unharmed: cancelling a stream is an ordinary event,
+     * not an error. */
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+    TEST_ASSERT(s->conn->state == QUICCONN_ACTIVE, "the connection carried on");
+    TEST_ASSERT(s->conn->stream_count < streams_before || s->conn->peer_bidi_closed > 0,
+                "and the stream was released");
+
+    free(body);
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_stop_sending) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("STOP_SENDING stops the response and is answered with RESET_STREAM (§3.5)");
+    /* The cancellation that comes from the *receiver*: the client is not going
+     * to read this stream, and says so. §3.5 obliges us to give up sending and
+     * answer with RESET_STREAM carrying the code it asked for -- an
+     * implementation that merely stopped would leave the peer unable to tell
+     * that from a stall, and one that kept sending would spend the window on
+     * data nobody will read.
+     *
+     * Both halves are asserted, and the second is the one worth the trouble:
+     * what the server sends *after* the request, counted. */
+    stand_t* s = __stand_create(17);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+
+    quicstream_t* qs = __open_request_stream(s);
+    TEST_REQUIRE_NOT_NULL(qs, "the server has the stream");
+
+    const size_t total = 256 * 1024;
+    uint8_t* body = __body_make(total);
+    TEST_REQUIRE_NOT_NULL(body, "body allocated");
+
+    TEST_ASSERT(__respond(s, qs, body, total), "queued on the stream");
+
+    __run(s, 60000, NULL);
+    TEST_ASSERT(quicclient_stream_readable(&s->client, 0) > 0, "the body started arriving");
+
+    TEST_ASSERT(quicclient_stop_sending(&s->client, 0, 0x10c), "asking it to stop");
+    TEST_ASSERT(quicclient_flush(&s->client), "sent");
+
+    TEST_ASSERT(__run(s, 1000000, __stream0_reset), "answered with RESET_STREAM");
+
+    uint64_t error = 0;
+    TEST_ASSERT(quicclient_stream_reset(&s->client, 0, &error, NULL), "reset recorded");
+    TEST_ASSERT(error == 0x10c, "carrying the code the client asked for");
+
+    /* And then it really stops. A PING keeps the exchange alive so that "quiet"
+     * cannot be confused with "the connection died", and the datagram count is
+     * what says the body is no longer flowing: whatever still arrives is
+     * acknowledgements and the odd frame, not a quarter-megabyte of body. */
+    const uint64_t sent_before = s->sent_to_client;
+
+    TEST_ASSERT(quicclient_ping(&s->client), "poke it");
+    TEST_ASSERT(quicclient_flush(&s->client), "sent");
+    __run(s, 500000, NULL);
+
+    TEST_ASSERT(s->sent_to_client - sent_before < 10,
+                "the response stopped rather than draining into the void");
+
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+    TEST_ASSERT(s->conn->state == QUICCONN_ACTIVE, "and the connection carried on");
+
+    free(body);
     __stand_free(s);
 }
 

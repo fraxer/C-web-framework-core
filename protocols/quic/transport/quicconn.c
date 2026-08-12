@@ -1826,7 +1826,20 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
                 f.type = QUIC_FRAME_RESET_STREAM;
                 f.u.reset_stream.id = s->id;
                 f.u.reset_stream.error = s->send_reset_code;
-                f.u.reset_stream.final_size = s->send.write_off;
+                /* §4.5 defines the final size as "one higher than the offset of
+                 * the byte with the largest offset **sent** on the stream" --
+                 * which is sent_off, not write_off.
+                 *
+                 * The difference is the abandoned tail, and the abandoned tail
+                 * is the entire point of a reset: a 128 KB response cancelled
+                 * after 20 KB used to declare 128 KB of the peer's
+                 * connection-level window consumed. The peer must account for
+                 * the final size (§4.5), so its view of our consumption ran
+                 * ahead of ours by everything we never sent -- and it is the
+                 * peer that enforces the limit, so far enough ahead is a
+                 * FLOW_CONTROL_ERROR for data we were entitled to send.
+                 * Found by the deterministic stand (08-testing.md §2f). */
+                f.u.reset_stream.final_size = s->send.sent_off;
 
                 const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
                 if (n > 0) {
