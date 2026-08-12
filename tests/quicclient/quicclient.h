@@ -76,6 +76,13 @@ typedef struct clientstream {
      * anyway. */
     int           reset_queued;
     uint64_t      reset_error;
+
+    /* Receive-side flow control for this stream: what we have advertised and
+     * what the test has read. A MAX_STREAM_DATA goes out when the peer could
+     * have used more than half of what it has. */
+    uint64_t      in_limit;
+    uint64_t      in_consumed;
+    int           max_stream_data_queued;
 } clientstream_t;
 
 typedef struct quicclient {
@@ -169,6 +176,32 @@ typedef struct quicclient {
 
     int      ping_queued;
     uint64_t datagrams_received;
+
+    /* ---- Receive-side flow control (RFC 9000 §4) ---- *
+     *
+     * The client used to advertise 64 MB and never send a MAX_DATA, which made
+     * every window in the exchange unreachable: a limit that is never met is a
+     * limit that is never tested, and the code that raises one is the code
+     * three of this project's recent bugs were in.
+     *
+     * Windows of its own, and the credit that follows reading. Deliberately
+     * cruder than the server's: the client tracks what the *test* has read
+     * rather than the highest offset received, so the limit it advertises is
+     * `consumed + window`. For a peer that reads everything it is offered the
+     * two agree, and a test client that reads nothing is exactly the case worth
+     * being able to produce on purpose. */
+    uint64_t conn_window;            /* what a fresh limit is measured against */
+    uint64_t stream_window;
+    uint64_t conn_limit;             /* connection-level, advertised */
+    uint64_t conn_consumed;
+    int      max_data_queued;
+
+    /* The peer said it was stuck against one of those limits (§4.1). Recorded
+     * because "the transfer stopped" and "the transfer stopped and said why"
+     * are different results, and only the second proves the window was what
+     * stopped it. */
+    uint64_t data_blocked_received;
+    uint64_t stream_data_blocked_received;
 
     /* ---- The one piece of loss recovery a client cannot do without ---- *
      *
@@ -342,6 +375,15 @@ int quicclient_run(quicclient_t* client, int timeout_ms);
 int quicclient_connect_inproc(quicclient_t* client, const char* server_name, int verbose,
                               void (*out)(void* arg, const uint8_t* data, size_t len),
                               void* out_arg);
+
+/* The same, with receive windows small enough to be reached. 0 for either means
+ * the default, which is large enough that nothing ever blocks -- fine for every
+ * scenario except the ones about blocking. */
+int quicclient_connect_inproc_windowed(quicclient_t* client, const char* server_name,
+                                       int verbose,
+                                       void (*out)(void* arg, const uint8_t* data, size_t len),
+                                       void* out_arg,
+                                       uint64_t conn_window, uint64_t stream_window);
 
 /* One datagram from the peer. Returns 0 if the connection failed -- which
  * includes a stateless reset, exactly as the socket path reports it. */

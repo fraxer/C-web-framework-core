@@ -227,10 +227,16 @@ static clientstream_t* __stream_get(quicclient_t* c, uint64_t id, int create) {
         s->id = id;
         s->fin_queued = 0;
         s->in_fin = 0;
+        s->in_reset = 0;
+        s->stop_sending_queued = 0;
+        s->reset_queued = 0;
+        s->max_stream_data_queued = 0;
+        s->in_consumed = 0;
+        s->in_limit = c->stream_window;
         quicsendbuf_init(&s->out);
         /* The window we advertised, which is what bounds what the peer may put
-         * in here (quicclient_connect). */
-        quicrecvbuf_init(&s->in, 32 * 1024 * 1024);
+         * in here (__handshake_start). */
+        quicrecvbuf_init(&s->in, s->in_limit);
 
         return s;
     }
@@ -263,8 +269,24 @@ size_t quicclient_stream_readable(quicclient_t* client, uint64_t id) {
 size_t quicclient_stream_read(quicclient_t* client, uint64_t id,
                               uint8_t* dst, size_t cap) {
     clientstream_t* s = __stream_get(client, id, 0);
+    if (s == NULL) return 0;
 
-    return s == NULL ? 0 : quicrecvbuf_read(&s->in, dst, cap);
+    const size_t n = quicrecvbuf_read(&s->in, dst, cap);
+    if (n == 0) return 0;
+
+    /* Reading is what earns the peer more credit, on both limits. Queued rather
+     * than sent, because the frames belong in the next packet the client builds
+     * and a read is not a reason to build one on its own. */
+    s->in_consumed += n;
+    client->conn_consumed += n;
+
+    if (s->in_limit < s->in_consumed + client->stream_window / 2)
+        s->max_stream_data_queued = 1;
+
+    if (client->conn_limit < client->conn_consumed + client->conn_window / 2)
+        client->max_data_queued = 1;
+
+    return n;
 }
 
 int quicclient_ping(quicclient_t* client) {
@@ -572,6 +594,46 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
             __log(c, "  [client] -> STOP_SENDING %llu, error 0x%llx\n",
                   (unsigned long long)st->id,
                   (unsigned long long)st->stop_sending_error);
+        }
+
+        /* Credit first, and before anything that could fill the packet: a
+         * MAX_DATA that keeps missing the packet is a peer that stays blocked
+         * while we believe we unblocked it. */
+        if (c->max_data_queued) {
+            quicframe_t f;
+            memset(&f, 0, sizeof f);
+            f.type = QUIC_FRAME_MAX_DATA;
+            f.u.max_data.max = c->conn_consumed + c->conn_window;
+
+            const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
+            if (n > 0) {
+                p += n;
+                c->conn_limit = f.u.max_data.max;
+                c->max_data_queued = 0;
+                __log(c, "  [client] -> MAX_DATA %llu\n",
+                      (unsigned long long)f.u.max_data.max);
+            }
+        }
+
+        for (size_t i = 0; i < CLIENT_MAX_STREAMS && p + 64 < payload_cap; i++) {
+            clientstream_t* st = &c->streams[i];
+            if (!st->used || !st->max_stream_data_queued) continue;
+
+            quicframe_t f;
+            memset(&f, 0, sizeof f);
+            f.type = QUIC_FRAME_MAX_STREAM_DATA;
+            f.u.max_stream_data.id = st->id;
+            f.u.max_stream_data.max = st->in_consumed + c->stream_window;
+
+            const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
+            if (n == 0) continue;
+
+            p += n;
+            st->in_limit = f.u.max_stream_data.max;
+            st->max_stream_data_queued = 0;
+            __log(c, "  [client] -> MAX_STREAM_DATA %llu %llu\n",
+                  (unsigned long long)st->id,
+                  (unsigned long long)f.u.max_stream_data.max);
         }
 
         for (size_t i = 0; i < CLIENT_MAX_STREAMS && p + 64 < payload_cap; i++) {
@@ -922,6 +984,22 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
             __log(c, "  [client] <- PING\n");
             break;
 
+        /* §4.1: the peer is stuck against a limit we set. Counted, because
+         * "the transfer stopped" and "the transfer stopped and said why" are
+         * different results, and only the second proves what stopped it. */
+        case QUIC_FRAME_DATA_BLOCKED:
+            c->data_blocked_received++;
+            __log(c, "  [client] <- DATA_BLOCKED at %llu\n",
+                  (unsigned long long)f.u.data_blocked.limit);
+            break;
+
+        case QUIC_FRAME_STREAM_DATA_BLOCKED:
+            c->stream_data_blocked_received++;
+            __log(c, "  [client] <- STREAM_DATA_BLOCKED %llu at %llu\n",
+                  (unsigned long long)f.u.stream_data_blocked.id,
+                  (unsigned long long)f.u.stream_data_blocked.limit);
+            break;
+
         case QUIC_FRAME_NEW_TOKEN:
             c->new_token_received = 1;
             if (f.u.new_token.len > 0 && f.u.new_token.len <= sizeof c->new_token) {
@@ -1022,13 +1100,19 @@ static int __handshake_start(quicclient_t* c, const quiccid_t* dcid) {
 
     quictp_t params;
     quictp_defaults(&params);
-    /* Generous on purpose. This client never sends MAX_DATA or MAX_STREAM_DATA
-     * -- see the note in quicclient.h -- so whatever it advertises here is all
-     * the room a response will ever get. It has to exceed the server's
-     * write-ahead budget several times over, or a large response would stall on
-     * flow control and look like a server bug. */
-    params.initial_max_data = 64 * 1024 * 1024;
-    params.initial_max_stream_data_bidi_local = 32 * 1024 * 1024;
+    /* Generous unless a test asked otherwise, and the default has to stay that
+     * way: it must exceed the server's write-ahead budget several times over,
+     * or every large response would stall on flow control and look like a
+     * server bug. A test that wants the window reached sets one it can reach
+     * (quicclient_connect_inproc_windowed) and reads, which is what makes the
+     * credit go back out. */
+    if (c->conn_window == 0) c->conn_window = 64 * 1024 * 1024;
+    if (c->stream_window == 0) c->stream_window = 32 * 1024 * 1024;
+
+    c->conn_limit = c->conn_window;
+
+    params.initial_max_data = c->conn_window;
+    params.initial_max_stream_data_bidi_local = c->stream_window;
     params.initial_max_stream_data_uni = 1024 * 1024;
     params.initial_max_streams_bidi = 16;
     params.initial_max_streams_uni = 16;
@@ -1218,7 +1302,8 @@ static int __connect(quicclient_t* client, const char* host, uint16_t port,
                      unsigned loss_out_pct, unsigned loss_in_pct,
                      unsigned reorder_pct, unsigned dup_pct, uint64_t seed,
                      void (*out)(void* arg, const uint8_t* data, size_t len),
-                     void* out_arg);
+                     void* out_arg,
+                     uint64_t conn_window, uint64_t stream_window);
 
 int quicclient_connect(quicclient_t* client, const char* host, uint16_t port,
                        const char* server_name, int verbose) {
@@ -1236,16 +1321,25 @@ int quicclient_connect_impaired(quicclient_t* client, const char* host, uint16_t
      * exists and nothing has been sent yet. */
     return __connect(client, host, port, server_name, verbose, NULL, 0,
                      loss_out_pct, loss_in_pct, reorder_pct, dup_pct, seed,
-                     NULL, NULL);
+                     NULL, NULL, 0, 0);
 }
 
 int quicclient_connect_inproc(quicclient_t* client, const char* server_name, int verbose,
                               void (*out)(void* arg, const uint8_t* data, size_t len),
                               void* out_arg) {
+    return quicclient_connect_inproc_windowed(client, server_name, verbose,
+                                              out, out_arg, 0, 0);
+}
+
+int quicclient_connect_inproc_windowed(quicclient_t* client, const char* server_name,
+                                       int verbose,
+                                       void (*out)(void* arg, const uint8_t* data, size_t len),
+                                       void* out_arg,
+                                       uint64_t conn_window, uint64_t stream_window) {
     if (client == NULL || out == NULL) return 0;
 
     return __connect(client, NULL, 0, server_name, verbose, NULL, 0,
-                     0, 0, 0, 0, 0, out, out_arg);
+                     0, 0, 0, 0, 0, out, out_arg, conn_window, stream_window);
 }
 
 size_t quicclient_take_token(const quicclient_t* client, uint8_t* out, size_t cap) {
@@ -1261,7 +1355,7 @@ int quicclient_connect_token(quicclient_t* client, const char* host, uint16_t po
                              const char* server_name, int verbose,
                              const uint8_t* token, size_t token_len) {
     return __connect(client, host, port, server_name, verbose, token, token_len,
-                     0, 0, 0, 0, 0, NULL, NULL);
+                     0, 0, 0, 0, 0, NULL, NULL, 0, 0);
 }
 
 static int __connect(quicclient_t* client, const char* host, uint16_t port,
@@ -1270,7 +1364,8 @@ static int __connect(quicclient_t* client, const char* host, uint16_t port,
                      unsigned loss_out_pct, unsigned loss_in_pct,
                      unsigned reorder_pct, unsigned dup_pct, uint64_t seed,
                      void (*out)(void* arg, const uint8_t* data, size_t len),
-                     void* out_arg) {
+                     void* out_arg,
+                     uint64_t conn_window, uint64_t stream_window) {
     if (client == NULL) return 0;
 
     memset(client, 0, sizeof * client);
@@ -1278,6 +1373,11 @@ static int __connect(quicclient_t* client, const char* host, uint16_t port,
     client->fd = -1;
     client->out = out;
     client->out_arg = out_arg;
+    /* Before __handshake_start, which is what turns these into the transport
+     * parameters the peer will be held to. Zero means "the generous default"
+     * and is filled in there. */
+    client->conn_window = conn_window;
+    client->stream_window = stream_window;
 
     for (int i = 0; i < QUIC_ENC_COUNT; i++) {
         quicsendbuf_init(&client->crypto_out[i]);

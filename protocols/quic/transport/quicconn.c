@@ -1930,7 +1930,26 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
             size_t room = payload_cap - p - 24;
             if (!resending && allowed < room) room = (size_t)allowed;
 
-            if (room == 0 && !(s->send.fin && !s->send.fin_sent)) {
+            /* A FIN with nothing in front of it left to send is the one thing a
+             * closed window does not stop (§4.1: an empty frame carrying only
+             * the FIN consumes no credit), so the loop falls through to it.
+             *
+             * The test is `sent_off == write_off`, not merely "a FIN is
+             * queued": a response written in one go -- which is every response
+             * the h3 layer produces -- has its FIN queued from the first byte,
+             * and treating that as "the FIN is all that is left" made the whole
+             * branch below unreachable for exactly the case it exists for. The
+             * sender then hit the window and went completely silent: no
+             * STREAM_DATA_BLOCKED, no packet, nothing in flight to arm a timer.
+             * Its peer, which had no reason to raise a limit it did not know
+             * was in the way, waited out the idle timeout. Found in the
+             * deterministic stand (docs/http3/08-testing.md §2h), which is the
+             * first thing here that could advertise a window small enough to
+             * reach. */
+            const int fin_alone = s->send.fin && !s->send.fin_sent &&
+                                  s->send.sent_off == s->send.write_off;
+
+            if (room == 0 && !fin_alone) {
                 /* Only a closed window is counted, not a full packet: the
                  * second is the loop doing its job and would bury the first,
                  * which is a stall the peer has to end.

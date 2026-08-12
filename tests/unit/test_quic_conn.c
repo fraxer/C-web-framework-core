@@ -1248,13 +1248,25 @@ static size_t __drain(stand_t* s, uint8_t* got, size_t total) {
     size_t have = 0;
 
     for (int round = 0; round < 200000 && have < total; round++) {
-        if (!__step(s, __now_us + 60000000)) break;
-
+        /* Read before stepping: whatever is already waiting was put there by
+         * the exchange so far, and a loop that steps first would jump the clock
+         * to the next timer -- which, on a connection stalled against a closed
+         * window, is the idle timeout. */
         const size_t ready = quicclient_stream_readable(&s->client, 0);
-        if (ready == 0) continue;
+
+        if (ready == 0) {
+            if (!__step(s, __now_us + 60000000)) break;
+            continue;
+        }
 
         have += quicclient_stream_read(&s->client, 0, got + have,
                                        total - have < ready ? total - have : ready);
+
+        /* Reading earns the peer credit, and the frames that carry it need a
+         * packet to leave in. Nothing else builds one here: a blocked server
+         * sends nothing, so waiting for its next datagram to piggyback on is
+         * waiting for the thing the credit is supposed to cause. */
+        if (!quicclient_flush(&s->client)) break;
     }
 
     return have;
@@ -1709,6 +1721,90 @@ TEST(test_quic_stand_reset_opens_stream) {
 
     (void)streams_before;
 
+    free(body);
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_flow_control) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a response stops at the receive window and resumes when credit arrives");
+    /* The last of §2's list, and the one the client could not express: it
+     * advertised 64 MB and never sent a MAX_DATA, so no window in the exchange
+     * was ever reachable. A limit that is never met is a limit that is never
+     * tested -- and the code that raises one is where three of this phase's
+     * bugs were.
+     *
+     * Here it advertises 48 KB on the connection and 16 KB on the stream, and
+     * the test reads nothing until it has checked that the server stopped. Both
+     * limits are in play, and the smaller one has to bite first. */
+    stand_t* s = __stand_create(20);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    const uint64_t conn_window = 48 * 1024;
+    const uint64_t stream_window = 16 * 1024;
+
+    TEST_ASSERT(quicclient_connect_inproc_windowed(&s->client, "localhost", s->trace,
+                                                   __client_out, s,
+                                                   conn_window, stream_window),
+                "connecting with a window that can be reached");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+
+    quicstream_t* qs = __open_request_stream(s);
+    TEST_REQUIRE_NOT_NULL(qs, "the server has the stream");
+    TEST_ASSERT(__consume_request(s, 0), "the request was read");
+
+    const size_t total = 128 * 1024;
+    uint8_t* body = __body_make(total);
+    TEST_REQUIRE_NOT_NULL(body, "body allocated");
+
+    TEST_ASSERT(__respond(s, qs, body, total), "queued on the stream");
+
+    /* Nothing is read here on purpose. */
+    __run(s, 1000000, NULL);
+
+    const size_t stalled_at = quicclient_stream_readable(&s->client, 0);
+
+    if (s->trace)
+        printf("      stalled at %zu bytes (stream window %llu), blocked frames %llu/%llu\n",
+               stalled_at, (unsigned long long)stream_window,
+               (unsigned long long)s->client.data_blocked_received,
+               (unsigned long long)s->client.stream_data_blocked_received);
+
+    /* It stopped, and it stopped at the smaller of the two limits rather than
+     * wherever the congestion window happened to run out. */
+    TEST_ASSERT(stalled_at >= stream_window, "the whole stream window was used");
+    TEST_ASSERT(stalled_at <= stream_window + STAND_MAX_DGRAM,
+                "and nothing beyond it");
+
+    /* And it said so. A sender that stalls silently is indistinguishable from
+     * one that has died, which is the whole reason §4.1 asks for the frame. */
+    TEST_ASSERT(s->client.stream_data_blocked_received > 0, "and said it was blocked");
+
+    TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
+    TEST_ASSERT(s->conn->state == QUICCONN_ACTIVE, "and alive, not closed");
+
+    /* Now read, which is what earns the credit -- and the rest arrives. */
+    uint8_t* got = calloc(1, total);
+    TEST_REQUIRE_NOT_NULL(got, "sink allocated");
+
+    const size_t have = __drain(s, got, total);
+
+    if (have != total || s->trace)
+        printf("      after reading: %zu of %zu, blocked frames %llu/%llu\n",
+               have, total,
+               (unsigned long long)s->client.data_blocked_received,
+               (unsigned long long)s->client.stream_data_blocked_received);
+
+    TEST_ASSERT(have == total, "every byte arrived once the window opened");
+    TEST_ASSERT(memcmp(got, body, total) == 0, "and in the right order, exactly once");
+    TEST_ASSERT(quicclient_stream_fin(&s->client, 0), "and the stream finished");
+
+    /* The connection-level limit was reached too -- 128 KB through a 48 KB
+     * window cannot happen on one MAX_DATA. */
+    TEST_ASSERT(s->client.conn_limit > conn_window, "the connection window was raised");
+
+    free(got);
     free(body);
     __stand_free(s);
 }
