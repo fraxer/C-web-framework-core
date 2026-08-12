@@ -412,6 +412,16 @@ int quicclient_stop_sending(quicclient_t* client, uint64_t id, uint64_t error) {
     return 1;
 }
 
+int quicclient_close(quicclient_t* client, uint64_t error, int is_app) {
+    if (client == NULL) return 0;
+
+    client->close_queued = 1;
+    client->close_send_error = error;
+    client->close_send_is_app = is_app;
+
+    return 1;
+}
+
 int quicclient_reset_stream(quicclient_t* client, uint64_t id, uint64_t error) {
     if (client == NULL) return 0;
 
@@ -506,6 +516,25 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
             p += n;
             c->path_response_queued = 0;
             __log(c, "  [client] -> PATH_RESPONSE\n");
+        }
+    }
+
+    /* Ours to send, and it ends the connection: nothing after it in this packet
+     * would ever be read, so it goes last among the frames we build and the
+     * loop stops caring about the rest. */
+    if (level == QUIC_ENC_APP && c->close_queued) {
+        quicframe_t f;
+        memset(&f, 0, sizeof f);
+        f.type = c->close_send_is_app ? QUIC_FRAME_CONNECTION_CLOSE_APP
+                                      : QUIC_FRAME_CONNECTION_CLOSE;
+        f.u.close.error = c->close_send_error;
+
+        const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
+        if (n > 0) {
+            p += n;
+            c->close_queued = 0;
+            __log(c, "  [client] -> CONNECTION_CLOSE 0x%llx\n",
+                  (unsigned long long)c->close_send_error);
         }
     }
 

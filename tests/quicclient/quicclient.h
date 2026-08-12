@@ -189,6 +189,11 @@ typedef struct quicclient {
     int      ping_queued;
     uint64_t datagrams_received;
 
+    /* A CONNECTION_CLOSE of our own, waiting for the next packet (§19.19). */
+    int      close_queued;
+    uint64_t close_send_error;
+    int      close_send_is_app;
+
     /* ---- Receive-side flow control (RFC 9000 §4) ---- *
      *
      * The client used to advertise 64 MB and never send a MAX_DATA, which made
@@ -442,6 +447,12 @@ int quicclient_stop_sending(quicclient_t* client, uint64_t id, uint64_t error);
  * actually sent -- which, when part of it was lost, is more than the peer
  * received, and that difference is what §4.5 makes it account for. */
 int quicclient_reset_stream(quicclient_t* client, uint64_t id, uint64_t error);
+
+/* Close the connection ourselves (§10.2), so the peer has to handle the state
+ * it is least often tested in: draining. A peer that has been told to close
+ * must send nothing further -- not even an acknowledgement -- and simply wait
+ * the period out (§10.2.2). Nothing else in this client can produce that. */
+int quicclient_close(quicclient_t* client, uint64_t error, int is_app);
 
 /* Done with this stream: free its buffers and the slot.
  *

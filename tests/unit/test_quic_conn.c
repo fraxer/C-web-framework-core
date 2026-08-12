@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "quicclient.h"
 #include "quiccc.h"
@@ -827,6 +828,10 @@ static int __read_after_update(stand_t* s) {
 
 static int __challenged(stand_t* s) {
     return s->client.path_challenge_received;
+}
+
+static int __draining(stand_t* s) {
+    return s->conn != NULL && s->conn->state == QUICCONN_DRAINING;
 }
 
 static int __stream0_reset(stand_t* s) {
@@ -2008,6 +2013,140 @@ TEST(test_quic_stand_flow_control) {
     __stand_free(s);
 }
 
+/* The body pattern, generated at an offset rather than held in memory: a
+ * hundred megabytes of it would otherwise be two hundred, once to send and once
+ * to compare. */
+static void __pattern_fill(uint8_t* dst, size_t offset, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        const size_t j = offset + i;
+        dst[i] = (uint8_t)(j * 31 + (j >> 8));
+    }
+}
+
+TEST(test_quic_stand_large_transfer) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a response far larger than any buffer arrives byte for byte");
+    /* §2's "100 MB down one stream", which is a different test from the ones
+     * above rather than a bigger one. What only size reaches: the send buffer's
+     * compaction as acknowledgements retire its prefix, the packet number
+     * growing past its short encodings, the congestion window in steady state
+     * rather than in slow start, and the write-ahead budget -- the application
+     * here refills through quicconn_write_room exactly as the h3 layer does,
+     * so the buffer stays bounded while the stream does not.
+     *
+     * One megabyte by default, because the whole runner is two seconds and a
+     * sanitised build moves about 2 MB a second (docs/http3/08 §7). The real
+     * figure is a Release build and STAND_BIG_MB=100, which is where this was
+     * measured; the small default keeps the path itself under test everywhere. */
+    size_t megabytes = 1;
+    const char* env = getenv("STAND_BIG_MB");
+    if (env != NULL) {
+        const long n = strtol(env, NULL, 10);
+        if (n > 0) megabytes = (size_t)n;
+    }
+
+    const size_t total = megabytes * 1024 * 1024;
+
+    stand_t* s = __stand_create(24);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+
+    quicstream_t* qs = __open_request_stream(s);
+    TEST_REQUIRE_NOT_NULL(qs, "the server has the stream");
+    TEST_ASSERT(__consume_request(s, 0), "the request was read");
+
+    uint8_t chunk[64 * 1024];
+    uint8_t got[64 * 1024];
+
+    size_t written = 0;
+    size_t have = 0;
+    int intact = 1;
+
+    const uint64_t began = __now_us;
+    const clock_t wall = clock();
+
+    for (int round = 0; round < 20000000 && have < total; round++) {
+        /* Top up as far as the write-ahead budget allows, which is what an
+         * application is supposed to do and what nothing else here tests. */
+        if (s->conn != NULL && written < total) {
+            size_t before = written;
+
+            connection_s_lock(&s->conn->conn, LOCK_SITE_QUIC_SEND);
+
+            while (written < total) {
+                const size_t room = quicconn_write_room(s->conn);
+                if (room == 0) break;
+
+                size_t take = room < sizeof chunk ? room : sizeof chunk;
+                if (take > total - written) take = total - written;
+
+                __pattern_fill(chunk, written, take);
+                if (!quicstream_write(qs, chunk, take)) break;
+
+                written += take;
+            }
+
+            if (written == total) quicstream_finish(qs);
+
+            connection_s_unlock(&s->conn->conn);
+
+            /* Only when something was actually produced. Waking the endpoint on
+             * every turn of this loop keeps it permanently woken -- and since a
+             * woken endpoint is an event due *now*, the stand's clock stops
+             * advancing and the datagrams already in flight never arrive. The
+             * first version of this test spun twenty million times at t=0. */
+            if (written > before) quicconn_want_write(&s->conn->conn);
+        }
+
+        const size_t ready = quicclient_stream_readable(&s->client, 0);
+
+        if (ready == 0) {
+            if (!__step(s, __now_us + 120000000)) break;
+            continue;
+        }
+
+        size_t want = ready < sizeof got ? ready : sizeof got;
+        if (want > total - have) want = total - have;
+
+        const size_t n = quicclient_stream_read(&s->client, 0, got, want);
+
+        /* Verified against the generator as it arrives, so nothing has to be
+         * kept: at this size the comparison buffer would be the memory. */
+        __pattern_fill(chunk, have, n);
+        if (memcmp(got, chunk, n) != 0) intact = 0;
+
+        have += n;
+
+        if (!quicclient_flush(&s->client)) break;
+    }
+
+    const uint64_t elapsed = __now_us - began;
+
+    if (megabytes > 4 || have != total || s->trace)
+        printf("      %zu MB: %zu bytes, %llu ms of virtual time, %.1f s of wall clock"
+               " (%.1f MB/s virtual)\n",
+               megabytes, have, (unsigned long long)(elapsed / 1000),
+               (double)(clock() - wall) / CLOCKS_PER_SEC,
+               elapsed > 0 ? (double)have / (double)elapsed : 0.0);
+
+    TEST_ASSERT(have == total, "every byte arrived");
+    TEST_ASSERT(intact, "and in the right order, exactly once");
+    TEST_ASSERT(quicclient_stream_fin(&s->client, 0), "and the stream finished");
+
+    TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
+    TEST_ASSERT(s->conn->state == QUICCONN_ACTIVE, "and unharmed");
+
+    /* The point of refilling through the budget: the send buffer never held the
+     * whole response, however big the response was. */
+    TEST_ASSERT(quicconn_unsent_bytes(s->conn) <= QUICCONN_WRITE_AHEAD_MAX,
+                "the write-ahead budget was respected throughout");
+
+    __stand_free(s);
+}
+
 TEST(test_quic_stand_bottleneck) {
     TEST_SUITE("quic_stand");
 
@@ -2177,6 +2316,131 @@ TEST(test_quic_stand_connection_close) {
     /* §10.2.1: the closing endpoint holds the packet for three PTOs so a lost
      * close is re-sent in answer to anything that arrives, and only then goes. */
     TEST_ASSERT(__run(s, 5000000, __conn_gone), "and the connection was reaped");
+
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_close_during_handshake) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a connection closed mid-handshake is readable by a peer that has no 1-RTT keys");
+    /* The most expensive defect h3spec found (§3d.7), as a test.
+     *
+     * CONNECTION_CLOSE used to go out at one level, chosen by *our* keys -- and
+     * a server owns 1-RTT keys from the moment it sends its Finished, a whole
+     * flight before the client can read them. Every error found during a
+     * handshake therefore travelled in a packet the peer could not open: the
+     * server closed correctly and the peer saw silence until its timeout,
+     * which is the worst failure mode the protocol has.
+     *
+     * So the assertion is not "it closed" but "the peer read the close", and
+     * the moment is chosen to be exactly the one that used to fail: the client
+     * has sent its ClientHello and nothing more. */
+    stand_t* s = __stand_create(21);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    TEST_ASSERT(__start(s), "the ClientHello went out");
+
+    /* One step: the server has the flight and has answered, and the client has
+     * not yet processed the answer, so it holds Initial keys and nothing else. */
+    __step(s, __now_us + 100000);
+
+    TEST_REQUIRE_NOT_NULL(s->conn, "the server accepted the connection");
+    TEST_ASSERT(s->conn->state == QUICCONN_HANDSHAKE, "and is still handshaking");
+    TEST_ASSERT(!s->client.tx[QUIC_ENC_APP].valid, "the client has no 1-RTT keys yet");
+
+    connection_s_lock(&s->conn->conn, LOCK_SITE_QUIC_SEND);
+    quicconn_close(s->conn, QUIC_CONNECTION_REFUSED, 0, __now_us);
+    connection_s_unlock(&s->conn->conn);
+    quicconn_want_write(&s->conn->conn);
+
+    TEST_ASSERT(__run(s, 1000000, __closed), "the client read the close");
+    TEST_ASSERT(s->client.close_error == QUIC_CONNECTION_REFUSED, "with the reason");
+
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_closing_repeats) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a closing connection answers what arrives, and only that (§10.2.1)");
+    /* §10.2.1 gives the closing state one job: re-send the close packet in
+     * answer to an incoming packet, so a lost close does not leave the peer
+     * waiting out its idle timeout. In answer to a packet -- not on a timer,
+     * which is what makes a peer that keeps sending unable to turn this into an
+     * amplifier.
+     *
+     * Both halves are asserted, and the second is the one a lazy implementation
+     * gets wrong: silence when nothing arrives. */
+    stand_t* s = __stand_create(22);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    connection_s_lock(&s->conn->conn, LOCK_SITE_QUIC_SEND);
+    quicconn_close(s->conn, QUIC_APPLICATION_ERROR, 1, __now_us);
+    connection_s_unlock(&s->conn->conn);
+    quicconn_want_write(&s->conn->conn);
+
+    TEST_ASSERT(__run(s, 1000000, __closed), "the first close arrived");
+
+    /* Quiet: nothing goes to a peer that says nothing. Kept short on purpose --
+     * the closing period is three PTOs, and a longer look would be measuring
+     * the connection's reaping instead. */
+    const uint64_t after_first = s->sent_to_client;
+    __run(s, 50000, NULL);
+    TEST_ASSERT(s->sent_to_client == after_first, "and nothing is sent unprompted");
+    TEST_REQUIRE_NOT_NULL(s->conn, "still closing, not yet reaped");
+
+    /* Prompted: a packet arrives, an answer goes back. */
+    TEST_ASSERT(quicclient_ping(&s->client), "poke it");
+    TEST_ASSERT(quicclient_flush(&s->client), "sent");
+    __run(s, 500000, NULL);
+
+    TEST_ASSERT(s->sent_to_client > after_first, "the close was repeated on demand");
+
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_draining) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a peer's CONNECTION_CLOSE puts us in draining: silent, then gone (§10.2.2)");
+    /* The state nothing else here reaches. Told that the peer has closed, an
+     * endpoint must send nothing at all -- not even an acknowledgement of what
+     * it has just been told -- and wait the period out, so that a late packet
+     * cannot provoke a stateless reset at a peer that has already gone.
+     *
+     * "Nothing at all" is the assertion, and it is worth making because the
+     * natural implementation of a receive path is to answer. */
+    stand_t* s = __stand_create(23);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    TEST_ASSERT(quicclient_close(&s->client, 0x99, 0), "the client closes");
+    TEST_ASSERT(quicclient_flush(&s->client), "sent");
+
+    /* Stopped at the state rather than after a fixed window: the drain period
+     * is three PTOs, and a window long enough to be safe is also long enough to
+     * outlast it -- the connection would be gone before the assertion looked. */
+    TEST_ASSERT(__run(s, 200000, __draining), "the peer's close put it in draining");
+
+    /* Not a word, whatever arrives. */
+    const uint64_t quiet_from = s->sent_to_client;
+
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT(quicclient_ping(&s->client), "poke it");
+        TEST_ASSERT(quicclient_flush(&s->client), "sent");
+        __run(s, 200000, NULL);
+    }
+
+    TEST_ASSERT(s->sent_to_client == quiet_from, "and it said nothing at all");
+
+    /* And then it goes, rather than sitting in the table for ever. */
+    TEST_ASSERT(__run(s, 5000000, __conn_gone), "the connection was reaped");
 
     __stand_free(s);
 }
