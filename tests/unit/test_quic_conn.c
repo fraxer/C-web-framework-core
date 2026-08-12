@@ -2125,12 +2125,18 @@ TEST(test_quic_stand_large_transfer) {
 
     const uint64_t elapsed = __now_us - began;
 
-    if (megabytes > 4 || have != total || s->trace)
-        printf("      %zu MB: %zu bytes, %llu ms of virtual time, %.1f s of wall clock"
-               " (%.1f MB/s virtual)\n",
-               megabytes, have, (unsigned long long)(elapsed / 1000),
-               (double)(clock() - wall) / CLOCKS_PER_SEC,
+    if (megabytes > 4 || have != total || s->trace) {
+        const double cpu_ms = (double)(clock() - wall) * 1000.0 / CLOCKS_PER_SEC;
+
+        /* Cost per megabyte, not total: the open question in §7 is whether it
+         * grows with the size of the transfer, and a total tells you nothing
+         * about that without arithmetic done by hand. */
+        printf("      %zu MB: %zu bytes, %llu ms virtual, %.0f ms CPU"
+               " (%.2f ms/MB, %.1f MB/s virtual)\n",
+               megabytes, have, (unsigned long long)(elapsed / 1000), cpu_ms,
+               cpu_ms / (double)megabytes,
                elapsed > 0 ? (double)have / (double)elapsed : 0.0);
+    }
 
     TEST_ASSERT(have == total, "every byte arrived");
     TEST_ASSERT(intact, "and in the right order, exactly once");
