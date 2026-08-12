@@ -374,6 +374,15 @@ int quicclient_stream_fin(quicclient_t* client, uint64_t id) {
     return s != NULL && s->in_fin;
 }
 
+void quicclient_stream_release(quicclient_t* client, uint64_t id) {
+    clientstream_t* s = __stream_get(client, id, 0);
+    if (s == NULL) return;
+
+    quicsendbuf_free(&s->out);
+    quicrecvbuf_free(&s->in);
+    memset(s, 0, sizeof * s);
+}
+
 static size_t __build(quicclient_t* c, quic_enc_level_e level,
                       uint8_t* dst, size_t cap, int pad_to_minimum) {
     quickeys_t* keys = &c->tx[level];

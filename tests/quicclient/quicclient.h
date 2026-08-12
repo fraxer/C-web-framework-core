@@ -36,10 +36,16 @@
  * the packet loop, which is what has to be independent for the test to mean
  * anything. */
 
-/* Streams the test drives. A handful is plenty: HTTP/3 needs one control
- * stream, one request stream, and room for whatever the server opens back --
- * its control stream and both QPACK streams. */
-#define CLIENT_MAX_STREAMS 16
+/* Streams the test drives.
+ *
+ * A handful covers one exchange -- HTTP/3 needs one control stream, one request
+ * stream, and room for whatever the server opens back. The rest of the room is
+ * for the parallel-stream scenarios of docs/http3/08-testing.md §2: the send
+ * path's round-robin between streams, and the stream credit that MAX_STREAMS
+ * renews, are only exercised by a peer that has many open at once. Slots are
+ * reusable (quicclient_stream_release), so a run that opens hundreds one after
+ * another needs no more than this. */
+#define CLIENT_MAX_STREAMS 64
 
 typedef struct clientstream {
     uint64_t      id;
@@ -347,6 +353,14 @@ size_t quicclient_stream_read(quicclient_t* client, uint64_t id,
 
 /* Has the server finished its half of this stream? */
 int quicclient_stream_fin(quicclient_t* client, uint64_t id);
+
+/* Done with this stream: free its buffers and the slot.
+ *
+ * The peer's stream credit is renewed per stream, not per byte, so a scenario
+ * that opens more streams than the initial allowance has to let go of the ones
+ * it has finished with -- otherwise it runs out of slots here long before the
+ * server runs out of credit, and the test would be measuring the harness. */
+void quicclient_stream_release(quicclient_t* client, uint64_t id);
 
 /* One turn of the loop: send what is queued, then receive for up to
  * `timeout_ms`. Unlike quicclient_run it has no completion condition of its

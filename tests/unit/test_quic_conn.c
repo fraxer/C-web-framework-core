@@ -1220,6 +1220,224 @@ static size_t __drain(stand_t* s, uint8_t* got, size_t total) {
     return have;
 }
 
+/* What an application does with a request stream, minus the HTTP: read what the
+ * peer sent (which is what moves the stream to DATA_READ and lets the transport
+ * release it), then answer and end it. Returns 0 if the stream is not there. */
+static int __serve(stand_t* s, uint64_t id, const uint8_t* body, size_t len) {
+    if (s->conn == NULL) return 0;
+
+    quicstream_t* qs = quicconn_stream_find(s->conn, id);
+    if (qs == NULL) return 0;
+
+    connection_s_lock(&s->conn->conn, LOCK_SITE_QUIC_SEND);
+
+    uint8_t sink[256];
+    size_t taken = 0;
+    for (;;) {
+        const size_t n = quicstream_read(qs, sink, sizeof sink);
+        if (n == 0) break;
+        taken += n;
+    }
+
+    /* The connection-level half of the window, which quicstream_read cannot
+     * credit because a stream deliberately does not know its connection. An
+     * application that forgets it stalls after initial_max_data. */
+    if (taken > 0) quicconn_consumed(s->conn, taken);
+
+    const int ok = len == 0 || quicstream_write(qs, body, len);
+    quicstream_finish(qs);
+
+    connection_s_unlock(&s->conn->conn);
+
+    quicconn_want_write(&s->conn->conn);
+
+    return ok;
+}
+
+TEST(test_quic_stand_parallel_streams) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("thirty-two streams in flight at once, each intact, through a lossy path");
+    /* The send path shares one connection between all open streams by
+     * round-robin, and until now nothing in the tests had more than one. What
+     * that scheduling gets wrong is not "does data arrive" but "does *this*
+     * stream's data arrive on this stream": an offset applied to the wrong
+     * stream, or a frame built for one and accounted to another, produces a
+     * connection where everything works and one response is subtly another's.
+     * Hence a different body per stream, and every byte checked.
+     *
+     * Loss on top, because the interesting interaction is retransmission across
+     * streams: the lost frames of thirty-two streams come back through one
+     * congestion window. */
+    stand_t* s = __stand_create(14);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+
+#define PARALLEL_STREAMS 32
+
+    /* Client-initiated bidirectional ids are 0, 4, 8, ... (§2.1). */
+    for (int i = 0; i < PARALLEL_STREAMS; i++) {
+        const uint8_t request[4] = { 'G', 'E', 'T', (uint8_t)i };
+        TEST_ASSERT(quicclient_stream_write(&s->client, (uint64_t)i * 4,
+                                            request, sizeof request, 1),
+                    "request queued");
+    }
+
+    TEST_ASSERT(quicclient_flush(&s->client), "sent");
+    __run(s, 500000, NULL);
+
+    /* Bodies of different lengths as well as different contents: a stream that
+     * received another's data would otherwise still be the right size. */
+    size_t lens[PARALLEL_STREAMS];
+    uint8_t* bodies[PARALLEL_STREAMS];
+
+    for (int i = 0; i < PARALLEL_STREAMS; i++) {
+        lens[i] = 512 + (size_t)i * 137;
+        bodies[i] = malloc(lens[i]);
+        TEST_REQUIRE_NOT_NULL(bodies[i], "body allocated");
+        for (size_t j = 0; j < lens[i]; j++)
+            bodies[i][j] = (uint8_t)(j * 31 + i * 7 + 1);
+
+        TEST_ASSERT(__serve(s, (uint64_t)i * 4, bodies[i], lens[i]), "answered");
+    }
+
+    /* "Parallel" as a fact rather than an intention: all of them are open on the
+     * server at this moment, so what follows really is one window shared
+     * between thirty-two streams. */
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+    TEST_ASSERT(s->conn->stream_count >= PARALLEL_STREAMS, "all of them open at once");
+
+    s->loss_to_client_pct = 15;
+    s->loss_to_server_pct = 15;
+
+    uint8_t* got[PARALLEL_STREAMS];
+    size_t have[PARALLEL_STREAMS];
+
+    for (int i = 0; i < PARALLEL_STREAMS; i++) {
+        got[i] = calloc(1, lens[i]);
+        TEST_REQUIRE_NOT_NULL(got[i], "sink allocated");
+        have[i] = 0;
+    }
+
+    int complete = 0;
+
+    for (int round = 0; round < 200000 && complete < PARALLEL_STREAMS; round++) {
+        if (!__step(s, __now_us + 60000000)) break;
+
+        complete = 0;
+        for (int i = 0; i < PARALLEL_STREAMS; i++) {
+            const uint64_t id = (uint64_t)i * 4;
+            const size_t ready = quicclient_stream_readable(&s->client, id);
+
+            if (ready > 0 && have[i] < lens[i]) {
+                const size_t room = lens[i] - have[i];
+                have[i] += quicclient_stream_read(&s->client, id, got[i] + have[i],
+                                                  room < ready ? room : ready);
+            }
+
+            if (have[i] == lens[i] && quicclient_stream_fin(&s->client, id)) complete++;
+        }
+    }
+
+    int intact = 0;
+    for (int i = 0; i < PARALLEL_STREAMS; i++)
+        if (have[i] == lens[i] && memcmp(got[i], bodies[i], lens[i]) == 0) intact++;
+
+    if (complete != PARALLEL_STREAMS || intact != PARALLEL_STREAMS)
+        printf("      %d of %d complete, %d intact; lost %llu/%llu\n",
+               complete, PARALLEL_STREAMS, intact,
+               (unsigned long long)s->lost_to_client,
+               (unsigned long long)s->lost_to_server);
+
+    TEST_ASSERT(complete == PARALLEL_STREAMS, "every stream finished");
+    TEST_ASSERT(intact == PARALLEL_STREAMS, "and carried its own body, exactly");
+    TEST_ASSERT(s->lost_to_client > 0, "the path really did lose datagrams");
+
+    for (int i = 0; i < PARALLEL_STREAMS; i++) {
+        free(bodies[i]);
+        free(got[i]);
+    }
+
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_stream_credit) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("more streams than the initial allowance, one after another (§4.6)");
+    /* The wall that a third-party client found and no test of ours could
+     * (docs/http3/08 §7a): stream credit is granted per stream and never
+     * renewed, so a connection is spent after initial_max_streams_bidi
+     * requests -- a hundred here. Not a slow path, a wall.
+     *
+     * MAX_STREAMS renews it, but only for streams the transport has actually
+     * released, and it releases a peer's stream only once both directions are
+     * done *and* the application has read what arrived. That is why __serve
+     * reads the request it is about to answer, and it is the part a stand that
+     * only writes would silently not test. */
+    stand_t* s = __stand_create(15);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    const uint64_t allowance = s->conn->local_params.initial_max_streams_bidi;
+    TEST_ASSERT(allowance > 0, "an allowance was advertised");
+
+    /* Half again as many as the allowance: enough that a connection with no
+     * renewal fails, and few enough to stay a unit test. */
+    const uint64_t wanted = allowance + allowance / 2;
+    uint64_t served = 0;
+
+    const uint8_t body[64] = { 0 };
+
+    for (uint64_t i = 0; i < wanted; i++) {
+        const uint64_t id = i * 4;
+
+        if (!quicclient_stream_write(&s->client, id, (const uint8_t*)"GET", 3, 1)) break;
+        if (!quicclient_flush(&s->client)) break;
+
+        __run(s, 500000, NULL);
+
+        if (!__serve(s, id, body, sizeof body)) break;
+
+        /* Wait for the whole answer, then let go of the slot -- both halves of
+         * the stream are finished, which is exactly the state that earns the
+         * credit back. */
+        for (int round = 0; round < 2000; round++) {
+            if (quicclient_stream_readable(&s->client, id) >= sizeof body &&
+                quicclient_stream_fin(&s->client, id))
+                break;
+            if (!__step(s, __now_us + 2000000)) break;
+        }
+
+        if (!quicclient_stream_fin(&s->client, id)) break;
+
+        quicclient_stream_release(&s->client, id);
+        served++;
+    }
+
+    if (served != wanted || s->trace)
+        printf("      served %llu of %llu (allowance %llu), closed %llu, state %d\n",
+               (unsigned long long)served, (unsigned long long)wanted,
+               (unsigned long long)allowance,
+               s->conn != NULL ? (unsigned long long)s->conn->peer_bidi_closed : 0,
+               s->conn != NULL ? (int)s->conn->state : -1);
+
+    TEST_ASSERT(served == wanted, "the connection kept accepting streams past the allowance");
+    TEST_REQUIRE_NOT_NULL(s->conn, "and stayed alive");
+    TEST_ASSERT(s->conn->state == QUICCONN_ACTIVE, "still active");
+
+    /* The transport really did let them go, rather than accumulating them: the
+     * per-packet walk over conn->streams is only short if this happens. */
+    TEST_ASSERT(s->conn->stream_count < allowance, "and released the finished ones");
+
+    __stand_free(s);
+}
+
 TEST(test_quic_stand_bottleneck) {
     TEST_SUITE("quic_stand");
 
