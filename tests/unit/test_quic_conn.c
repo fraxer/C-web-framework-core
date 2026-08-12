@@ -82,6 +82,11 @@ typedef struct standpkt {
     uint8_t  data[STAND_MAX_DGRAM];
     size_t   len;
     uint64_t due_us;
+    /* When the bottleneck link starts putting this datagram on the wire. Until
+     * then it is sitting in the queue, and that is what makes the queue's depth
+     * a number rather than a guess. Equal to the moment it was sent when there
+     * is no bandwidth limit. */
+    uint64_t start_us;
     /* Total order among datagrams due at the same instant, so "which arrives
      * first" is never left to the queue's internal layout. */
     uint64_t seq;
@@ -108,6 +113,27 @@ typedef struct stand {
     unsigned reorder_pct;
     uint64_t reorder_extra_us;  /* how late a reordered datagram is */
 
+    /* ---- The bottleneck (0 = an infinitely fast path, as above) ---- *
+     *
+     * A link with a rate and a queue in front of it, which is a different thing
+     * from a link that loses at random and tests different code. Random loss
+     * asks "does recovery work"; a queue asks "does the sender stay inside the
+     * path", and a sender that does not gets its own overflow back as loss --
+     * congestion signal and consequence in one. That is the shape of the
+     * interop path (`simple-p2p --delay=15ms --bandwidth=10Mbps --queue=25`),
+     * where this project has already been bitten twice: §3i's sender emptied a
+     * whole flow-control window into a queue that held a twentieth of it, and
+     * the peer received under a tenth of what was sent.
+     *
+     * One rate and one queue for both directions: the interop model is
+     * symmetric, and two of each would be two more numbers to explain. */
+    uint64_t bandwidth_bps;
+    size_t   queue_pkts;
+    /* When the link finishes what it is transmitting, per direction. A datagram
+     * handed over before then waits. */
+    uint64_t link_free_to_server;
+    uint64_t link_free_to_client;
+
     /* Scripted, not random: "lose the server's first flight" is a scenario,
      * not a probability. */
     unsigned drop_next_to_client;
@@ -128,6 +154,10 @@ typedef struct stand {
     uint64_t sent_to_server, sent_to_client;
     uint64_t lost_to_server, lost_to_client;
     uint64_t delivered_to_server, delivered_to_client;
+    /* Tail drops, counted apart from the losses above. The cause is different --
+     * the sender's own overrun rather than the path's misfortune -- and a test
+     * that could not tell them apart would report the sender's bug as bad luck. */
+    uint64_t queue_dropped_to_server, queue_dropped_to_client;
     uint64_t overflowed;            /* the queue was full: a test bug, not a path */
 
     uint64_t marks[STAND_MAX_MARKS];   /* when the server handed over a datagram */
@@ -191,7 +221,7 @@ static standpkt_t* __slot(stand_t* s) {
 }
 
 static void __schedule(stand_t* s, const uint8_t* data, size_t len,
-                       int to_server, uint64_t due_us) {
+                       int to_server, uint64_t start_us, uint64_t due_us) {
     standpkt_t* p = __slot(s);
     if (p == NULL) {
         s->overflowed++;
@@ -200,10 +230,24 @@ static void __schedule(stand_t* s, const uint8_t* data, size_t len,
 
     memcpy(p->data, data, len);
     p->len = len;
+    p->start_us = start_us;
     p->due_us = due_us;
     p->seq = s->seq++;
     p->to_server = to_server;
     p->used = 1;
+}
+
+/* Datagrams in this direction that the link has not begun transmitting: the
+ * queue, exactly, rather than an estimate from the backlog in time. */
+static size_t __backlog(const stand_t* s, int to_server) {
+    size_t n = 0;
+
+    for (size_t i = 0; i < STAND_MAX_QUEUE; i++) {
+        const standpkt_t* p = &s->q[i];
+        if (p->used && p->to_server == to_server && p->start_us > __now_us) n++;
+    }
+
+    return n;
 }
 
 /* One datagram enters the path. Whether it comes out the other end, when, and
@@ -239,7 +283,33 @@ static void __net_send(stand_t* s, const uint8_t* data, size_t len, int to_serve
         return;
     }
 
-    uint64_t due = __now_us + s->delay_us;
+    /* Through the bottleneck, if there is one: wait for the link, then take the
+     * time the bytes actually need on it, then fly. */
+    uint64_t start = __now_us;
+    uint64_t serialise = 0;
+
+    if (s->bandwidth_bps > 0) {
+        if (s->queue_pkts > 0 && __backlog(s, to_server) >= s->queue_pkts) {
+            /* Tail drop, which is what a full queue does -- and the only
+             * congestion signal the sender is going to get. */
+            if (to_server) s->queue_dropped_to_server++;
+            else s->queue_dropped_to_client++;
+
+            __trace(s, "%s %zu bytes DROPPED (queue full)\n",
+                    to_server ? "c->s" : "s->c", len);
+            return;
+        }
+
+        uint64_t* link_free = to_server ? &s->link_free_to_server
+                                        : &s->link_free_to_client;
+
+        if (*link_free > start) start = *link_free;
+
+        serialise = (uint64_t)len * 8 * 1000000ULL / s->bandwidth_bps;
+        *link_free = start + serialise;
+    }
+
+    uint64_t due = start + serialise + s->delay_us;
 
     /* Reordering as extra delay rather than as a swap: a swap needs a
      * successor to swap with, so it silently does nothing to the last datagram
@@ -251,14 +321,15 @@ static void __net_send(stand_t* s, const uint8_t* data, size_t len, int to_serve
         s->sent_to_server == s->delay_nth_to_server)
         due += s->reorder_extra_us;
 
-    __schedule(s, data, len, to_server, due);
-    __trace(s, "%s %zu bytes, due %llu\n", to_server ? "c->s" : "s->c", len,
-            (unsigned long long)due);
+    __schedule(s, data, len, to_server, start, due);
+    __trace(s, "%s %zu bytes, due %llu%s\n", to_server ? "c->s" : "s->c", len,
+            (unsigned long long)due,
+            start > __now_us ? " (queued)" : "");
 
     /* A duplicate arrives just after the original, never before: that is what
      * a retransmitting middlebox does, and it keeps the order total. */
     if (s->dup_pct > 0 && __roll(s) < s->dup_pct)
-        __schedule(s, data, len, to_server, due + 1);
+        __schedule(s, data, len, to_server, start, due + 1);
 }
 
 /* The server's only way out (quicendpoint.h's send hook). */
@@ -1087,6 +1158,209 @@ TEST(test_quic_stand_stream_under_loss) {
     TEST_ASSERT(memcmp(got, body, total) == 0, "and in the right order, exactly once");
     TEST_ASSERT(s->lost_to_client > 0, "the path really did lose datagrams");
     TEST_ASSERT(s->overflowed == 0, "the emulator never dropped anything itself");
+
+    free(got);
+    free(body);
+    __stand_free(s);
+}
+
+/* Stream 0, opened the way a request opens it, with the server's side found and
+ * returned. NULL if anything went wrong. */
+static quicstream_t* __open_request_stream(stand_t* s) {
+    if (!quicclient_stream_write(&s->client, 0, (const uint8_t*)"GET", 3, 0)) return NULL;
+    if (!quicclient_flush(&s->client)) return NULL;
+
+    __run(s, 200000, NULL);
+
+    return s->conn != NULL ? quicconn_stream_find(s->conn, 0) : NULL;
+}
+
+/* A body with a pattern rather than zeroes: a truncation, a duplicated
+ * retransmission and an offset applied twice all look identical in a buffer of
+ * zeroes. */
+static uint8_t* __body_make(size_t total) {
+    uint8_t* body = malloc(total);
+    if (body == NULL) return NULL;
+
+    for (size_t i = 0; i < total; i++) body[i] = (uint8_t)(i * 31 + (i >> 8));
+
+    return body;
+}
+
+/* Put the whole body on the server's stream and end it. The FIN matters as much
+ * as the bytes: §3t was two deadlocks in which every byte arrived and the stream
+ * never finished. */
+static int __respond(stand_t* s, quicstream_t* qs, const uint8_t* body, size_t total) {
+    connection_s_lock(&s->conn->conn, LOCK_SITE_QUIC_SEND);
+    const int written = quicstream_write(qs, body, total);
+    quicstream_finish(qs);
+    connection_s_unlock(&s->conn->conn);
+
+    quicconn_want_write(&s->conn->conn);
+
+    return written;
+}
+
+/* Step the stand until the client has read `total` bytes, reading as it goes.
+ * Reading is not optional: without it the connection-level window closes and the
+ * transfer stalls for a reason that has nothing to do with the path. */
+static size_t __drain(stand_t* s, uint8_t* got, size_t total) {
+    size_t have = 0;
+
+    for (int round = 0; round < 200000 && have < total; round++) {
+        if (!__step(s, __now_us + 60000000)) break;
+
+        const size_t ready = quicclient_stream_readable(&s->client, 0);
+        if (ready == 0) continue;
+
+        have += quicclient_stream_read(&s->client, 0, got + have,
+                                       total - have < ready ? total - have : ready);
+    }
+
+    return have;
+}
+
+TEST(test_quic_stand_bottleneck) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a transfer through a 10 Mbps link with a 25-packet queue stays inside the path");
+    /* The interop path, in process: `simple-p2p --delay=15ms --bandwidth=10Mbps
+     * --queue=25`. Nothing here loses at random -- every drop is the sender's
+     * own overrun coming back to it, which is the only congestion signal the
+     * path offers and the only one that matters.
+     *
+     * This is the regression test for §3i, where the send window was checked
+     * after a packet had already gone out: the sender ran at line rate, emptied
+     * a flow-control window into a queue that could hold a twentieth of it, and
+     * the peer received under a tenth of what was sent. That failure is a ratio,
+     * so the assertion is a ratio. */
+    stand_t* s = __stand_create(12);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    s->delay_us = 15000;
+
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+
+    quicstream_t* qs = __open_request_stream(s);
+    TEST_REQUIRE_NOT_NULL(qs, "the server has the stream");
+
+    const size_t total = 512 * 1024;
+    uint8_t* body = __body_make(total);
+    TEST_REQUIRE_NOT_NULL(body, "body allocated");
+
+    TEST_ASSERT(__respond(s, qs, body, total), "queued on the stream");
+
+    /* The bottleneck switches on only now, so the handshake above is not part of
+     * what is being measured. */
+    s->bandwidth_bps = 10 * 1000 * 1000;
+    s->queue_pkts = 25;
+
+    const uint64_t began = __now_us;
+
+    uint8_t* got = calloc(1, total);
+    TEST_REQUIRE_NOT_NULL(got, "sink allocated");
+
+    const size_t have = __drain(s, got, total);
+    const uint64_t elapsed = __now_us - began;
+    const uint64_t queue_drops = s->queue_dropped_to_client;
+
+    if (have != total || s->trace)
+        printf("      %zu of %zu bytes in %llu us; sent %llu, delivered %llu, "
+               "queue drops %llu\n",
+               have, total, (unsigned long long)elapsed,
+               (unsigned long long)s->sent_to_client,
+               (unsigned long long)s->delivered_to_client,
+               (unsigned long long)queue_drops);
+
+    TEST_ASSERT(have == total, "every byte arrived");
+    TEST_ASSERT(memcmp(got, body, total) == 0, "and in the right order, exactly once");
+
+    /* The queue was reached: without a drop somewhere, the transfer never found
+     * the edge of the path and the test would be measuring an idle link. */
+    TEST_ASSERT(queue_drops >= 1, "the bottleneck was actually reached");
+
+    /* Three quarters of what was sent came out the other end. Measured: 426 of
+     * 485, and §3i's sender managed under a tenth -- so the bar is set where it
+     * separates those two rather than where it pins today's number.
+     *
+     * It cannot be set much higher, and that is a property of the path rather
+     * than of the sender: the queue (25 packets) is smaller than the
+     * bandwidth-delay product (10 Mbps x 30 ms is ~31), so a loss-based
+     * controller has to overrun it to find it. Of the 59 drops measured, 57 fell
+     * in one burst of ~57 ms -- two round trips, which is exactly how long it
+     * takes to fill the queue and then hear about it -- and only 2 in the
+     * remaining 380 ms. Textbook slow-start overshoot, written down here so the
+     * next person to see a loss burst at the start of a transfer knows it is the
+     * path talking. */
+    TEST_ASSERT(s->delivered_to_client * 4 >= s->sent_to_client * 3,
+                "most of what was sent was carried, so the sender was not blasting");
+
+    /* 512 KB at 10 Mbps is 419 ms of pure serialisation, and the transfer took
+     * 497 -- the link ran at 84 %. The ceiling is the assertion that matters:
+     * a sender that stalls on a lost tail, or that spends a round trip per
+     * window, fails here and nowhere else. */
+    TEST_ASSERT(elapsed >= 419000, "no faster than the link allows");
+    TEST_ASSERT(elapsed <= 700000, "and it kept the link busy rather than stalling");
+
+    TEST_ASSERT(quicclient_stream_fin(&s->client, 0), "and the stream finished");
+
+    free(got);
+    free(body);
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_lossy_bottleneck) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a transfer finishes through a lossy bottleneck, FIN included");
+    /* The same link with 2 % random loss on top -- the shape of the interop
+     * `transferloss` case, and the closest this stand gets to the matrix.
+     *
+     * Two failure modes meet here and only here. Loss on top of a queue means a
+     * retransmission has to get through a path that is already full, which is
+     * where §3i's retransmission-blocked-by-flow-control deadlock lived. And the
+     * FIN is asserted separately from the bytes because §3t was exactly that:
+     * every byte arrived, the stream never ended, and the peer waited 420
+     * seconds for a frame that was riding inside a duplicate. */
+    stand_t* s = __stand_create(13);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    s->delay_us = 15000;
+
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+
+    quicstream_t* qs = __open_request_stream(s);
+    TEST_REQUIRE_NOT_NULL(qs, "the server has the stream");
+
+    const size_t total = 256 * 1024;
+    uint8_t* body = __body_make(total);
+    TEST_REQUIRE_NOT_NULL(body, "body allocated");
+
+    TEST_ASSERT(__respond(s, qs, body, total), "queued on the stream");
+
+    s->bandwidth_bps = 10 * 1000 * 1000;
+    s->queue_pkts = 25;
+    s->loss_to_client_pct = 2;
+    s->loss_to_server_pct = 2;
+
+    uint8_t* got = calloc(1, total);
+    TEST_REQUIRE_NOT_NULL(got, "sink allocated");
+
+    const size_t have = __drain(s, got, total);
+
+    if (have != total || s->trace)
+        printf("      %zu of %zu bytes; lost %llu/%llu, queue drops %llu\n",
+               have, total,
+               (unsigned long long)s->lost_to_client,
+               (unsigned long long)s->lost_to_server,
+               (unsigned long long)s->queue_dropped_to_client);
+
+    TEST_ASSERT(have == total, "every byte arrived");
+    TEST_ASSERT(memcmp(got, body, total) == 0, "and in the right order, exactly once");
+    TEST_ASSERT(s->lost_to_client > 0 && s->lost_to_server > 0, "both directions lost");
+    TEST_ASSERT(quicclient_stream_fin(&s->client, 0), "and the stream finished");
 
     free(got);
     free(body);
