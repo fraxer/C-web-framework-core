@@ -230,8 +230,8 @@ static clientstream_t* __stream_get(quicclient_t* c, uint64_t id, int create) {
         s->in_reset = 0;
         s->stop_sending_queued = 0;
         s->reset_queued = 0;
-        s->max_stream_data_queued = 0;
         s->in_consumed = 0;
+        s->in_received = 0;
         s->in_limit = c->stream_window;
         quicsendbuf_init(&s->out);
         /* The window we advertised, which is what bounds what the peer may put
@@ -274,17 +274,10 @@ size_t quicclient_stream_read(quicclient_t* client, uint64_t id,
     const size_t n = quicrecvbuf_read(&s->in, dst, cap);
     if (n == 0) return 0;
 
-    /* Reading is what earns the peer more credit, on both limits. Queued rather
-     * than sent, because the frames belong in the next packet the client builds
-     * and a read is not a reason to build one on its own. */
+    /* Reading is what the credit below is measured from; whether a frame goes
+     * out is decided when a packet is built, not here. */
     s->in_consumed += n;
     client->conn_consumed += n;
-
-    if (s->in_limit < s->in_consumed + client->stream_window / 2)
-        s->max_stream_data_queued = 1;
-
-    if (client->conn_limit < client->conn_consumed + client->conn_window / 2)
-        client->max_data_queued = 1;
 
     return n;
 }
@@ -598,8 +591,13 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
 
         /* Credit first, and before anything that could fill the packet: a
          * MAX_DATA that keeps missing the packet is a peer that stays blocked
-         * while we believe we unblocked it. */
-        if (c->max_data_queued) {
+         * while we believe we unblocked it.
+         *
+         * The condition is the server's own (quicflow_should_update): less than
+         * half the window left between what we advertised and how far the peer
+         * has reached. Re-evaluated on every packet, so a lost frame is simply
+         * sent again. */
+        if (c->conn_consumed + c->conn_window > c->conn_limit || c->conn_credit_resend) {
             quicframe_t f;
             memset(&f, 0, sizeof f);
             f.type = QUIC_FRAME_MAX_DATA;
@@ -608,8 +606,8 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
             const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
             if (n > 0) {
                 p += n;
-                c->conn_limit = f.u.max_data.max;
-                c->max_data_queued = 0;
+                if (f.u.max_data.max > c->conn_limit) c->conn_limit = f.u.max_data.max;
+                c->conn_credit_resend = 0;
                 __log(c, "  [client] -> MAX_DATA %llu\n",
                       (unsigned long long)f.u.max_data.max);
             }
@@ -617,7 +615,13 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
 
         for (size_t i = 0; i < CLIENT_MAX_STREAMS && p + 64 < payload_cap; i++) {
             clientstream_t* st = &c->streams[i];
-            if (!st->used || !st->max_stream_data_queued) continue;
+            if (!st->used || st->in_fin || st->in_reset) continue;
+            /* Something new to grant, or a reason to believe the last grant
+             * never arrived. Anything else would be a frame that says what the
+             * peer already knows. */
+            if (st->in_consumed + c->stream_window <= st->in_limit &&
+                !st->credit_resend)
+                continue;
 
             quicframe_t f;
             memset(&f, 0, sizeof f);
@@ -629,8 +633,9 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
             if (n == 0) continue;
 
             p += n;
-            st->in_limit = f.u.max_stream_data.max;
-            st->max_stream_data_queued = 0;
+            if (f.u.max_stream_data.max > st->in_limit)
+                st->in_limit = f.u.max_stream_data.max;
+            st->credit_resend = 0;
             __log(c, "  [client] -> MAX_STREAM_DATA %llu %llu\n",
                   (unsigned long long)st->id,
                   (unsigned long long)f.u.max_stream_data.max);
@@ -832,11 +837,33 @@ static void __pto_disarm(quicclient_t* c) {
     c->pto_count = 0;
 }
 
+/* Is there anything left to wait for?
+ *
+ * The handshake, or a stream the peer has neither finished nor abandoned. Both
+ * are cases where our silence can be the thing holding the exchange up: the
+ * peer may be waiting for an acknowledgement we sent into a lost packet, or for
+ * flow-control credit that went the same way. Neither is recoverable by waiting,
+ * because a blocked peer sends nothing to prompt us with.
+ *
+ * Bounded by the question rather than by a phase: an idle connection with every
+ * stream finished arms nothing, so this cannot become a machine that pings
+ * connections open. */
+static int __pto_wanted(const quicclient_t* c) {
+    if (!c->handshake_done_received) return 1;
+
+    for (size_t i = 0; i < CLIENT_MAX_STREAMS; i++) {
+        const clientstream_t* s = &c->streams[i];
+        if (s->used && !s->in_fin && !s->in_reset) return 1;
+    }
+
+    return 0;
+}
+
 /* Armed after sending, while the handshake is unconfirmed. Re-armed from
  * scratch rather than extended: this measures silence since our last packet,
  * which is the only thing the client can measure. */
 static void __pto_arm(quicclient_t* c) {
-    if (c->handshake_done_received) {
+    if (!__pto_wanted(c)) {
         __pto_disarm(c);
         return;
     }
@@ -868,17 +895,36 @@ int quicclient_tick(quicclient_t* client) {
      * acknowledgement that would otherwise drive retransmission may never
      * arrive at all. */
     int requeued = 0;
-    for (int i = 0; i < QUIC_ENC_COUNT; i++) {
-        if (i == QUIC_ENC_EARLY) continue;
-        if (!client->tx[i].valid) continue;
-        if (quicsendbuf_requeue_unacked(&client->crypto_out[i])) requeued = 1;
+
+    /* Only while the handshake is unconfirmed. A real client discards its
+     * Initial and Handshake keys as soon as it can (RFC 9001 §4.9) and could
+     * not resend that flight if it wanted to; this one keeps them, so without
+     * the guard a probe fired minutes into a connection re-sent the
+     * ClientHello -- and the server, whose connection had meanwhile idled out,
+     * answered it by opening a brand new one. A stalled transfer then looked
+     * like a handshake at t=107s, which is a diagnosis nobody needs. */
+    if (!client->handshake_done_received) {
+        for (int i = 0; i < QUIC_ENC_COUNT; i++) {
+            if (i == QUIC_ENC_EARLY) continue;
+            if (!client->tx[i].valid) continue;
+            if (quicsendbuf_requeue_unacked(&client->crypto_out[i])) requeued = 1;
+        }
     }
 
-    /* Nothing to resend and no keys to say anything with: a PING at least makes
-     * the peer answer, which is the minimum a probe owes (§6.2.4). */
+    /* Nothing to resend: a PING at least makes the peer answer, which is the
+     * minimum a probe owes (§6.2.4). After the handshake it is also what
+     * carries the flow-control credit back out -- the frames are rebuilt from
+     * the current state whenever a packet is built, so the probe repairs a lost
+     * MAX_STREAM_DATA without anything having to remember that one was lost. */
     if (!requeued && client->tx[QUIC_ENC_APP].valid) client->ping_queued = 1;
 
-    __log(client, "  [client] PTO %u, resending the flight\n", client->pto_count);
+    /* And re-advertise: if the peer is stuck against a limit whose credit we
+     * lost, the probe is the only packet that will be built at all. */
+    client->conn_credit_resend = 1;
+    for (size_t i = 0; i < CLIENT_MAX_STREAMS; i++)
+        if (client->streams[i].used) client->streams[i].credit_resend = 1;
+
+    __log(client, "  [client] PTO %u, probing\n", client->pto_count);
 
     return __flush(client);
 }
@@ -930,6 +976,16 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
             if (quicrecvbuf_insert(&s->in, f.u.stream.offset, f.u.stream.data,
                                    (size_t)f.u.stream.len, f.u.stream.fin) != QUICRECVBUF_OK)
                 return 0;
+
+            /* Flow control counts the highest offset reached, not the bytes
+             * delivered: a retransmission must not consume the window twice
+             * (§4.1). The connection-level figure is the sum over streams,
+             * which is how the peer counts it too. */
+            const uint64_t end = f.u.stream.offset + f.u.stream.len;
+            if (end > s->in_received) {
+                c->conn_received += end - s->in_received;
+                s->in_received = end;
+            }
 
             if (f.u.stream.fin) s->in_fin = 1;
 
@@ -984,21 +1040,36 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
             __log(c, "  [client] <- PING\n");
             break;
 
-        /* §4.1: the peer is stuck against a limit we set. Counted, because
-         * "the transfer stopped" and "the transfer stopped and said why" are
-         * different results, and only the second proves what stopped it. */
+        /* §4.1: the peer is stuck against a limit we set. Counted -- "the
+         * transfer stopped" and "the transfer stopped and said why" are
+         * different results -- and answered.
+         *
+         * Answering matters more than counting. Credit is sent once, when a
+         * read crosses the half-window mark, and a MAX_STREAM_DATA lost in
+         * flight is never repeated: we believe the peer has room, the peer
+         * knows it does not, and the exchange stops for good. This frame is
+         * the peer telling us exactly that, and §4.1 offers it as the signal
+         * to raise the limit. Found by the impairment matrix, in the one
+         * combination of loss and a reachable window
+         * (docs/http3/08-testing.md §2i). */
         case QUIC_FRAME_DATA_BLOCKED:
             c->data_blocked_received++;
+            c->conn_credit_resend = 1;
             __log(c, "  [client] <- DATA_BLOCKED at %llu\n",
                   (unsigned long long)f.u.data_blocked.limit);
             break;
 
-        case QUIC_FRAME_STREAM_DATA_BLOCKED:
+        case QUIC_FRAME_STREAM_DATA_BLOCKED: {
             c->stream_data_blocked_received++;
+
+            clientstream_t* bs = __stream_get(c, f.u.stream_data_blocked.id, 0);
+            if (bs != NULL) bs->credit_resend = 1;
+
             __log(c, "  [client] <- STREAM_DATA_BLOCKED %llu at %llu\n",
                   (unsigned long long)f.u.stream_data_blocked.id,
                   (unsigned long long)f.u.stream_data_blocked.limit);
             break;
+        }
 
         case QUIC_FRAME_NEW_TOKEN:
             c->new_token_received = 1;

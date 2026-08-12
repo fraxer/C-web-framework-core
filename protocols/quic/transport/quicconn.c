@@ -345,6 +345,27 @@ static void __requeue_lost(quicconn_t* conn, quic_enc_level_e level,
                     break;
                 }
         }
+        else if (ref->type == QUIC_FRAME_DATA_BLOCKED ||
+                 ref->type == QUIC_FRAME_STREAM_DATA_BLOCKED) {
+            /* §13.3: still blocked means still worth saying. Clearing the latch
+             * rather than resending the frame verbatim, so the next one carries
+             * the limit as it stands -- and if the peer has meanwhile raised it,
+             * quicflow_should_send_blocked finds nothing to say and the send
+             * loop simply carries on with the data. */
+            quicflow_t* flow = NULL;
+
+            if (ref->type == QUIC_FRAME_DATA_BLOCKED)
+                flow = &conn->send_flow;
+            else {
+                quicstream_t* s = __stream_find(conn, ref->stream_id);
+                if (s != NULL) flow = &s->send_flow;
+            }
+
+            if (flow != NULL) {
+                flow->blocked_sent = 0;
+                atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+            }
+        }
         /* Other control frames carry a limit and are not queued for
          * retransmission: the next packet carries the current value anyway,
          * which is both simpler and more correct than resending a stale one. */
@@ -1990,6 +2011,28 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
                         if (bn > 0) {
                             p += bn;
                             ack_eliciting = 1;
+
+                            /* §13.3: repeated while we are still blocked. The
+                             * reasoning that excuses the other limit-carrying
+                             * frames -- "the next packet carries the current
+                             * value anyway" -- is exactly backwards here, since
+                             * being blocked is the state in which there is no
+                             * next packet. Lose this one and the connection is
+                             * up, idle and finished: we wait for credit, the
+                             * peer waits for a reason to give it. The
+                             * impairment matrix produced it in the combination
+                             * of loss and a window small enough to reach
+                             * (docs/http3/08-testing.md §2i).
+                             *
+                             * `offset` carries the stream id so the loss path
+                             * can find the right flow; the connection-level
+                             * frame leaves it zero and is told apart by type. */
+                            quicframe_ref_t* ref = quicframe_ref_new(bf.type);
+                            if (ref != NULL) {
+                                ref->stream_id = conn_level ? 0 : s->id;
+                                ref->next = refs;
+                                refs = ref;
+                            }
                         }
                     }
                 }

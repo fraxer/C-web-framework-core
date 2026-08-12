@@ -1244,10 +1244,19 @@ static int __respond(stand_t* s, quicstream_t* qs, const uint8_t* body, size_t t
 /* Step the stand until the client has read `total` bytes, reading as it goes.
  * Reading is not optional: without it the connection-level window closes and the
  * transfer stalls for a reason that has nothing to do with the path. */
+/* Waits for the FIN as well as for the bytes, and the difference is not
+ * pedantry: since §3t the FIN does not ride on a retransmission -- a peer
+ * discards the duplicate frame and the FIN with it -- so a lost final packet
+ * makes the end of the stream arrive in a frame of its own, after the last
+ * byte. A loop that stopped counting bytes would report that as "every byte
+ * arrived but the stream never finished", which is what the impairment matrix
+ * said the first time it ran. */
 static size_t __drain(stand_t* s, uint8_t* got, size_t total) {
     size_t have = 0;
 
-    for (int round = 0; round < 200000 && have < total; round++) {
+    for (int round = 0;
+         round < 200000 && (have < total || !quicclient_stream_fin(&s->client, 0));
+         round++) {
         /* Read before stepping: whatever is already waiting was put there by
          * the exchange so far, and a loop that steps first would jump the clock
          * to the next timer -- which, on a connection stalled against a closed
@@ -1723,6 +1732,196 @@ TEST(test_quic_stand_reset_opens_stream) {
 
     free(body);
     __stand_free(s);
+}
+
+/* ---- The impairment matrix ---- *
+ *
+ * One exchange, run under every combination of things a path does, with a
+ * seed per run. This is what the socket-based client's matrix was
+ * (docs/http3/08 §2a: 27 runs, minutes each, and a rebuild between them) --
+ * except that here a run is milliseconds and a failure names the combination
+ * and the seed that produced it, which is the difference between a matrix and
+ * a lottery.
+ *
+ * It earns its place by covering what the hand-written scenarios cannot: they
+ * each break one thing on purpose, and the interesting failures of this phase
+ * -- the FIN inside a duplicate (§3t), the retransmission locked out by flow
+ * control (§3i) -- needed two at once. */
+
+typedef struct impairment {
+    const char* name;
+    unsigned loss_to_client;
+    unsigned loss_to_server;
+    unsigned reorder;
+    unsigned dup;
+    uint64_t bandwidth_bps;
+    size_t   queue_pkts;
+    /* 0 = the client's generous default, so flow control stays out of the way.
+     * A window small enough to be reached puts the sender's blocked/unblocked
+     * path into the same run as the losses, which is where a stall hides: the
+     * credit that would unblock it travels on the same broken path. */
+    uint64_t conn_window;
+    uint64_t stream_window;
+} impairment_t;
+
+static const impairment_t __matrix[] = {
+    /* The baseline is not a formality: if it ever fails, nothing below it means
+     * anything. */
+    { "clean",             0,  0,  0,  0,        0,  0,      0,     0 },
+    { "loss 10%",         10, 10,  0,  0,        0,  0,      0,     0 },
+    { "loss 25%",         25, 25,  0,  0,        0,  0,      0,     0 },
+    /* One direction only, like the socket client's `--loss-in` (§2a). Forty per
+     * cent both ways makes a round trip succeed 36 % of the time, and a
+     * connection with a thirty-second idle timeout is then entitled to die --
+     * asserting that it must not would be asserting against the protocol. This
+     * way the server has to recover a response through a path that eats two
+     * datagrams in five, while its acknowledgements come back. */
+    { "loss 40% one way", 40,  0,  0,  0,        0,  0,      0,     0 },
+    { "reorder 30%",       0,  0, 30,  0,        0,  0,      0,     0 },
+    { "dup 20%",           0,  0,  0, 20,        0,  0,      0,     0 },
+    { "loss + reorder",   15, 15, 30,  0,        0,  0,      0,     0 },
+    { "loss + dup",       15, 15,  0, 20,        0,  0,      0,     0 },
+    { "bottleneck",        0,  0,  0,  0, 10000000, 25,      0,     0 },
+    { "bottleneck + loss", 5,  5,  0,  0, 10000000, 25,      0,     0 },
+    { "tight window",      0,  0,  0,  0,        0,  0,  49152, 16384 },
+    { "tight + loss",     15, 15,  0,  0,        0,  0,  49152, 16384 },
+    { "tight + reorder",   0,  0, 30, 10,        0,  0,  49152, 16384 },
+    { "everything",       10, 10, 20, 10, 10000000, 25,  49152, 16384 },
+};
+
+/* One request and one response through `imp`. Returns 1 if every byte arrived
+ * in order, exactly once, with the FIN and a connection still up. */
+static int __matrix_run(const impairment_t* imp, uint64_t seed, char* why, size_t why_cap) {
+    stand_t* s = __stand_create(seed);
+    if (s == NULL) return 0;
+
+    s->delay_us = 15000;
+
+    int ok = 0;
+    uint8_t* body = NULL;
+    uint8_t* got = NULL;
+
+    const size_t total = 32 * 1024;
+
+    if (!quicclient_connect_inproc_windowed(&s->client, "localhost", s->trace,
+                                            __client_out, s,
+                                            imp->conn_window, imp->stream_window)) {
+        snprintf(why, why_cap, "could not start");
+        goto done;
+    }
+
+    if (!__run(s, 5000000, __handshake_done)) {
+        snprintf(why, why_cap, "handshake did not complete");
+        goto done;
+    }
+
+    /* The request goes out on a clean path: this client cannot retransmit
+     * stream data of its own (only its handshake flight), so losing the request
+     * would test the harness rather than the server. Everything after this
+     * point -- the response, and every acknowledgement of it -- is impaired. */
+    quicstream_t* qs = __open_request_stream(s);
+    if (qs == NULL || !__consume_request(s, 0)) {
+        snprintf(why, why_cap, "the request did not arrive");
+        goto done;
+    }
+
+    body = __body_make(total);
+    got = calloc(1, total);
+    if (body == NULL || got == NULL) {
+        snprintf(why, why_cap, "out of memory");
+        goto done;
+    }
+
+    if (!__respond(s, qs, body, total)) {
+        snprintf(why, why_cap, "could not queue the response");
+        goto done;
+    }
+
+    s->loss_to_client_pct = imp->loss_to_client;
+    s->loss_to_server_pct = imp->loss_to_server;
+    s->reorder_pct = imp->reorder;
+    s->dup_pct = imp->dup;
+    s->bandwidth_bps = imp->bandwidth_bps;
+    s->queue_pkts = imp->queue_pkts;
+
+    const size_t have = __drain(s, got, total);
+
+    if (have != total) {
+        snprintf(why, why_cap, "%zu of %zu bytes", have, total);
+        goto done;
+    }
+
+    if (memcmp(got, body, total) != 0) {
+        snprintf(why, why_cap, "the body came back altered");
+        goto done;
+    }
+
+    if (!quicclient_stream_fin(&s->client, 0)) {
+        snprintf(why, why_cap, "every byte arrived but the stream never finished");
+        goto done;
+    }
+
+    if (s->conn == NULL || s->conn->state != QUICCONN_ACTIVE) {
+        snprintf(why, why_cap, "the connection did not survive");
+        goto done;
+    }
+
+    if (s->overflowed > 0) {
+        snprintf(why, why_cap, "the emulator's own queue overflowed");
+        goto done;
+    }
+
+    ok = 1;
+
+    done:
+
+    free(got);
+    free(body);
+    __stand_free(s);
+
+    return ok;
+}
+
+TEST(test_quic_stand_impairment_matrix) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("one exchange survives every combination of loss, reordering, duplication and a bottleneck");
+
+    const size_t cases = sizeof __matrix / sizeof __matrix[0];
+    int failures = 0;
+
+    /* Five seeds a case keeps the whole runner under two seconds, which is what
+     * makes this a test rather than an errand. STAND_MATRIX_SEEDS=200 turns the
+     * same table into a sweep when something is being hunted -- the two bugs
+     * this found came out of seeds 2 and 4. */
+    uint64_t seeds = 5;
+    const char* env = getenv("STAND_MATRIX_SEEDS");
+    if (env != NULL) {
+        const long n = strtol(env, NULL, 10);
+        if (n > 0) seeds = (uint64_t)n;
+    }
+
+    /* And one cell of it, by name, so a failure found by a sweep can be
+     * reproduced with the trace on without drowning in the other hundreds. */
+    const char* only = getenv("STAND_MATRIX_ONLY");
+
+    for (size_t i = 0; i < cases; i++) {
+        if (only != NULL && strstr(__matrix[i].name, only) == NULL) continue;
+
+        for (uint64_t seed = 1; seed <= seeds; seed++) {
+            char why[128] = { 0 };
+
+            if (__matrix_run(&__matrix[i], seed * 7919, why, sizeof why)) continue;
+
+            /* Named, and reproducible from the name: the seed is the whole
+             * point of having one. */
+            printf("      FAILED: %-18s seed %llu -- %s\n",
+                   __matrix[i].name, (unsigned long long)(seed * 7919), why);
+            failures++;
+        }
+    }
+
+    TEST_ASSERT(failures == 0, "every combination completed");
 }
 
 TEST(test_quic_stand_flow_control) {

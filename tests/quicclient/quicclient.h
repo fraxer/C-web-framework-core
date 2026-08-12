@@ -77,12 +77,24 @@ typedef struct clientstream {
     int           reset_queued;
     uint64_t      reset_error;
 
-    /* Receive-side flow control for this stream: what we have advertised and
-     * what the test has read. A MAX_STREAM_DATA goes out when the peer could
-     * have used more than half of what it has. */
+    /* Receive-side flow control for this stream: what we have advertised, how
+     * far the peer has reached, and what the test has read. The limit granted
+     * is `consumed + window`, so a test that stops reading really does apply
+     * back pressure.
+     *
+     * Decided when a packet is built, not when a read happens, and the
+     * difference is a deadlock: credit sent once and lost in flight is credit
+     * the peer never hears about, while we believe it has room and it knows it
+     * does not. Both sides then wait. So the frame goes out whenever there is
+     * something new to grant -- or whenever `credit_resend` says the last grant
+     * may not have survived (docs/http3/08-testing.md §2i). */
     uint64_t      in_limit;
+    uint64_t      in_received;
     uint64_t      in_consumed;
-    int           max_stream_data_queued;
+    /* Say it again even though nothing new was earned: the peer told us it is
+     * blocked, or our probe timer fired, and either means the credit we believe
+     * it has may have died in flight. */
+    int           credit_resend;
 } clientstream_t;
 
 typedef struct quicclient {
@@ -193,8 +205,9 @@ typedef struct quicclient {
     uint64_t conn_window;            /* what a fresh limit is measured against */
     uint64_t stream_window;
     uint64_t conn_limit;             /* connection-level, advertised */
+    uint64_t conn_received;          /* summed over streams, as the peer counts it */
     uint64_t conn_consumed;
-    int      max_data_queued;
+    int      conn_credit_resend;
 
     /* The peer said it was stuck against one of those limits (§4.1). Recorded
      * because "the transfer stopped" and "the transfer stopped and said why"
