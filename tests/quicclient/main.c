@@ -481,6 +481,21 @@ int main(int argc, char* argv[]) {
     }
 
     h3client_response_free(&response);
+
+    /* Say goodbye rather than walking away.
+     *
+     * A client that simply exits leaves the server holding the connection for
+     * its whole idle timeout -- thirty seconds of state per run, and, for
+     * anything that measures a server per connection, thirty seconds of window
+     * in which the *next* run's traffic is counted against this one. That is
+     * how the first per-connection measurement of docs/http3/08 §7b came out
+     * unreadable: three consecutive connections reported the same overflow
+     * figure because their lifetimes overlapped.
+     *
+     * It is also simply what a real client does (§10.2). */
+    quicclient_close(&client, 0, 1);
+    quicclient_flush(&client);
+
     quicclient_free(&client);
 
     printf("\n%s\n", all_ok ? "OK: request and response completed end to end"

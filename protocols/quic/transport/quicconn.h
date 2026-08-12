@@ -247,6 +247,20 @@ typedef struct quicconn {
     uint64_t last_activity_us;
     uint64_t close_deadline_us;
 
+    /* ---- What this connection cost the endpoint (docs/http3/08 §7b) ---- *
+     *
+     * When it started, and what the kernel's receive-overflow counter stood at
+     * then. The difference at close is how many datagrams the socket dropped
+     * while this connection was alive -- the one number that says whether a
+     * transfer starved the receive path, and the reason the connection *after*
+     * a big one may never be accepted at all.
+     *
+     * Sampled per connection rather than read from the process-wide metric
+     * because that metric cannot answer "did it grow with the transfer": it is
+     * a running total over every connection the worker ever had. */
+    uint64_t accepted_us;
+    uint32_t rx_overflow_at_accept;
+
     /* Something is queued for sending.
      *
      * Atomic because quicconn_want_write is callable from a handler thread --

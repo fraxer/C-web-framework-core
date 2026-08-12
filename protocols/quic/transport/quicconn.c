@@ -2464,6 +2464,8 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
 
     const uint64_t now = quic_now_us();
     conn->last_activity_us = now;
+    conn->accepted_us = now;
+    conn->rx_overflow_at_accept = quicendpoint_kernel_drops(endpoint);
 
     /* §8.1: nothing may go back to an unvalidated address beyond three times
      * what came from it. The first Initial is at least 1200 bytes, so this

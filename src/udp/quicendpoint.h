@@ -262,6 +262,12 @@ void quicendpoint_wake(quicendpoint_t* endpoint, struct quicconn* conn);
 listener_t* quicendpoint_listener(quicendpoint_t* endpoint);
 int quicendpoint_fd(quicendpoint_t* endpoint);
 
+/* The kernel's receive-overflow counter for this endpoint's socket, as of the
+ * last datagram that carried one (SO_RXQ_OVFL). Cumulative, so it is only
+ * meaningful as a difference between two moments -- which is what a connection
+ * samples at accept in order to report its own share at close. */
+uint32_t quicendpoint_kernel_drops(const quicendpoint_t* endpoint);
+
 /* The address the endpoint is bound to, in the form connection_t carries it.
  * A QUIC connection needs these because they are what selects the virtual
  * server: httpparser_select_server matches a vhost by (ip, port), and a

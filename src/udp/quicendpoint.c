@@ -673,6 +673,10 @@ int quicendpoint_fd(quicendpoint_t* endpoint) {
     return endpoint != NULL ? endpoint->fd : -1;
 }
 
+uint32_t quicendpoint_kernel_drops(const quicendpoint_t* endpoint) {
+    return endpoint != NULL ? endpoint->kernel_drops : 0;
+}
+
 in_addr_t quicendpoint_ip(quicendpoint_t* endpoint) {
     if (endpoint == NULL || endpoint->local.ss_family != AF_INET) return 0;
 
@@ -691,6 +695,33 @@ unsigned short quicendpoint_port(quicendpoint_t* endpoint) {
 
 void quicendpoint_detach(quicendpoint_t* endpoint, quicconn_t* conn) {
     if (endpoint == NULL || conn == NULL) return;
+
+    /* One line per connection, at the only moment that can report the whole of
+     * it (docs/http3/08 §7b).
+     *
+     * `rx_overflow` is what the kernel dropped on this socket while the
+     * connection was alive. It is here rather than in the process-wide metric
+     * because the question it answers -- does a big transfer starve the receive
+     * path, and is that why the *next* connection fails to be accepted -- needs
+     * it attributed to a connection and a duration. Sampling /metrics between
+     * transfers cannot answer it: the pause that sampling introduces is enough
+     * for the worker to drain the queue, and the effect disappears.
+     *
+     * At info, not debug: a line per connection is what a busy server can
+     * afford, and 25 % of this server's CPU under a large transfer went to
+     * debug-level formatting when that was left on by accident. */
+    const uint32_t overflow = quicendpoint_kernel_drops(endpoint) - conn->rx_overflow_at_accept;
+    const uint64_t now = quic_now_us();
+    const uint64_t lived_ms = conn->accepted_us > 0 && now > conn->accepted_us
+                              ? (now - conn->accepted_us) / 1000 : 0;
+
+    log_info("quic: conn cid=%02x%02x%02x%02x closed after %llu ms, "
+             "rx_overflow=%u, streams=%zu, pto=%u, srtt=%llu us\n",
+             conn->odcid.data[0], conn->odcid.data[1],
+             conn->odcid.data[2], conn->odcid.data[3],
+             (unsigned long long)lived_ms, overflow, conn->stream_count,
+             conn->loss.pto_count,
+             (unsigned long long)conn->loss.smoothed_rtt_us);
 
     /* Every id this connection answers to, so a datagram in flight cannot find
      * it after this returns. */
