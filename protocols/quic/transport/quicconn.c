@@ -512,14 +512,19 @@ static int __on_ack_frame(quicconn_t* conn, quic_enc_level_e level,
  *
  * Returns the stream, or NULL with `*ignore` telling the caller which of the
  * last two it was: 1 to carry on, 0 because the connection is now closing. */
-static quicstream_t* __stream_for_send_frame(quicconn_t* conn, uint64_t id,
-                                             uint64_t now_us, int* ignore) {
+/* `permitted` is quicstream_can_send for a frame about our send side
+ * (STOP_SENDING, MAX_STREAM_DATA) and quicstream_can_receive for one about the
+ * peer's (RESET_STREAM). Everything else below is the same four cases, and they
+ * are subtle enough that a second copy of them would be a second set of bugs. */
+static quicstream_t* __stream_for_frame(quicconn_t* conn, uint64_t id,
+                                        uint64_t now_us, int* ignore,
+                                        int (*permitted)(uint64_t)) {
     *ignore = 0;
 
     quicstream_t* s = __stream_find(conn, id);
     if (s != NULL) return s;
 
-    if (!quicstream_can_send(id)) {
+    if (!permitted(id)) {
         quicconn_close(conn, QUIC_STREAM_STATE_ERROR, 0, now_us);
         return NULL;
     }
@@ -559,6 +564,22 @@ static quicstream_t* __stream_for_send_frame(quicconn_t* conn, uint64_t id,
     }
 
     return s;
+}
+
+static quicstream_t* __stream_for_send_frame(quicconn_t* conn, uint64_t id,
+                                             uint64_t now_us, int* ignore) {
+    return __stream_for_frame(conn, id, now_us, ignore, quicstream_can_send);
+}
+
+/* RESET_STREAM speaks about the peer's send side, so the permission it needs is
+ * ours to receive -- and, like a STREAM frame, it opens a peer stream we have
+ * not seen (§3.2). Looking it up and ignoring the miss, which is what this did
+ * before, threw away two things at once: the stream limit went unenforced for
+ * ids that arrive as a reset, and the final size never reached the
+ * connection-level flow controller §4.5 requires it to reach. */
+static quicstream_t* __stream_for_recv_frame(quicconn_t* conn, uint64_t id,
+                                             uint64_t now_us, int* ignore) {
+    return __stream_for_frame(conn, id, now_us, ignore, quicstream_can_receive);
 }
 
 static int __on_stream_frame(quicconn_t* conn, const quicframe_t* frame,
@@ -667,10 +688,16 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
         return __on_crypto_frame(conn, level, frame);
 
     case QUIC_FRAME_RESET_STREAM: {
-        quicstream_t* s = __stream_find(conn, frame->u.reset_stream.id);
-        if (s == NULL) return 1;
+        int ignore = 0;
+        quicstream_t* s = __stream_for_recv_frame(conn, frame->u.reset_stream.id,
+                                                  now_us, &ignore);
+        if (s == NULL) return ignore;
 
         metrics_quic(METRICS_QUIC_STREAMS_RESET_RECEIVED);
+
+        /* What this stream had already charged to the connection window, so the
+         * charge below is the difference and never the whole stream twice. */
+        const uint64_t counted = s->recv_flow.used;
 
         const quicstream_err_t err =
             quicstream_on_reset(s, frame->u.reset_stream.error,
@@ -679,6 +706,28 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
             quicconn_close(conn, err, 0, now_us);
             return 0;
         }
+
+        /* §4.5: "the final size is used to account for all bytes on the stream
+         * in the connection-level flow controller" -- including the bytes that
+         * never arrived, which is precisely the interesting part of a reset.
+         *
+         * Without this our count of what the peer has spent stays below the
+         * peer's own, and since the limit we advertise is derived from that
+         * count (quicflow_should_update), the peer's usable window shrinks by
+         * the abandoned tail of every stream it cancels, permanently. */
+        const uint64_t delta = s->recv_flow.used > counted ? s->recv_flow.used - counted : 0;
+
+        if (delta > 0) {
+            if (!quicflow_record_received(&conn->recv_flow, conn->recv_flow.used + delta)) {
+                quicconn_close(conn, QUIC_FLOW_CONTROL_ERROR, 0, now_us);
+                return 0;
+            }
+
+            /* A MAX_DATA may be due now, and nothing else on this path would
+             * build a packet to carry it. */
+            atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+        }
+
         return 1;
     }
 

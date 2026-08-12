@@ -397,6 +397,18 @@ int quicclient_stop_sending(quicclient_t* client, uint64_t id, uint64_t error) {
     return 1;
 }
 
+int quicclient_reset_stream(quicclient_t* client, uint64_t id, uint64_t error) {
+    if (client == NULL) return 0;
+
+    clientstream_t* s = __stream_get(client, id, 1);
+    if (s == NULL) return 0;
+
+    s->reset_queued = 1;
+    s->reset_error = error;
+
+    return 1;
+}
+
 void quicclient_stream_release(quicclient_t* client, uint64_t id) {
     clientstream_t* s = __stream_get(client, id, 0);
     if (s == NULL) return;
@@ -560,6 +572,30 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
             __log(c, "  [client] -> STOP_SENDING %llu, error 0x%llx\n",
                   (unsigned long long)st->id,
                   (unsigned long long)st->stop_sending_error);
+        }
+
+        for (size_t i = 0; i < CLIENT_MAX_STREAMS && p + 64 < payload_cap; i++) {
+            clientstream_t* st = &c->streams[i];
+            if (!st->used || !st->reset_queued) continue;
+
+            quicframe_t f;
+            memset(&f, 0, sizeof f);
+            f.type = QUIC_FRAME_RESET_STREAM;
+            f.u.reset_stream.id = st->id;
+            f.u.reset_stream.error = st->reset_error;
+            /* §4.5: one higher than the largest offset sent, which the send
+             * buffer already tracks -- not what was written, and not what the
+             * peer managed to receive. */
+            f.u.reset_stream.final_size = st->out.sent_off;
+
+            const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
+            if (n == 0) continue;
+
+            p += n;
+            st->reset_queued = 0;
+            __log(c, "  [client] -> RESET_STREAM %llu, error 0x%llx, final size %llu\n",
+                  (unsigned long long)st->id, (unsigned long long)st->reset_error,
+                  (unsigned long long)st->out.sent_off);
         }
 
         for (size_t i = 0; i < CLIENT_MAX_STREAMS && p + 64 < payload_cap; i++) {

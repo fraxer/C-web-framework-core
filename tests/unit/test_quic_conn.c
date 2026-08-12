@@ -1592,6 +1592,127 @@ TEST(test_quic_stand_stop_sending) {
     __stand_free(s);
 }
 
+TEST(test_quic_stand_peer_reset_accounting) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a peer's RESET_STREAM charges the connection window for what never arrived (§4.5)");
+    /* The other side of §2f. The peer abandons a stream having sent more than
+     * we received -- the ordinary case, since the tail was in flight when it
+     * gave up -- and §4.5 makes the final size account for the whole stream in
+     * the *connection-level* flow controller, missing bytes included.
+     *
+     * Skip it and nothing breaks loudly: the peer is the strict one, so it
+     * simply believes it has less window than we think we gave it, and the
+     * difference accumulates over every cancelled stream until it stalls
+     * against a limit we thought was generous. That is a bug that arrives as
+     * "the connection got slow after a while", which is why it is worth a test
+     * that reads a counter rather than a symptom. */
+    stand_t* s = __stand_create(18);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    /* A request stream with a body, so that some of it arrives before the rest
+     * is lost. */
+    const size_t chunk = 2048;
+    uint8_t* body = __body_make(chunk);
+    TEST_REQUIRE_NOT_NULL(body, "body allocated");
+
+    TEST_ASSERT(quicclient_stream_write(&s->client, 0, body, chunk, 0), "first half");
+    TEST_ASSERT(quicclient_flush(&s->client), "sent");
+    __run(s, 200000, NULL);
+
+    TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
+    const uint64_t counted_before = s->conn->recv_flow.used;
+    TEST_ASSERT(counted_before >= chunk, "what arrived was counted");
+
+    /* Now the rest goes into a black hole, and the client gives up on the
+     * stream. Its final size covers the lost part; ours has never seen it. */
+    s->blackhole_to_server = 1;
+    TEST_ASSERT(quicclient_stream_write(&s->client, 0, body, chunk, 0), "second half");
+    TEST_ASSERT(quicclient_flush(&s->client), "sent into the void");
+    s->blackhole_to_server = 0;
+
+    TEST_ASSERT(quicclient_reset_stream(&s->client, 0, 0x11), "the client gives up");
+    TEST_ASSERT(quicclient_flush(&s->client), "reset sent");
+
+    __run(s, 500000, NULL);
+
+    TEST_REQUIRE_NOT_NULL(s->conn, "the connection survived the reset");
+    TEST_ASSERT(s->conn->state == QUICCONN_ACTIVE, "and carried on");
+
+    const uint64_t counted_after = s->conn->recv_flow.used;
+
+    if (s->trace)
+        printf("      connection window: counted %llu -> %llu (stream final size %llu)\n",
+               (unsigned long long)counted_before, (unsigned long long)counted_after,
+               (unsigned long long)(chunk * 2));
+
+    /* The whole stream, not just the part that made it: both halves were sent,
+     * so the final size is 2 x chunk and the connection must have been charged
+     * for all of it. */
+    TEST_ASSERT(counted_after >= counted_before + chunk,
+                "the abandoned tail was charged to the connection window");
+
+    free(body);
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_reset_opens_stream) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a RESET_STREAM for a stream never seen opens it, limit and all (§3.2)");
+    /* The extreme of the same case: everything the peer sent on the stream was
+     * lost, so the first thing we ever hear about it is that it is over.
+     *
+     * Looking the id up and shrugging -- which is what this did -- loses two
+     * things at once. The stream limit goes unenforced for any id that arrives
+     * as a reset, and §4.5's accounting never happens at all, since there is no
+     * stream to account it against. Both are invisible in every test that does
+     * not lose a whole stream's worth of data. */
+    stand_t* s = __stand_create(19);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    const uint64_t counted_before = s->conn->recv_flow.used;
+    const size_t streams_before = s->conn->stream_count;
+
+    /* Stream 4 exists only in the client's imagination as far as the server is
+     * concerned: every datagram carrying it is dropped. */
+    const size_t chunk = 1024;
+    uint8_t* body = __body_make(chunk);
+    TEST_REQUIRE_NOT_NULL(body, "body allocated");
+
+    s->blackhole_to_server = 1;
+    TEST_ASSERT(quicclient_stream_write(&s->client, 4, body, chunk, 0), "a whole stream");
+    TEST_ASSERT(quicclient_flush(&s->client), "sent into the void");
+    s->blackhole_to_server = 0;
+
+    TEST_ASSERT(quicclient_reset_stream(&s->client, 4, 0x12), "and then abandoned");
+    TEST_ASSERT(quicclient_flush(&s->client), "reset sent");
+
+    __run(s, 500000, NULL);
+
+    TEST_REQUIRE_NOT_NULL(s->conn, "the connection survived");
+    TEST_ASSERT(s->conn->state == QUICCONN_ACTIVE, "and carried on");
+
+    /* The stream was opened by the reset -- which is what makes the id count
+     * against the concurrency limit and its final size against the window. */
+    TEST_ASSERT(s->conn->next_peer_bidi > 1, "the id was accounted as opened");
+    TEST_ASSERT(s->conn->recv_flow.used >= counted_before + chunk,
+                "and the whole stream was charged to the connection window");
+
+    (void)streams_before;
+
+    free(body);
+    __stand_free(s);
+}
+
 TEST(test_quic_stand_bottleneck) {
     TEST_SUITE("quic_stand");
 

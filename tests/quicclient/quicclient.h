@@ -68,6 +68,14 @@ typedef struct clientstream {
      * stream, and saying so is what stops it spending the window on us. */
     int           stop_sending_queued;
     uint64_t      stop_sending_error;
+
+    /* And a RESET_STREAM of our own (§19.4): we abandon our send side. The
+     * final size that goes with it is what we actually sent, which is what
+     * §4.5 defines it as -- and the gap between that and what arrived is the
+     * whole point of the case, since the peer must account for the difference
+     * anyway. */
+    int           reset_queued;
+    uint64_t      reset_error;
 } clientstream_t;
 
 typedef struct quicclient {
@@ -374,6 +382,11 @@ int quicclient_stream_reset(const quicclient_t* client, uint64_t id,
 /* Tell the server to stop sending on this stream (§19.5). It goes out with the
  * next flush; §3.5 obliges the peer to answer with RESET_STREAM. */
 int quicclient_stop_sending(quicclient_t* client, uint64_t id, uint64_t error);
+
+/* Abandon our send side of a stream (§19.4). The final size declared is what we
+ * actually sent -- which, when part of it was lost, is more than the peer
+ * received, and that difference is what §4.5 makes it account for. */
+int quicclient_reset_stream(quicclient_t* client, uint64_t id, uint64_t error);
 
 /* Done with this stream: free its buffers and the slot.
  *
