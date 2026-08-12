@@ -54,6 +54,23 @@ typedef struct quicendpoint {
      * the metric can report the step rather than the running total. */
     uint32_t kernel_drops;
 
+    /* ---- How long the socket goes unread (docs/http3/08 §7b) ---- *
+     *
+     * A large response makes this endpoint's own peer look far away: the
+     * measured round trip on loopback climbs from 8 ms to 480 as the transfer
+     * grows, and the receive queue eventually overflows. Both are consistent
+     * with one thing -- the worker not coming back to the socket often enough
+     * -- and neither proves it, because an acknowledgement that waits in the
+     * queue is indistinguishable from one the peer sent late.
+     *
+     * This is the number that tells them apart: the longest interval between
+     * two reads of the socket. Sampled here rather than as a metric because a
+     * metric is read by an HTTP request, and the pause that request introduces
+     * is exactly the thing being measured. Reported and reset when a connection
+     * closes, so a single-connection run reads it per transfer. */
+    uint64_t last_recv_us;
+    uint64_t max_recv_gap_us;
+
     /* The endpoint's own deadline timer (docs/http3/01 §6).
      *
      * QUIC's timers are PTO, ack delay and pacing -- tens of milliseconds and
@@ -267,6 +284,10 @@ int quicendpoint_fd(quicendpoint_t* endpoint);
  * meaningful as a difference between two moments -- which is what a connection
  * samples at accept in order to report its own share at close. */
 uint32_t quicendpoint_kernel_drops(const quicendpoint_t* endpoint);
+
+/* Start the receive-gap measurement over. Called when a connection is accepted:
+ * the counter is otherwise dominated by the idle stretch since the last one. */
+void quicendpoint_recv_gap_reset(quicendpoint_t* endpoint);
 
 /* The address the endpoint is bound to, in the form connection_t carries it.
  * A QUIC connection needs these because they are what selects the virtual

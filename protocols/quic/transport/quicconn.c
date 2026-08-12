@@ -2466,6 +2466,11 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     conn->last_activity_us = now;
     conn->accepted_us = now;
     conn->rx_overflow_at_accept = quicendpoint_kernel_drops(endpoint);
+    /* The gap counter starts over with the connection. Left running, it reports
+     * the idle stretch between two runs -- forty seconds of a server with
+     * nothing to do -- which is true and useless: the question is how long the
+     * socket waits while a transfer is in progress. */
+    quicendpoint_recv_gap_reset(endpoint);
 
     /* §8.1: nothing may go back to an unvalidated address beyond three times
      * what came from it. The first Initial is at least 1200 bytes, so this

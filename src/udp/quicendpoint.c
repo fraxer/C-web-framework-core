@@ -677,6 +677,13 @@ uint32_t quicendpoint_kernel_drops(const quicendpoint_t* endpoint) {
     return endpoint != NULL ? endpoint->kernel_drops : 0;
 }
 
+void quicendpoint_recv_gap_reset(quicendpoint_t* endpoint) {
+    if (endpoint == NULL) return;
+
+    endpoint->max_recv_gap_us = 0;
+    endpoint->last_recv_us = quic_now_us();
+}
+
 in_addr_t quicendpoint_ip(quicendpoint_t* endpoint) {
     if (endpoint == NULL || endpoint->local.ss_family != AF_INET) return 0;
 
@@ -716,12 +723,16 @@ void quicendpoint_detach(quicendpoint_t* endpoint, quicconn_t* conn) {
                               ? (now - conn->accepted_us) / 1000 : 0;
 
     log_info("quic: conn cid=%02x%02x%02x%02x closed after %llu ms, "
-             "rx_overflow=%u, streams=%zu, pto=%u, srtt=%llu us\n",
+             "rx_overflow=%u, max_rx_gap=%llu us, streams=%zu, pto=%u, srtt=%llu us\n",
              conn->odcid.data[0], conn->odcid.data[1],
              conn->odcid.data[2], conn->odcid.data[3],
-             (unsigned long long)lived_ms, overflow, conn->stream_count,
+             (unsigned long long)lived_ms, overflow,
+             (unsigned long long)endpoint->max_recv_gap_us, conn->stream_count,
              conn->loss.pto_count,
              (unsigned long long)conn->loss.smoothed_rtt_us);
+
+    /* Reset with the report: the next connection's figure has to be its own. */
+    endpoint->max_recv_gap_us = 0;
 
     /* Every id this connection answers to, so a datagram in flight cannot find
      * it after this returns. */
@@ -1329,6 +1340,17 @@ static int __endpoint_timer_close(connection_t* connection) {
 static int __endpoint_read(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
     quicendpoint_t* ep = (quicendpoint_t*)ctx->listener;
+
+    /* Before the first read, not after the last: what is being measured is how
+     * long the socket waited for us, and that interval ends here. */
+    const uint64_t entered_us = quic_now_us();
+
+    if (ep->last_recv_us != 0) {
+        const uint64_t gap = entered_us - ep->last_recv_us;
+        if (gap > ep->max_recv_gap_us) ep->max_recv_gap_us = gap;
+    }
+
+    ep->last_recv_us = entered_us;
 
     for (int round = 0; round < QUIC_RX_MAX_BATCHES; round++) {
         const int n = udp_rx_batch_recv(ep->rx, ep->fd);
