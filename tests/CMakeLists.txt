@@ -119,6 +119,67 @@ if(INCLUDE_HTTP3 STREQUAL yes)
     )
 endif()
 
+# --- Fuzzing (docs/http3/08-testing.md §5) ---
+#
+# Behind a flag because it changes how the *target* code is compiled: coverage
+# instrumentation belongs to the whole framework, not to these binaries, and an
+# ordinary build must not carry it.
+#
+# Two toolchains, one set of targets. With clang the entry point is libFuzzer's
+# own (`-fsanitize=fuzzer`); with gcc, which has no libFuzzer, the driver in
+# fuzz_main.c supplies the loop and gcc's `-fsanitize-coverage=trace-pc` supplies
+# the feedback. The target files do not know the difference.
+if(BUILD_FUZZERS STREQUAL "yes" AND INCLUDE_HTTP3 STREQUAL yes)
+    set(FUZZ_TARGET_NAMES
+        quic_packet quic_frame quic_tp h3_frame qpack_decode qpack_streams huffman)
+
+    set(FUZZ_ID_quic_packet    1)
+    set(FUZZ_ID_quic_frame     2)
+    set(FUZZ_ID_quic_tp        3)
+    set(FUZZ_ID_h3_frame       4)
+    set(FUZZ_ID_qpack_decode   5)
+    set(FUZZ_ID_qpack_streams  6)
+    set(FUZZ_ID_huffman        7)
+
+    foreach(name ${FUZZ_TARGET_NAMES})
+        set(exe fuzz_${name})
+
+        if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+            add_executable(${exe} fuzz/fuzz_targets.c)
+            target_compile_options(${exe} PRIVATE -fsanitize=fuzzer,address)
+            target_link_options(${exe} PRIVATE -fsanitize=fuzzer,address)
+        else()
+            add_executable(${exe} fuzz/fuzz_targets.c fuzz/fuzz_main.c)
+            target_compile_options(${exe} PRIVATE -fsanitize-coverage=trace-pc)
+        endif()
+
+        string(TOUPPER ${name} upper)
+        target_compile_definitions(${exe} PRIVATE
+            FUZZ_QUIC_PACKET=1
+            FUZZ_QUIC_FRAME=2
+            FUZZ_QUIC_TP=3
+            FUZZ_H3_FRAME=4
+            FUZZ_QPACK_DECODE=5
+            FUZZ_QPACK_STREAMS=6
+            FUZZ_HUFFMAN=7
+            FUZZ_TARGET=${FUZZ_ID_${name}}
+        )
+
+        target_include_directories(${exe} PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/quic/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http3/frame
+            ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http3/qpack
+        )
+
+        target_link_libraries(${exe} PRIVATE
+            cwfr_framework
+            ${OPENSSL_LIBRARIES}
+            Threads::Threads
+            ${CMAKE_DL_LIBS}
+        )
+    endforeach()
+endif()
+
 # --- Database tests (separate binary, requires database) ---
 set(HAS_DB FALSE)
 if(PostgreSQL_FOUND AND INCLUDE_POSTGRESQL STREQUAL "yes")
