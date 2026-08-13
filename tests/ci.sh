@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+#
+# The gate of docs/http3/08-testing.md §8, as a script.
+#
+# There is no CI configuration in this repository, so "add it to CI" would have
+# meant picking a CI. This runs the same list from anywhere -- a laptop, a hook,
+# a runner -- and says plainly which stage failed. A CI job then reduces to
+# calling it.
+#
+# Stages, in the order §8 lists them:
+#
+#   noh3     build with -DINCLUDE_HTTP3=no  + unit tests   (h3 broke nothing)
+#   asan     build with h3, ASan            + unit tests
+#   tsan     build with h3, TSan            + unit tests   (data races)
+#   fuzz     build the fuzz targets         + FUZZ_SECONDS each
+#   h3spec   run a server, run h3spec against it           (RFC conformance)
+#
+# The interop matrix (§8.6) is deliberately absent: it needs docker and tens of
+# minutes, and belongs to a schedule rather than to a gate.
+#
+# Usage:
+#   tests/ci.sh                  # every stage
+#   tests/ci.sh asan tsan        # a subset, in the order given
+#   FUZZ_SECONDS=600 tests/ci.sh fuzz
+#   CI_BUILD_DIR=/var/tmp/ci tests/ci.sh
+#
+# Environment:
+#   CI_BUILD_DIR   where build trees go (default: a temp dir, kept between runs)
+#   FUZZ_SECONDS   per fuzz target (default 60; §5 asks for 24h on a schedule)
+#   H3SPEC         path to the h3spec binary (default: found on PATH)
+#   JOBS           parallel build jobs (default: nproc)
+
+set -u -o pipefail
+
+CORE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+BACKEND_DIR=$(cd "$CORE_DIR/.." && pwd)
+
+CI_BUILD_DIR=${CI_BUILD_DIR:-/tmp/cwfr-ci}
+FUZZ_SECONDS=${FUZZ_SECONDS:-10}
+JOBS=${JOBS:-$(nproc)}
+H3SPEC=${H3SPEC:-$(command -v h3spec || true)}
+
+# Databases are off in every stage: the gate must run on a machine with none,
+# and the database tests are a separate binary with their own requirements.
+COMMON_CMAKE=(
+    -DINCLUDE_POSTGRESQL=no -DINCLUDE_MYSQL=no
+    -DINCLUDE_REDIS=no -DINCLUDE_SQLITE=no
+)
+
+# The fake stack turns an idle sanitised server into an apparent 4.5 KB/s leak
+# (core/INSTALL.md), and every stage here either runs a server or a fuzzer.
+export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_stack_use_after_return=0}"
+
+mkdir -p "$CI_BUILD_DIR"
+
+STAGES_RUN=()
+STAGES_RESULT=()
+FAILED=0
+
+say() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
+note() { printf '   %s\n' "$*"; }
+
+record() {
+    STAGES_RUN+=("$1")
+    STAGES_RESULT+=("$2")
+    [ "$2" = FAIL ] && FAILED=1
+    return 0
+}
+
+# Configure + build one tree. Extra cmake arguments come after the directory.
+build() {
+    local dir=$1; shift
+    local log="$CI_BUILD_DIR/$(basename "$dir").log"
+
+    cmake -S "$BACKEND_DIR" -B "$dir" -G Ninja "${COMMON_CMAKE[@]}" "$@" > "$log" 2>&1 &&
+        cmake --build "$dir" -j"$JOBS" >> "$log" 2>&1 && return 0
+
+    note "build failed, see $log"
+    tail -20 "$log" | sed 's/^/   | /'
+
+    return 1
+}
+
+stage_noh3() {
+    say "noh3: build without HTTP/3, then unit tests"
+
+    if build "$CI_BUILD_DIR/noh3" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=no &&
+       "$CI_BUILD_DIR/noh3/exec/runner" | tail -4 | sed 's/^/   /'; then
+        record noh3 OK
+    else
+        record noh3 FAIL
+    fi
+}
+
+stage_asan() {
+    say "asan: build with HTTP/3 (ASan+LSan), then unit tests"
+
+    if build "$CI_BUILD_DIR/asan" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes &&
+       "$CI_BUILD_DIR/asan/exec/runner" | tail -4 | sed 's/^/   /'; then
+        record asan OK
+    else
+        record asan FAIL
+    fi
+}
+
+stage_tsan() {
+    say "tsan: build with HTTP/3 (ThreadSanitizer), then unit tests"
+
+    # TSan cannot be linked alongside ASan, hence its own tree -- and its own
+    # ASAN_OPTIONS-free environment.
+    if ASAN_OPTIONS= build "$CI_BUILD_DIR/tsan" -DCMAKE_BUILD_TYPE=Debug \
+             -DBUILD_TESTS=yes -DINCLUDE_HTTP3=yes -DSANITIZE=thread &&
+       ASAN_OPTIONS= TSAN_OPTIONS="halt_on_error=1" \
+             "$CI_BUILD_DIR/tsan/exec/runner" | tail -4 | sed 's/^/   /'; then
+        record tsan OK
+    else
+        record tsan FAIL
+    fi
+}
+
+stage_fuzz() {
+    say "fuzz: $FUZZ_SECONDS s per target (§5 asks 24h per target on a schedule)"
+
+    if ! build "$CI_BUILD_DIR/fuzz" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=yes \
+               -DINCLUDE_HTTP3=yes -DBUILD_FUZZERS=yes; then
+        record fuzz FAIL
+        return
+    fi
+
+    local crashes="$CI_BUILD_DIR/crashes"
+    mkdir -p "$crashes"
+
+    local ok=1
+    local target
+    for target in "$CI_BUILD_DIR"/fuzz/exec/fuzz_*; do
+        [ -x "$target" ] || continue
+
+        local name=$(basename "$target")
+        local corpus="$CORE_DIR/tests/fuzz/corpus/${name#fuzz_}"
+
+        # The corpus in the tree is the seed set; found inputs go to the build
+        # dir, so a gate run never writes to the working copy.
+        local work="$CI_BUILD_DIR/corpus/${name#fuzz_}"
+        mkdir -p "$work"
+        [ -d "$corpus" ] && cp -n "$corpus"/* "$work"/ 2>/dev/null
+
+        if "$target" -seconds="$FUZZ_SECONDS" -artifacts="$crashes" "$work" \
+                > "$CI_BUILD_DIR/$name.log" 2>&1; then
+            note "$(tail -1 "$CI_BUILD_DIR/$name.log")"
+        else
+            note "$name CRASHED -- input in $crashes, log in $CI_BUILD_DIR/$name.log"
+            ok=0
+        fi
+    done
+
+    [ "$ok" = 1 ] && record fuzz OK || record fuzz FAIL
+}
+
+stage_h3spec() {
+    say "h3spec: RFC conformance against a running server"
+
+    if [ -z "$H3SPEC" ] || [ ! -x "$H3SPEC" ]; then
+        note "h3spec binary not found (set H3SPEC=/path/to/h3spec)."
+        note "Releases: github.com/kazu-yamamoto/h3spec -- take the binary, do"
+        note "not build Haskell."
+        record h3spec SKIP
+        return
+    fi
+
+    if ! build "$CI_BUILD_DIR/rel" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+               -DINCLUDE_HTTP3=yes; then
+        record h3spec FAIL
+        return
+    fi
+
+    # A server of its own, so the stage needs nothing configured on the machine.
+    # The certificate is the committed test one (tests/data), which is what the
+    # unit tests use for the same reason.
+    local root="$CI_BUILD_DIR/www"
+    mkdir -p "$root"
+    echo '<html><body>ci</body></html>' > "$root/index.html"
+
+    local config="$CI_BUILD_DIR/h3spec.json"
+    cat > "$config" <<JSON
+{
+    "main": {
+        "workers": 1, "threads": 2, "reload": "hard",
+        "buffer_size": 16384, "client_max_body_size": 1048576, "tmp": "/tmp",
+        "gzip": ["text/html"],
+        "log": { "enabled": true, "level": "error" },
+        "env": { "http3_so_rcvbuf": 4194304 }
+    },
+    "servers": {
+        "s1": {
+            "domains": ["localhost"],
+            "ip": "127.0.0.1", "port": 18443,
+            "root": "$root",
+            "index": "index.html",
+            "tls": {
+                "fullchain": "$CORE_DIR/tests/data/quic_test_cert.pem",
+                "private": "$CORE_DIR/tests/data/quic_test_key.pem",
+                "ciphers": "TLS_AES_128_GCM_SHA256 TLS_AES_256_GCM_SHA384 TLS_CHACHA20_POLY1305_SHA256"
+            },
+            "http3": { "enabled": true, "port": 18443 }
+        }
+    },
+    "mimetypes": { "text/html": ["html"] }
+}
+JSON
+
+    "$CI_BUILD_DIR/rel/exec/cwfr" -c "$config" -f > "$CI_BUILD_DIR/h3spec-server.log" 2>&1 &
+    local server=$!
+    sleep 2
+
+    if ! kill -0 "$server" 2>/dev/null; then
+        note "server did not start, see $CI_BUILD_DIR/h3spec-server.log"
+        record h3spec FAIL
+        return
+    fi
+
+    # `-n` skips certificate validation: the test certificate is self-signed on
+    # purpose. A dead port looks exactly like a non-conforming server here (48
+    # failures out of 49), which is why the liveness check above is separate.
+    local out="$CI_BUILD_DIR/h3spec.txt"
+    "$H3SPEC" -n localhost 18443 > "$out" 2>&1
+    kill "$server" 2>/dev/null
+    wait "$server" 2>/dev/null
+
+    note "$(tail -1 "$out")"
+
+    if grep -q "0 failures" "$out"; then
+        record h3spec OK
+    else
+        note "see $out"
+        record h3spec FAIL
+    fi
+}
+
+STAGES=("$@")
+[ ${#STAGES[@]} -eq 0 ] && STAGES=(noh3 asan tsan fuzz h3spec)
+
+for stage in "${STAGES[@]}"; do
+    case "$stage" in
+    noh3)   stage_noh3 ;;
+    asan)   stage_asan ;;
+    tsan)   stage_tsan ;;
+    fuzz)   stage_fuzz ;;
+    h3spec) stage_h3spec ;;
+    *)      echo "unknown stage: $stage" >&2; exit 2 ;;
+    esac
+done
+
+say "summary"
+for i in "${!STAGES_RUN[@]}"; do
+    printf '   %-8s %s\n' "${STAGES_RUN[$i]}" "${STAGES_RESULT[$i]}"
+done
+
+exit "$FAILED"
