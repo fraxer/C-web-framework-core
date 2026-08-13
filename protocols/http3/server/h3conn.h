@@ -86,6 +86,14 @@ typedef struct h3conn {
 
     /* Our outbound service streams, opened once the handshake completes. */
     int          service_streams_open;
+
+    /* Early hints waiting to be encoded, across all streams of the connection.
+     *
+     * A counter rather than a scan: the 103 pass walks every stream before the
+     * response pass does, which doubled the walk of a turn for a feature almost
+     * no response uses (docs/http3/08 §7g). Raised when a 103 is staged, lowered
+     * when it goes out. */
+    int          early_hints_pending;
 } h3conn_t;
 
 h3conn_t* h3conn_create(connection_t* connection, uint64_t max_field_section_size,
@@ -205,5 +213,15 @@ int h3conn_goaway(h3conn_t* c, quicconn_t* qc);
  * answering it. This is what a drain waits for -- not the stream count, which
  * includes our own service streams and stays non-zero forever. */
 size_t h3conn_requests_in_flight(const h3conn_t* c, const quicconn_t* qc);
+
+/* The smallest slice of the connection's write-ahead budget worth running a
+ * response's filter chain for (docs/http3/08 §7g).
+ *
+ * Without a floor the budget is spent in dribbles: thirty streams share 256 KB,
+ * every turn finds a few hundred bytes free, and each of those turns costs a
+ * full pass through the header and body filters to move almost nothing. With
+ * one, a turn serves fewer streams and serves them properly; what a stream
+ * waits for is at most a turn, and turns happen on every acknowledgement. */
+#define H3_WRITE_MIN_ROOM (4 * 1024)
 
 #endif

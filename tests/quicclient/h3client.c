@@ -227,9 +227,11 @@ int h3client_get(quicclient_t* client, uint64_t stream_id,
             return 0;
         }
 
-        /* Done when the server has finished its half and nothing is left in the
-         * buffer -- the response body ends with the stream (§4.1). */
-        if (quicclient_stream_fin(client, stream_id) &&
+        /* Done when the server has finished its half, without gaps, and nothing
+         * is left in the buffer -- the response body ends with the stream
+         * (§4.1). "Without gaps" is the whole difference between a finished
+         * response and a lost packet (quicclient.h). */
+        if (quicclient_stream_complete(client, stream_id) &&
             quicclient_stream_readable(client, stream_id) == 0) {
             complete = 1;
             break;
@@ -303,7 +305,9 @@ int h3client_get_many(quicclient_t* client, size_t count,
             if (!__consume(client, i * 4, &parsers[i], &out[i], &headers_seen[i]))
                 goto finish;
 
-            if (quicclient_stream_fin(client, i * 4) &&
+            /* Complete, not merely finished: a FIN with a gap in front of it
+             * is a response still arriving (quicclient.h). */
+            if (quicclient_stream_complete(client, i * 4) &&
                 quicclient_stream_readable(client, i * 4) == 0) {
                 complete[i] = 1;
                 done++;
@@ -374,7 +378,7 @@ int h3client_post_expect(quicclient_t* client, uint64_t stream_id,
             return 0;
         }
 
-        if (quicclient_stream_fin(client, stream_id) &&
+        if (quicclient_stream_complete(client, stream_id) &&
             quicclient_stream_readable(client, stream_id) == 0) {
             complete = 1;
             break;

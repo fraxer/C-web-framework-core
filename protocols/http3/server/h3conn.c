@@ -627,6 +627,9 @@ int h3_server_early_hints(connection_t* connection, httpresponse_t* response,
 
         st->last_early_hint = last;
         ok = 1;
+
+        h3conn_t* c = h3_conn_of(connection);
+        if (c != NULL) c->early_hints_pending++;
     }
 
     connection_s_unlock(connection);
@@ -719,14 +722,20 @@ int h3conn_write(h3conn_t* c, quicconn_t* qc) {
 
     /* Informational responses first, and outside the per-stream turn below: a
      * 103 is a staged block, not a scheduled body, and it has to precede the
-     * final HEADERS of its own stream. */
-    for (quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
+     * final HEADERS of its own stream.
+     *
+     * Guarded by a counter because almost no response stages one, and without
+     * the guard this walked every stream of the connection on every turn to
+     * find nothing (§7g). */
+    for (quicstream_t* qs = c->early_hints_pending > 0 ? qc->streams : NULL;
+         qs != NULL; qs = qs->next) {
         h3stream_t* st = h3conn_request_of(qs);
         if (st == NULL || st->early_hints == NULL) continue;
 
         http_header_t* fields = st->early_hints;
         st->early_hints = NULL;
         st->last_early_hint = NULL;
+        if (c->early_hints_pending > 0) c->early_hints_pending--;
 
         if (!st->response_headers_sent)
             (void)__write_informational(c, qs, 103, fields);
@@ -739,10 +748,24 @@ int h3conn_write(h3conn_t* c, quicconn_t* qc) {
      * for it per dribble walked the stream list 146 times per request. */
     quicconn_budget_open(qc);
 
+    /* Not enough left of the write-ahead budget to be worth a turn: a response
+     * that has already sent its headers has only body to add, and the body
+     * writer would refuse it -- or, worse, accept a few hundred bytes.
+     * Running the whole filter chain to be refused is what the turn used to do
+     * -- 145 entries into the body writer per request against 9 frames actually
+     * written, because thirty streams share one 256 KB budget and most turns
+     * find it spent (docs/http3/08 §7g).
+     *
+     * A response that has *not* sent its headers is let through: its headers
+     * are not body, they are small, and holding them back would delay every new
+     * response behind whatever is draining. */
+    const int budget_spent = quicconn_write_room(qc) < H3_WRITE_MIN_ROOM;
+
     for (quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
         h3stream_t* st = h3conn_request_of(qs);
         if (st == NULL || st->response_done) continue;
         if (!atomic_load_explicit(&st->response_ready, memory_order_acquire)) continue;
+        if (budget_spent && st->response_headers_sent) continue;
 
         log_debug("h3: response cid=%02x%02x%02x%02x stream=%llu\n",
                   qc->odcid.data[0], qc->odcid.data[1],

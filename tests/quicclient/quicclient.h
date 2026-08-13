@@ -339,6 +339,17 @@ void quicclient_impair(quicclient_t* client, unsigned loss_out_pct, unsigned los
  * requires before a server will treat a new address as the peer's. */
 int quicclient_ping(quicclient_t* client);
 
+/* Everything the peer sent on this stream has arrived and been read: the FIN is
+ * known *and* there are no gaps before it.
+ *
+ * Not the same question as `quicclient_stream_fin`, and the difference is a
+ * harness that lies: a FIN arrives at its offset whether or not the data before
+ * it did, so a run that lost a packet reported the response "complete" with an
+ * empty body -- and stopped reading, so the retransmission it was waiting for
+ * never came. Thirty parallel streams and a fast sender turned that into a
+ * "server regression" that did not exist (docs/http3/08 §7g). */
+int quicclient_stream_complete(quicclient_t* client, uint64_t id);
+
 /* What the receive path cost this run. Zeroed datagram counts in the
  * in-process stand: there is no socket there and hence nothing to queue. */
 void quicclient_rxstats(const quicclient_t* client, quicclient_rxstats_t* out);

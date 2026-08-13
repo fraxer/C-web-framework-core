@@ -447,6 +447,12 @@ int quicclient_path_challenge(quicclient_t* client) {
     return 1;
 }
 
+int quicclient_stream_complete(quicclient_t* client, uint64_t id) {
+    clientstream_t* s = __stream_get(client, id, 0);
+
+    return s != NULL && quicrecvbuf_complete(&s->in);
+}
+
 int quicclient_stream_fin(quicclient_t* client, uint64_t id) {
     clientstream_t* s = __stream_get(client, id, 0);
 
