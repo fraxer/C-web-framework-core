@@ -615,10 +615,28 @@ ssize_t quicendpoint_send(quicendpoint_t* endpoint, const uint8_t* data, size_t 
 
     if (endpoint->fd == -1) return -1;
 
-    const ssize_t sent = udp_send(endpoint->fd, data, len,
-                                  (const struct sockaddr*)&path->remote,
-                                  path->remote_len,
-                                  path->local_len > 0 ? &path->local : NULL);
+    const struct sockaddr* peer = (const struct sockaddr*)&path->remote;
+    const struct sockaddr_storage* local = path->local_len > 0 ? &path->local : NULL;
+
+    if (endpoint->tx_batch != NULL) {
+        int queued = udp_tx_batch_add(endpoint->tx_batch, data, len, peer,
+                                      path->remote_len, local);
+
+        /* Full, or a datagram too big for a slot. The first is answered by
+         * making room; the second never happens for QUIC (a slot is a whole
+         * datagram) and falls through to the single send below, which reports
+         * EMSGSIZE honestly. */
+        if (queued == 0 && udp_tx_batch_count(endpoint->tx_batch) > 0) {
+            quicendpoint_send_flush(endpoint);
+            queued = udp_tx_batch_add(endpoint->tx_batch, data, len, peer,
+                                      path->remote_len, local);
+        }
+
+        if (queued == 1) return (ssize_t)len;
+    }
+
+    const ssize_t sent = udp_send(endpoint->fd, data, len, peer,
+                                  path->remote_len, local);
 
     if (sent < 0) {
         metrics_quic(METRICS_QUIC_SEND_ERROR);
@@ -631,6 +649,33 @@ ssize_t quicendpoint_send(quicendpoint_t* endpoint, const uint8_t* data, size_t 
     }
 
     return sent;
+}
+
+void quicendpoint_send_flush(quicendpoint_t* endpoint) {
+    if (endpoint == NULL || endpoint->tx_batch == NULL || endpoint->fd == -1) return;
+
+    const size_t queued = udp_tx_batch_count(endpoint->tx_batch);
+    if (queued == 0) return;
+
+    size_t bytes = 0;
+    const int sent = udp_tx_batch_flush(endpoint->tx_batch, endpoint->fd, &bytes);
+
+    if (sent < 0) {
+        metrics_quic_add(METRICS_QUIC_SEND_ERROR, (unsigned long long)queued);
+        return;
+    }
+
+    /* Counted here rather than at queue time, so the metric keeps meaning what
+     * it always meant: datagrams the kernel took. What it refused is loss, and
+     * loss recovery is what answers for it. */
+    if (sent > 0) {
+        metrics_quic_add(METRICS_QUIC_DGRAM_SENT, (unsigned long long)sent);
+        metrics_quic_add(METRICS_QUIC_BYTES_SENT, (unsigned long long)bytes);
+    }
+
+    if ((size_t)sent < queued)
+        metrics_quic_add(METRICS_QUIC_SEND_ERROR,
+                         (unsigned long long)(queued - (size_t)sent));
 }
 
 void quicendpoint_wake(quicendpoint_t* endpoint, struct quicconn* conn) {
@@ -654,13 +699,22 @@ void quicendpoint_wake(quicendpoint_t* endpoint, struct quicconn* conn) {
 
     atomic_flag_clear_explicit(&endpoint->tx_lock, memory_order_release);
 
-    /* And wake the worker. Outside the lock: the write is a syscall, and the
-     * queue must not be held across one. */
-    if (endpoint->eventfd >= 0) {
+    /* And wake the worker -- once. Outside the lock: the write is a syscall,
+     * and the queue must not be held across one.
+     *
+     * Only the producer that finds no wakeup outstanding pays for it. The
+     * worker clears the flag before it drains the queue, so a response queued
+     * after that clear finds the flag down and writes its own wakeup: a
+     * response can be late by one turn, never lost. */
+    if (endpoint->eventfd >= 0 &&
+        !atomic_exchange_explicit(&endpoint->wake_pending, 1, memory_order_acq_rel)) {
         const uint64_t one = 1;
         if (write(endpoint->eventfd, &one, sizeof one) != (ssize_t)sizeof one) {
-            /* EAGAIN means the counter is saturated, which already means the
-             * worker has a wakeup coming. Nothing else is worth doing here. */
+            /* Nothing was said, so nothing may be assumed: put the flag back or
+             * the next response would stay silent too. EAGAIN here means the
+             * counter is saturated, which already means a wakeup is coming, but
+             * the cheap correct move is the same either way. */
+            atomic_store_explicit(&endpoint->wake_pending, 0, memory_order_release);
         }
     }
 }
@@ -706,6 +760,13 @@ unsigned short quicendpoint_port(quicendpoint_t* endpoint) {
 
 void quicendpoint_detach(quicendpoint_t* endpoint, quicconn_t* conn) {
     if (endpoint == NULL || conn == NULL) return;
+
+    /* Whatever this connection queued last -- and that is normally its
+     * CONNECTION_CLOSE -- goes out before the state behind it disappears. The
+     * turn would flush anyway; doing it here costs one syscall per closing
+     * connection and removes a whole class of "the goodbye was built and never
+     * left" from every future caller. */
+    quicendpoint_send_flush(endpoint);
 
     /* One line per connection, at the only moment that can report the whole of
      * it (docs/http3/08 §7b).
@@ -1297,6 +1358,12 @@ static int __endpoint_wake_read(connection_t* connection) {
         /* drain -- level-triggered */
     }
 
+    /* Before the drain below, never after: a response queued between this store
+     * and the drain still finds the flag down and writes its own wakeup, while
+     * clearing afterwards would let one slip in unseen and unannounced -- and
+     * it would then wait for the timer. */
+    atomic_store_explicit(&ep->wake_pending, 0, memory_order_release);
+
     __endpoint_tick(ep, 0);
     __endpoint_timer_arm(ep);
 
@@ -1405,6 +1472,11 @@ static int __endpoint_read(connection_t* connection) {
         if ((size_t)n < __quic_rx_batch) break;
     }
 
+    /* The answers to everything just dispatched, in one syscall (§7d). Before
+     * arming the timer, because a deadline computed while a flight is still in
+     * our own buffer would be measuring from the wrong moment. */
+    quicendpoint_send_flush(ep);
+
     /* Deadlines move with every datagram -- an acknowledgement disarms a PTO, a
      * new packet arms one -- so the timer is re-armed once the batch is done
      * rather than per datagram. */
@@ -1507,11 +1579,16 @@ static void __endpoint_free(quicendpoint_t* ep) {
     }
 
     if (ep->fd != -1) {
+        /* Last chance for anything still queued -- a CONNECTION_CLOSE from the
+         * shutdown, most likely -- because after this there is no socket. */
+        quicendpoint_send_flush(ep);
+
         close(ep->fd);
         ep->fd = -1;
     }
 
     udp_rx_batch_free(ep->rx);
+    udp_tx_batch_free(ep->tx_batch);
     cqueue_clear(&ep->listener.servers);
     free(ep);
 }
@@ -1547,6 +1624,12 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server) {
 
     ep->rx = udp_rx_batch_create(__quic_rx_batch, QUIC_RX_DATAGRAM_SIZE);
     if (ep->rx == NULL) goto failed;
+
+    /* Same depth as the receive batch: what arrives in one turn is roughly what
+     * leaves in one, and both are bounded by the worker's visit rather than by
+     * memory. */
+    ep->tx_batch = udp_tx_batch_create(__quic_rx_batch, QUIC_RX_DATAGRAM_SIZE);
+    if (ep->tx_batch == NULL) goto failed;
 
     /* The endpoint's own connection carries no buffer: datagrams live in the
      * batch, not in the shared per-worker scratch that TCP connections use. */
@@ -1747,6 +1830,11 @@ static void __endpoint_tick(quicendpoint_t* ep, int shutdown_now) {
 
         conn = next;
     }
+
+    /* Everything the turn produced leaves here, in one syscall (§7d). Every
+     * caller of this function ends its own turn with it, so this single line
+     * covers the timer, the wake queue and the worker's sweep. */
+    quicendpoint_send_flush(ep);
 }
 
 void quicendpoints_tick(quicendpoint_t* endpoints, int shutdown_now) {

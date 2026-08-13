@@ -50,6 +50,15 @@ typedef struct quicendpoint {
 
     udp_rx_batch_t* rx;
 
+    /* Datagrams built but not yet handed to the kernel (docs/http3/08 §7d).
+     *
+     * Owned by the worker thread that runs this endpoint, exactly like `rx`:
+     * everything that fills it -- a connection's send round, a stateless
+     * answer -- runs on that thread. Flushed by `quicendpoint_send_flush()`
+     * before the worker returns to the event loop, and automatically whenever
+     * it fills up. */
+    udp_tx_batch_t* tx_batch;
+
     /* Last value of the kernel's receive-overflow counter for this socket, so
      * the metric can report the step rather than the running total. */
     uint32_t kernel_drops;
@@ -181,6 +190,16 @@ typedef struct quicendpoint {
     struct quicconn* tx_tail;
     atomic_flag tx_lock;
 
+    /* A wakeup is already on its way to the worker, so another response does
+     * not need to write the eventfd again.
+     *
+     * The write is a syscall per published response, and under load that was
+     * 12 % of the server's CPU (docs/http3/08 §7d) -- paid to say a second time
+     * what the worker has not yet acted on once. Cleared by the worker before
+     * it drains the queue, never after: a producer that enqueued before the
+     * clear is then either seen by that drain or writes its own wakeup. */
+    atomic_int wake_pending;
+
     /* ---- Test seam (docs/http3/08-testing.md §2) ---- *
      *
      * Where the endpoint's datagrams go instead of the socket. NULL in every
@@ -269,14 +288,26 @@ void quicendpoints_drain(quicendpoint_t* endpoints);
 void quicendpoints_unlisten(quicendpoint_t* endpoints);
 void quicendpoints_free(quicendpoint_t* endpoints);
 
-/* Send one datagram from this endpoint's socket, with the source address
- * pinned to the one the peer sent to. Returns the bytes sent, 0 if the socket
- * would block (QUIC datagrams are droppable; loss recovery will notice), or -1.
+/* Queue one datagram to leave this endpoint's socket, with the source address
+ * pinned to the one the peer sent to. Returns the bytes queued, 0 if the
+ * datagram was dropped (QUIC datagrams are droppable; loss recovery will
+ * notice), or -1 on an error the caller should stop sending after.
+ *
+ * "Queued", not "sent": the datagram is copied into the endpoint's transmit
+ * batch and leaves on the next `quicendpoint_send_flush()`, or sooner if the
+ * batch fills. That is worth 26 % of the server's CPU under load
+ * (docs/http3/08 §7d) and costs one rule -- every path that produces datagrams
+ * must flush before it returns to the event loop.
  *
  * The only way a connection reaches the wire: connections have no socket of
  * their own. */
 ssize_t quicendpoint_send(quicendpoint_t* endpoint, const uint8_t* data, size_t len,
                           const struct quicpath* path);
+
+/* Hand everything queued to the kernel. Cheap and idempotent when the batch is
+ * empty, so it belongs at the end of every entry point that can send: the
+ * datagram reader, the timer, the wake queue and the sweep. */
+void quicendpoint_send_flush(quicendpoint_t* endpoint);
 
 /* Mark a connection as having something to send.
  *

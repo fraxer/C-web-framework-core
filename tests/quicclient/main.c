@@ -59,6 +59,13 @@ int main(int argc, char* argv[]) {
      * fit. Raised per run rather than globally, so an ordinary failure is still
      * reported in five seconds instead of thirty. */
     int timeout_ms = 5000;
+
+    /* Where to put the body, for the checks that only bytes can settle. A
+     * response of the right *length* proves nothing about a send path that
+     * reorders or mis-splits datagrams -- and segmentation offload
+     * (docs/http3/08 §7e) is exactly such a path. */
+    const char* out_path = NULL;
+
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-q") == 0) verbose = 0;
         else if (strcmp(argv[i], "--handshake-only") == 0) handshake_only = 1;
@@ -78,6 +85,7 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--dup") == 0 && i + 1 < argc) dup = (unsigned)atoi(argv[++i]);
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) seed = strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) timeout_ms = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_path = argv[++i];
     }
 
     if (concurrent < 1) concurrent = 1;
@@ -486,6 +494,16 @@ int main(int argc, char* argv[]) {
             printf(" (last %d, %zu fields)\n", response.interim_status, response.interim_fields);
         printf("trailers:                  %zu\n", response.trailer_count);
         printf("body:                      %zu bytes\n", response.body_len);
+
+        if (out_path != NULL && response.body_len > 0) {
+            FILE* out = fopen(out_path, "wb");
+            const size_t written = out != NULL
+                ? fwrite(response.body, 1, response.body_len, out) : 0;
+            if (out != NULL) fclose(out);
+
+            printf("body written:              %s (%zu bytes)\n",
+                   written == response.body_len ? out_path : "FAILED", written);
+        }
 
         quicclient_rxstats_t rx;
         quicclient_rxstats(&client, &rx);

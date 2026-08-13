@@ -107,11 +107,49 @@ int udp_rx_batch_recv(udp_rx_batch_t* batch, int fd);
  * belongs to the batch and is overwritten by the next recv. */
 udp_datagram_t* udp_rx_batch_get(udp_rx_batch_t* batch, size_t index);
 
-/* ---- Transmit ----
+/* ---- Batched transmit ----
  *
- * One datagram at a time. Phase 1 only ever answers a datagram it just received
- * (Version Negotiation, stateless reset), so batching would have no user; the
- * connection write path in phase 4 adds sendmmsg alongside this.
+ * One `sendmmsg` per turn of the worker instead of one `sendmsg` per datagram.
+ *
+ * This is not a micro-optimisation: a response of an average web asset leaves
+ * as ~25 datagrams, and at one syscall each that was **26 % of the server's
+ * CPU** under load -- the single largest item in the profile, and most of why a
+ * request cost 222 µs against HTTP/2's 46 (docs/http3/08 §7d). The receive side
+ * has been batched since phase 1; this is the other half.
+ *
+ * Datagrams are copied in, because the caller builds each one in a buffer it
+ * reuses immediately. Each carries its own destination, so a batch may mix
+ * connections -- which is the point of batching at the endpoint rather than
+ * inside one connection's send loop.
+ *
+ * The caller must flush before returning to the event loop: a datagram left in
+ * the batch is not late, it is simply not sent. */
+typedef struct udp_tx_batch udp_tx_batch_t;
+
+udp_tx_batch_t* udp_tx_batch_create(size_t count, size_t datagram_size);
+void udp_tx_batch_free(udp_tx_batch_t* batch);
+
+/* Copy one datagram in. Returns 1 when queued, 0 when the batch is full or the
+ * datagram does not fit a slot (the caller flushes and retries, or sends it
+ * alone), -1 on a bad argument. */
+int udp_tx_batch_add(udp_tx_batch_t* batch, const uint8_t* data, size_t len,
+                     const struct sockaddr* peer, socklen_t peer_len,
+                     const struct sockaddr_storage* local);
+
+size_t udp_tx_batch_count(const udp_tx_batch_t* batch);
+
+/* Send everything queued, in order, with one syscall. Returns the number of
+ * datagrams the kernel accepted and writes the bytes accepted to `out_bytes`
+ * when it is not NULL; the batch is emptied either way. A short send is not an
+ * error to recover from -- what the kernel refused is a lost packet, and QUIC
+ * has loss recovery for exactly that -- so the remainder is dropped and
+ * reported through the return value. -1 means the socket itself failed. */
+int udp_tx_batch_flush(udp_tx_batch_t* batch, int fd, size_t* out_bytes);
+
+/* ---- Transmit, one at a time ----
+ *
+ * For datagrams answered without a connection (Version Negotiation, stateless
+ * reset) and as the fallback when a batch is not available.
  *
  * Returns the number of bytes sent, 0 if the socket would block (the caller
  * decides whether to retry -- these datagrams are all droppable), or -1 on a
