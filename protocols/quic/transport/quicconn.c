@@ -163,8 +163,35 @@ uint64_t quicconn_unsent_bytes(const quicconn_t* conn) {
     return total;
 }
 
-size_t quicconn_write_room(const quicconn_t* conn) {
-    const uint64_t unsent = quicconn_unsent_bytes(conn);
+void quicconn_budget_open(quicconn_t* conn) {
+    if (conn == NULL) return;
+
+    conn->unsent_cached = quicconn_unsent_bytes(conn);
+    conn->unsent_valid = 1;
+}
+
+void quicconn_budget_close(quicconn_t* conn) {
+    if (conn != NULL) conn->unsent_valid = 0;
+}
+
+void quicconn_note_queued(quicconn_t* conn, uint64_t bytes) {
+    if (conn == NULL || !conn->unsent_valid) return;
+
+    conn->unsent_cached += bytes;
+}
+
+size_t quicconn_write_room(quicconn_t* conn) {
+    if (conn == NULL) return 0;
+
+    /* Inside a write turn the answer is kept; outside one it is walked, which
+     * is what makes this safe: the kept value can only be wrong if bytes leave
+     * the buffers while it is held, and nothing sends during a write turn.
+     * A cache with no such window drifts the moment anyone marks bytes sent by
+     * another route -- which the unit tests do, and which is how this was
+     * caught rather than deployed. */
+    const uint64_t unsent = conn->unsent_valid ? conn->unsent_cached
+                                               : quicconn_unsent_bytes(conn);
+
     if (unsent >= QUICCONN_WRITE_AHEAD_MAX) return 0;
 
     return (size_t)(QUICCONN_WRITE_AHEAD_MAX - unsent);

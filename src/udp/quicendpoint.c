@@ -681,23 +681,26 @@ void quicendpoint_send_flush(quicendpoint_t* endpoint) {
 void quicendpoint_wake(quicendpoint_t* endpoint, struct quicconn* conn) {
     if (endpoint == NULL || conn == NULL) return;
 
-    /* A leaf lock held for a handful of instructions. It exists because this is
-     * reachable from a handler thread, which must not be holding -- or waiting
-     * for -- the connection lock at this point. */
-    while (atomic_flag_test_and_set_explicit(&endpoint->tx_lock, memory_order_acquire))
-        sched_yield();
+    /* Already queued: nothing to add, and nothing to lock. This is the common
+     * case by far -- a response asks to be sent once per chunk written -- and
+     * taking the endpoint's queue lock to learn it cost more than the queueing
+     * itself (docs/http3/08 §7f). */
+    if (atomic_exchange_explicit(&conn->in_tx_queue, 1, memory_order_acq_rel) == 0) {
+        /* A leaf lock held for a handful of instructions. It exists because
+         * this is reachable from a handler thread, which must not be holding --
+         * or waiting for -- the connection lock at this point. */
+        while (atomic_flag_test_and_set_explicit(&endpoint->tx_lock, memory_order_acquire))
+            sched_yield();
 
-    if (!conn->in_tx_queue) {
-        conn->in_tx_queue = 1;
         conn->tx_next = NULL;
 
         if (endpoint->tx_tail != NULL) endpoint->tx_tail->tx_next = conn;
         else endpoint->tx_head = conn;
 
         endpoint->tx_tail = conn;
-    }
 
-    atomic_flag_clear_explicit(&endpoint->tx_lock, memory_order_release);
+        atomic_flag_clear_explicit(&endpoint->tx_lock, memory_order_release);
+    }
 
     /* And wake the worker -- once. Outside the lock: the write is a syscall,
      * and the queue must not be held across one.
@@ -844,7 +847,7 @@ void quicendpoint_detach(quicendpoint_t* endpoint, quicconn_t* conn) {
         if (*tx == conn) {
             *tx = conn->tx_next;
             if (endpoint->tx_tail == conn) endpoint->tx_tail = prev;
-            conn->in_tx_queue = 0;
+            atomic_store_explicit(&conn->in_tx_queue, 0, memory_order_release);
             break;
         }
         prev = *tx;
@@ -1761,7 +1764,13 @@ static void __endpoint_tick(quicendpoint_t* ep, int shutdown_now) {
     while (pending != NULL) {
         quicconn_t* next = pending->tx_next;
         pending->tx_next = NULL;
-        pending->in_tx_queue = 0;
+
+        /* Before the work, never after: a response published between this store
+         * and the turn below is served by that turn, while one published after
+         * it finds the flag down and queues the connection afresh. Clearing it
+         * afterwards would lose exactly the responses that arrive while we
+         * work. */
+        atomic_store_explicit(&pending->in_tx_queue, 0, memory_order_release);
 
         connection_s_lock(&pending->conn, LOCK_SITE_QUIC_SEND);
 

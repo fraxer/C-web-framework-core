@@ -261,6 +261,13 @@ typedef struct quicconn {
     uint64_t accepted_us;
     uint32_t rx_overflow_at_accept;
 
+    /* Unsent bytes across this connection's streams, as of the last time the
+     * send path ran, plus whatever has been queued since (quicconn_note_queued).
+     * `unsent_valid` is cleared wherever the buffers change behind its back:
+     * the send path marking bytes sent, and streams being freed. */
+    uint64_t unsent_cached;
+    int      unsent_valid;
+
     /* Something is queued for sending.
      *
      * Atomic because quicconn_want_write is callable from a handler thread --
@@ -275,7 +282,19 @@ typedef struct quicconn {
 
     struct quicconn* ep_next;   /* endpoint's connection list */
     struct quicconn* tx_next;   /* endpoint's send queue */
-    int      in_tx_queue;
+
+    /* Already waiting in the endpoint's send queue.
+     *
+     * Atomic and consulted before the queue's lock, because the answer is
+     * almost always yes: a response of a few chunks asks to be sent ~150 times,
+     * and only the first of those has anything to add (docs/http3/08 §7f). The
+     * rest used to take a lock shared by every connection to discover it.
+     *
+     * Cleared by the worker *before* it serves the entry, which is what makes
+     * the unlocked read safe -- the same rule as the wakeup flag next to it in
+     * the endpoint. A publisher that reads 1 has its work picked up by the turn
+     * that is about to run; one that reads 0 queues the connection again. */
+    atomic_int in_tx_queue;
 } quicconn_t;
 
 /* Build a connection from a client's first Initial packet.
@@ -365,8 +384,38 @@ void quicconn_consumed(quicconn_t* conn, uint64_t bytes);
 uint64_t quicconn_unsent_bytes(const quicconn_t* conn);
 
 /* How much more the application may write before it must wait. 0 means stop and
- * resume when the send path has drained (quicconn_send is what frees it). */
-size_t quicconn_write_room(const quicconn_t* conn);
+ * resume when the send path has drained (quicconn_send is what frees it).
+ *
+ * Answers from a value kept across calls rather than by walking the streams
+ * every time. The walk was written on the assumption that this is asked once
+ * per 16 KB chunk; measured, it is asked **146 times per request** -- the
+ * write-ahead budget is shared by thirty streams, so each response goes out in
+ * dribbles, and each dribble walked the whole list. That was 5300 pointer steps
+ * per request and ~4 % of the server's CPU (docs/http3/08 §7f).
+ *
+ * The value is rebuilt by the walk on the first ask of each send turn and then
+ * kept honest by quicconn_note_queued below. Not const, because asking now
+ * remembers. */
+size_t quicconn_write_room(quicconn_t* conn);
+
+/* Open and close a write turn: between the two, quicconn_write_room answers
+ * from a value taken once instead of walking the streams per call.
+ *
+ * The window is exactly a turn of h3conn_write, and that is what makes it
+ * safe -- during it the application only *adds* to the buffers, and every
+ * addition is declared through quicconn_note_queued. Nothing sends. Outside
+ * the window the walk is used, so anything that empties a buffer by another
+ * route (a test draining a stream by hand, a reset) is seen immediately. */
+void quicconn_budget_open(quicconn_t* conn);
+void quicconn_budget_close(quicconn_t* conn);
+
+/* Tell the connection that `bytes` were just queued on one of its streams.
+ *
+ * The only thing the kept value cannot see for itself: it is refreshed when the
+ * send path runs, and between two runs the application may write. Callers that
+ * queue stream data and then ask for room again must say so, or the budget
+ * reads high and the write-ahead limit stops limiting. */
+void quicconn_note_queued(quicconn_t* conn, uint64_t bytes);
 
 /* Open the next server-initiated unidirectional stream (§2.1), or NULL when the
  * peer's initial_max_streams_uni is exhausted or allocation fails.

@@ -734,6 +734,11 @@ int h3conn_write(h3conn_t* c, quicconn_t* qc) {
         http_headers_free(fields);
     }
 
+    /* One budget for the whole turn (docs/http3/08 §7f): every response about
+     * to be written shares the connection's write-ahead allowance, and asking
+     * for it per dribble walked the stream list 146 times per request. */
+    quicconn_budget_open(qc);
+
     for (quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
         h3stream_t* st = h3conn_request_of(qs);
         if (st == NULL || st->response_done) continue;
@@ -753,6 +758,8 @@ int h3conn_write(h3conn_t* c, quicconn_t* qc) {
             atomic_store_explicit(&st->response_ready, 0, memory_order_release);
         }
     }
+
+    quicconn_budget_close(qc);
 
     return 1;
 }

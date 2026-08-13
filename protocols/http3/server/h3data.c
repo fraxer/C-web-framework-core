@@ -17,13 +17,18 @@ void h3_data_writer_reset(h3_data_writer_t* w) {
  * would carry a frame announcing bytes that never arrive -- and a QUIC stream
  * cannot be rewound. So the two writes are ordered header-first and a failure
  * of the second is fatal to the stream rather than retried. */
-static int __write_frame(quicstream_t* qs, const uint8_t* data, size_t len) {
+static int __write_frame(quicstream_t* qs, const uint8_t* data, size_t len,
+                         size_t* out_queued) {
     uint8_t header[9];
     const size_t hlen = h3response_data_header(header, sizeof header, len);
     if (hlen == 0) return 0;
 
     if (!quicstream_write(qs, header, hlen)) return 0;
     if (!quicstream_write(qs, data, len)) return 0;
+
+    /* Header included: what the budget lost is what went into the stream, and
+     * the caller tracks the budget itself now (see the loop below). */
+    if (out_queued != NULL) *out_queued = hlen + len;
 
     return 1;
 }
@@ -32,13 +37,22 @@ h3_data_status_e h3_data_write(h3_data_writer_t* w, quicconn_t* qc, quicstream_t
                                bufo_t* src, int is_last, int fin_allowed) {
     if (w == NULL || qc == NULL || qs == NULL || src == NULL) return H3_DATA_ERROR;
 
+    /* Asked once, then kept.
+     *
+     * `quicconn_write_room` walks every stream of the connection, and asking it
+     * per chunk made that walk 152 times per request -- 5300 pointer steps,
+     * ~4 % of the server's CPU under load (docs/http3/08 §7f). Nothing else
+     * writes to these streams while this loop runs -- the connection is
+     * single-threaded here -- so the budget can simply be carried down: what
+     * the write queues is exactly what the budget loses. */
+    size_t room = quicconn_write_room(qc);
+
     for (;;) {
         const size_t remaining = src->size > src->pos ? src->size - src->pos : 0;
 
         if (remaining == 0) break;
 
         /* Budget first: the point of the check is to not have written yet. */
-        const size_t room = quicconn_write_room(qc);
         if (room == 0) return H3_DATA_BLOCKED;
 
         size_t chunk = remaining;
@@ -49,10 +63,17 @@ h3_data_status_e h3_data_write(h3_data_writer_t* w, quicconn_t* qc, quicstream_t
          * not a hard cap on bytes held. */
         if (chunk > room) chunk = room;
 
-        if (!__write_frame(qs, (const uint8_t*)src->data + src->pos, chunk))
+        size_t queued = 0;
+        if (!__write_frame(qs, (const uint8_t*)src->data + src->pos, chunk, &queued))
             return H3_DATA_ERROR;
 
         src->pos += chunk;
+        room = room > queued ? room - queued : 0;
+
+        /* The connection keeps the budget across calls now, so what was queued
+         * here has to be told to it -- otherwise the next stream's turn reads a
+         * budget that ignores this write. */
+        quicconn_note_queued(qc, queued);
     }
 
     /* Everything this source held is queued. FIN belongs here only if the
