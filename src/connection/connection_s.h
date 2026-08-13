@@ -111,10 +111,20 @@ typedef struct {
      * Handler threads read this, so it crosses the thread boundary — but it is
      * only ever written before the first handler on the connection can run: at
      * ALPN time, or from connection_after_write on the h2c upgrade path, where
-     * h1.1 guarantees no handler is in flight. Once set it never clears. That
-     * write-once ordering is what makes a plain bitfield safe here; anything
-     * that starts flipping it later must move it out of the word. */
-    unsigned is_http2: 1;
+     * h1.1 guarantees no handler is in flight. Once set it never clears.
+     *
+     * A byte of its own, not a bitfield, and that is the whole point: write-once
+     * makes the *field* safe, while a bitfield shares a storage unit with its
+     * neighbours, and writing a neighbour is a read-modify-write of the whole
+     * unit. `cont_pending`/`cont_sent` are written by the worker on every
+     * exchange, so the word was being modified under handler threads reading
+     * this flag out of it -- a data race by the memory model, reported by TSan
+     * on the first load with a slow handler (docs/http3/08 §7h). Harmless in
+     * practice on x86 today, and one added handler-side write away from a lost
+     * update. The old comment here already said "anything that starts flipping
+     * it later must move it out of the word"; what it missed is that a
+     * neighbour flipping counts. */
+    uint8_t is_http2;
     /* Plaintext connection whose first bytes have not yet been inspected for the
      * h2c connection preface (RFC 9113 §3.4). Set once at plaintext accept;
      * cleared as soon as the protocol is settled, so the h1.1 hot path pays a
