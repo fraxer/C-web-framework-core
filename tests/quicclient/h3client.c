@@ -268,7 +268,24 @@ int h3client_get_many(quicclient_t* client, size_t count,
                       const char* authority, const char* path,
                       int timeout_ms, h3client_response_t* out) {
     if (client == NULL || out == NULL || count == 0) return 0;
-    if (count > CLIENT_MAX_STREAMS / 2) return 0;
+
+    /* Slots, not a fraction. Every request holds one for the life of the
+     * exchange, and the service streams of both ends -- our control and two
+     * QPACK streams, the server's three, a grease stream apiece -- hold the
+     * rest. Halving the table was a guess that cost a bug report: `-n 40`
+     * against a 64-slot client refused here and printed "not every response
+     * completed", which reads as the *server* failing (docs/http3/08 §3q saw
+     * the same thing at `-n 10`).
+     *
+     * And it says so now. A harness that declines to do what it was asked must
+     * not do it silently -- the whole point of §7g. */
+    const size_t room = CLIENT_MAX_STREAMS - H3CLIENT_SERVICE_SLOTS;
+    if (count > room) {
+        printf("  [h3] refusing %zu concurrent requests: this client has %d "
+               "stream slots, %d of them reserved for service streams\n",
+               count, CLIENT_MAX_STREAMS, H3CLIENT_SERVICE_SLOTS);
+        return 0;
+    }
 
     h3frame_parser_t* parsers = calloc(count, sizeof * parsers);
     int* headers_seen = calloc(count, sizeof * headers_seen);

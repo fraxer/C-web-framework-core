@@ -104,4 +104,9 @@ int h3client_post_expect(quicclient_t* client, uint64_t stream_id,
  * request streams are delivered independently. */
 int h3client_peer_settings(quicclient_t* client, h3settings_t* out);
 
+/* Stream slots kept aside for the service streams both ends open: our control
+ * stream and two QPACK streams, the server's three, and a grease stream each
+ * (RFC 9114 §6.2, RFC 9287). Eight is the observed count plus room. */
+#define H3CLIENT_SERVICE_SLOTS 8
+
 #endif

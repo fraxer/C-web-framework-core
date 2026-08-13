@@ -267,7 +267,21 @@ int main(int argc, char* argv[]) {
 
             /* §19.16 makes retiring a sequence number that was never issued a
              * protocol violation -- a MUST, and the only way to notice a peer
-             * that is guessing. Deliberately last: it ends the connection. */
+             * that is guessing. Deliberately last: it ends the connection.
+             *
+             * And therefore skipped when a later phase still needs that
+             * connection. `--cid --migrate` together used to report "the
+             * connection did not migrate": the migration ran against a
+             * connection this check had just made the server close, so the
+             * rebound port got a stateless reset -- correct behaviour by §10.3,
+             * read as a server defect. A harness must not destroy the thing it
+             * is about to test, and when it declines a check it must say so
+             * (docs/http3/08 §7g). */
+            if (migrate) {
+                printf("unissued retire:           skipped, --migrate needs "
+                       "this connection alive\n");
+            }
+            else {
             quicclient_retire_cid(&client, 4242);
 
             /* A PING each turn, because §10.2.1 has a closing endpoint re-send
@@ -293,6 +307,7 @@ int main(int argc, char* argv[]) {
             printf("unissued retire refused:   %s%s\n", refused ? "yes" : "no",
                    client.reset_received ? " (by stateless reset)" : "");
             if (!refused) ok = 0;
+            }
         }
     }
 
