@@ -9,10 +9,11 @@
 #include "log.h"
 #include "udpsocket.h"
 
-/* Room for the local-address cmsg of either family, the ECN byte and the
- * receive-queue overflow counter. */
+/* Room for the local-address cmsg of either family, the ECN byte, the
+ * receive-queue overflow counter and the arrival timestamp. */
 #define UDP_CONTROL_SIZE (CMSG_SPACE(sizeof(struct in6_pktinfo)) + \
-                          CMSG_SPACE(sizeof(int)) + CMSG_SPACE(sizeof(uint32_t)))
+                          CMSG_SPACE(sizeof(int)) + CMSG_SPACE(sizeof(uint32_t)) + \
+                          CMSG_SPACE(sizeof(struct timespec)))
 
 struct udp_rx_batch {
     size_t count;
@@ -97,6 +98,12 @@ int udp_socket_create(const struct sockaddr* addr, socklen_t addrlen,
      * forbids it) should still serve traffic. */
     if (setsockopt(fd, SOL_SOCKET, SO_RXQ_OVFL, &on, sizeof on) == -1)
         log_error("Udp socket error: SO_RXQ_OVFL failed (errno %d)\n", errno);
+
+    /* And when it took each datagram, for the same reason: the drop counter
+     * says the queue overflowed, the timestamp says how long it was already
+     * standing before it did. Diagnostics too, so not fatal either. */
+    if (setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof on) == -1)
+        log_error("Udp socket error: SO_TIMESTAMPNS failed (errno %d)\n", errno);
 
     if (options != NULL && options->rcvbuf > 0)
         if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &options->rcvbuf,
@@ -187,6 +194,8 @@ static void __parse_control(struct msghdr* hdr, udp_datagram_t* dgram) {
     dgram->ecn = 0;
     dgram->drops = 0;
     dgram->drops_valid = 0;
+    dgram->stamp_us = 0;
+    dgram->stamp_valid = 0;
 
     for (struct cmsghdr* cmsg = CMSG_FIRSTHDR(hdr); cmsg != NULL;
          cmsg = CMSG_NXTHDR(hdr, cmsg)) {
@@ -218,6 +227,14 @@ static void __parse_control(struct msghdr* hdr, udp_datagram_t* dgram) {
         else if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_RXQ_OVFL) {
             memcpy(&dgram->drops, CMSG_DATA(cmsg), sizeof dgram->drops);
             dgram->drops_valid = 1;
+        }
+        else if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMPNS) {
+            struct timespec ts;
+            memcpy(&ts, CMSG_DATA(cmsg), sizeof ts);
+
+            dgram->stamp_us = (uint64_t)ts.tv_sec * 1000000ULL +
+                              (uint64_t)ts.tv_nsec / 1000ULL;
+            dgram->stamp_valid = 1;
         }
         /* ECN (IP_RECVTOS / IPV6_RECVTCLASS) is phase 9. The socket does not ask
          * for it, so there is deliberately no branch here: a placeholder that

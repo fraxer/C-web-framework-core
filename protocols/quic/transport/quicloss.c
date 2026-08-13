@@ -219,6 +219,9 @@ static void __detect_lost(quicloss_t* loss, quic_enc_level_e level,
     uint64_t latest_lost = 0;
     int lost_ack_eliciting = 0;
 
+    /* The last packet kept, for the tail (see the removal below). */
+    quicsent_t* kept = NULL;
+
     quicsent_t** link = &space->sent;
     while (*link != NULL) {
         quicsent_t* sent = *link;
@@ -235,13 +238,19 @@ static void __detect_lost(quicloss_t* loss, quic_enc_level_e level,
             if (space->loss_time_us == 0 || when < space->loss_time_us)
                 space->loss_time_us = when;
 
+            kept = sent;
             link = &sent->next;
             continue;
         }
 
         *link = sent->next;
-        if (space->sent_tail == sent)
-            space->sent_tail = (*link == NULL) ? NULL : space->sent_tail;
+
+        /* Same reasoning as in quicloss_on_ack: only the tail can be removed
+         * with nothing behind it, so the last packet kept is the new tail. The
+         * list is not walked again to find it -- that rescan was most of this
+         * function's cost on a large transfer (docs/http3/08 §7c). */
+        if (space->sent_tail == sent) space->sent_tail = kept;
+
         space->sent_count--;
 
         if (sent->ack_eliciting) {
@@ -281,13 +290,7 @@ static void __detect_lost(quicloss_t* loss, quic_enc_level_e level,
         __sent_free(sent);
     }
 
-    /* Rebuild the tail pointer if the list changed shape. */
     if (space->sent == NULL) space->sent_tail = NULL;
-    else {
-        quicsent_t* tail = space->sent;
-        while (tail->next != NULL) tail = tail->next;
-        space->sent_tail = tail;
-    }
 
     if (lost_ack_eliciting && loss->cc != NULL && loss->have_rtt_sample) {
         const uint64_t pto = quicloss_pto_us(loss, level);
@@ -315,6 +318,10 @@ int quicloss_on_ack(quicloss_t* loss, quic_enc_level_e level,
     uint64_t largest_sent_us = 0;
     int largest_was_ack_eliciting = 0;
 
+    /* The last packet this walk decided to keep, which is the new tail if the
+     * walk removes the old one. */
+    quicsent_t* kept = NULL;
+
     quicsent_t** link = &space->sent;
     while (*link != NULL) {
         quicsent_t* sent = *link;
@@ -333,6 +340,7 @@ int quicloss_on_ack(quicloss_t* loss, quic_enc_level_e level,
         if (sent->pn > largest) break;
 
         if (!quicrange_contains(acked, sent->pn)) {
+            kept = sent;
             link = &sent->next;
             continue;
         }
@@ -352,6 +360,11 @@ int quicloss_on_ack(quicloss_t* loss, quic_enc_level_e level,
         *link = sent->next;
         space->sent_count--;
 
+        /* Only the tail can be removed with nothing behind it -- removals here
+         * come from the prefix at or below `largest`, and the list is ascending
+         * -- so the packet before it is the new tail. */
+        if (space->sent_tail == sent) space->sent_tail = kept;
+
         /* Hand the frames to the caller so it can release what they carried;
          * with nowhere to put them they are freed as before. */
         if (out_acked != NULL && sent->frames != NULL) {
@@ -365,12 +378,15 @@ int quicloss_on_ack(quicloss_t* loss, quic_enc_level_e level,
         __sent_free(sent);
     }
 
+    /* The tail is maintained in the loop above, not rediscovered here.
+     *
+     * Rediscovering it walked the whole list on every acknowledgement, and that
+     * list *is* the congestion window -- thousands of packets on a large
+     * transfer. It is the same quadratic §7a removed from the acknowledgement
+     * scan itself, left standing three lines below it: on a 64 MB response this
+     * rescan and its twin in __detect_lost were 86 % of the server's CPU
+     * (docs/http3/08 §7c). */
     if (space->sent == NULL) space->sent_tail = NULL;
-    else {
-        quicsent_t* tail = space->sent;
-        while (tail->next != NULL) tail = tail->next;
-        space->sent_tail = tail;
-    }
 
     if (space->largest_acked == QUICPKT_NO_ACKED || largest > space->largest_acked)
         space->largest_acked = largest;

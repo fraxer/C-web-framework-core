@@ -72,6 +72,15 @@ typedef struct udp_datagram {
      * server-side counter at zero (docs/http3/08 §7a). */
     uint32_t  drops;
     int       drops_valid;
+
+    /* When the kernel took delivery (SO_TIMESTAMPNS), in CLOCK_REALTIME
+     * microseconds. `now - stamp` is how long the datagram waited for this
+     * process, which is the part of a peer-measured round trip that belongs to
+     * us and not to the network. Without it a receive path that has fallen
+     * behind is indistinguishable from a slow path: both show up only as the
+     * peer's srtt (docs/http3/08 §7c). */
+    uint64_t  stamp_us;
+    int       stamp_valid;
 } udp_datagram_t;
 
 /* ---- Batched receive ----

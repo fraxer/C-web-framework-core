@@ -97,6 +97,23 @@ typedef struct clientstream {
     int           credit_resend;
 } clientstream_t;
 
+/* ---- What this client's own receive path costs (docs/http3/08 §7c) ---- *
+ *
+ * A server-observed srtt is the path plus however long its peer sat on the
+ * packet before reading it, and a measuring client that falls behind the wire
+ * charges its own backlog to the server. That backlog is only visible here:
+ * the kernel stamps every datagram when it arrives (SO_TIMESTAMPNS) and
+ * `dwell` is how long it then waited for this process. Without it, "the server
+ * is slow" and "the client cannot keep up" produce the same numbers. */
+typedef struct quicclient_rxstats {
+    uint64_t datagrams;
+    uint64_t bytes;
+    uint64_t stamped;        /* datagrams that carried a kernel timestamp */
+    uint64_t dwell_sum_us;   /* over `stamped` only */
+    uint64_t dwell_max_us;
+    uint64_t burst_max;      /* most datagrams taken in one uninterrupted drain */
+} quicclient_rxstats_t;
+
 typedef struct quicclient {
     int fd;
     struct sockaddr_in server;
@@ -293,6 +310,8 @@ typedef struct quicclient {
     uint64_t net_reordered;
     uint64_t net_duplicated;
 
+    quicclient_rxstats_t rxstats;
+
     /* ---- In-process transport (docs/http3/08-testing.md §2) ---- *
      *
      * Set instead of `fd`: every datagram goes to this callback and every one
@@ -319,6 +338,10 @@ void quicclient_impair(quicclient_t* client, unsigned loss_out_pct, unsigned los
 /* Queue a PING: the smallest non-probing frame there is, which is what §9.3
  * requires before a server will treat a new address as the peer's. */
 int quicclient_ping(quicclient_t* client);
+
+/* What the receive path cost this run. Zeroed datagram counts in the
+ * in-process stand: there is no socket there and hence nothing to queue. */
+void quicclient_rxstats(const quicclient_t* client, quicclient_rxstats_t* out);
 
 /* ---- Probe timer ---- *
  *

@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "quicclient.h"
@@ -183,8 +184,69 @@ static int __net_send(quicclient_t* c, const uint8_t* buf, size_t len) {
  * because they fail differently: a lost request stalls the peer's stream, a
  * lost response stalls ours, and only one of the two exercises our own ACK
  * and retransmission logic. */
+/* Ask the kernel to stamp arriving datagrams. Failure is not fatal: the stamp
+ * is diagnostics, and a run without it simply reports no dwell. */
+static void __stamp_incoming(int fd) {
+    const int on = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &on, sizeof on);
+}
+
+/* Read one datagram and, with it, the moment the kernel took delivery.
+ *
+ * The stamp is the whole point: `now - stamp` is the time the datagram spent in
+ * this process's receive queue, which is exactly what a peer measuring round
+ * trips would charge to the network. Read with recvmsg rather than recv because
+ * that is the only call that carries control messages. */
+static ssize_t __net_recv_stamped(quicclient_t* c, uint8_t* buf, size_t cap) {
+    struct iovec iov = { .iov_base = buf, .iov_len = cap };
+    union {
+        struct cmsghdr align;
+        uint8_t bytes[CMSG_SPACE(sizeof(struct timespec))];
+    } control;
+    struct msghdr msg;
+
+    memset(&msg, 0, sizeof msg);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.bytes;
+    msg.msg_controllen = sizeof control.bytes;
+
+    const ssize_t n = recvmsg(c->fd, &msg, 0);
+    if (n <= 0) return n;
+
+    c->rxstats.datagrams++;
+    c->rxstats.bytes += (uint64_t)n;
+
+    for (struct cmsghdr* cm = CMSG_FIRSTHDR(&msg); cm != NULL;
+         cm = CMSG_NXTHDR(&msg, cm)) {
+        if (cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SO_TIMESTAMPNS)
+            continue;
+
+        struct timespec stamp;
+        memcpy(&stamp, CMSG_DATA(cm), sizeof stamp);
+
+        /* Realtime on both sides: the kernel stamps with CLOCK_REALTIME, and
+         * quic_now_us() is monotonic, so the two cannot be subtracted. */
+        struct timespec now;
+        if (clock_gettime(CLOCK_REALTIME, &now) != 0) break;
+
+        const int64_t dwell_us = ((int64_t)now.tv_sec - stamp.tv_sec) * 1000000 +
+                                 ((int64_t)now.tv_nsec - stamp.tv_nsec) / 1000;
+
+        c->rxstats.stamped++;
+        if (dwell_us > 0) {
+            c->rxstats.dwell_sum_us += (uint64_t)dwell_us;
+            if ((uint64_t)dwell_us > c->rxstats.dwell_max_us)
+                c->rxstats.dwell_max_us = (uint64_t)dwell_us;
+        }
+        break;
+    }
+
+    return n;
+}
+
 static ssize_t __net_recv(quicclient_t* c, uint8_t* buf, size_t cap) {
-    const ssize_t n = recv(c->fd, buf, cap, 0);
+    const ssize_t n = __net_recv_stamped(c, buf, cap);
     if (n <= 0 || c->net_loss_in_pct == 0) return n;
 
     if (c->net_loss_in_pct > 0 && __net_roll(c) < c->net_loss_in_pct) {
@@ -301,6 +363,8 @@ int quicclient_rebind(quicclient_t* client) {
 
         const int fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (fd < 0) return 0;
+
+        __stamp_incoming(fd);
 
         /* Not bound explicitly: the first sendto picks an ephemeral port, and
          * any port different from the last one is what the test needs. */
@@ -1520,6 +1584,8 @@ static int __connect(quicclient_t* client, const char* host, uint16_t port,
         client->fd = socket(AF_INET, SOCK_DGRAM, 0);
         if (client->fd < 0) return 0;
 
+        __stamp_incoming(client->fd);
+
         memset(&client->server, 0, sizeof client->server);
         client->server.sin_family = AF_INET;
         client->server.sin_port = htons(port);
@@ -1598,6 +1664,17 @@ int quicclient_deliver(quicclient_t* client, const uint8_t* data, size_t len) {
     return 1;
 }
 
+void quicclient_rxstats(const quicclient_t* client, quicclient_rxstats_t* out) {
+    if (out == NULL) return;
+
+    if (client == NULL) {
+        memset(out, 0, sizeof * out);
+        return;
+    }
+
+    *out = client->rxstats;
+}
+
 int quicclient_flush(quicclient_t* client) {
     if (client == NULL) return 0;
 
@@ -1611,6 +1688,7 @@ int quicclient_pump(quicclient_t* client, int timeout_ms) {
 
     const uint64_t deadline = quic_now_us() + (uint64_t)timeout_ms * 1000;
     int got_anything = 0;
+    uint64_t burst = 0;
 
     /* Drains every datagram that is ready, not just the first. Reading one per
      * call was the whole reason a megabyte response arrived as sixty
@@ -1633,7 +1711,10 @@ int quicclient_pump(quicclient_t* client, int timeout_ms) {
 
         if (!__recv_datagram(client, buf, (size_t)n)) return 0;
         got_anything = 1;
+        burst++;
     }
+
+    if (burst > client->rxstats.burst_max) client->rxstats.burst_max = burst;
 
     /* Acknowledge the burst in one go rather than per datagram. */
     if (got_anything && !__flush(client)) return 0;

@@ -682,6 +682,10 @@ void quicendpoint_recv_gap_reset(quicendpoint_t* endpoint) {
 
     endpoint->max_recv_gap_us = 0;
     endpoint->last_recv_us = quic_now_us();
+
+    endpoint->rx_dwell_max_us = 0;
+    endpoint->rx_dwell_sum_us = 0;
+    endpoint->rx_dwell_count = 0;
 }
 
 in_addr_t quicendpoint_ip(quicendpoint_t* endpoint) {
@@ -722,17 +726,28 @@ void quicendpoint_detach(quicendpoint_t* endpoint, quicconn_t* conn) {
     const uint64_t lived_ms = conn->accepted_us > 0 && now > conn->accepted_us
                               ? (now - conn->accepted_us) / 1000 : 0;
 
+    const uint64_t dwell_avg = endpoint->rx_dwell_count > 0
+        ? endpoint->rx_dwell_sum_us / endpoint->rx_dwell_count : 0;
+
     log_info("quic: conn cid=%02x%02x%02x%02x closed after %llu ms, "
-             "rx_overflow=%u, max_rx_gap=%llu us, streams=%zu, pto=%u, srtt=%llu us\n",
+             "rx_overflow=%u, max_rx_gap=%llu us, rx=%llu dgrams, "
+             "rx_dwell=%llu/%llu us avg/max, "
+             "streams=%zu, pto=%u, srtt=%llu us\n",
              conn->odcid.data[0], conn->odcid.data[1],
              conn->odcid.data[2], conn->odcid.data[3],
              (unsigned long long)lived_ms, overflow,
-             (unsigned long long)endpoint->max_recv_gap_us, conn->stream_count,
+             (unsigned long long)endpoint->max_recv_gap_us,
+             (unsigned long long)endpoint->rx_dwell_count,
+             (unsigned long long)dwell_avg,
+             (unsigned long long)endpoint->rx_dwell_max_us, conn->stream_count,
              conn->loss.pto_count,
              (unsigned long long)conn->loss.smoothed_rtt_us);
 
     /* Reset with the report: the next connection's figure has to be its own. */
     endpoint->max_recv_gap_us = 0;
+    endpoint->rx_dwell_max_us = 0;
+    endpoint->rx_dwell_sum_us = 0;
+    endpoint->rx_dwell_count = 0;
 
     /* Every id this connection answers to, so a datagram in flight cannot find
      * it after this returns. */
@@ -1352,6 +1367,15 @@ static int __endpoint_read(connection_t* connection) {
 
     ep->last_recv_us = entered_us;
 
+    /* Realtime, because the kernel stamps datagrams with CLOCK_REALTIME and
+     * quic_now_us() is monotonic. One reading per wakeup, not per datagram:
+     * the batch is drained in microseconds, and the syscall is a vDSO call
+     * either way. */
+    struct timespec wall;
+    const int wall_ok = clock_gettime(CLOCK_REALTIME, &wall) == 0;
+    const uint64_t wall_us = wall_ok
+        ? (uint64_t)wall.tv_sec * 1000000ULL + (uint64_t)wall.tv_nsec / 1000ULL : 0;
+
     for (int round = 0; round < QUIC_RX_MAX_BATCHES; round++) {
         const int n = udp_rx_batch_recv(ep->rx, ep->fd);
 
@@ -1362,8 +1386,20 @@ static int __endpoint_read(connection_t* connection) {
 
         metrics_quic(METRICS_QUIC_RECV_CALLS);
 
-        for (int i = 0; i < n; i++)
-            __dispatch(ep, udp_rx_batch_get(ep->rx, (size_t)i));
+        for (int i = 0; i < n; i++) {
+            udp_datagram_t* dgram = udp_rx_batch_get(ep->rx, (size_t)i);
+
+            if (wall_ok && dgram != NULL && dgram->stamp_valid &&
+                wall_us > dgram->stamp_us) {
+                const uint64_t dwell = wall_us - dgram->stamp_us;
+
+                if (dwell > ep->rx_dwell_max_us) ep->rx_dwell_max_us = dwell;
+                ep->rx_dwell_sum_us += dwell;
+                ep->rx_dwell_count++;
+            }
+
+            __dispatch(ep, dgram);
+        }
 
         /* A short batch means the socket is drained. */
         if ((size_t)n < __quic_rx_batch) break;

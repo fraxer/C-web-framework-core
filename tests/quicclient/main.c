@@ -1,11 +1,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "h3client.h"
 #include "h3frame.h"
 #include "quicclient.h"
+#include "quictime.h"
 
 /* Drive a QUIC handshake and one HTTP/3 request against this server, and report
  * what happened.
@@ -400,6 +403,14 @@ int main(int argc, char* argv[]) {
     /* Several at once when asked. They go out together, so the server has to
      * hold them all open -- the case a single request cannot distinguish from
      * a server that serialises everything. */
+    /* What the request cost *this process*, wall and CPU both. A transfer
+     * measured by a client that cannot keep up reports the client's own
+     * backlog as the server's round trip (docs/http3/08 §7c), and these two
+     * numbers plus the dwell below are what separate the two. */
+    struct rusage ru_before;
+    getrusage(RUSAGE_SELF, &ru_before);
+    const uint64_t wall_before = quic_now_us();
+
     h3client_response_t* many = NULL;
     if (h3_ok && concurrent > 1) {
         many = calloc((size_t)concurrent, sizeof * many);
@@ -418,6 +429,17 @@ int main(int argc, char* argv[]) {
         h3_ok = h3client_get(&client, 0, authority, path, timeout_ms, &response);
         if (!h3_ok) printf("FAIL: no response\n");
     }
+
+    const uint64_t wall_us = quic_now_us() - wall_before;
+
+    struct rusage ru_after;
+    getrusage(RUSAGE_SELF, &ru_after);
+
+    const uint64_t cpu_us =
+        (uint64_t)((ru_after.ru_utime.tv_sec - ru_before.ru_utime.tv_sec) * 1000000LL +
+                   (ru_after.ru_utime.tv_usec - ru_before.ru_utime.tv_usec) +
+                   (ru_after.ru_stime.tv_sec - ru_before.ru_stime.tv_sec) * 1000000LL +
+                   (ru_after.ru_stime.tv_usec - ru_before.ru_stime.tv_usec));
 
     /* Read after the request, not before: service streams and request streams
      * are delivered independently, so the server's SETTINGS may well arrive
@@ -464,6 +486,33 @@ int main(int argc, char* argv[]) {
             printf(" (last %d, %zu fields)\n", response.interim_status, response.interim_fields);
         printf("trailers:                  %zu\n", response.trailer_count);
         printf("body:                      %zu bytes\n", response.body_len);
+
+        quicclient_rxstats_t rx;
+        quicclient_rxstats(&client, &rx);
+
+        const double mb = (double)response.body_len / (1024.0 * 1024.0);
+        printf("client wall:               %.1f ms%s", wall_us / 1000.0,
+               mb > 0 ? "" : "\n");
+        if (mb > 0)
+            printf(" (%.1f MB/s)\n", mb / (wall_us / 1000000.0));
+
+        printf("client cpu:                %.1f ms%s", cpu_us / 1000.0,
+               mb > 0 ? "" : "\n");
+        if (mb > 0) printf(" (%.2f ms/MB)\n", (cpu_us / 1000.0) / mb);
+
+        printf("client rx:                 %llu datagrams, %llu bytes, "
+               "burst max %llu\n",
+               (unsigned long long)rx.datagrams, (unsigned long long)rx.bytes,
+               (unsigned long long)rx.burst_max);
+
+        /* How long a datagram waited in *our* receive queue after the kernel
+         * took it. This is the part of the server's srtt that belongs to the
+         * client. */
+        if (rx.stamped > 0)
+            printf("client rx dwell:           avg %.2f ms, max %.2f ms "
+                   "(%llu stamped)\n",
+                   (rx.dwell_sum_us / (double)rx.stamped) / 1000.0,
+                   rx.dwell_max_us / 1000.0, (unsigned long long)rx.stamped);
 
         if (verbose && response.body_len > 0) {
             const size_t show = response.body_len > 512 ? 512 : response.body_len;

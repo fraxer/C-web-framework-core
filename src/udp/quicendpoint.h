@@ -71,6 +71,18 @@ typedef struct quicendpoint {
     uint64_t last_recv_us;
     uint64_t max_recv_gap_us;
 
+    /* ---- And how long each datagram waits once it is here (§7c) ---- *
+     *
+     * The gap above measures this process; this measures the queue. They are
+     * not the same number: a worker that returns every 20 ms still delays a
+     * datagram by half a second if it takes fewer per visit than arrive
+     * between them, and only the backlog shows that. Taken from the kernel's
+     * own arrival stamp (SO_TIMESTAMPNS), so it counts the wait, not the
+     * work. Reset with the report, like the gap. */
+    uint64_t rx_dwell_max_us;
+    uint64_t rx_dwell_sum_us;
+    uint64_t rx_dwell_count;
+
     /* The endpoint's own deadline timer (docs/http3/01 §6).
      *
      * QUIC's timers are PTO, ack delay and pacing -- tens of milliseconds and
