@@ -32,12 +32,35 @@ typedef enum {
     H2_DATA_ERROR,
 } h2_data_status_e;
 
+/* Payload up to this size travels in the same write as its frame header.
+ *
+ * The header is nine bytes, and sending it on its own costs a syscall and --
+ * over TLS, which is the only way h2 is served here -- a whole record: 22 bytes
+ * of overhead and an AEAD seal to carry nine bytes of length. Measured on
+ * `robots.txt`: three writes of 39, 31 and 131 bytes per response, where nginx
+ * does one (docs/http2/10 §1).
+ *
+ * The bound is what keeps the cure from being worse: a copy is cheap next to a
+ * syscall only while it is small. Above it the payload goes straight from the
+ * caller's buffer as before, and one extra header write per 16 KB frame is
+ * noise. */
+#define H2_DATA_JOIN_MAX 2048
+
 typedef struct h2_data_writer {
     uint8_t  fh[H2_FRAME_HEADER_LEN];
     size_t   fh_len;              /* 0 = no frame header pending or being built */
     size_t   fh_pos;
     size_t   frame_remaining;     /* payload bytes still owed for this frame */
     unsigned frame_end_stream : 1;
+
+    /* Header and a small payload, joined. `join_payload` is how many of the
+     * bytes past the header came from `src`: the source is only advanced, and
+     * the windows only debited, once the whole buffer has left -- a partial
+     * write must not be counted twice when the socket comes back. */
+    uint8_t  join[H2_FRAME_HEADER_LEN + H2_DATA_JOIN_MAX];
+    size_t   join_len;            /* 0 = nothing joined and pending */
+    size_t   join_pos;
+    size_t   join_payload;
 } h2_data_writer_t;
 
 void h2_data_writer_reset(h2_data_writer_t* w);

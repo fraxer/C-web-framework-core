@@ -214,6 +214,12 @@ static int body_set(httpresponse_t* response, const void* data, size_t size) {
 /* Stage `data` in an unlinked tmpfile positioned at offset 0 so the file path
  * (read + lseek) exercises a real descriptor. Returns the fd, or -1. */
 static int file_set(httpresponse_t* response, const void* data, size_t size) {
+    /* Kept because the write loop below spends `size`, and what the response
+     * needs is the size the file ended up with -- fstat's answer in production.
+     * Assigning the spent variable left file_.size at 0, which passed only
+     * while the reader discovered the end by a pread() returning zero. */
+    const size_t file_size = size;
+
     char tmpl[] = "/tmp/cwfr_data_filter_XXXXXX";
     int fd = mkstemp(tmpl);
     if (fd < 0)
@@ -234,8 +240,7 @@ static int file_set(httpresponse_t* response, const void* data, size_t size) {
     if (lseek(fd, 0, SEEK_SET) != 0) { close(fd); return -1; }
 
     response->file_.fd = fd;
-    response->file_.size = response->body.size;  /* size set by body_set, or 0 */
-    response->file_.size = size ? size : (size_t)0;
+    response->file_.size = file_size;
     return fd;
 }
 

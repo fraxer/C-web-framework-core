@@ -14,6 +14,9 @@ void h2_data_writer_reset(h2_data_writer_t* w) {
     w->fh_pos = 0;
     w->frame_remaining = 0;
     w->frame_end_stream = 0;
+    w->join_len = 0;
+    w->join_pos = 0;
+    w->join_payload = 0;
 }
 
 /* Worker thread only — see the invariant on connection_data_write(). */
@@ -47,11 +50,14 @@ static __io_status_e __io_status(connection_t* connection, ssize_t written) {
     return __IO_FATAL;
 }
 
-/* Drain w->fh[fh_pos..fh_len) — the 9-byte frame header. */
-static h2_data_status_e __write_frame_header(h2_data_writer_t* w, connection_t* connection) {
-    while (w->fh_pos < w->fh_len) {
-        const ssize_t written = __raw_write(connection, (const char*)w->fh + w->fh_pos,
-                                            w->fh_len - w->fh_pos);
+/* Drain buf[*pos..len) onto the connection, resuming where a full socket left
+ * off. Used for the bare frame header and for the header joined to a small
+ * payload — the two differ only in what they carry. */
+static h2_data_status_e __drain(connection_t* connection, const uint8_t* buf,
+                                size_t* pos, size_t len) {
+    while (*pos < len) {
+        const ssize_t written = __raw_write(connection, (const char*)buf + *pos,
+                                            len - *pos);
         if (written < 0) {
             switch (__io_status(connection, written)) {
             case __IO_RETRY:   continue;
@@ -64,7 +70,7 @@ static h2_data_status_e __write_frame_header(h2_data_writer_t* w, connection_t* 
             return H2_DATA_ERROR;
         }
 
-        w->fh_pos += (size_t)written;
+        *pos += (size_t)written;
     }
 
     return H2_DATA_DRAINED;
@@ -121,9 +127,43 @@ h2_data_status_e h2_data_write(h2_data_writer_t* w, h2session_t* s,
                                               w->frame_end_stream ? H2_FLAG_END_STREAM : 0,
                                               stream->id, chunk);
             if (w->fh_len == 0) return H2_DATA_ERROR;
+
+            /* Small enough to travel with its header: copy both into one
+             * buffer and pay for one write instead of two. `bufo` is a
+             * contiguous region, so the whole chunk is always available. */
+            if (chunk <= H2_DATA_JOIN_MAX && bufo_chunk_size(src, chunk) == chunk) {
+                memcpy(w->join, w->fh, w->fh_len);
+                memcpy(w->join + w->fh_len, bufo_data(src), chunk);
+
+                w->join_len = w->fh_len + chunk;
+                w->join_pos = 0;
+                w->join_payload = chunk;
+            }
         }
 
-        const h2_data_status_e hdr = __write_frame_header(w, connection);
+        if (w->join_len > 0) {
+            const h2_data_status_e st = __drain(connection, w->join,
+                                                &w->join_pos, w->join_len);
+            if (st != H2_DATA_DRAINED) return st;
+
+            /* Settled only now, and only once: everything below counts bytes
+             * that have actually left, and a partial write returns above
+             * without touching any of it. */
+            bufo_move_front_pos(src, w->join_payload);
+
+            s->send_window -= (int64_t)w->join_payload;
+            stream->send_window -= (int64_t)w->join_payload;
+            stream->write_credit -= (int64_t)w->join_payload;
+            w->frame_remaining -= w->join_payload;
+
+            w->join_len = 0;
+            w->join_pos = 0;
+            w->join_payload = 0;
+
+            goto frame_done;
+        }
+
+        const h2_data_status_e hdr = __drain(connection, w->fh, &w->fh_pos, w->fh_len);
         if (hdr != H2_DATA_DRAINED) return hdr;
 
         /* Payload: written straight from the caller's buffer, no copy. */
@@ -154,6 +194,7 @@ h2_data_status_e h2_data_write(h2_data_writer_t* w, h2session_t* s,
             stream->write_credit -= written;
         }
 
+frame_done:
         if (w->frame_end_stream)
             stream->end_stream_sent = 1;
 

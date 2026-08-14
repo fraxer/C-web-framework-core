@@ -201,6 +201,18 @@ bufo_t* file_next_chunk_data(httpresponse_t* response, http_module_data_t* modul
 
     if (!bufo_alloc(&response->body, BUF_SIZE)) return NULL;
 
+    /* The file is spent, and its size says so: asking the kernel to confirm it
+     * costs a syscall per response that returns nothing. The caller's loop ends
+     * on an empty buffer either way -- it just used to learn about the end from
+     * a pread() of zero bytes. Measured: two pread() per request against one in
+     * nginx, for a file read whole on the first one (docs/http2/10 §2). */
+    if (module->file_offset >= (off_t)response->file_.size) {
+        bufo_reset_pos(&response->body);
+        bufo_set_size(&response->body, 0);
+        **ok = 1;
+        return &response->body;
+    }
+
     /* pread() reads at an explicit offset and leaves the descriptor offset
      * untouched, so the read position is tracked in module->file_offset
      * (reset to 0 between responses) and EOF is derived from it instead of
