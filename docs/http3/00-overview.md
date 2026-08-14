@@ -136,10 +136,10 @@ fork / BoringSSL) без изменений в транспорте. Свой TL
 - Retry и валидация адреса токеном;
 - полный набор фреймов RFC 9000, включая миграцию и path validation;
 - NewReno + pacing;
-- HTTP/3: GET/POST/PUT/…, тела запросов, trailers, 103 Early Hints,
-  Extended CONNECT (WebSocket over HTTP/3, RFC 9220);
-- QPACK: полный декодер, кодировщик со статической таблицей и литералами;
-- IPv4 и IPv6 (см. §5).
+- HTTP/3: GET/POST/PUT/…, тела запросов, trailers и 103 Early Hints;
+- QPACK static-only: статическая таблица и литералы, без динамической таблицы и
+  blocked streams;
+- IPv4 endpoint; UDP GSO (`UDP_SEGMENT`) для пакетной отправки.
 
 **Не входит (осознанно):**
 
@@ -149,10 +149,29 @@ fork / BoringSSL) без изменений в транспорте. Свой TL
 | Server Push (`PUSH_PROMISE`) | По тем же причинам, что h2-push был удалён из проекта — см. `docs/http2/07`. Реализуем только приём `MAX_PUSH_ID` и игнорирование |
 | QUIC v2 (RFC 9369), совместимое согласование версий (RFC 9368) | Только version negotiation-пакет для неизвестных версий |
 | Unreliable datagrams (RFC 9221), MASQUE | Нет потребителя |
+| Extended CONNECT / WebSocket over HTTP/3 (RFC 9220) | Отложено до отдельной реализации |
+| IPv6 endpoint | Текущий endpoint поддерживает только IPv4 |
 | DPLPMTUD (RFC 8899) | v1 фиксирует 1200-байтные датаграммы; фаза 9 |
 | ECN | Фаза 9 |
+| UDP GRO | GSO реализован, GRO пока отсутствует |
 | CUBIC/BBR | NewReno в v1, CUBIC — фаза 9 |
-| RFC 9218 urgency-планирование | Как и в h2: парсим и игнорируем |
+| RFC 9218 `PRIORITY_UPDATE` и urgency-планирование | Специализированная валидация и планирование не реализованы; кадр проходит как неизвестный |
+
+### 3.1 Актуальная capability matrix
+
+Эта таблица — источник текущего состояния. Фазовые записи ниже сохранены как
+журнал разработки и могут описывать первоначальные планы.
+
+| Возможность | Статус |
+|---|---|
+| QUIC v1, TLS 1.3, Retry, migration, loss recovery, pacing | Готово |
+| HTTP/3 server, Alt-Svc, graceful shutdown | Готово |
+| QPACK | Static-only; dynamic table и blocked streams отсутствуют |
+| UDP batching / GSO | `recvmmsg`, `sendmmsg`, `UDP_SEGMENT` |
+| UDP GRO, ECN, DPLPMTUD | Не реализовано |
+| IPv6 endpoint | Не реализовано |
+| 0-RTT, QUIC v2, Extended CONNECT | Не реализовано |
+| HTTP/3 client, Server Push | Вне scope |
 
 ## 4. Что переиспользуется из существующего кода
 

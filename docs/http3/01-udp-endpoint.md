@@ -206,12 +206,12 @@ int udp_socket_create(const struct sockaddr_storage* addr, socklen_t addrlen);
 | `SO_REUSEPORT` | Несколько воркеров на один порт |
 | `SO_REUSEADDR` | Как в TCP |
 | `O_NONBLOCK` | Общая модель |
-| `IP_PKTINFO` / `IPV6_RECVPKTINFO` | На wildcard-bind узнать **локальный** адрес датаграммы. Без этого ответ уйдёт с адреса, выбранным ядром, и клиент его отбросит |
-| `IPV6_V6ONLY=0` (или два сокета) | Решение фиксируем: **два отдельных сокета**, v4 и v6. Dual-stack сокет усложняет `IP_PKTINFO` и различается между ядрами |
+| `IP_PKTINFO` | На wildcard-bind узнать **локальный** IPv4-адрес датаграммы. Без этого ответ уйдёт с адреса, выбранным ядром, и клиент его отбросит |
+| IPv6 socket options | Пока не используются: endpoint поддерживает только IPv4 |
 | `IP_MTU_DISCOVER=IP_PMTUDISC_PROBE` / `IPV6_MTU_DISCOVER` | Ставим DF, чтобы не фрагментировать (RFC 9000 §14) |
 | `SO_RCVBUF`/`SO_SNDBUF` | Поднять; на дефолтах теряются пакеты на всплесках. Значения — из конфига |
 | `UDP_GRO` (опц.) | Фаза 9 |
-| `UDP_SEGMENT` (опц., per-message) | Фаза 9, GSO |
+| `UDP_SEGMENT` (опц., per-message) | Реализованный GSO fast path; при недоступности используется обычная отправка |
 
 **Чтение** — `recvmmsg()` пачками по 32 датаграммы, у каждой свой
 `msg_control` для `IP_PKTINFO` и (позже) ECN-битов из `IP_TOS`/`IPV6_TCLASS`.
