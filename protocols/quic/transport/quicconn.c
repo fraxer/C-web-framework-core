@@ -977,8 +977,29 @@ static void __streams_reap(quicconn_t* conn) {
              * to build a packet. Without this the first MAX_STREAMS rode along
              * with the last response and the rest were never sent -- a peer
              * that had used its allowance then waited for credit that was
-             * sitting here. */
-            atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+             * sitting here.
+             *
+             * But asking for a packet on *every* release paid for that safety
+             * once per request: a stream is released when the peer acknowledges
+             * the response, and at that moment there is nothing else to send,
+             * so the credit left as a datagram of its own carrying four bytes.
+             * Measured at 2.04 datagrams sent per request, one of them this
+             * (docs/http3/08 §7j).
+             *
+             * The frame itself is written by every packet that finds credit
+             * outstanding, so what is decided here is only whether the credit
+             * is worth a packet of its own. It is when the peer is running out
+             * -- and only then, because a peer with headroom will open another
+             * stream, and that request is the ride this frame is waiting for. */
+            const uint64_t announced = __streams_limit(conn, 0);
+            const uint64_t headroom = announced > conn->next_peer_bidi
+                                      ? announced - conn->next_peer_bidi : 0;
+
+            uint64_t urgent = conn->local_params.initial_max_streams_bidi / 4;
+            if (urgent == 0) urgent = 1;
+
+            if (headroom <= urgent)
+                atomic_store_explicit(&conn->want_write, 1, memory_order_release);
         }
 
         metrics_quic(METRICS_QUIC_STREAMS_RELEASED);
@@ -1421,7 +1442,8 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
 
     if (ack_eliciting) atomic_store_explicit(&conn->want_write, 1, memory_order_release);
 
-    QUICBEACON("RECV  level=%d pn=%llu elic=%d pending=%u deadline_in=%lld",
+    QUICBEACON("cid=%02x%02x RECV  level=%d pn=%llu elic=%d pending=%u deadline_in=%lld",
+               conn->odcid.data[0], conn->odcid.data[1],
                (int)level, (unsigned long long)pn, ack_eliciting,
                conn->ack[level].eliciting_pending,
                conn->ack[level].ack_deadline_us == 0
@@ -2233,7 +2255,8 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
 
     quicloss_on_sent(&conn->loss, level, pn, total, ack_eliciting, 1, refs, now_us);
 
-    QUICBEACON("SENT  level=%d pn=%llu bytes=%zu payload=%zu ack_bytes=%zu elic=%d",
+    QUICBEACON("cid=%02x%02x SENT  level=%d pn=%llu bytes=%zu payload=%zu ack_bytes=%zu elic=%d",
+               conn->odcid.data[0], conn->odcid.data[1],
                (int)level, (unsigned long long)pn, total, p, ack_len, ack_eliciting);
 
     if (out_ack_eliciting != NULL) *out_ack_eliciting = ack_eliciting;
