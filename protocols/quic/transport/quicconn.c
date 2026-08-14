@@ -64,6 +64,38 @@ static quicstream_t* __stream_find(quicconn_t* conn, uint64_t id) {
     return NULL;
 }
 
+/* At the tail, so the list reads in the order the streams were opened, which is
+ * the order the send loop then serves them in.
+ *
+ * It used to prepend, and the cost of that was not a detail of list order: the
+ * loop that fills a packet with stream data starts at the head every time and
+ * gives the first stream that can send as much of the packet as it will take,
+ * so the head stream holds the connection until it is finished or blocked. With
+ * newest-first that head is the *last* request, and four large files asked for
+ * together were delivered strictly in reverse -- the file the client asked for
+ * first arrived last, after every other one had finished. A page waiting on its
+ * first stylesheet waited for the whole set.
+ *
+ * Ascending order is also what RFC 9218 §7 recommends for responses of equal
+ * urgency that are not incremental: serve them one at a time, lowest stream id
+ * first, because a resource that is only useful complete is worth finishing.
+ * The unidirectional control and QPACK streams are opened before any request
+ * and so stay ahead of them, which is what they need.
+ *
+ * A tail pointer rather than a walk to the end: __stream_ensure opens every
+ * stream up to the id the peer used, so a client that jumps straight to a high
+ * id opens them in a loop -- and a walk inside that loop is quadratic in a
+ * count the peer chooses (initial_max_streams_bidi goes to 65536). */
+static void __stream_append(quicconn_t* conn, quicstream_t* s) {
+    s->next = NULL;
+
+    if (conn->streams_tail != NULL) conn->streams_tail->next = s;
+    else conn->streams = s;
+
+    conn->streams_tail = s;
+    conn->stream_count++;
+}
+
 /* How many streams of a kind the peer may have opened by now.
  *
  * The transport parameter is only the *first* limit. Every MAX_STREAMS frame
@@ -122,9 +154,7 @@ static quicstream_t* __stream_open_peer(quicconn_t* conn, uint64_t id) {
                                       : conn->peer_params.initial_max_stream_data_bidi_local);
             if (s == NULL) return NULL;
 
-            s->next = conn->streams;
-            conn->streams = s;
-            conn->stream_count++;
+            __stream_append(conn, s);
         }
 
         if (open_id == id) result = s;
@@ -216,9 +246,7 @@ quicstream_t* quicconn_open_uni(quicconn_t* conn) {
 
     conn->next_local_uni++;
 
-    s->next = conn->streams;
-    conn->streams = s;
-    conn->stream_count++;
+    __stream_append(conn, s);
 
     return s;
 }
@@ -940,6 +968,12 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
  * one place that knows both halves are done is here. */
 static void __streams_reap(quicconn_t* conn) {
     quicstream_t** link = &conn->streams;
+    /* The tail is rebuilt from the walk this function already makes, rather
+     * than patched at the removal below: recovering the previous node from a
+     * `quicstream_t**` is exactly the kind of pointer arithmetic that reads
+     * fine and is wrong once. Last survivor wins; no survivor means an empty
+     * list, and NULL is what an empty list's tail is. */
+    quicstream_t* tail = NULL;
 
     while (*link != NULL) {
         quicstream_t* s = *link;
@@ -955,6 +989,7 @@ static void __streams_reap(quicconn_t* conn) {
                               !quicstream_can_receive(s->id);
 
         if (!send_done || !recv_done) {
+            tail = s;
             link = &s->next;
             continue;
         }
@@ -962,6 +997,7 @@ static void __streams_reap(quicconn_t* conn) {
         /* The application layer may still be holding this stream: h3 keeps the
          * request and response on it until the response is done. */
         if (s->app != NULL && s->app_done != NULL && !s->app_done(s->app)) {
+            tail = s;
             link = &s->next;
             continue;
         }
@@ -1006,6 +1042,8 @@ static void __streams_reap(quicconn_t* conn) {
 
         quicstream_free(s);
     }
+
+    conn->streams_tail = tail;
 }
 
 /* ---- Connection ids we answer to (RFC 9000 §5.1.1) ---- *
@@ -1951,7 +1989,18 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
         }
     }
 
-    /* Stream data, round-robin so one large response cannot starve the rest. */
+    /* Stream data, in the order the streams were opened: the walk starts at the
+     * head and the first stream that can send takes as much of the packet as it
+     * will hold, so responses are finished one at a time, oldest request first.
+     * RFC 9218 §7 asks for exactly that of equal-urgency, non-incremental
+     * responses -- a resource that is only useful complete is worth finishing
+     * rather than interleaving. A stream that is blocked falls through to the
+     * next one, so the connection is never idle while anyone has data.
+     *
+     * The comment here used to claim round-robin. It never was: the list was
+     * built newest-first, which made this reverse order of arrival, and the
+     * first file a client asked for was the last one it got. See
+     * __stream_append. */
     if (level == QUIC_ENC_APP) {
         for (quicstream_t* s = conn->streams; s != NULL && p + 32 < payload_cap;
              s = s->next) {
@@ -2584,6 +2633,7 @@ static void __quicconn_transport_free(void* arg) {
         s = next;
     }
     conn->streams = NULL;
+    conn->streams_tail = NULL;
 }
 
 quicconn_t* quicconn_accept(struct quicendpoint* endpoint,

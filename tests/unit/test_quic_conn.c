@@ -2023,6 +2023,80 @@ static void __pattern_fill(uint8_t* dst, size_t offset, size_t len) {
     }
 }
 
+TEST(test_quic_stand_stream_order) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("request streams are served oldest first, not newest first");
+    /* REGRESSION. The list of streams was built by prepending, and the loop that
+     * fills a packet with stream data walks it from the head and lets the first
+     * stream that can send take as much of the packet as it will hold. Newest
+     * first therefore meant strictly *reverse* order of arrival: four large
+     * files asked for together came back last-requested-first, and the file the
+     * client wanted first arrived only after all the others had finished. A page
+     * blocked on its first stylesheet waited for the entire set.
+     *
+     * The order of this list is the scheduling policy, so this asserts the list
+     * itself: unidirectional control streams (opened during the handshake) ahead
+     * of any request, and request streams in ascending id. That is what RFC 9218
+     * §7 recommends for equal-urgency, non-incremental responses. */
+    stand_t* s = __stand_create(41);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    TEST_REQUIRE_GOTO(__start(s), "connecting", cleanup);
+    TEST_REQUIRE_GOTO(__run(s, 2000000, __handshake_done), "handshake complete", cleanup);
+
+    /* Opened in ascending order, which is the order a client makes requests in
+     * -- the point is that the server must not reverse it. */
+    const uint64_t ids[] = { 0, 4, 8 };
+
+    for (size_t i = 0; i < sizeof ids / sizeof ids[0]; i++) {
+        TEST_REQUIRE_GOTO(quicclient_stream_write(&s->client, ids[i], (const uint8_t*)"GET", 3, 1),
+                         "request written", cleanup);
+        TEST_REQUIRE_GOTO(quicclient_flush(&s->client), "request flushed", cleanup);
+        __run(s, 200000, NULL);
+    }
+
+    TEST_REQUIRE_NOT_NULL_GOTO(s->conn, "the connection is still up", cleanup);
+
+    for (size_t i = 0; i < sizeof ids / sizeof ids[0]; i++)
+        TEST_REQUIRE_GOTO(quicconn_stream_find(s->conn, ids[i]) != NULL,
+                         "the server has every request stream", cleanup);
+
+    /* Walk the list the send loop walks. */
+    int seen_bidi = 0;
+    uint64_t previous_bidi = 0;
+    int order_ok = 1;
+    int uni_after_bidi = 0;
+
+    for (const quicstream_t* qs = s->conn->streams; qs != NULL; qs = qs->next) {
+        if (quic_stream_is_uni(qs->id)) {
+            if (seen_bidi) uni_after_bidi = 1;
+            continue;
+        }
+
+        if (seen_bidi && qs->id <= previous_bidi) order_ok = 0;
+
+        previous_bidi = qs->id;
+        seen_bidi = 1;
+    }
+
+    TEST_ASSERT(seen_bidi, "the request streams are on the list");
+    TEST_ASSERT(order_ok, "request streams are in ascending id order, so the oldest is served first");
+    TEST_ASSERT(!uni_after_bidi, "control streams stay ahead of any request");
+
+    /* The head decides who gets the next packet, and it must be the first
+     * request rather than the last. */
+    const quicstream_t* first_bidi = NULL;
+    for (const quicstream_t* qs = s->conn->streams; qs != NULL; qs = qs->next)
+        if (!quic_stream_is_uni(qs->id)) { first_bidi = qs; break; }
+
+    TEST_REQUIRE_NOT_NULL_GOTO(first_bidi, "a request stream is on the list", cleanup);
+    TEST_ASSERT_EQUAL_UINT(0, first_bidi->id, "the first request asked for is the first one served");
+
+    cleanup:
+    __stand_free(s);
+}
+
 TEST(test_quic_stand_large_transfer) {
     TEST_SUITE("quic_stand");
 

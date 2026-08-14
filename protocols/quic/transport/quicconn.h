@@ -139,8 +139,13 @@ typedef struct quicconn {
      * left want_write raised so the wake-up finds work to do. */
     uint64_t pace_until_us;
 
-    /* Streams, and the limits that bound them. */
+    /* Streams, and the limits that bound them.
+     *
+     * The list is in the order the streams were opened, and the send loop walks
+     * it from the head -- so the order here *is* the scheduling policy. See
+     * __stream_append for what depends on that. */
     quicstream_t* streams;
+    quicstream_t* streams_tail;
     size_t    stream_count;
     uint64_t  next_peer_bidi;   /* lowest client bidi id not yet opened */
     uint64_t  next_peer_uni;
