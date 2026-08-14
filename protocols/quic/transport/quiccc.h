@@ -60,6 +60,14 @@ struct quiccc {
 
 void quiccc_init(quiccc_t* cc, size_t max_datagram_size);
 
+/* Same, with a non-default initial window in datagrams. RFC 9002 §7.2 has ten
+ * and caps the bytes at 14720; a server on a long-RTT path may knowingly open
+ * wider -- the same reasoning an operator tunes TCP's initcwnd -- and the
+ * deviation is the operator's, logged where the config is read. The §7.2 byte
+ * cap only applies to the RFC default: it exists to keep TEN packets from
+ * growing with the datagram size, not to overrule a deliberate choice. */
+void quiccc_init_packets(quiccc_t* cc, size_t max_datagram_size, uint64_t packets);
+
 /* NewReno, the only controller in v1. */
 extern const quiccc_ops_t quiccc_newreno;
 

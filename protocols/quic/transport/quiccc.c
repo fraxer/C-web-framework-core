@@ -7,6 +7,10 @@ static uint64_t __min_window(const quiccc_t* cc) {
 }
 
 void quiccc_init(quiccc_t* cc, size_t max_datagram_size) {
+    quiccc_init_packets(cc, max_datagram_size, QUICCC_INITIAL_WINDOW_PACKETS);
+}
+
+void quiccc_init_packets(quiccc_t* cc, size_t max_datagram_size, uint64_t packets) {
     if (cc == NULL) return;
 
     memset(cc, 0, sizeof * cc);
@@ -14,10 +18,14 @@ void quiccc_init(quiccc_t* cc, size_t max_datagram_size) {
     cc->ops = &quiccc_newreno;
     cc->max_datagram_size = max_datagram_size;
 
+    uint64_t initial = packets * max_datagram_size;
+
     /* §7.2: ten datagrams, but not more than 14720 bytes -- the cap is what
-     * keeps a large-MTU path from opening with an unreasonably large burst. */
-    uint64_t initial = (uint64_t)QUICCC_INITIAL_WINDOW_PACKETS * max_datagram_size;
-    if (initial > QUICCC_INITIAL_WINDOW_MAX) initial = QUICCC_INITIAL_WINDOW_MAX;
+     * keeps a large-MTU path from opening with an unreasonably large burst.
+     * See the header: a non-default packet count is a deliberate operator
+     * choice and is not second-guessed here. */
+    if (packets == QUICCC_INITIAL_WINDOW_PACKETS && initial > QUICCC_INITIAL_WINDOW_MAX)
+        initial = QUICCC_INITIAL_WINDOW_MAX;
 
     const uint64_t floor = __min_window(cc);
     if (initial < floor) initial = floor;

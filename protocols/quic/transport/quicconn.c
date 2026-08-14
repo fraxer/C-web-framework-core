@@ -1136,7 +1136,9 @@ static void __path_probe_succeed(quicconn_t* conn) {
      * quicloss_init: that would drop the sent lists on the floor, and they hold
      * packets still waiting to be acknowledged -- on the old path, but their
      * acknowledgements are still coming. */
-    quiccc_init(&conn->cc, QUICCONN_MAX_PACKET);
+    /* The configured initial window, not whatever the old path had grown --
+     * same reasoning as the RTT estimator reset right below. */
+    quiccc_init_packets(&conn->cc, QUICCONN_MAX_PACKET, quic_policy_conn()->initcwnd_packets);
 
     conn->loss.have_rtt_sample = 0;
     conn->loss.latest_rtt_us = 0;
@@ -2620,7 +2622,7 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
 
     conn->amplification_factor = policy->amplification_factor;
 
-    quiccc_init(&conn->cc, QUICCONN_MAX_PACKET);
+    quiccc_init_packets(&conn->cc, QUICCONN_MAX_PACKET, policy->initcwnd_packets);
     quicpacer_init(&conn->pacer, QUICCONN_MAX_PACKET, policy->pacing);
     quicloss_init(&conn->loss, &conn->cc, policy->ack_delay_ms * 1000);
     quicloss_set_cid_tag(&conn->loss, conn->odcid.data, conn->odcid.len);

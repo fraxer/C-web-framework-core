@@ -129,6 +129,7 @@ static quic_conn_policy_t __quic_conn_policy = {
     .recv_window_max        = QUIC_DEFAULT_INITIAL_MAX_DATA * 16,
     .active_cid_limit       = QUIC_DEFAULT_ACTIVE_CID_LIMIT,
     .ack_delay_ms           = QUIC_DEFAULT_ACK_DELAY_MS,
+    .initcwnd_packets       = QUICCC_INITIAL_WINDOW_PACKETS,
     .pacing                 = 1,
     .amplification_factor   = QUIC_DEFAULT_AMPLIFICATION
 };
@@ -197,6 +198,17 @@ static void __conn_policy_init(void) {
     /* §18.2 caps the parameter itself at 2^14 ms. */
     p->ack_delay_ms =
         __policy_u64("http3_ack_delay_ms", QUIC_DEFAULT_ACK_DELAY_MS, 0, 16383);
+
+    /* RFC 9002 §7.2 has ten; the ceiling of 64 datagrams is where a burst
+     * stops being a tuning choice and starts being an attack on the path. */
+    p->initcwnd_packets =
+        __policy_u64("http3_initcwnd_packets", QUICCC_INITIAL_WINDOW_PACKETS,
+                     QUICCC_MIN_WINDOW_PACKETS, 64);
+
+    if (p->initcwnd_packets != QUICCC_INITIAL_WINDOW_PACKETS)
+        log_error("quic: http3_initcwnd_packets is %llu, not the %d RFC 9002 §7.2 "
+                  "recommends -- every connection opens with a burst of that many datagrams\n",
+                  (unsigned long long)p->initcwnd_packets, QUICCC_INITIAL_WINDOW_PACKETS);
 
     p->pacing = env_get_int("http3_pacing", 1) != 0;
 

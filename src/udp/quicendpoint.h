@@ -244,6 +244,10 @@ typedef struct {
     uint64_t recv_window_max;
     uint64_t active_cid_limit;
     uint64_t ack_delay_ms;
+    /* Initial congestion window in datagrams. RFC 9002 §7.2 says ten; a
+     * server on a long-RTT path may open wider, and the deviation is logged
+     * where it is configured. */
+    uint64_t initcwnd_packets;
     int      pacing;
     /* §8.1 says three. Configurable only so a test can make the limit fire
      * without sending megabytes; anything but 3 is logged as the deviation it

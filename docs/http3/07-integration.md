@@ -53,6 +53,7 @@
   http3_recv_window_max              16777216  авто-тюнинг, как в h2
   http3_active_cid_limit             4
   http3_ack_delay_ms                 25
+  http3_initcwnd_packets             10       начальное окно NewReno, датаграмм
   http3_cc                           "newreno" | "cubic"(фаза 9)
   http3_pacing                       true
   http3_rx_batch                     32
@@ -175,6 +176,7 @@ http3_max_streams_uni          8       [3 .. 65536]
 http3_recv_window_max          16 МиБ  [initial_max_data .. 1 ГиБ]
 http3_active_cid_limit         4       [2 .. 8]
 http3_ack_delay_ms             25      [0 .. 16383]
+http3_initcwnd_packets         10      [2 .. 64] датаграмм, RFC 9002 §7.2
 http3_pacing                   true
 http3_amplification_factor     3       [1 .. 16]
 
@@ -189,6 +191,11 @@ http3_handshake_burst          1000
 14 битами поля §18.2; `recv_window_max` не может быть ниже `initial_max_data`,
 иначе окно умеет только уменьшаться. Отклонение `amplification_factor` от 3
 пишется в лог прямым текстом — это не настройка, а способ уронить лимит в тесте.
+`initcwnd_packets` — тот же выбор, что у TCP `initcwnd`: RFC рекомендует 10
+датаграмм, но на длинном RTT (спутник, трансокеанский путь) файл в 30 КБ при
+десяти пакетах едет два RTT только на разгоне окна. Отклонение от 10 тоже
+пишется в лог; потолок 64 — где перестаёт быть настройкой и становится
+burst'ом в сторону пути.
 
 **Где они живут и почему.** По смыслу это transport parameters, то есть епархия
 `quicconn`. Но читаются они из `main.env`, и чтение env из транспортного слоя
