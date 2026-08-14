@@ -98,6 +98,7 @@ static void __table_acquire(void* value) {
 static quiccidtable_t* __quic_table = NULL;
 static size_t   __quic_max_connections = QUIC_DEFAULT_MAX_CONNECTIONS;
 static _Atomic size_t __quic_connections = 0;
+static _Atomic size_t __quic_handshakes_inflight = 0;
 static uint8_t  __quic_reset_key[32];
 static size_t   __quic_rx_batch = 32;
 static int      __quic_rcvbuf = 0;
@@ -108,6 +109,16 @@ static int64_t  __quic_reset_rate = QUIC_DEFAULT_RESET_RATE;
 static int64_t  __quic_reset_burst = QUIC_DEFAULT_RESET_BURST;
 static int64_t  __quic_handshake_rate = QUIC_DEFAULT_HANDSHAKE_RATE;
 static int64_t  __quic_handshake_burst = QUIC_DEFAULT_HANDSHAKE_BURST;
+
+typedef struct {
+    int64_t tokens;
+    uint64_t epoch_us;
+    atomic_flag lock;
+} quic_process_bucket_t;
+
+static quic_process_bucket_t __quic_vn_bucket = { .lock = ATOMIC_FLAG_INIT };
+static quic_process_bucket_t __quic_reset_bucket = { .lock = ATOMIC_FLAG_INIT };
+static quic_process_bucket_t __quic_handshake_bucket = { .lock = ATOMIC_FLAG_INIT };
 
 /* Address validation (RFC 9000 §8.1). Its own key, not the stateless reset
  * one: the two authenticate different things to different audiences, and a
@@ -145,7 +156,10 @@ int quic_process_conn_try_acquire(void) {
         if (atomic_compare_exchange_weak_explicit(
                 &__quic_connections, &current, current + 1,
                 memory_order_acq_rel, memory_order_relaxed))
+        {
+            metrics_quic_connections(current + 1, __quic_max_connections);
             return 1;
+        }
     }
     return 0;
 }
@@ -157,6 +171,7 @@ void quic_process_conn_release(void) {
      * counter wrapped if it slips through a failure path. */
     if (previous == 0)
         atomic_store_explicit(&__quic_connections, 0, memory_order_release);
+    metrics_quic_connections(previous > 0 ? previous - 1 : 0, __quic_max_connections);
 }
 
 size_t quic_process_conn_current(void) {
@@ -251,13 +266,20 @@ static void __conn_policy_init(void) {
 }
 
 int quic_policy_init(void) {
-    int64_t max_connections = env_get_int("http3_max_connections", QUIC_DEFAULT_MAX_CONNECTIONS);
+    long long configured_max = QUIC_DEFAULT_MAX_CONNECTIONS;
+    const int max_status = env_get_llong_checked("http3_max_connections", &configured_max);
+    if (max_status < 0) {
+        log_error("quic: http3_max_connections must be an integer\n");
+        return 0;
+    }
+    const int64_t max_connections = configured_max;
     if (max_connections < 64 || max_connections > 4000000) {
         log_error("quic: http3_max_connections must be in 64..4000000 (got %lld)\n",
                   (long long)max_connections);
         return 0;
     }
     __quic_max_connections = (size_t)max_connections;
+    metrics_quic_connections(quic_process_conn_current(), __quic_max_connections);
 
     int64_t batch = env_get_int("http3_rx_batch", 32);
     if (batch < 1) batch = 1;
@@ -287,10 +309,21 @@ int quic_policy_init(void) {
     __quic_handshake_burst = env_get_int("http3_handshake_burst", QUIC_DEFAULT_HANDSHAKE_BURST);
     if (__quic_handshake_burst < 1) __quic_handshake_burst = 1;
 
-    const char* retry = env_get_string("http3_retry", "auto");
-    __quic_retry_mode = strcmp(retry, "always") == 0 ? QUIC_RETRY_ALWAYS
-                      : strcmp(retry, "never") == 0  ? QUIC_RETRY_NEVER
-                                                     : QUIC_RETRY_AUTO;
+    const char* retry = "auto";
+    if (env_get_string_checked("http3_retry", &retry) < 0) {
+        log_error("quic: http3_retry must be a string\n");
+        return 0;
+    }
+    if (strcmp(retry, "always") == 0)
+        __quic_retry_mode = QUIC_RETRY_ALWAYS;
+    else if (strcmp(retry, "never") == 0)
+        __quic_retry_mode = QUIC_RETRY_NEVER;
+    else if (strcmp(retry, "auto") == 0)
+        __quic_retry_mode = QUIC_RETRY_AUTO;
+    else {
+        log_error("quic: http3_retry must be auto, always or never (got '%s')\n", retry);
+        return 0;
+    }
 
     int64_t threshold = env_get_int("http3_retry_threshold", QUIC_DEFAULT_RETRY_THRESHOLD);
     if (threshold < 0) threshold = 0;
@@ -377,35 +410,36 @@ int quic_policy_init(void) {
     return 1;
 }
 
-/* ---- Token buckets ----
- *
- * Milli-tokens, like the HTTP/2 budgets, so a rate below one per second is
- * still expressible. Endpoint-local: only the owning worker touches them. */
-static int __budget_spend(int64_t* tokens, uint64_t* epoch_us,
+/* ---- Process-wide token buckets ---- */
+static int __budget_spend(quic_process_bucket_t* bucket,
                           int64_t rate, int64_t burst) {
     if (rate <= 0) return 1; /* limit disabled */
+
+    while (atomic_flag_test_and_set_explicit(&bucket->lock, memory_order_acquire))
+        sched_yield();
 
     const uint64_t now = quic_now_us();
     const int64_t ceiling = burst * 1000;
 
-    if (*epoch_us == 0) {
-        *epoch_us = now;
-        *tokens = ceiling;
+    if (bucket->epoch_us == 0) {
+        bucket->epoch_us = now;
+        bucket->tokens = ceiling;
     }
 
-    const uint64_t elapsed = now > *epoch_us ? now - *epoch_us : 0;
-    *epoch_us = now;
+    const uint64_t elapsed = now > bucket->epoch_us ? now - bucket->epoch_us : 0;
+    bucket->epoch_us = now;
 
     /* rate is tokens per second; elapsed is microseconds. Gained milli-tokens
      * are rate * elapsed / 1000. */
-    *tokens += (int64_t)((elapsed * (uint64_t)rate) / 1000);
-    if (*tokens > ceiling) *tokens = ceiling;
+    bucket->tokens += (int64_t)((elapsed * (uint64_t)rate) / 1000);
+    if (bucket->tokens > ceiling) bucket->tokens = ceiling;
 
-    if (*tokens < 1000) return 0;
+    const int allowed = bucket->tokens >= 1000;
+    if (allowed) bucket->tokens -= 1000;
 
-    *tokens -= 1000;
+    atomic_flag_clear_explicit(&bucket->lock, memory_order_release);
 
-    return 1;
+    return allowed;
 }
 
 /* ---- Replies that need no connection state ---- */
@@ -457,8 +491,7 @@ static void __send_stateless_reset(quicendpoint_t* ep, const udp_datagram_t* dgr
         return;
     }
 
-    if (!__budget_spend(&ep->reset_tokens, &ep->reset_epoch_us,
-                        __quic_reset_rate, __quic_reset_burst)) {
+    if (!__budget_spend(&__quic_reset_bucket, __quic_reset_rate, __quic_reset_burst)) {
         metrics_quic(METRICS_QUIC_DROP_NO_BUDGET);
         return;
     }
@@ -611,8 +644,7 @@ static void __send_initial_close(quicendpoint_t* ep, const udp_datagram_t* dgram
 
 static void __send_version_negotiation(quicendpoint_t* ep, const udp_datagram_t* dgram,
                                        const quicinvariants_t* inv) {
-    if (!__budget_spend(&ep->vn_tokens, &ep->vn_epoch_us,
-                        __quic_vn_rate, __quic_vn_burst)) {
+    if (!__budget_spend(&__quic_vn_bucket, __quic_vn_rate, __quic_vn_burst)) {
         metrics_quic(METRICS_QUIC_DROP_NO_BUDGET);
         return;
     }
@@ -870,8 +902,12 @@ void quicendpoint_detach(quicendpoint_t* endpoint, quicconn_t* conn) {
 
     /* A connection that dies mid-handshake still leaves the count, or `auto`
      * would ratchet up to permanent Retry after enough failed handshakes. */
-    if (conn->state == QUICCONN_HANDSHAKE && endpoint->handshakes_in_flight > 0)
-        endpoint->handshakes_in_flight--;
+    if (conn->process_handshake_counted) {
+        conn->process_handshake_counted = 0;
+        const size_t previous = atomic_fetch_sub_explicit(
+            &__quic_handshakes_inflight, 1, memory_order_acq_rel);
+        metrics_quic_handshakes(previous > 0 ? previous - 1 : 0);
+    }
 
     quicconn_t** link = &endpoint->conns;
     while (*link != NULL) {
@@ -975,7 +1011,10 @@ static void __accept(quicendpoint_t* ep, udp_datagram_t* dgram,
     }
 
     metrics_quic(METRICS_QUIC_CONN_ACCEPTED);
-    ep->handshakes_in_flight++;
+    const size_t handshakes = atomic_fetch_add_explicit(
+        &__quic_handshakes_inflight, 1, memory_order_acq_rel) + 1;
+    metrics_quic_handshakes(handshakes);
+    conn->process_handshake_counted = 1;
 
     __route(ep, conn, dgram);
 }
@@ -1075,6 +1114,7 @@ static int __h3_turn(quicconn_t* conn, uint64_t now) {
 
 /* Hand a datagram to a connection and let it answer. */
 static void __route(quicendpoint_t* ep, quicconn_t* conn, udp_datagram_t* dgram) {
+    (void)ep;
 
     quicpath_t path;
     memset(&path, 0, sizeof path);
@@ -1100,8 +1140,12 @@ static void __route(quicendpoint_t* ep, quicconn_t* conn, udp_datagram_t* dgram)
     int alive = quicconn_recv(conn, dgram->data, dgram->len, &path, now);
 
     if (was_handshaking && conn->state != QUICCONN_HANDSHAKE &&
-        ep->handshakes_in_flight > 0)
-        ep->handshakes_in_flight--;
+        conn->process_handshake_counted) {
+        conn->process_handshake_counted = 0;
+        const size_t previous = atomic_fetch_sub_explicit(
+            &__quic_handshakes_inflight, 1, memory_order_acq_rel);
+        metrics_quic_handshakes(previous > 0 ? previous - 1 : 0);
+    }
 
     /* Run this connection's timers here as well as on the worker sweep.
      *
@@ -1319,7 +1363,8 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
 
     if (!validated && __quic_retry_mode != QUIC_RETRY_NEVER &&
         (__quic_retry_mode == QUIC_RETRY_ALWAYS ||
-         ep->handshakes_in_flight >= __quic_retry_threshold)) {
+         atomic_load_explicit(&__quic_handshakes_inflight, memory_order_acquire) >=
+             __quic_retry_threshold)) {
         __send_retry(ep, dgram, &inv);
         return;
     }
@@ -1332,7 +1377,7 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
      * packet per arriving datagram -- work performed for whoever is flooding
      * us, at an address we have not validated. The client's own
      * retransmissions handle the rest. */
-    if (!__budget_spend(&ep->handshake_tokens, &ep->handshake_epoch_us,
+    if (!__budget_spend(&__quic_handshake_bucket,
                         __quic_handshake_rate, __quic_handshake_burst)) {
         metrics_quic(METRICS_QUIC_HANDSHAKE_RATE_LIMITED);
         log_debug("quic: drop handshake_rate_limited\n");

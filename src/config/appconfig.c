@@ -322,6 +322,26 @@ const char* env_get_string(const char* key, const char* default_value) {
     return json_string(token);
 }
 
+int env_get_string_checked(const char* key, const char** value) {
+    json_token_t* token = __env_get_token(key);
+    if (token == NULL) return 0;
+    if (!json_is_string(token)) return -1;
+    if (value != NULL) *value = json_string(token);
+    return 1;
+}
+
+int env_get_llong_checked(const char* key, long long* value) {
+    json_token_t* token = __env_get_token(key);
+    if (token == NULL) return 0;
+    if (!json_is_number(token)) return -1;
+
+    int ok = 0;
+    const long long parsed = json_llong(token, &ok);
+    if (!ok) return -1;
+    if (value != NULL) *value = parsed;
+    return 1;
+}
+
 int env_get_int(const char* key, int default_value) {
     json_token_t* token = __env_get_token(key);
     if (token == NULL || !json_is_number(token)) return default_value;

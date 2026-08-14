@@ -2775,6 +2775,16 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     conn->address_validated = address_validated;
     conn->local_params.has_initial_scid = 1;
     conn->local_params.initial_scid = conn->local_cids[0].cid;
+    /* RFC 9000 §18.2: a server supplies the reset token for the initial CID in
+     * its transport parameters. Later CIDs carry their tokens in
+     * NEW_CONNECTION_ID; omitting this one leaves the original routing name
+     * without a stateless-reset path. */
+    if (!quicendpoint_reset_token(&conn->local_cids[0].cid,
+                                  conn->local_params.stateless_reset_token)) {
+        quicconn_free(conn);
+        return NULL;
+    }
+    conn->local_params.has_stateless_reset_token = 1;
 
     conn->idle_timeout_us = conn->local_params.max_idle_timeout * 1000;
 

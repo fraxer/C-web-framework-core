@@ -299,11 +299,12 @@ RFC 9220 — это RFC 8441, перенесённый на h3, и почти в
 
 ## 9. Приоритеты (RFC 9218)
 
-Текущее состояние: отдельного разбора и валидации `PRIORITY_UPDATE`
-(0xf0700/0xf0701) ещё нет; кадр проходит по общему правилу неизвестных HTTP/3
-кадров. Следующий совместимый шаг — распознавать оба типа, проверять placement,
-element ID и значение `Priority`, учитывать control-frame budget и игнорировать
-корректный сигнал. Планирование по urgency в этот шаг не входит.
+Оба типа `PRIORITY_UPDATE` (0xf0700/0xf0701) распознаются на control stream.
+Проверяются placement, element ID и синтаксис Priority Field Value; каждый кадр
+тратит control-frame budget. Корректный сигнал валидируется и игнорируется —
+планирование по urgency пока намеренно не меняется. Некорректный payload даёт
+`H3_FRAME_ERROR`, недопустимый request/push ID — `H3_ID_ERROR`, кадр на request
+stream — `H3_FRAME_UNEXPECTED`.
 
 ## 10. Коды ошибок
 

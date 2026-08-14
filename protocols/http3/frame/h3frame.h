@@ -37,7 +37,9 @@ typedef enum {
     H3_FRAME_SETTINGS      = 0x04,
     H3_FRAME_PUSH_PROMISE  = 0x05,
     H3_FRAME_GOAWAY        = 0x07,
-    H3_FRAME_MAX_PUSH_ID   = 0x0d
+    H3_FRAME_MAX_PUSH_ID   = 0x0d,
+    H3_FRAME_PRIORITY_UPDATE_REQUEST = 0xf0700,
+    H3_FRAME_PRIORITY_UPDATE_PUSH    = 0xf0701
 } h3_frame_type_e;
 
 /* Reserved in HTTP/3 because HTTP/2 used them (§11.2.1). */

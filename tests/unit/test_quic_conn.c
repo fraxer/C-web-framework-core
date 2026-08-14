@@ -421,7 +421,6 @@ static quicconn_t* __lookup_or_accept(stand_t* s, const uint8_t* data, size_t le
     conn->ep_next = s->ep.conns;
     s->ep.conns = conn;
     s->ep.conn_count++;
-    s->ep.handshakes_in_flight++;
 
     s->conn = conn;
 
@@ -868,6 +867,13 @@ TEST(test_quic_stand_handshake) {
     TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete and confirmed");
     TEST_REQUIRE_NOT_NULL(s->conn, "the connection is still there");
     TEST_ASSERT(s->conn->state == QUICCONN_ACTIVE, "the server calls it active");
+    TEST_ASSERT(s->conn->local_params.has_stateless_reset_token,
+                "initial server CID has a reset token transport parameter");
+    uint8_t expected_reset[16];
+    TEST_ASSERT(quicendpoint_reset_token(&s->conn->local_cids[0].cid, expected_reset),
+                "reset token derives from the process key");
+    TEST_ASSERT(memcmp(expected_reset, s->conn->local_params.stateless_reset_token, 16) == 0,
+                "advertised reset token matches the initial CID");
 
     /* Two round trips is the floor for a full handshake: ClientHello, the
      * server's flight, the client's Finished, HANDSHAKE_DONE. Asserting the

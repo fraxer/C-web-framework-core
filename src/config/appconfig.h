@@ -110,6 +110,9 @@ void appconfig_set_terminating(void);
 int  appconfig_terminating(void);
 
 const char* env_get_string(const char* key, const char* default_value);
+/* 1 = present and valid, 0 = absent, -1 = present with the wrong type/range. */
+int env_get_string_checked(const char* key, const char** value);
+int env_get_llong_checked(const char* key, long long* value);
 int env_get_int(const char* key, int default_value);
 long long env_get_llong(const char* key, long long default_value);
 int env_get_bool(const char* key, int default_value);

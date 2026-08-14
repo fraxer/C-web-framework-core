@@ -155,7 +155,7 @@ fork / BoringSSL) без изменений в транспорте. Свой TL
 | ECN | Фаза 9 |
 | UDP GRO | GSO реализован, GRO пока отсутствует |
 | CUBIC/BBR | NewReno в v1, CUBIC — фаза 9 |
-| RFC 9218 `PRIORITY_UPDATE` и urgency-планирование | Специализированная валидация и планирование не реализованы; кадр проходит как неизвестный |
+| RFC 9218 `PRIORITY_UPDATE` | Оба типа валидируются и учитываются control budget; корректный сигнал игнорируется, urgency scheduling отсутствует |
 
 ### 3.1 Актуальная capability matrix
 

@@ -141,36 +141,10 @@ typedef struct quicendpoint {
      * worker the next datagram reaches. */
     const uint8_t* reset_key;
 
-    /* Token buckets, in milli-tokens, for the two replies we owe strangers.
-     * Both are amplification vectors -- an attacker spoofing a victim's address
-     * makes us send to the victim -- so both are rate limited, and separately:
-     * a scanner's rate of unknown short-header packets has nothing to do with
-     * a client's rate of unsupported versions.
-     *
-     * Endpoint-local and touched only by the worker that owns the endpoint,
-     * hence no atomics. */
-    int64_t  vn_tokens;
-    uint64_t vn_epoch_us;
-    int64_t  reset_tokens;
-    uint64_t reset_epoch_us;
-    /* And a third, for the one reply that is not a reply at all: accepting a
-     * connection. Separate from the connection ceiling next to it because the
-     * two say different things -- the ceiling is how many may exist, this is
-     * how fast they may appear, and a flood exhausts the second long before it
-     * reaches the first. */
-    int64_t  handshake_tokens;
-    uint64_t handshake_epoch_us;
-
     /* Connections on this endpoint, for the timer sweep and the shutdown drain.
      * Touched only by the owning worker. */
     struct quicconn* conns;
     size_t conn_count;
-    /* Of those, how many are still handshaking. This is the load signal
-     * `http3_retry: auto` reacts to -- not the connection count, because a
-     * server with many established connections is busy, while one with many
-     * half-open ones is being attacked, and only the second calls for Retry. */
-    size_t handshakes_in_flight;
-
     /* A graceful shutdown is in progress: no new connections, existing ones
      * are being drained.
      *

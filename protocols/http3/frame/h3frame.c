@@ -29,6 +29,8 @@ static int __accumulates(uint64_t type) {
     case H3_FRAME_CANCEL_PUSH:
     case H3_FRAME_MAX_PUSH_ID:
     case H3_FRAME_PUSH_PROMISE:
+    case H3_FRAME_PRIORITY_UPDATE_REQUEST:
+    case H3_FRAME_PRIORITY_UPDATE_PUSH:
         return 1;
     default:
         return 0;

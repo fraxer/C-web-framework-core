@@ -280,6 +280,27 @@ TEST(test_h3metrics_samples) {
     metrics_init(0);
 }
 
+TEST(test_h3metrics_process_gauges) {
+    TEST_SUITE("h3metrics");
+    TEST_CASE("connection and handshake gauges expose current limits and peak");
+
+    metrics_init(1);
+    metrics_reset();
+
+    metrics_quic_connections(3, 65536);
+    metrics_quic_connections(7, 65536);
+    metrics_quic_connections(2, 65536);
+    metrics_quic_handshakes(5);
+
+    TEST_ASSERT(snapshot_sample("connections", "current") == 2, "current connections");
+    TEST_ASSERT(snapshot_sample("connections", "limit") == 65536, "connection limit");
+    TEST_ASSERT(snapshot_sample("connections", "peak") == 7, "connection peak");
+    TEST_ASSERT(snapshot_sample("handshakes", "inflight") == 5, "handshakes inflight");
+
+    metrics_reset();
+    metrics_init(0);
+}
+
 TEST(test_h3metrics_stream_events) {
     TEST_SUITE("h3metrics");
 

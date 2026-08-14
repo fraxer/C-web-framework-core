@@ -246,6 +246,87 @@ int h3session_accepts_request(const h3session_t* s, uint64_t stream_id) {
 
 /* ---- The control stream ---- */
 
+static int __priority_key_char(uint8_t c, int first) {
+    if (c >= 'a' && c <= 'z') return 1;
+    if (!first && c >= '0' && c <= '9') return 1;
+    return !first && (c == '_' || c == '-' || c == '.' || c == '*');
+}
+
+/* RFC 9218 carries an RFC 8941 Dictionary. We consume the two defined keys and
+ * validate unknown members conservatively so a syntactically broken value is
+ * never mistaken for an extension we can ignore. */
+static int __priority_value_valid(const uint8_t* p, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        while (i < len && p[i] == ' ') i++;
+        if (i == len) return 1; /* empty dictionary means defaults */
+
+        const size_t key_start = i;
+        if (!__priority_key_char(p[i], 1)) return 0;
+        while (++i < len && __priority_key_char(p[i], 0)) {}
+        const size_t key_len = i - key_start;
+
+        while (i < len && p[i] == ' ') i++;
+        const size_t value_start = i;
+        if (i < len && p[i] == '=') {
+            i++;
+            if (i == len) return 0;
+            if (p[i] == '?') {
+                i++;
+                if (i == len || (p[i] != '0' && p[i] != '1')) return 0;
+                i++;
+            } else {
+                if (p[i] == '-') i++;
+                const size_t digits = i;
+                while (i < len && p[i] >= '0' && p[i] <= '9') i++;
+                if (i == digits) return 0;
+            }
+        }
+
+        /* Parameters and extension members use visible ASCII up to the next
+         * comma. This accepts extensions while excluding control characters,
+         * non-ASCII and malformed empty list members. */
+        while (i < len && p[i] != ',') {
+            if (p[i] < 0x20 || p[i] > 0x7e) return 0;
+            i++;
+        }
+
+        if (key_len == 1 && p[key_start] == 'u') {
+            if (value_start >= len || p[value_start] != '=' ||
+                value_start + 1 >= len || p[value_start + 1] < '0' ||
+                p[value_start + 1] > '7') return 0;
+            if (value_start + 2 < i && p[value_start + 2] != ';' &&
+                p[value_start + 2] != ' ') return 0;
+        } else if (key_len == 1 && p[key_start] == 'i' && value_start < len &&
+                   p[value_start] == '=') {
+            if (value_start + 2 >= len || p[value_start + 1] != '?' ||
+                (p[value_start + 2] != '0' && p[value_start + 2] != '1')) return 0;
+        }
+
+        if (i == len) return 1;
+        i++; /* comma */
+        if (i == len) return 0;
+    }
+    return 1;
+}
+
+static h3session_verdict_t __priority_update(h3session_t* s, h3uni_recv_t* uni,
+                                             int push) {
+    if (!h3session_ctrl_spend(s)) return __conn(H3_EXCESSIVE_LOAD);
+
+    uint64_t element = 0;
+    const size_t n = varint_read(uni->frames.payload, uni->frames.payload_len, &element);
+    if (n == 0) return __conn(H3_FRAME_ERROR);
+
+    if ((!push && (element & 0x03) != 0) || push)
+        return __conn(H3_ID_ERROR);
+
+    if (!__priority_value_valid(uni->frames.payload + n, uni->frames.payload_len - n))
+        return __conn(H3_FRAME_ERROR);
+
+    return __ok(); /* scheduling intentionally unchanged */
+}
+
 /* One frame off the peer's control stream. `uni->frames.payload` holds it. */
 static h3session_verdict_t __control_frame(h3session_t* s, h3uni_recv_t* uni) {
     const uint64_t type = uni->frames.type;
@@ -326,6 +407,12 @@ static h3session_verdict_t __control_frame(h3session_t* s, h3uni_recv_t* uni) {
          * that does not exist. */
         return __conn(H3_ID_ERROR);
     }
+
+    case H3_FRAME_PRIORITY_UPDATE_REQUEST:
+        return __priority_update(s, uni, 0);
+
+    case H3_FRAME_PRIORITY_UPDATE_PUSH:
+        return __priority_update(s, uni, 1);
 
     case H3_FRAME_DATA:
     case H3_FRAME_HEADERS:

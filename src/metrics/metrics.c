@@ -153,6 +153,10 @@ typedef struct {
     atomic_ullong h3[METRICS_H3__COUNT];
     sample_series_t rtt_us;
     sample_series_t cwnd_bytes;
+    atomic_ullong quic_connections_current;
+    atomic_ullong quic_connections_limit;
+    atomic_ullong quic_connections_peak;
+    atomic_ullong quic_handshakes_inflight;
 #endif
 
     atomic_ullong window_started_ns;
@@ -337,6 +341,22 @@ void metrics_quic_cwnd(uint64_t bytes) {
     if (!metrics_enabled()) return;
 
     __sample_add(&__m.cwnd_bytes, bytes, __cwnd_bucket(bytes));
+}
+
+void metrics_quic_connections(size_t current, size_t limit) {
+    atomic_store_explicit(&__m.quic_connections_current, current, memory_order_relaxed);
+    atomic_store_explicit(&__m.quic_connections_limit, limit, memory_order_relaxed);
+
+    unsigned long long peak =
+        atomic_load_explicit(&__m.quic_connections_peak, memory_order_relaxed);
+    while (peak < current &&
+           !atomic_compare_exchange_weak_explicit(&__m.quic_connections_peak, &peak, current,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) {}
+}
+
+void metrics_quic_handshakes(size_t inflight) {
+    atomic_store_explicit(&__m.quic_handshakes_inflight, inflight, memory_order_relaxed);
 }
 
 void metrics_h3(metrics_h3_t kind) {
@@ -552,6 +572,20 @@ json_doc_t* metrics_snapshot_json(void) {
 
     json_object_set(quic, "rtt_us", __sample_json(&__m.rtt_us, __rtt_bucket_name));
     json_object_set(quic, "cwnd_bytes", __sample_json(&__m.cwnd_bytes, __cwnd_bucket_name));
+
+    json_token_t* connections = json_create_object();
+    if (connections != NULL) {
+        json_object_set(connections, "current", json_create_number((long double)__load(&__m.quic_connections_current)));
+        json_object_set(connections, "limit", json_create_number((long double)__load(&__m.quic_connections_limit)));
+        json_object_set(connections, "peak", json_create_number((long double)__load(&__m.quic_connections_peak)));
+        json_object_set(quic, "connections", connections);
+    }
+
+    json_token_t* handshakes = json_create_object();
+    if (handshakes != NULL) {
+        json_object_set(handshakes, "inflight", json_create_number((long double)__load(&__m.quic_handshakes_inflight)));
+        json_object_set(quic, "handshakes", handshakes);
+    }
 
     json_object_set(root, "quic", quic);
 

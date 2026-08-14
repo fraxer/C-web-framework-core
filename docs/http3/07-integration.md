@@ -324,6 +324,10 @@ http3.qpack{inserts,evictions,blocked_streams,literal_ratio}
 Добавлено вместе с §4 (2026-08-09): `refused.at_capacity`,
 `refused.handshake_rate`, `abuse.field_section_hard_cap`.
 
+Добавлено 2026-08-15: `quic.connections.{current,limit,peak}` и
+`quic.handshakes.inflight`. Это process-wide gauges; `peak` считается с запуска
+процесса и не сбрасывается soft reload.
+
 **Осталось по §3:** `qpack.*` (придёт с full QPACK 6.2), `loss_rate` (частное,
 которое считает читатель), и счётчики нереализованного из списка выше.
 
@@ -349,6 +353,12 @@ QUIC даёт атакующему возможности, которых не �
 | Флуд NEW_CONNECTION_ID | `active_connection_id_limit`, превышение → `CONNECTION_ID_LIMIT_ERROR` |
 | Миграция-флуд | не чаще одной валидации пути за 3×PTO |
 | Огромный ACK-«гребёнка» | ≤ 32 диапазона на приём и на отправку |
+
+Handshake, Version Negotiation и stateless-reset buckets являются процессными:
+workers и endpoint не умножают настроенные rate/burst. Короткий atomic spinlock
+защищает только обновление одного bucket и не попадает на data path
+установленных соединений. Число незавершённых handshake также process-wide и
+служит единым сигналом для `http3_retry=auto`.
 
 ### 4a. Ход работ
 

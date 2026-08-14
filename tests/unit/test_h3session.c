@@ -285,6 +285,45 @@ TEST(test_h3session_control_frames) {
     TEST_ASSERT(s->max_push_id == 7, "assembled");
     h3uni_recv_free(uni); h3session_free(s);
 
+    TEST_CASE("a valid request PRIORITY_UPDATE is validated and ignored");
+    OPEN(s, uni);
+    uint8_t priority[32];
+    size_t pp = varint_write(priority, sizeof priority, 8); /* client bidi request */
+    memcpy(priority + pp, "u=2, i", 6); pp += 6;
+    n = h3frame_write(frame, sizeof frame, H3_FRAME_PRIORITY_UPDATE_REQUEST,
+                      priority, pp);
+    TEST_ASSERT(feed(s, uni, frame, n, 0).action == H3SESSION_OK, "valid signal ignored");
+    h3uni_recv_free(uni); h3session_free(s);
+
+    TEST_CASE("PRIORITY_UPDATE rejects a non-request stream id");
+    OPEN(s, uni);
+    pp = varint_write(priority, sizeof priority, 2); /* server unidirectional */
+    memcpy(priority + pp, "u=1", 3); pp += 3;
+    n = h3frame_write(frame, sizeof frame, H3_FRAME_PRIORITY_UPDATE_REQUEST,
+                      priority, pp);
+    v = feed(s, uni, frame, n, 0);
+    TEST_ASSERT(v.action == H3SESSION_CONN_ERROR && v.error == H3_ID_ERROR, "element id");
+    h3uni_recv_free(uni); h3session_free(s);
+
+    TEST_CASE("PRIORITY_UPDATE rejects a malformed Priority field value");
+    OPEN(s, uni);
+    pp = varint_write(priority, sizeof priority, 0);
+    memcpy(priority + pp, "u=9", 3); pp += 3;
+    n = h3frame_write(frame, sizeof frame, H3_FRAME_PRIORITY_UPDATE_REQUEST,
+                      priority, pp);
+    v = feed(s, uni, frame, n, 0);
+    TEST_ASSERT(v.action == H3SESSION_CONN_ERROR && v.error == H3_FRAME_ERROR, "urgency range");
+    h3uni_recv_free(uni); h3session_free(s);
+
+    TEST_CASE("a push PRIORITY_UPDATE is an ID error when no push exists");
+    OPEN(s, uni);
+    pp = varint_write(priority, sizeof priority, 0);
+    n = h3frame_write(frame, sizeof frame, H3_FRAME_PRIORITY_UPDATE_PUSH,
+                      priority, pp);
+    v = feed(s, uni, frame, n, 0);
+    TEST_ASSERT(v.action == H3SESSION_CONN_ERROR && v.error == H3_ID_ERROR, "push id");
+    h3uni_recv_free(uni); h3session_free(s);
+
 #undef OPEN
 }
 
