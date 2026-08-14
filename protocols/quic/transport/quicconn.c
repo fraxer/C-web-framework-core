@@ -1137,8 +1137,12 @@ static void __path_probe_succeed(quicconn_t* conn) {
      * packets still waiting to be acknowledged -- on the old path, but their
      * acknowledgements are still coming. */
     /* The configured initial window, not whatever the old path had grown --
-     * same reasoning as the RTT estimator reset right below. */
+     * same reasoning as the RTT estimator reset right below. The pacer follows
+     * it: its bucket was filled at the old path's rate, and spending that on the
+     * new one is the burst this reset exists to prevent. */
     quiccc_init_packets(&conn->cc, QUICCONN_MAX_PACKET, quic_policy_conn()->initcwnd_packets);
+    quicpacer_init(&conn->pacer, &conn->cc, quic_policy_conn()->pacing);
+    conn->pace_until_us = 0;
 
     conn->loss.have_rtt_sample = 0;
     conn->loss.latest_rtt_us = 0;
@@ -2364,6 +2368,11 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
      * flight is still waiting and must be asked for again. */
     int more_pending = 0;
 
+    /* Recomputed by this turn, so cleared at its start: a deadline left over
+     * from a previous turn would keep waking the endpoint for a connection that
+     * is no longer waiting on the clock. */
+    conn->pace_until_us = 0;
+
     for (int round = 0; round < QUICCONN_SEND_ROUNDS; round++) {
         size_t total = 0;
         int ack_levels = 0;
@@ -2376,7 +2385,44 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
          * 15 ms, a 25-packet queue) it emptied the whole flow-control window
          * into a queue that could hold a twentieth of it, and the peer received
          * under a tenth of what was sent (docs/http3/08 §3i). */
-        const int cc_blocked = quiccc_available(&conn->cc) < QUICCONN_MAX_PACKET;
+        /* §7.7, and asked in the same breath as the window because it answers
+         * the same question with a different clock. The window reopens when the
+         * peer says something; the pacer reopens on time alone, so a turn it
+         * stops has to leave a deadline behind or the rest of the flight waits
+         * for a peer with nothing to say. */
+        const size_t paced = quicpacer_allowance(&conn->pacer, &conn->cc,
+                                                 conn->loss.smoothed_rtt_us, now_us);
+
+        /* The allowance is the smaller of the bucket and the window, so a zero
+         * does not say which of them produced it. The deadline does: it is
+         * non-zero only when the bucket is short of a datagram. Asking that way
+         * round also decides the failure mode -- a pacer that cannot name the
+         * moment it reopens is treated as not blocking at all, because the
+         * window is the limit that must hold and this one is advisory. */
+        const uint64_t pace_resume_us =
+            paced < QUICCONN_MAX_PACKET
+                ? quicpacer_next_time_us(&conn->pacer, &conn->cc,
+                                         conn->loss.smoothed_rtt_us, now_us)
+                : 0;
+
+        const int pace_blocked = pace_resume_us != 0;
+
+        if (pace_blocked) {
+            conn->pace_until_us = pace_resume_us;
+            more_pending = 1;
+        }
+
+        /* Folded into the window's own flag, which is what gives the pacer the
+         * two exemptions __build_packet already grants: an acknowledgement
+         * (§7.7 paces what the controller counts, and an ACK-only packet is not
+         * in flight -- holding one back costs the peer a round trip and buys
+         * the path nothing) and a PTO probe (§7.7 lets one go without regard to
+         * pacing, for the same reason §7.5 lets it exceed the window: a probe
+         * exists to end a stall, and a stall is not eased by waiting). */
+        const int cc_blocked = quiccc_available(&conn->cc) < QUICCONN_MAX_PACKET ||
+                               pace_blocked;
+
+        const uint64_t in_flight_before = conn->cc.bytes_in_flight;
 
         /* Coalesce the levels into one datagram where possible: an Initial and
          * a Handshake packet together is what makes a server flight fit in one
@@ -2455,6 +2501,15 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
             break;
 
         sent_anything = 1;
+
+        /* Charged exactly what the controller counted, which is how an ACK-only
+         * datagram leaves the bucket alone: bytes_in_flight is raised by
+         * quicloss_on_sent for the packets that are in flight and by nothing
+         * else, so its rise over this round is the paced quantity. */
+        const uint64_t in_flight_added = conn->cc.bytes_in_flight > in_flight_before
+                                       ? conn->cc.bytes_in_flight - in_flight_before : 0;
+        if (in_flight_added > 0)
+            quicpacer_consume(&conn->pacer, (size_t)in_flight_added);
 
         /* Out of window: stop, and do *not* ask for another turn. The window
          * reopens on an acknowledgement or when the loss timer declares
@@ -2623,7 +2678,10 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     conn->amplification_factor = policy->amplification_factor;
 
     quiccc_init_packets(&conn->cc, QUICCONN_MAX_PACKET, policy->initcwnd_packets);
-    quicpacer_init(&conn->pacer, QUICCONN_MAX_PACKET, policy->pacing);
+    /* After the controller, always: the burst limit is the window it just
+     * computed. */
+    quicpacer_init(&conn->pacer, &conn->cc, policy->pacing);
+    conn->pace_until_us = 0;
     quicloss_init(&conn->loss, &conn->cc, policy->ack_delay_ms * 1000);
     quicloss_set_cid_tag(&conn->loss, conn->odcid.data, conn->odcid.len);
 
@@ -3027,6 +3085,10 @@ uint64_t quicconn_next_timeout(const quicconn_t* conn) {
     const uint64_t loss_timeout = quicloss_timeout(&conn->loss, 0);
     if (loss_timeout != 0 && (earliest == 0 || loss_timeout < earliest))
         earliest = loss_timeout;
+
+    if (conn->pace_until_us != 0 &&
+        (earliest == 0 || conn->pace_until_us < earliest))
+        earliest = conn->pace_until_us;
 
     for (int i = 0; i < QUIC_ENC_COUNT; i++) {
         const uint64_t ack_deadline = quicack_deadline(&conn->ack[i]);

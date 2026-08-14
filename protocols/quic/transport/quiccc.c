@@ -138,16 +138,13 @@ const quiccc_ops_t quiccc_newreno = {
 
 /* ---- Pacing ---- */
 
-void quicpacer_init(quicpacer_t* pacer, size_t max_datagram_size, int enabled) {
-    if (pacer == NULL) return;
+void quicpacer_init(quicpacer_t* pacer, const quiccc_t* cc, int enabled) {
+    if (pacer == NULL || cc == NULL) return;
 
     memset(pacer, 0, sizeof * pacer);
 
     pacer->enabled = enabled;
-    /* Ten datagrams of burst: enough that the common case of a few packets
-     * back to back costs no timer, small enough that an idle connection cannot
-     * resume by dumping a whole window. */
-    pacer->burst_limit = (uint64_t)max_datagram_size * 10;
+    pacer->burst_limit = cc->cwnd;   /* the initial window -- see the header */
     pacer->tokens = pacer->burst_limit;
 }
 
@@ -206,5 +203,15 @@ uint64_t quicpacer_next_time_us(const quicpacer_t* pacer, const quiccc_t* cc,
 
     const uint64_t needed = cc->max_datagram_size - pacer->tokens;
 
-    return now_us + needed * 1000000ULL / rate;
+    /* Rounded up, and never zero. The refill in quicpacer_allowance truncates
+     * -- rate * elapsed / 1000000 -- so a deadline rounded down buys back less
+     * than a datagram, the sender wakes to find itself still blocked, and asks
+     * for the same instant again. That is not a slow path but a live one: the
+     * stand caught it as a transfer that stopped 208 bytes short while the
+     * clock crawled forward a microsecond per turn. Ceiling division makes one
+     * wake-up worth at least one datagram, always. */
+    uint64_t delay_us = (needed * 1000000ULL + rate - 1) / rate;
+    if (delay_us == 0) delay_us = 1;
+
+    return now_us + delay_us;
 }

@@ -132,6 +132,13 @@ typedef struct quicconn {
     quiccc_t   cc;
     quicpacer_t pacer;
 
+    /* When the pacer will next let a datagram out, or 0 when it is not what is
+     * holding the connection up. Unlike the congestion window this reopens on
+     * the clock and on nothing the peer does, so it has to be a timer deadline
+     * of its own -- quicconn_next_timeout reports it, and the turn that set it
+     * left want_write raised so the wake-up finds work to do. */
+    uint64_t pace_until_us;
+
     /* Streams, and the limits that bound them. */
     quicstream_t* streams;
     size_t    stream_count;

@@ -92,7 +92,16 @@ typedef struct quicpacer {
     int      enabled;
 } quicpacer_t;
 
-void quicpacer_init(quicpacer_t* pacer, size_t max_datagram_size, int enabled);
+/* The burst limit is the controller's *initial* window, which is why this takes
+ * the controller and must be called right after it is initialised. §7.2 defines
+ * the initial window as precisely the burst a sender may open a path with, and
+ * §7.7 recommends no larger burst later on -- so a connection sends its opening
+ * flight exactly as it would with no pacer at all, an operator who raised
+ * http3_initcwnd_packets gets the burst they asked for, and every later release
+ * of a grown window is spread instead of dumped. That last case is the one that
+ * matters in steady state: a single cumulative acknowledgement can free a
+ * window many times the initial one. */
+void quicpacer_init(quicpacer_t* pacer, const quiccc_t* cc, int enabled);
 
 /* Bytes the pacer permits at `now_us`, given the window and RTT. Returns 0 when
  * the caller must wait; quicpacer_next_time_us says until when. */

@@ -123,40 +123,68 @@ TEST(test_quic_pacer) {
     quiccc_init(&cc, MTU);
 
     quicpacer_t pacer;
-    quicpacer_init(&pacer, MTU, 1);
+    quicpacer_init(&pacer, &cc, 1);
 
     TEST_CASE("with no RTT sample the pacer does not delay the handshake");
     /* The first flight has nothing to pace against, and holding it back would
      * add a round trip to every connection. */
     TEST_ASSERT(quicpacer_allowance(&pacer, &cc, 0, 1000) > 0, "allowed");
 
-    TEST_CASE("the burst is bounded");
-    quicpacer_init(&pacer, MTU, 1);
+    TEST_CASE("the burst is the initial window");
+    quicpacer_init(&pacer, &cc, 1);
     const size_t allowance = quicpacer_allowance(&pacer, &cc, 50000, 1000000);
-    TEST_ASSERT(allowance <= 10 * MTU, "at most ten datagrams at once");
+    TEST_ASSERT_EQUAL_SIZE((size_t)cc.cwnd, allowance,
+                           "the opening flight goes out exactly as it would unpaced");
+
+    TEST_CASE("a raised initial window raises the burst with it");
+    /* An operator who sets http3_initcwnd_packets asks for that burst; the pacer
+     * shapes what comes after it, not the window they configured. */
+    quiccc_t wide;
+    quiccc_init_packets(&wide, MTU, 30);
+    quicpacer_init(&pacer, &wide, 1);
+    TEST_ASSERT_EQUAL_SIZE((size_t)(30 * MTU),
+                           quicpacer_allowance(&pacer, &wide, 50000, 1000000),
+                           "thirty datagrams at once, as configured");
 
     TEST_CASE("tokens are consumed and refill over time");
-    quicpacer_init(&pacer, MTU, 1);
+    quicpacer_init(&pacer, &cc, 1);
     __now = 1000000;
     quicpacer_allowance(&pacer, &cc, 50000, __now);
-    quicpacer_consume(&pacer, 10 * MTU);
+    quicpacer_consume(&pacer, (size_t)cc.cwnd);
     TEST_ASSERT(quicpacer_allowance(&pacer, &cc, 50000, __now) == 0,
                 "nothing left immediately");
+
+    TEST_CASE("an exhausted bucket names the time it reopens");
+    /* The congestion window reopens when the peer says something; this reopens
+     * on the clock alone, so the sender has to be told when to come back. */
+    const uint64_t resume = quicpacer_next_time_us(&pacer, &cc, 50000, __now);
+    TEST_ASSERT(resume > __now, "a deadline in the future");
+
+    TEST_CASE("waiting until that deadline buys a whole datagram");
+    /* REGRESSION: the deadline was computed with a truncating division while
+     * the refill truncates too, so waiting for it bought back less than a
+     * datagram. The sender woke still blocked and asked for the same instant
+     * again -- a live loop that the stand saw as a transfer stopping a couple
+     * of hundred bytes short. One wake-up must always be worth one datagram. */
+    TEST_ASSERT(quicpacer_allowance(&pacer, &cc, 50000, resume) >= (size_t)MTU,
+                "the wake-up is not wasted");
 
     /* One RTT later a full window's worth has been earned back. */
     __now += 50000;
     TEST_ASSERT(quicpacer_allowance(&pacer, &cc, 50000, __now) > 0, "refilled");
+    TEST_ASSERT_EQUAL_UINT(0, quicpacer_next_time_us(&pacer, &cc, 50000, __now),
+                           "and no deadline while it allows a datagram");
 
     TEST_CASE("the pacer never exceeds the congestion window");
     quiccc_init(&cc, MTU);
+    quicpacer_init(&pacer, &cc, 1);
     cc.ops->on_sent(&cc, cc.cwnd);       /* window full */
-    quicpacer_init(&pacer, MTU, 1);
     TEST_ASSERT(quicpacer_allowance(&pacer, &cc, 50000, __now) == 0,
                 "no allowance when the window is full");
 
     TEST_CASE("disabled, it reports the raw window");
     quiccc_init(&cc, MTU);
-    quicpacer_init(&pacer, MTU, 0);
+    quicpacer_init(&pacer, &cc, 0);
     TEST_ASSERT(quicpacer_allowance(&pacer, &cc, 50000, __now) == quiccc_available(&cc),
                 "the window itself");
 }
