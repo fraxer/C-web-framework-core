@@ -2622,6 +2622,14 @@ static h2session_t* h2_session_begin(connection_t* connection) {
 
     ctx->parser = s;
     ctx->is_http2 = 1;
+
+    /* Safe here and only here: h2_read loops until SSL_read reports WANT_READ,
+     * so whatever the library pulled in ahead is consumed in the same visit.
+     * The h1.1 and WebSocket readers leave their loops on a parsed message too,
+     * which would strand the rest of the buffer where epoll cannot find it --
+     * so they keep one record per read until they learn to ask SSL_pending. */
+    if (connection->ssl != NULL)
+        openssl_set_read_ahead(connection->ssl, 1);
     /* h2 connections are always persistent; connection_after_write() tears down
      * a connection whose keepalive flag is clear. */
     connection->keepalive = 1;

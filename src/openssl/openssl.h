@@ -54,6 +54,7 @@ openssl_t* openssl_create(void);
 void openssl_free(openssl_t* openssl);
 void openssl_set_sni_callback(openssl_t* openssl, int (*callback)(SSL*, int*, void*));
 int openssl_read(SSL*, void*, size_t);
+void openssl_set_read_ahead(SSL*, int);
 int openssl_write(SSL*, const void*, size_t);
 openssl_io_status_e openssl_io_status(SSL*, int ret);
 

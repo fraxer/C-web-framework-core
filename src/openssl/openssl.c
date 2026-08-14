@@ -309,6 +309,22 @@ int openssl_read(SSL* ssl, void* buffer, size_t num) {
     return SSL_read(ssl, buffer, (int)num);
 }
 
+/* Let the library take more than one TLS record from the socket per read.
+ *
+ * Without it every record costs two reads -- five bytes of length, then the
+ * body -- and that showed as 1,5 reads per request against nginx's 0,16
+ * (docs/http2/10 §7).
+ *
+ * The caller must drain: with read ahead the bytes sit in the library's buffer,
+ * where epoll cannot see them, so a reader that stops before SSL_read says
+ * WANT_READ leaves them unnoticed until the peer happens to send more. Only
+ * enable it where the read loop runs to WANT_READ unconditionally. */
+void openssl_set_read_ahead(SSL* ssl, int on) {
+    if (ssl == NULL) return;
+
+    SSL_set_read_ahead(ssl, on);
+}
+
 int openssl_write(SSL* ssl, const void* buffer, size_t num) {
     if (num == 0) return 0;
     if (num > INT_MAX) num = INT_MAX;
