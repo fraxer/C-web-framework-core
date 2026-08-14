@@ -97,6 +97,7 @@ static void __table_acquire(void* value) {
 
 static quiccidtable_t* __quic_table = NULL;
 static size_t   __quic_max_connections = QUIC_DEFAULT_MAX_CONNECTIONS;
+static _Atomic size_t __quic_connections = 0;
 static uint8_t  __quic_reset_key[32];
 static size_t   __quic_rx_batch = 32;
 static int      __quic_rcvbuf = 0;
@@ -136,6 +137,34 @@ static quic_conn_policy_t __quic_conn_policy = {
 
 const quic_conn_policy_t* quic_policy_conn(void) {
     return &__quic_conn_policy;
+}
+
+int quic_process_conn_try_acquire(void) {
+    size_t current = atomic_load_explicit(&__quic_connections, memory_order_relaxed);
+    while (current < __quic_max_connections) {
+        if (atomic_compare_exchange_weak_explicit(
+                &__quic_connections, &current, current + 1,
+                memory_order_acq_rel, memory_order_relaxed))
+            return 1;
+    }
+    return 0;
+}
+
+void quic_process_conn_release(void) {
+    const size_t previous =
+        atomic_fetch_sub_explicit(&__quic_connections, 1, memory_order_acq_rel);
+    /* A double release is a programming error, but do not leave the process
+     * counter wrapped if it slips through a failure path. */
+    if (previous == 0)
+        atomic_store_explicit(&__quic_connections, 0, memory_order_release);
+}
+
+size_t quic_process_conn_current(void) {
+    return atomic_load_explicit(&__quic_connections, memory_order_acquire);
+}
+
+size_t quic_process_conn_limit(void) {
+    return __quic_max_connections;
 }
 
 /* One key, clamped into a range it cannot break the protocol from. Every bound
@@ -223,8 +252,11 @@ static void __conn_policy_init(void) {
 
 int quic_policy_init(void) {
     int64_t max_connections = env_get_int("http3_max_connections", QUIC_DEFAULT_MAX_CONNECTIONS);
-    if (max_connections < 64) max_connections = 64;
-    if (max_connections > 4000000) max_connections = 4000000;
+    if (max_connections < 64 || max_connections > 4000000) {
+        log_error("quic: http3_max_connections must be in 64..4000000 (got %lld)\n",
+                  (long long)max_connections);
+        return 0;
+    }
     __quic_max_connections = (size_t)max_connections;
 
     int64_t batch = env_get_int("http3_rx_batch", 32);
@@ -846,6 +878,10 @@ void quicendpoint_detach(quicendpoint_t* endpoint, quicconn_t* conn) {
         if (*link == conn) {
             *link = conn->ep_next;
             if (endpoint->conn_count > 0) endpoint->conn_count--;
+            if (conn->process_slot_reserved) {
+                conn->process_slot_reserved = 0;
+                quic_process_conn_release();
+            }
             break;
         }
         link = &(*link)->ep_next;
@@ -896,12 +932,21 @@ static void __accept(quicendpoint_t* ep, udp_datagram_t* dgram,
         path.local_len = dgram->peer_len;
     }
 
+    if (!quic_process_conn_try_acquire()) {
+        metrics_quic(METRICS_QUIC_AT_CAPACITY);
+        metrics_quic(METRICS_QUIC_DROP_NO_BUDGET);
+        __send_initial_close(ep, dgram, inv, QUIC_CONNECTION_REFUSED);
+        return;
+    }
+
     quicconn_t* conn = quicconn_accept(ep, &inv->dcid, &inv->scid, &path, server,
                                        address_validated, retry_odcid);
     if (conn == NULL) {
+        quic_process_conn_release();
         metrics_quic(METRICS_QUIC_DROP_NO_BUDGET);
         return;
     }
+    conn->process_slot_reserved = 1;
 
     /* Both ids are registered: the client addresses its next packets to the id
      * we chose, but anything already in flight still carries the one it made
@@ -910,6 +955,8 @@ static void __accept(quicendpoint_t* ep, udp_datagram_t* dgram,
         quiccidtable_insert(ep->table, &conn->odcid, conn) != QUICCIDTABLE_OK) {
         quiccidtable_remove(ep->table, &conn->local_cids[0].cid);
         quiccidtable_remove(ep->table, &conn->odcid);
+        conn->process_slot_reserved = 0;
+        quic_process_conn_release();
         quicconn_free(conn);
         metrics_quic(METRICS_QUIC_DROP_NO_BUDGET);
         return;
@@ -1214,7 +1261,7 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
         return;
     }
 
-    if (ep->conn_count >= __quic_max_connections) {
+    if (quic_process_conn_current() >= __quic_max_connections) {
         metrics_quic(METRICS_QUIC_AT_CAPACITY);
         /* Told, not dropped. Being full is not an attack, and a client that
          * knows can go elsewhere now instead of at its handshake timeout. */

@@ -88,6 +88,35 @@ endif()
 
 add_test(NAME core_tests COMMAND runner)
 
+# A small protocol-only runner keeps the QUIC/H3/QPACK signal visible when an
+# unrelated framework regression breaks the broad runner.  It is an additional
+# gate, not a replacement for core_tests.
+if(INCLUDE_HTTP3 STREQUAL yes)
+    set(H3_UNIT_TEST_FILES ${UNIT_TEST_FILES})
+    list(FILTER H3_UNIT_TEST_FILES INCLUDE REGEX "/test_(quic|h3|qpack)")
+    add_executable(h3_runner
+        unit/runner.c
+        ${H3_UNIT_TEST_FILES}
+        ${QUIC_CLIENT_SOURCES}
+        unit/h3_config_stubs.c
+        unit/httpclient_stubs.c
+        unit/mail_stubs.c
+    )
+    target_include_directories(h3_runner PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/quicclient
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/udp
+    )
+    target_compile_definitions(h3_runner PRIVATE
+        TEST_QUIC_CERT="${CMAKE_CURRENT_SOURCE_DIR}/data/quic_test_cert.pem"
+        TEST_QUIC_KEY="${CMAKE_CURRENT_SOURCE_DIR}/data/quic_test_key.pem"
+    )
+    target_link_libraries(h3_runner PRIVATE
+        cwfr_framework ${PCRE_LIBRARIES} ${ZLIB_LIBRARIES}
+        ${OPENSSL_LIBRARIES} idn2 resolv ${CMAKE_DL_LIBS} Threads::Threads
+    )
+    add_test(NAME h3_unit_tests COMMAND h3_runner)
+endif()
+
 # --- QUIC test client ---
 #
 # Not part of `runner`: it needs a server to talk to, so it is a tool rather

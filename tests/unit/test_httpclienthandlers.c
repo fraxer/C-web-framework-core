@@ -126,6 +126,20 @@ static size_t read_all_peer(int fd, char* buf, size_t cap, int timeout_ms) {
     return total;
 }
 
+/* The captured request may contain an arbitrary binary body and is not NUL
+ * terminated.  strstr() therefore both stops at the first body NUL and may
+ * read beyond the capture. */
+static const char* find_head_end(const char* wire, size_t len) {
+    static const char marker[] = "\r\n\r\n";
+    if (len < sizeof(marker) - 1) return NULL;
+
+    for (size_t i = 0; i <= len - (sizeof(marker) - 1); i++)
+        if (memcmp(wire + i, marker, sizeof(marker) - 1) == 0)
+            return wire + i;
+
+    return NULL;
+}
+
 // Декодировать chunked body из wire в out. Возвращает кол-во декодированных
 // байт или -1 при битом фрейминге.
 static ssize_t decode_chunked(const char* wire, size_t len, char* out, size_t outcap) {
@@ -265,8 +279,8 @@ TEST(test_write_post_plain_preserves_body) {
     size_t wn = read_all_peer(h.peer_fd, wire, sizeof(wire), 100);
     TEST_ASSERT(wn > PAYLOAD, "peer received head + body");
 
-    const char* body = strstr(wire, "\r\n\r\n");
-    TEST_ASSERT_NOT_NULL(body, "head terminator present");
+    const char* body = find_head_end(wire, wn);
+    TEST_REQUIRE_NOT_NULL(body, "head terminator present");
     body += 4;
     size_t body_len = wn - (size_t)(body - wire);
     TEST_ASSERT_EQUAL_SIZE(PAYLOAD, body_len, "plain body length equals payload");
@@ -315,8 +329,8 @@ TEST(test_write_post_chunked_preserves_body) {
     size_t wn = read_all_peer(h.peer_fd, wire, sizeof(wire), 100);
     TEST_ASSERT(wn > 0, "peer received bytes");
 
-    const char* body = strstr(wire, "\r\n\r\n");
-    TEST_ASSERT_NOT_NULL(body, "head terminator present");
+    const char* body = find_head_end(wire, wn);
+    TEST_REQUIRE_NOT_NULL(body, "head terminator present");
     body += 4;
     size_t body_len = wn - (size_t)(body - wire);
 

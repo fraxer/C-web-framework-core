@@ -294,6 +294,9 @@ typedef struct quicconn {
 
     struct quicconn* ep_next;   /* endpoint's connection list */
     struct quicconn* tx_next;   /* endpoint's send queue */
+    /* One process-wide connection-limit reservation. It is acquired before
+     * allocation and cleared exactly once by endpoint detach/error rollback. */
+    int process_slot_reserved;
 
     /* Already waiting in the endpoint's send queue.
      *

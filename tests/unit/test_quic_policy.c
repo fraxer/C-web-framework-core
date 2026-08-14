@@ -64,3 +64,22 @@ TEST(test_quic_policy_defaults) {
     /* §18.2: a peer may not advertise less than 2. */
     TEST_ASSERT(p->active_cid_limit >= 2, "at least two");
 }
+
+TEST(test_quic_process_connection_limit) {
+    TEST_SUITE("quic_policy");
+    TEST_CASE("connection admission is shared process-wide and rolls back");
+
+    const size_t limit = quic_process_conn_limit();
+    TEST_REQUIRE(limit >= 64, "configured/default process limit is valid");
+    TEST_ASSERT_EQUAL_SIZE(0, quic_process_conn_current(), "starts empty");
+
+    size_t acquired = 0;
+    while (acquired < limit && quic_process_conn_try_acquire()) acquired++;
+
+    TEST_ASSERT_EQUAL_SIZE(limit, acquired, "all process slots acquired once");
+    TEST_ASSERT(!quic_process_conn_try_acquire(), "next endpoint is refused at the same limit");
+    TEST_ASSERT_EQUAL_SIZE(limit, quic_process_conn_current(), "failed reservation does not increment");
+
+    while (acquired-- > 0) quic_process_conn_release();
+    TEST_ASSERT_EQUAL_SIZE(0, quic_process_conn_current(), "all reservations rolled back");
+}

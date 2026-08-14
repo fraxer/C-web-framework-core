@@ -12,6 +12,7 @@
 #   noh3     build with -DINCLUDE_HTTP3=no  + unit tests   (h3 broke nothing)
 #   asan     build with h3, ASan            + unit tests
 #   tsan     build with h3, TSan            + unit tests   (data races)
+#   h3unit   QUIC / HTTP/3 / QPACK unit runner only
 #   fuzz     build the fuzz targets         + FUZZ_SECONDS each
 #   h3spec   run a server, run h3spec against it           (RFC conformance)
 #
@@ -28,6 +29,7 @@
 #   CI_BUILD_DIR   where build trees go (default: a temp dir, kept between runs)
 #   FUZZ_SECONDS   per fuzz target (default 60; §5 asks for 24h on a schedule)
 #   H3SPEC         path to the h3spec binary (default: found on PATH)
+#   REQUIRE_H3SPEC fail instead of skip when h3spec is unavailable (default 0)
 #   JOBS           parallel build jobs (default: nproc)
 
 set -u -o pipefail
@@ -39,6 +41,7 @@ CI_BUILD_DIR=${CI_BUILD_DIR:-/tmp/cwfr-ci}
 FUZZ_SECONDS=${FUZZ_SECONDS:-10}
 JOBS=${JOBS:-$(nproc)}
 H3SPEC=${H3SPEC:-$(command -v h3spec || true)}
+REQUIRE_H3SPEC=${REQUIRE_H3SPEC:-0}
 
 # Databases are off in every stage: the gate must run on a machine with none,
 # and the database tests are a separate binary with their own requirements.
@@ -120,6 +123,17 @@ stage_tsan() {
     fi
 }
 
+stage_h3unit() {
+    say "h3unit: isolated QUIC / HTTP/3 / QPACK unit tests"
+    if build "$CI_BUILD_DIR/h3unit" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes &&
+       "$CI_BUILD_DIR/h3unit/exec/h3_runner" | tail -4 | sed 's/^/   /'; then
+        record h3unit OK
+    else
+        record h3unit FAIL
+    fi
+}
+
 stage_fuzz() {
     say "fuzz: $FUZZ_SECONDS s per target (§5 asks 24h per target on a schedule)"
 
@@ -146,9 +160,20 @@ stage_fuzz() {
         mkdir -p "$work"
         [ -d "$corpus" ] && cp -n "$corpus"/* "$work"/ 2>/dev/null
 
+        local log="$CI_BUILD_DIR/$name.log"
         if "$target" -seconds="$FUZZ_SECONDS" -artifacts="$crashes" "$work" \
-                > "$CI_BUILD_DIR/$name.log" 2>&1; then
+                > "$log" 2>&1; then
             note "$(tail -1 "$CI_BUILD_DIR/$name.log")"
+        elif grep -Eq 'LeakSanitizer.*(does not work|not supported)|LSan.*(does not work|not supported)' "$log"; then
+            note "$name: LeakSanitizer unavailable; retrying with leak detection disabled"
+            if ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_leaks=0" \
+                    "$target" -seconds="$FUZZ_SECONDS" -artifacts="$crashes" "$work" \
+                    >> "$log" 2>&1; then
+                note "$(tail -1 "$log")"
+            else
+                note "$name CRASHED after the LSan fallback -- input in $crashes, log in $log"
+                ok=0
+            fi
         else
             note "$name CRASHED -- input in $crashes, log in $CI_BUILD_DIR/$name.log"
             ok=0
@@ -165,7 +190,12 @@ stage_h3spec() {
         note "h3spec binary not found (set H3SPEC=/path/to/h3spec)."
         note "Releases: github.com/kazu-yamamoto/h3spec -- take the binary, do"
         note "not build Haskell."
-        record h3spec SKIP
+        if [ "$REQUIRE_H3SPEC" = 1 ]; then
+            note "REQUIRE_H3SPEC=1: absence is a release-gate failure."
+            record h3spec FAIL
+        else
+            record h3spec SKIP
+        fi
         return
     fi
 
@@ -239,13 +269,14 @@ JSON
 }
 
 STAGES=("$@")
-[ ${#STAGES[@]} -eq 0 ] && STAGES=(noh3 asan tsan fuzz h3spec)
+[ ${#STAGES[@]} -eq 0 ] && STAGES=(noh3 h3unit asan tsan fuzz h3spec)
 
 for stage in "${STAGES[@]}"; do
     case "$stage" in
     noh3)   stage_noh3 ;;
     asan)   stage_asan ;;
     tsan)   stage_tsan ;;
+    h3unit) stage_h3unit ;;
     fuzz)   stage_fuzz ;;
     h3spec) stage_h3spec ;;
     *)      echo "unknown stage: $stage" >&2; exit 2 ;;

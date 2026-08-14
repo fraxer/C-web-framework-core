@@ -744,7 +744,12 @@ httprequest_head_t httprequest_create_head(httprequest_t* request) {
 }
 
 int httprequest_create_payload_file(http_payload_t* payload) {
-    payload->path = create_tmppath(env()->main.tmp);
+    /* Protocol-only tests and embedders can construct requests before a full
+     * appconfig exists. Keep payload spilling functional in that state. */
+    env_t* current_env = env();
+    const char* tmp = current_env != NULL && current_env->main.tmp != NULL
+                      ? current_env->main.tmp : "/tmp";
+    payload->path = create_tmppath(tmp);
     if (payload->path == NULL)
         return 0;
 

@@ -256,7 +256,9 @@ typedef struct {
 } quic_conn_policy_t;
 
 /* Read the process-wide QUIC policy from main.env and create the shared
- * connection table and endpoint keys. Call once per config load, after the
+ * connection table and endpoint keys. http3_max_connections defaults to
+ * 65536 and values outside 64..4000000 (including zero) reject the config.
+ * Call once per config load, after the
  * config is readable and BEFORE any worker thread exists -- the values are
  * plain globals, and that ordering is what makes them safe to read from every
  * worker afterwards. Mirrors h2_policy_init(). Returns 0 on failure.
@@ -274,6 +276,13 @@ int quic_policy_init(void);
 /* The connection defaults, never NULL: before quic_policy_init() runs it
  * returns the built-in ones, which is what a unit test gets. */
 const quic_conn_policy_t* quic_policy_conn(void);
+
+/* Process-wide admission accounting, shared by every worker/endpoint. These
+ * are public primarily so the multi-endpoint invariant can be unit-tested. */
+int    quic_process_conn_try_acquire(void);
+void   quic_process_conn_release(void);
+size_t quic_process_conn_current(void);
+size_t quic_process_conn_limit(void);
 
 /* One endpoint per (address, udp port) across every vhost that enables http3,
  * mirroring how __listener_get folds vhosts onto one TCP listener. Returns the
