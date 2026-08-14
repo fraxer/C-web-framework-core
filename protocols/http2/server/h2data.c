@@ -17,6 +17,17 @@ void h2_data_writer_reset(h2_data_writer_t* w) {
     w->join_len = 0;
     w->join_pos = 0;
     w->join_payload = 0;
+    w->prefix = NULL;
+    w->prefix_len = 0;
+    w->prefix_pos = 0;
+}
+
+void h2_data_writer_prefix(h2_data_writer_t* w, const uint8_t* data, size_t len) {
+    if (w == NULL || data == NULL || len == 0) return;
+
+    w->prefix = data;
+    w->prefix_len = len;
+    w->prefix_pos = 0;
 }
 
 /* Worker thread only — see the invariant on connection_data_write(). */
@@ -76,6 +87,21 @@ static h2_data_status_e __drain(connection_t* connection, const uint8_t* buf,
     return H2_DATA_DRAINED;
 }
 
+h2_data_status_e h2_data_flush_prefix(h2_data_writer_t* w, h2session_t* s) {
+    if (w == NULL || s == NULL) return H2_DATA_ERROR;
+    if (w->prefix == NULL || w->prefix_len <= w->prefix_pos) return H2_DATA_DRAINED;
+
+    const h2_data_status_e st = __drain(s->connection, w->prefix,
+                                        &w->prefix_pos, w->prefix_len);
+    if (st != H2_DATA_DRAINED) return st;
+
+    w->prefix = NULL;
+    w->prefix_len = 0;
+    w->prefix_pos = 0;
+
+    return H2_DATA_DRAINED;
+}
+
 h2_data_status_e h2_data_write(h2_data_writer_t* w, h2session_t* s,
                                h2stream_t* stream, bufo_t* src, int end_stream_allowed) {
     connection_t* connection = s->connection;
@@ -130,15 +156,47 @@ h2_data_status_e h2_data_write(h2_data_writer_t* w, h2session_t* s,
 
             /* Small enough to travel with its header: copy both into one
              * buffer and pay for one write instead of two. `bufo` is a
-             * contiguous region, so the whole chunk is always available. */
-            if (chunk <= H2_DATA_JOIN_MAX && bufo_chunk_size(src, chunk) == chunk) {
-                memcpy(w->join, w->fh, w->fh_len);
-                memcpy(w->join + w->fh_len, bufo_data(src), chunk);
+             * contiguous region, so the whole chunk is always available. The
+             * pending HEADERS block, if the filter left one, goes in front of
+             * both -- that is the record the peer no longer has to read
+             * separately. */
+            const size_t pfx = w->prefix != NULL && w->prefix_len > w->prefix_pos
+                               ? w->prefix_len - w->prefix_pos : 0;
 
-                w->join_len = w->fh_len + chunk;
+            if (chunk <= H2_DATA_JOIN_MAX &&
+                bufo_chunk_size(src, chunk) == chunk &&
+                pfx + w->fh_len + chunk <= sizeof w->join) {
+                size_t n = 0;
+
+                if (pfx > 0) {
+                    memcpy(w->join, w->prefix + w->prefix_pos, pfx);
+                    n += pfx;
+                }
+
+                memcpy(w->join + n, w->fh, w->fh_len);
+                n += w->fh_len;
+
+                memcpy(w->join + n, bufo_data(src), chunk);
+                n += chunk;
+
+                w->join_len = n;
                 w->join_pos = 0;
                 w->join_payload = chunk;
+                w->join_prefix = pfx;
             }
+        }
+
+        /* Too big to join, or joined once already: the prefix still has to lead.
+         * Drained on its own here, which is the old two-write shape and the
+         * right one for a body that is not small. */
+        if (w->join_len == 0 && w->prefix != NULL && w->prefix_len > w->prefix_pos) {
+            const h2_data_status_e st = __drain(connection, w->prefix,
+                                                &w->prefix_pos, w->prefix_len);
+            if (st != H2_DATA_DRAINED) return st;
+
+            w->prefix = NULL;
+            w->prefix_len = 0;
+            w->prefix_pos = 0;
         }
 
         if (w->join_len > 0) {
@@ -155,6 +213,13 @@ h2_data_status_e h2_data_write(h2_data_writer_t* w, h2session_t* s,
             stream->send_window -= (int64_t)w->join_payload;
             stream->write_credit -= (int64_t)w->join_payload;
             w->frame_remaining -= w->join_payload;
+
+            if (w->join_prefix > 0) {
+                w->prefix = NULL;
+                w->prefix_len = 0;
+                w->prefix_pos = 0;
+                w->join_prefix = 0;
+            }
 
             w->join_len = 0;
             w->join_pos = 0;

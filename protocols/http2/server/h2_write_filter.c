@@ -271,6 +271,24 @@ static int __header(httprequest_t* request, httpresponse_t* response) {
         if (!__build_headers(request, response, s, stream, module->buf))
             return CWF_ERROR;
 
+    /* A body is coming: hand the block to the DATA writer instead of sending it
+     * now, and it goes out in the same TLS record as the first DATA frame. What
+     * this saves is mostly the *peer's* work -- a record costs the reader two
+     * reads, so two records per response had clients doing 4.3 reads where one
+     * record needs 2.2 (docs/http2/10 §6).
+     *
+     * Ordering is safe because the writer puts the prefix ahead of the frame it
+     * joins, and a response that turns out to have no body at all still sends
+     * the block: h2_data_flush_prefix runs when the body stage finds nothing to
+     * frame. __has_body is deliberately conservative in the same direction it
+     * always was -- guessing "no body" here only means the old two-write path. */
+    if (__has_body(request, response) && !__has_trailers(response)) {
+        h2_data_writer_prefix(&module->writer,
+                              (const uint8_t*)bufo_data(module->buf),
+                              bufo_chunk_size(module->buf, module->buf->size));
+        return CWF_OK;
+    }
+
     return __write_bufo(response, module->buf);
 }
 
@@ -295,6 +313,20 @@ static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* pare
      * here is the translation into the filter chain's vocabulary. */
     switch (h2_data_write(&module->writer, s, stream, parent_buf, !__has_trailers(response))) {
     case H2_DATA_DRAINED:
+        /* Nothing was framed, so a HEADERS block held back for a ride has no
+         * ride: __has_body said there would be a body and there was none (an
+         * empty file, a handler that changed its mind). Sending it here is what
+         * keeps that guess from truncating the response into silence. */
+        switch (h2_data_flush_prefix(&module->writer, s)) {
+        case H2_DATA_DRAINED:
+            break;
+        case H2_DATA_SOCKET:
+            response->event_again = 1;
+            return CWF_EVENT_AGAIN;
+        default:
+            return CWF_ERROR;
+        }
+
         return CWF_DATA_AGAIN;
 
     case H2_DATA_YIELD:

@@ -57,11 +57,36 @@ typedef struct h2_data_writer {
      * bytes past the header came from `src`: the source is only advanced, and
      * the windows only debited, once the whole buffer has left -- a partial
      * write must not be counted twice when the socket comes back. */
-    uint8_t  join[H2_FRAME_HEADER_LEN + H2_DATA_JOIN_MAX];
+    uint8_t  join[H2_DATA_JOIN_MAX + H2_FRAME_HEADER_LEN + H2_DATA_JOIN_MAX];
     size_t   join_len;            /* 0 = nothing joined and pending */
     size_t   join_pos;
     size_t   join_payload;
+    size_t   join_prefix;         /* prefix bytes that went into `join` */
+
+    /* Bytes that must precede the first DATA frame -- the response's HEADERS
+     * block, handed over by the write filter instead of being sent on its own.
+     *
+     * Sending it separately doubled the *client's* work, not ours: over TLS
+     * each record costs the peer two reads (five bytes of length, then the
+     * body), so two records per response meant 4.3 reads per response against
+     * 2.2 for nginx, and a benchmark client that spent 8.8 us of CPU per
+     * request against 3.3 (docs/http2/10 §6).
+     *
+     * Not owned here: the buffer belongs to the filter and outlives the write. */
+    const uint8_t* prefix;
+    size_t   prefix_len;
+    size_t   prefix_pos;
 } h2_data_writer_t;
+
+/* Hand the writer bytes to put in front of the first DATA frame. Must be called
+ * before the first h2_data_write of the response, and the memory must stay put
+ * until the write completes. */
+void h2_data_writer_prefix(h2_data_writer_t* w, const uint8_t* data, size_t len);
+
+/* Push out a prefix that never found a DATA frame to ride with -- a response
+ * that turned out to have no body at all. Returns the same statuses as
+ * h2_data_write. */
+h2_data_status_e h2_data_flush_prefix(h2_data_writer_t* w, struct h2session* s);
 
 void h2_data_writer_reset(h2_data_writer_t* w);
 
