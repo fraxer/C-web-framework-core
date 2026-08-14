@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "quicrecvbuf.h"
+#include "quicmemory.h"
 
 void quicrecvbuf_init(quicrecvbuf_t* buf, size_t limit) {
     if (buf == NULL) return;
@@ -16,6 +17,7 @@ void quicrecvbuf_free(quicrecvbuf_t* buf) {
     quicrecvseg_t* seg = buf->head;
     while (seg != NULL) {
         quicrecvseg_t* next = seg->next;
+        quicmemory_release(sizeof *seg + seg->len);
         free(seg->data);
         free(seg);
         seg = next;
@@ -46,11 +48,18 @@ static quicrecvbuf_status_e __insert_piece(quicrecvbuf_t* buf, uint64_t offset,
     if (buf->limit != 0 && buf->buffered + len > buf->limit)
         return QUICRECVBUF_TOO_MUCH;
 
+    if (!quicmemory_reserve(sizeof(quicrecvseg_t) + len))
+        return QUICRECVBUF_TOO_MUCH;
+
     quicrecvseg_t* seg = malloc(sizeof * seg);
-    if (seg == NULL) return QUICRECVBUF_OOM;
+    if (seg == NULL) {
+        quicmemory_release(sizeof(quicrecvseg_t) + len);
+        return QUICRECVBUF_OOM;
+    }
 
     seg->data = malloc(len);
     if (seg->data == NULL) {
+        quicmemory_release(sizeof *seg + len);
         free(seg);
         return QUICRECVBUF_OOM;
     }
@@ -195,6 +204,7 @@ size_t quicrecvbuf_read(quicrecvbuf_t* buf, uint8_t* dst, size_t len) {
         if (buf->read_off >= seg->offset + seg->len) {
             buf->head = seg->next;
             buf->buffered -= seg->len;
+            quicmemory_release(sizeof *seg + seg->len);
             free(seg->data);
             free(seg);
         }

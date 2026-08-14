@@ -166,6 +166,7 @@ fork / BoringSSL) без изменений в транспорте. Свой TL
 |---|---|
 | QUIC v1, TLS 1.3, Retry, migration, loss recovery, pacing | Готово |
 | HTTP/3 server, Alt-Svc, graceful shutdown | Готово |
+| Process connection/memory limits и process-wide rate buckets | Готово |
 | QPACK | Static-only; dynamic table и blocked streams отсутствуют |
 | UDP batching / GSO | `recvmmsg`, `sendmmsg`, `UDP_SEGMENT` |
 | UDP GRO, ECN, DPLPMTUD | Не реализовано |

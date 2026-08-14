@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "quicsendbuf.h"
+#include "quicmemory.h"
 
 void quicsendbuf_init(quicsendbuf_t* buf) {
     if (buf == NULL) return;
@@ -16,6 +17,7 @@ void quicsendbuf_init(quicsendbuf_t* buf) {
 void quicsendbuf_free(quicsendbuf_t* buf) {
     if (buf == NULL) return;
 
+    quicmemory_release(buf->cap);
     free(buf->data);
     buf->data = NULL;
     buf->len = 0;
@@ -42,8 +44,14 @@ int quicsendbuf_write(quicsendbuf_t* buf, const uint8_t* data, size_t len) {
             size_t cap = buf->cap == 0 ? 4096 : buf->cap;
             while (cap < buf->len + len) cap *= 2;
 
+            const size_t growth = cap - buf->cap;
+            if (!quicmemory_reserve(growth)) return 0;
+
             uint8_t* grown = realloc(buf->data, cap);
-            if (grown == NULL) return 0;
+            if (grown == NULL) {
+                quicmemory_release(growth);
+                return 0;
+            }
 
             buf->data = grown;
             buf->cap = cap;

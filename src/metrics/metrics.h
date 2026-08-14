@@ -244,6 +244,7 @@ void metrics_quic_rtt(uint64_t rtt_us);
 void metrics_quic_cwnd(uint64_t bytes);
 void metrics_quic_connections(size_t current, size_t limit);
 void metrics_quic_handshakes(size_t inflight);
+void metrics_quic_memory(size_t current, size_t limit, unsigned long long refused);
 
 /* HTTP/3 application counters (docs/http3/07-integration.md §3).
  *

@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <stdlib.h>
@@ -25,6 +26,7 @@
 #include "quicendpoint.h"
 #include "quichp.h"
 #include "quicinvariants.h"
+#include "quicmemory.h"
 #include "quicpacket.h"
 #include "quicretry.h"
 #include "quictime.h"
@@ -130,6 +132,11 @@ static size_t   __quic_retry_threshold = QUIC_DEFAULT_RETRY_THRESHOLD;
 static uint64_t __quic_token_lifetime_us =
     (uint64_t)QUIC_DEFAULT_TOKEN_LIFETIME_SEC * 1000000ULL;
 static int      __quic_new_token = 1;
+
+static void __memory_metrics(size_t current, size_t limit,
+                             unsigned long long refused) {
+    metrics_quic_memory(current, limit, refused);
+}
 
 static quic_conn_policy_t __quic_conn_policy = {
     .idle_timeout_ms        = QUIC_DEFAULT_IDLE_TIMEOUT_SEC * 1000,
@@ -280,6 +287,30 @@ int quic_policy_init(void) {
     }
     __quic_max_connections = (size_t)max_connections;
     metrics_quic_connections(quic_process_conn_current(), __quic_max_connections);
+
+    long long memory_limit = -1;
+    const int memory_status =
+        env_get_llong_checked("http3_buffer_memory_limit", &memory_limit);
+    if (memory_status < 0 || memory_limit < 0) {
+        if (memory_status != 0) {
+            log_error("quic: http3_buffer_memory_limit must be a non-negative integer\n");
+            return 0;
+        }
+
+        const long pages = sysconf(_SC_PHYS_PAGES);
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (pages <= 0 || page_size <= 0 ||
+            (uint64_t)pages > UINT64_MAX / (uint64_t)page_size) {
+            log_error("quic: cannot determine physical RAM for http3_buffer_memory_limit\n");
+            return 0;
+        }
+        const uint64_t quarter = ((uint64_t)pages * (uint64_t)page_size) / 4;
+        memory_limit = quarter > (uint64_t)LLONG_MAX ? LLONG_MAX : (long long)quarter;
+    }
+
+    quicmemory_configure((size_t)memory_limit, __memory_metrics);
+    if (memory_limit == 0)
+        log_error("quic: http3_buffer_memory_limit=0 disables the process memory budget\n");
 
     int64_t batch = env_get_int("http3_rx_batch", 32);
     if (batch < 1) batch = 1;
@@ -956,6 +987,13 @@ static void __accept(quicendpoint_t* ep, udp_datagram_t* dgram,
 
     if (server == NULL || server->openssl == NULL) {
         metrics_quic(METRICS_QUIC_DROP_UNKNOWN_CID);
+        return;
+    }
+
+    const size_t memory_limit = quicmemory_limit();
+    if (memory_limit != 0 && quicmemory_current() >= memory_limit) {
+        metrics_quic(METRICS_QUIC_AT_CAPACITY);
+        __send_initial_close(ep, dgram, inv, QUIC_CONNECTION_REFUSED);
         return;
     }
 

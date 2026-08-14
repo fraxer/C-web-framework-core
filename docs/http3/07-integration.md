@@ -44,6 +44,7 @@
 ```
 Транспорт
   http3_max_connections              65536    процессный лимит, [64 .. 4000000]
+  http3_buffer_memory_limit          25% RAM  динамические recv/send/CRYPTO buffers
   http3_idle_timeout_sec             30
   http3_max_udp_payload_size         1452
   http3_initial_max_data             1048576
@@ -85,6 +86,8 @@ HTTP/3
 Для rate/budget-настроек `0` по-прежнему означает «выключено» там, где это
 указано явно. `http3_max_connections` — исключение: `0` и значения вне
 `64..4000000` являются ошибкой конфигурации, а не скрытым clamp.
+Для `http3_buffer_memory_limit` значение `0` явно отключает байтовый лимит и
+пишет предупреждение; отсутствие ключа означает 25% физической RAM.
 
 ---
 
@@ -328,6 +331,11 @@ http3.qpack{inserts,evictions,blocked_streams,literal_ratio}
 `quic.handshakes.inflight`. Это process-wide gauges; `peak` считается с запуска
 процесса и не сбрасывается soft reload.
 
+Там же добавлено `quic.memory.{current_bytes,limit_bytes,refused}`. Учитывается
+реально выделенная capacity динамических stream receive/send и TLS CRYPTO
+буферов, включая метаданные receive-сегментов. Резервирование выполняется до
+`malloc/realloc`, а каждый error/consume/free path возвращает резерв.
+
 **Осталось по §3:** `qpack.*` (придёт с full QPACK 6.2), `loss_rate` (частное,
 которое считает читатель), и счётчики нереализованного из списка выше.
 
@@ -450,9 +458,10 @@ Version Negotiation и stateless reset. Рукопожатие — самое д
 `http3_max_connections = 65536` теоретический потолок значительно выше
 разумного RSS. Сейчас этот параметр является точным атомарным **процессным**
 лимитом: слот резервируется до `quicconn_accept()` и освобождается при закрытии
-или rollback. Отдельный байтовый лимит динамических QUIC-буферов ещё не
-реализован; до его появления оператор обязан согласовать лимит соединений и
-окна с доступной памятью.
+или rollback. Дополнительно `http3_buffer_memory_limit` ограничивает общую
+capacity динамических receive/send/CRYPTO-буферов. При исчерпании новые
+соединения получают `CONNECTION_REFUSED`, а рост буфера активного соединения
+завершается соответствующей transport/application error веткой.
 
 ---
 

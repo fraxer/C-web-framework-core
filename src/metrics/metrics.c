@@ -157,6 +157,9 @@ typedef struct {
     atomic_ullong quic_connections_limit;
     atomic_ullong quic_connections_peak;
     atomic_ullong quic_handshakes_inflight;
+    atomic_ullong quic_memory_current;
+    atomic_ullong quic_memory_limit;
+    atomic_ullong quic_memory_refused;
 #endif
 
     atomic_ullong window_started_ns;
@@ -357,6 +360,12 @@ void metrics_quic_connections(size_t current, size_t limit) {
 
 void metrics_quic_handshakes(size_t inflight) {
     atomic_store_explicit(&__m.quic_handshakes_inflight, inflight, memory_order_relaxed);
+}
+
+void metrics_quic_memory(size_t current, size_t limit, unsigned long long refused) {
+    atomic_store_explicit(&__m.quic_memory_current, current, memory_order_relaxed);
+    atomic_store_explicit(&__m.quic_memory_limit, limit, memory_order_relaxed);
+    atomic_store_explicit(&__m.quic_memory_refused, refused, memory_order_relaxed);
 }
 
 void metrics_h3(metrics_h3_t kind) {
@@ -585,6 +594,14 @@ json_doc_t* metrics_snapshot_json(void) {
     if (handshakes != NULL) {
         json_object_set(handshakes, "inflight", json_create_number((long double)__load(&__m.quic_handshakes_inflight)));
         json_object_set(quic, "handshakes", handshakes);
+    }
+
+    json_token_t* memory = json_create_object();
+    if (memory != NULL) {
+        json_object_set(memory, "current_bytes", json_create_number((long double)__load(&__m.quic_memory_current)));
+        json_object_set(memory, "limit_bytes", json_create_number((long double)__load(&__m.quic_memory_limit)));
+        json_object_set(memory, "refused", json_create_number((long double)__load(&__m.quic_memory_refused)));
+        json_object_set(quic, "memory", memory);
     }
 
     json_object_set(root, "quic", quic);

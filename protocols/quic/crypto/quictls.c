@@ -6,6 +6,7 @@
 #include <openssl/err.h>
 
 #include "quicerror.h"
+#include "quicmemory.h"
 #include "quictls.h"
 
 /* OpenSSL's protection levels, mapped onto ours. They agree on order but not on
@@ -22,6 +23,7 @@ static quic_enc_level_e __level_of(uint32_t prot_level) {
 /* ---- CRYPTO reassembly ---- */
 
 static void __crypto_in_free(quictls_crypto_in_t* in) {
+    quicmemory_release(in->cap);
     free(in->data);
     in->data = NULL;
     in->len = 0;
@@ -91,8 +93,14 @@ static int __crypto_in_insert(quictls_crypto_in_t* in, uint64_t offset,
         while (cap < need) cap *= 2;
         if (cap > QUICTLS_MAX_CRYPTO_BUFFER) cap = QUICTLS_MAX_CRYPTO_BUFFER;
 
+        const size_t growth = cap - in->cap;
+        if (!quicmemory_reserve(growth)) return 0;
+
         uint8_t* grown = realloc(in->data, cap);
-        if (grown == NULL) return 0;
+        if (grown == NULL) {
+            quicmemory_release(growth);
+            return 0;
+        }
 
         memset(grown + in->cap, 0, cap - in->cap);
         in->data = grown;
