@@ -76,6 +76,12 @@ void quicack_on_received(quicack_t* ack, quic_enc_level_e level, uint64_t pn,
 /* Whether an ACK frame should go out now. */
 int quicack_should_send(const quicack_t* ack, uint64_t now_us);
 
+/* Whether anything is waiting to be acknowledged, due or not. A delayed ACK is
+ * only delayed against sending a packet *for it*; §13.2.1 asks that one ride
+ * along with any packet that is going out anyway, and this is the question that
+ * asks. */
+int quicack_pending(const quicack_t* ack);
+
 /* When an ACK is next owed, or 0 if none is pending. */
 uint64_t quicack_deadline(const quicack_t* ack);
 

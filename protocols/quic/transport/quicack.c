@@ -81,6 +81,16 @@ int quicack_should_send(const quicack_t* ack, uint64_t now_us) {
     return ack->ack_deadline_us != 0 && now_us >= ack->ack_deadline_us;
 }
 
+int quicack_pending(const quicack_t* ack) {
+    if (ack == NULL || !ack->any_received) return 0;
+
+    /* Only ack-eliciting arrivals are owed an acknowledgement. Riding along on
+     * the strength of anything else would answer the peer's own ACKs with ours,
+     * for as long as both sides had a packet to send. */
+    return ack->ack_immediately || ack->eliciting_pending > 0 ||
+           ack->ack_deadline_us != 0;
+}
+
 uint64_t quicack_deadline(const quicack_t* ack) {
     if (ack == NULL) return 0;
     if (ack->ack_immediately) return 1;   /* "now" -- any past time works */

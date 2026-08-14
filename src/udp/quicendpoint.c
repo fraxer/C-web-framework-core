@@ -19,6 +19,7 @@
 /* The full connection type: the header pair is deliberately opaque in both
  * directions (quicconn.h holds a `struct quicendpoint*`, quicendpoint.h a
  * `struct quicconn*`), so exactly one of the two .c files has to see both. */
+#include "quicbeacon.h"
 #include "quicconn.h"
 #include "quiccrypto.h"
 #include "quicendpoint.h"
@@ -672,6 +673,8 @@ void quicendpoint_send_flush(quicendpoint_t* endpoint) {
         metrics_quic_add(METRICS_QUIC_DGRAM_SENT, (unsigned long long)sent);
         metrics_quic_add(METRICS_QUIC_BYTES_SENT, (unsigned long long)bytes);
     }
+
+    QUICBEACON("TX    datagrams=%d bytes=%zu", sent, bytes);
 
     if ((size_t)sent < queued)
         metrics_quic_add(METRICS_QUIC_SEND_ERROR,

@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "metrics.h"
+#include "quicbeacon.h"
 #include "quicstream.h"
 
 quicstream_t* quicstream_create(uint64_t id,
@@ -232,6 +233,8 @@ int quicstream_write(quicstream_t* stream, const uint8_t* data, size_t len) {
         stream->send_state == QUIC_SEND_RESET_RECVD) return 0;
 
     if (!quicsendbuf_write(&stream->send, data, len)) return 0;
+
+    QUICBEACON("APP   stream=%llu wrote=%zu", (unsigned long long)stream->id, len);
 
     if (stream->send_state == QUIC_SEND_READY) stream->send_state = QUIC_SEND_SEND;
 

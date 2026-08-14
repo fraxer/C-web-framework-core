@@ -5,6 +5,7 @@
 
 #include "log.h"
 #include "metrics.h"
+#include "quicbeacon.h"
 #include "quicconn.h"
 #include "quicendpoint.h"
 #include "quichp.h"
@@ -1420,6 +1421,13 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
 
     if (ack_eliciting) atomic_store_explicit(&conn->want_write, 1, memory_order_release);
 
+    QUICBEACON("RECV  level=%d pn=%llu elic=%d pending=%u deadline_in=%lld",
+               (int)level, (unsigned long long)pn, ack_eliciting,
+               conn->ack[level].eliciting_pending,
+               conn->ack[level].ack_deadline_us == 0
+                   ? -1LL
+                   : (long long)conn->ack[level].ack_deadline_us - (long long)now_us);
+
     return 1;
 }
 
@@ -1657,13 +1665,33 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
         - QUICCONN_HEADER_RESERVE;
 
     /* An ACK first: it is what unblocks the peer, and it is cheap. */
-    if (quicack_should_send(&conn->ack[level], now_us)) {
+    size_t ack_len = 0;
+    const int ack_due = quicack_should_send(&conn->ack[level], now_us);
+
+    QUICBEACON("BUILD level=%d ack_due=%d pending=%u deadline_in=%lld",
+               (int)level, ack_due, conn->ack[level].eliciting_pending,
+               conn->ack[level].ack_deadline_us == 0
+                   ? -1LL
+                   : (long long)conn->ack[level].ack_deadline_us - (long long)now_us);
+
+    /* Written whenever anything is owed, not only when it has come due: a
+     * delayed ACK is meant to save a *packet*, not to be withheld from one that
+     * is leaving regardless (§13.2.1). Held back, it cost a full max_ack_delay
+     * on every request -- the response left in 0.13 ms and the acknowledgement
+     * of the request that asked for it followed 25 ms later, so the peer could
+     * not retire the stream and h2load measured 25 ms per request against
+     * 0.5 ms over HTTP/2 (docs/http3/08 §7j).
+     *
+     * If nothing else joins it below, the packet is dropped instead of sent --
+     * see the `p == ack_len` test -- so an ACK that is not due still does not
+     * put a packet on the wire by itself. */
+    if (ack_due || quicack_pending(&conn->ack[level])) {
         const size_t n = quicack_write(&conn->ack[level], payload + p, payload_cap - p,
                                        now_us,
                                        conn->peer_params.ack_delay_exponent);
         if (n > 0) {
             p += n;
-            quicack_on_sent(&conn->ack[level]);
+            ack_len = n;
         }
     }
 
@@ -2118,7 +2146,11 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
         }
     }
 
-    if (p == 0) {
+    /* Nothing to send -- or nothing but an ACK that is not due yet, which is
+     * the piggyback above finding no ride. Either way no packet is built, and
+     * the ACK stays owed: quicack_on_sent runs only where a packet actually
+     * leaves. */
+    if (p == 0 || (p == ack_len && !ack_due)) {
         quicframe_ref_free(refs);
         return 0;
     }
@@ -2194,7 +2226,15 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
         total = QUIC_MIN_INITIAL_DATAGRAM;
     }
 
+    /* Here and nowhere earlier: every failure above returns without a packet,
+     * and an ACK counted as sent for a packet that was never built is an ACK
+     * the peer waits for until its own timer gives up on it. */
+    if (ack_len > 0) quicack_on_sent(&conn->ack[level]);
+
     quicloss_on_sent(&conn->loss, level, pn, total, ack_eliciting, 1, refs, now_us);
+
+    QUICBEACON("SENT  level=%d pn=%llu bytes=%zu payload=%zu ack_bytes=%zu elic=%d",
+               (int)level, (unsigned long long)pn, total, p, ack_len, ack_eliciting);
 
     if (out_ack_eliciting != NULL) *out_ack_eliciting = ack_eliciting;
 
