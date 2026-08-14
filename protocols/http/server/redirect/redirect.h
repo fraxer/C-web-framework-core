@@ -3,6 +3,8 @@
 
 #include <pcre.h>
 
+#include "strtemplate.h"
+
 enum redirect_status {
     REDIRECT_OUT_OF_MEMORY,
     REDIRECT_LOOP_CYCLE,
@@ -11,21 +13,15 @@ enum redirect_status {
     REDIRECT_BAD_REQUEST
 };
 
-typedef struct redirect_param {
-    int number;
-    size_t start;
-    size_t end;
-    struct redirect_param* next;
-} redirect_param_t;
-
 typedef struct redirect {
     int location_erroffset;
+    /* Placeholders in the destination; the http server sizes the pcre_exec
+     * output vector from it, and redirect_create refuses a destination whose
+     * count does not match the capture count of the location. */
     int params_count;
-    char* template;
-    size_t template_length;
     const char* location_error;
     pcre* location;
-    redirect_param_t* param;
+    strtemplate_t* destination;
     struct redirect* next;
 } redirect_t;
 

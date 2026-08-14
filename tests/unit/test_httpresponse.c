@@ -962,3 +962,73 @@ TEST(test_httpresponse_payload_from_file) {
     cleanup_response:
     free_response(response, conn);
 }
+
+// ============================================================================
+// Accept-Encoding negotiation — httpresponse_set_accept_encoding decides
+// whether the content-type rules in main.gzip are allowed to compress at all.
+// ============================================================================
+
+static int accepts_gzip(const char* value) {
+    connection_t* conn = NULL;
+    httpresponse_t* response = make_response(&conn);
+    if (response == NULL) return -1;
+
+    if (value == NULL)
+        httpresponse_set_accept_encoding(response, NULL, 0);
+    else
+        httpresponse_set_accept_encoding(response, value, strlen(value));
+
+    const int result = (int)response->client_gzip;
+
+    free_response(response, conn);
+
+    return result;
+}
+
+TEST(test_response_accept_encoding_names_gzip) {
+    TEST_SUITE("httpresponse: Accept-Encoding");
+    TEST_CASE("gzip is used only when the client names it");
+
+    TEST_ASSERT_EQUAL(1, accepts_gzip("gzip"), "bare gzip");
+    TEST_ASSERT_EQUAL(1, accepts_gzip("gzip, deflate, br"), "gzip among others");
+    TEST_ASSERT_EQUAL(1, accepts_gzip("deflate, GZIP"), "the token is case-insensitive");
+    TEST_ASSERT_EQUAL(1, accepts_gzip("  gzip  "), "surrounding whitespace is optional");
+    TEST_ASSERT_EQUAL(1, accepts_gzip("gzip;q=1.0"), "an explicit q of one");
+    TEST_ASSERT_EQUAL(1, accepts_gzip("gzip;q=0.001"), "a tiny q is still acceptance");
+
+    TEST_ASSERT_EQUAL(0, accepts_gzip("deflate, br"), "gzip not offered");
+    TEST_ASSERT_EQUAL(0, accepts_gzip("gzipx"), "a longer token is a different coding");
+    TEST_ASSERT_EQUAL(0, accepts_gzip("identity"), "identity only");
+}
+
+TEST(test_response_accept_encoding_absent_means_identity) {
+    TEST_SUITE("httpresponse: Accept-Encoding");
+    TEST_CASE("a missing or empty field means identity only");
+
+    TEST_ASSERT_EQUAL(0, accepts_gzip(NULL), "no field at all");
+    TEST_ASSERT_EQUAL(0, accepts_gzip(""), "an empty field");
+}
+
+TEST(test_response_accept_encoding_zero_q_refuses) {
+    TEST_SUITE("httpresponse: Accept-Encoding");
+    TEST_CASE("q=0 is a refusal, not a weak preference");
+
+    TEST_ASSERT_EQUAL(0, accepts_gzip("gzip;q=0"), "q=0");
+    TEST_ASSERT_EQUAL(0, accepts_gzip("gzip;q=0.0"), "q=0.0");
+    TEST_ASSERT_EQUAL(0, accepts_gzip("gzip;q=0.000"), "q=0.000");
+    TEST_ASSERT_EQUAL(0, accepts_gzip("gzip; q=0, deflate"), "whitespace before the parameter");
+}
+
+TEST(test_response_accept_encoding_wildcard) {
+    TEST_SUITE("httpresponse: Accept-Encoding");
+    TEST_CASE("* stands in for gzip unless gzip is named separately");
+
+    TEST_ASSERT_EQUAL(1, accepts_gzip("*"), "a bare wildcard allows gzip");
+    TEST_ASSERT_EQUAL(0, accepts_gzip("*;q=0"), "a refused wildcard");
+
+    /* An explicit entry outranks the wildcard whichever way each of them
+     * points, and whichever order they appear in. */
+    TEST_ASSERT_EQUAL(0, accepts_gzip("*, gzip;q=0"), "gzip refused past an allowing wildcard");
+    TEST_ASSERT_EQUAL(0, accepts_gzip("gzip;q=0, *"), "the same with the wildcard last");
+    TEST_ASSERT_EQUAL(1, accepts_gzip("*;q=0, gzip"), "gzip allowed past a refusing wildcard");
+}

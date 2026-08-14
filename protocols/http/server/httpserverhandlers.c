@@ -112,6 +112,16 @@ static int __post_deffered_response(httprequest_t* request, httpresponse_t* resp
 static ratelimiter_t* __ratelimiter_find(server_http_t* http_config, route_t* route);
 static int __prepare_static_file_response(connection_server_ctx_t* ctx, httpresponse_t* response, const char* static_file_path);
 
+/* What a matched route did with the request: nothing it could serve for this
+ * method (keep looking), queued, or failed outright. */
+typedef enum {
+    ROUTE_DISPATCH_SKIP = 0,
+    ROUTE_DISPATCH_DONE,
+    ROUTE_DISPATCH_ERROR
+} route_dispatch_e;
+
+static void __apply_route_cache_control(httpresponse_t* response, route_t* route, int method);
+
 int __tls_read(connection_t* connection) {
     return __handshake(connection);
 }
@@ -525,6 +535,13 @@ int __handle(connection_t* connection, httprequest_t* request, deferred_handler 
     httpresponse_t* response = __create_response(connection);
     if (response == NULL) return 0;
 
+    /* Before anything builds the response: the content-type rules in main.gzip
+     * are applied as headers are added, and they must know whether this client
+     * would take compressed bytes at all. */
+    const http_header_t* accept_encoding = request->get_header(request, "Accept-Encoding");
+    if (accept_encoding != NULL)
+        httpresponse_set_accept_encoding(response, accept_encoding->value, accept_encoding->value_length);
+
     /* Under a multiplexed protocol the response belongs to a stream, not to the
      * connection: bind it now so the write path and the write filter can reach
      * it from the response alone, and so it is freed with the stream. */
@@ -584,36 +601,81 @@ int __handle(connection_t* connection, httprequest_t* request, deferred_handler 
     return handler(request, response);
 }
 
+/* One route has matched the path; hand the request to whatever it names. The
+ * three match kinds (primitive, regex with capture groups, regex without)
+ * differ only in `vector`, so the dispatch itself lives here once.
+ *
+ * `vector` is the pcre_exec output the route's static_file template expands
+ * {N} against, or NULL for a primitive location, which has no groups. */
+static route_dispatch_e __route_dispatch(connection_t* connection, httprequest_t* request,
+                                         httpresponse_t* response, route_t* route,
+                                         const int* vector, ratelimiter_t* ratelimiter,
+                                         int* queued) {
+    connection_server_ctx_t* ctx = connection->ctx;
+    const int method = request->method;
+
+    if (route->static_file[method] != NULL) {
+        char* path = strtemplate_expand(route->static_file[method], request->path, vector);
+        if (path == NULL) return ROUTE_DISPATCH_ERROR;
+
+        const int prepared = __prepare_static_file_response(ctx, response, path);
+        free(path);
+
+        if (!prepared) return ROUTE_DISPATCH_ERROR;
+
+        /* Only once the file is actually open: __prepare_static_file_response
+         * answers a missing file with 404, and a route that caches for a year
+         * must not put that on it. */
+        if (response->file_.fd > -1)
+            __apply_route_cache_control(response, route, method);
+
+        *queued = __deferred_handler(connection, request, response, __queue_response_handler, NULL, __queue_data_response_create, ratelimiter);
+
+        return ROUTE_DISPATCH_DONE;
+    }
+
+    if (route->handler[method] == NULL) return ROUTE_DISPATCH_SKIP;
+
+    __apply_route_cache_control(response, route, method);
+
+    *queued = __deferred_handler(connection, request, response, __queue_request_handler, route->handler[method], __queue_data_request_create, ratelimiter);
+
+    return ROUTE_DISPATCH_DONE;
+}
+
 int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
     connection_t* connection = request->connection;
     connection_server_ctx_t* ctx = connection->ctx;
 
     for (route_t* route = ctx->server->http.route; route; route = route->next) {
         ratelimiter_t* ratelimiter = __ratelimiter_find(&ctx->server->http, route);
+        int queued = 0;
 
         if (route->is_primitive && route_compare_primitive(route, request->path, request->path_length)) {
-            if (route->static_file[request->method] != NULL) {
-                if (!__prepare_static_file_response(ctx, response, route->static_file[request->method]))
-                    return 0;
-
-                return __deferred_handler(connection, request, response, __queue_response_handler, NULL, __queue_data_response_create, ratelimiter);
+            switch (__route_dispatch(connection, request, response, route, NULL, ratelimiter, &queued)) {
+            case ROUTE_DISPATCH_ERROR: return 0;
+            case ROUTE_DISPATCH_DONE: return queued;
+            case ROUTE_DISPATCH_SKIP: continue;
             }
-
-            if (route->handler[request->method] == NULL) continue;
-
-            return __deferred_handler(connection, request, response, __queue_request_handler, route->handler[request->method], __queue_data_request_create, ratelimiter);
         }
 
         int vector_size = route->params_count > 0 ? route->params_count * 6 : 20 * 6;
         int vector[vector_size];
+        /* pcre_exec leaves the entries of non-participating capture groups
+         * untouched, and both the named-param loop below and the static_file
+         * template read them; pre-mark every offset as "unset". */
+        memset(vector, -1, sizeof(vector));
 
         // find resource by template
         int matches_count = pcre_exec(route->location, NULL, request->path, request->path_length, 0, 0, vector, vector_size);
+        if (matches_count < 1) continue;
 
         if (matches_count > 1) {
             int i = 1; // escape full string match
 
             for (route_param_t* param = route->param; param; param = param->next, i++) {
+                if (vector[i * 2] < 0) continue;
+
                 size_t substring_length = vector[i * 2 + 1] - vector[i * 2];
 
                 query_t* query = query_create(param->string, param->string_len, &request->path[vector[i * 2]], substring_length);
@@ -622,29 +684,12 @@ int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
 
                 httpparser_append_query(request, query);
             }
-
-            if (route->static_file[request->method] != NULL) {
-                if (!__prepare_static_file_response(ctx, response, route->static_file[request->method]))
-                    return 0;
-
-                return __deferred_handler(connection, request, response, __queue_response_handler, NULL, __queue_data_response_create, ratelimiter);
-            }
-
-            if (route->handler[request->method] == NULL) continue;
-
-            return __deferred_handler(connection, request, response,  __queue_request_handler, route->handler[request->method], __queue_data_request_create, ratelimiter);
         }
-        else if (matches_count == 1) {
-            if (route->static_file[request->method] != NULL) {
-                if (!__prepare_static_file_response(ctx, response, route->static_file[request->method]))
-                    return 0;
 
-                return __deferred_handler(connection, request, response, __queue_response_handler, NULL, __queue_data_response_create, ratelimiter);
-            }
-
-            if (route->handler[request->method] == NULL) continue;
-
-            return __deferred_handler(connection, request, response,  __queue_request_handler, route->handler[request->method], __queue_data_request_create, ratelimiter);
+        switch (__route_dispatch(connection, request, response, route, vector, ratelimiter, &queued)) {
+        case ROUTE_DISPATCH_ERROR: return 0;
+        case ROUTE_DISPATCH_DONE: return queued;
+        case ROUTE_DISPATCH_SKIP: continue;
         }
     }
 
@@ -1232,6 +1277,16 @@ ratelimiter_t* __ratelimiter_find(server_http_t* http_config, route_t* route) {
     if (route->ratelimiter != NULL) return route->ratelimiter;
 
     return http_config->ratelimiter;
+}
+
+/* The route's Cache-Control, if it configured one. add_headeru rather than
+ * add_header: the value is the route's default, and anything that already
+ * decided for this response outranks it. */
+void __apply_route_cache_control(httpresponse_t* response, route_t* route, int method) {
+    const char* value = route->cache_control[method];
+    if (value == NULL) return;
+
+    response->add_headeru(response, "Cache-Control", 13, value, strlen(value));
 }
 
 int __prepare_static_file_response(connection_server_ctx_t* ctx, httpresponse_t* response, const char* static_file_path) {

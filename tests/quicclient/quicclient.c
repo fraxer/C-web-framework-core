@@ -217,6 +217,20 @@ static ssize_t __net_recv_stamped(quicclient_t* c, uint8_t* buf, size_t cap) {
     c->rxstats.datagrams++;
     c->rxstats.bytes += (uint64_t)n;
 
+    /* CWFR_QUIC_RXTRACE prints an arrival timeline: one line per datagram with
+     * the milliseconds since the first one. Reading the gaps is how a round trip
+     * spent waiting for the congestion window is told apart from one spent
+     * waiting for the peer — the former shows a cluster, a silence of about one
+     * RTT, then the next cluster. */
+    if (getenv("CWFR_QUIC_RXTRACE") != NULL) {
+        static uint64_t rx_first_us = 0;
+        const uint64_t now_us = quic_now_us();
+        if (rx_first_us == 0) rx_first_us = now_us;
+        fprintf(stderr, "  [rx] %7.3f ms  %5zd bytes  #%llu\n",
+                (double)(now_us - rx_first_us) / 1000.0, n,
+                (unsigned long long)c->rxstats.datagrams);
+    }
+
     for (struct cmsghdr* cm = CMSG_FIRSTHDR(&msg); cm != NULL;
          cm = CMSG_NXTHDR(&msg, cm)) {
         if (cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SO_TIMESTAMPNS)

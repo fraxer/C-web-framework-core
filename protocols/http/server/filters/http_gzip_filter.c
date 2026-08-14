@@ -79,6 +79,16 @@ int __header(httprequest_t* request, httpresponse_t* response) {
     if (response->file_.fd > -1)
         data_size = response->file_.size;
 
+    /* Ahead of every early return below, because the header is about what the
+     * response could have been, not what it is: a type main.gzip lists is
+     * served compressed or not depending on Accept-Encoding, and the two
+     * representations carry different ETags. Without Vary a shared cache keys
+     * both under one entry and hands the wrong one on. The 304 needs it for the
+     * same reason, which is why last_modified is not checked first. */
+    if (response->vary_encoding && response->get_header(response, "Vary") == NULL)
+        if (!response->add_header(response, "Vary", "Accept-Encoding"))
+            return CWF_ERROR;
+
     if (response->content_encoding == CE_NONE || data_size < HTTP_GZIP_MIN_SIZE)
         return filter_next_handler_header(request, response);
 

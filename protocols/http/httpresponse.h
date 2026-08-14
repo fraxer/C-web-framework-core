@@ -279,6 +279,14 @@ typedef struct httpresponse {
     unsigned headers_sended : 1;
     unsigned range : 1;
     unsigned last_modified : 1;
+    /* What the request's Accept-Encoding allows. Zero for a response built
+     * without a request behind it -- an early error, say -- which is the safe
+     * answer: identity is acceptable to every client. */
+    unsigned client_gzip : 1;
+    /* The body this response carries is one main.gzip would compress, so which
+     * bytes go out depends on Accept-Encoding and the answer must carry
+     * Vary -- whether or not this particular client got the compressed ones. */
+    unsigned vary_encoding : 1;
 } httpresponse_t;
 
 httpresponse_t* httpresponse_create(connection_t* connection);
@@ -294,6 +302,11 @@ void http_ranges_free(http_ranges_t* ranges);
 int httpresponse_redirect_is_external(const char* url);
 const char* httpresponse_status_string(int status_code);
 int httpresponse_has_payload(httpresponse_t* response);
+/* Record what the request's Accept-Encoding allows. Called once per request,
+ * before the handler runs, because the content-type rules in main.gzip are
+ * applied while the response is being built. A NULL value means the field was
+ * absent, which RFC 9110 §12.5.3 reads as "identity only". */
+void httpresponse_set_accept_encoding(httpresponse_t* response, const char* value, size_t length);
 file_status_e http_get_file_full_path(server_t* server, char* file_full_path, size_t file_full_path_size, const char* path, size_t length);
 void http_response_file(httpresponse_t* response, const char* file_full_path);
 size_t httpresponse_status_length(int status_code);

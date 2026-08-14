@@ -358,6 +358,72 @@ TEST(test_gzip_header_ce_none_passthrough) {
     fixture_teardown(&fx);
 }
 
+TEST(test_gzip_header_vary_without_compression) {
+    TEST_SUITE("http_gzip_filter: header");
+    TEST_CASE("a negotiable type gets Vary even when the client refused gzip");
+
+    gzip_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx, 64), "fixture should be created");
+
+    /* What the response build leaves behind for a client whose Accept-Encoding
+     * did not allow gzip: the type is one main.gzip lists, so the answer still
+     * depends on the request field, but nothing is compressed. */
+    fx.response->vary_encoding = 1;
+    fx.response->content_encoding = CE_NONE;
+    body_set_size(fx.response, 4096);
+
+    const int r = run_header(&fx);
+    TEST_ASSERT_EQUAL(CWF_OK, r, "header chain should finish with CWF_OK");
+
+    http_header_t* vary = fx.response->get_header(fx.response, "Vary");
+    TEST_REQUIRE_NOT_NULL_GOTO(vary, "Vary should be added for a negotiable type", cleanup);
+    TEST_ASSERT_STR_EQUAL("Accept-Encoding", vary->value, "Vary should name Accept-Encoding");
+
+    TEST_ASSERT_NULL(fx.response->get_header(fx.response, "Content-Encoding"),
+                     "an identity answer must not claim gzip");
+    TEST_ASSERT_EQUAL(TE_NONE, fx.response->transfer_encoding, "transfer_encoding should stay TE_NONE");
+
+    cleanup:
+    fixture_teardown(&fx);
+}
+
+TEST(test_gzip_header_vary_on_304) {
+    TEST_SUITE("http_gzip_filter: header");
+    TEST_CASE("Vary survives the 304 pass-through, so a cache keeps the negotiated key");
+
+    gzip_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx, 64), "fixture should be created");
+
+    fx.response->vary_encoding = 1;
+    fx.response->last_modified = 1;   /* the not-modified filter turned it into a 304 */
+    body_set_size(fx.response, 4096);
+
+    const int r = run_header(&fx);
+    TEST_ASSERT_EQUAL(CWF_OK, r, "header chain should finish with CWF_OK");
+    TEST_ASSERT_NOT_NULL(fx.response->get_header(fx.response, "Vary"),
+                         "Vary should be present on the 304 too");
+
+    fixture_teardown(&fx);
+}
+
+TEST(test_gzip_header_no_vary_for_plain_type) {
+    TEST_SUITE("http_gzip_filter: header");
+    TEST_CASE("a type outside main.gzip gets no Vary");
+
+    gzip_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx, 64), "fixture should be created");
+
+    fx.response->vary_encoding = 0;
+    body_set_size(fx.response, 4096);
+
+    const int r = run_header(&fx);
+    TEST_ASSERT_EQUAL(CWF_OK, r, "header chain should finish with CWF_OK");
+    TEST_ASSERT_NULL(fx.response->get_header(fx.response, "Vary"),
+                     "nothing was negotiated, so nothing varies");
+
+    fixture_teardown(&fx);
+}
+
 TEST(test_gzip_header_small_passthrough) {
     TEST_SUITE("http_gzip_filter: header");
     TEST_CASE("bodies smaller than 1024 bytes pass through (not worth compressing)");

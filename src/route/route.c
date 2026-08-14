@@ -12,6 +12,7 @@
 #define ROUTE_EMPTY_PARAM_EXPRESSION "Route error: Empty param expression in \"%s\"\n"
 #define ROUTE_PARAM_ONE_WORD "Route error: For param need one word in \"%s\"\n"
 #define ROUTE_REGEX_AND_PARAMS "Route error: Can't use named params with regex \"%s\"\n"
+#define ROUTE_BAD_STATIC_FILE "Route error: Bad static file template \"%s\"\n"
 
 typedef struct route_parser {
     int is_primitive;
@@ -100,13 +101,10 @@ route_t* route_init_route() {
     route->handler[ROUTE_PATCH] = NULL;
     route->handler[ROUTE_HEAD] = NULL;
 
-    route->static_file[ROUTE_GET] = NULL;
-    route->static_file[ROUTE_POST] = NULL;
-    route->static_file[ROUTE_PUT] = NULL;
-    route->static_file[ROUTE_DELETE] = NULL;
-    route->static_file[ROUTE_OPTIONS] = NULL;
-    route->static_file[ROUTE_PATCH] = NULL;
-    route->static_file[ROUTE_HEAD] = NULL;
+    for (int i = 0; i < 7; i++) {
+        route->static_file[i] = NULL;
+        route->cache_control[i] = NULL;
+    }
 
     route->location_erroffset = 0;
     route->location = NULL;
@@ -436,15 +434,30 @@ int route_set_http_static(route_t* route, const char* method, const char* static
         return 1;
     }
 
-    size_t len = strlen(static_file);
-    route->static_file[m] = malloc(len + 1);
+    route->static_file[m] = strtemplate_create(static_file);
     if (route->static_file[m] == NULL) {
-        log_error(ROUTE_OUT_OF_MEMORY);
+        log_error(ROUTE_BAD_STATIC_FILE, static_file);
         route_drop_ratelimiter(route, ratelimiter);
         return 0;
     }
-    memcpy(route->static_file[m], static_file, len + 1);
     route_own_ratelimiter(route, ratelimiter);
+
+    return 1;
+}
+
+int route_set_http_cache_control(route_t* route, const char* method, const char* cache_control) {
+    const int m = route_method_index(method);
+    if (m == ROUTE_NONE) return 0;
+
+    if (route->cache_control[m]) return 1;
+
+    const size_t len = strlen(cache_control);
+    route->cache_control[m] = malloc(len + 1);
+    if (route->cache_control[m] == NULL) {
+        log_error(ROUTE_OUT_OF_MEMORY);
+        return 0;
+    }
+    memcpy(route->cache_control[m], cache_control, len + 1);
 
     return 1;
 }
@@ -485,8 +498,8 @@ void routes_free(route_t* route) {
             pcre_free(route->location);
 
         for (int i = 0; i < 7; i++) {
-            if (route->static_file[i] != NULL)
-                free(route->static_file[i]);
+            strtemplate_free(route->static_file[i]);
+            free(route->cache_control[i]);
         }
 
         free(route->path);

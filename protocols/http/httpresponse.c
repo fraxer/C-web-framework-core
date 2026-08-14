@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <strings.h>
 #include <fcntl.h>
 #include <ctype.h>
 #include <time.h>
@@ -157,6 +158,8 @@ static httpresponse_t* __httpresponse_create(connection_t* connection, http_chai
     response->headers_sended = 0;
     response->range = 0;
     response->last_modified = 0;
+    response->client_gzip = 0;
+    response->vary_encoding = 0;
     response->connection = connection;
     response->send_data = __httpresponse_data;
     response->send_datan = __httpresponse_datan;
@@ -209,6 +212,8 @@ void __httpresponse_reset(httpresponse_t* response) {
     response->headers_sended = 0;
     response->range = 0;
     response->last_modified = 0;
+    response->client_gzip = 0;
+    response->vary_encoding = 0;
 
     filters_reset(response->filter);
     response->cur_filter = response->filter;
@@ -925,14 +930,102 @@ int __httpresponse_alloc_body(httpresponse_t* response, const char* data, size_t
     return 1;
 }
 
+/* The q value of one Accept-Encoding element, or -1 when the element carries no
+ * q parameter. The exact weight is never needed -- the only question this
+ * server asks is whether the coding is refused (q=0, in any of its spellings)
+ * or allowed -- so the return is a coarse "zero or not". */
+static int __qvalue(const char* params, size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        if (params[i] != 'q' && params[i] != 'Q') continue;
+
+        size_t j = i + 1;
+        while (j < length && (params[j] == ' ' || params[j] == '\t')) j++;
+        if (j >= length || params[j] != '=') continue;
+
+        j++;
+        while (j < length && (params[j] == ' ' || params[j] == '\t')) j++;
+        if (j >= length) return -1;
+
+        /* "0", "0.", "0.000" are the only refusals; anything starting with 1,
+         * or a zero with a non-zero digit after the point, is acceptable. */
+        if (params[j] != '0') return 100;
+
+        j++;
+        if (j >= length || params[j] != '.') return 0;
+
+        for (j++; j < length; j++) {
+            if (params[j] < '0' || params[j] > '9') break;
+            if (params[j] != '0') return 1;
+        }
+
+        return 0;
+    }
+
+    return -1;
+}
+
+/* Whether Accept-Encoding lets this server send gzip (RFC 9110 §12.5.3).
+ * "gzip" named outright decides it; "*" stands in when it is not named, and
+ * either of them with q=0 is a refusal, not a weak preference. An absent or
+ * empty field means identity only -- the same reading nginx takes, and the one
+ * that keeps a client which never asked from being handed compressed bytes. */
+static int __accept_encoding_allows_gzip(const char* value, size_t length) {
+    if (value == NULL || length == 0) return 0;
+
+    int gzip_q = -1;
+    int star_q = -1;
+
+    size_t pos = 0;
+    while (pos < length) {
+        size_t end = pos;
+        while (end < length && value[end] != ',') end++;
+
+        size_t start = pos;
+        while (start < end && (value[start] == ' ' || value[start] == '\t')) start++;
+
+        size_t token_end = start;
+        while (token_end < end && value[token_end] != ';' &&
+               value[token_end] != ' ' && value[token_end] != '\t') token_end++;
+
+        const size_t token_length = token_end - start;
+        int* slot = NULL;
+
+        if (token_length == 4 && strncasecmp(&value[start], "gzip", 4) == 0)
+            slot = &gzip_q;
+        else if (token_length == 1 && value[start] == '*')
+            slot = &star_q;
+
+        if (slot != NULL) {
+            const int q = __qvalue(&value[token_end], end - token_end);
+            *slot = q < 0 ? 100 : q;
+        }
+
+        pos = end + 1;
+    }
+
+    if (gzip_q >= 0) return gzip_q > 0;
+
+    return star_q > 0;
+}
+
+void httpresponse_set_accept_encoding(httpresponse_t* response, const char* value, size_t length) {
+    response->client_gzip = __accept_encoding_allows_gzip(value, length) ? 1 : 0;
+}
+
 void __httpresponse_try_enable_gzip(httpresponse_t* response, const char* directive) {
     if (response->range) return;
 
     env_gzip_str_t* item = env()->main.gzip;
     while (item != NULL) {
         if (cmpstr_lower(item->mimetype, directive)) {
-            response->content_encoding = CE_GZIP;
-            response->transfer_encoding = TE_CHUNKED;
+            /* The type is negotiable whoever asked; the compression itself
+             * happens only for a client that said it would take it. */
+            response->vary_encoding = 1;
+
+            if (response->client_gzip) {
+                response->content_encoding = CE_GZIP;
+                response->transfer_encoding = TE_CHUNKED;
+            }
             break;
         }
         item = item->next;

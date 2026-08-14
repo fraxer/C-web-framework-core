@@ -1535,6 +1535,27 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
             }
         }
 
+        /* Read before the static_file branch returns: cache_control belongs to
+         * whatever the route answers with, a file or a handler alike. */
+        const json_token_t* token_cache_control = json_object_get(token_item, "cache_control");
+        if (token_cache_control != NULL) {
+            if (!json_is_string(token_cache_control)) {
+                __module_loader_config_error("__module_loader_set_http_route: http.route item.value.cache_control must be string\n");
+                ratelimiter_free(ratelimiter);
+                return 0;
+            }
+            if (json_string_size(token_cache_control) == 0) {
+                __module_loader_config_error("__module_loader_set_http_route: http.route item.value.cache_control must be not empty string\n");
+                ratelimiter_free(ratelimiter);
+                return 0;
+            }
+            if (!route_set_http_cache_control(route, method, json_string(token_cache_control))) {
+                log_error("__module_loader_set_http_route: failed to set cache_control %s\n", json_string(token_cache_control));
+                ratelimiter_free(ratelimiter);
+                return 0;
+            }
+        }
+
         const json_token_t* token_static_file = json_object_get(token_item, "static_file");
         if (token_static_file != NULL) {
             if (!json_is_string(token_static_file)) {

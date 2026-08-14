@@ -280,7 +280,7 @@ TEST(test_nm_header_file_adds_last_modified_and_etag) {
 
 TEST(test_nm_header_file_gzip_etag_suffix_and_vary) {
     TEST_SUITE("http_not_modified_filter: header generation");
-    TEST_CASE("a gzipped file response gets a -gzip ETag suffix and Vary: Accept-Encoding");
+    TEST_CASE("a gzipped file response gets a -gzip ETag suffix");
 
     nm_fixture_t fx;
     TEST_REQUIRE(fixture_setup(&fx), "fixture should be created");
@@ -296,10 +296,11 @@ TEST(test_nm_header_file_gzip_etag_suffix_and_vary) {
     TEST_ASSERT_STR_EQUAL(EXPECTED_ETAG_GZIP, et->value,
                           "ETag should carry the -gzip suffix for the compressed representation");
 
-    http_header_t* vary = fx.response->get_header(fx.response, "Vary");
-    TEST_REQUIRE_NOT_NULL_GOTO(vary, "Vary should be added for a negotiated response", cleanup);
-    TEST_ASSERT_STR_EQUAL("Accept-Encoding", vary->value,
-                          "Vary should advertise the Accept-Encoding negotiation");
+    /* Vary belongs to the gzip filter downstream, which emits it for every
+     * negotiable type rather than only for the compressed answers -- see
+     * test_gzip_header_vary_* in test_http_gzip_filter.c. */
+    TEST_ASSERT_NULL(fx.response->get_header(fx.response, "Vary"),
+                     "This filter should not add Vary itself");
 
     cleanup:
     fixture_teardown(&fx);
@@ -437,9 +438,6 @@ TEST(test_nm_inm_gzip_etag_revalidates_304) {
     TEST_ASSERT_EQUAL(304, fx.response->status_code,
                       "the -gzip ETag must match the gzipped representation -> 304");
     TEST_ASSERT_EQUAL_UINT(1, fx.response->last_modified, "last_modified should signal 304");
-    /* The 304 carries the same Vary so a cache keeps the negotiated key. */
-    TEST_ASSERT_NOT_NULL(fx.response->get_header(fx.response, "Vary"),
-                         "Vary should be present on the 304 too");
 
     fixture_teardown(&fx);
 }

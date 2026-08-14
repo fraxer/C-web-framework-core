@@ -88,15 +88,11 @@ int http_not_modified_header(httprequest_t* request, httpresponse_t* response) {
         // exactly: CE set during response build + size at or above the gzip
         // minimum. The 304 path keeps the suffix too — the client cached the
         // gzipped bytes, so it sends If-None-Match: ...-gzip and must match the
-        // same generated value. Vary: Accept-Encoding is emitted alongside so a
-        // cache keys the negotiated representation by the request encoding, and
-        // it appears on the 304 as well because this block precedes the 304
-        // decision below.
+        // same generated value. The matching Vary: Accept-Encoding is added by
+        // the gzip filter downstream, which emits it for every negotiable type
+        // and not only for the requests that ended up compressed.
         const int will_gzip = response->content_encoding != CE_NONE &&
                               response->file_.size >= HTTP_GZIP_MIN_SIZE;
-
-        if (will_gzip)
-            response->add_header(response, "Vary", "Accept-Encoding");
 
         // Generate and add ETag header
         char etag[64];

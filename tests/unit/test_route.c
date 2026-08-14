@@ -279,6 +279,12 @@ TEST(test_route_set_http_handler_ratelimiter_ownership) {
     routes_free(r);
 }
 
+// The stored static_file is a template now, so its value is read back by
+// expanding it; a path without {N} expands to itself whatever the vector says.
+static char* route_test_static_path(route_t* r, int method) {
+    return strtemplate_expand(r->static_file[method], "", NULL);
+}
+
 TEST(test_route_set_http_static) {
     TEST_CASE("route_set_http_static copies path and keeps first file");
 
@@ -289,11 +295,56 @@ TEST(test_route_set_http_static) {
 
     char source[] = "/var/www/a.html";
     TEST_ASSERT_EQUAL(1, route_set_http_static(r, "GET", source, NULL), "GET static file should be accepted");
-    TEST_ASSERT_STR_EQUAL("/var/www/a.html", r->static_file[ROUTE_GET], "Static file path should be stored");
-    TEST_ASSERT(r->static_file[ROUTE_GET] != source, "Static file path should be copied, not aliased");
+
+    char* stored = route_test_static_path(r, ROUTE_GET);
+    TEST_ASSERT_STR_EQUAL("/var/www/a.html", stored, "Static file path should be stored");
+    TEST_ASSERT((void*)stored != (void*)source, "Static file path should be copied, not aliased");
+    free(stored);
 
     TEST_ASSERT_EQUAL(1, route_set_http_static(r, "GET", "/var/www/b.html", NULL), "Duplicate GET should report success");
-    TEST_ASSERT_STR_EQUAL("/var/www/a.html", r->static_file[ROUTE_GET], "Duplicate GET should not overwrite static file");
+    stored = route_test_static_path(r, ROUTE_GET);
+    TEST_ASSERT_STR_EQUAL("/var/www/a.html", stored, "Duplicate GET should not overwrite static file");
+    free(stored);
+
+    routes_free(r);
+}
+
+TEST(test_route_static_file_template) {
+    TEST_CASE("static_file expands {N} from the location's capture groups");
+
+    route_t* r = route_create("/assets/(.*)");
+    TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
+    TEST_ASSERT_EQUAL(1, route_set_http_static(r, "GET", "/assets/{1}", NULL), "Template should be accepted");
+
+    const char* path = "/assets/app/style.css";
+    int vector[30];
+    memset(vector, -1, sizeof(vector));
+
+    int rc = pcre_exec(r->location, NULL, path, strlen(path), 0, 0, vector, 30);
+    TEST_ASSERT(rc > 1, "Location should match with a capture group");
+
+    char* expanded = strtemplate_expand(r->static_file[ROUTE_GET], path, vector);
+    TEST_ASSERT_STR_EQUAL("/assets/app/style.css", expanded, "{1} should carry the captured tail");
+    free(expanded);
+
+    routes_free(r);
+}
+
+TEST(test_route_set_http_cache_control) {
+    TEST_CASE("route_set_http_cache_control stores per method and keeps the first value");
+
+    route_t* r = route_create("/index.html");
+    TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
+
+    TEST_ASSERT_EQUAL(0, route_set_http_cache_control(r, "BOGUS", "no-store"), "Unknown method should be rejected");
+    TEST_ASSERT_NULL(r->cache_control[ROUTE_GET], "Nothing should be stored yet");
+
+    TEST_ASSERT_EQUAL(1, route_set_http_cache_control(r, "GET", "public, max-age=31536000, immutable"), "GET should be accepted");
+    TEST_ASSERT_STR_EQUAL("public, max-age=31536000, immutable", r->cache_control[ROUTE_GET], "Value should be stored");
+    TEST_ASSERT_NULL(r->cache_control[ROUTE_POST], "Other methods should be untouched");
+
+    TEST_ASSERT_EQUAL(1, route_set_http_cache_control(r, "GET", "no-store"), "Duplicate GET should report success");
+    TEST_ASSERT_STR_EQUAL("public, max-age=31536000, immutable", r->cache_control[ROUTE_GET], "Duplicate GET should not overwrite");
 
     routes_free(r);
 }

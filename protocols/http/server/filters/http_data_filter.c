@@ -87,8 +87,12 @@ int __header(httprequest_t* request, httpresponse_t* response) {
     if (module->base.cont)
         goto cont;
 
+    /* A file with nothing else said about it revalidates every time. This is a
+     * default, not a rule: add_headeru leaves alone the value a route's
+     * cache_control or a handler already put here, which is the only way a
+     * static asset can be served with a long max-age. */
     if (response->file_.fd > -1)
-        if (!response->add_header(response, "Cache-Control", "no-cache"))
+        if (!response->add_headeru(response, "Cache-Control", 13, "no-cache", 8))
             return CWF_ERROR;
 
     /* RFC 7232: 304 response MUST NOT contain Content-Length for body.
