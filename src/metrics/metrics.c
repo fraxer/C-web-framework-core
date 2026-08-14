@@ -160,6 +160,8 @@ typedef struct {
     atomic_ullong quic_memory_current;
     atomic_ullong quic_memory_limit;
     atomic_ullong quic_memory_refused;
+    atomic_ullong quic_reload_handoffs;
+    atomic_ullong quic_reload_handoff_failures;
 #endif
 
     atomic_ullong window_started_ns;
@@ -366,6 +368,12 @@ void metrics_quic_memory(size_t current, size_t limit, unsigned long long refuse
     atomic_store_explicit(&__m.quic_memory_current, current, memory_order_relaxed);
     atomic_store_explicit(&__m.quic_memory_limit, limit, memory_order_relaxed);
     atomic_store_explicit(&__m.quic_memory_refused, refused, memory_order_relaxed);
+}
+
+void metrics_quic_reload_handoff(int success) {
+    atomic_ullong* counter = success ? &__m.quic_reload_handoffs
+                                     : &__m.quic_reload_handoff_failures;
+    atomic_fetch_add_explicit(counter, 1, memory_order_relaxed);
 }
 
 void metrics_h3(metrics_h3_t kind) {
@@ -602,6 +610,13 @@ json_doc_t* metrics_snapshot_json(void) {
         json_object_set(memory, "limit_bytes", json_create_number((long double)__load(&__m.quic_memory_limit)));
         json_object_set(memory, "refused", json_create_number((long double)__load(&__m.quic_memory_refused)));
         json_object_set(quic, "memory", memory);
+    }
+
+    json_token_t* reload = json_create_object();
+    if (reload != NULL) {
+        json_object_set(reload, "handoffs", json_create_number((long double)__load(&__m.quic_reload_handoffs)));
+        json_object_set(reload, "handoff_failures", json_create_number((long double)__load(&__m.quic_reload_handoff_failures)));
+        json_object_set(quic, "reload", reload);
     }
 
     json_object_set(root, "quic", quic);

@@ -18,6 +18,10 @@ enum mpxevents {
 
 typedef struct mpxapi {
     atomic_int connection_count;
+    /* Config generation owned by this worker. Never use the process-global
+     * appconfig() for lifecycle decisions: soft reload replaces that pointer
+     * before the previous generation has finished draining. */
+    appconfig_t* owner_config;
     void* config;
     /* This worker's connections, linked through connection_t::prev/next. The
      * worker timer sweep walks it to enforce idle/PING timeouts and graceful

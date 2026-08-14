@@ -24,11 +24,13 @@ static void __listener_unlisten(listener_t* listener);
 static int __listener_read(connection_t* listener_connection);
 static void __set_protocol(connection_t* connection);
 static void __mpx_on_tick(mpxapi_t* api);
+static void __mpx_http1_shutdown_tick(connection_t* connection);
 
 int mpxserver_run(appconfig_t* appconfig) {
     int result = 0;
     mpxapi_t* api = mpx_create();
     if (api == NULL) return result;
+    api->owner_config = appconfig;
 
     listener_t* listeners = NULL;
 #ifdef CWFR_HTTP3
@@ -46,7 +48,8 @@ int mpxserver_run(appconfig_t* appconfig) {
      * A NULL result is normal -- it just means nothing configured h3 -- so the
      * failure is reported separately from the value. */
     int quic_ok = 1;
-    endpoints = quicendpoints_create(api, appconfig->server_chain->server, &quic_ok);
+    endpoints = quicendpoints_create(api, appconfig->server_chain->server,
+                                     appconfig, &quic_ok);
     if (!quic_ok)
         goto failed;
 
@@ -68,39 +71,27 @@ int mpxserver_run(appconfig_t* appconfig) {
         api->process_events(appconfig, api);
 
         if (atomic_load(&appconfig->shutdown)) {
-            /* A hard *reload* leaves the listeners alone on purpose: signal_USR1
-             * shut the sockets down itself and the new configuration takes them
-             * over. Terminating does neither, so it has to close them here or
-             * connection_count never falls to zero and this loop never ends --
-             * which is what made every `reload: hard` shutdown run out its grace
-             * window with the workers still running. */
-            if (appconfig->env.main.reload != APPCONFIG_RELOAD_HARD ||
-                appconfig_terminating()) {
-                __listeners_unlisten(listeners);
+            __listeners_unlisten(listeners);
 #ifdef CWFR_HTTP3
-                /* Terminating and reloading need opposite things here, and a
-                 * QUIC endpoint is where the difference bites.
-                 *
-                 * Terminating: nothing is taking the port, so the socket stays
-                 * open to finish the connections it carries -- closing it would
-                 * strand the very ones being drained -- and new arrivals are
-                 * refused (docs/http3/07 §5).
-                 *
-                 * Reloading: the new configuration's endpoints are already
-                 * bound to the same port under SO_REUSEPORT, and the kernel
-                 * hashes each client to one socket of the group. A draining
-                 * socket left in that group refuses whatever hashes to it, and
-                 * the client's retransmissions hash the same way -- so it fails
-                 * for good rather than reaching the instance that could serve
-                 * it. Leaving the group is the only way to hand those clients
-                 * over, and it costs the connections this endpoint still holds
-                 * (see §5a). */
+            if (appconfig->env.main.reload == APPCONFIG_RELOAD_HARD &&
+                !appconfig_terminating()) {
+                /* shutdown(2) wakes TCP descriptors, but an unconnected UDP
+                 * socket may remain registered after ENOTCONN. Hard reload
+                 * therefore tears down QUIC explicitly. */
+                quicendpoints_abort(endpoints);
+            }
+            else {
+                /* Termination keeps the endpoint reader while it drains. A
+                 * soft reload hands that one reader to the new generation;
+                 * both generations retain a reference to the same UDP socket,
+                 * so old CIDs keep using it for replies without two epoll loops
+                 * ever reading it concurrently (docs/http3/07 §5). */
                 if (appconfig_terminating())
                     quicendpoints_drain(endpoints);
                 else
-                    quicendpoints_unlisten(endpoints);
-#endif
+                    quicendpoints_handoff(endpoints);
             }
+#endif
 
             if (atomic_load(&api->connection_count) == 0)
                 break;
@@ -342,7 +333,11 @@ void __set_protocol(connection_t* connection) {
  * lifecycle and may close (and free) the connection, so next is captured first
  * and the connection is not touched after the call. */
 static void __mpx_on_tick(mpxapi_t* api) {
-    const int shutdown_now = atomic_load(&appconfig()->shutdown);
+    /* appconfig() points at the newest generation after SIGUSR1. This worker
+     * may belong to the previous one, whose shutdown bit is the signal that
+     * makes H2/QUIC drain and ultimately releases connection_count. */
+    const int shutdown_now = api->owner_config != NULL &&
+        atomic_load(&api->owner_config->shutdown);
 
     connection_t* connection = api->conns;
     while (connection != NULL) {
@@ -350,9 +345,13 @@ static void __mpx_on_tick(mpxapi_t* api) {
 
         /* QUIC connections are aged by their endpoint instead: the send queue
          * they share belongs to it, and draining that is half the work. */
-        if (connection->transport == CONN_TRANSPORT_TCP &&
-            ((connection_server_ctx_t*)connection->ctx)->is_http2)
-            h2_server_tick(connection, shutdown_now);
+        if (connection->transport == CONN_TRANSPORT_TCP) {
+            connection_server_ctx_t* ctx = connection->ctx;
+            if (ctx->is_http2)
+                h2_server_tick(connection, shutdown_now);
+            else if (shutdown_now && connection->close == connection_close)
+                __mpx_http1_shutdown_tick(connection);
+        }
 
         connection = next;
     }
@@ -360,4 +359,34 @@ static void __mpx_on_tick(mpxapi_t* api) {
 #ifdef CWFR_HTTP3
     quicendpoints_tick(api->quic_endpoints, shutdown_now);
 #endif
+}
+
+/* Drain a plain HTTP/1.x/WebSocket TCP connection owned by the old config.
+ *
+ * Closing the TCP listeners is insufficient: an idle HTTP/1.1 keep-alive is
+ * still registered in epoll and can otherwise keep api->connection_count above
+ * zero forever. An active request gets to publish and flush its current
+ * response; keepalive=0 makes connection_after_write reap it afterwards. An
+ * idle connection has no response to preserve and is closed immediately.
+ *
+ * QUIC endpoint timer/event connections also look like TCP descriptors, hence
+ * the caller's `close == connection_close` guard: their specialised callbacks
+ * must remain under quicendpoints_tick(). */
+static void __mpx_http1_shutdown_tick(connection_t* connection) {
+    if (!connection_s_trylock(connection)) return;
+
+    connection_server_ctx_t* ctx = connection->ctx;
+    if (atomic_load(&ctx->detached)) {
+        connection_s_unlock(connection);
+        return;
+    }
+
+    connection->keepalive = 0;
+
+    const int idle = ctx->request == NULL && ctx->response == NULL &&
+        !atomic_load_explicit(&ctx->need_write, memory_order_acquire);
+    if (idle)
+        connection_close_locked(connection);
+    else
+        connection_s_unlock(connection);
 }

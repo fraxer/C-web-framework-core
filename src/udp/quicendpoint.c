@@ -4,10 +4,12 @@
 #include <limits.h>
 #include <openssl/hmac.h>
 #include <openssl/rand.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/timerfd.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "appconfig.h"
@@ -98,6 +100,129 @@ static void __table_acquire(void* value) {
 }
 
 static quiccidtable_t* __quic_table = NULL;
+
+typedef struct quic_udp_handle {
+    int fd;
+    struct sockaddr_storage local;
+    socklen_t local_len;
+    const void* generation;
+    size_t refs;
+    int reserved;
+    quicendpoint_t* reader;
+    pthread_cond_t changed;
+    struct quic_udp_handle* next;
+} quic_udp_handle_t;
+
+static pthread_mutex_t __transport_lock = PTHREAD_MUTEX_INITIALIZER;
+static quic_udp_handle_t* __transports;
+
+static int __same_address(const quic_udp_handle_t* h,
+                          const struct sockaddr_storage* local, socklen_t len) {
+    return h->local_len == len && memcmp(&h->local, local, len) == 0;
+}
+
+static quic_udp_handle_t* __transport_acquire(
+        const struct sockaddr_storage* local, socklen_t local_len,
+        const udp_socket_options_t* options, const void* generation, int* reused,
+        const void** previous_generation) {
+    if (reused != NULL) *reused = 0;
+    if (previous_generation != NULL) *previous_generation = NULL;
+    pthread_mutex_lock(&__transport_lock);
+    for (quic_udp_handle_t* h = __transports; h != NULL; h = h->next) {
+        if (__same_address(h, local, local_len) && h->generation != generation &&
+            !h->reserved) {
+            h->reserved = 1;
+            h->refs++;
+            if (reused != NULL) *reused = 1;
+            if (previous_generation != NULL)
+                *previous_generation = h->generation;
+            pthread_mutex_unlock(&__transport_lock);
+            return h;
+        }
+    }
+    pthread_mutex_unlock(&__transport_lock);
+
+    const int fd = udp_socket_create((const struct sockaddr*)local, local_len, options);
+    if (fd == -1) return NULL;
+
+    quic_udp_handle_t* h = calloc(1, sizeof *h);
+    if (h == NULL) { close(fd); return NULL; }
+    h->fd = fd;
+    h->local = *local;
+    h->local_len = local_len;
+    h->generation = generation;
+    h->refs = 1;
+    h->reserved = 1;
+    if (pthread_cond_init(&h->changed, NULL) != 0) {
+        close(fd);
+        free(h);
+        return NULL;
+    }
+
+    pthread_mutex_lock(&__transport_lock);
+    h->next = __transports;
+    __transports = h;
+    pthread_mutex_unlock(&__transport_lock);
+    return h;
+}
+
+static int __transport_claim_reader(quic_udp_handle_t* h, quicendpoint_t* ep) {
+    if (h == NULL) return 0;
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) return 0;
+    deadline.tv_sec += 5;
+
+    pthread_mutex_lock(&__transport_lock);
+    while (h->reader != NULL && h->reader != ep) {
+        const int wait_result =
+            pthread_cond_timedwait(&h->changed, &__transport_lock, &deadline);
+        if (wait_result == ETIMEDOUT) {
+            h->reserved = 0;
+            pthread_cond_broadcast(&h->changed);
+            pthread_mutex_unlock(&__transport_lock);
+            return 0;
+        }
+    }
+    h->reader = ep;
+    h->generation = ep->generation;
+    h->reserved = 0;
+    pthread_mutex_unlock(&__transport_lock);
+    return 1;
+}
+
+static void __transport_abort_handoff(quic_udp_handle_t* h,
+                                      quicendpoint_t* ep) {
+    if (h == NULL || ep == NULL || !ep->handoff_candidate) return;
+    pthread_mutex_lock(&__transport_lock);
+    if (h->reader == ep) h->reader = NULL;
+    h->generation = ep->previous_generation;
+    h->reserved = 0;
+    pthread_cond_broadcast(&h->changed);
+    pthread_mutex_unlock(&__transport_lock);
+}
+
+static void __transport_release_reader(quic_udp_handle_t* h, quicendpoint_t* ep) {
+    if (h == NULL) return;
+    pthread_mutex_lock(&__transport_lock);
+    if (h->reader == ep) {
+        h->reader = NULL;
+        pthread_cond_broadcast(&h->changed);
+    }
+    pthread_mutex_unlock(&__transport_lock);
+}
+
+static void __transport_release(quic_udp_handle_t* h) {
+    if (h == NULL) return;
+    pthread_mutex_lock(&__transport_lock);
+    if (--h->refs != 0) { pthread_mutex_unlock(&__transport_lock); return; }
+    quic_udp_handle_t** link = &__transports;
+    while (*link != NULL && *link != h) link = &(*link)->next;
+    if (*link == h) *link = h->next;
+    pthread_mutex_unlock(&__transport_lock);
+    close(h->fd);
+    pthread_cond_destroy(&h->changed);
+    free(h);
+}
 static size_t   __quic_max_connections = QUIC_DEFAULT_MAX_CONNECTIONS;
 static _Atomic size_t __quic_connections = 0;
 static _Atomic size_t __quic_handshakes_inflight = 0;
@@ -1525,6 +1650,7 @@ static int __endpoint_wake_close(connection_t* connection) {
     connection_s_lock(connection, LOCK_SITE_CLOSE);
 
     if (ep->wake_connection == connection) ep->wake_connection = NULL;
+    ep->wake_listening = 0;
 
     if (!ep->listener.api->control_del(connection))
         log_error("Quic endpoint: wake not removed from api\n");
@@ -1549,6 +1675,7 @@ static int __endpoint_timer_close(connection_t* connection) {
     connection_s_lock(connection, LOCK_SITE_CLOSE);
 
     if (ep->timer_connection == connection) ep->timer_connection = NULL;
+    ep->timer_listening = 0;
 
     if (!ep->listener.api->control_del(connection))
         log_error("Quic endpoint: timer not removed from api\n");
@@ -1656,8 +1783,7 @@ static int __endpoint_close(connection_t* connection) {
 
     atomic_store(&ctx->detached, 1);
 
-    close(connection->fd);
-    ep->fd = -1;
+    __transport_release_reader(ep->transport, ep);
     ep->listening = 0;
 
     atomic_store(&ctx->destroyed, 1);
@@ -1689,8 +1815,8 @@ static void __endpoint_free(quicendpoint_t* ep) {
     if (ep == NULL) return;
 
     if (ep->wake_connection != NULL) {
-        if (ep->listening) ep->wake_connection->close(ep->wake_connection);
-        else               connection_free(ep->wake_connection);
+        if (ep->wake_listening) ep->wake_connection->close(ep->wake_connection);
+        else                    connection_free(ep->wake_connection);
 
         ep->wake_connection = NULL;
     }
@@ -1701,8 +1827,8 @@ static void __endpoint_free(quicendpoint_t* ep) {
     }
 
     if (ep->timer_connection != NULL) {
-        if (ep->listening) ep->timer_connection->close(ep->timer_connection);
-        else               connection_free(ep->timer_connection);
+        if (ep->timer_listening) ep->timer_connection->close(ep->timer_connection);
+        else                     connection_free(ep->timer_connection);
 
         ep->timer_connection = NULL;
     }
@@ -1731,7 +1857,9 @@ static void __endpoint_free(quicendpoint_t* ep) {
          * shutdown, most likely -- because after this there is no socket. */
         quicendpoint_send_flush(ep);
 
-        close(ep->fd);
+        __transport_abort_handoff(ep->transport, ep);
+        __transport_release(ep->transport);
+        ep->transport = NULL;
         ep->fd = -1;
     }
 
@@ -1741,7 +1869,8 @@ static void __endpoint_free(quicendpoint_t* ep) {
     free(ep);
 }
 
-static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server) {
+static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server,
+                                         const void* generation) {
     quicendpoint_t* ep = malloc(sizeof * ep);
     if (ep == NULL) return NULL;
 
@@ -1751,6 +1880,7 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server) {
     ep->eventfd = -1;
     ep->table = __quic_table;
     ep->reset_key = __quic_reset_key;
+    ep->generation = generation;
     cqueue_init(&ep->listener.servers);
 
     int result = 0;
@@ -1767,8 +1897,11 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server) {
         .sndbuf = __quic_sndbuf
     };
 
-    ep->fd = udp_socket_create((const struct sockaddr*)&ep->local, ep->local_len, &options);
-    if (ep->fd == -1) goto failed;
+    ep->transport = __transport_acquire(&ep->local, ep->local_len, &options,
+                                        generation, &ep->handoff_candidate,
+                                        &ep->previous_generation);
+    if (ep->transport == NULL) goto failed;
+    ep->fd = ep->transport->fd;
 
     ep->rx = udp_rx_batch_create(__quic_rx_batch, QUIC_RX_DATAGRAM_SIZE);
     if (ep->rx == NULL) goto failed;
@@ -1834,7 +1967,8 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server) {
     return ep;
 }
 
-quicendpoint_t* quicendpoints_create(mpxapi_t* api, server_t* first_server, int* ok) {
+quicendpoint_t* quicendpoints_create(mpxapi_t* api, server_t* first_server,
+                                     const void* generation, int* ok) {
     quicendpoint_t* head = NULL;
     quicendpoint_t* tail = NULL;
 
@@ -1867,7 +2001,7 @@ quicendpoint_t* quicendpoints_create(mpxapi_t* api, server_t* first_server, int*
             continue;
         }
 
-        quicendpoint_t* ep = __endpoint_create(api, server);
+        quicendpoint_t* ep = __endpoint_create(api, server, generation);
         if (ep == NULL) {
             log_error("Quic endpoint: cannot create endpoint on udp port %d\n",
                       server->http3.port);
@@ -2000,8 +2134,7 @@ void quicendpoints_tick(quicendpoint_t* endpoints, int shutdown_now) {
          * socket can go. Until it does the worker's connection_count cannot
          * reach zero, which is precisely what keeps the loop running long
          * enough for the drain to happen. */
-        if (endpoints->draining && endpoints->conn_count == 0 &&
-            endpoints->listener.connection != NULL) {
+        if (endpoints->draining && endpoints->conn_count == 0) {
             if (endpoints->wake_connection != NULL) {
                 endpoints->wake_connection->close(endpoints->wake_connection);
                 endpoints->wake_connection = NULL;
@@ -2012,9 +2145,11 @@ void quicendpoints_tick(quicendpoint_t* endpoints, int shutdown_now) {
                 endpoints->timer_connection = NULL;
             }
 
-            endpoints->listener.connection->close(endpoints->listener.connection);
-            endpoints->listener.connection = NULL;
-            endpoints->listening = 0;
+            if (endpoints->listener.connection != NULL) {
+                endpoints->listener.connection->close(endpoints->listener.connection);
+                endpoints->listener.connection = NULL;
+                endpoints->listening = 0;
+            }
         }
 
         endpoints = endpoints->next;
@@ -2030,28 +2165,98 @@ void quicendpoints_drain(quicendpoint_t* endpoints) {
 
 int quicendpoints_listen(quicendpoint_t* endpoints) {
     while (endpoints != NULL) {
+        int endpoint_added = 0;
+        int timer_added = 0;
+        int wake_added = 0;
         if (endpoints->listener.connection == NULL) return 0;
+
+        if (!__transport_claim_reader(endpoints->transport, endpoints)) {
+            if (endpoints->handoff_candidate)
+                metrics_quic_reload_handoff(0);
+            return 0;
+        }
 
         /* MPXIN only: a UDP socket has no peer to hang up, so MPXRDHUP would
          * never fire, and there is no write path here -- phase 1 answers a
          * datagram inline on the read path. */
         if (!endpoints->listener.api->control_add(endpoints->listener.connection,
                                                   MPXIN))
-            return 0;
+            goto failed;
+        endpoint_added = 1;
 
         if (endpoints->timer_connection != NULL &&
             !endpoints->listener.api->control_add(endpoints->timer_connection, MPXIN))
-            return 0;
+            goto failed;
+        if (endpoints->timer_connection != NULL) {
+            timer_added = 1;
+            endpoints->timer_listening = 1;
+        }
 
         if (endpoints->wake_connection != NULL &&
             !endpoints->listener.api->control_add(endpoints->wake_connection, MPXIN))
-            return 0;
+            goto failed;
+        if (endpoints->wake_connection != NULL) {
+            wake_added = 1;
+            endpoints->wake_listening = 1;
+        }
 
         endpoints->listening = 1;
+        if (endpoints->handoff_candidate) {
+            metrics_quic_reload_handoff(1);
+            endpoints->handoff_candidate = 0;
+            endpoints->previous_generation = NULL;
+        }
         endpoints = endpoints->next;
+        continue;
+
+        failed:
+        if (endpoints->handoff_candidate)
+            metrics_quic_reload_handoff(0);
+        if (wake_added) {
+            endpoints->wake_connection->close(endpoints->wake_connection);
+            endpoints->wake_connection = NULL;
+        }
+        if (timer_added) {
+            endpoints->timer_connection->close(endpoints->timer_connection);
+            endpoints->timer_connection = NULL;
+        }
+        if (endpoint_added) {
+            endpoints->listener.connection->close(endpoints->listener.connection);
+            endpoints->listener.connection = NULL;
+        } else {
+            __transport_release_reader(endpoints->transport, endpoints);
+        }
+        __transport_abort_handoff(endpoints->transport, endpoints);
+        return 0;
     }
 
     return 1;
+}
+
+void quicendpoints_handoff(quicendpoint_t* endpoints) {
+    while (endpoints != NULL) {
+        endpoints->draining = 1;
+        if (endpoints->listener.connection != NULL) {
+            endpoints->listener.connection->close(endpoints->listener.connection);
+            endpoints->listener.connection = NULL;
+            endpoints->listening = 0;
+        }
+        endpoints = endpoints->next;
+    }
+}
+
+void quicendpoints_abort(quicendpoint_t* endpoints) {
+    for (quicendpoint_t* ep = endpoints; ep != NULL; ep = ep->next) {
+        ep->draining = 1;
+        while (ep->conns != NULL) {
+            quicconn_t* conn = ep->conns;
+            connection_s_lock(&conn->conn, LOCK_SITE_CLOSE);
+            metrics_quic(METRICS_QUIC_CONN_CLOSED);
+            conn->conn.close(&conn->conn);
+        }
+    }
+
+    quicendpoints_unlisten(endpoints);
 }
 
 void quicendpoints_unlisten(quicendpoint_t* endpoints) {

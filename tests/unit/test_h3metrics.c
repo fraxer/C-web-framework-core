@@ -292,6 +292,9 @@ TEST(test_h3metrics_process_gauges) {
     metrics_quic_connections(2, 65536);
     metrics_quic_handshakes(5);
     metrics_quic_memory(4096, 1048576, 3);
+    metrics_quic_reload_handoff(1);
+    metrics_quic_reload_handoff(1);
+    metrics_quic_reload_handoff(0);
 
     TEST_ASSERT(snapshot_sample("connections", "current") == 2, "current connections");
     TEST_ASSERT(snapshot_sample("connections", "limit") == 65536, "connection limit");
@@ -300,6 +303,8 @@ TEST(test_h3metrics_process_gauges) {
     TEST_ASSERT(snapshot_sample("memory", "current_bytes") == 4096, "memory current");
     TEST_ASSERT(snapshot_sample("memory", "limit_bytes") == 1048576, "memory limit");
     TEST_ASSERT(snapshot_sample("memory", "refused") == 3, "memory refusals");
+    TEST_ASSERT(snapshot_sample("reload", "handoffs") == 2, "reload handoffs");
+    TEST_ASSERT(snapshot_sample("reload", "handoff_failures") == 1, "reload failures");
 
     metrics_reset();
     metrics_init(0);

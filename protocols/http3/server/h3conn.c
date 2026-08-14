@@ -572,17 +572,22 @@ int h3_server_response_ready(connection_t* connection, httpresponse_t* response)
      * walks the connection's stream list, which the worker mutates.
      * (docs/concurrency/01 §2.3 measured h2's queue as a net contention cost --
      * worth not repeating.) */
-    connection_s_lock(connection, LOCK_SITE_H3_PUBLISH);
-    __publish_one((quicconn_t*)connection, response);
-    connection_s_unlock(connection);
-
     connection_server_ctx_t* ctx = connection->ctx;
+    connection_s_lock(connection, LOCK_SITE_H3_PUBLISH);
+    if (atomic_load_explicit(&ctx->detached, memory_order_acquire)) {
+        connection_s_unlock(connection);
+        return 1;
+    }
+
+    __publish_one((quicconn_t*)connection, response);
     atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
 
     /* Wake the endpoint so it gives this connection a send turn. Takes only the
-     * endpoint's leaf lock, never connection_s_lock, which is why it is outside
-     * the block above. */
+     * endpoint's leaf lock. Retaining the connection lock through the enqueue
+     * prevents hard reload from detaching the connection and freeing its
+     * endpoint in between. */
     quicconn_want_write(connection);
+    connection_s_unlock(connection);
 
     return 1;
 }

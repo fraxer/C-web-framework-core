@@ -45,6 +45,10 @@ typedef struct quicendpoint {
     listener_t listener;
 
     int fd;
+    struct quic_udp_handle* transport;
+    const void* generation;
+    const void* previous_generation;
+    int handoff_candidate;
     struct sockaddr_storage local;
     socklen_t local_len;
 
@@ -130,6 +134,8 @@ typedef struct quicendpoint {
      * near control_del -- epoll_ctl would fail on an fd it never held, and the
      * error would be logged as if something had gone wrong. */
     int listening;
+    int timer_listening;
+    int wake_listening;
 
     /* Routing table. Borrowed, not owned: it is process-wide, shared by every
      * endpoint on every worker, because a migrating client's datagrams land on
@@ -262,7 +268,8 @@ size_t quic_process_conn_limit(void);
  * mirroring how __listener_get folds vhosts onto one TCP listener. Returns the
  * head of the list, or NULL if none was configured (which is not an error).
  * `*ok` is set to 0 if a configured endpoint could not be created. */
-quicendpoint_t* quicendpoints_create(mpxapi_t* api, server_t* first_server, int* ok);
+quicendpoint_t* quicendpoints_create(mpxapi_t* api, server_t* first_server,
+                                     const void* generation, int* ok);
 
 int  quicendpoints_listen(quicendpoint_t* endpoints);
 
@@ -273,6 +280,12 @@ int  quicendpoints_listen(quicendpoint_t* endpoints);
 void quicendpoints_drain(quicendpoint_t* endpoints);
 
 void quicendpoints_unlisten(quicendpoint_t* endpoints);
+/* Hard reload: detach every QUIC connection immediately, then remove all
+ * endpoint descriptors. No GOAWAY/drain window and no socket handoff. */
+void quicendpoints_abort(quicendpoint_t* endpoints);
+/* Soft reload: relinquish UDP reads, but retain timer/wakeup and the shared
+ * transport for existing connections until their drain completes. */
+void quicendpoints_handoff(quicendpoint_t* endpoints);
 void quicendpoints_free(quicendpoint_t* endpoints);
 
 /* Queue one datagram to leave this endpoint's socket, with the source address
