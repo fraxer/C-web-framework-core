@@ -81,6 +81,7 @@ static int __crypto_in_insert(quictls_crypto_in_t* in, uint64_t offset,
                               const uint8_t* data, size_t len) {
     if (len == 0) return 1;
 
+    if (len > UINT64_MAX - offset) return 0;
     const uint64_t end = offset + len;
 
     /* Bounds the memory an incomplete handshake can hold open (§7.5), and with

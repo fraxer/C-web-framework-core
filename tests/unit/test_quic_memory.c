@@ -29,6 +29,13 @@ TEST(test_quic_memory_budget) {
     quicsendbuf_free(&send);
     TEST_ASSERT(quicmemory_current() == 0, "send capacity released");
 
+    TEST_CASE("impossible send and receive sizes fail before allocation");
+    quicsendbuf_init(&send);
+    TEST_ASSERT(!quicsendbuf_write(&send, &byte, SIZE_MAX),
+                "send size overflow refused");
+    TEST_ASSERT(quicmemory_current() == 0, "overflow reserves nothing");
+    quicsendbuf_free(&send);
+
     TEST_CASE("receive segments charge metadata and payload");
     quicmemory_configure(sizeof(quicrecvseg_t) + 4, NULL);
     quicrecvbuf_t recv;
@@ -41,6 +48,13 @@ TEST(test_quic_memory_budget) {
     uint8_t out[4];
     TEST_ASSERT(quicrecvbuf_read(&recv, out, sizeof out) == sizeof out, "segment consumed");
     TEST_ASSERT(quicmemory_current() == 0, "consumption releases memory");
+    quicrecvbuf_free(&recv);
+
+    quicrecvbuf_init(&recv, 0);
+    TEST_ASSERT(quicrecvbuf_insert(&recv, UINT64_MAX, data, 2, 0) ==
+                    QUICRECVBUF_FINAL_SIZE,
+                "receive offset overflow refused");
+    TEST_ASSERT(quicmemory_current() == 0, "receive overflow reserves nothing");
     quicrecvbuf_free(&recv);
 
     quicmemory_configure(0, NULL); /* do not constrain later suites */

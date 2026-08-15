@@ -47,10 +47,14 @@ int quicmemory_reserve(size_t bytes) {
 
 void quicmemory_release(size_t bytes) {
     if (bytes == 0) return;
-    const size_t previous = atomic_fetch_sub_explicit(&current_bytes, bytes,
-                                                       memory_order_acq_rel);
-    if (previous < bytes)
-        atomic_store_explicit(&current_bytes, 0, memory_order_release);
+    size_t current = atomic_load_explicit(&current_bytes, memory_order_relaxed);
+    for (;;) {
+        const size_t next = current < bytes ? 0 : current - bytes;
+        if (atomic_compare_exchange_weak_explicit(&current_bytes, &current, next,
+                                                  memory_order_acq_rel,
+                                                  memory_order_relaxed))
+            break;
+    }
     notify();
 }
 

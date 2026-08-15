@@ -3261,6 +3261,11 @@ REQUIRE_H3SPEC=1 tests/ci.sh h3spec  # только обязательный h3s
 скрывает состояние QUIC/H3/QPACK. Он остаётся дополнительным gate и не заменяет
 полный unit-прогон.
 
+Memory-budget unit-набор проверяет точный reserve/refuse/rollback/free для
+receive segments, send capacity и CRYPTO reassembly, включая переполнение
+offset/size до выделения памяти. После аудита 2026-08-15 полный результат —
+1921/1921; `h3unit`, ASan hard/soft reload и TSan hard/soft reload зелёные.
+
 Пять вещей, ради которых это скрипт, а не строчка в yaml:
 
 - **h3spec-стадия поднимает сервер сама** — своим конфигом, с

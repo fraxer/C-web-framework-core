@@ -1,6 +1,7 @@
 #include "framework.h"
 
 #include "quictls.h"
+#include "quicmemory.h"
 
 #include <string.h>
 
@@ -200,6 +201,26 @@ TEST(test_quic_tls_crypto_reassembly) {
 
     quictls_free(&tls);
     SSL_CTX_free(ctx);
+
+    TEST_CASE("CRYPTO receive growth is charged, refused and released");
+    quictls_t budget_tls = {0};
+    quicmemory_configure(4095, NULL);
+    TEST_ASSERT(!quictls_recv_crypto(&budget_tls, QUIC_ENC_INITIAL, 0,
+                                     (const uint8_t*)"x", 1),
+                "initial 4K growth over budget refused");
+    TEST_ASSERT(quicmemory_current() == 0, "failed CRYPTO growth rolls back");
+    quicmemory_configure(4096, NULL);
+    TEST_ASSERT(quictls_recv_crypto(&budget_tls, QUIC_ENC_INITIAL, 0,
+                                    (const uint8_t*)"x", 1),
+                "initial CRYPTO growth fits exact budget");
+    TEST_ASSERT(quicmemory_current() == 4096, "CRYPTO capacity charged");
+    TEST_ASSERT(!quictls_recv_crypto(&budget_tls, QUIC_ENC_HANDSHAKE,
+                                     UINT64_MAX, (const uint8_t*)"xx", 2),
+                "CRYPTO offset overflow refused");
+    TEST_ASSERT(quicmemory_current() == 4096, "overflow reserves nothing");
+    quictls_free(&budget_tls);
+    TEST_ASSERT(quicmemory_current() == 0, "CRYPTO capacity released");
+    quicmemory_configure(0, NULL);
 }
 
 /* ---- A real handshake, both ends in this process ----

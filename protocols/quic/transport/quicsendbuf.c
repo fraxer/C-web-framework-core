@@ -32,6 +32,9 @@ int quicsendbuf_write(quicsendbuf_t* buf, const uint8_t* data, size_t len) {
     if (len == 0) return 1;
     if (data == NULL) return 0;
 
+    if (buf->head > SIZE_MAX - buf->len ||
+        len > SIZE_MAX - buf->head - buf->len) return 0;
+
     if (buf->head + buf->len + len > buf->cap) {
         /* Reclaim the dead prefix before growing: a buffer that is only being
          * drained from the front would otherwise double forever. */
@@ -42,7 +45,14 @@ int quicsendbuf_write(quicsendbuf_t* buf, const uint8_t* data, size_t len) {
 
         if (buf->len + len > buf->cap) {
             size_t cap = buf->cap == 0 ? 4096 : buf->cap;
-            while (cap < buf->len + len) cap *= 2;
+            const size_t need = buf->len + len;
+            while (cap < need) {
+                if (cap > SIZE_MAX / 2) {
+                    cap = need;
+                    break;
+                }
+                cap *= 2;
+            }
 
             const size_t growth = cap - buf->cap;
             if (!quicmemory_reserve(growth)) return 0;

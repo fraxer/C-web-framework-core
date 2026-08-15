@@ -779,9 +779,10 @@ int h3conn_write(h3conn_t* c, quicconn_t* qc) {
 
         if (!__write_stream(qs, st)) {
             log_error("h3: write failed on stream %llu\n", (unsigned long long)qs->id);
-            /* One stream's response failing is not the connection's problem:
-             * reset it and carry on with the rest. */
-            quicstream_reset(qs, H3_INTERNAL_ERROR);
+            /* A response buffer that cannot grow is local resource pressure,
+             * not a protocol defect. Isolate the culprit stream and report
+             * the application error RFC 9114 reserves for that condition. */
+            quicstream_reset(qs, H3_EXCESSIVE_LOAD);
             st->response_done = 1;
             atomic_store_explicit(&st->response_ready, 0, memory_order_release);
         }

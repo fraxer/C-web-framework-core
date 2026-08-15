@@ -483,6 +483,11 @@ capacity динамических receive/send/CRYPTO-буферов. При и�
 соединения получают `CONNECTION_REFUSED`, а рост буфера активного соединения
 завершается соответствующей transport/application error веткой.
 
+Аудит 2026-08-15 подтвердил все три пути и добавил проверки точного
+reserve/rollback/free для CRYPTO capacity. Переполнения `offset + len` в
+receive/CRYPTO и размера роста send buffer отвергаются до reserve; отказ роста
+response send buffer сбрасывает виновный поток с `H3_EXCESSIVE_LOAD`.
+
 ---
 
 ## 5. Перезагрузка и остановка

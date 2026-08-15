@@ -45,7 +45,8 @@ static quicrecvbuf_status_e __insert_piece(quicrecvbuf_t* buf, uint64_t offset,
                                            const uint8_t* data, size_t len) {
     if (len == 0) return QUICRECVBUF_OK;
 
-    if (buf->limit != 0 && buf->buffered + len > buf->limit)
+    if (buf->limit != 0 &&
+        (buf->buffered > buf->limit || len > buf->limit - buf->buffered))
         return QUICRECVBUF_TOO_MUCH;
 
     if (!quicmemory_reserve(sizeof(quicrecvseg_t) + len))
@@ -86,6 +87,7 @@ quicrecvbuf_status_e quicrecvbuf_insert(quicrecvbuf_t* buf, uint64_t offset,
                                         const uint8_t* data, size_t len, int fin) {
     if (buf == NULL) return QUICRECVBUF_OOM;
 
+    if (len > UINT64_MAX - offset) return QUICRECVBUF_FINAL_SIZE;
     const uint64_t end = offset + len;
 
     /* §4.5: no data may arrive past a final size, and a second final size must
