@@ -149,7 +149,7 @@ fork / BoringSSL) без изменений в транспорте. Свой TL
 | Server Push (`PUSH_PROMISE`) | По тем же причинам, что h2-push был удалён из проекта — см. `docs/http2/07`. Реализуем только приём `MAX_PUSH_ID` и игнорирование |
 | QUIC v2 (RFC 9369), совместимое согласование версий (RFC 9368) | Только version negotiation-пакет для неизвестных версий |
 | Unreliable datagrams (RFC 9221), MASQUE | Нет потребителя |
-| Extended CONNECT / WebSocket over HTTP/3 (RFC 9220) | Отложено до отдельной реализации |
+| Extended CONNECT / WebSocket over HTTP/3 (RFC 9220) | **Закрыто решением (2026-08-15).** Не реализовал ни один браузер и ни один распространённый клиент; нишу двунаправленного канала поверх h3 занял WebTransport. Обоснование и условия пересмотра — `05` §8. WebSocket поверх h1.1 и h2 работает как прежде |
 | IPv6 endpoint | Текущий endpoint поддерживает только IPv4 |
 | DPLPMTUD (RFC 8899) | Реализован: padded probes, подтверждение ACK, повтор и black-hole fallback |
 | ECN | Реализован: ECT(0), ACK_ECN, валидация и реакция на CE |
@@ -173,8 +173,8 @@ fork / BoringSSL) без изменений в транспорте. Свой TL
 | UDP batching / GSO | `recvmmsg`, `sendmmsg`, `UDP_SEGMENT` |
 | UDP GRO, ECN, DPLPMTUD | Готово |
 | IPv6 endpoint | Не реализовано |
-| 0-RTT, QUIC v2, Extended CONNECT | Не реализовано |
-| HTTP/3 client, Server Push | Вне scope |
+| 0-RTT, QUIC v2 | Не реализовано |
+| HTTP/3 client, Server Push, Extended CONNECT (RFC 9220) | Вне scope по решению |
 
 ## 4. Что переиспользуется из существующего кода
 
@@ -192,7 +192,7 @@ fork / BoringSSL) без изменений в транспорте. Свой TL
 | `src/metrics/` | Добавляем секции `quic` и `http3`, новые `LOCK_SITE_*` |
 | Паттерн timerfd из `multiplexingepoll.c` | QUIC-эндпоинт заводит собственный timerfd с динамическим взводом |
 | SNI-колбэки, `openssl_t` на vhost | Тот же `SSL_CTX`, добавляется `h3` в ALPN |
-| `h2ws.c` | Образец для `h3ws.c` (RFC 9220 ≈ RFC 8441) |
+| `h2ws.c` | Не переиспользуется: WebSocket-over-h3 закрыт решением (`05` §8), `h3ws.c` не существует |
 
 **Не** переиспользуется: `h2frame`, `h2session`, `h2stream`, `h2data`,
 `h2_write_filter` — кадрирование и мультиплексирование в h3 принципиально
@@ -255,7 +255,7 @@ RFC 9000 §13.3 и оно определяет форму `quicsendbuf` и `quic
 | 4 | Транспорт: потоки, flow control, ACK, loss detection, NewReno, pacing, закрытие | `04` | XL | **Сделано.** Соединение живёт: настоящий Initial принят, расшифрован, PING обработан, ACK вернулся расшифровываемым. Пропускная способность и устойчивость к потерям — фаза 8, нужен тестовый клиент |
 | 5 | HTTP/3: кадры, служебные потоки, SETTINGS, интеграция с dispatch и фильтрами | `05` | L | `curl --http3 https://host/` отдаёт страницу; статические файлы, POST с телом |
 | 6 | QPACK | `06` | L | Векторы RFC 9204 Приложение B; Chrome/Firefox открывают сайт |
-| 7 | Интеграция: конфиг, Alt-Svc, метрики, лимиты, shutdown/reload, WebSocket over h3 | `07` | M | Браузер сам переключается на h3 после Alt-Svc; `/metrics` показывает секцию quic |
+| 7 | Интеграция: конфиг, Alt-Svc, метрики, лимиты, shutdown/reload (WebSocket over h3 исключён решением, `05` §8) | `07` | M | Браузер сам переключается на h3 после Alt-Svc; `/metrics` показывает секцию quic |
 | 8 | Тесты и interop | `08` | L | quic-interop-runner: handshake, transfer, retry, resumption, multiplexing, http3 — зелёные; h3spec без падений |
 | 9 | Отложенное: обязательное (key update, миграция, Retry), производительность (BBR, ECN, GSO/GRO, DPLPMTUD, аффинность, обход списка потоков), опции (0-RTT, QUIC v2); CUBIC уже реализован | `09` | — | По отдельности, каждый пункт за своим флагом и со своим критерием — см. `09` |
 
@@ -282,7 +282,7 @@ core/protocols/quic/
 core/protocols/http3/
   frame/   h3frame.{c,h}  h3error.{c,h}
   qpack/   qpack.{c,h}  qpack_statictable.h  (+ misc/huffman.{c,h} общий с HPACK)
-  server/  h3session.{c,h}  h3stream.{c,h}  h3_write_filter.{c,h}  h3ws.{c,h}
+  server/  h3session.{c,h}  h3stream.{c,h}  h3_write_filter.{c,h}
 ```
 
 Каждый каталог — свой `CMakeLists.txt` по образцу существующих; всё попадает в

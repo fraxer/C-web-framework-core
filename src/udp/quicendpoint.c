@@ -1304,8 +1304,11 @@ static int __h3_attach(quicconn_t* conn) {
     /* ALPN settled this at the handshake: the QUIC context offers `h3` and
      * nothing else (openssl.h), so an ACTIVE connection is an HTTP/3 one.
      *
-     * Extended CONNECT is not advertised -- §8 is not implemented, and
-     * advertising what we cannot serve is worse than staying quiet. */
+     * Extended CONNECT is not advertised, and will not be: WebSocket over h3
+     * (RFC 9220) is closed by decision, no browser implements it, and
+     * advertising what we cannot serve is worse than staying quiet. WebSocket
+     * keeps working over h1.1 and h2. See docs/http3/05 §8 before changing the
+     * 0 below. */
     h3conn_t* c = h3conn_create(&conn->conn, h3_policy_max_field_section_size(), 0);
     if (c == NULL) return 0;
 
