@@ -1632,7 +1632,12 @@ int quicclient_run(quicclient_t* client, int timeout_ms) {
 
         if (r > 0) {
             uint8_t buf[2048];
-            const ssize_t n = recv(client->fd, buf, sizeof buf, 0);
+            /* Use the same receive shim as the post-handshake pump.  Reading
+             * the socket directly here silently disabled --loss-in during the
+             * handshake, so loss tests only impaired application data and a
+             * supposedly unfinished connection could already be complete. */
+            const ssize_t n = __net_recv(client, buf, sizeof buf);
+            if (n == -2) continue;   /* dropped on purpose */
             if (n <= 0) continue;
 
             if (!__recv_datagram(client, buf, (size_t)n)) return 0;

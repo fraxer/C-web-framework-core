@@ -141,6 +141,27 @@ TEST(test_h3dispatch_publish) {
     TEST_ASSERT(h3_server_attach_response(&f.qc->conn, NULL, orphan) == 0, "no stream");
     httpresponse_free(orphan);
     fixture_free(&f);
+
+    TEST_CASE("a late handler publish after hard-reload detach is ignored safely");
+    fixture_init(&f);
+    qs = add_request(&f, 0);
+    st = h3conn_request_of(qs);
+    r = httpresponse_create_h3(&f.qc->conn);
+    TEST_ASSERT(h3_server_attach_response(&f.qc->conn, st->request, r) == 1,
+                "response attached before detach");
+
+    /* quicconn_want_write would dereference qc->endpoint, deliberately NULL in
+     * this fixture.  Reaching it after detach therefore makes this regression
+     * fail immediately, while the correct path leaves ownership with the
+     * stream: teardown frees the response together with that stream. */
+    atomic_store_explicit(&f.ctx.detached, 1, memory_order_release);
+    TEST_ASSERT(h3_server_response_ready(&f.qc->conn, r) == 1,
+                "late completion accepted for teardown");
+    TEST_ASSERT(st->response == r, "stream retains response ownership");
+    TEST_ASSERT(!atomic_load(&st->response_ready), "response was not published");
+    TEST_ASSERT(!atomic_load(&f.ctx.need_write), "detached endpoint was not woken");
+    TEST_ASSERT(!atomic_load(&f.qc->want_write), "QUIC write turn was not queued");
+    fixture_free(&f);
 }
 
 TEST(test_h3dispatch_write_turn) {

@@ -14,6 +14,7 @@
 #   tsan     build with h3, TSan            + unit tests   (data races)
 #   h3unit   QUIC / HTTP/3 / QPACK unit runner only
 #   fuzz     build the fuzz targets         + FUZZ_SECONDS each
+#   reload   hard reload with live QUIC      + old worker retirement
 #   h3spec   run a server, run h3spec against it           (RFC conformance)
 #
 # The interop matrix (§8.6) is deliberately absent: it needs docker and tens of
@@ -183,6 +184,19 @@ stage_fuzz() {
     [ "$ok" = 1 ] && record fuzz OK || record fuzz FAIL
 }
 
+stage_reload() {
+    say "reload: hard reload retires old HTTP/3 workers"
+
+    if build "$CI_BUILD_DIR/rel" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes &&
+       "$CORE_DIR/tests/h3_hard_reload.sh" "$CI_BUILD_DIR/rel" \
+             "$CI_BUILD_DIR/h3-hard-reload"; then
+        record reload OK
+    else
+        record reload FAIL
+    fi
+}
+
 stage_h3spec() {
     say "h3spec: RFC conformance against a running server"
 
@@ -269,7 +283,7 @@ JSON
 }
 
 STAGES=("$@")
-[ ${#STAGES[@]} -eq 0 ] && STAGES=(noh3 h3unit asan tsan fuzz h3spec)
+[ ${#STAGES[@]} -eq 0 ] && STAGES=(noh3 h3unit asan tsan fuzz reload h3spec)
 
 for stage in "${STAGES[@]}"; do
     case "$stage" in
@@ -278,6 +292,7 @@ for stage in "${STAGES[@]}"; do
     tsan)   stage_tsan ;;
     h3unit) stage_h3unit ;;
     fuzz)   stage_fuzz ;;
+    reload) stage_reload ;;
     h3spec) stage_h3spec ;;
     *)      echo "unknown stage: $stage" >&2; exit 2 ;;
     esac
