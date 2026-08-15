@@ -29,6 +29,12 @@ typedef struct {
     size_t   head_len;
     int      head_sent;
 
+    /* Resolved once on the first terminal-filter pass. A 57 KB response enters
+     * this filter several times; walking every stream of a c=100/m=30
+     * connection on every body chunk showed up directly in perf. The response
+     * and its stream have the same lifetime while the filter is runnable. */
+    quicstream_t* stream;
+
     h3_data_writer_t writer;
 } h3_module_write_t;
 
@@ -38,7 +44,8 @@ static void __free(void* arg);
 static void __reset(void* arg);
 
 /* The QUIC stream and connection behind a response, or a pair of NULLs. */
-static int __locate(httpresponse_t* response, quicconn_t** qc_out, quicstream_t** qs_out) {
+static int __locate(h3_module_write_t* module, httpresponse_t* response,
+                    quicconn_t** qc_out, quicstream_t** qs_out) {
     h3conn_t* c = h3_conn_of(response->connection);
     if (c == NULL) return 0;
 
@@ -47,7 +54,11 @@ static int __locate(httpresponse_t* response, quicconn_t** qc_out, quicstream_t*
      * really is QUIC. */
     quicconn_t* qc = (quicconn_t*)response->connection;
 
-    quicstream_t* qs = h3conn_stream_by_response(qc, response);
+    quicstream_t* qs = module->stream;
+    if (qs == NULL) {
+        qs = h3conn_stream_by_response(qc, response);
+        module->stream = qs;
+    }
     if (qs == NULL) return 0;
 
     *qc_out = qc;
@@ -78,7 +89,7 @@ static int __header(httprequest_t* request, httpresponse_t* response) {
 
     quicconn_t* qc = NULL;
     quicstream_t* qs = NULL;
-    if (!__locate(response, &qc, &qs)) {
+    if (!__locate(module, response, &qc, &qs)) {
         log_error("h3_write_filter: no HTTP/3 stream owns this response\n");
         return CWF_ERROR;
     }
@@ -134,7 +145,7 @@ static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* pare
 
     quicconn_t* qc = NULL;
     quicstream_t* qs = NULL;
-    if (!__locate(response, &qc, &qs)) return CWF_ERROR;
+    if (!__locate(module, response, &qc, &qs)) return CWF_ERROR;
 
     module->base.parent_buf = parent_buf;
     if (parent_buf == NULL) return CWF_ERROR;
@@ -184,6 +195,7 @@ static void __reset(void* arg) {
     module->head = NULL;
     module->head_len = 0;
     module->head_sent = 0;
+    module->stream = NULL;
 
     h3_data_writer_reset(&module->writer);
 }
@@ -206,6 +218,7 @@ http_filter_t* h3_write_filter_create(void) {
     module->head = NULL;
     module->head_len = 0;
     module->head_sent = 0;
+    module->stream = NULL;
     h3_data_writer_reset(&module->writer);
 
     filter->handler_header = __header;

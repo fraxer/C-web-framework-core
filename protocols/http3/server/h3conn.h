@@ -121,8 +121,18 @@ h3conn_result_t h3conn_stream_read(h3conn_t* c, quicconn_t* qc, quicstream_t* qs
  * path rather than the handler-thread one. */
 int h3conn_read(h3conn_t* c, quicconn_t* qc, uint64_t* error);
 
-/* The request state on a stream, or NULL if it is not a request stream. */
-h3stream_t* h3conn_request_of(quicstream_t* qs);
+/* The request state on a stream, or NULL if it is not a request stream.
+ *
+ * This is deliberately inline. The response/read/send paths ask it several
+ * times per stream per turn; perf measured the out-of-line function plus its
+ * PLT stub at 3.7% of representative c=100 CPU despite it being only two
+ * pointer tests and a branch. */
+static inline h3stream_t* h3conn_request_of(quicstream_t* qs) {
+    if (qs == NULL || qs->app == NULL) return NULL;
+
+    const h3app_t* app = qs->app;
+    return app->is_request ? app->req : NULL;
+}
 
 /* The HTTP/3 state of a connection, or NULL if it is not one.
  *

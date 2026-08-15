@@ -91,14 +91,6 @@ void h3conn_stream_release(quicstream_t* qs) {
     qs->app_free = NULL;
 }
 
-h3stream_t* h3conn_request_of(quicstream_t* qs) {
-    if (qs == NULL || qs->app == NULL) return NULL;
-
-    const h3app_t* app = qs->app;
-
-    return app->is_request ? app->req : NULL;
-}
-
 h3conn_t* h3_conn_of(connection_t* connection) {
     if (connection == NULL || connection->transport != CONN_TRANSPORT_QUIC) return NULL;
 
