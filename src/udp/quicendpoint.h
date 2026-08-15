@@ -67,6 +67,11 @@ typedef struct quicendpoint {
      * an old CID while the old endpoint's timer/wakeup worker is still alive. */
     pthread_mutex_t tx_batch_mutex;
 
+    /* The owning worker normally has exclusive access to this list.  During
+     * soft reload, however, the new socket reader can close an old-generation
+     * connection after routing one of its CIDs. */
+    pthread_mutex_t conns_mutex;
+
     /* Last value of the kernel's receive-overflow counter for this socket, so
      * the metric can report the step rather than the running total. */
     uint32_t kernel_drops;

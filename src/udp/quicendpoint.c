@@ -1067,6 +1067,7 @@ void quicendpoint_detach(quicendpoint_t* endpoint, quicconn_t* conn) {
         metrics_quic_handshakes(previous > 0 ? previous - 1 : 0);
     }
 
+    pthread_mutex_lock(&endpoint->conns_mutex);
     quicconn_t** link = &endpoint->conns;
     while (*link != NULL) {
         if (*link == conn) {
@@ -1080,6 +1081,7 @@ void quicendpoint_detach(quicendpoint_t* endpoint, quicconn_t* conn) {
         }
         link = &(*link)->ep_next;
     }
+    pthread_mutex_unlock(&endpoint->conns_mutex);
 
     /* And out of the send queue, under its own lock: a handler thread may be
      * pushing onto it at this moment. */
@@ -1163,9 +1165,11 @@ static void __accept(quicendpoint_t* ep, udp_datagram_t* dgram,
         return;
     }
 
+    pthread_mutex_lock(&ep->conns_mutex);
     conn->ep_next = ep->conns;
     ep->conns = conn;
     ep->conn_count++;
+    pthread_mutex_unlock(&ep->conns_mutex);
 
     /* Into the worker's connection list and count, so the timer sweep and the
      * shutdown drain see it. For QUIC this does no epoll_ctl. */
@@ -1583,9 +1587,26 @@ static void __endpoint_timer_arm(quicendpoint_t* ep) {
 
     uint64_t earliest = 0;
 
-    for (quicconn_t* conn = ep->conns; conn != NULL; conn = conn->ep_next) {
-        const uint64_t when = quicconn_next_timeout(conn);
+    pthread_mutex_lock(&ep->conns_mutex);
+    quicconn_t* conn = ep->conns;
+    if (conn != NULL) connection_s_inc(&conn->conn);
+    pthread_mutex_unlock(&ep->conns_mutex);
+
+    while (conn != NULL) {
+        pthread_mutex_lock(&ep->conns_mutex);
+        quicconn_t* next = conn->ep_next;
+        if (next != NULL) connection_s_inc(&next->conn);
+        pthread_mutex_unlock(&ep->conns_mutex);
+
+        uint64_t when = 0;
+        if (connection_s_trylock(&conn->conn)) {
+            when = quicconn_next_timeout(conn);
+            connection_s_unlock(&conn->conn);
+        }
         if (when != 0 && (earliest == 0 || when < earliest)) earliest = when;
+
+        connection_s_dec(&conn->conn);
+        conn = next;
     }
 
     if (earliest == ep->timer_deadline_us) return;   /* already armed for it */
@@ -1883,6 +1904,7 @@ static void __endpoint_free(quicendpoint_t* ep) {
 
     udp_rx_batch_free(ep->rx);
     udp_tx_batch_free(ep->tx_batch);
+    pthread_mutex_destroy(&ep->conns_mutex);
     pthread_mutex_destroy(&ep->tx_batch_mutex);
     cqueue_clear(&ep->listener.servers);
     free(ep);
@@ -1895,6 +1917,11 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server,
 
     memset(ep, 0, sizeof * ep);
     if (pthread_mutex_init(&ep->tx_batch_mutex, NULL) != 0) {
+        free(ep);
+        return NULL;
+    }
+    if (pthread_mutex_init(&ep->conns_mutex, NULL) != 0) {
+        pthread_mutex_destroy(&ep->tx_batch_mutex);
         free(ep);
         return NULL;
     }
@@ -2094,12 +2121,22 @@ static void __endpoint_tick(quicendpoint_t* ep, int shutdown_now) {
         pending = next;
     }
 
+    pthread_mutex_lock(&ep->conns_mutex);
     quicconn_t* conn = ep->conns;
+    if (conn != NULL) connection_s_inc(&conn->conn);
+    pthread_mutex_unlock(&ep->conns_mutex);
+
     while (conn != NULL) {
-        /* Captured first: the tick may close and free the connection. */
+        /* Capture a referenced successor under the list lock. A packet routed
+         * by the new reload generation may close and unlink either connection
+         * while this old endpoint is sweeping its timers. */
+        pthread_mutex_lock(&ep->conns_mutex);
         quicconn_t* next = conn->ep_next;
+        if (next != NULL) connection_s_inc(&next->conn);
+        pthread_mutex_unlock(&ep->conns_mutex);
 
         if (!connection_s_trylock(&conn->conn)) {
+            connection_s_dec(&conn->conn);
             conn = next;
             continue;
         }
@@ -2139,6 +2176,7 @@ static void __endpoint_tick(quicendpoint_t* ep, int shutdown_now) {
             connection_s_unlock(&conn->conn);
         }
 
+        connection_s_dec(&conn->conn);
         conn = next;
     }
 
@@ -2157,7 +2195,11 @@ void quicendpoints_tick(quicendpoint_t* endpoints, int shutdown_now) {
          * socket can go. Until it does the worker's connection_count cannot
          * reach zero, which is precisely what keeps the loop running long
          * enough for the drain to happen. */
-        if (endpoints->draining && endpoints->conn_count == 0) {
+        pthread_mutex_lock(&endpoints->conns_mutex);
+        const int drained = endpoints->conn_count == 0;
+        pthread_mutex_unlock(&endpoints->conns_mutex);
+
+        if (endpoints->draining && drained) {
             if (endpoints->wake_connection != NULL) {
                 endpoints->wake_connection->close(endpoints->wake_connection);
                 endpoints->wake_connection = NULL;
