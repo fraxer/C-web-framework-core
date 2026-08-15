@@ -166,10 +166,10 @@ int h3conn_open_service_streams(h3conn_t* c, quicconn_t* qc) {
     size_t n = h3session_control_preamble(c->session, buf, sizeof buf);
     if (n == 0 || !__open_uni(qc, buf, n, &c->session->ctrl_send_id)) return 0;
 
-    /* Both QPACK streams stay empty in lite -- we insert nothing and, with a
-     * Required Insert Count of 0 everywhere, have nothing to acknowledge -- but
-     * they are opened anyway: RFC 9204 §4.2 has each side open both, and a peer
-     * that waits for ours would wait forever. */
+    /* Both QPACK streams are opened before either has anything to say, and both
+     * are opened even against a peer that advertised capacity 0 and so will
+     * never make one of them carry a byte: RFC 9204 §4.2 has each side open
+     * both, and a peer that waits for ours would wait forever. */
     n = h3session_uni_preamble(buf, sizeof buf, H3_UNI_STREAM_QPACK_ENCODER);
     if (n == 0 || !__open_uni(qc, buf, n, &c->session->qpack_enc_send_id)) return 0;
 

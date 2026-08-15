@@ -5,7 +5,7 @@
 
 #include <string.h>
 
-/* QPACK-lite encoder (RFC 9204). Most cases are round-trip: encode, decode,
+/* The QPACK encoder (RFC 9204). Most cases are round-trip: encode, decode,
  * compare, so the test does not depend on whether the encoder chose Huffman.
  * The indexed-static cases are exact-byte because indexed lines carry no
  * Huffman and no literal, so the encoding is forced. */

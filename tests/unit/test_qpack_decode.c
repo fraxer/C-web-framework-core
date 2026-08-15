@@ -6,12 +6,19 @@
 
 #include <string.h>
 
-/* QPACK-lite decoder (RFC 9204 §4.5). The static table is 0-based; blocks here
- * use Required Insert Count 0 and reference only the static table or literals,
- * which is exactly what a peer may send when we advertised capacity 0. The RFC
- * 9204 §B.1 vector is the one canonical example that fits lite; the rest are
- * built here using the codec's own encoder primitives so the Huffman path is
- * exercised against known-good bytes rather than hand-computed ones. */
+/* The QPACK decoder (RFC 9204 §4.5), in both of the shapes it takes.
+ *
+ * The first half works against a decoder created with capacity 0 -- what a peer
+ * sees when we advertise no table: Required Insert Count is always 0, blocks
+ * reference only the 0-based static table or literals, and anything naming a
+ * dynamic entry is a decompression failure *because we said there was none*.
+ * The second half gives the decoder a real capacity and drives the dynamic
+ * table proper: insertions, Duplicate, eviction, post-base indices and a
+ * section that blocks on an insert count still in the future.
+ *
+ * The RFC 9204 §B.1 vector is the canonical example for the static case; the
+ * rest are built here using the codec's own encoder primitives, so the Huffman
+ * path is exercised against known-good bytes rather than hand-computed ones. */
 
 static int field_eq(const qpack_header_t* h,
                     const char* name, const char* value, int never) {
@@ -178,7 +185,7 @@ TEST(test_qpack_decode_errors) {
     qpack_header_t* h = NULL;
     size_t count = 0;
 
-    TEST_CASE("a dynamic-table indexed reference is refused (no table in lite)");
+    TEST_CASE("a dynamic-table reference is refused when we advertised no table");
     /* 0x80 = 1 T=0 idx=0 (dynamic). */
     static const uint8_t dyn[] = { 0x00, 0x00, 0x80 };
     TEST_ASSERT(qpack_decode_block(d, dyn, sizeof dyn, 0, &h, &count)
@@ -190,7 +197,7 @@ TEST(test_qpack_decode_errors) {
     TEST_ASSERT(qpack_decode_block(d, pb, sizeof pb, 0, &h, &count)
                 == QPACK_ERR_DECOMPRESSION, "post-base ref");
 
-    TEST_CASE("Required Insert Count > 0 is refused (no inserts in lite)");
+    TEST_CASE("Required Insert Count > 0 is refused when we advertised no table");
     static const uint8_t ric[] = { 0x01, 0x00 };
     TEST_ASSERT(qpack_decode_block(d, ric, sizeof ric, 0, &h, &count)
                 == QPACK_ERR_DECOMPRESSION, "RIC=1");

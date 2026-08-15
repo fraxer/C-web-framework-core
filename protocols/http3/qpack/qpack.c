@@ -200,8 +200,9 @@ qpack_status_e qpack_decoder_read_encoder(qpack_decoder_t* d, const uint8_t* dat
 
         /* With an advertised maximum of zero every table-mutating opcode is
          * already illegal from its first byte. Returning the error immediately
-         * also preserves lite's useful behaviour for a truncated malicious
-         * instruction: there is no future suffix that could make it valid. */
+         * is also what makes a truncated malicious instruction cheap: there is
+         * no future suffix that could make it valid, so nothing is buffered
+         * waiting for one. */
         if (d->max_capacity == 0) return QPACK_ERR_ENCODER_STREAM;
 
         if ((octet & 0x80) != 0) { /* Insert With Name Reference: 1Txxxxxx */
@@ -288,6 +289,10 @@ qpack_status_e qpack_decoder_read_encoder(qpack_decoder_t* d, const uint8_t* dat
     return QPACK_OK;
 }
 
+/* The stateless reader: validates decoder-stream instructions without an
+ * encoder to apply them to. Used where the caller keeps no dynamic table --
+ * and by the tests. The live path is qpack_encoder_read_decoder_state below,
+ * which settles outstanding sections and advances the Known Received Count. */
 qpack_status_e qpack_encoder_read_decoder(const uint8_t* data, size_t len,
                                           size_t* consumed) {
     if (consumed != NULL) *consumed = 0;
@@ -298,8 +303,8 @@ qpack_status_e qpack_encoder_read_decoder(const uint8_t* data, size_t len,
         const uint8_t octet = data[p];
 
         /* Section Acknowledgment is `1sssssss`, Stream Cancellation `01ssssss`.
-         * Both name a stream and neither asks anything of an encoder that has
-         * inserted nothing, so they are read past. */
+         * Both name a stream, and with no encoder state here there is nothing
+         * to settle them against, so they are read past. */
         if ((octet & 0x80) != 0 || (octet & 0xc0) == 0x40) {
             uint64_t id = 0;
             const size_t n = prefix_int_decode(data + p, len - p,
@@ -311,9 +316,9 @@ qpack_status_e qpack_encoder_read_decoder(const uint8_t* data, size_t len,
 
         /* What is left is Insert Count Increment, `00iiiiii`. §4.4.3 makes an
          * increment of zero a connection error outright, and any other value is
-         * one too against this encoder: the count may not pass the number of
-         * insertions, and a static-only encoder has made none. Both are the
-         * peer describing a dynamic table that does not exist. */
+         * one too *here*: this entry point has no record of any insertion, so
+         * every increment claims more than it can account for. The stateful
+         * reader below compares against the real insert count instead. */
         uint64_t increment = 0;
         const size_t n = prefix_int_decode(data + p, len - p, 6, &increment);
         if (n == 0) break;
@@ -377,10 +382,11 @@ qpack_status_e qpack_encoder_read_decoder_state(qpack_encoder_t* e,
 }
 
 /* ======================================================================= *
- *  Encoder (lite)
+ *  Encoder
  * ======================================================================= *
- *  A small growable buffer, the static-table lookup, and one helper per string
- *  shape QPACK literals use. The value literal is `H | length (7-bit) | bytes`,
+ *  A small growable buffer, the static-table lookup, the dynamic table with its
+ *  outstanding-section bookkeeping, and one helper per string shape QPACK
+ *  literals use. The value literal is `H | length (7-bit) | bytes`,
  *  identical to HPACK; the literal-literal-name's name is `001 N H | length
  *  (3-bit) | bytes`, with the Huffman flag carried in the opcode rather than a
  *  length-prefix bit. */

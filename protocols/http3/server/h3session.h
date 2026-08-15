@@ -193,7 +193,8 @@ void h3session_free(h3session_t* s);
 size_t h3session_control_preamble(const h3session_t* s, uint8_t* dst, size_t cap);
 
 /* The stream-type varint for one of our other outbound uni-streams: the QPACK
- * encoder (0x02) and decoder (0x03) streams, which stay empty in lite, and one
+ * encoder (0x02) and decoder (0x03) streams, which carry table instructions and
+ * acknowledgements once either side advertises a capacity, and one
  * grease stream, which stays empty forever. */
 size_t h3session_uni_preamble(uint8_t* dst, size_t cap, uint64_t type);
 

@@ -391,16 +391,18 @@ TEST(test_h3session_qpack_streams) {
     h3session_free(s);
 
     /* The decoder stream used to be drained without being read at all. It is
-     * parsed to one depth now: acknowledgements still say nothing to an encoder
-     * that inserts nothing, but an Insert Count Increment is a connection error
-     * whatever it carries (RFC 9204 §4.4.3) -- found by h3spec. */
+     * parsed now: an acknowledgement for a section this encoder never had
+     * outstanding settles nothing and passes, while an Insert Count Increment
+     * that claims more insertions than were made is a connection error
+     * (RFC 9204 §4.4.3) -- found by h3spec. Here the peer sent no SETTINGS, so
+     * the encoder is still capped at capacity 0 and has inserted nothing. */
     TEST_CASE("the peer's decoder stream: acknowledgements pass");
     s = h3session_create(65536, 0);
     uni = h3uni_recv_create(10);
     /* stream type 3, Section Acknowledgment (1sssssss), Stream Cancellation (01ssssss) */
     const uint8_t dec_acks[] = { 0x03, 0x80, 0x40 };
     TEST_ASSERT(feed(s, uni, dec_acks, sizeof dec_acks, 0).action == H3SESSION_OK,
-                "acks ignored in lite");
+                "acks for unknown sections pass");
     h3uni_recv_free(uni);
     h3session_free(s);
 

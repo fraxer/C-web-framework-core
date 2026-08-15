@@ -6,19 +6,23 @@
 
 /* QPACK (RFC 9204) -- header compression for HTTP/3.
  *
- * This is the QPACK-lite decoder (RFC 9204 §6 of docs/http3/06-qpack.md): our
- * decoder advertises QPACK_MAX_TABLE_CAPACITY=0 and QPACK_BLOCKED_STREAMS=0, so
- * the peer may not insert anything into a dynamic table, no block ever blocks,
- * and Required Insert Count is always 0. Field sections reference only the
- * 99-entry static table (qpack_statictable.h) and literals. That is fully RFC-
- * compliant -- the dynamic table is optional on both sides -- and loses ~10-20%
- * compression versus h2, acceptable for a first h3. The full dynamic table,
- * encoder/decoder-stream instructions, blocked-stream accounting and our encoder
- * arrive in phase 6.2; the API below carries only what lite needs.
+ * Complete on both sides (docs/http3/06-qpack.md §6.2): dynamic tables with
+ * absolute indexing and eviction, all three insert forms, Duplicate, the
+ * encoder and decoder instruction streams, blocked field sections, and the
+ * acknowledgement bookkeeping that lets an encoder know which entries the peer
+ * has actually seen.
+ *
+ * Two decoders live in this file, and the difference is what each *advertises*:
+ * a decoder created with (0, 0) is the static-only case -- it refuses any
+ * reference into a dynamic table and any Required Insert Count above zero,
+ * because it told the peer there was no table -- while one created with a real
+ * capacity accepts the lot. Both are conforming; the dynamic table is optional
+ * per RFC 9204, and the zero case is what a peer gets when it advertises zero
+ * to us. What this server advertises is in h3session.c.
  *
  * Field validity (RFC 9114 §4.3) is NOT checked here -- this module hands back
- * the fields the peer encoded, exactly as HPACK does. The caller (the future
- * h3session, via the shared httpfields_to_request) applies the protocol rules. */
+ * the fields the peer encoded, exactly as HPACK does. The caller (h3session,
+ * via the shared httpfields_to_request) applies the protocol rules. */
 
 typedef enum {
     QPACK_OK = 0,
@@ -30,14 +34,15 @@ typedef enum {
      * dynamic table, Required Insert Count != 0, or a truncated representation.
      * Maps to QPACK_DECOMPRESSION_FAILED -- a connection error. */
     QPACK_ERR_DECOMPRESSION,
-    /* The peer sent an encoder-stream instruction (an insert/duplicate/set-
-     * capacity), which it may not when we advertised capacity 0. Connection
-     * error QPACK_ENCODER_STREAM_ERROR. Reserved for phase 6.2's read path. */
+    /* An encoder-stream instruction this decoder cannot accept: an insert or
+     * duplicate when we advertised capacity 0, or a Set Dynamic Table Capacity
+     * above what we advertised. Connection error QPACK_ENCODER_STREAM_ERROR
+     * (§4.3.1). */
     QPACK_ERR_ENCODER_STREAM,
-    /* The peer sent a decoder-stream instruction our encoder cannot make sense
-     * of: an Insert Count Increment, which §4.4.3 forbids at zero and which any
-     * value of describes a dynamic table a static-only encoder never built.
-     * Connection error QPACK_DECODER_STREAM_ERROR. */
+    /* A decoder-stream instruction that contradicts what our encoder has done:
+     * an Insert Count Increment of zero, which §4.4.3 forbids outright, or one
+     * that acknowledges more insertions than we made. Connection error
+     * QPACK_DECODER_STREAM_ERROR. */
     QPACK_ERR_DECODER_STREAM,
     QPACK_ERR_MEMORY,
     /* The decoded field section exceeded max_list_size. The caller answers 431
@@ -80,8 +85,9 @@ typedef struct qpack_decoder {
     uint64_t evictions;
 } qpack_decoder_t;
 
-/* Create a decoder. For lite pass (0, 0); the full decoder (6.2) takes the
- * negotiated capacity and blocked-stream limit. Returns NULL on OOM. */
+/* Create a decoder with the capacity and blocked-stream limit this side is
+ * about to advertise. (0, 0) builds the static-only decoder described at the
+ * top of this file. Returns NULL on OOM. */
 qpack_decoder_t* qpack_decoder_create(size_t max_capacity, size_t max_blocked);
 void qpack_decoder_free(qpack_decoder_t* d);
 
@@ -120,12 +126,14 @@ void qpack_headers_free(qpack_header_t* headers, size_t count);
 
 /* Instructions arriving on the peer's QPACK encoder stream (RFC 9204 §4.3).
  *
- * In lite we advertise QPACK_MAX_TABLE_CAPACITY=0, so the peer has no table to
- * insert into and exactly one instruction remains legal: `Set Dynamic Table
- * Capacity` with a value of 0, which real clients do send as an opener. Insert
- * With Name Reference, Insert With Literal Name, Duplicate, and any capacity
- * above what we advertised are all QPACK_ERR_ENCODER_STREAM -- a connection
- * error of type QPACK_ENCODER_STREAM_ERROR (§4.3.1).
+ * What is legal here follows from what this decoder advertised. With a real
+ * capacity, all of them are: Set Dynamic Table Capacity (up to that value),
+ * Insert With Name Reference, Insert With Literal Name and Duplicate. With
+ * capacity 0 the peer has no table to insert into, so exactly one instruction
+ * remains legal -- `Set Dynamic Table Capacity` with a value of 0, which real
+ * clients do send as an opener -- and every other one, or any capacity above
+ * what we advertised, is QPACK_ERR_ENCODER_STREAM: a connection error of type
+ * QPACK_ENCODER_STREAM_ERROR (§4.3.1).
  *
  * Refusing every byte instead would be wrong: capacity-0 is legal and common.
  * The parser is resumable, because a stream hands over bytes in arbitrary
@@ -135,34 +143,43 @@ qpack_status_e qpack_decoder_read_encoder(qpack_decoder_t* d, const uint8_t* dat
                                           size_t len, size_t* consumed);
 
 /* The mirror of the above for the peer's decoder stream, which talks to our
- * encoder. Section Acknowledgment and Stream Cancellation are read past: they
- * name a stream and ask nothing of an encoder that inserts nothing. An Insert
- * Count Increment is QPACK_ERR_DECODER_STREAM -- §4.4.3 forbids the value zero
- * outright, and every other value claims we made insertions we did not.
+ * encoder (§4.4).
  *
- * Takes no decoder: there is no encoder state to keep while the dynamic table
- * does not exist. Resumable on the same terms as the encoder-stream reader. */
+ * `qpack_encoder_read_decoder_state` applies them: Section Acknowledgment
+ * settles an outstanding section and raises the Known Received Count, Stream
+ * Cancellation drops one, and Insert Count Increment advances what the peer has
+ * confirmed -- which is what tells the encoder an entry is safe to reference
+ * without blocking the peer.
+ *
+ * Resumable on the same terms as the encoder-stream reader. */
 struct qpack_encoder;
 typedef struct qpack_outstanding_section qpack_outstanding_section_t;
 qpack_status_e qpack_encoder_read_decoder_state(struct qpack_encoder* e,
                                                  const uint8_t* data, size_t len,
                                                  size_t* consumed);
+/* Validate decoder-stream instructions without an encoder to apply them to --
+ * for a caller that keeps no dynamic table of its own, and for tests. */
 qpack_status_e qpack_encoder_read_decoder(const uint8_t* data, size_t len,
-                                          size_t* consumed); /* lite compatibility */
+                                          size_t* consumed);
 
-/* ---- Encoder (lite) ---- *
+/* ---- Encoder ---- *
  *
- * Emits a field section that references only the static table and literals:
- * the prefix is always RIC=0, Delta Base=0. For each field it picks the smallest
- * lite representation -- indexed static on an exact match, else a literal with a
- * static name reference, else a literal with a literal name -- Huffman-encoding
- * a string only when that is shorter. A field marked never_indexed is emitted
- * as a literal with N=1 (never an indexed line), so a peer intermediary does
- * not re-index a value that may be sensitive. */
+ * Picks the smallest representation available for each field: an indexed line
+ * (static or dynamic) on an exact match, else a literal with a name reference,
+ * else a literal with a literal name -- Huffman-encoding a string only when
+ * that is shorter. Whether the dynamic half of that is used at all depends on
+ * what the peer advertised: against a peer offering capacity 0 the output is
+ * static-and-literal only, with the prefix fixed at RIC=0, Delta Base=0.
+ *
+ * A field marked never_indexed is emitted as a literal with N=1 (never an
+ * indexed line, and never inserted), so neither this table nor a peer
+ * intermediary re-indexes a value that may be sensitive. */
 
 typedef struct qpack_encoder {
-    size_t max_capacity;   /* 0 in lite */
-    size_t max_blocked;    /* 0 in lite */
+    /* Negotiated from the peer's SETTINGS: both are 0 until they arrive, which
+     * is what keeps the first field sections static-only. */
+    size_t max_capacity;
+    size_t max_blocked;
     uint64_t insert_count;
     uint64_t known_received_count;
     size_t capacity;
