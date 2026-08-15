@@ -42,6 +42,8 @@ static const char* const __quic_name[METRICS_QUIC__COUNT] = {
     "datagrams_received", "datagrams_sent",
     "bytes_received", "bytes_sent",
     "recv_calls",
+    "send.batch_calls", "send.messages", "send.gso_messages",
+    "send.gso_segments", "send.gso_fallbacks", "send.partial",
     "drop.truncated", "drop.oversize", "drop.cid_too_long",
     "drop.short_initial", "drop.unknown_cid", "drop.no_budget", "drop.peer_version_negotiation",
     "drop.kernel_overflow",

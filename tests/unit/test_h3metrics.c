@@ -144,6 +144,9 @@ TEST(test_h3metrics_quic_counters) {
     for (int i = 0; i < 9; i++) metrics_quic(METRICS_QUIC_AMPLIFICATION_LIMITED);
     for (int i = 0; i < 10; i++) metrics_quic(METRICS_QUIC_CLOSED_IDLE);
     for (int i = 0; i < 11; i++) metrics_quic(METRICS_QUIC_CLOSED_PEER);
+    for (int i = 0; i < 12; i++) metrics_quic(METRICS_QUIC_SEND_BATCH_CALLS);
+    for (int i = 0; i < 13; i++) metrics_quic(METRICS_QUIC_SEND_GSO_MESSAGES);
+    for (int i = 0; i < 14; i++) metrics_quic(METRICS_QUIC_SEND_GSO_SEGMENTS);
 
     TEST_ASSERT(snapshot_value("quic", "handshakes_completed") == 1, "handshakes_completed");
     TEST_ASSERT(snapshot_value("quic", "handshakes_failed.tls") == 2, "handshakes_failed.tls");
@@ -156,6 +159,9 @@ TEST(test_h3metrics_quic_counters) {
     TEST_ASSERT(snapshot_value("quic", "amplification_limited") == 9, "amplification_limited");
     TEST_ASSERT(snapshot_value("quic", "closed.idle_timeout") == 10, "closed.idle_timeout");
     TEST_ASSERT(snapshot_value("quic", "closed.peer") == 11, "closed.peer");
+    TEST_ASSERT(snapshot_value("quic", "send.batch_calls") == 12, "send.batch_calls");
+    TEST_ASSERT(snapshot_value("quic", "send.gso_messages") == 13, "send.gso_messages");
+    TEST_ASSERT(snapshot_value("quic", "send.gso_segments") == 14, "send.gso_segments");
 
     /* Zeroes are reported, not omitted: "no handshake has failed" is an answer,
      * and a missing key reads as "this build has no HTTP/3". */

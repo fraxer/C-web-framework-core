@@ -120,6 +120,15 @@ typedef enum {
      * the number that says whether batching is earning anything. */
     METRICS_QUIC_RECV_CALLS,
 
+    /* Transmit batching/offload. datagrams_sent alone cannot distinguish a
+     * healthy GSO path from hundreds of thousands of one-packet messages. */
+    METRICS_QUIC_SEND_BATCH_CALLS,
+    METRICS_QUIC_SEND_BATCH_MESSAGES,
+    METRICS_QUIC_SEND_GSO_MESSAGES,
+    METRICS_QUIC_SEND_GSO_SEGMENTS,
+    METRICS_QUIC_SEND_GSO_FALLBACKS,
+    METRICS_QUIC_SEND_PARTIAL,
+
     /* Drops, by reason. */
     METRICS_QUIC_DROP_TRUNCATED,      /* buffer ended inside the invariant header */
     METRICS_QUIC_DROP_OVERSIZE,       /* larger than the receive buffer (MSG_TRUNC) */

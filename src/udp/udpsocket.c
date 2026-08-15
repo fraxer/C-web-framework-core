@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "log.h"
+#include "metrics.h"
 #include "udpsocket.h"
 
 /* Room for the local-address cmsg of either family, the ECN byte, the
@@ -605,6 +606,10 @@ int udp_tx_batch_flush(udp_tx_batch_t* batch, int fd, size_t* out_bytes) {
     for (size_t i = 0; i < queued; i++)
         __tx_prepare(batch, i, batch->gso);
 
+    metrics_quic(METRICS_QUIC_SEND_BATCH_CALLS);
+    metrics_quic_add(METRICS_QUIC_SEND_BATCH_MESSAGES,
+                     (unsigned long long)queued);
+
     const int n = sendmmsg(fd, batch->msgs, (unsigned int)queued, MSG_NOSIGNAL);
     if (n < 0) {
         /* A kernel (or a container) without segmentation offload says so here,
@@ -616,6 +621,7 @@ int udp_tx_batch_flush(udp_tx_batch_t* batch, int fd, size_t* out_bytes) {
             log_error("Udp socket error: no segmentation offload (errno %d), "
                       "falling back to one datagram per send\n", errno);
             batch->gso = 0;
+            metrics_quic(METRICS_QUIC_SEND_GSO_FALLBACKS);
 
             int split_sent = 0;
             for (size_t i = 0; i < queued; i++)
@@ -635,6 +641,27 @@ int udp_tx_batch_flush(udp_tx_batch_t* batch, int fd, size_t* out_bytes) {
         log_error("Udp socket error: sendmmsg failed (errno %d)\n", errno);
         return -1;
     }
+
+    if ((size_t)n < queued)
+        metrics_quic_add(METRICS_QUIC_SEND_PARTIAL,
+                         (unsigned long long)(queued - (size_t)n));
+
+    size_t gso_messages = 0;
+    size_t gso_segments = 0;
+    if (batch->gso) {
+        /* sendmmsg accepts a prefix. Do not call the unaccepted suffix GSO:
+         * those packets are deliberately left to QUIC loss recovery. */
+        for (int i = 0; i < n; i++) {
+            if (batch->segments[i] < 2) continue;
+            gso_messages++;
+            gso_segments += batch->segments[i];
+        }
+    }
+
+    metrics_quic_add(METRICS_QUIC_SEND_GSO_MESSAGES,
+                     (unsigned long long)gso_messages);
+    metrics_quic_add(METRICS_QUIC_SEND_GSO_SEGMENTS,
+                     (unsigned long long)gso_segments);
 
     /* The count is datagrams, not messages: everything above this function
      * counts packets on the wire, and one message may be twenty of them. */
