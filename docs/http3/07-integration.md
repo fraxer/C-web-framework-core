@@ -59,7 +59,7 @@
   http3_pacing                       true
   http3_rx_batch                     32
   http3_tx_batch                     32
-  http3_so_rcvbuf / http3_so_sndbuf  4194304
+  http3_so_rcvbuf / http3_so_sndbuf  0        системный default, [0 .. INT_MAX]
 
 Валидация адреса и защита
   http3_retry                        "auto" | "always" | "never"
@@ -185,7 +185,10 @@ http3_pacing                   true
 http3_amplification_factor     3       [1 .. 16]
 
 http3_handshake_rate           500     новых рукопожатий/с, 0 = без лимита
-http3_handshake_burst          1000
+http3_handshake_burst          1000    [1 .. INT_MAX]
+http3_rx_batch                 32      [1 .. 256]
+http3_retry_threshold          1000    [0 .. 4000000]
+http3_token_lifetime_sec       86400   [1 .. 315360000]
 ```
 
 Границы — не вкусовые: `max_streams_uni` не может быть меньше **трёх**, потому
@@ -204,6 +207,9 @@ burst'ом в сторону пути.
 Все перечисленные границы валидируются без clamp: неверный тип или значение за
 пределами диапазона останавливает загрузку конфигурации. `http3_pacing` имеет
 строгий JSON boolean тип (`true`/`false`), числовые `0`/`1` не принимаются.
+То же относится к `http3_new_token`. Rate-параметры принимают
+`0..INT_MAX` (`0` отключает соответствующий rate-limit), burst-параметры —
+`1..INT_MAX`; отрицательные значения больше не превращаются молча в fallback.
 
 Та же проверка выполняется транзакционно перед reload. Кандидат читается из
 отдельного, ещё не опубликованного `env`; при ошибке старое поколение Server

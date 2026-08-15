@@ -227,15 +227,15 @@ static _Atomic size_t __quic_max_connections = QUIC_DEFAULT_MAX_CONNECTIONS;
 static _Atomic size_t __quic_connections = 0;
 static _Atomic size_t __quic_handshakes_inflight = 0;
 static uint8_t  __quic_reset_key[32];
-static size_t   __quic_rx_batch = 32;
-static int      __quic_rcvbuf = 0;
-static int      __quic_sndbuf = 0;
-static int64_t  __quic_vn_rate = QUIC_DEFAULT_VN_RATE;
-static int64_t  __quic_vn_burst = QUIC_DEFAULT_VN_BURST;
-static int64_t  __quic_reset_rate = QUIC_DEFAULT_RESET_RATE;
-static int64_t  __quic_reset_burst = QUIC_DEFAULT_RESET_BURST;
-static int64_t  __quic_handshake_rate = QUIC_DEFAULT_HANDSHAKE_RATE;
-static int64_t  __quic_handshake_burst = QUIC_DEFAULT_HANDSHAKE_BURST;
+static _Atomic size_t __quic_rx_batch = 32;
+static _Atomic int __quic_rcvbuf = 0;
+static _Atomic int __quic_sndbuf = 0;
+static _Atomic int64_t __quic_vn_rate = QUIC_DEFAULT_VN_RATE;
+static _Atomic int64_t __quic_vn_burst = QUIC_DEFAULT_VN_BURST;
+static _Atomic int64_t __quic_reset_rate = QUIC_DEFAULT_RESET_RATE;
+static _Atomic int64_t __quic_reset_burst = QUIC_DEFAULT_RESET_BURST;
+static _Atomic int64_t __quic_handshake_rate = QUIC_DEFAULT_HANDSHAKE_RATE;
+static _Atomic int64_t __quic_handshake_burst = QUIC_DEFAULT_HANDSHAKE_BURST;
 
 typedef struct {
     int64_t tokens;
@@ -252,11 +252,11 @@ static quic_process_bucket_t __quic_handshake_bucket = { .lock = ATOMIC_FLAG_INI
  * single key would make a token forgeable by anyone who could collect resets. */
 static uint8_t  __quic_token_key[32];
 typedef enum { QUIC_RETRY_AUTO = 0, QUIC_RETRY_ALWAYS, QUIC_RETRY_NEVER } quic_retry_mode_e;
-static quic_retry_mode_e __quic_retry_mode = QUIC_RETRY_AUTO;
-static size_t   __quic_retry_threshold = QUIC_DEFAULT_RETRY_THRESHOLD;
-static uint64_t __quic_token_lifetime_us =
+static _Atomic quic_retry_mode_e __quic_retry_mode = QUIC_RETRY_AUTO;
+static _Atomic size_t __quic_retry_threshold = QUIC_DEFAULT_RETRY_THRESHOLD;
+static _Atomic uint64_t __quic_token_lifetime_us =
     (uint64_t)QUIC_DEFAULT_TOKEN_LIFETIME_SEC * 1000000ULL;
-static int      __quic_new_token = 1;
+static _Atomic int __quic_new_token = 1;
 
 static void __memory_metrics(size_t current, size_t limit,
                              unsigned long long refused) {
@@ -411,63 +411,126 @@ static int __conn_policy_parse(const env_t* source, quic_conn_policy_t* next) {
     return 1;
 }
 
-int quic_policy_validate(const env_t* candidate) {
-    long long value = QUIC_DEFAULT_MAX_CONNECTIONS;
-    if (env_config_get_llong_checked(candidate, "http3_max_connections", &value) < 0 ||
-        value < 64 || value > 4000000) {
-        log_error("quic: http3_max_connections must be an integer in 64..4000000\n");
+typedef struct {
+    int64_t max_connections;
+    int64_t memory_limit; /* -1 means the 25% RAM default */
+    int64_t rx_batch;
+    int64_t rcvbuf;
+    int64_t sndbuf;
+    int64_t vn_rate;
+    int64_t vn_burst;
+    int64_t reset_rate;
+    int64_t reset_burst;
+    int64_t handshake_rate;
+    int64_t handshake_burst;
+    quic_retry_mode_e retry_mode;
+    int64_t retry_threshold;
+    int64_t token_lifetime_sec;
+    bool new_token;
+} quic_runtime_policy_t;
+
+static int __policy_i64(const env_t* source, const char* key, int64_t fallback,
+                        int64_t min, int64_t max, int64_t* out) {
+    long long value = fallback;
+    if (env_config_get_llong_checked(source, key, &value) < 0) {
+        log_error("quic: %s must be an integer\n", key);
         return 0;
     }
+    if (value < min || value > max) {
+        log_error("quic: %s must be in %lld..%lld (got %lld)\n", key,
+                  (long long)min, (long long)max, value);
+        return 0;
+    }
+    *out = value;
+    return 1;
+}
 
-    value = -1;
+static int __runtime_policy_parse(const env_t* source, quic_runtime_policy_t* p) {
+    p->memory_limit = -1;
+    if (!__policy_i64(source, "http3_max_connections",
+                      QUIC_DEFAULT_MAX_CONNECTIONS, 64, 4000000,
+                      &p->max_connections)) return 0;
+
+    long long memory = -1;
     const int memory_status = env_config_get_llong_checked(
-        candidate, "http3_buffer_memory_limit", &value);
-    if (memory_status < 0 || (memory_status > 0 && value < 0)) {
+        source, "http3_buffer_memory_limit", &memory);
+    if (memory_status < 0 || (memory_status > 0 && memory < 0)) {
         log_error("quic: http3_buffer_memory_limit must be a non-negative integer\n");
         return 0;
     }
+    if (memory_status > 0) p->memory_limit = memory;
 
-    quic_conn_policy_t policy = __quic_conn_policy;
-    if (!__conn_policy_parse(candidate, &policy)) return 0;
+    if (!__policy_i64(source, "http3_rx_batch", 32, 1, 256,
+                      &p->rx_batch) ||
+        !__policy_i64(source, "http3_so_rcvbuf", 0, 0, INT_MAX,
+                      &p->rcvbuf) ||
+        !__policy_i64(source, "http3_so_sndbuf", 0, 0, INT_MAX,
+                      &p->sndbuf) ||
+        !__policy_i64(source, "http3_version_negotiation_rate",
+                      QUIC_DEFAULT_VN_RATE, 0, INT_MAX, &p->vn_rate) ||
+        !__policy_i64(source, "http3_version_negotiation_burst",
+                      QUIC_DEFAULT_VN_BURST, 1, INT_MAX, &p->vn_burst) ||
+        !__policy_i64(source, "http3_stateless_reset_rate",
+                      QUIC_DEFAULT_RESET_RATE, 0, INT_MAX, &p->reset_rate) ||
+        !__policy_i64(source, "http3_stateless_reset_burst",
+                      QUIC_DEFAULT_RESET_BURST, 1, INT_MAX, &p->reset_burst) ||
+        !__policy_i64(source, "http3_handshake_rate",
+                      QUIC_DEFAULT_HANDSHAKE_RATE, 0, INT_MAX,
+                      &p->handshake_rate) ||
+        !__policy_i64(source, "http3_handshake_burst",
+                      QUIC_DEFAULT_HANDSHAKE_BURST, 1, INT_MAX,
+                      &p->handshake_burst) ||
+        !__policy_i64(source, "http3_retry_threshold",
+                      QUIC_DEFAULT_RETRY_THRESHOLD, 0, 4000000,
+                      &p->retry_threshold) ||
+        !__policy_i64(source, "http3_token_lifetime_sec",
+                      QUIC_DEFAULT_TOKEN_LIFETIME_SEC, 1, 315360000,
+                      &p->token_lifetime_sec)) return 0;
 
     const char* retry = "auto";
-    if (env_config_get_string_checked(candidate, "http3_retry", &retry) < 0 ||
-        (strcmp(retry, "auto") != 0 && strcmp(retry, "always") != 0 &&
-         strcmp(retry, "never") != 0)) {
-        log_error("quic: http3_retry must be auto, always or never\n");
+    if (env_config_get_string_checked(source, "http3_retry", &retry) < 0) {
+        log_error("quic: http3_retry must be a string\n");
+        return 0;
+    }
+    if (strcmp(retry, "always") == 0) p->retry_mode = QUIC_RETRY_ALWAYS;
+    else if (strcmp(retry, "never") == 0) p->retry_mode = QUIC_RETRY_NEVER;
+    else if (strcmp(retry, "auto") == 0) p->retry_mode = QUIC_RETRY_AUTO;
+    else {
+        log_error("quic: http3_retry must be auto, always or never (got '%s')\n",
+                  retry);
+        return 0;
+    }
+
+    p->new_token = true;
+    if (env_config_get_bool_checked(source, "http3_new_token", &p->new_token) < 0) {
+        log_error("quic: http3_new_token must be a boolean\n");
         return 0;
     }
     return 1;
 }
 
+int quic_policy_validate(const env_t* candidate) {
+    quic_runtime_policy_t runtime;
+    if (!__runtime_policy_parse(candidate, &runtime)) return 0;
+
+    quic_conn_policy_t policy = __quic_conn_policy;
+    if (!__conn_policy_parse(candidate, &policy)) return 0;
+    return 1;
+}
+
 int quic_policy_init(void) {
     const env_t* source = env();
-    if (!quic_policy_validate(source)) return 0;
-    long long configured_max = QUIC_DEFAULT_MAX_CONNECTIONS;
-    const int max_status = env_get_llong_checked("http3_max_connections", &configured_max);
-    if (max_status < 0) {
-        log_error("quic: http3_max_connections must be an integer\n");
-        return 0;
-    }
-    const int64_t max_connections = configured_max;
-    if (max_connections < 64 || max_connections > 4000000) {
-        log_error("quic: http3_max_connections must be in 64..4000000 (got %lld)\n",
-                  (long long)max_connections);
-        return 0;
-    }
+    quic_runtime_policy_t runtime;
+    quic_conn_policy_t next_policy = __quic_conn_policy;
+    if (!__runtime_policy_parse(source, &runtime) ||
+        !__conn_policy_parse(source, &next_policy)) return 0;
+    const int64_t max_connections = runtime.max_connections;
     atomic_store_explicit(&__quic_max_connections, (size_t)max_connections,
                           memory_order_release);
     metrics_quic_connections(quic_process_conn_current(), (size_t)max_connections);
 
-    long long memory_limit = -1;
-    const int memory_status =
-        env_get_llong_checked("http3_buffer_memory_limit", &memory_limit);
-    if (memory_status < 0 || memory_limit < 0) {
-        if (memory_status != 0) {
-            log_error("quic: http3_buffer_memory_limit must be a non-negative integer\n");
-            return 0;
-        }
-
+    long long memory_limit = runtime.memory_limit;
+    if (memory_limit < 0) {
         const long pages = sysconf(_SC_PHYS_PAGES);
         const long page_size = sysconf(_SC_PAGESIZE);
         if (pages <= 0 || page_size <= 0 ||
@@ -483,62 +546,25 @@ int quic_policy_init(void) {
     if (memory_limit == 0)
         log_error("quic: http3_buffer_memory_limit=0 disables the process memory budget\n");
 
-    int64_t batch = env_get_int("http3_rx_batch", 32);
-    if (batch < 1) batch = 1;
-    if (batch > 256) batch = 256;
-    __quic_rx_batch = (size_t)batch;
-
-    __quic_rcvbuf = env_get_int("http3_so_rcvbuf", 0);
-    __quic_sndbuf = env_get_int("http3_so_sndbuf", 0);
-
-    quic_conn_policy_t next_policy = __quic_conn_policy;
-    if (!__conn_policy_parse(source, &next_policy)) return 0;
+    atomic_store(&__quic_rx_batch, (size_t)runtime.rx_batch);
+    atomic_store(&__quic_rcvbuf, (int)runtime.rcvbuf);
+    atomic_store(&__quic_sndbuf, (int)runtime.sndbuf);
     __quic_conn_policy = next_policy;
 
     /* 0 disables a limit. Every one of these guesses a threshold, and an
      * operator needs a way to prove a limit is the cause of an incident --
      * the same reasoning as the HTTP/2 budgets (docs/http2/08, phase A). */
-    __quic_vn_rate = env_get_int("http3_version_negotiation_rate", QUIC_DEFAULT_VN_RATE);
-    if (__quic_vn_rate < 0) __quic_vn_rate = 0;
-    __quic_vn_burst = env_get_int("http3_version_negotiation_burst", QUIC_DEFAULT_VN_BURST);
-    if (__quic_vn_burst < 1) __quic_vn_burst = 1;
-
-    __quic_reset_rate = env_get_int("http3_stateless_reset_rate", QUIC_DEFAULT_RESET_RATE);
-    if (__quic_reset_rate < 0) __quic_reset_rate = 0;
-    __quic_reset_burst = env_get_int("http3_stateless_reset_burst", QUIC_DEFAULT_RESET_BURST);
-    if (__quic_reset_burst < 1) __quic_reset_burst = 1;
-
-    __quic_handshake_rate = env_get_int("http3_handshake_rate", QUIC_DEFAULT_HANDSHAKE_RATE);
-    if (__quic_handshake_rate < 0) __quic_handshake_rate = 0;
-    __quic_handshake_burst = env_get_int("http3_handshake_burst", QUIC_DEFAULT_HANDSHAKE_BURST);
-    if (__quic_handshake_burst < 1) __quic_handshake_burst = 1;
-
-    const char* retry = "auto";
-    if (env_get_string_checked("http3_retry", &retry) < 0) {
-        log_error("quic: http3_retry must be a string\n");
-        return 0;
-    }
-    if (strcmp(retry, "always") == 0)
-        __quic_retry_mode = QUIC_RETRY_ALWAYS;
-    else if (strcmp(retry, "never") == 0)
-        __quic_retry_mode = QUIC_RETRY_NEVER;
-    else if (strcmp(retry, "auto") == 0)
-        __quic_retry_mode = QUIC_RETRY_AUTO;
-    else {
-        log_error("quic: http3_retry must be auto, always or never (got '%s')\n", retry);
-        return 0;
-    }
-
-    int64_t threshold = env_get_int("http3_retry_threshold", QUIC_DEFAULT_RETRY_THRESHOLD);
-    if (threshold < 0) threshold = 0;
-    __quic_retry_threshold = (size_t)threshold;
-
-    int64_t token_life = env_get_int("http3_token_lifetime_sec",
-                                     QUIC_DEFAULT_TOKEN_LIFETIME_SEC);
-    if (token_life < 1) token_life = 1;
-    __quic_token_lifetime_us = (uint64_t)token_life * 1000000ULL;
-
-    __quic_new_token = env_get_int("http3_new_token", 1) != 0;
+    atomic_store(&__quic_vn_rate, runtime.vn_rate);
+    atomic_store(&__quic_vn_burst, runtime.vn_burst);
+    atomic_store(&__quic_reset_rate, runtime.reset_rate);
+    atomic_store(&__quic_reset_burst, runtime.reset_burst);
+    atomic_store(&__quic_handshake_rate, runtime.handshake_rate);
+    atomic_store(&__quic_handshake_burst, runtime.handshake_burst);
+    atomic_store(&__quic_retry_mode, runtime.retry_mode);
+    atomic_store(&__quic_retry_threshold, (size_t)runtime.retry_threshold);
+    atomic_store(&__quic_token_lifetime_us,
+                 (uint64_t)runtime.token_lifetime_sec * 1000000ULL);
+    atomic_store(&__quic_new_token, runtime.new_token);
 
     /* ---- Everything below is created once per process ---- *
      *
@@ -652,7 +678,7 @@ static int __budget_spend(quic_process_bucket_t* bucket,
  * the whole point is to answer for a connection we no longer have. */
 size_t quicendpoint_new_token(const struct sockaddr* peer, socklen_t peer_len,
                               uint8_t* out, size_t cap) {
-    if (!__quic_new_token || peer == NULL || out == NULL) return 0;
+    if (!atomic_load(&__quic_new_token) || peer == NULL || out == NULL) return 0;
 
     return quic_token_write(out, cap, __quic_token_key, QUIC_TOKEN_NEW_TOKEN,
                             peer, peer_len, NULL, quic_now_us());
@@ -695,7 +721,8 @@ static void __send_stateless_reset(quicendpoint_t* ep, const udp_datagram_t* dgr
         return;
     }
 
-    if (!__budget_spend(&__quic_reset_bucket, __quic_reset_rate, __quic_reset_burst)) {
+    if (!__budget_spend(&__quic_reset_bucket, atomic_load(&__quic_reset_rate),
+                        atomic_load(&__quic_reset_burst))) {
         metrics_quic(METRICS_QUIC_DROP_NO_BUDGET);
         return;
     }
@@ -848,7 +875,8 @@ static void __send_initial_close(quicendpoint_t* ep, const udp_datagram_t* dgram
 
 static void __send_version_negotiation(quicendpoint_t* ep, const udp_datagram_t* dgram,
                                        const quicinvariants_t* inv) {
-    if (!__budget_spend(&__quic_vn_bucket, __quic_vn_rate, __quic_vn_burst)) {
+    if (!__budget_spend(&__quic_vn_bucket, atomic_load(&__quic_vn_rate),
+                        atomic_load(&__quic_vn_burst))) {
         metrics_quic(METRICS_QUIC_DROP_NO_BUDGET);
         return;
     }
@@ -1583,7 +1611,7 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
             st = quic_token_read(pkt_token, pkt_token_len, __quic_token_key,
                                  QUIC_TOKEN_NEW_TOKEN,
                                  (const struct sockaddr*)&dgram->peer, dgram->peer_len,
-                                 now, __quic_token_lifetime_us, NULL);
+                                 now, atomic_load(&__quic_token_lifetime_us), NULL);
 
             if (st == QUIC_TOKEN_OK) {
                 validated = 1;
@@ -1594,10 +1622,11 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
         }
     }
 
-    if (!validated && __quic_retry_mode != QUIC_RETRY_NEVER &&
-        (__quic_retry_mode == QUIC_RETRY_ALWAYS ||
+    const quic_retry_mode_e retry_mode = atomic_load(&__quic_retry_mode);
+    if (!validated && retry_mode != QUIC_RETRY_NEVER &&
+        (retry_mode == QUIC_RETRY_ALWAYS ||
          atomic_load_explicit(&__quic_handshakes_inflight, memory_order_acquire) >=
-             __quic_retry_threshold)) {
+             atomic_load(&__quic_retry_threshold))) {
         __send_retry(ep, dgram, &inv);
         return;
     }
@@ -1611,7 +1640,8 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
      * us, at an address we have not validated. The client's own
      * retransmissions handle the rest. */
     if (!__budget_spend(&__quic_handshake_bucket,
-                        __quic_handshake_rate, __quic_handshake_burst)) {
+                        atomic_load(&__quic_handshake_rate),
+                        atomic_load(&__quic_handshake_burst))) {
         metrics_quic(METRICS_QUIC_HANDSHAKE_RATE_LIMITED);
         log_debug("quic: drop handshake_rate_limited\n");
         return;
@@ -1831,7 +1861,7 @@ static int __endpoint_read(connection_t* connection) {
         }
 
         /* A short batch means the socket is drained. */
-        if ((size_t)n < __quic_rx_batch) break;
+        if ((size_t)n < ep->rx_batch) break;
     }
 
     /* The answers to everything just dispatched, in one syscall (§7d). Before
@@ -1991,8 +2021,8 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server,
 
     const udp_socket_options_t options = {
         .reuseport = 1,
-        .rcvbuf = __quic_rcvbuf,
-        .sndbuf = __quic_sndbuf
+        .rcvbuf = atomic_load(&__quic_rcvbuf),
+        .sndbuf = atomic_load(&__quic_sndbuf)
     };
 
     ep->transport = __transport_acquire(&ep->local, ep->local_len, &options,
@@ -2001,13 +2031,15 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server,
     if (ep->transport == NULL) goto failed;
     ep->fd = ep->transport->fd;
 
-    ep->rx = udp_rx_batch_create(__quic_rx_batch, QUIC_RX_DATAGRAM_SIZE);
+    const size_t rx_batch = atomic_load(&__quic_rx_batch);
+    ep->rx_batch = rx_batch;
+    ep->rx = udp_rx_batch_create(rx_batch, QUIC_RX_DATAGRAM_SIZE);
     if (ep->rx == NULL) goto failed;
 
     /* Same depth as the receive batch: what arrives in one turn is roughly what
      * leaves in one, and both are bounded by the worker's visit rather than by
      * memory. */
-    ep->tx_batch = udp_tx_batch_create(__quic_rx_batch, QUIC_RX_DATAGRAM_SIZE);
+    ep->tx_batch = udp_tx_batch_create(rx_batch, QUIC_RX_DATAGRAM_SIZE);
     if (ep->tx_batch == NULL) goto failed;
 
     /* The endpoint's own connection carries no buffer: datagrams live in the

@@ -54,6 +54,9 @@ typedef struct quicendpoint {
     socklen_t local_len;
 
     udp_rx_batch_t* rx;
+    /* Snapshot of the generation's configured batch depth. Reload may publish
+     * a different depth while this endpoint is still draining. */
+    size_t rx_batch;
 
     /* Datagrams built but not yet handed to the kernel (docs/http3/08 §7d).
      *

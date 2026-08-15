@@ -55,6 +55,13 @@ ok=1
 run_invalid http3_idle_timeout_sec 0 || ok=0
 run_invalid http3_max_streams_uni '"three"' || ok=0
 run_invalid http3_pacing 2 || ok=0
+run_invalid http3_rx_batch 257 || ok=0
+run_invalid http3_so_rcvbuf -1 || ok=0
+run_invalid http3_handshake_rate -1 || ok=0
+run_invalid http3_stateless_reset_burst 0 || ok=0
+run_invalid http3_retry_threshold 4000001 || ok=0
+run_invalid http3_token_lifetime_sec 0 || ok=0
+run_invalid http3_new_token 1 || ok=0
 
 [ "$ok" -eq 1 ] || exit 1
 
