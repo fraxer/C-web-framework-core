@@ -320,6 +320,8 @@ void quicendpoints_free(quicendpoint_t* endpoints);
  * their own. */
 ssize_t quicendpoint_send(quicendpoint_t* endpoint, const uint8_t* data, size_t len,
                           const struct quicpath* path);
+ssize_t quicendpoint_send_ecn(quicendpoint_t* endpoint, const uint8_t* data,
+                              size_t len, const struct quicpath* path, uint8_t ecn);
 
 /* Hand everything queued to the kernel. Cheap and idempotent when the batch is
  * empty, so it belongs at the end of every entry point that can send: the

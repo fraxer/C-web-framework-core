@@ -10,6 +10,10 @@
 #include "metrics.h"
 #include "udpsocket.h"
 
+#ifndef UDP_GRO
+#define UDP_GRO 104
+#endif
+
 /* Room for the local-address cmsg of either family, the ECN byte, the
  * receive-queue overflow counter, the arrival timestamp -- and, on the send
  * side, the segment size that goes out alongside the local address. */
@@ -94,6 +98,23 @@ int udp_socket_create(const struct sockaddr* addr, socklen_t addrlen,
         int mtu = IP_PMTUDISC_DO;
         if (setsockopt(fd, IPPROTO_IP, IP_MTU_DISCOVER, &mtu, sizeof mtu) == -1)
             log_error("Udp socket error: IP_MTU_DISCOVER failed (errno %d)\n", errno);
+    }
+
+    /* Best effort: Linux 5.0+. A kernel without GRO still delivers ordinary
+     * datagrams, so lack of offload must never prevent the endpoint starting. */
+    if (setsockopt(fd, IPPROTO_UDP, UDP_GRO, &on, sizeof on) == -1 &&
+        errno != ENOPROTOOPT && errno != EOPNOTSUPP)
+        log_error("Udp socket error: UDP_GRO unavailable (errno %d)\n", errno);
+
+    /* Receive the ECN field of every IP packet. Like GRO, failure degrades to
+     * Not-ECT rather than making QUIC unavailable. */
+    if (family == AF_INET) {
+        if (setsockopt(fd, IPPROTO_IP, IP_RECVTOS, &on, sizeof on) == -1)
+            log_error("Udp socket error: IP_RECVTOS failed (errno %d)\n", errno);
+    }
+    else {
+        if (setsockopt(fd, IPPROTO_IPV6, IPV6_RECVTCLASS, &on, sizeof on) == -1)
+            log_error("Udp socket error: IPV6_RECVTCLASS failed (errno %d)\n", errno);
     }
 
     /* Ask the kernel to tell us what it drops. A failure here is not fatal:
@@ -195,6 +216,7 @@ void udp_rx_batch_free(udp_rx_batch_t* batch) {
 static void __parse_control(struct msghdr* hdr, udp_datagram_t* dgram) {
     dgram->local_valid = 0;
     dgram->ecn = 0;
+    dgram->gro_segment_size = 0;
     dgram->drops = 0;
     dgram->drops_valid = 0;
     dgram->stamp_us = 0;
@@ -239,9 +261,20 @@ static void __parse_control(struct msghdr* hdr, udp_datagram_t* dgram) {
                               (uint64_t)ts.tv_nsec / 1000ULL;
             dgram->stamp_valid = 1;
         }
-        /* ECN (IP_RECVTOS / IPV6_RECVTCLASS) is phase 9. The socket does not ask
-         * for it, so there is deliberately no branch here: a placeholder that
-         * never runs is a placeholder nobody notices is wrong. */
+        else if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_TOS) {
+            uint8_t tos = 0;
+            memcpy(&tos, CMSG_DATA(cmsg), sizeof tos);
+            dgram->ecn = tos & 0x03;
+        }
+        else if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_TCLASS) {
+            int tclass = 0;
+            memcpy(&tclass, CMSG_DATA(cmsg), sizeof tclass);
+            dgram->ecn = (uint8_t)tclass & 0x03;
+        }
+        else if (cmsg->cmsg_level == IPPROTO_UDP && cmsg->cmsg_type == UDP_GRO) {
+            memcpy(&dgram->gro_segment_size, CMSG_DATA(cmsg),
+                   sizeof dgram->gro_segment_size);
+        }
     }
 }
 
@@ -373,6 +406,7 @@ struct udp_tx_batch {
     struct sockaddr_storage* peers;
     struct sockaddr_storage* locals;
     int* local_valid;
+    uint8_t* ecn;
 
     /* Per message: the segment size the kernel is told to cut at (0 when the
      * message is a single datagram) and how many datagrams it holds. */
@@ -408,12 +442,13 @@ udp_tx_batch_t* udp_tx_batch_create(size_t count, size_t datagram_size) {
     batch->peers = calloc(count, sizeof * batch->peers);
     batch->locals = calloc(count, sizeof * batch->locals);
     batch->local_valid = calloc(count, sizeof * batch->local_valid);
+    batch->ecn = calloc(count, sizeof * batch->ecn);
     batch->seg_size = calloc(count, sizeof * batch->seg_size);
     batch->segments = calloc(count, sizeof * batch->segments);
 
     if (batch->msgs == NULL || batch->iov == NULL || batch->arena == NULL ||
         batch->control == NULL || batch->peers == NULL || batch->locals == NULL ||
-        batch->local_valid == NULL || batch->seg_size == NULL ||
+        batch->local_valid == NULL || batch->ecn == NULL || batch->seg_size == NULL ||
         batch->segments == NULL) {
         udp_tx_batch_free(batch);
         return NULL;
@@ -441,6 +476,7 @@ void udp_tx_batch_free(udp_tx_batch_t* batch) {
     free(batch->peers);
     free(batch->locals);
     free(batch->local_valid);
+    free(batch->ecn);
     free(batch->seg_size);
     free(batch->segments);
     free(batch);
@@ -458,7 +494,7 @@ size_t udp_tx_batch_count(const udp_tx_batch_t* batch) {
  * closes the run. */
 static int __tx_joins_open(const udp_tx_batch_t* batch, size_t len,
                            const struct sockaddr* peer, socklen_t peer_len,
-                           const struct sockaddr_storage* local) {
+                           const struct sockaddr_storage* local, uint8_t ecn) {
     if (!batch->gso || batch->open < 0) return 0;
 
     const size_t i = (size_t)batch->open;
@@ -470,6 +506,7 @@ static int __tx_joins_open(const udp_tx_batch_t* batch, size_t len,
     const int valid = local != NULL && local->ss_family == peer->sa_family;
     if (batch->local_valid[i] != valid) return 0;
     if (valid && memcmp(&batch->locals[i], local, sizeof * local) != 0) return 0;
+    if (batch->ecn[i] != (ecn & 0x03)) return 0;
 
     /* Equal to the run's segment size continues it; smaller ends it; larger
      * cannot belong to it at all. */
@@ -479,13 +516,19 @@ static int __tx_joins_open(const udp_tx_batch_t* batch, size_t len,
 int udp_tx_batch_add(udp_tx_batch_t* batch, const uint8_t* data, size_t len,
                      const struct sockaddr* peer, socklen_t peer_len,
                      const struct sockaddr_storage* local) {
+    return udp_tx_batch_add_ecn(batch, data, len, peer, peer_len, local, 0);
+}
+
+int udp_tx_batch_add_ecn(udp_tx_batch_t* batch, const uint8_t* data, size_t len,
+                         const struct sockaddr* peer, socklen_t peer_len,
+                         const struct sockaddr_storage* local, uint8_t ecn) {
     if (batch == NULL || data == NULL || peer == NULL || len == 0) return -1;
     if (len > batch->datagram_size || peer_len > sizeof(struct sockaddr_storage))
         return 0;
 
     if (batch->used + len > batch->arena_size) return 0;
 
-    if (__tx_joins_open(batch, len, peer, peer_len, local)) {
+    if (__tx_joins_open(batch, len, peer, peer_len, local, ecn)) {
         const size_t i = (size_t)batch->open;
 
         memcpy(batch->arena + batch->used, data, len);
@@ -515,6 +558,7 @@ int udp_tx_batch_add(udp_tx_batch_t* batch, const uint8_t* data, size_t len,
 
     batch->local_valid[i] = local != NULL && local->ss_family == peer->sa_family;
     if (batch->local_valid[i]) memcpy(&batch->locals[i], local, sizeof * local);
+    batch->ecn[i] = ecn & 0x03;
 
     batch->seg_size[i] = (uint16_t)len;
     batch->segments[i] = 1;
@@ -538,6 +582,22 @@ static void __tx_prepare(udp_tx_batch_t* batch, size_t i, int with_gso) {
     __msg_set_local(hdr, control, batch->local_valid[i] ? &batch->locals[i] : NULL,
                     ((const struct sockaddr*)&batch->peers[i])->sa_family);
 
+    if (batch->ecn[i]) {
+        const size_t used = hdr->msg_controllen;
+        hdr->msg_control = control;
+        hdr->msg_controllen = used + CMSG_SPACE(sizeof(int));
+        struct cmsghdr* ec = used ? CMSG_NXTHDR(hdr, CMSG_FIRSTHDR(hdr))
+                                  : CMSG_FIRSTHDR(hdr);
+        if (ec != NULL) {
+            const int value = batch->ecn[i];
+            const int family = ((const struct sockaddr*)&batch->peers[i])->sa_family;
+            ec->cmsg_level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
+            ec->cmsg_type = family == AF_INET6 ? IPV6_TCLASS : IP_TOS;
+            ec->cmsg_len = CMSG_LEN(sizeof value);
+            memcpy(CMSG_DATA(ec), &value, sizeof value);
+        }
+    }
+
     if (!with_gso || batch->segments[i] < 2) return;
 
     const size_t local_len = hdr->msg_controllen;
@@ -546,8 +606,7 @@ static void __tx_prepare(udp_tx_batch_t* batch, size_t i, int with_gso) {
     hdr->msg_control = control;
     hdr->msg_controllen = local_len + CMSG_SPACE(sizeof(uint16_t));
 
-    struct cmsghdr* cmsg = local_len > 0
-        ? CMSG_NXTHDR(hdr, CMSG_FIRSTHDR(hdr)) : CMSG_FIRSTHDR(hdr);
+    struct cmsghdr* cmsg = (struct cmsghdr*)(control + local_len);
     if (cmsg == NULL) {
         hdr->msg_controllen = local_len;
         return;
@@ -573,10 +632,11 @@ static int __tx_send_split(udp_tx_batch_t* batch, size_t i, int fd, size_t* out_
     while (left > 0) {
         const size_t take = left < seg ? left : seg;
 
-        const ssize_t n = udp_send(fd, p, take,
+        const ssize_t n = udp_send_ecn(fd, p, take,
                                    (const struct sockaddr*)&batch->peers[i],
                                    batch->msgs[i].msg_hdr.msg_namelen,
-                                   batch->local_valid[i] ? &batch->locals[i] : NULL);
+                                   batch->local_valid[i] ? &batch->locals[i] : NULL,
+                                   batch->ecn[i]);
         if (n > 0) {
             sent++;
             if (out_bytes != NULL) *out_bytes += (size_t)n;
@@ -677,6 +737,12 @@ int udp_tx_batch_flush(udp_tx_batch_t* batch, int fd, size_t* out_bytes) {
 ssize_t udp_send(int fd, const uint8_t* data, size_t len,
                  const struct sockaddr* peer, socklen_t peer_len,
                  const struct sockaddr_storage* local) {
+    return udp_send_ecn(fd, data, len, peer, peer_len, local, 0);
+}
+
+ssize_t udp_send_ecn(int fd, const uint8_t* data, size_t len,
+                     const struct sockaddr* peer, socklen_t peer_len,
+                     const struct sockaddr_storage* local, uint8_t ecn) {
     if (data == NULL || peer == NULL) return -1;
 
     struct iovec iov = { .iov_base = (void*)data, .iov_len = len };
@@ -690,6 +756,21 @@ ssize_t udp_send(int fd, const uint8_t* data, size_t len,
     hdr.msg_iovlen = 1;
 
     __msg_set_local(&hdr, control, local, peer->sa_family);
+
+    if (ecn & 0x03) {
+        const size_t used = hdr.msg_controllen;
+        hdr.msg_control = control;
+        hdr.msg_controllen = used + CMSG_SPACE(sizeof(int));
+        struct cmsghdr* ec = used ? CMSG_NXTHDR(&hdr, CMSG_FIRSTHDR(&hdr))
+                                  : CMSG_FIRSTHDR(&hdr);
+        if (ec != NULL) {
+            const int value = ecn & 0x03;
+            ec->cmsg_level = peer->sa_family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
+            ec->cmsg_type = peer->sa_family == AF_INET6 ? IPV6_TCLASS : IP_TOS;
+            ec->cmsg_len = CMSG_LEN(sizeof value);
+            memcpy(CMSG_DATA(ec), &value, sizeof value);
+        }
+    }
 
     const ssize_t sent = sendmsg(fd, &hdr, MSG_NOSIGNAL);
     if (sent < 0) {

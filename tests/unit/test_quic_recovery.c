@@ -1,8 +1,10 @@
 #include "framework.h"
 
+#include "quicack.h"
 #include "quiccc.h"
 #include "quicloss.h"
 #include "quicpacket.h"
+#include "quicpmtud.h"
 #include "quictime.h"
 
 #include <string.h>
@@ -144,6 +146,47 @@ TEST(test_quic_cc_cubic) {
     TEST_ASSERT(cc.cwnd == 2 * MTU, "minimum window");
     TEST_ASSERT(quiccc_in_slow_start(&cc), "slow start restored");
     TEST_ASSERT(cc.cubic_w_max == 0, "old path history discarded");
+}
+
+TEST(test_quic_ecn_accounting) {
+    TEST_SUITE("quic_ecn");
+    quicack_t ack;
+    quicack_init(&ack);
+
+    quicack_on_received_ecn(&ack, QUIC_ENC_APP, 1, 1, 0x02, 1000, 25000);
+    quicack_on_received_ecn(&ack, QUIC_ENC_APP, 2, 1, 0x03, 1100, 25000);
+    TEST_ASSERT(ack.has_ecn, "ACK_ECN enabled by marked packets");
+    TEST_ASSERT(ack.ect0 == 1 && ack.ce == 1 && ack.ect1 == 0,
+                "ECT(0) and CE counted independently");
+
+    uint8_t frame[128];
+    const size_t n = quicack_write(&ack, frame, sizeof frame, 1200, 3);
+    quicframe_t parsed;
+    size_t off = 0;
+    TEST_ASSERT(n > 0 && quicframe_next(frame, n, &off, &parsed) == QUICFRAME_OK,
+                "ACK_ECN encoded and parsed");
+    TEST_ASSERT(parsed.type == QUIC_FRAME_ACK_ECN && parsed.u.ack.ect0 == 1 &&
+                parsed.u.ack.ce == 1, "wire counters preserved");
+    quicack_free(&ack);
+}
+
+TEST(test_quic_dplpmtud) {
+    TEST_SUITE("quic_dplpmtud");
+    quicpmtud_t p;
+    quicpmtud_init(&p, 1350, 1472);
+
+    TEST_ASSERT(quicpmtud_should_probe(&p, 1), "search begins at the base PLPMTU");
+    TEST_ASSERT(quicpmtud_candidate(&p) == 1472, "probes the link MTU ceiling");
+    quicpmtud_on_probe_sent(&p, 42, 1000, 10000);
+    TEST_ASSERT(!quicpmtud_on_ack(&p, 41, 2000, 10000),
+                "an unrelated ACK cannot raise PLPMTU");
+    TEST_ASSERT(quicpmtud_on_ack(&p, 42, 2000, 10000),
+                "the probe packet ACK confirms PLPMTU");
+    TEST_ASSERT(p.current == 1472, "confirmed size becomes the packet size");
+
+    quicpmtud_on_blackhole(&p, 50000, 10000);
+    TEST_ASSERT(p.current == 1350, "black hole falls back to the safe base");
+    TEST_ASSERT(p.ceiling == 1471, "failed size is excluded from the next search");
 }
 
 TEST(test_quic_pacer) {

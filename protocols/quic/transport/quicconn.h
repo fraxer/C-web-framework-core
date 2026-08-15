@@ -11,6 +11,7 @@
 #include "quiccc.h"
 #include "quiccrypto.h"
 #include "quicloss.h"
+#include "quicpmtud.h"
 #include "quicretry.h"
 #include "quicstream.h"
 #include "quictls.h"
@@ -123,6 +124,12 @@ typedef struct quicconn {
 
     /* Acknowledgement state, one per packet number space. */
     quicack_t ack[QUIC_ENC_COUNT];
+    uint8_t recv_ecn;
+    int ecn_enabled;
+    uint64_t ecn_sent[QUIC_ENC_COUNT];
+    uint64_t ecn_peer_ect0[QUIC_ENC_COUNT];
+    uint64_t ecn_peer_ect1[QUIC_ENC_COUNT];
+    uint64_t ecn_peer_ce[QUIC_ENC_COUNT];
 
     /* CRYPTO send buffers, one per level: handshake data is retransmitted the
      * same way stream data is. */
@@ -131,6 +138,7 @@ typedef struct quicconn {
     quicloss_t loss;
     quiccc_t   cc;
     quicpacer_t pacer;
+    quicpmtud_t pmtud;
 
     /* When the pacer will next let a datagram out, or 0 when it is not what is
      * holding the connection up. Unlike the congestion window this reopens on

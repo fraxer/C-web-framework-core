@@ -72,6 +72,9 @@ int quicack_is_duplicate(const quicack_t* ack, uint64_t pn);
 void quicack_on_received(quicack_t* ack, quic_enc_level_e level, uint64_t pn,
                          int ack_eliciting, uint64_t now_us,
                          uint64_t max_ack_delay_us);
+void quicack_on_received_ecn(quicack_t* ack, quic_enc_level_e level, uint64_t pn,
+                             int ack_eliciting, uint8_t ecn, uint64_t now_us,
+                             uint64_t max_ack_delay_us);
 
 /* Whether an ACK frame should go out now. */
 int quicack_should_send(const quicack_t* ack, uint64_t now_us);

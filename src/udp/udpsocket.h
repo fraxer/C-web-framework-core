@@ -60,6 +60,11 @@ typedef struct udp_datagram {
      * to change shape then, not because it carries anything today. */
     uint8_t   ecn;
 
+    /* UDP_GRO coalesces equally-sized datagrams into this receive buffer. Zero
+     * means an ordinary datagram; otherwise the caller must dispatch chunks of
+     * this size (the final chunk may be shorter). */
+    uint16_t  gro_segment_size;
+
     /* Datagrams the kernel dropped because this socket's receive queue was
      * full, as a running total (SO_RXQ_OVFL). Present only on the datagram that
      * follows a drop, so the caller reports the *difference* from the last one
@@ -135,6 +140,9 @@ void udp_tx_batch_free(udp_tx_batch_t* batch);
 int udp_tx_batch_add(udp_tx_batch_t* batch, const uint8_t* data, size_t len,
                      const struct sockaddr* peer, socklen_t peer_len,
                      const struct sockaddr_storage* local);
+int udp_tx_batch_add_ecn(udp_tx_batch_t* batch, const uint8_t* data, size_t len,
+                         const struct sockaddr* peer, socklen_t peer_len,
+                         const struct sockaddr_storage* local, uint8_t ecn);
 
 size_t udp_tx_batch_count(const udp_tx_batch_t* batch);
 
@@ -158,5 +166,8 @@ int udp_tx_batch_flush(udp_tx_batch_t* batch, int fd, size_t* out_bytes);
 ssize_t udp_send(int fd, const uint8_t* data, size_t len,
                  const struct sockaddr* peer, socklen_t peer_len,
                  const struct sockaddr_storage* local);
+ssize_t udp_send_ecn(int fd, const uint8_t* data, size_t len,
+                     const struct sockaddr* peer, socklen_t peer_len,
+                     const struct sockaddr_storage* local, uint8_t ecn);
 
 #endif

@@ -24,6 +24,13 @@ int quicack_is_duplicate(const quicack_t* ack, uint64_t pn) {
 void quicack_on_received(quicack_t* ack, quic_enc_level_e level, uint64_t pn,
                          int ack_eliciting, uint64_t now_us,
                          uint64_t max_ack_delay_us) {
+    quicack_on_received_ecn(ack, level, pn, ack_eliciting, 0, now_us,
+                            max_ack_delay_us);
+}
+
+void quicack_on_received_ecn(quicack_t* ack, quic_enc_level_e level, uint64_t pn,
+                             int ack_eliciting, uint8_t ecn, uint64_t now_us,
+                             uint64_t max_ack_delay_us) {
     if (ack == NULL) return;
 
     /* Reordering: a packet below the highest seen means the peer's packets are
@@ -42,6 +49,13 @@ void quicack_on_received(quicack_t* ack, quic_enc_level_e level, uint64_t pn,
     }
 
     ack->any_received = 1;
+
+    switch (ecn & 0x03) {
+    case 0x02: ack->ect0++; ack->has_ecn = 1; break;
+    case 0x01: ack->ect1++; ack->has_ecn = 1; break;
+    case 0x03: ack->ce++;   ack->has_ecn = 1; break;
+    default: break;
+    }
 
     if (!ack_eliciting) return;
 

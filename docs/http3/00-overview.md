@@ -151,9 +151,9 @@ fork / BoringSSL) без изменений в транспорте. Свой TL
 | Unreliable datagrams (RFC 9221), MASQUE | Нет потребителя |
 | Extended CONNECT / WebSocket over HTTP/3 (RFC 9220) | Отложено до отдельной реализации |
 | IPv6 endpoint | Текущий endpoint поддерживает только IPv4 |
-| DPLPMTUD (RFC 8899) | v1 фиксирует 1200-байтные датаграммы; фаза 9 |
-| ECN | Фаза 9 |
-| UDP GRO | GSO реализован, GRO пока отсутствует |
+| DPLPMTUD (RFC 8899) | Реализован: padded probes, подтверждение ACK, повтор и black-hole fallback |
+| ECN | Реализован: ECT(0), ACK_ECN, валидация и реакция на CE |
+| UDP GRO | Реализован с автоматическим fallback на обычный receive |
 | BBR | NewReno и CUBIC реализованы; BBR отложен до измерений |
 | RFC 9218 `PRIORITY_UPDATE` | Оба типа валидируются и учитываются control budget; корректный сигнал игнорируется, urgency scheduling отсутствует |
 
@@ -171,7 +171,7 @@ fork / BoringSSL) без изменений в транспорте. Свой TL
 | Process connection/memory limits и process-wide rate buckets | Готово |
 | QPACK | Static-only; dynamic table и blocked streams отсутствуют |
 | UDP batching / GSO | `recvmmsg`, `sendmmsg`, `UDP_SEGMENT` |
-| UDP GRO, ECN, DPLPMTUD | Не реализовано |
+| UDP GRO, ECN, DPLPMTUD | Готово |
 | IPv6 endpoint | Не реализовано |
 | 0-RTT, QUIC v2, Extended CONNECT | Не реализовано |
 | HTTP/3 client, Server Push | Вне scope |

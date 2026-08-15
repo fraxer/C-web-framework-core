@@ -38,7 +38,7 @@
  * (QUIC_MAX_UDP_PAYLOAD_V4) so that an oversized one is visibly rejected as
  * oversized rather than silently truncated into a packet that fails to
  * decrypt for reasons nobody can see. */
-#define QUIC_RX_DATAGRAM_SIZE 2048
+#define QUIC_RX_DATAGRAM_SIZE 65535
 
 /* One event drains at most this many batches. Level-triggered epoll will report
  * the socket again, so a busy endpoint cannot starve the rest of the worker. */
@@ -950,6 +950,11 @@ static void __send_flush_locked(quicendpoint_t* endpoint) {
 
 ssize_t quicendpoint_send(quicendpoint_t* endpoint, const uint8_t* data, size_t len,
                           const quicpath_t* path) {
+    return quicendpoint_send_ecn(endpoint, data, len, path, 0);
+}
+
+ssize_t quicendpoint_send_ecn(quicendpoint_t* endpoint, const uint8_t* data,
+                              size_t len, const quicpath_t* path, uint8_t ecn) {
     if (endpoint == NULL || data == NULL || path == NULL) return -1;
 
     /* The in-process stand's network emulator, when there is one. Checked
@@ -964,8 +969,8 @@ ssize_t quicendpoint_send(quicendpoint_t* endpoint, const uint8_t* data, size_t 
 
     if (endpoint->tx_batch != NULL) {
         pthread_mutex_lock(&endpoint->tx_batch_mutex);
-        int queued = udp_tx_batch_add(endpoint->tx_batch, data, len, peer,
-                                      path->remote_len, local);
+        int queued = udp_tx_batch_add_ecn(endpoint->tx_batch, data, len, peer,
+                                          path->remote_len, local, ecn);
 
         /* Full, or a datagram too big for a slot. The first is answered by
          * making room; the second never happens for QUIC (a slot is a whole
@@ -973,16 +978,16 @@ ssize_t quicendpoint_send(quicendpoint_t* endpoint, const uint8_t* data, size_t 
          * EMSGSIZE honestly. */
         if (queued == 0 && udp_tx_batch_count(endpoint->tx_batch) > 0) {
             __send_flush_locked(endpoint);
-            queued = udp_tx_batch_add(endpoint->tx_batch, data, len, peer,
-                                      path->remote_len, local);
+            queued = udp_tx_batch_add_ecn(endpoint->tx_batch, data, len, peer,
+                                          path->remote_len, local, ecn);
         }
 
         pthread_mutex_unlock(&endpoint->tx_batch_mutex);
         if (queued == 1) return (ssize_t)len;
     }
 
-    const ssize_t sent = udp_send(endpoint->fd, data, len, peer,
-                                  path->remote_len, local);
+    const ssize_t sent = udp_send_ecn(endpoint->fd, data, len, peer,
+                                      path->remote_len, local, ecn);
 
     if (sent < 0) {
         metrics_quic(METRICS_QUIC_SEND_ERROR);
@@ -1395,7 +1400,9 @@ static void __route(quicendpoint_t* ep, quicconn_t* conn, udp_datagram_t* dgram)
      * this is the one place that sees a connection leave that state. */
     const int was_handshaking = conn->state == QUICCONN_HANDSHAKE;
 
+    conn->recv_ecn = dgram->ecn;
     int alive = quicconn_recv(conn, dgram->data, dgram->len, &path, now);
+    conn->recv_ecn = 0;
 
     if (was_handshaking && conn->state != QUICCONN_HANDSHAKE &&
         conn->process_handshake_counted) {
@@ -1870,7 +1877,28 @@ static int __endpoint_read(connection_t* connection) {
                 ep->rx_dwell_count++;
             }
 
-            __dispatch(ep, dgram);
+            if (dgram != NULL && dgram->gro_segment_size > 0 &&
+                dgram->len > dgram->gro_segment_size) {
+                const size_t total = dgram->len;
+                uint8_t* const data = dgram->data;
+                for (size_t off = 0; off < total; off += dgram->gro_segment_size) {
+                    udp_datagram_t segment = *dgram;
+                    segment.data = data + off;
+                    segment.len = total - off < dgram->gro_segment_size
+                                  ? total - off : dgram->gro_segment_size;
+                    segment.gro_segment_size = 0;
+                    /* Ancillary socket counters describe the aggregate skb;
+                     * account them once, not once per reconstructed datagram. */
+                    if (off != 0) {
+                        segment.drops_valid = 0;
+                        segment.stamp_valid = 0;
+                    }
+                    __dispatch(ep, &segment);
+                }
+            }
+            else {
+                __dispatch(ep, dgram);
+            }
         }
 
         /* A short batch means the socket is drained. */
@@ -2052,7 +2080,7 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server,
     /* Same depth as the receive batch: what arrives in one turn is roughly what
      * leaves in one, and both are bounded by the worker's visit rather than by
      * memory. */
-    ep->tx_batch = udp_tx_batch_create(rx_batch, QUIC_RX_DATAGRAM_SIZE);
+    ep->tx_batch = udp_tx_batch_create(rx_batch, QUIC_MAX_UDP_PAYLOAD_V4);
     if (ep->tx_batch == NULL) goto failed;
 
     /* The endpoint's own connection carries no buffer: datagrams live in the

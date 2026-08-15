@@ -18,7 +18,7 @@
 /* Largest packet we build. Below the path MTU with room to spare -- phase 9
  * adds discovery; until then a conservative fixed size beats a datagram that
  * is silently dropped by a tunnel. */
-#define QUICCONN_MAX_PACKET QUIC_DEFAULT_UDP_PAYLOAD
+#define QUICCONN_MAX_PACKET QUIC_MAX_UDP_PAYLOAD_V4
 
 /* Datagrams built per quicconn_send call. A cap rather than a loop to
  * exhaustion: one connection must not hold the worker while a large flight or
@@ -527,9 +527,38 @@ static int __on_ack_frame(quicconn_t* conn, quic_enc_level_e level,
                            << (conn->local_params.ack_delay_exponent > 20
                                ? 20 : conn->local_params.ack_delay_exponent);
 
+    /* RFC 9000 §13.4.2: an ACK for ECT-marked packets must carry monotonic ECN
+     * counters and may not claim more marked packets than were sent. A path
+     * that bleaches or fabricates codepoints loses ECN for this connection. */
+    if (conn->ecn_enabled && conn->ecn_sent[level] > 0) {
+        const uint64_t old0 = conn->ecn_peer_ect0[level];
+        const uint64_t old1 = conn->ecn_peer_ect1[level];
+        const uint64_t oldce = conn->ecn_peer_ce[level];
+        const uint64_t total = frame->u.ack.ect0 + frame->u.ack.ect1 + frame->u.ack.ce;
+        if (!frame->u.ack.has_ecn || frame->u.ack.ect0 < old0 ||
+            frame->u.ack.ect1 < old1 || frame->u.ack.ce < oldce ||
+            total > conn->ecn_sent[level]) {
+            conn->ecn_enabled = 0;
+        }
+        else {
+            if (frame->u.ack.ce > oldce)
+                conn->cc.ops->on_loss(&conn->cc, 0, now_us, now_us);
+            conn->ecn_peer_ect0[level] = frame->u.ack.ect0;
+            conn->ecn_peer_ect1[level] = frame->u.ack.ect1;
+            conn->ecn_peer_ce[level] = frame->u.ack.ce;
+        }
+    }
+
     quicframe_ref_t* lost = NULL;
     quicframe_ref_t* confirmed = NULL;
     quicloss_on_ack(&conn->loss, level, &acked, delay, now_us, &lost, &confirmed);
+
+    if (level == QUIC_ENC_APP && conn->pmtud.outstanding &&
+        quicrange_contains(&acked, conn->pmtud.probe_pn) &&
+        quicpmtud_on_ack(&conn->pmtud, conn->pmtud.probe_pn, now_us,
+                         quicloss_pto_us(&conn->loss, QUIC_ENC_APP))) {
+        conn->cc.max_datagram_size = conn->pmtud.current;
+    }
 
     /* Release what the peer has confirmed. Until this existed the send buffers
      * kept every byte ever written for the life of the connection, no stream
@@ -1178,9 +1207,12 @@ static void __path_probe_succeed(quicconn_t* conn) {
      * same reasoning as the RTT estimator reset right below. The pacer follows
      * it: its bucket was filled at the old path's rate, and spending that on the
      * new one is the burst this reset exists to prevent. */
-    quiccc_init_algorithm(&conn->cc, QUICCONN_MAX_PACKET,
+    quiccc_init_algorithm(&conn->cc, QUIC_DEFAULT_UDP_PAYLOAD,
                           quic_policy_conn()->initcwnd_packets,
                           quic_policy_conn()->cc_algorithm);
+    quicpmtud_init(&conn->pmtud, QUIC_DEFAULT_UDP_PAYLOAD,
+                   conn->path.remote.ss_family == AF_INET6
+                       ? QUIC_MAX_UDP_PAYLOAD_V6 : QUIC_MAX_UDP_PAYLOAD_V4);
     quicpacer_init(&conn->pacer, &conn->cc, quic_policy_conn()->pacing);
     conn->pace_until_us = 0;
 
@@ -1469,8 +1501,9 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
      * what makes this packet the largest. */
     const int newest = !conn->ack[level].any_received || pn > conn->ack[level].largest;
 
-    quicack_on_received(&conn->ack[level], level, pn, ack_eliciting, now_us,
-                        conn->local_params.max_ack_delay * 1000);
+    quicack_on_received_ecn(&conn->ack[level], level, pn, ack_eliciting,
+                            conn->recv_ecn, now_us,
+                            conn->local_params.max_ack_delay * 1000);
 
     if (level == QUIC_ENC_APP && non_probing && newest &&
         conn->recv_path != NULL && !__path_same(conn->recv_path, &conn->path))
@@ -1643,6 +1676,16 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
             metrics_quic(METRICS_QUIC_HANDSHAKE_COMPLETED);
 
             conn->state = QUICCONN_ACTIVE;
+            if (conn->peer_params.max_udp_payload_size < conn->pmtud.ceiling) {
+                conn->pmtud.ceiling = (size_t)conn->peer_params.max_udp_payload_size;
+                if (conn->pmtud.current > conn->pmtud.ceiling) {
+                    conn->pmtud.current = conn->pmtud.ceiling;
+                    conn->pmtud.base = conn->pmtud.ceiling;
+                    conn->cc.max_datagram_size = conn->pmtud.current;
+                }
+            }
+            conn->pmtud.next_probe_us = now_us +
+                10 * quicloss_pto_us(&conn->loss, QUIC_ENC_APP);
 
             /* §4.9.2: for a server the handshake is confirmed by its own
              * completion -- the client's Finished cannot exist unless the
@@ -2311,6 +2354,7 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
     if (ack_len > 0) quicack_on_sent(&conn->ack[level]);
 
     quicloss_on_sent(&conn->loss, level, pn, total, ack_eliciting, 1, refs, now_us);
+    if (conn->ecn_enabled) conn->ecn_sent[level]++;
 
     QUICBEACON("cid=%02x%02x SENT  level=%d pn=%llu bytes=%zu payload=%zu ack_bytes=%zu elic=%d",
                conn->odcid.data[0], conn->odcid.data[1],
@@ -2385,12 +2429,66 @@ static void __path_probe_send(quicconn_t* conn, uint64_t now_us) {
      * the path in use, and a probe on a different one must neither consume it
      * nor be treated as loss on it when the new path turns out to be dead. */
     quicloss_on_sent(&conn->loss, QUIC_ENC_APP, pn, total, 1, 0, NULL, now_us);
+    if (conn->ecn_enabled) conn->ecn_sent[QUIC_ENC_APP]++;
 
-    quicendpoint_send(conn->endpoint, datagram, total, &conn->probe_path);
+    quicendpoint_send_ecn(conn->endpoint, datagram, total, &conn->probe_path,
+                          conn->ecn_enabled ? 0x02 : 0);
 
     conn->probe_pending = 0;
     conn->probe_attempts++;
     conn->probe_next_us = now_us + quicloss_pto_us(&conn->loss, QUIC_ENC_APP);
+}
+
+/* RFC 8899 probe: a probe-only 1-RTT packet padded to the candidate size.
+ * Application data is deliberately excluded so loss of a probe never causes
+ * head-of-line delay at the application. */
+static void __pmtu_probe_send(quicconn_t* conn, uint64_t now_us) {
+    if (!conn->tx[QUIC_ENC_APP].valid || conn->peer_cid_count == 0) return;
+
+    const size_t target = quicpmtud_candidate(&conn->pmtud);
+    if (target <= conn->pmtud.current || target > QUICCONN_MAX_PACKET)
+        return;
+
+    const uint64_t pn = conn->loss.space[QUIC_ENC_APP].next_pn;
+    const size_t pn_len = quicpkt_pn_length(
+        pn, conn->loss.space[QUIC_ENC_APP].largest_acked);
+    quicpkt_hdr_out_t hdr;
+    memset(&hdr, 0, sizeof hdr);
+    hdr.type = QUIC_PKT_SHORT;
+    hdr.version = QUIC_VERSION_1;
+    hdr.dcid = &conn->peer_cids[0];
+    hdr.scid = &conn->local_cids[0].cid;
+    hdr.pn = pn;
+    hdr.pn_len = pn_len;
+    hdr.key_phase = conn->key_phase;
+
+    uint8_t datagram[QUICCONN_MAX_PACKET];
+    size_t pn_offset = 0;
+    const size_t header_len = quicpkt_write_header(datagram, sizeof datagram,
+                                                    &hdr, &pn_offset);
+    if (!header_len || target <= header_len + QUIC_AEAD_TAG_LEN) return;
+
+    const size_t plain_len = target - header_len - QUIC_AEAD_TAG_LEN;
+    uint8_t plain[QUICCONN_MAX_PACKET];
+    plain[0] = QUIC_FRAME_PING;
+    memset(plain + 1, 0, plain_len - 1);
+
+    size_t sealed = 0;
+    if (!quiccrypto_seal(&conn->tx[QUIC_ENC_APP], pn, datagram, header_len,
+                         plain, plain_len, datagram + header_len, &sealed)) return;
+    const size_t total = header_len + sealed;
+    if (total != target || !quichp_apply(&conn->tx[QUIC_ENC_APP], datagram,
+                                         total, pn_offset, pn_len)) return;
+
+    quicframe_ref_t* ref = quicframe_ref_new(QUIC_FRAME_PING);
+    /* Probe loss says the size may be wrong, not that the path is congested;
+     * keep it in loss detection for its ACK, but outside bytes_in_flight. */
+    quicloss_on_sent(&conn->loss, QUIC_ENC_APP, pn, total, 1, 0, ref, now_us);
+    if (conn->ecn_enabled) conn->ecn_sent[QUIC_ENC_APP]++;
+    quicpmtud_on_probe_sent(&conn->pmtud, pn, now_us,
+                            quicloss_pto_us(&conn->loss, QUIC_ENC_APP));
+    quicendpoint_send_ecn(conn->endpoint, datagram, total, &conn->path,
+                          conn->ecn_enabled ? 0x02 : 0);
 }
 
 int quicconn_send(quicconn_t* conn, uint64_t now_us) {
@@ -2399,8 +2497,9 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
 
     if (conn->state == QUICCONN_CLOSING) {
         if (conn->close_packet_len > 0) {
-            quicendpoint_send(conn->endpoint, conn->close_packet,
-                              conn->close_packet_len, &conn->path);
+            quicendpoint_send_ecn(conn->endpoint, conn->close_packet,
+                                  conn->close_packet_len, &conn->path,
+                                  conn->ecn_enabled ? 0x02 : 0);
         }
         atomic_store_explicit(&conn->want_write, 0, memory_order_release);
         return 1;
@@ -2410,6 +2509,11 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
      * delayed, and the same urgency applies to the question. */
     if (conn->probe_active && conn->probe_pending)
         __path_probe_send(conn, now_us);
+
+    if (conn->state == QUICCONN_ACTIVE &&
+        quicconn_unsent_bytes(conn) >= 4 * conn->pmtud.current &&
+        quicpmtud_should_probe(&conn->pmtud, now_us))
+        __pmtu_probe_send(conn, now_us);
 
     uint8_t datagram[QUICCONN_MAX_PACKET];
     int sent_anything = 0;
@@ -2451,7 +2555,7 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
          * moment it reopens is treated as not blocking at all, because the
          * window is the limit that must hold and this one is advisory. */
         const uint64_t pace_resume_us =
-            paced < QUICCONN_MAX_PACKET
+            paced < conn->pmtud.current
                 ? quicpacer_next_time_us(&conn->pacer, &conn->cc,
                                          conn->loss.smoothed_rtt_us, now_us)
                 : 0;
@@ -2470,7 +2574,7 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
          * the path nothing) and a PTO probe (§7.7 lets one go without regard to
          * pacing, for the same reason §7.5 lets it exceed the window: a probe
          * exists to end a stall, and a stall is not eased by waiting). */
-        const int cc_blocked = quiccc_available(&conn->cc) < QUICCONN_MAX_PACKET ||
+        const int cc_blocked = quiccc_available(&conn->cc) < conn->pmtud.current ||
                                pace_blocked;
 
         const uint64_t in_flight_before = conn->cc.bytes_in_flight;
@@ -2509,7 +2613,8 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
                 break;
             }
 
-            size_t room = sizeof datagram - total;
+            size_t room = conn->pmtud.current > total
+                          ? conn->pmtud.current - total : 0;
             if (!conn->address_validated) {
                 const uint64_t budget = conn->amplification_budget > total
                                         ? conn->amplification_budget - total : 0;
@@ -2548,7 +2653,8 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
                   conn->odcid.data[0], conn->odcid.data[1],
                   conn->odcid.data[2], conn->odcid.data[3], total, ack_levels);
 
-        if (quicendpoint_send(conn->endpoint, datagram, total, &conn->path) < 0)
+        if (quicendpoint_send_ecn(conn->endpoint, datagram, total, &conn->path,
+                                  conn->ecn_enabled ? 0x02 : 0) < 0)
             break;
 
         sent_anything = 1;
@@ -2566,7 +2672,7 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
          * reopens on an acknowledgement or when the loss timer declares
          * something lost, and both of those set want_write themselves. Asking
          * again here is what turned the window into a suggestion. */
-        if (quiccc_available(&conn->cc) < QUICCONN_MAX_PACKET) break;
+        if (quiccc_available(&conn->cc) < conn->pmtud.current) break;
 
         /* The last round produced a full datagram, so there may well be
          * another: a server flight carrying a certificate chain runs to six or
@@ -2728,8 +2834,9 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     const quic_conn_policy_t* policy = quic_policy_conn();
 
     conn->amplification_factor = policy->amplification_factor;
+    conn->ecn_enabled = 1;
 
-    quiccc_init_algorithm(&conn->cc, QUICCONN_MAX_PACKET,
+    quiccc_init_algorithm(&conn->cc, QUIC_DEFAULT_UDP_PAYLOAD,
                           policy->initcwnd_packets, policy->cc_algorithm);
     /* After the controller, always: the burst limit is the window it just
      * computed. */
@@ -2737,6 +2844,9 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     conn->pace_until_us = 0;
     quicloss_init(&conn->loss, &conn->cc, policy->ack_delay_ms * 1000);
     quicloss_set_cid_tag(&conn->loss, conn->odcid.data, conn->odcid.len);
+    const size_t pmtu_ceiling = conn->path.remote.ss_family == AF_INET6
+                                ? QUIC_MAX_UDP_PAYLOAD_V6 : QUIC_MAX_UDP_PAYLOAD_V4;
+    quicpmtud_init(&conn->pmtud, QUIC_DEFAULT_UDP_PAYLOAD, pmtu_ceiling);
 
     for (int i = 0; i < QUIC_ENC_COUNT; i++) {
         quicack_init(&conn->ack[i]);
@@ -3090,6 +3200,12 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
             conn->pto_probes = 2;
             conn->pto_level = level;
 
+            /* Repeated PTO after a raised PLPMTU is the RFC 8899 black-hole
+             * signal: return to the safe base before retransmitting data. */
+            if (level == QUIC_ENC_APP && conn->loss.pto_count >= 3)
+                quicpmtud_on_blackhole(&conn->pmtud, now_us,
+                                       quicloss_pto_us(&conn->loss, level));
+
             /* The five numbers that named the cause in §3g, at the moment they
              * are worth having: a stalled connection is diagnosed by what its
              * state says now, not by what happened. Cheap because a PTO is a
@@ -3131,6 +3247,13 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
         atomic_store_explicit(&conn->want_write, 1, memory_order_release);
     }
 
+    if (conn->state == QUICCONN_ACTIVE) {
+        quicpmtud_on_timeout(&conn->pmtud, now_us);
+        if (quicconn_unsent_bytes(conn) >= 4 * conn->pmtud.current &&
+            quicpmtud_should_probe(&conn->pmtud, now_us))
+            atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+    }
+
     return 1;
 }
 
@@ -3158,6 +3281,10 @@ uint64_t quicconn_next_timeout(const quicconn_t* conn) {
         if (ack_deadline != 0 && (earliest == 0 || ack_deadline < earliest))
             earliest = ack_deadline;
     }
+
+    const uint64_t pmtu_deadline = quicpmtud_deadline(&conn->pmtud);
+    if (pmtu_deadline != 0 && (earliest == 0 || pmtu_deadline < earliest))
+        earliest = pmtu_deadline;
 
     return earliest;
 }
