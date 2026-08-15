@@ -148,6 +148,18 @@ stage_h3unit() {
     fi
 }
 
+stage_limits() {
+    say "limits: process-wide QUIC connection and memory budgets"
+    if build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes -DSANITIZE=none &&
+       H3_LIMITS_PORT=18459 "$CORE_DIR/tests/h3_resource_limits.sh" \
+             "$CI_BUILD_DIR/limits" "$CI_BUILD_DIR/h3-resource-limits"; then
+        record limits OK
+    else
+        record limits FAIL
+    fi
+}
+
 stage_config() {
     say "config: invalid HTTP/3 policy rejects startup"
 
@@ -330,7 +342,7 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit config asan tsan fuzz reload softreload h3spec)
+ALL_STAGES=(noh3 h3unit config limits asan tsan fuzz reload softreload h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
@@ -346,6 +358,7 @@ for stage in "${STAGES[@]}"; do
     tsan)   stage_tsan ;;
     h3unit) stage_h3unit ;;
     config) stage_config ;;
+    limits) stage_limits ;;
     fuzz)   stage_fuzz ;;
     reload) stage_reload ;;
     softreload) stage_softreload ;;

@@ -3240,6 +3240,7 @@ docker run -d --name hap --network host --ulimit nofile=65536:65536 \
 tests/ci.sh                      # все стадии
 tests/ci.sh release              # полный обязательный release-gate
 tests/ci.sh h3unit asan tsan     # подмножество, в указанном порядке
+tests/ci.sh limits               # connection/memory exhaustion и drain
 FUZZ_SECONDS=600 tests/ci.sh fuzz
 H3SPEC=/path/to/h3spec tests/ci.sh h3spec
 REQUIRE_H3SPEC=1 tests/ci.sh h3spec  # только обязательный h3spec
@@ -3250,6 +3251,7 @@ REQUIRE_H3SPEC=1 tests/ci.sh h3spec  # только обязательный h3s
 | `noh3` | сборка без h3 + юнит-тесты | 1 |
 | `h3unit` | отдельный QUIC/H3/QPACK runner | 1–3 |
 | `config` | неверные типы/диапазоны HTTP/3 останавливают запуск; неверный reload-кандидат не останавливает текущее поколение | 1–3, 5 |
+| `limits` | 64 занятых QUIC slots, отказ лишним соединениям, CRYPTO memory refusal и возврат обоих gauges к нулю | 3, 7 |
 | `asan` | сборка с h3 (ASan+LSan), unit + hard/soft reload | 2, 5 |
 | `tsan` | сборка с h3 (TSan), unit + hard/soft reload | 3, 5 |
 | `fuzz` | семь целей по `FUZZ_SECONDS` каждая | 4 |
