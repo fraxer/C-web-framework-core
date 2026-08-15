@@ -16,6 +16,7 @@
 #   config   invalid HTTP/3 types/ranges reject startup
 #   limits   process connection/memory exhaustion and drain
 #   soak     sustained requests, impairment, migration and RSS drain
+#   benchmark median req/s and throughput against a runner-local baseline
 #   fuzz     build the fuzz targets         + FUZZ_SECONDS each
 #   reload   hard reload with live QUIC      + old worker retirement
 #   softreload shared UDP handoff             + old CID/config drain
@@ -38,6 +39,8 @@
 #   REQUIRE_H3SPEC fail instead of skip when h3spec is unavailable (default 0)
 #   SOAK_REQUESTS requests in the soak stage (default 1000; release 10000)
 #   SOAK_RSS_GROWTH_KB allowed post-warmup RSS growth (default 16384)
+#   BENCH_BASELINE benchmark JSON produced with BENCH_RECORD
+#   REQUIRE_BENCHMARK fail instead of skip without a usable baseline
 #   JOBS           parallel build jobs (default: nproc)
 
 set -u -o pipefail
@@ -174,6 +177,28 @@ stage_soak() {
         record soak OK
     else
         record soak FAIL
+    fi
+}
+
+stage_benchmark() {
+    say "benchmark: median HTTP/3 req/s and throughput regression"
+    if ! build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+              -DINCLUDE_HTTP3=yes -DSANITIZE=none; then
+        record benchmark FAIL
+        return
+    fi
+
+    REQUIRE_BENCHMARK="${REQUIRE_BENCHMARK:-0}" \
+    BENCH_BASELINE="${BENCH_BASELINE:-}" BENCH_RECORD="${BENCH_RECORD:-}" \
+    H3_BENCH_PORT=18461 "$CORE_DIR/tests/h3_benchmark.sh" \
+        "$CI_BUILD_DIR/limits" "$CI_BUILD_DIR/h3-benchmark"
+    local status=$?
+    if [ "$status" -eq 0 ]; then
+        record benchmark OK
+    elif [ "$status" -eq 77 ]; then
+        record benchmark SKIP
+    else
+        record benchmark FAIL
     fi
 }
 
@@ -359,12 +384,13 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit config limits soak asan tsan fuzz reload softreload h3spec)
+ALL_STAGES=(noh3 h3unit config limits soak benchmark asan tsan fuzz reload softreload h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
 elif [ ${#STAGES[@]} -eq 1 ] && [ "${STAGES[0]}" = release ]; then
     REQUIRE_H3SPEC=1
+    REQUIRE_BENCHMARK=1
     SOAK_REQUESTS=${SOAK_REQUESTS:-10000}
     STAGES=("${ALL_STAGES[@]}")
 fi
@@ -378,6 +404,7 @@ for stage in "${STAGES[@]}"; do
     config) stage_config ;;
     limits) stage_limits ;;
     soak)    stage_soak ;;
+    benchmark) stage_benchmark ;;
     fuzz)   stage_fuzz ;;
     reload) stage_reload ;;
     softreload) stage_softreload ;;
