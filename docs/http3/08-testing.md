@@ -3256,7 +3256,7 @@ REQUIRE_H3SPEC=1 tests/ci.sh h3spec  # только обязательный h3s
 | `config` | неверные типы/диапазоны HTTP/3 останавливают запуск; неверный reload-кандидат не останавливает текущее поколение | 1–3, 5 |
 | `limits` | 64 занятых QUIC slots, отказ лишним соединениям, CRYPTO memory refusal и возврат обоих gauges к нулю | 3, 7 |
 | `soak` | 1000 запросов обычно, 10000 в release; loss/reorder/dup, migration, drain gauges и RSS около прогретого baseline | 7 |
-| `benchmark` | медиана 5 прогонов: h2load `-n20000 -c10 -m30` short req/s (fallback: 1000 запросов multiplexed quicclient) и загрузка 64 МиБ; FAIL при деградации любой метрики более 5% | 7 |
+| `benchmark` | медиана 5 прогонов: short req/s, обязательный h2load-профиль 57074 байта `-n10000 -c100 -m30` и загрузка 64 МиБ; FAIL при неполных/не-2xx ответах или деградации любой метрики более 5% | 7 |
 | `asan` | сборка с h3 (ASan+LSan), unit + hard/soft reload | 2, 5 |
 | `tsan` | сборка с h3 (TSan), unit + hard/soft reload | 3, 5 |
 | `fuzz` | семь целей по `FUZZ_SECONDS` каждая | 4 |
@@ -3268,7 +3268,10 @@ Benchmark baseline намеренно не хранится в репозито�
 req/s зависят от CPU, kernel, OpenSSL и topology runner-а сильнее допустимых
 5%. Его снимают `BENCH_RECORD` на закреплённом runner-е и передают следующей
 сборке через `BENCH_BASELINE`. Формат фиксирует также short-client method;
-baseline от h2load нельзя случайно сравнить с fallback-методикой. Без baseline
+baseline от h2load нельзя случайно сравнить с fallback-методикой. Baseline
+содержит три независимых числа: `short_rps`, `representative_rps` и
+`throughput_mbps`; старый двухметричный файл отвергается и должен быть один раз
+перезаписан. Без baseline
 локальная стадия — `SKIP`, а `tests/ci.sh release` — `FAIL`.
 Перед выборкой прогреваются CPU/OpenSSL и page cache; без этого ondemand CPU
 governor занижал первый short sample в 2–3 раза и делал 5%-й порог фикцией.
@@ -3278,9 +3281,11 @@ governor занижал первый short sample в 2–3 раза и дела�
 При наличии harness предпочитает `/opt/nghttp2-http3/bin/h2load` системному
 бинарнику. Проверенный A/B с nghttp2 1.71.0-DEV: baseline 167868.32 req/s и
 582.4 МБ/с, повтор 163080.26 req/s и 562.4 МБ/с; −2.85% и −3.43%, gate `OK`.
-Профиль `-c50 -m30` на одном статическом URI дал около 5000 ответов 4xx из
-20000, поэтому regression-профиль использует полностью успешный
-`-n20000 -c10 -m30`; перегрузочный 4xx-сценарий не маскируется как performance.
+Первый профиль `-c100 -m30` дал тысячи 404 не из-за HTTP/3: soft
+`RLIMIT_NOFILE=1024` не вмещал до 3000 одновременно открытых статических
+ответов, а `http_response_file` ошибочно называл любой отказ `open()` отсутствием
+файла. Benchmark теперь требует limit не меньше 8192; `EMFILE`, `ENFILE` и
+`ENOMEM` сервер отвечает 503. После этого профиль завершает 10000/10000 с 2xx.
 
 Сопоставимый H2/H3 контроль 2026-08-15 выполнен одним бинарником
 `/opt/nghttp2-http3/bin/h2load` и одним Release-сервером. Для short response

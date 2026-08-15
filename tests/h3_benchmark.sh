@@ -23,6 +23,14 @@ RECORD=${BENCH_RECORD:-}
 REQUIRE=${REQUIRE_BENCHMARK:-0}
 MAX_REGRESSION=${BENCH_MAX_REGRESSION_PERCENT:-5}
 
+# The representative profile can have c*m = 3000 static responses in flight,
+# each with its own descriptor. A runner's common 1024 soft limit benchmarks
+# EMFILE handling (and used to manufacture fast 404s), not HTTP/3 throughput.
+if [ "$(ulimit -n)" -lt 8192 ] && ! ulimit -n 8192; then
+    printf 'h3 benchmark: need RLIMIT_NOFILE >= 8192 for the c=100 profile\n' >&2
+    [ "$REQUIRE" = 1 ] && exit 1 || exit 77
+fi
+
 if [ ! -x "$SERVER" ] || [ ! -x "$CLIENT" ]; then
     printf 'h3 benchmark: server or quicclient unavailable\n' >&2
     [ "$REQUIRE" = 1 ] && exit 1 || exit 77
@@ -34,6 +42,7 @@ fi
 
 mkdir -p "$WORK_DIR/www"
 printf 'benchmark\n' > "$WORK_DIR/www/small.txt"
+dd if=/dev/zero of="$WORK_DIR/www/representative.bin" bs=57074 count=1 status=none
 dd if=/dev/zero of="$WORK_DIR/www/large.bin" bs=1M count=64 status=none
 
 cat > "$WORK_DIR/config.json" <<JSON
@@ -44,6 +53,7 @@ cat > "$WORK_DIR/config.json" <<JSON
         "tmp": "/tmp", "gzip": [],
         "log": { "enabled": true, "level": "error" },
         "env": {
+            "metrics": true,
             "http3_buffer_memory_limit": 134217728,
             "http3_handshake_rate": 0,
             "http3_max_streams_bidi": 1000,
@@ -59,7 +69,17 @@ cat > "$WORK_DIR/config.json" <<JSON
                 "private": "$CORE_DIR/tests/data/quic_test_key.pem",
                 "ciphers": "TLS_AES_128_GCM_SHA256 TLS_AES_256_GCM_SHA384 TLS_CHACHA20_POLY1305_SHA256"
             },
-            "http3": { "enabled": true, "port": $PORT }
+            "http3": { "enabled": true, "port": $PORT },
+            "http": {
+                "routes": {
+                    "/metrics": {
+                        "GET": {
+                            "file": "$BUILD_DIR/exec/handlers/bench/lib_metrics.so",
+                            "function": "get"
+                        }
+                    }
+                }
+            }
         }
     },
     "mimetypes": {
@@ -99,7 +119,9 @@ median() {
 }
 
 : > "$WORK_DIR/short.values"
+: > "$WORK_DIR/representative.values"
 : > "$WORK_DIR/throughput.values"
+: > "$WORK_DIR/gso.values"
 
 short_mode=quicclient
 if [ -n "$H2LOAD" ] && [ -x "$H2LOAD" ] &&
@@ -157,6 +179,46 @@ for i in $(seq 1 "$RUNS"); do
     fi
     printf '%s\n' "$value" >> "$WORK_DIR/short.values"
 
+    if [ "$short_mode" = h2load ]; then
+        representative_log="$WORK_DIR/representative-$i.log"
+        representative_requests="$WORK_DIR/representative-$i.tsv"
+        curl -fsk --resolve "localhost:$PORT:127.0.0.1" \
+            "https://localhost:$PORT/metrics?reset=1" > /dev/null || exit 1
+        if ! "$H2LOAD" --alpn-list=h3 --connect-to="127.0.0.1:$PORT" \
+                --sni=localhost --log-file="$representative_requests" \
+                -n 10000 -c 100 -m 30 \
+                "https://localhost:$PORT/representative.bin" \
+                > "$representative_log" 2>&1 ||
+           ! grep -Eq 'requests: 10000 total, 10000 started, 10000 done, 10000 succeeded' \
+                "$representative_log" ||
+           ! grep -Eq 'status codes: 10000 2xx, 0 3xx, 0 4xx, 0 5xx' \
+                "$representative_log"; then
+            printf 'h3 benchmark: representative c=100 run did not complete every request as 2xx\n' >&2
+            exit 1
+        fi
+        value=$(sed -n 's/.*finished in.*, \([0-9][0-9.]*\) req\/s.*/\1/p' \
+            "$representative_log" | tail -1)
+        if [ -z "$value" ]; then
+            printf 'h3 benchmark: could not parse representative req/s\n' >&2
+            exit 1
+        fi
+        printf '%s\n' "$value" >> "$WORK_DIR/representative.values"
+
+        metrics_log="$WORK_DIR/representative-$i-metrics.json"
+        curl -fsk --resolve "localhost:$PORT:127.0.0.1" \
+            "https://localhost:$PORT/metrics" > "$metrics_log" || exit 1
+        for key in datagrams_sent send.batch_calls send.messages \
+                   send.gso_messages send.gso_segments send.gso_fallbacks send.partial; do
+            metric=$(sed -n "s/.*\"$key\":[[:space:]]*\([0-9][0-9]*\).*/\1/p" \
+                "$metrics_log")
+            if [ -z "$metric" ]; then
+                printf 'h3 benchmark: missing quic.%s in metrics snapshot\n' "$key" >&2
+                exit 1
+            fi
+            printf '%s %s\n' "$key" "$metric" >> "$WORK_DIR/gso.values"
+        done
+    fi
+
     throughput_log="$WORK_DIR/throughput-$i.log"
     if ! "$CLIENT" 127.0.0.1 "$PORT" -q -a localhost -p /large.bin \
             --timeout 30000 > "$throughput_log" 2>&1; then
@@ -173,14 +235,31 @@ for i in $(seq 1 "$RUNS"); do
 done
 
 short_median=$(median "$WORK_DIR/short.values")
+representative_median=0
+if [ "$short_mode" = h2load ]; then
+    representative_median=$(median "$WORK_DIR/representative.values")
+fi
 throughput_median=$(median "$WORK_DIR/throughput.values")
-printf 'h3 benchmark: median short=%s req/s throughput=%s MB/s (%s runs)\n' \
-    "$short_median" "$throughput_median" "$RUNS"
+printf 'h3 benchmark: median short=%s req/s representative=%s req/s throughput=%s MB/s (%s runs)\n' \
+    "$short_median" "$representative_median" "$throughput_median" "$RUNS"
+if [ "$short_mode" = h2load ]; then
+    metric_sum() { awk -v key="$1" '$1 == key { n += $2 } END { print n + 0 }' "$WORK_DIR/gso.values"; }
+    dgrams=$(metric_sum datagrams_sent)
+    calls=$(metric_sum send.batch_calls)
+    messages=$(metric_sum send.messages)
+    gso_messages=$(metric_sum send.gso_messages)
+    gso_segments=$(metric_sum send.gso_segments)
+    fallbacks=$(metric_sum send.gso_fallbacks)
+    partial=$(metric_sum send.partial)
+    awk -v d="$dgrams" -v c="$calls" -v m="$messages" -v gm="$gso_messages" \
+        -v gs="$gso_segments" -v f="$fallbacks" -v p="$partial" \
+        'BEGIN { printf "h3 benchmark: tx datagrams=%d batch_calls=%d messages=%d avg_batch=%.2f gso_messages=%d gso_segments=%d avg_gso=%.2f fallbacks=%d partial=%d\n", d, c, m, c ? d/c : 0, gm, gs, gm ? gs/gm : 0, f, p }'
+fi
 
 if [ -n "$RECORD" ]; then
     mkdir -p "$(dirname "$RECORD")"
-    printf '{"short_rps":%s,"throughput_mbps":%s,"runs":%s,"short_client":"%s"}\n' \
-        "$short_median" "$throughput_median" "$RUNS" "$short_mode" > "$RECORD"
+    printf '{"short_rps":%s,"representative_rps":%s,"throughput_mbps":%s,"runs":%s,"short_client":"%s"}\n' \
+        "$short_median" "$representative_median" "$throughput_median" "$RUNS" "$short_mode" > "$RECORD"
     printf 'h3 benchmark: baseline recorded in %s\n' "$RECORD"
 fi
 
@@ -191,9 +270,11 @@ if [ -z "$BASELINE" ] || [ ! -r "$BASELINE" ]; then
 fi
 
 baseline_short=$(sed -n 's/.*"short_rps"[[:space:]]*:[[:space:]]*\([0-9][0-9.]*\).*/\1/p' "$BASELINE")
+baseline_representative=$(sed -n 's/.*"representative_rps"[[:space:]]*:[[:space:]]*\([0-9][0-9.]*\).*/\1/p' "$BASELINE")
 baseline_throughput=$(sed -n 's/.*"throughput_mbps"[[:space:]]*:[[:space:]]*\([0-9][0-9.]*\).*/\1/p' "$BASELINE")
 baseline_client=$(sed -n 's/.*"short_client"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$BASELINE")
-if [ -z "$baseline_short" ] || [ -z "$baseline_throughput" ] ||
+if [ -z "$baseline_short" ] || [ -z "$baseline_representative" ] ||
+   [ -z "$baseline_throughput" ] ||
    [ "$baseline_client" != "$short_mode" ]; then
         printf 'h3 benchmark: malformed or method-incompatible baseline %s\n' "$BASELINE" >&2
     exit 1
@@ -202,14 +283,16 @@ fi
 regressed=0
 awk -v a="$short_median" -v b="$baseline_short" -v p="$MAX_REGRESSION" \
     'BEGIN { exit !(a < b * (100-p) / 100) }' && regressed=1
+awk -v a="$representative_median" -v b="$baseline_representative" -v p="$MAX_REGRESSION" \
+    'BEGIN { exit !(a < b * (100-p) / 100) }' && regressed=1
 awk -v a="$throughput_median" -v b="$baseline_throughput" -v p="$MAX_REGRESSION" \
     'BEGIN { exit !(a < b * (100-p) / 100) }' && regressed=1
 
 if [ "$regressed" -ne 0 ]; then
-    printf 'h3 benchmark: regression exceeds %s%% (baseline %s req/s, %s MB/s)\n' \
-        "$MAX_REGRESSION" "$baseline_short" "$baseline_throughput" >&2
+    printf 'h3 benchmark: regression exceeds %s%% (baseline short=%s representative=%s req/s, %s MB/s)\n' \
+        "$MAX_REGRESSION" "$baseline_short" "$baseline_representative" "$baseline_throughput" >&2
     exit 1
 fi
 
-printf 'h3 benchmark: within %s%% of baseline (%s req/s, %s MB/s)\n' \
-    "$MAX_REGRESSION" "$baseline_short" "$baseline_throughput"
+printf 'h3 benchmark: within %s%% of baseline (short=%s representative=%s req/s, %s MB/s)\n' \
+    "$MAX_REGRESSION" "$baseline_short" "$baseline_representative" "$baseline_throughput"

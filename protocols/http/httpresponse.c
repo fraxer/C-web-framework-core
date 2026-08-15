@@ -1,4 +1,5 @@
 #include <stddef.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
@@ -334,7 +335,13 @@ file_status_e http_get_file_full_path(server_t* server, char* file_full_path, si
 void http_response_file(httpresponse_t* response, const char* file_full_path) {
     response->file_ = file_open(file_full_path, O_RDONLY);
     if (!response->file_.ok) {
-        response->send_default(response, 404);
+        /* EMFILE/ENFILE is temporary server capacity exhaustion, not a missing
+         * representation. Calling it 404 hid descriptor exhaustion in the
+         * high-concurrency h3 benchmark and encouraged clients to cache the
+         * lie. ENOMEM belongs to the same retryable resource class. */
+        const int status = errno == EMFILE || errno == ENFILE || errno == ENOMEM
+                           ? 503 : 404;
+        response->send_default(response, status);
         return;
     }
 
