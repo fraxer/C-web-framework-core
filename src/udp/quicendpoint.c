@@ -317,87 +317,100 @@ size_t quic_process_conn_limit(void) {
     return atomic_load_explicit(&__quic_max_connections, memory_order_acquire);
 }
 
-/* One key, clamped into a range it cannot break the protocol from. Every bound
- * here is a real limit of the code below it, not a taste: a receive window
- * under a packet stalls the connection on its first datagram, and a payload
- * size over the build's packet buffer would advertise room we cannot use. */
-static uint64_t __policy_u64(const char* key, uint64_t fallback,
-                             uint64_t min, uint64_t max) {
-    /* env_get_llong, not env_get_int: these are byte counts, and a value past
-     * 2^31 must clamp to the ceiling below rather than fall back to the default
-     * because the parse overflowed. */
-    const long long v = env_get_llong(key, (long long)fallback);
-
-    if (v < 0 || (uint64_t)v < min) return min;
-    if ((uint64_t)v > max) return max;
-
-    return (uint64_t)v;
+/* Parse one bounded policy value without silently changing operator intent. */
+static int __policy_u64(const char* key, uint64_t fallback,
+                        uint64_t min, uint64_t max, uint64_t* out) {
+    long long value = (long long)fallback;
+    if (env_get_llong_checked(key, &value) < 0) {
+        log_error("quic: %s must be an integer\n", key);
+        return 0;
+    }
+    if (value < 0 || (uint64_t)value < min || (uint64_t)value > max) {
+        log_error("quic: %s must be in %llu..%llu (got %lld)\n", key,
+                  (unsigned long long)min, (unsigned long long)max, value);
+        return 0;
+    }
+    *out = (uint64_t)value;
+    return 1;
 }
 
-static void __conn_policy_init(void) {
-    quic_conn_policy_t* p = &__quic_conn_policy;
+static int __conn_policy_init(void) {
+    /* Commit only after every value is valid, so a failed reload cannot leave
+     * a mixture of old and new transport parameters behind. */
+    quic_conn_policy_t next = __quic_conn_policy;
+    quic_conn_policy_t* p = &next;
+    uint64_t idle_timeout_sec = 0;
 
     /* §10.1 puts no ceiling on the idle timeout, but the connection state it
      * keeps alive is ours, so an hour is where this one stops. */
-    p->idle_timeout_ms =
-        __policy_u64("http3_idle_timeout_sec", QUIC_DEFAULT_IDLE_TIMEOUT_SEC, 1, 3600) * 1000;
+    if (!__policy_u64("http3_idle_timeout_sec", QUIC_DEFAULT_IDLE_TIMEOUT_SEC,
+                      1, 3600, &idle_timeout_sec)) return 0;
+    p->idle_timeout_ms = idle_timeout_sec * 1000;
 
     /* The floor is §14's minimum; the ceiling is the packet buffer quicconn
      * builds into, and advertising more than that would promise room the code
      * does not have. */
-    p->max_udp_payload_size =
-        __policy_u64("http3_max_udp_payload_size", QUIC_DEFAULT_UDP_PAYLOAD,
-                     QUIC_MIN_INITIAL_DATAGRAM, QUIC_DEFAULT_UDP_PAYLOAD);
+    if (!__policy_u64("http3_max_udp_payload_size", QUIC_DEFAULT_UDP_PAYLOAD,
+                      QUIC_MIN_INITIAL_DATAGRAM, QUIC_DEFAULT_UDP_PAYLOAD,
+                      &p->max_udp_payload_size)) return 0;
 
-    p->initial_max_data =
-        __policy_u64("http3_initial_max_data", QUIC_DEFAULT_INITIAL_MAX_DATA,
-                     QUIC_MIN_INITIAL_DATAGRAM, 1073741824ULL);
+    if (!__policy_u64("http3_initial_max_data", QUIC_DEFAULT_INITIAL_MAX_DATA,
+                      QUIC_MIN_INITIAL_DATAGRAM, 1073741824ULL,
+                      &p->initial_max_data)) return 0;
 
-    p->initial_max_stream_data =
-        __policy_u64("http3_initial_max_stream_data", QUIC_DEFAULT_STREAM_DATA,
-                     QUIC_MIN_INITIAL_DATAGRAM, 1073741824ULL);
+    if (!__policy_u64("http3_initial_max_stream_data", QUIC_DEFAULT_STREAM_DATA,
+                      QUIC_MIN_INITIAL_DATAGRAM, 1073741824ULL,
+                      &p->initial_max_stream_data)) return 0;
 
     /* Zero would be legal on the wire and useless here: a client that may open
      * no request stream has no way to ask for anything. */
-    p->max_streams_bidi =
-        __policy_u64("http3_max_streams_bidi", QUIC_DEFAULT_MAX_STREAMS_BIDI, 1, 65536);
+    if (!__policy_u64("http3_max_streams_bidi", QUIC_DEFAULT_MAX_STREAMS_BIDI,
+                      1, 65536, &p->max_streams_bidi)) return 0;
 
     /* HTTP/3 needs three of these before a request can be served (control and
      * both QPACK streams), so the floor is what the protocol itself costs. */
-    p->max_streams_uni =
-        __policy_u64("http3_max_streams_uni", QUIC_DEFAULT_MAX_STREAMS_UNI, 3, 65536);
+    if (!__policy_u64("http3_max_streams_uni", QUIC_DEFAULT_MAX_STREAMS_UNI,
+                      3, 65536, &p->max_streams_uni)) return 0;
 
-    p->recv_window_max =
-        __policy_u64("http3_recv_window_max", QUIC_DEFAULT_INITIAL_MAX_DATA * 16,
-                     p->initial_max_data, 1073741824ULL);
+    if (!__policy_u64("http3_recv_window_max", QUIC_DEFAULT_INITIAL_MAX_DATA * 16,
+                      p->initial_max_data, 1073741824ULL,
+                      &p->recv_window_max)) return 0;
 
-    p->active_cid_limit =
-        __policy_u64("http3_active_cid_limit", QUIC_DEFAULT_ACTIVE_CID_LIMIT, 2, 8);
+    if (!__policy_u64("http3_active_cid_limit", QUIC_DEFAULT_ACTIVE_CID_LIMIT,
+                      2, 8, &p->active_cid_limit)) return 0;
 
     /* §18.2 caps the parameter itself at 2^14 ms. */
-    p->ack_delay_ms =
-        __policy_u64("http3_ack_delay_ms", QUIC_DEFAULT_ACK_DELAY_MS, 0, 16383);
+    if (!__policy_u64("http3_ack_delay_ms", QUIC_DEFAULT_ACK_DELAY_MS,
+                      0, 16383, &p->ack_delay_ms)) return 0;
 
     /* RFC 9002 §7.2 has ten; the ceiling of 64 datagrams is where a burst
      * stops being a tuning choice and starts being an attack on the path. */
-    p->initcwnd_packets =
-        __policy_u64("http3_initcwnd_packets", QUICCC_INITIAL_WINDOW_PACKETS,
-                     QUICCC_MIN_WINDOW_PACKETS, 64);
+    if (!__policy_u64("http3_initcwnd_packets", QUICCC_INITIAL_WINDOW_PACKETS,
+                      QUICCC_MIN_WINDOW_PACKETS, 64,
+                      &p->initcwnd_packets)) return 0;
 
     if (p->initcwnd_packets != QUICCC_INITIAL_WINDOW_PACKETS)
         log_error("quic: http3_initcwnd_packets is %llu, not the %d RFC 9002 §7.2 "
                   "recommends -- every connection opens with a burst of that many datagrams\n",
                   (unsigned long long)p->initcwnd_packets, QUICCC_INITIAL_WINDOW_PACKETS);
 
-    p->pacing = env_get_int("http3_pacing", 1) != 0;
+    bool pacing = true;
+    if (env_get_bool_checked("http3_pacing", &pacing) < 0) {
+        log_error("quic: http3_pacing must be a boolean\n");
+        return 0;
+    }
+    p->pacing = pacing;
 
-    p->amplification_factor =
-        __policy_u64("http3_amplification_factor", QUIC_DEFAULT_AMPLIFICATION, 1, 16);
+    if (!__policy_u64("http3_amplification_factor", QUIC_DEFAULT_AMPLIFICATION,
+                      1, 16, &p->amplification_factor)) return 0;
 
     if (p->amplification_factor != QUIC_DEFAULT_AMPLIFICATION)
         log_error("quic: http3_amplification_factor is %llu, not the %d RFC 9000 §8.1 "
                   "requires -- this server can be used to amplify traffic at a spoofed address\n",
                   (unsigned long long)p->amplification_factor, QUIC_DEFAULT_AMPLIFICATION);
+
+    __quic_conn_policy = next;
+    return 1;
 }
 
 int quic_policy_init(void) {
@@ -449,7 +462,7 @@ int quic_policy_init(void) {
     __quic_rcvbuf = env_get_int("http3_so_rcvbuf", 0);
     __quic_sndbuf = env_get_int("http3_so_sndbuf", 0);
 
-    __conn_policy_init();
+    if (!__conn_policy_init()) return 0;
 
     /* 0 disables a limit. Every one of these guesses a threshold, and an
      * operator needs a way to prove a limit is the cause of an incident --

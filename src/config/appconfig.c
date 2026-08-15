@@ -343,6 +343,14 @@ int env_get_llong_checked(const char* key, long long* value) {
     return 1;
 }
 
+int env_get_bool_checked(const char* key, bool* value) {
+    json_token_t* token = __env_get_token(key);
+    if (token == NULL) return 0;
+    if (!json_is_bool(token)) return -1;
+    if (value != NULL) *value = json_bool(token);
+    return 1;
+}
+
 int env_get_int(const char* key, int default_value) {
     json_token_t* token = __env_get_token(key);
     if (token == NULL || !json_is_number(token)) return default_value;

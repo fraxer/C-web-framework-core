@@ -71,10 +71,10 @@ void signal_before_segmentation_fault(__attribute__((unused))int s) {
     _exit(1);
 }
 
-void signal_before_terminate(__attribute__((unused))int s) {
+void signal_before_terminate(int s) {
     signal_flush_streams();
     log_error("[signal_before_terminate] Запрос на прекращение работы\n");
-    exit(0);
+    exit(s);
 }
 
 void signal_before_abort(__attribute__((unused))int s) {

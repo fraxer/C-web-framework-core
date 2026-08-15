@@ -13,6 +13,7 @@
 #   asan     build with h3, ASan            + unit tests
 #   tsan     build with h3, TSan            + unit tests   (data races)
 #   h3unit   QUIC / HTTP/3 / QPACK unit runner only
+#   config   invalid HTTP/3 types/ranges reject startup
 #   fuzz     build the fuzz targets         + FUZZ_SECONDS each
 #   reload   hard reload with live QUIC      + old worker retirement
 #   softreload shared UDP handoff             + old CID/config drain
@@ -144,6 +145,19 @@ stage_h3unit() {
         record h3unit OK
     else
         record h3unit FAIL
+    fi
+}
+
+stage_config() {
+    say "config: invalid HTTP/3 policy rejects startup"
+
+    if build "$CI_BUILD_DIR/h3unit" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes &&
+       "$CORE_DIR/tests/h3_config_validation.sh" "$CI_BUILD_DIR/h3unit" \
+             "$CI_BUILD_DIR/h3-config-validation"; then
+        record config OK
+    else
+        record config FAIL
     fi
 }
 
@@ -316,7 +330,7 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit asan tsan fuzz reload softreload h3spec)
+ALL_STAGES=(noh3 h3unit config asan tsan fuzz reload softreload h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
@@ -331,6 +345,7 @@ for stage in "${STAGES[@]}"; do
     asan)   stage_asan ;;
     tsan)   stage_tsan ;;
     h3unit) stage_h3unit ;;
+    config) stage_config ;;
     fuzz)   stage_fuzz ;;
     reload) stage_reload ;;
     softreload) stage_softreload ;;

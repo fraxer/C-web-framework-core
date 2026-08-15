@@ -3249,6 +3249,7 @@ REQUIRE_H3SPEC=1 tests/ci.sh h3spec  # только обязательный h3s
 |---|---|---|
 | `noh3` | сборка без h3 + юнит-тесты | 1 |
 | `h3unit` | отдельный QUIC/H3/QPACK runner | 1–3 |
+| `config` | неверные типы/диапазоны HTTP/3 останавливают загрузку | 1–3 |
 | `asan` | сборка с h3 (ASan+LSan), unit + hard/soft reload | 2, 5 |
 | `tsan` | сборка с h3 (TSan), unit + hard/soft reload | 3, 5 |
 | `fuzz` | семь целей по `FUZZ_SECONDS` каждая | 4 |

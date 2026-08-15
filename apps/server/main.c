@@ -133,7 +133,7 @@ int main(int argc, char* argv[]) {
 
     failed:
 
-    signal_before_terminate(0);
+    signal_before_terminate(result);
 
     return result;
 }
