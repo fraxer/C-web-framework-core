@@ -49,7 +49,7 @@ typedef struct env_mail {
     char* host;
 } env_mail_t;
 
-typedef struct {
+typedef struct env {
     env_main_t main;
     env_mail_t mail;
     json_doc_t* custom_store;

@@ -72,9 +72,9 @@
   http3_amplification_factor         3        менять нельзя, только для тестов
 
 HTTP/3
-  http3_max_field_section_size       262144   как http2_max_header_list_size
-  http3_qpack_max_table_capacity     4096     0 -> QPACK-lite (фаза 6.1)
-  http3_qpack_blocked_streams        16
+  http3_max_field_section_size       1048576  [0 .. 1 ГиБ]
+  QPACK max table capacity           0        static-only, не настраивается
+  QPACK blocked streams              0        static-only, не настраивается
   http3_abort_rate / http3_abort_burst        как http2_abort_*
   http3_ctrl_rate  / http3_ctrl_burst         как http2_ctrl_*
 
@@ -157,15 +157,21 @@ h3) и `http3.alt_svc_max_age` (86400). Значение собирается о
 слоя (транспортные из таблицы выше — вместе с настройкой `quicconn`):
 
 ```
-http3_max_field_section_size   1048576
-http3_abort_rate / _burst      100 / 200
-http3_ctrl_rate  / _burst      100 / 200
+http3_max_field_section_size   1048576  [0 .. 1 ГиБ]
+http3_abort_rate / _burst      100 / 200 [0 .. INT32_MAX] / [1 .. INT32_MAX]
+http3_ctrl_rate  / _burst      100 / 200 [0 .. INT32_MAX] / [1 .. INT32_MAX]
 ```
 
 Первый закрывает костыль: до него h3 объявлял `MAX_FIELD_SECTION_SIZE` из
 `http2_max_header_list_size`. Это тот же бюджет по той же причине, но два
 протокола на одном операторском ключе означают, что ни один нельзя настроить, не
 трогая другой.
+
+Все пять значений разбираются тем же строгим preflight-валидатором, что и
+транспортные параметры: неверный тип, отрицательный rate или нулевой burst
+отклоняет startup/reload до публикации поколения. Нулевой rate явно отключает
+соответствующий budget; `max_field_section_size=0` запрещает ненулевые секции
+полей и остаётся допустимой диагностической настройкой.
 
 **Транспортные ключи готовы (2026-08-09).** Параметры соединения перестали быть
 константами внутри `quicconn_accept`:

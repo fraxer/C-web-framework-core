@@ -28,23 +28,63 @@ static _Atomic int64_t  h3_abort_burst = H3_DEFAULT_ABORT_BURST;
 static _Atomic int64_t  h3_ctrl_rate   = H3_DEFAULT_CTRL_RATE;
 static _Atomic int64_t  h3_ctrl_burst  = H3_DEFAULT_CTRL_BURST;
 
-static int64_t __policy_int(const char* key, int64_t fallback, int64_t min) {
-    int64_t v = env_get_int(key, (int)fallback);
-    if (v < min) v = min;
+typedef struct {
+    int64_t max_field_section_size;
+    int64_t abort_rate;
+    int64_t abort_burst;
+    int64_t ctrl_rate;
+    int64_t ctrl_burst;
+} h3_runtime_policy_t;
 
-    return v;
+static int __policy_int(const env_t* source, const char* key, int64_t fallback,
+                        int64_t min, int64_t max, int64_t* out) {
+    long long value = fallback;
+    if (env_config_get_llong_checked(source, key, &value) < 0) {
+        log_error("http3: %s must be an integer\n", key);
+        return 0;
+    }
+    if (value < min || value > max) {
+        log_error("http3: %s must be in %lld..%lld (got %lld)\n", key,
+                  (long long)min, (long long)max, value);
+        return 0;
+    }
+    *out = value;
+    return 1;
 }
 
-void h3_policy_init(void) {
+static int __policy_parse(const env_t* source, h3_runtime_policy_t* p) {
+    if (!__policy_int(source, "http3_max_field_section_size",
+                      H3_DEFAULT_MAX_FIELD_SECTION_SIZE, 0, 1073741824,
+                      &p->max_field_section_size) ||
+        !__policy_int(source, "http3_abort_rate", H3_DEFAULT_ABORT_RATE,
+                      0, INT32_MAX, &p->abort_rate) ||
+        !__policy_int(source, "http3_abort_burst", H3_DEFAULT_ABORT_BURST,
+                      1, INT32_MAX, &p->abort_burst) ||
+        !__policy_int(source, "http3_ctrl_rate", H3_DEFAULT_CTRL_RATE,
+                      0, INT32_MAX, &p->ctrl_rate) ||
+        !__policy_int(source, "http3_ctrl_burst", H3_DEFAULT_CTRL_BURST,
+                      1, INT32_MAX, &p->ctrl_burst)) return 0;
+    return 1;
+}
+
+int h3_policy_validate(const struct env* candidate) {
+    h3_runtime_policy_t policy;
+    return __policy_parse(candidate, &policy);
+}
+
+int h3_policy_init(void) {
+    h3_runtime_policy_t policy;
+    if (!__policy_parse(env(), &policy)) return 0;
+
     atomic_store(&h3_max_field_section_size,
-        (uint64_t)__policy_int("http3_max_field_section_size",
-                               H3_DEFAULT_MAX_FIELD_SECTION_SIZE, 0));
+                 (uint64_t)policy.max_field_section_size);
 
     /* 0 disables a bucket, which is why the floor is 0 and not 1. */
-    atomic_store(&h3_abort_rate,  __policy_int("http3_abort_rate",  H3_DEFAULT_ABORT_RATE, 0));
-    atomic_store(&h3_abort_burst, __policy_int("http3_abort_burst", H3_DEFAULT_ABORT_BURST, 1));
-    atomic_store(&h3_ctrl_rate,   __policy_int("http3_ctrl_rate",   H3_DEFAULT_CTRL_RATE, 0));
-    atomic_store(&h3_ctrl_burst,  __policy_int("http3_ctrl_burst",  H3_DEFAULT_CTRL_BURST, 1));
+    atomic_store(&h3_abort_rate, policy.abort_rate);
+    atomic_store(&h3_abort_burst, policy.abort_burst);
+    atomic_store(&h3_ctrl_rate, policy.ctrl_rate);
+    atomic_store(&h3_ctrl_burst, policy.ctrl_burst);
+    return 1;
 }
 
 uint64_t h3_policy_max_field_section_size(void) {

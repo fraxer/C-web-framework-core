@@ -14,6 +14,7 @@
 
 struct qpack_decoder;
 struct qpack_encoder;
+struct env;
 
 /* The connection-level half of HTTP/3 (RFC 9114 §6, §7.2) -- everything that is
  * true of the connection rather than of one request: the service streams, the
@@ -80,15 +81,16 @@ void h3uni_recv_free(h3uni_recv_t* uni);
 
 /* ---- Policy ---- *
  *
- * Read once per config load, before any worker thread exists, and read-only
- * afterwards -- the same contract h2_policy_init() carries, and the only reason
- * plain globals are safe here. Called from module_loader next to it.
+ * Parsed and validated from an unpublished reload candidate first, then
+ * published through atomics because old and new worker generations overlap.
+ * Called from module_loader next to h2_policy_init().
  *
  * Until this existed the field-section limit rode on http2_max_header_list_size
  * because it happens to be the same budget for the same reason. That was a
  * stopgap and said so: two protocols sharing one operator-facing key means
  * neither can be tuned without the other. */
-void h3_policy_init(void);
+int h3_policy_validate(const struct env* candidate);
+int h3_policy_init(void);
 
 typedef struct h3session {
     /* Owned by h3conn, not by the connection context: it is h3conn_t that lives

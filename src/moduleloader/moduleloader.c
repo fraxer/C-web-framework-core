@@ -146,6 +146,8 @@ int module_loader_config_correct(const char* path) {
     if (!module_loader_config_load(config, document))
         goto failed;
 #ifdef CWFR_HTTP3
+    if (!h3_policy_validate(&config->env))
+        goto failed;
     if (!quic_policy_validate(&config->env))
         goto failed;
 #endif
@@ -226,7 +228,10 @@ int __module_loader_init_modules(appconfig_t* config, json_doc_t* document) {
     h2_policy_init();
 
 #ifdef CWFR_HTTP3
-    h3_policy_init();
+    if (!h3_policy_init()) {
+        log_error("__module_loader_init_modules: h3_policy_init error\n");
+        goto failed;
+    }
 
     /* Same ordering contract as h2_policy_init: the QUIC policy is a set of
      * plain globals plus the process-wide connection table, and reading them

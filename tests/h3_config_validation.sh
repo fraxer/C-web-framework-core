@@ -62,6 +62,11 @@ run_invalid http3_stateless_reset_burst 0 || ok=0
 run_invalid http3_retry_threshold 4000001 || ok=0
 run_invalid http3_token_lifetime_sec 0 || ok=0
 run_invalid http3_new_token 1 || ok=0
+run_invalid http3_max_field_section_size 1073741825 || ok=0
+run_invalid http3_abort_rate -1 || ok=0
+run_invalid http3_abort_burst 0 || ok=0
+run_invalid http3_ctrl_rate '"fast"' || ok=0
+run_invalid http3_ctrl_burst 0 || ok=0
 
 [ "$ok" -eq 1 ] || exit 1
 
