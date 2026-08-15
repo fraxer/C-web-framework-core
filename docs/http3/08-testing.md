@@ -3238,18 +3238,19 @@ docker run -d --name hap --network host --ulimit nofile=65536:65536 \
 
 ```bash
 tests/ci.sh                      # все стадии
+tests/ci.sh release              # полный обязательный release-gate
 tests/ci.sh h3unit asan tsan     # подмножество, в указанном порядке
 FUZZ_SECONDS=600 tests/ci.sh fuzz
 H3SPEC=/path/to/h3spec tests/ci.sh h3spec
-REQUIRE_H3SPEC=1 tests/ci.sh h3spec  # обязательный release-gate
+REQUIRE_H3SPEC=1 tests/ci.sh h3spec  # только обязательный h3spec
 ```
 
 | стадия | что делает | пункт §8 |
 |---|---|---|
 | `noh3` | сборка без h3 + юнит-тесты | 1 |
 | `h3unit` | отдельный QUIC/H3/QPACK runner | 1–3 |
-| `asan` | сборка с h3 (ASan+LSan) + юнит-тесты | 2 |
-| `tsan` | сборка с h3 (TSan) + юнит-тесты | 3 |
+| `asan` | сборка с h3 (ASan+LSan), unit + hard/soft reload | 2, 5 |
+| `tsan` | сборка с h3 (TSan), unit + hard/soft reload | 3, 5 |
 | `fuzz` | семь целей по `FUZZ_SECONDS` каждая | 4 |
 | `reload` | hard reload при живом QUIC: проверяет уход старых TID и запрос к новому поколению | 5 |
 | `softreload` | общий UDP socket: незавершённый старый ответ, новая конфигурация и drain старых TID | 5 |
@@ -3266,8 +3267,8 @@ REQUIRE_H3SPEC=1 tests/ci.sh h3spec  # обязательный release-gate
   же, которым пользуется юнит-тест TLS-моста). Ничего не нужно настраивать на
   машине, и нечему разойтись между машинами;
 - **локально `h3spec` опционален**: без бинарника стадия сообщает `SKIP`.
-  Release-job обязан задавать `REQUIRE_H3SPEC=1`; тогда отсутствие бинарника —
-  `FAIL`, а не успешный пропуск;
+  Release-job обязан запускать `tests/ci.sh release`; этот режим сам делает
+  h3spec обязательным, и отсутствие бинарника становится `FAIL`;
 - **TSan живёт в своём дереве сборки и со своим окружением** — он не линкуется с
   ASan, и `ASAN_OPTIONS` для него сбрасывается;
 - **фаззинг не пишет в рабочую копию**: корпус из дерева копируется в каталог

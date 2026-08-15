@@ -23,6 +23,7 @@
 #
 # Usage:
 #   tests/ci.sh                  # every stage
+#   tests/ci.sh release          # every stage; h3spec must be installed
 #   tests/ci.sh asan tsan        # a subset, in the order given
 #   FUZZ_SECONDS=600 tests/ci.sh fuzz
 #   CI_BUILD_DIR=/var/tmp/ci tests/ci.sh
@@ -315,8 +316,14 @@ JSON
     fi
 }
 
+ALL_STAGES=(noh3 h3unit asan tsan fuzz reload softreload h3spec)
 STAGES=("$@")
-[ ${#STAGES[@]} -eq 0 ] && STAGES=(noh3 h3unit asan tsan fuzz reload softreload h3spec)
+if [ ${#STAGES[@]} -eq 0 ]; then
+    STAGES=("${ALL_STAGES[@]}")
+elif [ ${#STAGES[@]} -eq 1 ] && [ "${STAGES[0]}" = release ]; then
+    REQUIRE_H3SPEC=1
+    STAGES=("${ALL_STAGES[@]}")
+fi
 
 for stage in "${STAGES[@]}"; do
     case "$stage" in
