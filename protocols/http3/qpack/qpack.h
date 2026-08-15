@@ -22,6 +22,10 @@
 
 typedef enum {
     QPACK_OK = 0,
+    /* Required Insert Count is valid but has not arrived on the encoder stream
+     * yet. The HTTP/3 layer retains the field section and retries it after an
+     * insertion, subject to SETTINGS_QPACK_BLOCKED_STREAMS. */
+    QPACK_BLOCKED,
     /* A malformed block: a bad Huffman string, a reference into the (absent)
      * dynamic table, Required Insert Count != 0, or a truncated representation.
      * Maps to QPACK_DECOMPRESSION_FAILED -- a connection error. */
@@ -55,17 +59,49 @@ typedef struct {
     int    never_indexed;
 } qpack_header_t;
 
-/* Lite decoder. max_capacity and max_blocked are stored for phase 6.2; in lite
- * both are 0, and qpack_decode_block enforces that the peer respects them. */
+typedef struct qpack_dynamic_entry qpack_dynamic_entry_t;
+
+/* Decoder-side dynamic table. Entries are accounted as name + value + 32
+ * bytes (§3.2.1); insert_count is the monotonically increasing absolute index
+ * space and does not fall when old entries are evicted. */
 typedef struct qpack_decoder {
     size_t max_capacity;
     size_t max_blocked;
+    size_t capacity;
+    size_t bytes;
+    uint64_t insert_count;
+    qpack_dynamic_entry_t* entries; /* oldest first */
+    size_t entry_count;
+    size_t entry_cap;
+    uint8_t* pending;
+    size_t pending_len;
+    size_t pending_cap;
 } qpack_decoder_t;
 
 /* Create a decoder. For lite pass (0, 0); the full decoder (6.2) takes the
  * negotiated capacity and blocked-stream limit. Returns NULL on OOM. */
 qpack_decoder_t* qpack_decoder_create(size_t max_capacity, size_t max_blocked);
 void qpack_decoder_free(qpack_decoder_t* d);
+
+size_t qpack_decoder_capacity(const qpack_decoder_t* d);
+size_t qpack_decoder_bytes(const qpack_decoder_t* d);
+uint64_t qpack_decoder_insert_count(const qpack_decoder_t* d);
+
+/* Decode only the Field Section Prefix's Required Insert Count. Returns
+ * QPACK_BLOCKED when the count is valid but still in the future, while still
+ * storing it in *required so the HTTP/3 scheduler knows when to retry. */
+qpack_status_e qpack_required_insert_count(const qpack_decoder_t* d,
+                                            const uint8_t* block, size_t len,
+                                            uint64_t* required);
+
+/* Bytes to write on our QPACK decoder stream (§4.4). Insert Count Increment is
+ * queued as peer insertions arrive; the HTTP/3 layer adds Section
+ * Acknowledgment after decoding a dynamic section and Stream Cancellation when
+ * abandoning one. The returned storage belongs to the decoder. */
+size_t qpack_decoder_pending(const qpack_decoder_t* d, const uint8_t** out);
+void qpack_decoder_consume(qpack_decoder_t* d, size_t n);
+qpack_status_e qpack_decoder_ack_section(qpack_decoder_t* d, uint64_t stream_id);
+qpack_status_e qpack_decoder_cancel_stream(qpack_decoder_t* d, uint64_t stream_id);
 
 /* Decode one field section (request headers or trailers). On QPACK_OK, *out is
  * a malloc'd array of *out_count fields in the order they appeared; the caller
@@ -104,8 +140,13 @@ qpack_status_e qpack_decoder_read_encoder(qpack_decoder_t* d, const uint8_t* dat
  *
  * Takes no decoder: there is no encoder state to keep while the dynamic table
  * does not exist. Resumable on the same terms as the encoder-stream reader. */
+struct qpack_encoder;
+typedef struct qpack_outstanding_section qpack_outstanding_section_t;
+qpack_status_e qpack_encoder_read_decoder_state(struct qpack_encoder* e,
+                                                 const uint8_t* data, size_t len,
+                                                 size_t* consumed);
 qpack_status_e qpack_encoder_read_decoder(const uint8_t* data, size_t len,
-                                          size_t* consumed);
+                                          size_t* consumed); /* lite compatibility */
 
 /* ---- Encoder (lite) ---- *
  *
@@ -120,10 +161,42 @@ qpack_status_e qpack_encoder_read_decoder(const uint8_t* data, size_t len,
 typedef struct qpack_encoder {
     size_t max_capacity;   /* 0 in lite */
     size_t max_blocked;    /* 0 in lite */
+    uint64_t insert_count;
+    uint64_t known_received_count;
+    size_t capacity;
+    uint8_t* pending;
+    size_t pending_len;
+    size_t pending_cap;
+    qpack_dynamic_entry_t* entries;
+    size_t entry_count;
+    size_t entry_cap;
+    size_t bytes;
+    qpack_outstanding_section_t* sections;
+    size_t section_count;
+    size_t section_cap;
 } qpack_encoder_t;
 
 qpack_encoder_t* qpack_encoder_create(size_t max_capacity, size_t max_blocked);
 void qpack_encoder_free(qpack_encoder_t* e);
+qpack_status_e qpack_encoder_set_capacity(qpack_encoder_t* e, size_t capacity);
+size_t qpack_encoder_pending(const qpack_encoder_t* e, const uint8_t** out);
+void qpack_encoder_consume(qpack_encoder_t* e, size_t n);
+qpack_status_e qpack_encoder_section_open(qpack_encoder_t* e, uint64_t stream_id,
+                                           uint64_t required_insert_count);
+qpack_status_e qpack_encoder_insert_literal(qpack_encoder_t* e,
+                                             const char* name, size_t name_len,
+                                             const char* value, size_t value_len,
+                                             uint64_t* absolute);
+qpack_status_e qpack_encoder_insert_static_name(qpack_encoder_t* e,
+                                                 uint64_t static_index,
+                                                 const char* value, size_t value_len,
+                                                 uint64_t* absolute);
+qpack_status_e qpack_encoder_insert_dynamic_name(qpack_encoder_t* e,
+                                                  uint64_t relative_index,
+                                                  const char* value, size_t value_len,
+                                                  uint64_t* absolute);
+qpack_status_e qpack_encoder_duplicate(qpack_encoder_t* e, uint64_t relative_index,
+                                        uint64_t* absolute);
 
 /* Encode `count` fields into dst[0..cap). Returns bytes written, or 0 on error
  * (cap too small / OOM). Even an empty field section is two bytes (the prefix),

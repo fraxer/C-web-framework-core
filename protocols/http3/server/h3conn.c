@@ -299,6 +299,13 @@ static h3conn_result_t __on_reset(h3conn_t* c, quicstream_t* qs, h3app_t* app) {
      * between the attacker and the next stream -- so the budget is not
      * optional here. */
     const int answered = app->req != NULL && app->req->response_done;
+    if (app->qpack_blocked_counted) {
+        if (c->qpack_blocked_streams > 0) c->qpack_blocked_streams--;
+        app->qpack_blocked_counted = 0;
+        if (qpack_decoder_cancel_stream(c->session->qdec, qs->id) != QPACK_OK)
+            return __closed(H3_INTERNAL_ERROR);
+        h3stream_qpack_unblock(app->req);
+    }
     app->drained = 1;
 
     metrics_h3(METRICS_H3_STREAMS_CANCELLED);
@@ -360,6 +367,12 @@ static h3conn_result_t __read_request(h3conn_t* c, quicconn_t* qc, quicstream_t*
             const h3stream_status_e st = h3stream_feed(app->req, c->session->qdec, &p, end, fin);
 
             if (st == H3STREAM_REQUEST_READY) {
+                if (app->qpack_blocked_counted) {
+                    if (c->qpack_blocked_streams > 0) c->qpack_blocked_streams--;
+                    app->qpack_blocked_counted = 0;
+                    if (qpack_decoder_ack_section(c->session->qdec, qs->id) != QPACK_OK)
+                        return __closed(H3_INTERNAL_ERROR);
+                }
                 headers_became_ready = 1;
 
                 /* A request exists from here: the field section decoded into
@@ -403,6 +416,27 @@ static h3conn_result_t __read_request(h3conn_t* c, quicconn_t* qc, quicstream_t*
             }
 
             if (st == H3STREAM_NEED_MORE || st == H3STREAM_BODY_CHUNK) break;
+
+            if (st == H3STREAM_QPACK_BLOCKED) {
+                if (!app->qpack_blocked_counted) {
+                    if (c->qpack_blocked_streams >= c->session->qdec->max_blocked)
+                        return __closed(QPACK_DECOMPRESSION_FAILED);
+                    c->qpack_blocked_streams++;
+                    app->qpack_blocked_counted = 1;
+                }
+                break;
+            }
+
+            /* A formerly blocked section that decodes into a message/limit
+             * error is abandoned just like RESET_STREAM: release its blocked
+             * slot and tell the peer's encoder it may drop the references. */
+            if (app->qpack_blocked_counted) {
+                if (c->qpack_blocked_streams > 0) c->qpack_blocked_streams--;
+                app->qpack_blocked_counted = 0;
+                if (qpack_decoder_cancel_stream(c->session->qdec, qs->id) != QPACK_OK)
+                    return __closed(H3_INTERNAL_ERROR);
+                h3stream_qpack_unblock(app->req);
+            }
 
             return __apply_stream_status(qs, app, st);
         }
@@ -672,6 +706,30 @@ int h3_server_continue(h3conn_t* c, quicstream_t* qs) {
 
 /* ---- The write turn ---- */
 
+/* Drain decoder instructions onto the critical QPACK decoder stream before
+ * response data. Insert Count Increment unblocks the peer's encoder eviction;
+ * Section Acknowledgment releases references held for a field section. */
+static int __write_qpack_decoder(h3conn_t* c, quicconn_t* qc) {
+    const uint8_t* pending = NULL;
+    const size_t len = qpack_decoder_pending(c->session->qdec, &pending);
+    if (len == 0) return 1;
+
+    quicstream_t* qs = quicconn_stream_find(qc, c->session->qpack_dec_send_id);
+    if (qs == NULL || !quicstream_write(qs, pending, len)) return 0;
+    qpack_decoder_consume(c->session->qdec, len);
+    return 1;
+}
+
+static int __write_qpack_encoder(h3conn_t* c, quicconn_t* qc) {
+    const uint8_t* pending = NULL;
+    const size_t len = qpack_encoder_pending(c->session->qenc, &pending);
+    if (len == 0) return 1;
+    quicstream_t* qs = quicconn_stream_find(qc, c->session->qpack_enc_send_id);
+    if (qs == NULL || !quicstream_write(qs, pending, len)) return 0;
+    qpack_encoder_consume(c->session->qenc, len);
+    return 1;
+}
+
 /* One stream's turn at the filter chain. */
 static int __write_stream(quicstream_t* qs, h3stream_t* st) {
     httpresponse_t* response = st->response;
@@ -716,6 +774,8 @@ static int __write_stream(quicstream_t* qs, h3stream_t* st) {
 
 int h3conn_write(h3conn_t* c, quicconn_t* qc) {
     if (c == NULL || qc == NULL) return 0;
+
+    if (!__write_qpack_encoder(c, qc) || !__write_qpack_decoder(c, qc)) return 0;
 
     /* Informational responses first, and outside the per-stream turn below: a
      * 103 is a staged block, not a scheduled body, and it has to precede the

@@ -346,3 +346,72 @@ Literal Name, Duplicate, любая ёмкость выше объявленно
 через декодер и будущий общий `httpfields_to_request()`) — после этого
 `curl --http3` получит первый ответ. Full QPACK (6.2 — динамическая таблица,
 encoder/decoder-потоки, blocked streams) откладывается до работающего h3.
+
+## 6.2. Full QPACK — текущая реализация
+
+### 6.2a. Decoder dynamic table
+
+Начат full QPACK без преждевременного изменения SETTINGS production-сервера.
+Decoder теперь содержит динамическую таблицу с текущей и максимальной ёмкостью,
+точным учётом `name + value + 32`, монотонным absolute insert count и eviction
+самых старых записей. Encoder stream разбирает все четыре инструкции RFC 9204
+§4.3: Set Dynamic Table Capacity, Insert With Name Reference (static/dynamic),
+Insert With Literal Name и Duplicate. Разбор остаётся resumable: неполная
+инструкция не потребляется и повторно подаётся после следующего чтения stream.
+
+Field Section decoder раскодирует modulo Required Insert Count, Base, relative
+и post-base ссылки на динамические записи. Ссылка на ещё не полученный insert
+возвращает отдельный `QPACK_BLOCKED`, а не ошибочно закрывает соединение.
+Static-only режим не изменён: при `max_capacity=0` любая table-mutating
+инструкция по-прежнему немедленно даёт `QPACK_ENCODER_STREAM_ERROR`.
+
+Добавлены unit-сценарии capacity, insert, relative static/dynamic name,
+Duplicate, eviction, split instruction, relative/post-base Field Line и future
+Required Insert Count. H3 runner под ASan: 1949/1949.
+
+Этот этап намеренно ещё не включает non-zero SETTINGS: сначала нужны хранение и
+повторный запуск заблокированных field sections, лимит blocked streams,
+Section Acknowledgment/Stream Cancellation, а также encoder-side dynamic table.
+До завершения этих частей сервер продолжает рекламировать capacity=0 и остаётся
+совместимым с прежним static-only поведением.
+
+### 6.2b. Исходящий decoder stream и границы QUIC reads
+
+Decoder формирует собственный поток инструкций RFC 9204 §4.4. Каждая успешная
+вставка ставит в очередь Insert Count Increment; доступны Section
+Acknowledgment и Stream Cancellation. Очередь допускает частичную отправку
+(`pending`/`consume`) и дренируется `h3conn_write()` на открытый критический
+QPACK decoder stream до response data. Повторный write-turn не дублирует уже
+переданные инструкции.
+
+Исправлена необходимая для full QPACK граница потокового разбора. В lite любая
+легальная encoder-инструкция помещалась в один read, поэтому `consumed < len`
+можно было оставить теоретическим контрактом. Dynamic Insert содержит две
+строки и закономерно режется между QUIC STREAM frames. Теперь `h3uni_recv_t`
+хранит непотреблённый суффикс обоих QPACK service streams, дополняет его на
+следующем read и ограничивает накопление одним MiB. Превышение этого предела
+закрывает соединение с `H3_EXCESSIVE_LOAD`, OOM — с `H3_INTERNAL_ERROR`.
+
+Unit-тест фиксирует реальный split внутри literal name: после первой половины
+insert count остаётся нулевым, после второй появляется ровно одна запись и
+staging buffer пуст. Дополнительно проверены точные wire bytes decoder
+instructions и их частичное consume. H3 runner под ASan: 1966/1966.
+
+Connection glue считает blocked request streams ровно один раз на stream.
+Достижение `max_blocked` превращает следующий блок в
+`QPACK_DECOMPRESSION_FAILED`. Успешный retry освобождает слот и ставит Section
+Acknowledgment; RESET_STREAM либо ошибка повторного decode освобождает слот,
+очищает deferred bytes и ставит Stream Cancellation.
+
+### 6.2c. Инвариант blocked request stream
+
+Перед подключением `QPACK_BLOCKED` к `h3stream` зафиксирован важный lifetime:
+`quicstream_read()` удаляет из receive buffer весь выданный chunk, тогда как
+HEADERS может закончиться в середине этого chunk и за ним уже находиться DATA.
+Поэтому недостаточно сохранить только Field Section из `h3frame_parser` — при
+остановке на blocked HEADERS потеряется хвост уже прочитанного chunk. Реализация
+blocked-stream обязана владеть одновременно копией Field Section, всеми байтами
+после неё и флагом FIN; после insert сначала повторяется QPACK decode, затем тот
+же сохранённый хвост снова проходит обычную frame state machine. Этот буфер
+входит в HTTP/3 memory budget и освобождается при decode, RESET_STREAM и
+закрытии соединения.

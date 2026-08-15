@@ -217,3 +217,159 @@ TEST(test_qpack_decode_errors) {
 
     qpack_decoder_free(d);
 }
+
+TEST(test_qpack_dynamic_table_instructions) {
+    TEST_SUITE("qpack dynamic table");
+
+    qpack_decoder_t* d = qpack_decoder_create(128, 4);
+    size_t consumed = 99;
+
+    TEST_CASE("capacity and literal-name insertion are applied");
+    static const uint8_t first[] = {
+        0x3f, 0x61,                         /* capacity 128 */
+        0x43, 'f', 'o', 'o',               /* literal name foo */
+        0x03, 'b', 'a', 'r'                /* value bar */
+    };
+    TEST_ASSERT(qpack_decoder_read_encoder(d, first, sizeof first, &consumed) == QPACK_OK,
+                "encoder instructions accepted");
+    TEST_ASSERT(consumed == sizeof first, "all bytes consumed");
+    TEST_ASSERT(qpack_decoder_capacity(d) == 128, "capacity applied");
+    TEST_ASSERT(qpack_decoder_insert_count(d) == 1, "one insertion");
+    TEST_ASSERT(qpack_decoder_bytes(d) == 38, "entry uses name + value + 32 bytes");
+
+    TEST_CASE("static and dynamic name references insert entries");
+    static const uint8_t refs[] = {
+        0xc1, 0x02, '/', 'x',               /* static :path name, value /x */
+        0x80, 0x03, 'b', 'a', 'z'           /* newest dynamic name, value baz */
+    };
+    TEST_ASSERT(qpack_decoder_read_encoder(d, refs, sizeof refs, &consumed) == QPACK_OK,
+                "name references accepted");
+    TEST_ASSERT(consumed == sizeof refs, "both instructions consumed");
+    TEST_ASSERT(qpack_decoder_insert_count(d) == 3, "absolute insert count advances");
+
+    TEST_CASE("duplicate uses a relative dynamic index");
+    static const uint8_t duplicate[] = { 0x00 }; /* duplicate newest */
+    TEST_ASSERT(qpack_decoder_read_encoder(d, duplicate, sizeof duplicate, &consumed)
+                    == QPACK_OK, "duplicate accepted");
+    TEST_ASSERT(qpack_decoder_insert_count(d) == 4, "duplicate is a new insertion");
+
+    TEST_CASE("an instruction split before its value remains unconsumed");
+    static const uint8_t partial[] = { 0x41, 'x', 0x03, 'a' };
+    consumed = 99;
+    TEST_ASSERT(qpack_decoder_read_encoder(d, partial, sizeof partial, &consumed) == QPACK_OK,
+                "partial feed is not malformed");
+    TEST_ASSERT(consumed == 0, "caller retains the whole partial instruction");
+
+    TEST_CASE("capacity reduction evicts oldest entries but not insert count");
+    static const uint8_t shrink[] = { 0x3f, 0x01 }; /* capacity 32 */
+    TEST_ASSERT(qpack_decoder_read_encoder(d, shrink, sizeof shrink, &consumed) == QPACK_OK,
+                "capacity reduced");
+    TEST_ASSERT(qpack_decoder_capacity(d) == 32 && qpack_decoder_bytes(d) == 0,
+                "entries evicted");
+    TEST_ASSERT(qpack_decoder_insert_count(d) == 4, "absolute count is monotonic");
+
+    TEST_CASE("capacity above SETTINGS is an encoder-stream error");
+    static const uint8_t too_large[] = { 0x3f, 0x62 }; /* capacity 129 */
+    TEST_ASSERT(qpack_decoder_read_encoder(d, too_large, sizeof too_large, &consumed)
+                    == QPACK_ERR_ENCODER_STREAM, "peer cannot exceed advertised maximum");
+
+    qpack_decoder_free(d);
+}
+
+TEST(test_qpack_dynamic_field_references) {
+    TEST_SUITE("qpack dynamic fields");
+
+    qpack_decoder_t* d = qpack_decoder_create(128, 4);
+    size_t consumed = 0;
+    static const uint8_t setup[] = {
+        0x3f, 0x61,                         /* capacity 128 */
+        0x43, 'f', 'o', 'o', 0x03, 'b', 'a', 'r',
+        0xc1, 0x02, '/', 'x'                /* :path=/x */
+    };
+    TEST_ASSERT(qpack_decoder_read_encoder(d, setup, sizeof setup, &consumed) == QPACK_OK,
+                "dynamic table prepared");
+
+    qpack_header_t* h = NULL;
+    size_t count = 0;
+
+    TEST_CASE("relative indexed field resolves from Base");
+    static const uint8_t indexed[] = { 0x03, 0x00, 0x80 };
+    TEST_ASSERT(qpack_decode_block(d, indexed, sizeof indexed, 0, &h, &count) == QPACK_OK,
+                "dynamic indexed decoded");
+    TEST_ASSERT(count == 1 && field_eq(&h[0], ":path", "/x", 0), "newest entry");
+    qpack_headers_free(h, count);
+
+    TEST_CASE("relative dynamic name reference supplies a new literal value");
+    static const uint8_t named[] = { 0x03, 0x00, 0x41, 0x03, 'q', 'u', 'x' };
+    TEST_ASSERT(qpack_decode_block(d, named, sizeof named, 0, &h, &count) == QPACK_OK,
+                "dynamic name decoded");
+    TEST_ASSERT(count == 1 && field_eq(&h[0], "foo", "qux", 0), "older name");
+    qpack_headers_free(h, count);
+
+    TEST_CASE("post-base indexed field resolves an entry below Required Insert Count");
+    static const uint8_t postbase[] = { 0x03, 0x81, 0x10 };
+    TEST_ASSERT(qpack_decode_block(d, postbase, sizeof postbase, 0, &h, &count) == QPACK_OK,
+                "post-base decoded");
+    TEST_ASSERT(count == 1 && field_eq(&h[0], "foo", "bar", 0), "absolute entry zero");
+    qpack_headers_free(h, count);
+
+    TEST_CASE("a future Required Insert Count blocks instead of corrupting the connection");
+    qpack_decoder_t* waiting = qpack_decoder_create(128, 4);
+    static const uint8_t future[] = { 0x02, 0x00 };
+    uint64_t required = 99;
+    TEST_ASSERT(qpack_required_insert_count(waiting, future, sizeof future, &required)
+                    == QPACK_BLOCKED && required == 1,
+                "scheduler learns the exact insertion threshold");
+    TEST_ASSERT(qpack_decode_block(waiting, future, sizeof future, 0, &h, &count)
+                    == QPACK_BLOCKED, "waits for encoder stream insertion");
+    TEST_ASSERT(h == NULL && count == 0, "no partial fields escape");
+
+    static const uint8_t one_insert[] = {
+        0x3f, 0x61, 0x41, 'x', 0x01, 'y'
+    };
+    TEST_ASSERT(qpack_decoder_read_encoder(waiting, one_insert, sizeof one_insert,
+                                           &consumed) == QPACK_OK,
+                "required insertion arrived");
+    TEST_ASSERT(qpack_required_insert_count(waiting, future, sizeof future, &required)
+                    == QPACK_OK && required == 1,
+                "same section is now ready for retry");
+    qpack_decoder_free(waiting);
+
+    qpack_decoder_free(d);
+}
+
+TEST(test_qpack_decoder_stream_output) {
+    TEST_SUITE("qpack decoder stream");
+
+    qpack_decoder_t* d = qpack_decoder_create(128, 4);
+    size_t consumed = 0;
+    static const uint8_t insert[] = {
+        0x3f, 0x61,
+        0x41, 'x', 0x01, 'y'
+    };
+    TEST_ASSERT(qpack_decoder_read_encoder(d, insert, sizeof insert, &consumed) == QPACK_OK,
+                "one insertion accepted");
+
+    TEST_CASE("an insertion queues Insert Count Increment");
+    const uint8_t* pending = NULL;
+    size_t n = qpack_decoder_pending(d, &pending);
+    TEST_ASSERT(n == 1 && pending[0] == 0x01, "increment one encoded as 00iiiiii");
+
+    TEST_CASE("section acknowledgment and stream cancellation append in order");
+    TEST_ASSERT(qpack_decoder_ack_section(d, 300) == QPACK_OK, "section ack queued");
+    TEST_ASSERT(qpack_decoder_cancel_stream(d, 5) == QPACK_OK, "cancellation queued");
+    n = qpack_decoder_pending(d, &pending);
+    static const uint8_t expected[] = { 0x01, 0xff, 0xad, 0x01, 0x45 };
+    TEST_ASSERT(n == sizeof expected && memcmp(pending, expected, sizeof expected) == 0,
+                "decoder instructions have RFC 9204 wire forms");
+
+    TEST_CASE("partial consume preserves the unsent suffix");
+    qpack_decoder_consume(d, 2);
+    n = qpack_decoder_pending(d, &pending);
+    TEST_ASSERT(n == 3 && pending[0] == 0xad && pending[2] == 0x45,
+                "suffix retained");
+    qpack_decoder_consume(d, 99);
+    TEST_ASSERT(qpack_decoder_pending(d, &pending) == 0, "oversized consume drains queue");
+
+    qpack_decoder_free(d);
+}

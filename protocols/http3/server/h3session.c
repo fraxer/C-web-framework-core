@@ -178,6 +178,9 @@ h3uni_recv_t* h3uni_recv_create(uint64_t id) {
     uni->action = H3UNI_ROUTE;
     uni->settings_seen = 0;
     uni->closed = 0;
+    uni->qpack_pending = NULL;
+    uni->qpack_pending_len = 0;
+    uni->qpack_pending_cap = 0;
 
     return uni;
 }
@@ -186,6 +189,7 @@ void h3uni_recv_free(h3uni_recv_t* uni) {
     if (uni == NULL) return;
 
     h3frame_parser_free(&uni->frames);
+    free(uni->qpack_pending);
     free(uni);
 }
 
@@ -518,27 +522,64 @@ static h3session_verdict_t __control_feed(h3session_t* s, h3uni_recv_t* uni,
 
 /* ---- The QPACK streams ---- */
 
-static h3session_verdict_t __qpack_encoder_feed(h3session_t* s,
+static int __qpack_append(h3uni_recv_t* uni, const uint8_t* data, size_t len) {
+    if (len == 0) return 1;
+    if (len > H3FRAME_MAX_ACCUMULATED ||
+        uni->qpack_pending_len > H3FRAME_MAX_ACCUMULATED - len) return 0;
+    const size_t need = uni->qpack_pending_len + len;
+    if (need > uni->qpack_pending_cap) {
+        size_t cap = uni->qpack_pending_cap ? uni->qpack_pending_cap : 128;
+        while (cap < need) {
+            if (cap >= H3FRAME_MAX_ACCUMULATED / 2) {
+                cap = H3FRAME_MAX_ACCUMULATED;
+                break;
+            }
+            cap *= 2;
+        }
+        uint8_t* grown = realloc(uni->qpack_pending, cap);
+        if (grown == NULL) return 0;
+        uni->qpack_pending = grown;
+        uni->qpack_pending_cap = cap;
+    }
+    memcpy(uni->qpack_pending + uni->qpack_pending_len, data, len);
+    uni->qpack_pending_len += len;
+    return 1;
+}
+
+static void __qpack_consume(h3uni_recv_t* uni, size_t consumed) {
+    if (consumed >= uni->qpack_pending_len) { uni->qpack_pending_len = 0; return; }
+    memmove(uni->qpack_pending, uni->qpack_pending + consumed,
+            uni->qpack_pending_len - consumed);
+    uni->qpack_pending_len -= consumed;
+}
+
+static h3session_verdict_t __qpack_encoder_feed(h3session_t* s, h3uni_recv_t* uni,
                                                 const uint8_t* data, size_t len) {
-    /* In lite the only legal instruction is `Set Dynamic Table Capacity 0`;
-     * qpack_decoder_read_encoder knows the rule and the opcodes. A partial
-     * instruction is not an error -- but it also cannot be carried over,
-     * because a 5-bit-prefix integer of capacity 0 is a single octet and the
-     * only multi-octet form legal here would already be over capacity. */
+    if (!__qpack_append(uni, data, len)) return __conn(H3_EXCESSIVE_LOAD);
     size_t consumed = 0;
-    if (qpack_decoder_read_encoder(s->qdec, data, len, &consumed) != QPACK_OK)
+    const qpack_status_e st = qpack_decoder_read_encoder(
+        s->qdec, uni->qpack_pending, uni->qpack_pending_len, &consumed);
+    if (st == QPACK_ERR_MEMORY) return __conn(H3_INTERNAL_ERROR);
+    if (st != QPACK_OK)
         return __conn(QPACK_ENCODER_STREAM_ERROR);
+
+    __qpack_consume(uni, consumed);
 
     return __ok();
 }
 
-static h3session_verdict_t __qpack_decoder_feed(h3session_t* s,
+static h3session_verdict_t __qpack_decoder_feed(h3session_t* s, h3uni_recv_t* uni,
                                                 const uint8_t* data, size_t len) {
     (void)s;
 
+    if (!__qpack_append(uni, data, len)) return __conn(H3_EXCESSIVE_LOAD);
     size_t consumed = 0;
-    if (qpack_encoder_read_decoder(data, len, &consumed) != QPACK_OK)
+    if (qpack_encoder_read_decoder_state(s->qenc, uni->qpack_pending,
+                                         uni->qpack_pending_len,
+                                         &consumed) != QPACK_OK)
         return __conn(QPACK_DECODER_STREAM_ERROR);
+
+    __qpack_consume(uni, consumed);
 
     return __ok();
 }
@@ -619,7 +660,7 @@ h3session_verdict_t h3session_uni_feed(h3session_t* s, h3uni_recv_t* uni,
         break;
 
     case H3_UNI_STREAM_QPACK_ENCODER:
-        v = __qpack_encoder_feed(s, p, (size_t)(end - p));
+        v = __qpack_encoder_feed(s, uni, p, (size_t)(end - p));
         break;
 
     case H3_UNI_STREAM_QPACK_DECODER:
@@ -630,7 +671,7 @@ h3session_verdict_t h3session_uni_feed(h3session_t* s, h3uni_recv_t* uni,
          * error whatever its value (§4.4.3), so the stream is parsed to that
          * depth rather than drained. Full QPACK (6.2) is where the rest of
          * these instructions start to matter. */
-        v = __qpack_decoder_feed(s, p, (size_t)(end - p));
+        v = __qpack_decoder_feed(s, uni, p, (size_t)(end - p));
         break;
 
     default:

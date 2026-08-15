@@ -14,6 +14,7 @@
 #include "log.h"
 #include "metrics.h"
 #include "qpack.h"
+#include "quicmemory.h"
 
 _Static_assert(sizeof(qpack_header_t) == sizeof(httpfields_field_t),
                "qpack_header_t must stay layout-compatible with httpfields_field_t");
@@ -54,6 +55,12 @@ h3stream_t* h3stream_create(connection_t* connection, size_t max_field_section_s
     st->headers_done = 0;
     st->content_length = -1;
     st->req_body_len = 0;
+    st->qpack_deferred = NULL;
+    st->qpack_deferred_len = 0;
+    st->qpack_deferred_cap = 0;
+    st->qpack_deferred_fin = 0;
+    st->qpack_blocked = 0;
+    st->qpack_required_insert_count = 0;
     st->max_field_section_size = max_field_section_size;
 
     /* The factor HTTP/2 uses, not the ×2 the plan first guessed at: an operator
@@ -74,7 +81,62 @@ void h3stream_free(h3stream_t* st) {
     if (st->request != NULL) httprequest_free(st->request);
     if (st->response != NULL) httpresponse_free(st->response);
     http_headers_free(st->early_hints);
+    h3stream_qpack_deferred_clear(st);
     free(st);
+}
+
+int h3stream_qpack_defer(h3stream_t* st, const uint8_t* data, size_t len, int fin) {
+    if (st == NULL || (data == NULL && len != 0)) return 0;
+    if (len > SIZE_MAX - st->qpack_deferred_len) return 0;
+    const size_t need = st->qpack_deferred_len + len;
+    if (need > H3FRAME_MAX_ACCUMULATED) return 0;
+
+    if (need > st->qpack_deferred_cap) {
+        size_t cap = st->qpack_deferred_cap ? st->qpack_deferred_cap : 256;
+        while (cap < need) cap *= 2;
+        if (cap > H3FRAME_MAX_ACCUMULATED) cap = H3FRAME_MAX_ACCUMULATED;
+        const size_t growth = cap - st->qpack_deferred_cap;
+        if (!quicmemory_reserve(growth)) return 0;
+        uint8_t* grown = realloc(st->qpack_deferred, cap);
+        if (grown == NULL) { quicmemory_release(growth); return 0; }
+        st->qpack_deferred = grown;
+        st->qpack_deferred_cap = cap;
+    }
+    if (len != 0) memcpy(st->qpack_deferred + st->qpack_deferred_len, data, len);
+    st->qpack_deferred_len = need;
+    if (fin) st->qpack_deferred_fin = 1;
+    return 1;
+}
+
+void h3stream_qpack_deferred_clear(h3stream_t* st) {
+    if (st == NULL) return;
+    quicmemory_release(st->qpack_deferred_cap);
+    free(st->qpack_deferred);
+    st->qpack_deferred = NULL;
+    st->qpack_deferred_len = 0;
+    st->qpack_deferred_cap = 0;
+    st->qpack_deferred_fin = 0;
+}
+
+int h3stream_qpack_block(h3stream_t* st, uint64_t required,
+                         const uint8_t* tail, size_t tail_len, int fin) {
+    if (st == NULL || required == 0 || st->qpack_blocked) return 0;
+    if (!h3stream_qpack_defer(st, tail, tail_len, fin)) return 0;
+    st->qpack_required_insert_count = required;
+    st->qpack_blocked = 1;
+    return 1;
+}
+
+int h3stream_qpack_can_resume(const h3stream_t* st, uint64_t insert_count) {
+    return st != NULL && st->qpack_blocked &&
+           insert_count >= st->qpack_required_insert_count;
+}
+
+void h3stream_qpack_unblock(h3stream_t* st) {
+    if (st == NULL) return;
+    st->qpack_blocked = 0;
+    st->qpack_required_insert_count = 0;
+    h3stream_qpack_deferred_clear(st);
 }
 
 /* Spool a DATA chunk into the request's tmp-file payload, mirroring h2's
@@ -142,6 +204,7 @@ static h3stream_status_e decode_fields(h3stream_t* st, qpack_decoder_t* qdec,
                                                   st->max_field_section_hard, fields, count);
     switch (qst) {
     case QPACK_OK:               break;
+    case QPACK_BLOCKED:          return H3STREAM_QPACK_BLOCKED;
     case QPACK_ERR_TOO_LARGE:
         metrics_h3(METRICS_H3_FIELD_SECTION_HARD);
         log_error("h3: field section over the hard cap (%zu) -- closing connection\n",
@@ -278,6 +341,46 @@ h3stream_status_e h3stream_feed(h3stream_t* st, qpack_decoder_t* qdec,
      * own end is a bad argument. */
     if (st == NULL || pp == NULL || qdec == NULL || *pp > end) return H3STREAM_ERR_INTERNAL;
 
+    /* Retry a complete HEADERS payload retained by h3frame_parser. No request
+     * bytes are consumed while the required insertion is still in the future. */
+    if (st->qpack_blocked) {
+        if (!h3stream_qpack_can_resume(st, qpack_decoder_insert_count(qdec)))
+            return H3STREAM_QPACK_BLOCKED;
+
+        h3stream_status_e r = build_request(st, qdec, st->parser.payload,
+                                             st->parser.payload_len);
+        if (r != H3STREAM_REQUEST_READY) return r;
+        st->qpack_blocked = 0;
+        st->qpack_required_insert_count = 0;
+        st->headers_done = 1;
+        st->stage = H3STREAM_BODY;
+        return H3STREAM_REQUEST_READY;
+    }
+
+    /* A successful retry returns REQUEST_READY first so dispatch ordering stays
+     * identical to an unblocked request. On the following pass replay bytes
+     * that QUIC had already handed us after that HEADERS frame. Detach the old
+     * allocation before recursion: replay may itself encounter blocked
+     * trailers and must then be able to install a fresh deferred buffer. */
+    if (st->qpack_deferred_len != 0 || st->qpack_deferred_fin) {
+        uint8_t* saved = st->qpack_deferred;
+        const size_t saved_len = st->qpack_deferred_len;
+        const size_t saved_cap = st->qpack_deferred_cap;
+        const int saved_fin = st->qpack_deferred_fin;
+        st->qpack_deferred = NULL;
+        st->qpack_deferred_len = 0;
+        st->qpack_deferred_cap = 0;
+        st->qpack_deferred_fin = 0;
+
+        const uint8_t* replay = saved;
+        const uint8_t* replay_end = saved_len != 0 ? saved + saved_len : saved;
+        h3stream_status_e r = h3stream_feed(st, qdec, &replay,
+                                             replay_end, saved_fin);
+        quicmemory_release(saved_cap);
+        free(saved);
+        return r;
+    }
+
     int saw_body = 0;
 
     for (;;) {
@@ -303,6 +406,17 @@ h3stream_status_e h3stream_feed(h3stream_t* st, qpack_decoder_t* qdec,
             if (st->parser.type == H3_FRAME_HEADERS) {
                 if (st->stage == H3STREAM_EXPECT_HEADERS) {
                     const h3stream_status_e r = build_request(st, qdec, st->parser.payload, st->parser.payload_len);
+                    if (r == H3STREAM_QPACK_BLOCKED) {
+                        uint64_t required = 0;
+                        if (qpack_required_insert_count(qdec, st->parser.payload,
+                                                       st->parser.payload_len,
+                                                       &required) != QPACK_BLOCKED ||
+                            !h3stream_qpack_block(st, required, *pp,
+                                                 (size_t)(end - *pp), fin))
+                            return H3STREAM_ERR_INTERNAL;
+                        *pp = end;
+                        return H3STREAM_QPACK_BLOCKED;
+                    }
                     if (r != H3STREAM_REQUEST_READY) return r;
                     st->headers_done = 1;
                     st->stage = H3STREAM_BODY;

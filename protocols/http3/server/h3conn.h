@@ -67,6 +67,7 @@ typedef struct h3app {
      * been dispatched. Bytes still have to be read so the flow-control window
      * keeps moving, but nothing looks at them. */
     int            drained;
+    int            qpack_blocked_counted;
 } h3app_t;
 
 typedef struct h3conn {
@@ -94,6 +95,7 @@ typedef struct h3conn {
      * no response uses (docs/http3/08 §7g). Raised when a 103 is staged, lowered
      * when it goes out. */
     int          early_hints_pending;
+    size_t       qpack_blocked_streams;
 } h3conn_t;
 
 h3conn_t* h3conn_create(connection_t* connection, uint64_t max_field_section_size,

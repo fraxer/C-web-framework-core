@@ -72,6 +72,13 @@ typedef struct h3uni_recv {
     int              settings_seen;
 
     int              closed;     /* FIN or RESET has been reported */
+
+    /* QPACK instructions, unlike control frames, have no outer length. Their
+     * prefix integer or string may straddle QUIC reads, so an unconsumed suffix
+     * lives here until the next feed. Unused for other uni-stream types. */
+    uint8_t*         qpack_pending;
+    size_t           qpack_pending_len;
+    size_t           qpack_pending_cap;
 } h3uni_recv_t;
 
 h3uni_recv_t* h3uni_recv_create(uint64_t id);

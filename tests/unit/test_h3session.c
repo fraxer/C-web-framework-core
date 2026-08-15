@@ -339,6 +339,23 @@ TEST(test_h3session_qpack_streams) {
     h3uni_recv_free(uni);
     h3session_free(s);
 
+    TEST_CASE("a dynamic instruction split across QUIC reads is retained");
+    s = h3session_create(65536, 0);
+    qpack_decoder_free(s->qdec);
+    s->qdec = qpack_decoder_create(128, 4);
+    uni = h3uni_recv_create(6);
+    const uint8_t split1[] = { 0x02, 0x3f, 0x61, 0x43, 'f' };
+    const uint8_t split2[] = { 'o', 'o', 0x03, 'b', 'a', 'r' };
+    TEST_ASSERT(feed(s, uni, split1, sizeof split1, 0).action == H3SESSION_OK,
+                "first half retained");
+    TEST_ASSERT(qpack_decoder_insert_count(s->qdec) == 0, "not inserted prematurely");
+    TEST_ASSERT(feed(s, uni, split2, sizeof split2, 0).action == H3SESSION_OK,
+                "second half completes instruction");
+    TEST_ASSERT(qpack_decoder_insert_count(s->qdec) == 1, "one complete insertion");
+    TEST_ASSERT(uni->qpack_pending_len == 0, "staging buffer drained");
+    h3uni_recv_free(uni);
+    h3session_free(s);
+
     TEST_CASE("an insert into a table we said we do not have is an encoder-stream error");
     s = h3session_create(65536, 0);
     uni = h3uni_recv_create(6);

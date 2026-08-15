@@ -45,6 +45,9 @@ typedef enum {
     H3STREAM_REQUEST_READY,
     /* One or more DATA chunks were spooled into the request body. */
     H3STREAM_BODY_CHUNK,
+    /* HEADERS is complete but references a dynamic entry that has not arrived
+     * yet. This is flow-control state, not an HTTP/3 error. */
+    H3STREAM_QPACK_BLOCKED,
     /* FIN: the request is fully received (no handler could still want more). */
     H3STREAM_DONE,
 
@@ -124,6 +127,15 @@ typedef struct h3stream {
     int64_t  content_length;   /* declared, or -1 when the request carried none */
     size_t   req_body_len;     /* DATA bytes spooled into request->payload_ */
 
+    /* Bytes already removed from QUIC receive buffering after a HEADERS frame
+     * that blocked on QPACK. Owned and memory-budgeted until decode resumes. */
+    uint8_t* qpack_deferred;
+    size_t   qpack_deferred_len;
+    size_t   qpack_deferred_cap;
+    int      qpack_deferred_fin;
+    int      qpack_blocked;
+    uint64_t qpack_required_insert_count;
+
     /* The response is filled and the write turn may run the filter chain for
      * this stream. Atomic because a handler thread sets it and the worker reads
      * it; release/acquire, so seeing the flag implies seeing the response.
@@ -168,6 +180,13 @@ typedef struct h3stream {
  * `max_field_section_size` is the limit above; pass 0 for none. */
 h3stream_t* h3stream_create(connection_t* connection, size_t max_field_section_size);
 void h3stream_free(h3stream_t* st);
+
+int h3stream_qpack_defer(h3stream_t* st, const uint8_t* data, size_t len, int fin);
+void h3stream_qpack_deferred_clear(h3stream_t* st);
+int h3stream_qpack_block(h3stream_t* st, uint64_t required,
+                         const uint8_t* tail, size_t tail_len, int fin);
+int h3stream_qpack_can_resume(const h3stream_t* st, uint64_t insert_count);
+void h3stream_qpack_unblock(h3stream_t* st);
 
 /* Feed bytes received on this request stream, advancing *pp. Processes complete
  * frames and stops on the first event the caller must act on (REQUEST_READY, an

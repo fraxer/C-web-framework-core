@@ -5,6 +5,7 @@
 #include "httpcommon.h"
 #include "httprequest.h"
 #include "qpack.h"
+#include "quicmemory.h"
 
 #include <string.h>
 
@@ -14,6 +15,84 @@
  * frame-type rules, exactly as a real request stream would. */
 
 #define QF(n, v) ((qpack_header_t){(char*)(n), strlen(n), (char*)(v), strlen(v), 0})
+
+TEST(test_h3stream_qpack_deferred_lifecycle) {
+    TEST_SUITE("h3stream qpack blocked");
+
+    const size_t before = quicmemory_current();
+    h3stream_t* st = h3stream_create(NULL, 0);
+    static const uint8_t a[] = { 1, 2, 3 };
+    static const uint8_t b[] = { 4, 5 };
+
+    TEST_CASE("tails from several QUIC reads are retained with FIN");
+    TEST_ASSERT(h3stream_qpack_defer(st, a, sizeof a, 0), "first tail");
+    TEST_ASSERT(h3stream_qpack_defer(st, b, sizeof b, 1), "second tail");
+    TEST_ASSERT(st->qpack_deferred_len == 5 && st->qpack_deferred_fin,
+                "length and FIN retained");
+    TEST_ASSERT(memcmp(st->qpack_deferred, "\1\2\3\4\5", 5) == 0,
+                "original byte order retained");
+    TEST_ASSERT(quicmemory_current() > before, "capacity charged globally");
+
+    TEST_CASE("clear returns the complete reservation");
+    h3stream_qpack_deferred_clear(st);
+    TEST_ASSERT(st->qpack_deferred == NULL && st->qpack_deferred_len == 0,
+                "state cleared");
+    TEST_ASSERT(quicmemory_current() == before, "memory returned");
+
+    TEST_CASE("stream destruction also releases an outstanding tail");
+    TEST_ASSERT(h3stream_qpack_defer(st, a, sizeof a, 1), "tail reserved again");
+    h3stream_free(st);
+    TEST_ASSERT(quicmemory_current() == before, "destructor returned memory");
+
+    TEST_CASE("a blocked stream resumes only at its Required Insert Count");
+    st = h3stream_create(NULL, 0);
+    TEST_ASSERT(h3stream_qpack_block(st, 7, a, sizeof a, 1), "blocked once");
+    TEST_ASSERT(!h3stream_qpack_block(st, 8, b, sizeof b, 0),
+                "second registration cannot double-count the stream");
+    TEST_ASSERT(!h3stream_qpack_can_resume(st, 6), "insert six is too early");
+    TEST_ASSERT(h3stream_qpack_can_resume(st, 7), "exact threshold resumes");
+    h3stream_qpack_unblock(st);
+    TEST_ASSERT(!st->qpack_blocked && st->qpack_required_insert_count == 0,
+                "blocked state cleared");
+    TEST_ASSERT(quicmemory_current() == before, "unblock returned deferred memory");
+    h3stream_free(st);
+}
+
+TEST(test_h3stream_qpack_blocked_event) {
+    TEST_SUITE("h3stream qpack blocked");
+    h3stream_t* st = h3stream_create(NULL, 0);
+    qpack_decoder_t* d = qpack_decoder_create(128, 4);
+    /* HEADERS carrying RIC=1 in modulo form, followed by bytes already removed
+     * from QUIC receive buffering. */
+    static const uint8_t bytes[] = { H3_FRAME_HEADERS, 0x02, 0x02, 0x00, 0xaa, 0xbb };
+    const uint8_t* p = bytes;
+    TEST_ASSERT(h3stream_feed(st, d, &p, bytes + sizeof bytes, 1)
+                    == H3STREAM_QPACK_BLOCKED, "non-fatal blocked event");
+    TEST_ASSERT(st->qpack_blocked && st->qpack_required_insert_count == 1,
+                "threshold stored");
+    TEST_ASSERT(st->qpack_deferred_len == 2 && st->qpack_deferred_fin,
+                "tail and FIN retained");
+    TEST_ASSERT(p == bytes + sizeof bytes, "owned tail replaces caller bytes");
+    h3stream_free(st);
+    qpack_decoder_free(d);
+
+    TEST_CASE("deferred DATA and FIN replay through the normal frame parser");
+    st = h3stream_create(NULL, 0);
+    d = qpack_decoder_create(128, 4);
+    st->headers_done = 1;
+    st->stage = H3STREAM_BODY;
+    st->content_length = 2;
+    static const uint8_t body[] = { H3_FRAME_DATA, 0x02, 'x', 'y' };
+    TEST_ASSERT(h3stream_qpack_defer(st, body, sizeof body, 1), "body retained");
+    p = NULL;
+    TEST_ASSERT(h3stream_feed(st, d, &p, NULL, 0) == H3STREAM_DONE,
+                "replay reaches DATA and FIN");
+    TEST_ASSERT(st->req_body_len == 2, "body accounted once");
+    TEST_ASSERT(st->qpack_deferred == NULL && st->qpack_deferred_len == 0,
+                "owned replay storage released");
+    h3stream_free(st);
+    qpack_decoder_free(d);
+}
 
 static size_t headers_frame(qpack_encoder_t* enc, const qpack_header_t* f, size_t n,
                             uint8_t* out, size_t cap) {

@@ -83,6 +83,19 @@ static quicstream_t* add_request(h3fixture_t* f, uint64_t index) {
     return qs;
 }
 
+static quicstream_t* add_blocked_request(h3fixture_t* f, uint64_t index) {
+    quicstream_t* qs = quicstream_create(index << 2, STREAM_WINDOW, STREAM_WINDOW,
+                                         STREAM_WINDOW);
+    qs->next = f->qc->streams;
+    f->qc->streams = qs;
+    f->qc->stream_count++;
+    /* HEADERS whose encoded RIC=2 resolves to Required Insert Count 1 when the
+     * decoder has capacity but has received no insertions yet. */
+    static const uint8_t request[] = { H3_FRAME_HEADERS, 0x02, 0x02, 0x00 };
+    quicstream_on_data(qs, 0, request, sizeof request, 0);
+    return qs;
+}
+
 /* The frames queued on a stream's send buffer, by type. */
 static size_t queued_frames(const quicstream_t* qs, uint64_t type, size_t* payload_total) {
     const uint8_t* p = qs->send.data;
@@ -217,6 +230,115 @@ TEST(test_h3dispatch_write_turn) {
     TEST_ASSERT(h3conn_write(f.c, f.qc) == 1, "write turn ran");
     TEST_ASSERT(queued_frames(qs, H3_FRAME_HEADERS, NULL) == 1, "HEADERS");
     TEST_ASSERT(qs->send.fin, "FIN");
+    fixture_free(&f);
+}
+
+TEST(test_h3dispatch_qpack_decoder_stream) {
+    TEST_SUITE("h3dispatch");
+
+    TEST_CASE("queued decoder instructions are written before response turns");
+    h3fixture_t f;
+    fixture_init(&f);
+
+    quicstream_t* decoder = quicstream_create(3, STREAM_WINDOW, STREAM_WINDOW,
+                                               STREAM_WINDOW);
+    f.qc->streams = decoder;
+    f.qc->stream_count = 1;
+    f.c->session->qpack_dec_send_id = decoder->id;
+
+    TEST_ASSERT(qpack_decoder_ack_section(f.c->session->qdec, 12) == QPACK_OK,
+                "ack staged");
+    TEST_ASSERT(h3conn_write(f.c, f.qc) == 1, "write turn");
+    TEST_ASSERT(decoder->send.len == 1 && decoder->send.data[0] == 0x8c,
+                "section acknowledgment reached decoder stream");
+
+    const uint8_t* pending = NULL;
+    TEST_ASSERT(qpack_decoder_pending(f.c->session->qdec, &pending) == 0,
+                "staged bytes consumed exactly once");
+    TEST_ASSERT(h3conn_write(f.c, f.qc) == 1 && decoder->send.len == 1,
+                "second turn does not duplicate instruction");
+
+    fixture_free(&f);
+}
+
+TEST(test_h3dispatch_qpack_blocked_limit_and_reset) {
+    TEST_SUITE("h3dispatch qpack blocked");
+    h3fixture_t f;
+    fixture_init(&f);
+    qpack_decoder_free(f.c->session->qdec);
+    f.c->session->qdec = qpack_decoder_create(128, 1);
+
+    TEST_CASE("one blocked request occupies exactly one connection slot");
+    quicstream_t* first = add_blocked_request(&f, 0);
+    h3conn_result_t r = h3conn_stream_read(f.c, f.qc, first);
+    TEST_ASSERT(r.status == H3CONN_OK, "blocking is not a stream error");
+    TEST_ASSERT(f.c->qpack_blocked_streams == 1, "one blocked slot");
+    TEST_ASSERT(h3conn_request_of(first)->qpack_blocked, "stream carries threshold");
+
+    TEST_CASE("a second blocked request over the advertised limit is fatal");
+    quicstream_t* second = add_blocked_request(&f, 1);
+    r = h3conn_stream_read(f.c, f.qc, second);
+    TEST_ASSERT(r.status == H3CONN_CLOSED, "connection closed");
+    TEST_ASSERT(r.h3_error == QPACK_DECOMPRESSION_FAILED, "QPACK error code");
+    TEST_ASSERT(f.c->qpack_blocked_streams == 1, "rejected stream was not counted");
+
+    TEST_CASE("reset releases the slot and queues Stream Cancellation");
+    TEST_ASSERT(quicstream_on_reset(first, H3_REQUEST_CANCELLED, first->recv_flow.used)
+                    == QUICSTREAM_OK, "peer reset accepted");
+    r = h3conn_stream_read(f.c, f.qc, first);
+    TEST_ASSERT(r.status == H3CONN_REQUEST_RESET, "reset reported");
+    TEST_ASSERT(f.c->qpack_blocked_streams == 0, "blocked slot released");
+    const uint8_t* pending = NULL;
+    size_t n = qpack_decoder_pending(f.c->session->qdec, &pending);
+    TEST_ASSERT(n == 1 && pending[0] == 0x40, "Stream Cancellation for stream 0");
+
+    fixture_free(&f);
+}
+
+TEST(test_h3dispatch_qpack_blocked_retry) {
+    TEST_SUITE("h3dispatch qpack blocked");
+    h3fixture_t f;
+    fixture_init(&f);
+    qpack_decoder_free(f.c->session->qdec);
+    f.c->session->qdec = qpack_decoder_create(128, 1);
+
+    /* Static :method/:path/:scheme plus dynamic relative index 0 for
+     * :authority=example.com. RIC=1 is encoded as 2 with MaxEntries=4. */
+    static const uint8_t block[] = { 0x02, 0x00, 0xd1, 0xc1, 0xd7, 0x80 };
+    uint8_t request[32];
+    const size_t request_len = h3frame_write(request, sizeof request,
+                                              H3_FRAME_HEADERS, block, sizeof block);
+    quicstream_t* qs = quicstream_create(0, STREAM_WINDOW, STREAM_WINDOW, STREAM_WINDOW);
+    qs->next = f.qc->streams; f.qc->streams = qs; f.qc->stream_count++;
+    quicstream_on_data(qs, 0, request, request_len, 1);
+
+    TEST_CASE("future dynamic authority blocks the complete request");
+    h3conn_result_t r = h3conn_stream_read(f.c, f.qc, qs);
+    TEST_ASSERT(r.status == H3CONN_OK && f.c->qpack_blocked_streams == 1,
+                "request retained without dispatch");
+
+    TEST_CASE("encoder insertion retries through FIN and completes the request");
+    static const uint8_t insert[] = {
+        0x3f, 0x61,             /* capacity 128 */
+        0xc0, 0x0b, 'e','x','a','m','p','l','e','.','c','o','m'
+    };
+    size_t consumed = 0;
+    TEST_ASSERT(qpack_decoder_read_encoder(f.c->session->qdec, insert, sizeof insert,
+                                           &consumed) == QPACK_OK,
+                "authority inserted");
+    r = h3conn_stream_read(f.c, f.qc, qs);
+    TEST_ASSERT(r.status == H3CONN_REQUEST_DONE, "saved FIN completed request");
+    TEST_ASSERT(f.c->qpack_blocked_streams == 0, "blocked slot released");
+    h3stream_t* st = h3conn_request_of(qs);
+    TEST_ASSERT(st != NULL && st->request->get_headern(st->request, "Host", 4) != NULL,
+                "dynamic authority became Host");
+
+    TEST_CASE("decoder instructions preserve increment before section ack");
+    const uint8_t* pending = NULL;
+    const size_t n = qpack_decoder_pending(f.c->session->qdec, &pending);
+    TEST_ASSERT(n == 2 && pending[0] == 0x01 && pending[1] == 0x80,
+                "Insert Count Increment then Section Acknowledgment stream 0");
+
     fixture_free(&f);
 }
 

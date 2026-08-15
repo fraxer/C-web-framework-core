@@ -1,6 +1,7 @@
 #include "framework.h"
 
 #include "qpack.h"
+#include "qpack_statictable.h"
 
 #include <string.h>
 
@@ -106,5 +107,209 @@ TEST(test_qpack_encode_prefix_and_capacity) {
     qpack_header_t f = H(":method", "GET", 0);
     TEST_ASSERT(qpack_encode_block(e, &f, 1, buf, 2) == 0, "prefix alone fills 2 bytes");
 
+    qpack_encoder_free(e);
+}
+
+TEST(test_qpack_encoder_known_received_count) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(128, 4);
+    e->insert_count = 5;
+    size_t consumed = 0;
+
+    TEST_CASE("Insert Count Increment advances Known Received Count");
+    static const uint8_t inc3[] = { 0x03 };
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, inc3, sizeof inc3, &consumed)
+                    == QPACK_OK, "increment accepted");
+    TEST_ASSERT(consumed == 1 && e->known_received_count == 3, "advanced by three");
+
+    TEST_CASE("increment may reach but not pass insertion count");
+    static const uint8_t inc2[] = { 0x02 };
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, inc2, sizeof inc2, &consumed)
+                    == QPACK_OK && e->known_received_count == 5, "reached five");
+    static const uint8_t inc1[] = { 0x01 };
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, inc1, sizeof inc1, &consumed)
+                    == QPACK_ERR_DECODER_STREAM, "cannot acknowledge a future insert");
+
+    TEST_CASE("zero increment is always malformed");
+    static const uint8_t zero[] = { 0x00 };
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, zero, sizeof zero, &consumed)
+                    == QPACK_ERR_DECODER_STREAM, "zero rejected");
+    qpack_encoder_free(e);
+}
+
+TEST(test_qpack_encoder_stream_output) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(128, 4);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 128) == QPACK_OK, "capacity staged");
+    const uint8_t* pending = NULL;
+    size_t n = qpack_encoder_pending(e, &pending);
+    static const uint8_t cap128[] = { 0x3f, 0x61 };
+    TEST_ASSERT(n == sizeof cap128 && memcmp(pending, cap128, sizeof cap128) == 0,
+                "Set Dynamic Table Capacity wire form");
+    qpack_encoder_consume(e, 1);
+    TEST_ASSERT(qpack_encoder_pending(e, &pending) == 1 && pending[0] == 0x61,
+                "partial consume retains suffix");
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 129) == QPACK_ERR_ENCODER_STREAM,
+                "peer SETTINGS maximum enforced");
+    qpack_encoder_free(e);
+}
+
+TEST(test_qpack_encoder_literal_insert) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(128, 4);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 128) == QPACK_OK, "capacity");
+    qpack_encoder_consume(e, 99);
+    uint64_t absolute = 99;
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "foo", 3, "bar", 3, &absolute)
+                    == QPACK_OK, "literal inserted");
+    TEST_ASSERT(absolute == 0 && e->insert_count == 1 && e->bytes == 38,
+                "absolute index and accounting");
+    const uint8_t* pending = NULL;
+    const size_t n = qpack_encoder_pending(e, &pending);
+    static const uint8_t expected[] = { 0x43, 'f','o','o', 0x03, 'b','a','r' };
+    TEST_ASSERT(n == sizeof expected && memcmp(pending, expected, n) == 0,
+                "Insert With Literal Name wire form");
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "large", 5,
+                                              "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz", 78,
+                                              NULL) == QPACK_OK,
+                "unreferenced oldest entry may be evicted");
+    qpack_encoder_free(e);
+}
+
+TEST(test_qpack_encoder_static_name_insert) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(128, 4);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 128) == QPACK_OK, "capacity");
+    qpack_encoder_consume(e, 99);
+    uint64_t absolute = 99;
+    TEST_ASSERT(qpack_encoder_insert_static_name(e, 1, "/custom", 7, &absolute)
+                    == QPACK_OK, "static :path name inserted");
+    TEST_ASSERT(absolute == 0 && e->entry_count == 1 && e->bytes == 44,
+                "table owns one accounted entry");
+    const uint8_t* pending = NULL;
+    const size_t n = qpack_encoder_pending(e, &pending);
+    static const uint8_t expected[] = { 0xc1, 0x07, '/','c','u','s','t','o','m' };
+    TEST_ASSERT(n == sizeof expected && memcmp(pending, expected, n) == 0,
+                "Insert With Name Reference wire form");
+    TEST_ASSERT(qpack_encoder_insert_static_name(e, QPACK_STATIC_TABLE_SIZE,
+                                                  "x", 1, NULL)
+                    == QPACK_ERR_ENCODER_STREAM, "static index bounded");
+    qpack_encoder_free(e);
+}
+
+TEST(test_qpack_encoder_dynamic_name_insert) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(256, 4);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 256) == QPACK_OK, "capacity");
+    qpack_encoder_consume(e, 99);
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "foo", 3, "bar", 3, NULL) == QPACK_OK,
+                "source entry");
+    qpack_encoder_consume(e, 99);
+    uint64_t absolute = 99;
+    TEST_ASSERT(qpack_encoder_insert_dynamic_name(e, 0, "baz", 3, &absolute) == QPACK_OK,
+                "newest name referenced");
+    TEST_ASSERT(absolute == 1 && e->insert_count == 2, "second absolute entry");
+    const uint8_t* pending = NULL;
+    const size_t n = qpack_encoder_pending(e, &pending);
+    static const uint8_t expected[] = { 0x80, 0x03, 'b','a','z' };
+    TEST_ASSERT(n == sizeof expected && memcmp(pending, expected, n) == 0,
+                "dynamic Insert With Name Reference wire form");
+    TEST_ASSERT(qpack_encoder_insert_dynamic_name(e, 2, "x", 1, NULL)
+                    == QPACK_ERR_ENCODER_STREAM, "relative index bounded");
+    qpack_encoder_free(e);
+}
+
+TEST(test_qpack_encoder_duplicate) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(128, 4);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 128) == QPACK_OK, "capacity");
+    qpack_encoder_consume(e, 99);
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "foo", 3, "bar", 3, NULL) == QPACK_OK,
+                "source entry");
+    qpack_encoder_consume(e, 99);
+    uint64_t absolute = 99;
+    TEST_ASSERT(qpack_encoder_duplicate(e, 0, &absolute) == QPACK_OK,
+                "newest entry duplicated");
+    TEST_ASSERT(absolute == 1 && e->entry_count == 2 && e->bytes == 76,
+                "duplicate has a new absolute index and capacity charge");
+    const uint8_t* pending = NULL;
+    TEST_ASSERT(qpack_encoder_pending(e, &pending) == 1 && pending[0] == 0x00,
+                "Duplicate relative zero wire form");
+    TEST_ASSERT(qpack_encoder_duplicate(e, 2, NULL) == QPACK_ERR_ENCODER_STREAM,
+                "relative source bounded");
+    qpack_encoder_free(e);
+}
+
+TEST(test_qpack_encode_dynamic_indexed) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(128, 4);
+    qpack_decoder_t* d = qpack_decoder_create(128, 4);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 128) == QPACK_OK, "capacity");
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "foo", 3, "bar", 3, NULL) == QPACK_OK,
+                "entry inserted");
+    const uint8_t* instructions = NULL;
+    size_t ilen = qpack_encoder_pending(e, &instructions), consumed = 0;
+    TEST_ASSERT(qpack_decoder_read_encoder(d, instructions, ilen, &consumed) == QPACK_OK,
+                "peer decoder received encoder stream");
+
+    qpack_header_t field = { "foo", 3, "bar", 3, 0 };
+    uint8_t block[32];
+    const size_t n = qpack_encode_block(e, &field, 1, block, sizeof block);
+    static const uint8_t expected[] = { 0x02, 0x00, 0x80 };
+    TEST_ASSERT(n == sizeof expected && memcmp(block, expected, n) == 0,
+                "RIC=1 Base=1 Indexed Dynamic relative zero");
+    qpack_header_t* decoded = NULL; size_t count = 0;
+    TEST_ASSERT(qpack_decode_block(d, block, n, 0, &decoded, &count) == QPACK_OK,
+                "dynamic block decoded");
+    TEST_ASSERT(count == 1 && decoded[0].name_len == 3 && decoded[0].value_len == 3 &&
+                memcmp(decoded[0].name, "foo", 3) == 0 &&
+                memcmp(decoded[0].value, "bar", 3) == 0, "round trip");
+    qpack_headers_free(decoded, count);
+    qpack_encoder_free(e); qpack_decoder_free(d);
+}
+
+TEST(test_qpack_encoder_outstanding_sections) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(128, 4);
+    e->insert_count = 3;
+    TEST_ASSERT(qpack_encoder_section_open(e, 8, 1) == QPACK_OK, "first section");
+    TEST_ASSERT(qpack_encoder_section_open(e, 8, 3) == QPACK_OK, "trailers on same stream");
+    TEST_ASSERT(e->section_count == 2, "both sections tracked");
+    size_t consumed = 0;
+    static const uint8_t ack[] = { 0x88 };
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, ack, sizeof ack, &consumed) == QPACK_OK,
+                "one section acknowledged");
+    TEST_ASSERT(e->section_count == 1, "ack releases one section");
+    static const uint8_t cancel[] = { 0x48 };
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, cancel, sizeof cancel, &consumed) == QPACK_OK,
+                "stream cancelled");
+    TEST_ASSERT(e->section_count == 0, "cancellation releases every section on stream");
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, ack, sizeof ack, &consumed)
+                    == QPACK_ERR_DECODER_STREAM, "unknown acknowledgment rejected");
+    qpack_encoder_free(e);
+}
+
+TEST(test_qpack_encoder_safe_eviction) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(80, 4);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 80) == QPACK_OK, "capacity");
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "a", 1, "one", 3, NULL) == QPACK_OK,
+                "absolute zero");
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "b", 1, "two", 3, NULL) == QPACK_OK,
+                "absolute one");
+    TEST_ASSERT(qpack_encoder_section_open(e, 4, 1) == QPACK_OK,
+                "section protects absolute zero conservatively");
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "c", 1, "tri", 3, NULL)
+                    == QPACK_ERR_ENCODER_STREAM,
+                "protected oldest entry cannot be evicted");
+    size_t consumed = 0;
+    static const uint8_t ack[] = { 0x84 };
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, ack, sizeof ack, &consumed) == QPACK_OK,
+                "section released");
+    uint64_t absolute = 99;
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "c", 1, "tri", 3, &absolute) == QPACK_OK,
+                "insertion succeeds after acknowledgment");
+    TEST_ASSERT(absolute == 2 && e->entry_count == 2 && e->bytes == 72,
+                "oldest evicted, absolute count remains monotonic");
     qpack_encoder_free(e);
 }
