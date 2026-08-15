@@ -3241,6 +3241,7 @@ tests/ci.sh                      # все стадии
 tests/ci.sh release              # полный обязательный release-gate
 tests/ci.sh h3unit asan tsan     # подмножество, в указанном порядке
 tests/ci.sh limits               # connection/memory exhaustion и drain
+SOAK_REQUESTS=10000 tests/ci.sh soak
 FUZZ_SECONDS=600 tests/ci.sh fuzz
 H3SPEC=/path/to/h3spec tests/ci.sh h3spec
 REQUIRE_H3SPEC=1 tests/ci.sh h3spec  # только обязательный h3spec
@@ -3252,12 +3253,18 @@ REQUIRE_H3SPEC=1 tests/ci.sh h3spec  # только обязательный h3s
 | `h3unit` | отдельный QUIC/H3/QPACK runner | 1–3 |
 | `config` | неверные типы/диапазоны HTTP/3 останавливают запуск; неверный reload-кандидат не останавливает текущее поколение | 1–3, 5 |
 | `limits` | 64 занятых QUIC slots, отказ лишним соединениям, CRYPTO memory refusal и возврат обоих gauges к нулю | 3, 7 |
+| `soak` | 1000 запросов обычно, 10000 в release; loss/reorder/dup, migration, drain gauges и RSS около прогретого baseline | 7 |
 | `asan` | сборка с h3 (ASan+LSan), unit + hard/soft reload | 2, 5 |
 | `tsan` | сборка с h3 (TSan), unit + hard/soft reload | 3, 5 |
 | `fuzz` | семь целей по `FUZZ_SECONDS` каждая | 4 |
 | `reload` | hard reload при живом QUIC: проверяет уход старых TID и запрос к новому поколению | 5 |
 | `softreload` | общий UDP socket: незавершённый старый ответ, новая конфигурация и drain старых TID | 5 |
 | `h3spec` | поднимает свой сервер и гоняет h3spec | 6 |
+
+Полный локальный release-soak 2026-08-15 прошёл: 10000/10000 запросов, затем
+детерминированные loss/reorder/dup и migration; после закрытия
+`connections.current` и `memory.current_bytes` вернулись к нулю, RSS — с
+16860 до 20664 КиБ относительно прогретого baseline (рост 3804 КиБ).
 
 `h3unit` намеренно отделён от общего runner: регрессия другого протокола не
 скрывает состояние QUIC/H3/QPACK. Он остаётся дополнительным gate и не заменяет

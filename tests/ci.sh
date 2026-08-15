@@ -14,6 +14,8 @@
 #   tsan     build with h3, TSan            + unit tests   (data races)
 #   h3unit   QUIC / HTTP/3 / QPACK unit runner only
 #   config   invalid HTTP/3 types/ranges reject startup
+#   limits   process connection/memory exhaustion and drain
+#   soak     sustained requests, impairment, migration and RSS drain
 #   fuzz     build the fuzz targets         + FUZZ_SECONDS each
 #   reload   hard reload with live QUIC      + old worker retirement
 #   softreload shared UDP handoff             + old CID/config drain
@@ -34,6 +36,8 @@
 #   FUZZ_SECONDS   per fuzz target (default 60; §5 asks for 24h on a schedule)
 #   H3SPEC         path to the h3spec binary (default: found on PATH)
 #   REQUIRE_H3SPEC fail instead of skip when h3spec is unavailable (default 0)
+#   SOAK_REQUESTS requests in the soak stage (default 1000; release 10000)
+#   SOAK_RSS_GROWTH_KB allowed post-warmup RSS growth (default 16384)
 #   JOBS           parallel build jobs (default: nproc)
 
 set -u -o pipefail
@@ -157,6 +161,19 @@ stage_limits() {
         record limits OK
     else
         record limits FAIL
+    fi
+}
+
+stage_soak() {
+    say "soak: sustained HTTP/3 requests, impairment, migration and RSS drain"
+    local requests=${SOAK_REQUESTS:-1000}
+    if build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes -DSANITIZE=none &&
+       SOAK_REQUESTS="$requests" H3_SOAK_PORT=18460 "$CORE_DIR/tests/h3_soak.sh" \
+             "$CI_BUILD_DIR/limits" "$CI_BUILD_DIR/h3-soak"; then
+        record soak OK
+    else
+        record soak FAIL
     fi
 }
 
@@ -342,12 +359,13 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit config limits asan tsan fuzz reload softreload h3spec)
+ALL_STAGES=(noh3 h3unit config limits soak asan tsan fuzz reload softreload h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
 elif [ ${#STAGES[@]} -eq 1 ] && [ "${STAGES[0]}" = release ]; then
     REQUIRE_H3SPEC=1
+    SOAK_REQUESTS=${SOAK_REQUESTS:-10000}
     STAGES=("${ALL_STAGES[@]}")
 fi
 
@@ -359,6 +377,7 @@ for stage in "${STAGES[@]}"; do
     h3unit) stage_h3unit ;;
     config) stage_config ;;
     limits) stage_limits ;;
+    soak)    stage_soak ;;
     fuzz)   stage_fuzz ;;
     reload) stage_reload ;;
     softreload) stage_softreload ;;
