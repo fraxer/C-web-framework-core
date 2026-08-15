@@ -138,6 +138,36 @@ TEST(test_h3response_headers) {
     qpack_encoder_free(enc);
 }
 
+TEST(test_h3response_dynamic_section_tracks_stream) {
+    TEST_SUITE("h3response");
+
+    qpack_encoder_t* enc = qpack_encoder_create(128, 4);
+    httpresponse_t* r = httpresponse_create(NULL);
+    TEST_ASSERT(qpack_encoder_set_capacity(enc, 128) == QPACK_OK, "capacity");
+    TEST_ASSERT(qpack_encoder_insert_literal(enc, "x-answer", 8, "42", 2, NULL)
+                    == QPACK_OK, "dynamic response field inserted");
+    r->status_code = 200;
+    r->add_header(r, "X-Answer", "42");
+
+    uint8_t* frame = NULL;
+    size_t flen = 0;
+    TEST_ASSERT(h3response_headers_for_stream(enc, 12, r, &frame, &flen)
+                    == H3RESPONSE_OK, "stream-aware HEADERS encoded");
+    TEST_ASSERT(frame != NULL && flen > 2, "HEADERS bytes produced");
+    TEST_ASSERT(enc->section_count == 1, "dynamic section registered for acknowledgment");
+
+    size_t consumed = 0;
+    static const uint8_t ack[] = { 0x8c };
+    TEST_ASSERT(qpack_encoder_read_decoder_state(enc, ack, sizeof ack, &consumed)
+                    == QPACK_OK, "Section Acknowledgment matched response stream");
+    TEST_ASSERT(consumed == sizeof ack && enc->section_count == 0,
+                "response references released");
+
+    free(frame);
+    httpresponse_free(r);
+    qpack_encoder_free(enc);
+}
+
 TEST(test_h3response_interim_and_trailers) {
     TEST_SUITE("h3response");
 

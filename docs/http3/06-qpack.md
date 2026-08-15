@@ -403,6 +403,21 @@ Connection glue считает blocked request streams ровно один ра�
 Acknowledgment; RESET_STREAM либо ошибка повторного decode освобождает слот,
 очищает deferred bytes и ставит Stream Cancellation.
 
+### 6.2d. Привязка исходящих field sections к request stream
+
+Реальный response path теперь передаёт QPACK encoder идентификатор QUIC-потока
+для всех трёх видов field section: informational response, финальных заголовков
+и trailers. Если encoder использует динамическую запись, секция атомарно
+регистрируется как outstanding вместе с её Required Insert Count. Полученный от
+клиента Section Acknowledgment освобождает одну секцию, Stream Cancellation —
+все секции данного потока. Это защищает ещё используемые записи от eviction и
+позволяет корректно иметь несколько секций на одном request stream.
+
+Старые функции кодирования сохранены как совместимые обёртки и не регистрируют
+stream-specific состояние. Production SETTINGS пока остаются нулевыми, поэтому
+этот путь не меняет wire format действующих ответов до отдельного включения
+capacity/blocked streams и политики наполнения encoder table.
+
 ### 6.2c. Инвариант blocked request stream
 
 Перед подключением `QPACK_BLOCKED` к `h3stream` зафиксирован важный lifetime:

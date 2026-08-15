@@ -268,6 +268,25 @@ TEST(test_qpack_encode_dynamic_indexed) {
     qpack_encoder_free(e); qpack_decoder_free(d);
 }
 
+TEST(test_qpack_encode_dynamic_tracks_stream) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(128, 4);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 128) == QPACK_OK, "capacity");
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "foo", 3, "bar", 3, NULL) == QPACK_OK,
+                "entry");
+    qpack_header_t field = { "foo", 3, "bar", 3, 0 };
+    uint8_t block[32];
+    TEST_ASSERT(qpack_encode_block_for_stream(e, 12, &field, 1, block, sizeof block) == 3,
+                "dynamic section encoded for stream");
+    TEST_ASSERT(e->section_count == 1, "stream and RIC registered atomically");
+    size_t consumed = 0;
+    static const uint8_t ack[] = { 0x8c };
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, ack, sizeof ack, &consumed) == QPACK_OK,
+                "peer acknowledgment accepted");
+    TEST_ASSERT(e->section_count == 0, "outstanding protection released");
+    qpack_encoder_free(e);
+}
+
 TEST(test_qpack_encoder_outstanding_sections) {
     TEST_SUITE("qpack dynamic encoder");
     qpack_encoder_t* e = qpack_encoder_create(128, 4);
@@ -311,5 +330,25 @@ TEST(test_qpack_encoder_safe_eviction) {
                 "insertion succeeds after acknowledgment");
     TEST_ASSERT(absolute == 2 && e->entry_count == 2 && e->bytes == 72,
                 "oldest evicted, absolute count remains monotonic");
+    qpack_encoder_free(e);
+}
+
+TEST(test_qpack_encoder_source_survives_eviction_operation) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(76, 4);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 76) == QPACK_OK, "capacity");
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "a", 1, "one", 3, NULL) == QPACK_OK,
+                "oldest source");
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "b", 1, "two", 3, NULL) == QPACK_OK,
+                "newest source");
+    qpack_encoder_consume(e, 99);
+    uint64_t absolute = 99;
+    TEST_ASSERT(qpack_encoder_duplicate(e, 1, &absolute) == QPACK_OK,
+                "oldest copied before insertion evicts it");
+    TEST_ASSERT(absolute == 2 && e->entry_count == 2 && e->bytes == 72,
+                "duplicate replaced its evicted source safely");
+    const uint8_t* pending = NULL;
+    TEST_ASSERT(qpack_encoder_pending(e, &pending) == 1 && pending[0] == 0x01,
+                "wire index still names pre-insertion relative source one");
     qpack_encoder_free(e);
 }

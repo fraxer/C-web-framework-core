@@ -680,7 +680,8 @@ static int __write_informational(h3conn_t* c, quicstream_t* qs, int status,
     uint8_t* frame = NULL;
     size_t flen = 0;
 
-    if (h3response_informational(c->session->qenc, status, fields, &frame, &flen)
+    if (h3response_informational_for_stream(c->session->qenc, qs->id, status,
+                                            fields, &frame, &flen)
         != H3RESPONSE_OK)
         return 0;
 
@@ -753,7 +754,8 @@ static int __write_stream(quicstream_t* qs, h3stream_t* st) {
         size_t flen = 0;
 
         if (c != NULL &&
-            h3response_trailers(c->session->qenc, response->trailer_, &frame, &flen)
+            h3response_trailers_for_stream(c->session->qenc, qs->id,
+                                           response->trailer_, &frame, &flen)
                 == H3RESPONSE_OK) {
             const int ok = quicstream_write(qs, frame, flen);
             free(frame);

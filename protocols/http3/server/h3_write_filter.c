@@ -98,7 +98,8 @@ static int __header(httprequest_t* request, httpresponse_t* response) {
         h3conn_t* c = h3_conn_of(response->connection);
 
         const h3response_status_e st =
-            h3response_headers(c->session->qenc, response, &module->head, &module->head_len);
+            h3response_headers_for_stream(c->session->qenc, qs->id, response,
+                                          &module->head, &module->head_len);
         if (st != H3RESPONSE_OK) {
             log_error("h3_write_filter: qpack encode failed (%d)\n", (int)st);
             return CWF_ERROR;

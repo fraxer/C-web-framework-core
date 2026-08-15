@@ -36,6 +36,10 @@ typedef enum {
 h3response_status_e h3response_headers(struct qpack_encoder* enc,
                                        const httpresponse_t* response,
                                        uint8_t** out, size_t* out_len);
+h3response_status_e h3response_headers_for_stream(struct qpack_encoder* enc,
+                                                  uint64_t stream_id,
+                                                  const httpresponse_t* response,
+                                                  uint8_t** out, size_t* out_len);
 
 /* An informational response: `:status` and the given fields, nothing else.
  * Covers both 100 (Continue), which carries no fields at all, and 103 (Early
@@ -43,6 +47,11 @@ h3response_status_e h3response_headers(struct qpack_encoder* enc,
 h3response_status_e h3response_informational(struct qpack_encoder* enc, int status_code,
                                              const http_header_t* fields,
                                              uint8_t** out, size_t* out_len);
+h3response_status_e h3response_informational_for_stream(struct qpack_encoder* enc,
+                                                        uint64_t stream_id,
+                                                        int status_code,
+                                                        const http_header_t* fields,
+                                                        uint8_t** out, size_t* out_len);
 
 /* Trailing fields as a second HEADERS frame (§4.1). No `:status` -- a trailer
  * section carries no pseudo-header -- and no content-length, which by then
@@ -50,6 +59,10 @@ h3response_status_e h3response_informational(struct qpack_encoder* enc, int stat
 h3response_status_e h3response_trailers(struct qpack_encoder* enc,
                                         const http_header_t* trailers,
                                         uint8_t** out, size_t* out_len);
+h3response_status_e h3response_trailers_for_stream(struct qpack_encoder* enc,
+                                                   uint64_t stream_id,
+                                                   const http_header_t* trailers,
+                                                   uint8_t** out, size_t* out_len);
 
 /* ---- DATA framing ---- */
 

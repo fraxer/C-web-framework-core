@@ -61,6 +61,7 @@ static void __fieldlist_add(h3fieldlist_t* l, const http_header_t* h) {
 /* Wrap an encoded field section in a HEADERS frame. Takes ownership of nothing;
  * `*out` is fresh memory. */
 static h3response_status_e __encode(struct qpack_encoder* enc,
+                                    uint64_t stream_id,
                                     const qpack_header_t* fields, size_t count,
                                     uint8_t** out, size_t* out_len) {
     /* A generous bound: the prefix is 2 bytes, every field costs at most its
@@ -74,7 +75,8 @@ static h3response_status_e __encode(struct qpack_encoder* enc,
     uint8_t* block = malloc(bound);
     if (block == NULL) return H3RESPONSE_ERR_MEMORY;
 
-    const size_t block_len = qpack_encode_block(enc, fields, count, block, bound);
+    const size_t block_len = qpack_encode_block_for_stream(enc, stream_id,
+                                                           fields, count, block, bound);
     if (block_len == 0) {
         free(block);
         return H3RESPONSE_ERR_ENCODE;
@@ -121,6 +123,13 @@ static int __status_field(qpack_header_t* f, char* buf, size_t cap, int status_c
 h3response_status_e h3response_headers(struct qpack_encoder* enc,
                                        const httpresponse_t* response,
                                        uint8_t** out, size_t* out_len) {
+    return h3response_headers_for_stream(enc, UINT64_MAX, response, out, out_len);
+}
+
+h3response_status_e h3response_headers_for_stream(struct qpack_encoder* enc,
+                                                  uint64_t stream_id,
+                                                  const httpresponse_t* response,
+                                                  uint8_t** out, size_t* out_len) {
     if (enc == NULL || response == NULL || out == NULL || out_len == NULL)
         return H3RESPONSE_ERR_ENCODE;
 
@@ -152,7 +161,8 @@ h3response_status_e h3response_headers(struct qpack_encoder* enc,
         __fieldlist_add(&list, h);
     }
 
-    const h3response_status_e st = __encode(enc, list.fields, list.count, out, out_len);
+    const h3response_status_e st = __encode(enc, stream_id, list.fields, list.count,
+                                            out, out_len);
     __fieldlist_free(&list);
 
     return st;
@@ -161,6 +171,15 @@ h3response_status_e h3response_headers(struct qpack_encoder* enc,
 h3response_status_e h3response_informational(struct qpack_encoder* enc, int status_code,
                                              const http_header_t* fields,
                                              uint8_t** out, size_t* out_len) {
+    return h3response_informational_for_stream(enc, UINT64_MAX, status_code,
+                                               fields, out, out_len);
+}
+
+h3response_status_e h3response_informational_for_stream(struct qpack_encoder* enc,
+                                                        uint64_t stream_id,
+                                                        int status_code,
+                                                        const http_header_t* fields,
+                                                        uint8_t** out, size_t* out_len) {
     if (enc == NULL || out == NULL || out_len == NULL) return H3RESPONSE_ERR_ENCODE;
 
     *out = NULL;
@@ -191,7 +210,8 @@ h3response_status_e h3response_informational(struct qpack_encoder* enc, int stat
         __fieldlist_add(&list, h);
     }
 
-    const h3response_status_e st = __encode(enc, list.fields, list.count, out, out_len);
+    const h3response_status_e st = __encode(enc, stream_id, list.fields, list.count,
+                                            out, out_len);
     __fieldlist_free(&list);
 
     return st;
@@ -200,6 +220,13 @@ h3response_status_e h3response_informational(struct qpack_encoder* enc, int stat
 h3response_status_e h3response_trailers(struct qpack_encoder* enc,
                                         const http_header_t* trailers,
                                         uint8_t** out, size_t* out_len) {
+    return h3response_trailers_for_stream(enc, UINT64_MAX, trailers, out, out_len);
+}
+
+h3response_status_e h3response_trailers_for_stream(struct qpack_encoder* enc,
+                                                   uint64_t stream_id,
+                                                   const http_header_t* trailers,
+                                                   uint8_t** out, size_t* out_len) {
     if (enc == NULL || out == NULL || out_len == NULL) return H3RESPONSE_ERR_ENCODE;
 
     *out = NULL;
@@ -231,7 +258,8 @@ h3response_status_e h3response_trailers(struct qpack_encoder* enc,
         __fieldlist_add(&list, h);
     }
 
-    const h3response_status_e st = __encode(enc, list.fields, list.count, out, out_len);
+    const h3response_status_e st = __encode(enc, stream_id, list.fields, list.count,
+                                            out, out_len);
     __fieldlist_free(&list);
 
     return st;

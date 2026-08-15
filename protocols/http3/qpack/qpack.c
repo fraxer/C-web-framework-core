@@ -625,14 +625,14 @@ qpack_status_e qpack_encoder_insert_dynamic_name(qpack_encoder_t* e,
     const size_t name_len = ref->name_len;
     if (name_len > SIZE_MAX - value_len - 32) return QPACK_ERR_ENCODER_STREAM;
     const size_t size = name_len + value_len + 32;
-    if (size > e->capacity || e->bytes > e->capacity - size)
-        return QPACK_ERR_ENCODER_STREAM;
-
     /* Copy before growing the entry array: realloc may invalidate ref. */
     char* nc = malloc(name_len + 1); char* vc = malloc(value_len + 1);
     if (nc == NULL || vc == NULL) { free(nc); free(vc); return QPACK_ERR_MEMORY; }
     memcpy(nc, ref->name, name_len); nc[name_len] = 0;
     memcpy(vc, value, value_len); vc[value_len] = 0;
+    if (!__encoder_make_room(e, size)) {
+        free(nc); free(vc); return QPACK_ERR_ENCODER_STREAM;
+    }
 
     uint8_t prefix[16], vprefix[16];
     const size_t pn = prefix_int_encode(prefix, sizeof prefix, relative_index, 6, 0x80);
@@ -664,14 +664,14 @@ qpack_status_e qpack_encoder_duplicate(qpack_encoder_t* e, uint64_t relative_ind
     if (e == NULL || relative_index >= e->entry_count) return QPACK_ERR_ENCODER_STREAM;
     const qpack_dynamic_entry_t* ref =
         &e->entries[e->entry_count - 1 - (size_t)relative_index];
-    if (ref->size > e->capacity || e->bytes > e->capacity - ref->size)
-        return QPACK_ERR_ENCODER_STREAM;
-
     char* nc = malloc(ref->name_len + 1); char* vc = malloc(ref->value_len + 1);
     if (nc == NULL || vc == NULL) { free(nc); free(vc); return QPACK_ERR_MEMORY; }
     memcpy(nc, ref->name, ref->name_len + 1);
     memcpy(vc, ref->value, ref->value_len + 1);
     const size_t name_len = ref->name_len, value_len = ref->value_len, size = ref->size;
+    if (!__encoder_make_room(e, size)) {
+        free(nc); free(vc); return QPACK_ERR_ENCODER_STREAM;
+    }
 
     uint8_t prefix[16];
     const size_t pn = prefix_int_encode(prefix, sizeof prefix, relative_index, 5, 0x00);
@@ -735,8 +735,9 @@ void qpack_encoder_consume(qpack_encoder_t* e, size_t n) {
     e->pending_len -= n;
 }
 
-size_t qpack_encode_block(qpack_encoder_t* e, const qpack_header_t* fields, size_t count,
-                          uint8_t* dst, size_t cap) {
+size_t qpack_encode_block_for_stream(qpack_encoder_t* e, uint64_t stream_id,
+                                     const qpack_header_t* fields, size_t count,
+                                     uint8_t* dst, size_t cap) {
     if (e == NULL || (fields == NULL && count != 0) || dst == NULL || cap == 0) return 0;
 
     qpack_buf_t b;
@@ -835,8 +836,18 @@ size_t qpack_encode_block(qpack_encoder_t* e, const qpack_header_t* fields, size
     }
 
     memcpy(dst, b.data, b.len);
+    if (required != 0 && stream_id != UINT64_MAX &&
+        qpack_encoder_section_open(e, stream_id, required) != QPACK_OK) {
+        free(b.data);
+        return 0;
+    }
     free(b.data);
     return b.len;
+}
+
+size_t qpack_encode_block(qpack_encoder_t* e, const qpack_header_t* fields, size_t count,
+                          uint8_t* dst, size_t cap) {
+    return qpack_encode_block_for_stream(e, UINT64_MAX, fields, count, dst, cap);
 }
 
 /* ---- String literals ---- */

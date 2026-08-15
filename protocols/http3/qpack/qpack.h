@@ -204,5 +204,8 @@ qpack_status_e qpack_encoder_duplicate(qpack_encoder_t* e, uint64_t relative_ind
  * and retries larger on 0. */
 size_t qpack_encode_block(qpack_encoder_t* e, const qpack_header_t* fields, size_t count,
                           uint8_t* dst, size_t cap);
+size_t qpack_encode_block_for_stream(qpack_encoder_t* e, uint64_t stream_id,
+                                     const qpack_header_t* fields, size_t count,
+                                     uint8_t* dst, size_t cap);
 
 #endif
