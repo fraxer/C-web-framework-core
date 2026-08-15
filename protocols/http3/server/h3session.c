@@ -18,6 +18,12 @@
 #define H3_DEFAULT_CTRL_RATE   100
 #define H3_DEFAULT_CTRL_BURST  200
 
+/* Encoder-side policy. The peer SETTINGS are upper bounds, not a request to
+ * consume all advertised memory. Keep the first production step deliberately
+ * small while still gaining reuse for ordinary response headers. */
+#define H3_QPACK_ENCODER_CAPACITY 4096u
+#define H3_QPACK_ENCODER_BLOCKED  16u
+
 /* Replaced by h3_policy_init() on reload and read by both worker generations.
  * Atomics make that publication race-free; a session may observe either whole
  * scalar policy during handoff, both of which are valid. The initial values
@@ -396,6 +402,18 @@ static h3session_verdict_t __control_frame(h3session_t* s, h3uni_recv_t* uni) {
         case H3SETTINGS_ERR_SETTINGS: return __conn(H3_SETTINGS_ERROR);
         default:                      return __conn(H3_FRAME_ERROR);
         }
+
+        const size_t enc_capacity =
+            peer.qpack_max_table_capacity < H3_QPACK_ENCODER_CAPACITY
+                ? (size_t)peer.qpack_max_table_capacity : H3_QPACK_ENCODER_CAPACITY;
+        const size_t enc_blocked =
+            peer.qpack_blocked_streams < H3_QPACK_ENCODER_BLOCKED
+                ? (size_t)peer.qpack_blocked_streams : H3_QPACK_ENCODER_BLOCKED;
+        if (qpack_encoder_set_limits(s->qenc, enc_capacity, enc_blocked) != QPACK_OK)
+            return __conn(H3_INTERNAL_ERROR);
+        if (enc_capacity != 0 &&
+            qpack_encoder_set_capacity(s->qenc, enc_capacity) != QPACK_OK)
+            return __conn(H3_INTERNAL_ERROR);
 
         s->peer_settings = peer;
         s->peer_settings_seen = 1;

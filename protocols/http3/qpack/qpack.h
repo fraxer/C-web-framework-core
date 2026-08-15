@@ -178,6 +178,10 @@ typedef struct qpack_encoder {
 
 qpack_encoder_t* qpack_encoder_create(size_t max_capacity, size_t max_blocked);
 void qpack_encoder_free(qpack_encoder_t* e);
+/* Apply the peer's SETTINGS before the first encoder instruction or field
+ * section. Limits cannot be raised or changed after encoder state exists. */
+qpack_status_e qpack_encoder_set_limits(qpack_encoder_t* e, size_t max_capacity,
+                                        size_t max_blocked);
 qpack_status_e qpack_encoder_set_capacity(qpack_encoder_t* e, size_t capacity);
 size_t qpack_encoder_pending(const qpack_encoder_t* e, const uint8_t** out);
 void qpack_encoder_consume(qpack_encoder_t* e, size_t n);

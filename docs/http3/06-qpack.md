@@ -418,6 +418,26 @@ stream-specific состояние. Production SETTINGS пока остаютс�
 этот путь не меняет wire format действующих ответов до отдельного включения
 capacity/blocked streams и политики наполнения encoder table.
 
+### 6.2e. SETTINGS клиента и лимиты исходящего encoder
+
+После получения SETTINGS сервер применяет объявленные клиентом
+`QPACK_MAX_TABLE_CAPACITY` и `QPACK_BLOCKED_STREAMS` к исходящему encoder. Это
+именно верхние границы клиента: локальная политика дополнительно ограничивает
+их значениями 4096 байт и 16 blocked sections. При ненулевой согласованной
+ёмкости `Set Dynamic Table Capacity` ставится в очередь encoder stream.
+
+Лимиты принимаются только у pristine encoder и становятся неизменяемыми после
+первой инструкции, вставки или field section. Наши входящие SETTINGS пока
+остаются `0/0`: клиент всё ещё не может создавать динамические записи в decoder
+server-side, пока их память не включена в общий HTTP/3 memory budget.
+
+Encoder отдельно соблюдает `QPACK_BLOCKED_STREAMS`: считаются уникальные request
+streams с Required Insert Count выше уже подтверждённого клиентом insert count.
+Если новая секция превысила бы лимит, она кодируется static/literal без
+динамической ссылки. Несколько outstanding sections одного уже блокированного
+stream не расходуют дополнительные слоты; после acknowledgment слот снова
+доступен.
+
 ### 6.2c. Инвариант blocked request stream
 
 Перед подключением `QPACK_BLOCKED` к `h3stream` зафиксирован важный lifetime:

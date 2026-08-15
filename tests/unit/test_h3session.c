@@ -60,12 +60,24 @@ TEST(test_h3session_settings) {
     size_t sp = 0;
     sp += varint_write(settings + sp, sizeof settings - sp, H3_SETTINGS_MAX_FIELD_SECTION_SIZE);
     sp += varint_write(settings + sp, sizeof settings - sp, 4096);
+    sp += varint_write(settings + sp, sizeof settings - sp,
+                       H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY);
+    sp += varint_write(settings + sp, sizeof settings - sp, 8192);
+    sp += varint_write(settings + sp, sizeof settings - sp,
+                       H3_SETTINGS_QPACK_BLOCKED_STREAMS);
+    sp += varint_write(settings + sp, sizeof settings - sp, 100);
 
     uint8_t buf[64];
     const size_t n = control_bytes(buf, sizeof buf, H3_FRAME_SETTINGS, settings, sp);
     TEST_ASSERT(feed(s, uni, buf, n, 0).action == H3SESSION_OK, "accepted");
     TEST_ASSERT(s->peer_settings_seen, "seen");
     TEST_ASSERT(s->peer_settings.max_field_section_size == 4096, "value");
+    TEST_ASSERT(s->qenc->max_capacity == 4096 && s->qenc->capacity == 4096,
+                "encoder capacity is capped by local policy");
+    TEST_ASSERT(s->qenc->max_blocked == 16, "blocked sections are capped locally");
+    const uint8_t* pending = NULL;
+    TEST_ASSERT(qpack_encoder_pending(s->qenc, &pending) > 0,
+                "Set Dynamic Table Capacity queued for encoder stream");
     TEST_ASSERT(s->ctrl_recv_id == 2, "control stream id recorded");
     h3uni_recv_free(uni);
     h3session_free(s);

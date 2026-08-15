@@ -475,6 +475,20 @@ void qpack_encoder_free(qpack_encoder_t* e) {
     free(e);
 }
 
+qpack_status_e qpack_encoder_set_limits(qpack_encoder_t* e, size_t max_capacity,
+                                        size_t max_blocked) {
+    if (e == NULL) return QPACK_ERR_ENCODER_STREAM;
+    /* SETTINGS are immutable and precede useful request processing. Refusing a
+     * late mutation keeps modulo-RIC and outstanding-section accounting tied
+     * to one negotiated limit for the connection's whole lifetime. */
+    if (e->capacity != 0 || e->insert_count != 0 || e->entry_count != 0 ||
+        e->section_count != 0 || e->pending_len != 0)
+        return QPACK_ERR_ENCODER_STREAM;
+    e->max_capacity = max_capacity;
+    e->max_blocked = max_blocked;
+    return QPACK_OK;
+}
+
 qpack_status_e qpack_encoder_section_open(qpack_encoder_t* e, uint64_t stream_id,
                                            uint64_t required_insert_count) {
     if (e == NULL || required_insert_count == 0 ||
@@ -758,6 +772,26 @@ size_t qpack_encode_block_for_stream(qpack_encoder_t* e, uint64_t stream_id,
                 }
             }
         }
+    }
+    /* SETTINGS counts blocked request streams, not field sections. A stream
+     * with an older outstanding blocked section may carry another without
+     * consuming a second slot. If this would be a new blocked stream at the
+     * peer's limit, fall back to literals/static references for this section. */
+    if (required > e->known_received_count && stream_id != UINT64_MAX) {
+        size_t blocked = 0;
+        int stream_already_blocked = 0;
+        for (size_t i = 0; i < e->section_count; i++) {
+            if (e->sections[i].required_insert_count <= e->known_received_count) continue;
+            if (e->sections[i].stream_id == stream_id) stream_already_blocked = 1;
+            int first = 1;
+            for (size_t j = 0; j < i; j++)
+                if (e->sections[j].required_insert_count > e->known_received_count &&
+                    e->sections[j].stream_id == e->sections[i].stream_id) {
+                    first = 0; break;
+                }
+            if (first) blocked++;
+        }
+        if (!stream_already_blocked && blocked >= e->max_blocked) required = 0;
     }
     uint64_t encoded_ric = 0;
     if (required != 0) {

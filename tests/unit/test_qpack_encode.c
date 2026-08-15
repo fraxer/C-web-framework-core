@@ -154,6 +154,18 @@ TEST(test_qpack_encoder_stream_output) {
     qpack_encoder_free(e);
 }
 
+TEST(test_qpack_encoder_negotiated_limits) {
+    TEST_SUITE("qpack encoder stream");
+    qpack_encoder_t* e = qpack_encoder_create(0, 0);
+    TEST_ASSERT(qpack_encoder_set_limits(e, 4096, 16) == QPACK_OK,
+                "peer limits applied to pristine encoder");
+    TEST_ASSERT(e->max_capacity == 4096 && e->max_blocked == 16, "limits stored");
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 128) == QPACK_OK, "encoder started");
+    TEST_ASSERT(qpack_encoder_set_limits(e, 2048, 8) == QPACK_ERR_ENCODER_STREAM,
+                "negotiated limits are immutable after first instruction");
+    qpack_encoder_free(e);
+}
+
 TEST(test_qpack_encoder_literal_insert) {
     TEST_SUITE("qpack dynamic encoder");
     qpack_encoder_t* e = qpack_encoder_create(128, 4);
@@ -284,6 +296,31 @@ TEST(test_qpack_encode_dynamic_tracks_stream) {
     TEST_ASSERT(qpack_encoder_read_decoder_state(e, ack, sizeof ack, &consumed) == QPACK_OK,
                 "peer acknowledgment accepted");
     TEST_ASSERT(e->section_count == 0, "outstanding protection released");
+    qpack_encoder_free(e);
+}
+
+TEST(test_qpack_encoder_respects_blocked_stream_limit) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(128, 1);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 128) == QPACK_OK, "capacity");
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "foo", 3, "bar", 3, NULL) == QPACK_OK,
+                "entry");
+    qpack_header_t field = { "foo", 3, "bar", 3, 0 };
+    uint8_t first[32], second[32];
+    TEST_ASSERT(qpack_encode_block_for_stream(e, 4, &field, 1, first, sizeof first) == 3,
+                "first stream uses dynamic entry");
+    TEST_ASSERT(e->section_count == 1, "one potentially blocked stream");
+    TEST_ASSERT(qpack_encode_block_for_stream(e, 8, &field, 1, second, sizeof second) > 3,
+                "second stream falls back to a literal at the limit");
+    TEST_ASSERT(e->section_count == 1, "fallback creates no outstanding section");
+
+    size_t consumed = 0;
+    static const uint8_t ack[] = { 0x84 };
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, ack, sizeof ack, &consumed) == QPACK_OK,
+                "first stream acknowledged");
+    TEST_ASSERT(qpack_encode_block_for_stream(e, 8, &field, 1, second, sizeof second) == 3,
+                "released slot permits a dynamic section");
+    TEST_ASSERT(e->section_count == 1, "second stream now tracked");
     qpack_encoder_free(e);
 }
 
