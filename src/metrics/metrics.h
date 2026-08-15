@@ -166,6 +166,18 @@ typedef enum {
     METRICS_QUIC_HANDSHAKE_FAILED_TLS,      /* the TLS stack refused the flight */
     METRICS_QUIC_HANDSHAKE_FAILED_TIMEOUT,  /* idle timeout before completion */
 
+    /* 0-RTT (RFC 9001 §4.6). `offered` counts handshakes where a client
+     * presented early data at all, `accepted` those where TLS took it -- the
+     * gap is tickets refused, which is what a resumption context change or the
+     * replay defence looks like from here. `packets` and `bytes` are what
+     * actually arrived at the 0-RTT level, and are what says whether the
+     * feature is doing anything: accepted handshakes with zero packets mean
+     * clients are resuming but sending nothing early. */
+    METRICS_QUIC_EARLY_DATA_OFFERED,
+    METRICS_QUIC_EARLY_DATA_ACCEPTED,
+    METRICS_QUIC_EARLY_DATA_PACKETS,
+    METRICS_QUIC_EARLY_DATA_BYTES,
+
     METRICS_QUIC_DECRYPT_FAILURE,           /* AEAD open failed; usually harmless */
     METRICS_QUIC_AEAD_LIMIT,                /* §6.6 confidentiality limit reached */
     /* Key updates applied. Read next to decrypt_failures: before key updates

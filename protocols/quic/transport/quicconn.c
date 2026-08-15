@@ -1333,9 +1333,22 @@ static void __discard_space(quicconn_t* conn, quic_enc_level_e level) {
     if (conn->pto_level == level) conn->pto_probes = 0;
 }
 
+/* Which packet-number space a level is acknowledged in.
+ *
+ * RFC 9000 §12.3: 0-RTT and 1-RTT are ONE space. The numbers continue across
+ * the two, and a server acknowledges a 0-RTT packet in a 1-RTT packet -- it has
+ * no other way, since it never sends at the 0-RTT level. Tracking arrivals in a
+ * separate ack[EARLY] would therefore lose them twice over: the ranges would
+ * never be written into any packet, and the duplicate check would not see a
+ * 1-RTT packet reusing a number a 0-RTT packet already had. */
+static quic_enc_level_e __ack_space(quic_enc_level_e level) {
+    return level == QUIC_ENC_EARLY ? QUIC_ENC_APP : level;
+}
+
 static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
                             const quicpkt_t* pkt, uint64_t now_us) {
     const quic_enc_level_e level = quicpkt_level(pkt->type);
+    const quic_enc_level_e space = __ack_space(level);
 
     quickeys_t* keys = &conn->rx[level];
     if (!keys->valid) {
@@ -1367,8 +1380,8 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
         return 0;
     }
 
-    const uint64_t largest = conn->ack[level].any_received
-                             ? conn->ack[level].largest : QUICPKT_NO_ACKED;
+    const uint64_t largest = conn->ack[space].any_received
+                             ? conn->ack[space].largest : QUICPKT_NO_ACKED;
     const uint64_t pn = quicpkt_decode_pn(
         largest == QUICPKT_NO_ACKED ? 0 : largest, truncated, pn_len);
 
@@ -1445,9 +1458,25 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
         conn->address_validated = 1;
     }
 
+    /* §4.9.3: once a 1-RTT packet opens, the 0-RTT read keys have no further
+     * use -- the client has moved on and everything it sends from now is at the
+     * application level. Dropping them here bounds how long a replayed 0-RTT
+     * flight can be decrypted at all, and it is the moment the RFC names.
+     *
+     * Only the keys: the packet-number space and its acknowledgement state are
+     * shared with 1-RTT (see __ack_space) and must survive. */
+    if (level == QUIC_ENC_APP && conn->rx[QUIC_ENC_EARLY].valid)
+        quickeys_free(&conn->rx[QUIC_ENC_EARLY]);
+
+    if (level == QUIC_ENC_EARLY) {
+        conn->early_data_packets++;
+        metrics_quic(METRICS_QUIC_EARLY_DATA_PACKETS);
+        metrics_quic_add(METRICS_QUIC_EARLY_DATA_BYTES, pkt->pkt_len);
+    }
+
     /* A replayed packet is bit-identical to the original, so the AEAD cannot
      * tell them apart -- this check is the only thing that can. */
-    if (quicack_is_duplicate(&conn->ack[level], pn)) return 1;
+    if (quicack_is_duplicate(&conn->ack[space], pn)) return 1;
 
     /* The packet opened with the next generation's keys, which is the only
      * proof that the peer really updated: the Key Phase bit itself is under
@@ -1499,9 +1528,9 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
      * packet, injected from an address of the attacker's choosing, would drag
      * the connection back and forth. Read before quicack_on_received, which is
      * what makes this packet the largest. */
-    const int newest = !conn->ack[level].any_received || pn > conn->ack[level].largest;
+    const int newest = !conn->ack[space].any_received || pn > conn->ack[space].largest;
 
-    quicack_on_received_ecn(&conn->ack[level], level, pn, ack_eliciting,
+    quicack_on_received_ecn(&conn->ack[space], space, pn, ack_eliciting,
                             conn->recv_ecn, now_us,
                             conn->local_params.max_ack_delay * 1000);
 
@@ -1524,10 +1553,10 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
     QUICBEACON("cid=%02x%02x RECV  level=%d pn=%llu elic=%d pending=%u deadline_in=%lld",
                conn->odcid.data[0], conn->odcid.data[1],
                (int)level, (unsigned long long)pn, ack_eliciting,
-               conn->ack[level].eliciting_pending,
-               conn->ack[level].ack_deadline_us == 0
+               conn->ack[space].eliciting_pending,
+               conn->ack[space].ack_deadline_us == 0
                    ? -1LL
-                   : (long long)conn->ack[level].ack_deadline_us - (long long)now_us);
+                   : (long long)conn->ack[space].ack_deadline_us - (long long)now_us);
 
     return 1;
 }
@@ -1674,6 +1703,25 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
                      (unsigned long long)conn->peer_params.initial_max_stream_data_uni);
 
             metrics_quic(METRICS_QUIC_HANDSHAKE_COMPLETED);
+
+            /* Whether the client's early data was taken. Read here rather than
+             * when the 0-RTT keys appeared: TLS only settles it after the
+             * ClientHello is processed, and a handshake that yielded 0-RTT read
+             * keys can still end with the data refused. */
+            if (conn->tls.early_data_enabled) {
+                if (conn->early_data_packets > 0 || quictls_early_data_accepted(&conn->tls))
+                    metrics_quic(METRICS_QUIC_EARLY_DATA_OFFERED);
+
+                if (quictls_early_data_accepted(&conn->tls)) {
+                    metrics_quic(METRICS_QUIC_EARLY_DATA_ACCEPTED);
+
+                    log_info("quic: 0-RTT accepted cid=%02x%02x%02x%02x, "
+                             "%llu early packets\n",
+                             conn->odcid.data[0], conn->odcid.data[1],
+                             conn->odcid.data[2], conn->odcid.data[3],
+                             (unsigned long long)conn->early_data_packets);
+                }
+            }
 
             conn->state = QUICCONN_ACTIVE;
             if (conn->peer_params.max_udp_payload_size < conn->pmtud.ceiling) {
@@ -2914,8 +2962,21 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
         return NULL;
     }
 
+    /* 0-RTT, if the operator asked for it (RFC 9001 §4.6). The context binds
+     * every ticket to this configuration; quictls refuses to resume across a
+     * change, so a client can never bring early data into a connection whose
+     * limits differ from the ones it remembered (§7.4.1). */
+    quictls_early_t early;
+    memset(&early, 0, sizeof early);
+    early.enabled = policy->early_data;
+    early.resumption_context_len = policy->resumption_context_len;
+    if (early.resumption_context_len > sizeof early.resumption_context)
+        early.resumption_context_len = sizeof early.resumption_context;
+    memcpy(early.resumption_context, policy->resumption_context,
+           early.resumption_context_len);
+
     if (!quictls_init_server(&conn->tls, server->openssl->quic_ctx, &__tls_ops, conn,
-                             &conn->local_params)) {
+                             &conn->local_params, &early)) {
         quicconn_free(conn);
         return NULL;
     }

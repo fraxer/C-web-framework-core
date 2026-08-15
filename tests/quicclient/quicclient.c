@@ -105,6 +105,27 @@ static void __on_alert(void* ctx, uint8_t alert) {
     printf("  [client] TLS alert %u\n", alert);
 }
 
+/* Where the session callback finds the client. The callback is per SSL_CTX and
+ * every client makes its own, but the SSL is what it is handed, so the back
+ * pointer rides there. */
+static int __ex_data_index = -1;
+
+static int __on_new_session(SSL* ssl, SSL_SESSION* session) {
+    quicclient_t* c = __ex_data_index >= 0 ? SSL_get_ex_data(ssl, __ex_data_index) : NULL;
+    if (c == NULL) return 0;
+
+    /* Servers issue more than one; the newest is the one to keep, and holding
+     * exactly one keeps the ownership rule simple. Returning 1 takes the
+     * reference OpenSSL offers, so nothing else has to be incremented. */
+    SSL_SESSION_free(c->session);
+    c->session = session;
+
+    __log(c, "  [client] session ticket, max_early_data %u\n",
+          SSL_SESSION_get_max_early_data(session));
+
+    return 1;
+}
+
 static const quictls_ops_t __ops = {
     .install_secret = __on_secret,
     .send_crypto = __on_crypto,
@@ -554,7 +575,8 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
 
     /* Acknowledge what has arrived at this level. The server's loss detection
      * depends on it, and without it the handshake stalls into retransmissions. */
-    if (c->ack_pending[level] && !quicrange_empty(&c->received[level])) {
+    if (level != QUIC_ENC_EARLY &&
+        c->ack_pending[level] && !quicrange_empty(&c->received[level])) {
         quicack_block_t blocks[8];
         size_t count = quicrange_count(&c->received[level]);
         if (count > 8) count = 8;
@@ -653,7 +675,7 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
         }
     }
 
-    if (quicsendbuf_pending(&c->crypto_out[level])) {
+    if (level != QUIC_ENC_EARLY && quicsendbuf_pending(&c->crypto_out[level])) {
         uint64_t offset = 0;
         const uint8_t* data = NULL;
         size_t dlen = 0;
@@ -679,9 +701,14 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
         }
     }
 
-    /* Stream data, once the handshake keys exist. One frame per stream per
-     * packet is enough for a test whose whole exchange is a few kilobytes. */
-    if (level == QUIC_ENC_APP) {
+    /* Stream data, once the handshake keys exist -- or, when resuming, at the
+     * 0-RTT level before they do. §12.5 permits STREAM and the flow-control
+     * frames in a 0-RTT packet and forbids ACK and CRYPTO, which is why the
+     * blocks above are gated on APP alone and this one is not.
+     *
+     * One frame per stream per packet is enough for a test whose whole exchange
+     * is a few kilobytes. */
+    if (level == QUIC_ENC_APP || level == QUIC_ENC_EARLY) {
         for (size_t i = 0; i < CLIENT_MAX_STREAMS && p + 64 < payload_cap; i++) {
             clientstream_t* st = &c->streams[i];
             if (!st->used || !st->stop_sending_queued) continue;
@@ -813,13 +840,18 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
 
     if (p == 0) return 0;
 
-    const uint64_t pn = c->next_pn[level]++;
+    /* §12.3: 0-RTT and 1-RTT are one packet number space. Numbering them
+     * separately would make the server see the same number twice and drop the
+     * second as a duplicate. */
+    const quic_enc_level_e pn_space = level == QUIC_ENC_EARLY ? QUIC_ENC_APP : level;
+    const uint64_t pn = c->next_pn[pn_space]++;
     const size_t pn_len = 4;
 
     quicpkt_hdr_out_t hdr;
     memset(&hdr, 0, sizeof hdr);
     hdr.type = level == QUIC_ENC_INITIAL ? QUIC_PKT_INITIAL
              : level == QUIC_ENC_HANDSHAKE ? QUIC_PKT_HANDSHAKE
+             : level == QUIC_ENC_EARLY ? QUIC_PKT_0RTT
              : QUIC_PKT_SHORT;
     hdr.version = QUIC_VERSION_1;
     hdr.dcid = c->dcid.len > 0 ? &c->dcid : &c->odcid;
@@ -872,6 +904,8 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
 
     if (!quichp_apply(keys, dst, total, pn_offset, pn_len)) return 0;
 
+    if (level == QUIC_ENC_EARLY) c->early_data_sent_packets++;
+
     __log(c, "  [client] -> level %d, pn %llu, %zu bytes\n",
           (int)level, (unsigned long long)pn, total);
 
@@ -896,7 +930,11 @@ static int __flush_one(quicclient_t* c, size_t* out_total) {
     size_t total = 0;
 
     for (int i = 0; i < QUIC_ENC_COUNT; i++) {
-        if (i == QUIC_ENC_EARLY) continue;
+        /* 0-RTT carries data only while there is no 1-RTT key to carry it
+         * instead: once the handshake yields application keys, everything the
+         * client still owes goes there (§4.6.2 -- and a server that has
+         * discarded its 0-RTT keys would drop it anyway). */
+        if (i == QUIC_ENC_EARLY && c->tx[QUIC_ENC_APP].valid) continue;
 
         const int pad = (i == QUIC_ENC_INITIAL && !c->got_server_handshake);
         const size_t n = __build(c, (quic_enc_level_e)i, datagram + total,
@@ -1487,7 +1525,8 @@ static int __connect(quicclient_t* client, const char* host, uint16_t port,
                      unsigned reorder_pct, unsigned dup_pct, uint64_t seed,
                      void (*out)(void* arg, const uint8_t* data, size_t len),
                      void* out_arg,
-                     uint64_t conn_window, uint64_t stream_window);
+                     uint64_t conn_window, uint64_t stream_window,
+                     SSL_SESSION* resume_session, int resume_early_data);
 
 int quicclient_connect(quicclient_t* client, const char* host, uint16_t port,
                        const char* server_name, int verbose) {
@@ -1505,7 +1544,7 @@ int quicclient_connect_impaired(quicclient_t* client, const char* host, uint16_t
      * exists and nothing has been sent yet. */
     return __connect(client, host, port, server_name, verbose, NULL, 0,
                      loss_out_pct, loss_in_pct, reorder_pct, dup_pct, seed,
-                     NULL, NULL, 0, 0);
+                     NULL, NULL, 0, 0, NULL, 0);
 }
 
 int quicclient_connect_inproc(quicclient_t* client, const char* server_name, int verbose,
@@ -1523,7 +1562,8 @@ int quicclient_connect_inproc_windowed(quicclient_t* client, const char* server_
     if (client == NULL || out == NULL) return 0;
 
     return __connect(client, NULL, 0, server_name, verbose, NULL, 0,
-                     0, 0, 0, 0, 0, out, out_arg, conn_window, stream_window);
+                     0, 0, 0, 0, 0, out, out_arg, conn_window, stream_window,
+                     NULL, 0);
 }
 
 size_t quicclient_take_token(const quicclient_t* client, uint8_t* out, size_t cap) {
@@ -1539,7 +1579,34 @@ int quicclient_connect_token(quicclient_t* client, const char* host, uint16_t po
                              const char* server_name, int verbose,
                              const uint8_t* token, size_t token_len) {
     return __connect(client, host, port, server_name, verbose, token, token_len,
-                     0, 0, 0, 0, 0, NULL, NULL, 0, 0);
+                     0, 0, 0, 0, 0, NULL, NULL, 0, 0, NULL, 0);
+}
+
+SSL_SESSION* quicclient_session_take(quicclient_t* client) {
+    if (client == NULL) return NULL;
+
+    SSL_SESSION* session = client->session;
+    client->session = NULL;
+
+    return session;
+}
+
+int quicclient_early_data_accepted(const quicclient_t* client) {
+    if (client == NULL) return 0;
+
+    return quictls_early_data_accepted(&client->tls);
+}
+
+int quicclient_connect_resume(quicclient_t* client, const char* host, uint16_t port,
+                              const char* server_name, int verbose,
+                              SSL_SESSION* session, int early_data) {
+    if (client == NULL || session == NULL) return 0;
+
+    /* The session has to be installed between building the TLS state and
+     * driving it, and __connect does both -- hence the two extra arguments
+     * rather than a call after it. */
+    return __connect(client, host, port, server_name, verbose, NULL, 0,
+                     0, 0, 0, 0, 0, NULL, NULL, 0, 0, session, early_data);
 }
 
 static int __connect(quicclient_t* client, const char* host, uint16_t port,
@@ -1549,9 +1616,15 @@ static int __connect(quicclient_t* client, const char* host, uint16_t port,
                      unsigned reorder_pct, unsigned dup_pct, uint64_t seed,
                      void (*out)(void* arg, const uint8_t* data, size_t len),
                      void* out_arg,
-                     uint64_t conn_window, uint64_t stream_window) {
+                     uint64_t conn_window, uint64_t stream_window,
+                     SSL_SESSION* resume_session, int resume_early_data) {
     if (client == NULL) return 0;
 
+    /* The struct arrives uninitialised -- every caller passes a bare local --
+     * so nothing may be read out of it before this memset. The session to
+     * resume therefore travels as an argument and not as a field staged by the
+     * caller: reading one back across the wipe compiled, ran, and handed
+     * OpenSSL a pointer made of stack garbage. */
     memset(client, 0, sizeof * client);
     client->verbose = verbose;
     client->fd = -1;
@@ -1584,6 +1657,18 @@ static int __connect(quicclient_t* client, const char* host, uint16_t port,
     /* This is a test client talking to a test certificate. */
     SSL_CTX_set_verify(client->ssl_ctx, SSL_VERIFY_NONE, NULL);
 
+    /* Session tickets, so a later connection can resume and offer 0-RTT.
+     * NO_INTERNAL_STORE because the callback below keeps the one that matters:
+     * an internal cache would also hold references this client never frees. */
+    if (__ex_data_index < 0)
+        __ex_data_index = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+    if (__ex_data_index < 0) return 0;
+
+    SSL_CTX_set_session_cache_mode(client->ssl_ctx,
+                                   SSL_SESS_CACHE_CLIENT |
+                                   SSL_SESS_CACHE_NO_INTERNAL_STORE);
+    SSL_CTX_sess_set_new_cb(client->ssl_ctx, __on_new_session);
+
     client->server_name = server_name;
 
     quicclient_impair(client, loss_out_pct, loss_in_pct, reorder_pct, dup_pct, seed);
@@ -1597,6 +1682,21 @@ static int __connect(quicclient_t* client, const char* host, uint16_t port,
     }
 
     if (!__handshake_start(client, &client->odcid)) return 0;
+
+    /* The back pointer the session callback reads, and the session itself --
+     * both have to be in place before quictls_advance builds the ClientHello,
+     * because that is when the early-data extension and its write keys are
+     * produced. */
+    if (SSL_set_ex_data(client->tls.ssl, __ex_data_index, client) != 1) return 0;
+
+    if (resume_session != NULL) {
+        if (!quictls_client_resume(&client->tls, resume_session, resume_early_data)) {
+            printf("  [client] cannot resume the session\n");
+            return 0;
+        }
+
+        client->early_data = resume_early_data;
+    }
 
     /* No socket in the in-process mode, and no address either: where the peer
      * is, is the emulator's business. */
@@ -1648,6 +1748,10 @@ int quicclient_run(quicclient_t* client, int timeout_ms) {
                 client->handshake_complete = 1;
                 __log(client, "  [client] handshake complete\n");
             }
+
+            /* Session tickets arrive after the handshake, as CRYPTO at the
+             * application level, and quictls_advance stops before them. */
+            if (!quictls_post_handshake(&client->tls)) return 0;
         }
 
         if (!__flush(client)) return 0;
@@ -1685,6 +1789,8 @@ int quicclient_deliver(quicclient_t* client, const uint8_t* data, size_t len) {
         client->handshake_complete = 1;
         __log(client, "  [client] handshake complete\n");
     }
+
+    if (!quictls_post_handshake(&client->tls)) return 0;
 
     return 1;
 }
@@ -1741,6 +1847,14 @@ int quicclient_pump(quicclient_t* client, int timeout_ms) {
 
     if (burst > client->rxstats.burst_max) client->rxstats.burst_max = burst;
 
+    if (got_anything) {
+        if (!quictls_advance(&client->tls)) return 0;
+        /* Where the session ticket is actually collected in practice: run()
+         * returns as soon as HANDSHAKE_DONE arrives, and the ticket usually
+         * comes in a later datagram than that. */
+        if (!quictls_post_handshake(&client->tls)) return 0;
+    }
+
     /* Acknowledge the burst in one go rather than per datagram. */
     if (got_anything && !__flush(client)) return 0;
 
@@ -1769,6 +1883,11 @@ void quicclient_free(quicclient_t* client) {
         quicsendbuf_free(&client->streams[i].out);
         quicrecvbuf_free(&client->streams[i].in);
     }
+
+    /* Not taken by the caller, so it dies with the client. quicclient_session_take
+     * is what keeps one alive past this point. */
+    SSL_SESSION_free(client->session);
+    client->session = NULL;
 
     if (client->ssl_ctx != NULL) SSL_CTX_free(client->ssl_ctx);
     if (client->fd >= 0) close(client->fd);

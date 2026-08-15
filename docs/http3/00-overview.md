@@ -139,13 +139,13 @@ fork / BoringSSL) без изменений в транспорте. Свой TL
 - HTTP/3: GET/POST/PUT/…, тела запросов, trailers и 103 Early Hints;
 - Full QPACK: динамические encoder/decoder tables, оба instruction streams,
   blocked request streams, acknowledgments/cancellation и защищённая eviction;
-- IPv4 endpoint; UDP GSO (`UDP_SEGMENT`) для пакетной отправки.
+- IPv4 endpoint; UDP GSO (`UDP_SEGMENT`) для пакетной отправки;
+- 0-RTT (RFC 9001 §4.6) за ключом `http3_early_data`, по умолчанию выключенный.
 
 **Не входит (осознанно):**
 
 | Что | Почему |
 |---|---|
-| 0-RTT / early data | Требует политики анти-повтора; фаза 9, опционально |
 | Server Push (`PUSH_PROMISE`) | По тем же причинам, что h2-push был удалён из проекта — см. `docs/http2/07`. Реализуем только приём `MAX_PUSH_ID` и игнорирование |
 | QUIC v2 (RFC 9369), совместимое согласование версий (RFC 9368) | Только version negotiation-пакет для неизвестных версий |
 | Unreliable datagrams (RFC 9221), MASQUE | Нет потребителя |
@@ -169,11 +169,12 @@ fork / BoringSSL) без изменений в транспорте. Свой TL
 | HTTP/3 server, Alt-Svc, graceful shutdown | Готово |
 | Soft reload с сохранением UDP socket/CID | Реализовано; production-статус ждёт integration-гейта с `SIGUSR1` |
 | Process connection/memory limits и process-wide rate buckets | Готово |
-| QPACK | Static-only; dynamic table и blocked streams отсутствуют |
+| QPACK | Полный: динамические таблицы обеих сторон, оба instruction stream, blocked streams |
 | UDP batching / GSO | `recvmmsg`, `sendmmsg`, `UDP_SEGMENT` |
 | UDP GRO, ECN, DPLPMTUD | Готово |
-| IPv6 endpoint | Не реализовано |
-| 0-RTT, QUIC v2 | Не реализовано |
+| IPv6 endpoint | Не реализовано: сокет-слой умеет `AF_INET6`, но `quicendpoint` привязан к IPv4 |
+| 0-RTT / early data (`http3_early_data`) | Готово, по умолчанию выключено |
+| QUIC v2 | Не реализовано |
 | HTTP/3 client, Server Push, Extended CONNECT (RFC 9220) | Вне scope по решению |
 
 ## 4. Что переиспользуется из существующего кода
@@ -257,7 +258,7 @@ RFC 9000 §13.3 и оно определяет форму `quicsendbuf` и `quic
 | 6 | QPACK | `06` | L | Векторы RFC 9204 Приложение B; Chrome/Firefox открывают сайт |
 | 7 | Интеграция: конфиг, Alt-Svc, метрики, лимиты, shutdown/reload (WebSocket over h3 исключён решением, `05` §8) | `07` | M | Браузер сам переключается на h3 после Alt-Svc; `/metrics` показывает секцию quic |
 | 8 | Тесты и interop | `08` | L | quic-interop-runner: handshake, transfer, retry, resumption, multiplexing, http3 — зелёные; h3spec без падений |
-| 9 | Отложенное: обязательное (key update, миграция, Retry), производительность (BBR, ECN, GSO/GRO, DPLPMTUD, аффинность, обход списка потоков), опции (0-RTT, QUIC v2); CUBIC уже реализован | `09` | — | По отдельности, каждый пункт за своим флагом и со своим критерием — см. `09` |
+| 9 | Отложенное: обязательное (закрыто), производительность (BBR, аффинность, обход списка потоков — остальное сделано), опции (0-RTT сделан, QUIC v2 — по потребности) | `09` | — | По отдельности, каждый пункт за своим флагом и со своим критерием — см. `09` |
 
 Таблица выше сохраняет исторический порядок внедрения. Фазы 2 и 3 частично
 параллелились; 5 и 6 — нет. Начальный QPACK-lite впоследствии заменён full

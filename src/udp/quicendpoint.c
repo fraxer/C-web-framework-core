@@ -15,6 +15,7 @@
 #include "appconfig.h"
 #include "log.h"
 #include "metrics.h"
+#include "sha256.h"
 #ifdef CWFR_HQ_INTEROP
 #include "hq.h"
 #include "quictls.h"
@@ -335,6 +336,55 @@ static int __policy_u64(const env_t* source, const char* key, uint64_t fallback,
     return 1;
 }
 
+/* Derive the session-id context from everything a resuming client may have
+ * remembered (RFC 9001 §7.4.1, RFC 9114 §7.2.4.2).
+ *
+ * The rule for what belongs here: a value belongs if a client that resumes with
+ * 0-RTT acts on the *old* one. Transport parameters do -- it sends stream data
+ * against the limits it remembers, before ours arrive. The HTTP/3 settings do
+ * -- it encodes its request with the QPACK table size and field-section limit
+ * it remembers. Everything else (the congestion controller, pacing, the retry
+ * policy) is invisible to the peer, changes nothing it can get wrong, and is
+ * left out so an operator tuning throughput does not throw away every ticket in
+ * the field.
+ *
+ * The tag is the schema version: bump it and every ticket in the field stops
+ * resuming, which is the lever to pull if what any of these values *means*
+ * changes rather than what it is. */
+static void __resumption_context(quic_conn_policy_t* p) {
+    struct {
+        char     tag[16];
+        uint64_t idle_timeout_ms;
+        uint64_t max_udp_payload_size;
+        uint64_t initial_max_data;
+        uint64_t initial_max_stream_data;
+        uint64_t max_streams_bidi;
+        uint64_t max_streams_uni;
+        uint64_t active_cid_limit;
+        uint64_t ack_delay_ms;
+        uint64_t h3_settings[H3_SETTINGS_DIGEST_VALUES];
+    } material;
+
+    /* Zeroed whole, not field by field: this struct is hashed, so its padding
+     * is part of the input, and uninitialised padding would give the same
+     * configuration a different context on every start. */
+    memset(&material, 0, sizeof material);
+
+    memcpy(material.tag, "cwfr-h3-0rtt-1", 14);
+    material.idle_timeout_ms         = p->idle_timeout_ms;
+    material.max_udp_payload_size    = p->max_udp_payload_size;
+    material.initial_max_data        = p->initial_max_data;
+    material.initial_max_stream_data = p->initial_max_stream_data;
+    material.max_streams_bidi        = p->max_streams_bidi;
+    material.max_streams_uni         = p->max_streams_uni;
+    material.active_cid_limit        = p->active_cid_limit;
+    material.ack_delay_ms            = p->ack_delay_ms;
+    h3_local_settings_digest(material.h3_settings);
+
+    sha256((const unsigned char*)&material, sizeof material, p->resumption_context);
+    p->resumption_context_len = 32;
+}
+
 static int __conn_policy_parse(const env_t* source, quic_conn_policy_t* next) {
     /* Commit only after every value is valid, so a failed reload cannot leave
      * a mixture of old and new transport parameters behind. */
@@ -420,6 +470,15 @@ static int __conn_policy_parse(const env_t* source, quic_conn_policy_t* next) {
         log_error("quic: http3_amplification_factor is %llu, not the %d RFC 9000 §8.1 "
                   "requires -- this server can be used to amplify traffic at a spoofed address\n",
                   (unsigned long long)p->amplification_factor, QUIC_DEFAULT_AMPLIFICATION);
+
+    bool early_data = false;
+    if (env_config_get_bool_checked(source, "http3_early_data", &early_data) < 0) {
+        log_error("quic: http3_early_data must be a boolean\n");
+        return 0;
+    }
+    p->early_data = early_data;
+
+    __resumption_context(p);
 
     return 1;
 }
@@ -1294,7 +1353,25 @@ static void __accept(quicendpoint_t* ep, udp_datagram_t* dgram,
  * packet being built for them. */
 
 /* Attach the HTTP/3 layer once the handshake is done, and send our SETTINGS.
- * Returns 0 if the connection cannot go on without them. */
+ * Returns 0 if the connection cannot go on without them.
+ *
+ * **This is the anti-replay policy for 0-RTT** (RFC 9001 §9.2, RFC 8470 §5.2),
+ * and it is one line: ACTIVE, not HANDSHAKE. Early data is decrypted and
+ * accumulated in its streams by the transport, but nothing reads those streams
+ * until the handshake completes -- so no handler, no database write, no session
+ * lookup happens for a request that arrived in 0-RTT until the peer has proved
+ * it holds the key material. A replayed 0-RTT flight cannot do that: the
+ * attacker can copy datagrams but cannot finish the handshake, so the copy
+ * stalls here and dies at the idle timeout having executed nothing.
+ *
+ * What it costs: the response is not 0.5-RTT. The client still saves a full
+ * round trip -- its request was already here when the handshake finished --
+ * but the reply waits for the handshake rather than racing it.
+ *
+ * What it buys: early data needs no restriction to safe methods, no
+ * `Early-Data` header, no 425 Too Early, and no strike register. Moving the
+ * dispatch earlier would require all four, so do not relax this line without
+ * reading docs/http3/09 §3.1 first. */
 static int __h3_attach(quicconn_t* conn) {
     connection_server_ctx_t* ctx = conn->conn.ctx;
 

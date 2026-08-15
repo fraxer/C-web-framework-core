@@ -99,6 +99,15 @@ int h3client_post_expect(quicclient_t* client, uint64_t stream_id,
                          const char* body, size_t body_len,
                          int timeout_ms, h3client_response_t* out);
 
+/* Encode a GET request (HEADERS frame, QPACK static-only) into `dst`, without
+ * sending it. Returns its length, or 0.
+ *
+ * Split out for the scenarios that need the request bytes at a moment they
+ * choose rather than when h3client_get chooses -- notably a 0-RTT flight,
+ * which has to be written before the handshake completes. */
+size_t h3client_request_bytes(uint8_t* dst, size_t cap,
+                              const char* authority, const char* path);
+
 /* What the server said on its control stream: whether SETTINGS arrived, and
  * what they contained. Read after a request, because service streams and
  * request streams are delivered independently. */

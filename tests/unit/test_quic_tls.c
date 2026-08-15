@@ -123,7 +123,7 @@ TEST(test_quic_tls_crypto_reassembly) {
     memset(&probe, 0, sizeof probe);
 
     quictls_t tls;
-    TEST_REQUIRE(quictls_init_server(&tls, ctx, &probe_ops, &probe, &params),
+    TEST_REQUIRE(quictls_init_server(&tls, ctx, &probe_ops, &probe, &params, NULL),
                  "bridge initialised");
 
     TEST_CASE("in-order pieces accumulate");
@@ -371,7 +371,7 @@ TEST(test_quic_tls_full_handshake) {
 
     quictls_t s;
     quictls_t c;
-    TEST_REQUIRE(quictls_init_server(&s, server_ctx, &peer_ops, &server, &server_params),
+    TEST_REQUIRE(quictls_init_server(&s, server_ctx, &peer_ops, &server, &server_params, NULL),
                  "server bridge");
     TEST_REQUIRE(quictls_init_client(&c, client_ctx, &peer_ops, &client, &client_params,
                                      "localhost"), "client bridge");
@@ -453,7 +453,7 @@ TEST(test_quic_tls_handshake_start) {
     memset(&probe, 0, sizeof probe);
 
     quictls_t tls;
-    TEST_REQUIRE(quictls_init_server(&tls, ctx, &probe_ops, &probe, &params), "init");
+    TEST_REQUIRE(quictls_init_server(&tls, ctx, &probe_ops, &probe, &params, NULL), "init");
 
     /* Nothing fed yet: TLS wants to read, which is not a failure. */
     TEST_ASSERT(quictls_advance(&tls), "advancing with no input is not an error");
@@ -476,9 +476,300 @@ TEST(test_quic_tls_handshake_start) {
 
     TEST_CASE("NULL arguments are refused");
     quictls_t empty;
-    TEST_ASSERT(!quictls_init_server(&empty, NULL, &probe_ops, &probe, &params),
+    TEST_ASSERT(!quictls_init_server(&empty, NULL, &probe_ops, &probe, &params, NULL),
                 "no SSL_CTX");
     TEST_ASSERT(!quictls_configure_ctx(NULL), "no context");
     TEST_ASSERT(!quictls_advance(NULL), "no bridge");
     quictls_free(NULL);
+}
+
+/* ---- 0-RTT (RFC 9001 §4.6, docs/http3/09 §3.1) ---- *
+ *
+ * A resumption needs two handshakes and a ticket carried between them, which
+ * needs post-handshake TLS to run at all -- so these tests are also the only
+ * place quictls_post_handshake is exercised. The client side of the bridge
+ * exists for exactly this: without a real TLS peer, "the server accepted early
+ * data" is not a statement anything can check. */
+
+/* One side of an early-data handshake, driven to completion. */
+typedef struct {
+    peer_t   peer;
+    quictls_t tls;
+} early_side_t;
+
+/* Where a resuming client's ticket is kept between the two handshakes. */
+static SSL_SESSION* __early_session = NULL;
+
+static int __early_new_session(SSL* ssl, SSL_SESSION* session) {
+    (void)ssl;
+
+    SSL_SESSION_free(__early_session);
+    __early_session = session;
+
+    return 1;   /* the reference is ours now */
+}
+
+/* Run one handshake to completion, returning 1 if both sides finished.
+ * `resume` offers __early_session with early data; `server_early` configures
+ * the server to accept it under `context`. */
+static int __early_handshake(SSL_CTX* server_ctx, SSL_CTX* client_ctx,
+                             const quictls_early_t* server_early,
+                             int resume,
+                             early_side_t* server_out, early_side_t* client_out) {
+    static pipe_t to_server;
+    static pipe_t to_client;
+    memset(&to_server, 0, sizeof to_server);
+    memset(&to_client, 0, sizeof to_client);
+
+    memset(server_out, 0, sizeof * server_out);
+    memset(client_out, 0, sizeof * client_out);
+
+    server_out->peer.out = &to_client;
+    server_out->peer.keys_ok = 1;
+    client_out->peer.out = &to_server;
+    client_out->peer.keys_ok = 1;
+
+    quictp_t server_params;
+    quictp_defaults(&server_params);
+    server_params.initial_max_data = 1048576;
+    server_params.initial_max_streams_bidi = 100;
+    server_params.has_original_dcid = 1;
+    server_params.original_dcid.len = 8;
+    memset(server_params.original_dcid.data, 0xa1, 8);
+    server_params.has_initial_scid = 1;
+    server_params.initial_scid.len = 8;
+    memset(server_params.initial_scid.data, 0xb2, 8);
+
+    quictp_t client_params;
+    quictp_defaults(&client_params);
+    client_params.initial_max_data = 524288;
+    client_params.has_initial_scid = 1;
+    client_params.initial_scid.len = 8;
+    memset(client_params.initial_scid.data, 0xc3, 8);
+
+    if (!quictls_init_server(&server_out->tls, server_ctx, &peer_ops,
+                             &server_out->peer, &server_params, server_early))
+        return 0;
+
+    if (!quictls_init_client(&client_out->tls, client_ctx, &peer_ops,
+                             &client_out->peer, &client_params, "localhost"))
+        return 0;
+
+    if (resume && __early_session != NULL &&
+        !quictls_client_resume(&client_out->tls, __early_session, 1))
+        return 0;
+
+    int ok = 1;
+    for (int round = 0; round < 12 && ok; round++) {
+        ok = ok && quictls_advance(&client_out->tls);
+        ok = ok && quictls_post_handshake(&client_out->tls);
+        deliver(&server_out->tls, &to_server);
+        ok = ok && quictls_advance(&server_out->tls);
+        ok = ok && quictls_post_handshake(&server_out->tls);
+        deliver(&client_out->tls, &to_client);
+    }
+
+    return ok && server_out->tls.handshake_complete && client_out->tls.handshake_complete;
+}
+
+static void __early_context(quictls_early_t* early, uint8_t fill) {
+    memset(early, 0, sizeof * early);
+    early->enabled = 1;
+    early->resumption_context_len = 32;
+    memset(early->resumption_context, fill, 32);
+}
+
+TEST(test_quic_tls_early_data) {
+    TEST_SUITE("quic_tls");
+
+    TEST_CASE("a resumed handshake carries 0-RTT keys in both directions");
+
+    SSL_CTX* server_ctx = SSL_CTX_new(TLS_server_method());
+    SSL_CTX* client_ctx = SSL_CTX_new(TLS_client_method());
+    TEST_REQUIRE_NOT_NULL(server_ctx, "server context");
+    TEST_REQUIRE_NOT_NULL(client_ctx, "client context");
+
+    TEST_REQUIRE(quictls_configure_ctx(server_ctx), "server configured");
+    TEST_REQUIRE(quictls_configure_ctx(client_ctx), "client configured");
+
+    const int have_cert =
+        SSL_CTX_use_certificate_file(server_ctx, TEST_QUIC_CERT, SSL_FILETYPE_PEM) == 1 &&
+        SSL_CTX_use_PrivateKey_file(server_ctx, TEST_QUIC_KEY, SSL_FILETYPE_PEM) == 1;
+    TEST_REQUIRE(have_cert, "test certificate loaded");
+    SSL_CTX_set_verify(client_ctx, SSL_VERIFY_NONE, NULL);
+
+    /* The client keeps the ticket the server issues; nothing else does, because
+     * the internal store would hold references this test never frees. */
+    SSL_CTX_set_session_cache_mode(client_ctx,
+                                   SSL_SESS_CACHE_CLIENT | SSL_SESS_CACHE_NO_INTERNAL_STORE);
+    SSL_CTX_sess_set_new_cb(client_ctx, __early_new_session);
+
+    quictls_early_t early;
+    __early_context(&early, 0x5a);
+
+    early_side_t server;
+    early_side_t client;
+
+    TEST_REQUIRE(__early_handshake(server_ctx, client_ctx, &early, 0, &server, &client),
+                 "the first handshake completed");
+
+    TEST_CASE("the first handshake issues a ticket the client can resume");
+    /* Nothing here is about 0-RTT yet -- but a ticket that never arrives makes
+     * every assertion below vacuous, and that failure mode is silent. */
+    TEST_REQUIRE_NOT_NULL(__early_session, "a session ticket arrived");
+    TEST_ASSERT(SSL_SESSION_get_max_early_data(__early_session) == 0xffffffffu,
+                "advertised as 0xffffffff, the only value RFC 9001 §4.6.1 permits");
+
+    TEST_CASE("freeing the connection does not make the session unusable");
+    /* QUIC has no close_notify, so OpenSSL sees every connection as truncated
+     * and would drop the session on SSL_free. quictls_free says otherwise. */
+    quictls_free(&server.tls);
+    quictls_free(&client.tls);
+    TEST_ASSERT(SSL_SESSION_is_resumable(__early_session),
+                "still resumable after both sides were freed");
+
+    TEST_CASE("resuming under the same context accepts early data");
+    early_side_t server2;
+    early_side_t client2;
+    TEST_REQUIRE(__early_handshake(server_ctx, client_ctx, &early, 1, &server2, &client2),
+                 "the resumed handshake completed");
+
+    TEST_ASSERT(quictls_early_data_accepted(&server2.tls), "the server took the early data");
+    TEST_ASSERT(server2.peer.secrets[QUIC_ENC_EARLY][QUICTLS_DIR_READ] > 0,
+                "the server was given a 0-RTT read secret");
+    TEST_ASSERT(client2.peer.secrets[QUIC_ENC_EARLY][QUICTLS_DIR_WRITE] > 0,
+                "the client was given a 0-RTT write secret");
+    /* The direction that must NOT exist: a server never sends 0-RTT, and a key
+     * for it would be a key nothing may use. */
+    TEST_ASSERT(server2.peer.secrets[QUIC_ENC_EARLY][QUICTLS_DIR_WRITE] == 0,
+                "and no 0-RTT write secret, which the server has no use for");
+
+    quictls_free(&server2.tls);
+    quictls_free(&client2.tls);
+
+    TEST_CASE("a different resumption context refuses the ticket outright");
+    /* This is how RFC 9001 §7.4.1 is kept: rather than remembering the
+     * transport parameters a ticket was issued under, the ticket stops
+     * resuming when they change, so early data can never arrive against limits
+     * the client guessed from an older configuration. */
+    quictls_early_t other;
+    __early_context(&other, 0xa5);
+
+    early_side_t server3;
+    early_side_t client3;
+    TEST_REQUIRE(__early_handshake(server_ctx, client_ctx, &other, 1, &server3, &client3),
+                 "the handshake still completed");
+
+    TEST_ASSERT(!quictls_early_data_accepted(&server3.tls),
+                "but the early data was not accepted");
+    TEST_ASSERT(server3.peer.secrets[QUIC_ENC_EARLY][QUICTLS_DIR_READ] == 0,
+                "and no 0-RTT read secret was installed");
+
+    quictls_free(&server3.tls);
+    quictls_free(&client3.tls);
+
+    TEST_CASE("a server that offers no early data accepts none");
+    early_side_t server4;
+    early_side_t client4;
+    TEST_REQUIRE(__early_handshake(server_ctx, client_ctx, NULL, 1, &server4, &client4),
+                 "the handshake completed without early data");
+    TEST_ASSERT(!quictls_early_data_accepted(&server4.tls), "no early data");
+    TEST_ASSERT(!server4.tls.early_data_enabled, "and the bridge knows it never offered any");
+
+    quictls_free(&server4.tls);
+    quictls_free(&client4.tls);
+
+    SSL_SESSION_free(__early_session);
+    __early_session = NULL;
+
+    SSL_CTX_free(server_ctx);
+    SSL_CTX_free(client_ctx);
+}
+
+TEST(test_quic_tls_early_data_completion) {
+    TEST_SUITE("quic_tls");
+
+    TEST_CASE("a server offering early data does not call the handshake complete early");
+
+    /* The regression this exists for. With early data enabled, a server's
+     * SSL_do_handshake returns 1 as soon as its own flight is written --
+     * before the client's Finished. Treating that as completion made the
+     * connection discard the Handshake packet number space, taking the
+     * unsent certificate with it, and every handshake failed while the server
+     * logged success (docs/http3/09 §3.1). */
+
+    SSL_CTX* server_ctx = SSL_CTX_new(TLS_server_method());
+    SSL_CTX* client_ctx = SSL_CTX_new(TLS_client_method());
+    TEST_REQUIRE_NOT_NULL(server_ctx, "server context");
+    TEST_REQUIRE_NOT_NULL(client_ctx, "client context");
+    TEST_REQUIRE(quictls_configure_ctx(server_ctx), "server configured");
+    TEST_REQUIRE(quictls_configure_ctx(client_ctx), "client configured");
+
+    const int have_cert =
+        SSL_CTX_use_certificate_file(server_ctx, TEST_QUIC_CERT, SSL_FILETYPE_PEM) == 1 &&
+        SSL_CTX_use_PrivateKey_file(server_ctx, TEST_QUIC_KEY, SSL_FILETYPE_PEM) == 1;
+    TEST_REQUIRE(have_cert, "test certificate loaded");
+    SSL_CTX_set_verify(client_ctx, SSL_VERIFY_NONE, NULL);
+
+    static pipe_t to_server;
+    static pipe_t to_client;
+    memset(&to_server, 0, sizeof to_server);
+    memset(&to_client, 0, sizeof to_client);
+
+    peer_t server_peer = { .out = &to_client, .keys_ok = 1 };
+    peer_t client_peer = { .out = &to_server, .keys_ok = 1 };
+
+    quictp_t params;
+    quictp_defaults(&params);
+    params.has_original_dcid = 1;
+    params.original_dcid.len = 8;
+    memset(params.original_dcid.data, 0xa1, 8);
+    params.has_initial_scid = 1;
+    params.initial_scid.len = 8;
+    memset(params.initial_scid.data, 0xb2, 8);
+
+    quictp_t client_params;
+    quictp_defaults(&client_params);
+    client_params.has_initial_scid = 1;
+    client_params.initial_scid.len = 8;
+    memset(client_params.initial_scid.data, 0xc3, 8);
+
+    quictls_early_t early;
+    __early_context(&early, 0x5a);
+
+    quictls_t s;
+    quictls_t c;
+    TEST_REQUIRE(quictls_init_server(&s, server_ctx, &peer_ops, &server_peer,
+                                     &params, &early), "server bridge");
+    TEST_REQUIRE(quictls_init_client(&c, client_ctx, &peer_ops, &client_peer,
+                                     &client_params, "localhost"), "client bridge");
+
+    /* One round: the client's ClientHello reaches the server, and the server
+     * answers with its whole flight -- but the client's Finished has not been
+     * sent, let alone read. */
+    TEST_REQUIRE(quictls_advance(&c), "client produced its ClientHello");
+    deliver(&s, &to_server);
+    TEST_REQUIRE(quictls_advance(&s), "server processed it");
+
+    TEST_ASSERT(server_peer.secrets[QUIC_ENC_HANDSHAKE][QUICTLS_DIR_WRITE] > 0,
+                "the server has written its flight");
+    TEST_ASSERT(!s.handshake_complete,
+                "and the handshake is NOT complete, because the client has not answered");
+
+    /* Finish it, so the assertion above cannot be passing for the wrong reason
+     * (a handshake that never got anywhere at all). */
+    int ok = 1;
+    for (int round = 0; round < 10 && ok && !s.handshake_complete; round++) {
+        deliver(&c, &to_client);
+        ok = ok && quictls_advance(&c);
+        deliver(&s, &to_server);
+        ok = ok && quictls_advance(&s);
+    }
+
+    TEST_ASSERT(ok && s.handshake_complete, "and completes once the client answers");
+
+    quictls_free(&s);
+    quictls_free(&c);
+    SSL_CTX_free(server_ctx);
+    SSL_CTX_free(client_ctx);
 }

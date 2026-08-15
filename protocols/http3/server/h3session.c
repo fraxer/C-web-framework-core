@@ -101,6 +101,17 @@ uint64_t h3_policy_max_field_section_size(void) {
     return atomic_load(&h3_max_field_section_size);
 }
 
+void h3_local_settings_digest(uint64_t out[H3_SETTINGS_DIGEST_VALUES]) {
+    if (out == NULL) return;
+
+    /* The same three values h3session_create puts into local_settings. Kept
+     * next to them on purpose: a fourth setting that a resuming client could
+     * remember has to be added in both places, and they are one screen apart. */
+    out[0] = H3_QPACK_DECODER_CAPACITY;
+    out[1] = H3_QPACK_DECODER_BLOCKED;
+    out[2] = h3_policy_max_field_section_size();
+}
+
 /* ---- Budgets ---- */
 
 static uint64_t __now_ms(void) {

@@ -122,6 +122,21 @@ typedef struct quicconn {
     uint64_t key_update_tx_pn;
     int      key_update_unconfirmed;
 
+    /* ---- 0-RTT (RFC 9001 §4.6, docs/http3/09 §3.1) ---- *
+     *
+     * How many packets opened at the 0-RTT level. Whether TLS *accepted* the
+     * early data is not mirrored here -- quictls_early_data_accepted() answers
+     * that from the SSL, which outlives the 0-RTT keys.
+     *
+     * The anti-replay policy lives above this, in the endpoint: a request that
+     * arrives in early data is read into its stream here, but is not dispatched
+     * until the handshake completes. A replayed 0-RTT flight cannot complete a
+     * handshake -- it has no key material -- so it never reaches a handler,
+     * whatever it contains. That is why this server does not need to restrict
+     * early data to safe methods, and why this counter is for observation
+     * rather than for gating. */
+    uint64_t early_data_packets;
+
     /* Acknowledgement state, one per packet number space. */
     quicack_t ack[QUIC_ENC_COUNT];
     uint8_t recv_ecn;

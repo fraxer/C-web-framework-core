@@ -133,6 +133,11 @@ typedef struct quictls {
     int alert_raised;
     uint8_t alert_code;
 
+    /* 0-RTT was asked for on this handshake (RFC 9001 §4.6). Set by
+     * quictls_init_server when the operator turned early data on; what the
+     * peer actually got is quictls_early_data_accepted(). */
+    int early_data_enabled;
+
     /* A QUIC transport error code the connection must close with, set when the
      * TLS stack's own way of failing would name the wrong thing. Refusing a
      * transport parameter can only be done by failing the handshake, and that
@@ -148,11 +153,35 @@ typedef struct quictls {
  * CRYPTO_BUFFER_EXCEEDED (RFC 9000 §7.5). */
 #define QUICTLS_MAX_CRYPTO_BUFFER 65536
 
+/* What a server offers a resuming client (RFC 9001 §4.6, docs/http3/09 §3.1).
+ *
+ * `enabled` turns 0-RTT on for this handshake. `resumption_context` is the
+ * value the session is bound to: OpenSSL refuses to resume a ticket whose
+ * session-id context differs from the current one, which is how §7.4.1's
+ * "MUST NOT reduce the remembered transport parameters" is kept without
+ * storing anything in the ticket. Derive it from every value a resuming client
+ * may rely on, and a configuration change stops resumption instead of
+ * producing a connection whose limits the client guessed wrong.
+ *
+ * The maximum length OpenSSL accepts for a session-id context is 32 bytes
+ * (SSL_MAX_SID_CTX_LENGTH); a longer one is rejected, not truncated. */
+typedef struct quictls_early {
+    int     enabled;
+    uint8_t resumption_context[32];
+    size_t  resumption_context_len;
+} quictls_early_t;
+
 /* Build the server side of a handshake. `params` is encoded and handed to TLS
- * for the quic_transport_parameters extension. Returns 1 on success. */
+ * for the quic_transport_parameters extension. `early` may be NULL, which is
+ * the same as a disabled one. Returns 1 on success. */
 int quictls_init_server(quictls_t* tls, SSL_CTX* ssl_ctx,
                         const quictls_ops_t* ops, void* ctx,
-                        const quictp_t* params);
+                        const quictp_t* params, const quictls_early_t* early);
+
+/* Whether this handshake actually accepted the client's early data. Only
+ * meaningful once the handshake has read the ClientHello; a server that never
+ * offered 0-RTT, or a client that did not attempt it, both report 0. */
+int quictls_early_data_accepted(const quictls_t* tls);
 
 /* The client side of the same bridge.
  *
@@ -165,6 +194,25 @@ int quictls_init_server(quictls_t* tls, SSL_CTX* ssl_ctx,
 int quictls_init_client(quictls_t* tls, SSL_CTX* ssl_ctx,
                         const quictls_ops_t* ops, void* ctx,
                         const quictp_t* params, const char* server_name);
+
+/* Offer a remembered session on a client handshake, optionally with 0-RTT.
+ *
+ * Call between quictls_init_client and the first quictls_advance: the session
+ * has to be in place before the ClientHello is built, and the early-data write
+ * secret is yielded while it is. Returns 1 if the session was accepted for
+ * this handshake -- which is not a promise the server will resume it. */
+int quictls_client_resume(quictls_t* tls, SSL_SESSION* session, int early_data);
+
+/* Process post-handshake TLS messages -- in QUIC that means NewSessionTicket,
+ * and nothing else (KeyUpdate is forbidden by RFC 9001 §6).
+ *
+ * Needed because quictls_advance stops at handshake completion, while a
+ * client's session tickets arrive after it, as CRYPTO at the application
+ * level. Without this call a client can never resume, and the failure is
+ * silent: the ticket bytes arrive, are buffered, and nothing reads them.
+ * A no-op before the handshake completes. Returns 0 only on a fatal TLS
+ * error. */
+int quictls_post_handshake(quictls_t* tls);
 
 void quictls_free(quictls_t* tls);
 

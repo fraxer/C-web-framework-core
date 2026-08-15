@@ -3242,6 +3242,7 @@ tests/ci.sh release              # полный обязательный release
 tests/ci.sh h3unit asan tsan     # подмножество, в указанном порядке
 tests/ci.sh limits               # connection/memory exhaustion и drain
 SOAK_REQUESTS=10000 tests/ci.sh soak
+tests/ci.sh earlydata            # 0-RTT: приём, счётчики и анти-повтор
 BENCH_RECORD=/var/lib/cwfr/h3-baseline.json tests/ci.sh benchmark
 BENCH_BASELINE=/var/lib/cwfr/h3-baseline.json tests/ci.sh benchmark
 FUZZ_SECONDS=600 tests/ci.sh fuzz
@@ -3256,6 +3257,7 @@ REQUIRE_H3SPEC=1 tests/ci.sh h3spec  # только обязательный h3s
 | `config` | неверные типы/диапазоны HTTP/3 останавливают запуск; неверный reload-кандидат не останавливает текущее поколение | 1–3, 5 |
 | `limits` | 64 занятых QUIC slots, отказ лишним соединениям, CRYPTO memory refusal и возврат обоих gauges к нулю | 3, 7 |
 | `soak` | 1000 запросов обычно, 10000 в release; loss/reorder/dup, migration, drain gauges и RSS около прогретого baseline | 7 |
+| `earlydata` | 0-RTT: запрос едет в early data и обслуживается, счётчики `early_data.*` растут, флайт с незавершённым рукопожатием **не** доходит до диспетчера (`http3.requests` не растёт), и без ключа early data отвергается | 1–3 |
 | `benchmark` | медиана 5 прогонов: short req/s, обязательный h2load-профиль 57074 байта `-n10000 -c100 -m30` и загрузка 64 МиБ; FAIL при неполных/не-2xx ответах или деградации любой метрики более 5% | 7 |
 | `asan` | сборка с h3 (ASan+LSan), unit + hard/soft reload | 2, 5 |
 | `tsan` | сборка с h3 (TSan), unit + hard/soft reload | 3, 5 |

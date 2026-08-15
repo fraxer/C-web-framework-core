@@ -247,6 +247,23 @@ typedef struct {
      * without sending megabytes; anything but 3 is logged as the deviation it
      * is. */
     uint64_t amplification_factor;
+
+    /* 0-RTT (RFC 9001 §4.6, docs/http3/09 §3.1). Off unless http3_early_data
+     * says otherwise: early data is replayable by anyone who can copy a
+     * datagram, and turning it on is an operator's decision, not a default.
+     *
+     * What makes it safe here is not this flag but what the connection does
+     * with what arrives: early data is accepted into streams and NOT dispatched
+     * until the handshake completes, which a replay cannot reach. */
+    int early_data;
+
+    /* The session-id context every ticket is bound to -- a digest of every
+     * setting a resuming client may have remembered. Changing any of them
+     * changes this, and a ticket issued under the old one stops resuming, which
+     * is how RFC 9001 §7.4.1 ("MUST NOT reduce the remembered transport
+     * parameters") holds across a reload without ticket state. */
+    uint8_t resumption_context[32];
+    size_t  resumption_context_len;
 } quic_conn_policy_t;
 
 /* Read the process-wide QUIC policy from main.env and create the shared

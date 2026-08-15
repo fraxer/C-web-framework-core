@@ -345,9 +345,26 @@ int quictls_configure_ctx(SSL_CTX* ssl_ctx) {
 
     SSL_CTX_set_alpn_select_cb(ssl_ctx, __alpn_select_h3, NULL);
 
-    /* 0-RTT is phase 9: accepting early data needs an anti-replay policy this
-     * server does not have yet, and the default must be off rather than
-     * accidentally on. */
+    /* QUIC has no TLS close_notify (RFC 9001 §4.8: a connection ends with
+     * CONNECTION_CLOSE, and the only alerts that exist are fatal ones). Without
+     * telling OpenSSL that, every SSL_free looks like an unclean shutdown, and
+     * an unclean shutdown makes OpenSSL mark the session not-resumable -- which
+     * silently disables both resumption and 0-RTT: the ticket arrives, the
+     * client stores it, SSL_set_session accepts it, and no early data is ever
+     * sent because SSL_SESSION_is_resumable() has quietly become 0. */
+    SSL_CTX_set_quiet_shutdown(ssl_ctx, 1);
+
+    /* Off on the context, so a connection that was never told to accept early
+     * data cannot inherit it. quictls_init_server raises it per SSL when the
+     * operator turned http3_early_data on (RFC 9001 §4.6, docs/http3/09 §3.1);
+     * per-SSL is what lets one process serve one vhost with 0-RTT and another
+     * without.
+     *
+     * SSL_OP_NO_ANTI_REPLAY is deliberately NOT set: OpenSSL's own replay
+     * defence for resumed sessions stays on, as the second of the two lines of
+     * defence. The first is that this server does not run a request that
+     * arrived in early data until the handshake completes, which no replay can
+     * do -- see quicconn.c. */
     SSL_CTX_set_max_early_data(ssl_ctx, 0);
 
     return 1;
@@ -415,8 +432,100 @@ static int __init(quictls_t* tls, SSL_CTX* ssl_ctx,
 
 int quictls_init_server(quictls_t* tls, SSL_CTX* ssl_ctx,
                         const quictls_ops_t* ops, void* ctx,
-                        const quictp_t* params) {
-    return __init(tls, ssl_ctx, ops, ctx, params, 1, NULL);
+                        const quictp_t* params, const quictls_early_t* early) {
+    if (!__init(tls, ssl_ctx, ops, ctx, params, 1, NULL)) return 0;
+
+    if (early == NULL || !early->enabled) return 1;
+
+    /* §4.6.1: in QUIC the only legal value of max_early_data_size is
+     * 0xffffffff -- the amount of early data is bounded by flow control, not by
+     * TLS, and any other value is a protocol error the peer may reject us for.
+     * OpenSSL will not put an early_data extension in the ticket without it. */
+    if (SSL_set_max_early_data(tls->ssl, 0xffffffffu) != 1) {
+        log_error("quictls: SSL_set_max_early_data failed\n");
+        goto failed;
+    }
+
+    /* Binds every ticket this handshake issues to the configuration it was
+     * issued under. A ticket presented against a different context is not
+     * resumed at all, so a client can never carry 0-RTT into a connection
+     * whose transport parameters or HTTP/3 settings it guessed from the old
+     * ones -- §7.4.1 and RFC 9114 §7.2.4.2 without a byte of ticket state. */
+    if (early->resumption_context_len > 0 &&
+        SSL_set_session_id_context(tls->ssl, early->resumption_context,
+                                   (unsigned int)early->resumption_context_len) != 1) {
+        log_error("quictls: SSL_set_session_id_context failed\n");
+        goto failed;
+    }
+
+    if (SSL_set_quic_tls_early_data_enabled(tls->ssl, 1) != 1) {
+        log_error("quictls: SSL_set_quic_tls_early_data_enabled failed\n");
+        goto failed;
+    }
+
+    tls->early_data_enabled = 1;
+
+    return 1;
+
+    failed:
+
+    SSL_free(tls->ssl);
+    tls->ssl = NULL;
+
+    return 0;
+}
+
+int quictls_early_data_accepted(const quictls_t* tls) {
+    if (tls == NULL || tls->ssl == NULL) return 0;
+
+    return SSL_get_early_data_status(tls->ssl) == SSL_EARLY_DATA_ACCEPTED;
+}
+
+int quictls_client_resume(quictls_t* tls, SSL_SESSION* session, int early_data) {
+    if (tls == NULL || tls->ssl == NULL || session == NULL) return 0;
+    if (tls->is_server) return 0;
+
+    if (SSL_set_session(tls->ssl, session) != 1) return 0;
+
+    if (!early_data) return 1;
+
+    if (SSL_set_quic_tls_early_data_enabled(tls->ssl, 1) != 1) return 0;
+
+    tls->early_data_enabled = 1;
+
+    return 1;
+}
+
+int quictls_post_handshake(quictls_t* tls) {
+    if (tls == NULL || tls->ssl == NULL) return 0;
+    if (!tls->handshake_complete) return 1;
+
+    /* There is no application data in this mode -- SSL_read_ex exists here only
+     * as the pump that makes OpenSSL consume the CRYPTO bytes it has been
+     * handed and act on the handshake messages inside them. It therefore never
+     * returns data, and WANT_READ is the ordinary outcome. */
+    uint8_t discard[64];
+    size_t read = 0;
+
+    const int r = SSL_read_ex(tls->ssl, discard, sizeof discard, &read);
+    if (r > 0) {
+        /* A peer that sends application data over a QUIC TLS connection is
+         * confused about which protocol it is speaking; there is no legal way
+         * for these bytes to exist. */
+        log_error("quictls: TLS returned %zu bytes of application data\n", read);
+        return 0;
+    }
+
+    const int err = SSL_get_error(tls->ssl, r);
+    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE ||
+        err == SSL_ERROR_ZERO_RETURN)
+        return 1;
+
+    if (tls->alert_raised) return 0;
+
+    log_error("quictls: post-handshake failed (SSL error %d)\n", err);
+
+    return 0;
 }
 
 int quictls_init_client(quictls_t* tls, SSL_CTX* ssl_ctx,
@@ -427,6 +536,25 @@ int quictls_init_client(quictls_t* tls, SSL_CTX* ssl_ctx,
 
 void quictls_free(quictls_t* tls) {
     if (tls == NULL) return;
+
+    /* Tell OpenSSL the connection ended cleanly before letting go of it.
+     *
+     * SSL_free runs ssl_clear_bad_session(), which -- for a connection that
+     * neither sent nor received close_notify -- removes the session from the
+     * cache and marks it not-resumable. In TLS over TCP that is right: a
+     * truncated connection is suspicious. In QUIC there is no close_notify at
+     * all (RFC 9001 §4.8), so *every* connection looks truncated and *every*
+     * session is thrown away at the end of it.
+     *
+     * The symptom is remarkably quiet, which is why it is spelled out here: the
+     * server still issues tickets, the client still stores them,
+     * SSL_set_session still returns 1 -- and SSL_SESSION_is_resumable() has
+     * turned 0 behind everyone's back, so no early data is ever sent and no
+     * session is ever resumed. Both sides need this: the server's copy lives in
+     * its internal cache, and losing it there refuses the resumption just as
+     * effectively. */
+    if (tls->ssl != NULL)
+        SSL_set_shutdown(tls->ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
 
     SSL_free(tls->ssl);
     tls->ssl = NULL;
@@ -458,10 +586,27 @@ int quictls_advance(quictls_t* tls) {
     if (tls->handshake_complete) return 1;
 
     const int r = SSL_do_handshake(tls->ssl);
-    if (r == 1) {
+
+    /* Completion is SSL_is_init_finished, NOT "SSL_do_handshake returned 1".
+     *
+     * The two agree only while early data is off. With it on, a server's
+     * SSL_do_handshake returns 1 as soon as it has written its own flight --
+     * before the client's Finished has been seen -- because that is the moment
+     * an ordinary TLS application would start reading early data. Believing it
+     * cost the whole handshake: the connection went ACTIVE, discarded the
+     * Handshake packet number space per §4.9.2, and the send buffer it freed
+     * still held the certificate that had not been put on the wire yet. The
+     * client sat waiting for a flight that no longer existed while the server
+     * cheerfully sent 1-RTT packets it had no keys for.
+     *
+     * SSL_is_init_finished stays 0 until the peer's Finished is processed,
+     * which is exactly what "the handshake is complete" has to mean here. */
+    if (r == 1 && SSL_is_init_finished(tls->ssl)) {
         tls->handshake_complete = 1;
         return 1;
     }
+
+    if (r == 1) return 1;   /* our flight is out; the peer still owes one */
 
     const int err = SSL_get_error(tls->ssl, r);
 

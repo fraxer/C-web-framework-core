@@ -51,6 +51,8 @@ static const char* const __quic_name[METRICS_QUIC__COUNT] = {
     "connections_accepted", "connections_closed",
     "send_error",
     "handshakes_completed", "handshakes_failed.tls", "handshakes_failed.timeout",
+    "early_data.offered", "early_data.accepted",
+    "early_data.packets", "early_data.bytes",
     "decrypt_failures", "aead_limit_reached", "key_updates",
     "packets_lost", "pto_fired", "pto_probes_sent", "persistent_congestion",
     "flow_blocked.connection", "flow_blocked.stream", "amplification_limited",

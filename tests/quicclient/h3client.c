@@ -109,6 +109,11 @@ static size_t __build_request(uint8_t* dst, size_t cap,
     return h3frame_write(dst, cap, H3_FRAME_HEADERS, block, blen);
 }
 
+size_t h3client_request_bytes(uint8_t* dst, size_t cap,
+                              const char* authority, const char* path) {
+    return __build_request(dst, cap, authority, path);
+}
+
 /* Feed everything readable on `id` through the frame parser, collecting the
  * field section and the body. Returns 0 on a protocol error. */
 static int __consume(quicclient_t* client, uint64_t id, h3frame_parser_t* parser,

@@ -166,6 +166,19 @@ int h3session_ctrl_spend(h3session_t* s);
 /* What we advertise as SETTINGS_MAX_FIELD_SECTION_SIZE, from the policy. */
 uint64_t h3_policy_max_field_section_size(void);
 
+/* The SETTINGS a client is allowed to remember and encode 0-RTT requests
+ * against (RFC 9114 §7.2.4.2), written into `out` as
+ * {qpack_max_table_capacity, qpack_blocked_streams, max_field_section_size}.
+ *
+ * Exists for the 0-RTT resumption context (docs/http3/09 §3.1): a client that
+ * resumes uses the values it remembers *before* our SETTINGS arrive, so a
+ * server that reduced any of them would be decoding a field section against a
+ * table the client sized differently. Reading them through one function keeps
+ * that list in the module that advertises it, rather than copied into the
+ * transport where it would drift. */
+#define H3_SETTINGS_DIGEST_VALUES 3
+void h3_local_settings_digest(uint64_t out[H3_SETTINGS_DIGEST_VALUES]);
+
 /* `max_field_section_size` is what we advertise (UINT64_MAX = unlimited, which
  * is what "absent" means on the wire). `enable_connect_protocol` advertises
  * RFC 9220 Extended CONNECT. Returns NULL on OOM. */

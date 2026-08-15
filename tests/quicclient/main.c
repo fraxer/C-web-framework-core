@@ -5,6 +5,8 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <openssl/ssl.h>
+
 #include "h3client.h"
 #include "h3frame.h"
 #include "quicclient.h"
@@ -15,7 +17,7 @@
  *
  *   quicclient [host] [port] [-q] [-p /path] [-a authority] [-n N] [--expect]
  *              [--handshake-only] [--path-challenge] [--key-update] [--cid]
- *              [--migrate] [--new-token [--pause N]]
+ *              [--migrate] [--new-token [--pause N]] [--0rtt] [--0rtt-stall]
  *              [--pause-after-handshake N]
  *              [--pause-after-request N]
  *              [--pause-after-response N]
@@ -53,6 +55,8 @@ int main(int argc, char* argv[]) {
     int cid_test = 0;
     int migrate = 0;
     int new_token = 0;
+    int zero_rtt = 0;
+    int zero_rtt_stall = 0;
     int pause_ms = 0;
     int pause_after_handshake_ms = 0;
     int pause_after_request_ms = 0;
@@ -84,6 +88,8 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--cid") == 0) cid_test = 1;
         else if (strcmp(argv[i], "--migrate") == 0) migrate = 1;
         else if (strcmp(argv[i], "--new-token") == 0) new_token = 1;
+        else if (strcmp(argv[i], "--0rtt") == 0) zero_rtt = 1;
+        else if (strcmp(argv[i], "--0rtt-stall") == 0) zero_rtt_stall = 1;
         else if (strcmp(argv[i], "--pause") == 0 && i + 1 < argc) pause_ms = atoi(argv[++i]);
         else if (strcmp(argv[i], "--pause-after-handshake") == 0 && i + 1 < argc)
             pause_after_handshake_ms = atoi(argv[++i]);
@@ -109,6 +115,156 @@ int main(int argc, char* argv[]) {
      * Meaningful only against a server configured to Retry -- that is the round
      * trip the token is supposed to skip, and against a server that never
      * retries there is nothing to see. */
+    /* 0-RTT (RFC 9001 §4.6): two connections, the second resuming the first and
+     * sending its whole HTTP/3 request -- control stream, SETTINGS and all --
+     * before the handshake completes.
+     *
+     * What this can and cannot prove. It proves the request travelled in 0-RTT
+     * packets and was answered, which is the feature. It does not prove the
+     * server delayed dispatch until the handshake finished: that is invisible
+     * from a client that completes the handshake anyway, and is checked by the
+     * unit test instead (docs/http3/09 §3.1). */
+    /* The anti-replay property, made observable (RFC 8470 §5.2).
+     *
+     * A replaying attacker can deliver a captured 0-RTT flight but cannot
+     * answer the server's -- it holds no key material. This models exactly
+     * that: the request goes out in 0-RTT and every later client packet is
+     * then dropped, so the handshake never completes. The server must not act
+     * on the request, and the only way that is visible from out here is that
+     * nothing of a response ever arrives.
+     *
+     * What it cannot see is a handler that ran and whose output went nowhere.
+     * That distinction is enforced in __h3_attach (quicendpoint.c), where the
+     * HTTP/3 layer is not attached at all before the connection is ACTIVE. */
+    if (zero_rtt_stall) {
+        quicclient_t first;
+
+        printf("\n0-RTT REPLAY\n");
+
+        if (!quicclient_connect(&first, host, port, authority, 0) ||
+            !quicclient_run(&first, timeout_ms)) {
+            printf("FAIL: the first connection did not complete\n");
+            quicclient_free(&first);
+            return 1;
+        }
+
+        for (int i = 0; i < 20 && first.session == NULL; i++)
+            quicclient_pump(&first, 100);
+
+        SSL_SESSION* session = quicclient_session_take(&first);
+        quicclient_free(&first);
+
+        if (session == NULL) {
+            printf("FAIL: no ticket, so there is nothing to replay\n");
+            return 1;
+        }
+
+        quicclient_t second;
+        if (!quicclient_connect_resume(&second, host, port, authority, verbose,
+                                       session, 1)) {
+            printf("FAIL: the resumed connection did not start\n");
+            SSL_SESSION_free(session);
+            return 1;
+        }
+
+        uint8_t req[1024];
+        const size_t reqlen = h3client_request_bytes(req, sizeof req, authority, path);
+        const int sent = reqlen > 0 &&
+                         h3client_start(&second) &&
+                         quicclient_stream_write(&second, 0, req, reqlen, 1) &&
+                         quicclient_flush(&second);
+
+        const uint64_t early_packets = second.early_data_sent_packets;
+
+        /* From here the client is deaf-mute in one direction: everything it
+         * would send is dropped, so the server never gets a Finished and the
+         * handshake cannot complete -- which is the position a replaying
+         * attacker is in. */
+        quicclient_impair(&second, 100, 0, 0, 0, 1);
+
+        for (int i = 0; i < 20; i++) quicclient_pump(&second, 100);
+
+        const size_t readable = quicclient_stream_readable(&second, 0);
+        const int completed = second.handshake_done_received;
+
+        quicclient_free(&second);
+        SSL_SESSION_free(session);
+
+        printf("0-RTT packets sent:        %llu\n", (unsigned long long)early_packets);
+        printf("handshake confirmed:       %s\n", completed ? "yes" : "no");
+        printf("response bytes received:   %zu\n", readable);
+
+        const int good = sent && early_packets > 0 && !completed && readable == 0;
+        printf("\n%s\n", good
+               ? "OK: the request was not served without a completed handshake"
+               : "FAIL: a 0-RTT request was answered before the handshake finished");
+        return good ? 0 : 1;
+    }
+
+    if (zero_rtt) {
+        quicclient_t first;
+
+        printf("\n0-RTT\n");
+
+        if (!quicclient_connect(&first, host, port, authority, 0) ||
+            !quicclient_run(&first, timeout_ms)) {
+            printf("FAIL: the first connection did not complete\n");
+            quicclient_free(&first);
+            return 1;
+        }
+
+        /* The ticket arrives after HANDSHAKE_DONE, so run() has already
+         * returned by the time the server sends it. */
+        for (int i = 0; i < 20 && first.session == NULL; i++)
+            quicclient_pump(&first, 100);
+
+        SSL_SESSION* session = quicclient_session_take(&first);
+        quicclient_free(&first);
+
+        printf("session ticket:            %s\n", session != NULL ? "yes" : "no");
+
+        if (session == NULL) {
+            printf("\nFAIL: no ticket, so there is nothing to resume\n");
+            return 1;
+        }
+
+        quicclient_t second;
+        if (!quicclient_connect_resume(&second, host, port, authority, verbose,
+                                       session, 1)) {
+            printf("\nFAIL: the resumed connection did not start\n");
+            SSL_SESSION_free(session);
+            return 1;
+        }
+
+        /* Everything below goes out before a single server packet has been
+         * read: the control stream, SETTINGS and the request itself ride in
+         * 0-RTT packets alongside the ClientHello. */
+        const int started = h3client_start(&second);
+
+        h3client_response_t early;
+        const int got = started &&
+                        h3client_get(&second, 0, authority, path, timeout_ms, &early);
+
+        const uint64_t early_packets = second.early_data_sent_packets;
+        const int accepted = quicclient_early_data_accepted(&second);
+        const int status = early.status;
+        const size_t body_len = early.body_len;
+
+        h3client_response_free(&early);
+        quicclient_free(&second);
+        SSL_SESSION_free(session);
+
+        printf("0-RTT packets sent:        %llu\n", (unsigned long long)early_packets);
+        printf("early data accepted:       %s\n", accepted ? "yes" : "no");
+        printf("response:                  %d, %zu bytes\n", status, body_len);
+
+        const int good = got && accepted && early_packets > 0 &&
+                         status >= 200 && status < 400;
+        printf("\n%s\n", good ? "OK: the request was served from 0-RTT"
+                                : "FAIL: 0-RTT did not carry the request");
+        return good ? 0 : 1;
+    }
+
     if (new_token) {
         quicclient_t first;
         uint8_t token[256];

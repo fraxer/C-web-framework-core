@@ -331,6 +331,21 @@ typedef struct quicclient {
     void*  out_arg;
 
     int verbose;
+    /* ---- Resumption and 0-RTT (RFC 9001 §4.6) ---- *
+     *
+     * `session` is the newest ticket the server issued on this connection,
+     * kept so a later connection can resume it. It arrives after the handshake
+     * completes, which is why the client has to pump post-handshake TLS at all
+     * (quictls_post_handshake); a client that only drives the handshake never
+     * sees one. `early_data` records that this connection asked to use one. */
+    SSL_SESSION* session;
+    int early_data;
+
+    /* 0-RTT packets this client sent. The point of measuring it: a resumed
+     * connection that accepts early data but sends none looks identical to a
+     * working one from the outside, and that is exactly what a client whose
+     * request went out at the 1-RTT level instead would look like. */
+    uint64_t early_data_sent_packets;
 } quicclient_t;
 
 /* Impair the path in both directions. Percentages are per datagram; `seed` of 0
@@ -407,6 +422,29 @@ int quicclient_connect_impaired(quicclient_t* client, const char* host, uint16_t
  * earlier connection (a NEW_TOKEN). What it buys is visible only against a
  * server that would otherwise send a Retry: with the token the round trip is
  * skipped, without it there is one. */
+/* Take ownership of the session ticket this connection collected, if any.
+ *
+ * The caller must SSL_SESSION_free it, and may hand it to
+ * quicclient_connect_resume -- including after quicclient_free, which is the
+ * whole point: the session outlives the connection that produced it. Returns
+ * NULL when the server issued no ticket or none has arrived yet. */
+SSL_SESSION* quicclient_session_take(quicclient_t* client);
+
+/* Connect, offering a remembered session and optionally 0-RTT.
+ *
+ * With `early_data` set, anything written with quicclient_stream_write before
+ * the handshake completes goes out in 0-RTT packets. The server may still
+ * refuse the early data, in which case those bytes are retransmitted at the
+ * 1-RTT level and the exchange proceeds a round trip later --
+ * quicclient_early_data_accepted() says which happened. */
+int quicclient_connect_resume(quicclient_t* client, const char* host, uint16_t port,
+                              const char* server_name, int verbose,
+                              SSL_SESSION* session, int early_data);
+
+/* Whether the server accepted the 0-RTT data offered by connect_resume. Only
+ * meaningful once the handshake has completed. */
+int quicclient_early_data_accepted(const quicclient_t* client);
+
 int quicclient_connect_token(quicclient_t* client, const char* host, uint16_t port,
                              const char* server_name, int verbose,
                              const uint8_t* token, size_t token_len);
