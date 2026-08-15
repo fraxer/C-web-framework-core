@@ -135,7 +135,7 @@ fork / BoringSSL) без изменений в транспорте. Свой TL
 - TLS 1.3, 1-RTT, ALPN `h3`;
 - Retry и валидация адреса токеном;
 - полный набор фреймов RFC 9000, включая миграцию и path validation;
-- NewReno + pacing;
+- NewReno или CUBIC (RFC 9438) + pacing;
 - HTTP/3: GET/POST/PUT/…, тела запросов, trailers и 103 Early Hints;
 - Full QPACK: динамические encoder/decoder tables, оба instruction streams,
   blocked request streams, acknowledgments/cancellation и защищённая eviction;
@@ -154,7 +154,7 @@ fork / BoringSSL) без изменений в транспорте. Свой TL
 | DPLPMTUD (RFC 8899) | v1 фиксирует 1200-байтные датаграммы; фаза 9 |
 | ECN | Фаза 9 |
 | UDP GRO | GSO реализован, GRO пока отсутствует |
-| CUBIC/BBR | NewReno в v1, CUBIC — фаза 9 |
+| BBR | NewReno и CUBIC реализованы; BBR отложен до измерений |
 | RFC 9218 `PRIORITY_UPDATE` | Оба типа валидируются и учитываются control budget; корректный сигнал игнорируется, urgency scheduling отсутствует |
 
 ### 3.1 Актуальная capability matrix
@@ -165,6 +165,7 @@ fork / BoringSSL) без изменений в транспорте. Свой TL
 | Возможность | Статус |
 |---|---|
 | QUIC v1, TLS 1.3, Retry, migration, loss recovery, pacing | Готово |
+| NewReno / CUBIC (`http3_cc`) | Готово |
 | HTTP/3 server, Alt-Svc, graceful shutdown | Готово |
 | Soft reload с сохранением UDP socket/CID | Реализовано; production-статус ждёт integration-гейта с `SIGUSR1` |
 | Process connection/memory limits и process-wide rate buckets | Готово |
@@ -256,7 +257,7 @@ RFC 9000 §13.3 и оно определяет форму `quicsendbuf` и `quic
 | 6 | QPACK | `06` | L | Векторы RFC 9204 Приложение B; Chrome/Firefox открывают сайт |
 | 7 | Интеграция: конфиг, Alt-Svc, метрики, лимиты, shutdown/reload, WebSocket over h3 | `07` | M | Браузер сам переключается на h3 после Alt-Svc; `/metrics` показывает секцию quic |
 | 8 | Тесты и interop | `08` | L | quic-interop-runner: handshake, transfer, retry, resumption, multiplexing, http3 — зелёные; h3spec без падений |
-| 9 | Отложенное: обязательное (key update, миграция, Retry), производительность (CUBIC/BBR, ECN, GSO/GRO, DPLPMTUD, аффинность, обход списка потоков), опции (0-RTT, QUIC v2) | `09` | — | По отдельности, каждый пункт за своим флагом и со своим критерием — см. `09` |
+| 9 | Отложенное: обязательное (key update, миграция, Retry), производительность (BBR, ECN, GSO/GRO, DPLPMTUD, аффинность, обход списка потоков), опции (0-RTT, QUIC v2); CUBIC уже реализован | `09` | — | По отдельности, каждый пункт за своим флагом и со своим критерием — см. `09` |
 
 Таблица выше сохраняет исторический порядок внедрения. Фазы 2 и 3 частично
 параллелились; 5 и 6 — нет. Начальный QPACK-lite впоследствии заменён full

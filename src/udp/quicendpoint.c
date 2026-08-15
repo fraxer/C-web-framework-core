@@ -274,6 +274,7 @@ static quic_conn_policy_t __quic_conn_policy = {
     .active_cid_limit       = QUIC_DEFAULT_ACTIVE_CID_LIMIT,
     .ack_delay_ms           = QUIC_DEFAULT_ACK_DELAY_MS,
     .initcwnd_packets       = QUICCC_INITIAL_WINDOW_PACKETS,
+    .cc_algorithm           = QUICCC_NEWRENO,
     .pacing                 = 1,
     .amplification_factor   = QUIC_DEFAULT_AMPLIFICATION
 };
@@ -392,6 +393,18 @@ static int __conn_policy_parse(const env_t* source, quic_conn_policy_t* next) {
         log_error("quic: http3_initcwnd_packets is %llu, not the %d RFC 9002 §7.2 "
                   "recommends -- every connection opens with a burst of that many datagrams\n",
                   (unsigned long long)p->initcwnd_packets, QUICCC_INITIAL_WINDOW_PACKETS);
+
+    const char* cc = "newreno";
+    if (env_config_get_string_checked(source, "http3_cc", &cc) < 0) {
+        log_error("quic: http3_cc must be a string\n");
+        return 0;
+    }
+    if (strcmp(cc, "newreno") == 0) p->cc_algorithm = QUICCC_NEWRENO;
+    else if (strcmp(cc, "cubic") == 0) p->cc_algorithm = QUICCC_CUBIC;
+    else {
+        log_error("quic: http3_cc must be newreno or cubic (got '%s')\n", cc);
+        return 0;
+    }
 
     bool pacing = true;
     if (env_config_get_bool_checked(source, "http3_pacing", &pacing) < 0) {

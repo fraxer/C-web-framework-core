@@ -7,6 +7,7 @@
 #include "connection_s.h"
 #include "multiplexing.h"
 #include "quiccidtable.h"
+#include "quiccc.h"
 #include "server.h"
 #include "udpsocket.h"
 
@@ -240,6 +241,7 @@ typedef struct {
      * server on a long-RTT path may open wider, and the deviation is logged
      * where it is configured. */
     uint64_t initcwnd_packets;
+    quiccc_algorithm_e cc_algorithm;
     int      pacing;
     /* §8.1 says three. Configurable only so a test can make the limit fire
      * without sending megabytes; anything but 3 is logged as the deviation it

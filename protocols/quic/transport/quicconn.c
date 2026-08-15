@@ -1178,7 +1178,9 @@ static void __path_probe_succeed(quicconn_t* conn) {
      * same reasoning as the RTT estimator reset right below. The pacer follows
      * it: its bucket was filled at the old path's rate, and spending that on the
      * new one is the burst this reset exists to prevent. */
-    quiccc_init_packets(&conn->cc, QUICCONN_MAX_PACKET, quic_policy_conn()->initcwnd_packets);
+    quiccc_init_algorithm(&conn->cc, QUICCONN_MAX_PACKET,
+                          quic_policy_conn()->initcwnd_packets,
+                          quic_policy_conn()->cc_algorithm);
     quicpacer_init(&conn->pacer, &conn->cc, quic_policy_conn()->pacing);
     conn->pace_until_us = 0;
 
@@ -2727,7 +2729,8 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
 
     conn->amplification_factor = policy->amplification_factor;
 
-    quiccc_init_packets(&conn->cc, QUICCONN_MAX_PACKET, policy->initcwnd_packets);
+    quiccc_init_algorithm(&conn->cc, QUICCONN_MAX_PACKET,
+                          policy->initcwnd_packets, policy->cc_algorithm);
     /* After the controller, always: the burst limit is the window it just
      * computed. */
     quicpacer_init(&conn->pacer, &conn->cc, policy->pacing);

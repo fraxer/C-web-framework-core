@@ -27,6 +27,11 @@
 
 typedef struct quiccc quiccc_t;
 
+typedef enum {
+    QUICCC_NEWRENO = 0,
+    QUICCC_CUBIC
+} quiccc_algorithm_e;
+
 typedef struct quiccc_ops {
     void   (*on_sent)(quiccc_t*, size_t bytes);
     void   (*on_ack)(quiccc_t*, size_t bytes, uint64_t sent_us, uint64_t now_us);
@@ -56,6 +61,12 @@ struct quiccc {
      * datagram per window of acknowledged bytes, and dropping the remainder
      * each time would stall growth on small windows. */
     uint64_t ack_carry;
+
+    /* CUBIC (RFC 9438). Windows are kept in bytes; time is microseconds. */
+    uint64_t cubic_w_max;
+    uint64_t cubic_epoch_start_us;
+    uint64_t cubic_k_ms;
+    uint64_t cubic_rtt_us;
 };
 
 void quiccc_init(quiccc_t* cc, size_t max_datagram_size);
@@ -67,9 +78,12 @@ void quiccc_init(quiccc_t* cc, size_t max_datagram_size);
  * cap only applies to the RFC default: it exists to keep TEN packets from
  * growing with the datagram size, not to overrule a deliberate choice. */
 void quiccc_init_packets(quiccc_t* cc, size_t max_datagram_size, uint64_t packets);
+void quiccc_init_algorithm(quiccc_t* cc, size_t max_datagram_size,
+                           uint64_t packets, quiccc_algorithm_e algorithm);
 
 /* NewReno, the only controller in v1. */
 extern const quiccc_ops_t quiccc_newreno;
+extern const quiccc_ops_t quiccc_cubic;
 
 /* How many more bytes may be put in flight right now. */
 size_t quiccc_available(const quiccc_t* cc);

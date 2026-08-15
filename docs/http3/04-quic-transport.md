@@ -344,7 +344,7 @@ Initial > Handshake > Application, и Application учитывается тол�
 
 ## 6. Congestion control (`quiccc.{c,h}`)
 
-v1 — **NewReno** из RFC 9002 §7, дословно:
+По умолчанию используется **NewReno** из RFC 9002 §7:
 
 ```
 kInitialWindow      = min(10·max_datagram_size, max(14720, 2·max_datagram_size))
@@ -363,8 +363,9 @@ kPersistentCongestionThreshold = 3
 - ECN-CE трактуется как потеря (фаза 9);
 - `bytes_in_flight` не должен превышать `cwnd`.
 
-Интерфейс делаем виртуальным (структура с указателями на функции), чтобы CUBIC
-и BBR в фазе 9 добавлялись без правок в `quicloss`:
+Интерфейс виртуальный (структура с указателями на функции): NewReno и CUBIC
+переключаются без правок в `quicloss`; тот же шов оставлен для будущих
+контроллеров:
 
 ```c
 typedef struct quiccc_ops {
@@ -376,9 +377,18 @@ typedef struct quiccc_ops {
 } quiccc_ops_t;
 ```
 
+Вторая реализация — **CUBIC** по RFC 9438, выбираемая ключом
+`http3_cc = "cubic"`. Она хранит `W_max`, начало эпохи, `K` и оценку RTT. При
+сигнале перегрузки применяется `β = 0.7` и fast convergence; после него окно
+следует функции `W_cubic(t) = C(t-K)^3 + W_max`, где `C = 0.4`. Параллельно
+считается TCP-friendly estimate, и используется большее из двух окон. Вся
+арифметика целочисленная, чтобы ACK hot path не зависел от floating point.
+Persistent congestion очищает историю CUBIC и возвращает соединение в slow
+start с минимальным окном.
+
 ## 6.1 Pacing (`quicpacer.{c,h}`)
 
-Без pacing NewReno выдаёт cwnd одним залпом и топит буферы. Формула из
+Без pacing контроллер выдаёт cwnd одним залпом и топит буферы. Формула из
 RFC 9002 §7.7:
 
 ```
@@ -463,7 +473,7 @@ interval = smoothed_rtt · packet_size / (N · cwnd),   N = 1.25 (slow start: 2.
 ## 10a. Ход работ
 
 **Сделано (первый срез фазы):** структуры данных и восстановление —
-`quicrange`, `quicrecvbuf`, `quicsendbuf`, `quiccc` (NewReno + pacer),
+`quicrange`, `quicrecvbuf`, `quicsendbuf`, `quiccc` (NewReno/CUBIC + pacer),
 `quicloss` (RTT, пороги по номеру и по времени, PTO, persistent congestion,
 сброс пространства). +156 проверок (100 704 → 100 860), ASan с
 `detect_stack_use_after_return=1` чист.

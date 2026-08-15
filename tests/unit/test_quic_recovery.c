@@ -116,6 +116,36 @@ TEST(test_quic_cc_newreno) {
     TEST_ASSERT(quiccc_in_slow_start(&cc), "and back in slow start");
 }
 
+TEST(test_quic_cc_cubic) {
+    TEST_SUITE("quic_cc");
+
+    quiccc_t cc;
+    quiccc_init_algorithm(&cc, MTU, QUICCC_INITIAL_WINDOW_PACKETS, QUICCC_CUBIC);
+    TEST_ASSERT(cc.ops == &quiccc_cubic, "CUBIC selected");
+
+    TEST_CASE("CUBIC uses beta 0.7 on congestion");
+    cc.ops->on_sent(&cc, MTU);
+    cc.ops->on_loss(&cc, MTU, 1000, 2000);
+    TEST_ASSERT(cc.cwnd == 8400, "window reduced to 70 percent");
+    TEST_ASSERT(cc.ssthresh == cc.cwnd, "enters congestion avoidance");
+    TEST_ASSERT(cc.cubic_w_max == 12000, "remembers the pre-loss maximum");
+
+    TEST_CASE("the cubic curve returns to W_max and grows beyond it");
+    uint64_t sent = 3000;
+    for (uint64_t now = 103000; now <= 5103000; now += 100000) {
+        cc.ops->on_sent(&cc, MTU);
+        cc.ops->on_ack(&cc, MTU, sent, now);
+        sent = now - 50000;
+    }
+    TEST_ASSERT(cc.cwnd > cc.cubic_w_max, "grew beyond the previous maximum");
+
+    TEST_CASE("persistent congestion resets CUBIC to slow start");
+    cc.ops->on_persistent_congestion(&cc);
+    TEST_ASSERT(cc.cwnd == 2 * MTU, "minimum window");
+    TEST_ASSERT(quiccc_in_slow_start(&cc), "slow start restored");
+    TEST_ASSERT(cc.cubic_w_max == 0, "old path history discarded");
+}
+
 TEST(test_quic_pacer) {
     TEST_SUITE("quic_cc");
 
