@@ -99,11 +99,15 @@ stage_noh3() {
 }
 
 stage_asan() {
-    say "asan: build with HTTP/3 (ASan+LSan), then unit tests"
+    say "asan: HTTP/3 unit tests and both reload modes (ASan+LSan)"
 
     if build "$CI_BUILD_DIR/asan" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=yes \
              -DINCLUDE_HTTP3=yes &&
-       "$CI_BUILD_DIR/asan/exec/runner" | tail -4 | sed 's/^/   /'; then
+       "$CI_BUILD_DIR/asan/exec/runner" | tail -4 | sed 's/^/   /' &&
+       H3_RELOAD_PORT=18454 "$CORE_DIR/tests/h3_hard_reload.sh" \
+             "$CI_BUILD_DIR/asan" "$CI_BUILD_DIR/h3-hard-reload-asan" &&
+       H3_RELOAD_PORT=18455 "$CORE_DIR/tests/h3_soft_reload.sh" \
+             "$CI_BUILD_DIR/asan" "$CI_BUILD_DIR/h3-soft-reload-asan"; then
         record asan OK
     else
         record asan FAIL
@@ -111,14 +115,20 @@ stage_asan() {
 }
 
 stage_tsan() {
-    say "tsan: build with HTTP/3 (ThreadSanitizer), then unit tests"
+    say "tsan: HTTP/3 unit tests and both reload modes (ThreadSanitizer)"
 
     # TSan cannot be linked alongside ASan, hence its own tree -- and its own
     # ASAN_OPTIONS-free environment.
     if ASAN_OPTIONS= build "$CI_BUILD_DIR/tsan" -DCMAKE_BUILD_TYPE=Debug \
              -DBUILD_TESTS=yes -DINCLUDE_HTTP3=yes -DSANITIZE=thread &&
        ASAN_OPTIONS= TSAN_OPTIONS="halt_on_error=1" \
-             "$CI_BUILD_DIR/tsan/exec/runner" | tail -4 | sed 's/^/   /'; then
+             "$CI_BUILD_DIR/tsan/exec/runner" | tail -4 | sed 's/^/   /' &&
+       ASAN_OPTIONS= TSAN_OPTIONS="halt_on_error=1" H3_RELOAD_PORT=18456 \
+             "$CORE_DIR/tests/h3_hard_reload.sh" "$CI_BUILD_DIR/tsan" \
+             "$CI_BUILD_DIR/h3-hard-reload-tsan" &&
+       ASAN_OPTIONS= TSAN_OPTIONS="halt_on_error=1" H3_RELOAD_PORT=18457 \
+             "$CORE_DIR/tests/h3_soft_reload.sh" "$CI_BUILD_DIR/tsan" \
+             "$CI_BUILD_DIR/h3-soft-reload-tsan"; then
         record tsan OK
     else
         record tsan FAIL
@@ -149,9 +159,18 @@ stage_fuzz() {
     mkdir -p "$crashes"
 
     local ok=1
-    local target
-    for target in "$CI_BUILD_DIR"/fuzz/exec/fuzz_*; do
-        [ -x "$target" ] || continue
+    local fuzz_names=(
+        quic_packet quic_frame quic_tp h3_frame
+        qpack_decode qpack_streams huffman
+    )
+    local fuzz_name target
+    for fuzz_name in "${fuzz_names[@]}"; do
+        target="$CI_BUILD_DIR/fuzz/exec/fuzz_$fuzz_name"
+        if [ ! -x "$target" ]; then
+            note "fuzz_$fuzz_name is missing or not executable"
+            ok=0
+            continue
+        fi
 
         local name=$(basename "$target")
         local corpus="$CORE_DIR/tests/fuzz/corpus/${name#fuzz_}"

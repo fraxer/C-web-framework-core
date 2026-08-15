@@ -223,7 +223,7 @@ static void __transport_release(quic_udp_handle_t* h) {
     pthread_cond_destroy(&h->changed);
     free(h);
 }
-static size_t   __quic_max_connections = QUIC_DEFAULT_MAX_CONNECTIONS;
+static _Atomic size_t __quic_max_connections = QUIC_DEFAULT_MAX_CONNECTIONS;
 static _Atomic size_t __quic_connections = 0;
 static _Atomic size_t __quic_handshakes_inflight = 0;
 static uint8_t  __quic_reset_key[32];
@@ -283,13 +283,14 @@ const quic_conn_policy_t* quic_policy_conn(void) {
 }
 
 int quic_process_conn_try_acquire(void) {
+    const size_t limit = atomic_load_explicit(&__quic_max_connections, memory_order_acquire);
     size_t current = atomic_load_explicit(&__quic_connections, memory_order_relaxed);
-    while (current < __quic_max_connections) {
+    while (current < limit) {
         if (atomic_compare_exchange_weak_explicit(
                 &__quic_connections, &current, current + 1,
                 memory_order_acq_rel, memory_order_relaxed))
         {
-            metrics_quic_connections(current + 1, __quic_max_connections);
+            metrics_quic_connections(current + 1, limit);
             return 1;
         }
     }
@@ -303,7 +304,9 @@ void quic_process_conn_release(void) {
      * counter wrapped if it slips through a failure path. */
     if (previous == 0)
         atomic_store_explicit(&__quic_connections, 0, memory_order_release);
-    metrics_quic_connections(previous > 0 ? previous - 1 : 0, __quic_max_connections);
+    metrics_quic_connections(previous > 0 ? previous - 1 : 0,
+                             atomic_load_explicit(&__quic_max_connections,
+                                                  memory_order_acquire));
 }
 
 size_t quic_process_conn_current(void) {
@@ -311,7 +314,7 @@ size_t quic_process_conn_current(void) {
 }
 
 size_t quic_process_conn_limit(void) {
-    return __quic_max_connections;
+    return atomic_load_explicit(&__quic_max_connections, memory_order_acquire);
 }
 
 /* One key, clamped into a range it cannot break the protocol from. Every bound
@@ -410,8 +413,9 @@ int quic_policy_init(void) {
                   (long long)max_connections);
         return 0;
     }
-    __quic_max_connections = (size_t)max_connections;
-    metrics_quic_connections(quic_process_conn_current(), __quic_max_connections);
+    atomic_store_explicit(&__quic_max_connections, (size_t)max_connections,
+                          memory_order_release);
+    metrics_quic_connections(quic_process_conn_current(), (size_t)max_connections);
 
     long long memory_limit = -1;
     const int memory_status =
@@ -1490,7 +1494,7 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
         return;
     }
 
-    if (quic_process_conn_current() >= __quic_max_connections) {
+    if (quic_process_conn_current() >= quic_process_conn_limit()) {
         metrics_quic(METRICS_QUIC_AT_CAPACITY);
         /* Told, not dropped. Being full is not an attack, and a client that
          * knows can go elsewhere now instead of at its handshake timeout. */

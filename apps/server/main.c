@@ -32,19 +32,35 @@ int main(int argc, char* argv[]) {
          strcmp(CMAKE_BUILD_TYPE, "RelWithDebInfo") == 0))
         if (daemon(1, 1) < 0) goto failed;
 
+    /* Block control signals before module_loader_init creates any threads.
+     * They inherit this mask, leaving the main thread's sigwait() as the sole
+     * consumer. In particular, reload no longer parses JSON, allocates memory
+     * or starts workers from an asynchronous signal handler. */
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR1);
+    sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGINT);
+    if (pthread_sigmask(SIG_BLOCK, &mask, NULL) != 0)
+        goto failed;
+
     if (!module_loader_init(appconfig()))
         goto failed;
 
     result = EXIT_SUCCESS;
 
-    sigset_t mask;
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGTERM);
-    sigaddset(&mask, SIGINT);
-    pthread_sigmask(SIG_BLOCK, &mask, NULL);
-
     int sig;
-    sigwait(&mask, &sig);
+    for (;;) {
+        if (sigwait(&mask, &sig) != 0)
+            continue;
+
+        if (sig == SIGUSR1) {
+            signal_reload();
+            continue;
+        }
+
+        break;
+    }
 
     /* Phase 5 — graceful drain. SIGTERM/SIGINT no longer hard-exit: the app is
      * marked for shutdown, handler threads are released from the queue condvar,

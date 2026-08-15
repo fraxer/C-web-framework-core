@@ -198,6 +198,7 @@ int module_loader_load_json_config(const char* path, json_doc_t** document) {
 
 int __module_loader_init_modules(appconfig_t* config, json_doc_t* document) {
     int result = 0;
+    appconfig_t* previous_config = appconfig();
 
     if (!connection_queue_init()) {
         log_error("__module_loader_init_modules: connection_queue_init error\n");
@@ -205,6 +206,12 @@ int __module_loader_init_modules(appconfig_t* config, json_doc_t* document) {
     }
     if (!module_loader_config_load(config, document))
         goto failed;
+
+    /* Publish only a fully parsed environment. Old-generation workers may use
+     * env() for logging while reload is being prepared; exposing newconfig
+     * before config_load finishes lets them observe fields as they are being
+     * written. The release store in appconfig_set pairs with env()/appconfig(). */
+    appconfig_set(config);
 
     /* After the config is loaded (env is only readable now) and before any
      * worker or handler thread exists, so these never change under a running
@@ -243,8 +250,9 @@ int __module_loader_init_modules(appconfig_t* config, json_doc_t* document) {
     failed:
 
     if (!result) {
-        appconfig_free(appconfig());
-        appconfig_set(NULL);
+        if (appconfig() == config)
+            appconfig_set(previous_config == config ? NULL : previous_config);
+        appconfig_free(config);
     }
 
     return result;
@@ -1992,7 +2000,6 @@ void module_loader_create_config_and_init(void) {
     }
 
     middleware_registry_clear();
-    appconfig_set(newconfig);
     module_loader_init(newconfig);
 }
 

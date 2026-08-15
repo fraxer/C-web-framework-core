@@ -8,15 +8,20 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 
 #include "quictime.h"
 
 static inline int quicbeacon_on(void) {
-    static int state = -1;
+    static atomic_int state = -1;
+    int value = atomic_load_explicit(&state, memory_order_acquire);
 
-    if (state < 0) state = getenv("CWFR_QUIC_BEACON") != NULL;
+    if (value < 0) {
+        value = getenv("CWFR_QUIC_BEACON") != NULL;
+        atomic_store_explicit(&state, value, memory_order_release);
+    }
 
-    return state;
+    return value;
 }
 
 #define QUICBEACON(fmt, ...)                                                   \

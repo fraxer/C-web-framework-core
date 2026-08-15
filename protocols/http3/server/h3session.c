@@ -18,13 +18,15 @@
 #define H3_DEFAULT_CTRL_RATE   100
 #define H3_DEFAULT_CTRL_BURST  200
 
-/* Set once by h3_policy_init(), read by every worker afterwards. The values
- * below are what applies when it has not run at all -- a unit test, say. */
-static uint64_t h3_max_field_section_size = H3_DEFAULT_MAX_FIELD_SECTION_SIZE;
-static int64_t  h3_abort_rate  = H3_DEFAULT_ABORT_RATE;
-static int64_t  h3_abort_burst = H3_DEFAULT_ABORT_BURST;
-static int64_t  h3_ctrl_rate   = H3_DEFAULT_CTRL_RATE;
-static int64_t  h3_ctrl_burst  = H3_DEFAULT_CTRL_BURST;
+/* Replaced by h3_policy_init() on reload and read by both worker generations.
+ * Atomics make that publication race-free; a session may observe either whole
+ * scalar policy during handoff, both of which are valid. The initial values
+ * apply when policy init has not run at all -- a unit test, say. */
+static _Atomic uint64_t h3_max_field_section_size = H3_DEFAULT_MAX_FIELD_SECTION_SIZE;
+static _Atomic int64_t  h3_abort_rate  = H3_DEFAULT_ABORT_RATE;
+static _Atomic int64_t  h3_abort_burst = H3_DEFAULT_ABORT_BURST;
+static _Atomic int64_t  h3_ctrl_rate   = H3_DEFAULT_CTRL_RATE;
+static _Atomic int64_t  h3_ctrl_burst  = H3_DEFAULT_CTRL_BURST;
 
 static int64_t __policy_int(const char* key, int64_t fallback, int64_t min) {
     int64_t v = env_get_int(key, (int)fallback);
@@ -34,19 +36,19 @@ static int64_t __policy_int(const char* key, int64_t fallback, int64_t min) {
 }
 
 void h3_policy_init(void) {
-    h3_max_field_section_size =
+    atomic_store(&h3_max_field_section_size,
         (uint64_t)__policy_int("http3_max_field_section_size",
-                               H3_DEFAULT_MAX_FIELD_SECTION_SIZE, 0);
+                               H3_DEFAULT_MAX_FIELD_SECTION_SIZE, 0));
 
     /* 0 disables a bucket, which is why the floor is 0 and not 1. */
-    h3_abort_rate  = __policy_int("http3_abort_rate",  H3_DEFAULT_ABORT_RATE, 0);
-    h3_abort_burst = __policy_int("http3_abort_burst", H3_DEFAULT_ABORT_BURST, 1);
-    h3_ctrl_rate   = __policy_int("http3_ctrl_rate",   H3_DEFAULT_CTRL_RATE, 0);
-    h3_ctrl_burst  = __policy_int("http3_ctrl_burst",  H3_DEFAULT_CTRL_BURST, 1);
+    atomic_store(&h3_abort_rate,  __policy_int("http3_abort_rate",  H3_DEFAULT_ABORT_RATE, 0));
+    atomic_store(&h3_abort_burst, __policy_int("http3_abort_burst", H3_DEFAULT_ABORT_BURST, 1));
+    atomic_store(&h3_ctrl_rate,   __policy_int("http3_ctrl_rate",   H3_DEFAULT_CTRL_RATE, 0));
+    atomic_store(&h3_ctrl_burst,  __policy_int("http3_ctrl_burst",  H3_DEFAULT_CTRL_BURST, 1));
 }
 
 uint64_t h3_policy_max_field_section_size(void) {
-    return h3_max_field_section_size;
+    return atomic_load(&h3_max_field_section_size);
 }
 
 /* ---- Budgets ---- */
@@ -85,7 +87,7 @@ int h3session_abort_spend(h3session_t* s) {
     if (s == NULL) return 1;
 
     if (__budget_spend(&s->abort_tokens, &s->abort_epoch_ms,
-                       h3_abort_rate, h3_abort_burst))
+                       atomic_load(&h3_abort_rate), atomic_load(&h3_abort_burst)))
         return 1;
 
     metrics_h3(METRICS_H3_ABUSE_ABORT_BUDGET);
@@ -97,7 +99,7 @@ int h3session_ctrl_spend(h3session_t* s) {
     if (s == NULL) return 1;
 
     if (__budget_spend(&s->ctrl_tokens, &s->ctrl_epoch_ms,
-                       h3_ctrl_rate, h3_ctrl_burst))
+                       atomic_load(&h3_ctrl_rate), atomic_load(&h3_ctrl_burst)))
         return 1;
 
     metrics_h3(METRICS_H3_ABUSE_CTRL_BUDGET);
@@ -176,8 +178,8 @@ h3session_t* h3session_create(uint64_t max_field_section_size, int enable_connec
      * fresh connection, and starting empty would punish exactly that. */
     s->abort_epoch_ms = __now_ms();
     s->ctrl_epoch_ms = s->abort_epoch_ms;
-    s->abort_tokens = h3_abort_burst * 1000;
-    s->ctrl_tokens = h3_ctrl_burst * 1000;
+    s->abort_tokens = atomic_load(&h3_abort_burst) * 1000;
+    s->ctrl_tokens = atomic_load(&h3_ctrl_burst) * 1000;
 
     return s;
 }

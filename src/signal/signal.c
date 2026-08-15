@@ -122,7 +122,10 @@ void __signal_shutdown_sockets(void) {
     closedir(dir);
 }
 
-void signal_USR1(__attribute__((unused))int s) {
+/* Run a reload from ordinary thread context. SIGUSR1 is blocked process-wide
+ * and consumed by sigwait() in main, so everything below may safely allocate,
+ * log, inspect /proc and initialise threads. */
+void signal_reload(void) {
     signal_flush_streams();
     log_error("signal USR1\n");
 
@@ -160,7 +163,6 @@ void signal_init(void) {
     signal(SIGHUP,  SIG_IGN);
     signal(SIGBUS,  signal_before_segmentation_fault);
     signal(SIGABRT, signal_before_abort);
-    signal(SIGUSR1, signal_USR1);
     signal(SIGUSR2, SIG_IGN);
 }
 

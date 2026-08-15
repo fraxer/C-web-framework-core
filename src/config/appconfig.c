@@ -10,7 +10,7 @@
 void taskmanager_free(taskmanager_t* manager);
 
 static char* __appconfig_path = NULL;
-static appconfig_t* __appconfig = NULL;
+static _Atomic(appconfig_t*) __appconfig = NULL;
 
 /* Mirror of config->threads_count with process lifetime. The counter inside the
  * config cannot be polled by an observer: the thread that drops it to zero frees
@@ -82,18 +82,18 @@ appconfig_t* appconfig_create(const char* path) {
 }
 
 appconfig_t* appconfig(void) {
-    return __appconfig;
+    return atomic_load_explicit(&__appconfig, memory_order_acquire);
 }
 
 env_t* env(void) {
-    if (__appconfig == NULL)
-        return NULL;
+    appconfig_t* config = appconfig();
+    if (config == NULL) return NULL;
 
-    return &__appconfig->env;
+    return &config->env;
 }
 
 void appconfig_set(appconfig_t* config) {
-    __appconfig = config;
+    atomic_store_explicit(&__appconfig, config, memory_order_release);
 }
 
 void appconfig_clear(appconfig_t* config) {
@@ -306,10 +306,11 @@ const char* __appconfig_get_path(int argc, char* argv[]) {
 
 static json_token_t* __env_get_token(const char* key) {
     if (key == NULL) return NULL;
-    if (__appconfig == NULL) return NULL;
-    if (__appconfig->env.custom_store == NULL) return NULL;
+    appconfig_t* config = appconfig();
+    if (config == NULL) return NULL;
+    if (config->env.custom_store == NULL) return NULL;
 
-    json_token_t* root = json_root(__appconfig->env.custom_store);
+    json_token_t* root = json_root(config->env.custom_store);
     if (root == NULL) return NULL;
 
     return json_object_get(root, key);
