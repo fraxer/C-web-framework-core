@@ -146,6 +146,7 @@ TEST(test_h3response_dynamic_section_tracks_stream) {
     TEST_ASSERT(qpack_encoder_set_capacity(enc, 128) == QPACK_OK, "capacity");
     TEST_ASSERT(qpack_encoder_insert_literal(enc, "x-answer", 8, "42", 2, NULL)
                     == QPACK_OK, "dynamic response field inserted");
+    enc->known_received_count = 1;
     r->status_code = 200;
     r->add_header(r, "X-Answer", "42");
 
@@ -163,6 +164,43 @@ TEST(test_h3response_dynamic_section_tracks_stream) {
     TEST_ASSERT(consumed == sizeof ack && enc->section_count == 0,
                 "response references released");
 
+    free(frame);
+    httpresponse_free(r);
+    qpack_encoder_free(enc);
+}
+
+TEST(test_h3response_two_hit_dynamic_admission) {
+    TEST_SUITE("h3response");
+    qpack_encoder_t* enc = qpack_encoder_create(256, 4);
+    httpresponse_t* r = httpresponse_create(NULL);
+    TEST_ASSERT(qpack_encoder_set_capacity(enc, 256) == QPACK_OK, "capacity");
+    qpack_encoder_consume(enc, enc->pending_len);
+    r->status_code = 200;
+    r->add_header(r, "Content-Type", "text/example");
+
+    uint8_t* frame = NULL;
+    size_t flen = 0;
+    TEST_ASSERT(h3response_headers_for_stream(enc, 4, r, &frame, &flen) == H3RESPONSE_OK,
+                "first response encoded");
+    TEST_ASSERT(enc->entry_count == 0 && enc->section_count == 0,
+                "first sighting remains literal");
+    free(frame);
+
+    TEST_ASSERT(h3response_headers_for_stream(enc, 8, r, &frame, &flen) == H3RESPONSE_OK,
+                "second response encoded");
+    TEST_ASSERT(enc->entry_count == 1 && enc->section_count == 0,
+                "second sighting inserts but stays literal until confirmed");
+    TEST_ASSERT(enc->pending_len > 0, "insert instruction queued");
+    free(frame);
+
+    size_t consumed = 0;
+    static const uint8_t increment[] = { 0x01 };
+    TEST_ASSERT(qpack_encoder_read_decoder_state(enc, increment, sizeof increment,
+                                                 &consumed) == QPACK_OK,
+                "peer confirms the insertion");
+    TEST_ASSERT(h3response_headers_for_stream(enc, 12, r, &frame, &flen) == H3RESPONSE_OK,
+                "confirmed entry encoded dynamically");
+    TEST_ASSERT(enc->section_count == 1, "confirmed dynamic section tracked");
     free(frame);
     httpresponse_free(r);
     qpack_encoder_free(enc);

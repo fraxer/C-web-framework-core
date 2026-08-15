@@ -107,6 +107,7 @@ typedef struct h3session {
     /* Shared by every stream on the connection. */
     struct qpack_decoder* qdec;
     struct qpack_encoder* qenc;
+    size_t                 qpack_memory_reserved;
 
     /* What we advertise, and what the peer advertised. */
     h3settings_t local_settings;

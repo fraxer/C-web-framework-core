@@ -70,6 +70,8 @@ static const char* const __h3_name[METRICS_H3__COUNT] = {
     "abuse.field_section_too_large", "abuse.field_section_hard_cap",
     "abuse.body_too_large",
     "misdirected",
+    "qpack.inserts", "qpack.evictions", "qpack.blocked_streams",
+    "qpack.literal_fields", "qpack.dynamic_fields",
     "stream_errors", "connection_errors"
 };
 
@@ -379,10 +381,14 @@ void metrics_quic_reload_handoff(int success) {
 }
 
 void metrics_h3(metrics_h3_t kind) {
+    metrics_h3_add(kind, 1);
+}
+
+void metrics_h3_add(metrics_h3_t kind, unsigned long long value) {
     if (!metrics_enabled()) return;
     if (kind < 0 || kind >= METRICS_H3__COUNT) return;
 
-    atomic_fetch_add_explicit(&__m.h3[kind], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&__m.h3[kind], value, memory_order_relaxed);
 }
 
 void metrics_h3_status(int status_code) {

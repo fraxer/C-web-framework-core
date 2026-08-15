@@ -7,6 +7,7 @@
 #include "h3frame.h"
 #include "httpfields.h"
 #include "log.h"
+#include "metrics.h"
 #include "qpack.h"
 
 /* A field list under construction. The names need a buffer of their own because
@@ -75,12 +76,27 @@ static h3response_status_e __encode(struct qpack_encoder* enc,
     uint8_t* block = malloc(bound);
     if (block == NULL) return H3RESPONSE_ERR_MEMORY;
 
-    const size_t block_len = qpack_encode_block_for_stream(enc, stream_id,
-                                                           fields, count, block, bound);
+    const uint64_t inserts_before = enc->insert_count;
+    const uint64_t evictions_before = enc->evictions;
+    const uint64_t literals_before = enc->literal_fields;
+    const uint64_t dynamic_before = enc->dynamic_fields;
+    if (qpack_encoder_prepare_fields(enc, fields, count) == QPACK_ERR_MEMORY) {
+        free(block);
+        return H3RESPONSE_ERR_MEMORY;
+    }
+
+    const size_t block_len = qpack_encode_block_for_stream_confirmed(
+        enc, stream_id, fields, count, block, bound);
     if (block_len == 0) {
         free(block);
         return H3RESPONSE_ERR_ENCODE;
     }
+    metrics_h3_add(METRICS_H3_QPACK_INSERTS, enc->insert_count - inserts_before);
+    metrics_h3_add(METRICS_H3_QPACK_EVICTIONS, enc->evictions - evictions_before);
+    metrics_h3_add(METRICS_H3_QPACK_LITERAL_FIELDS,
+                   enc->literal_fields - literals_before);
+    metrics_h3_add(METRICS_H3_QPACK_DYNAMIC_FIELDS,
+                   enc->dynamic_fields - dynamic_before);
 
     /* The frame header's own width depends on the payload length, so the frame
      * is built after the block rather than around it. */

@@ -423,6 +423,7 @@ static h3conn_result_t __read_request(h3conn_t* c, quicconn_t* qc, quicstream_t*
                         return __closed(QPACK_DECOMPRESSION_FAILED);
                     c->qpack_blocked_streams++;
                     app->qpack_blocked_counted = 1;
+                    metrics_h3(METRICS_H3_QPACK_BLOCKED_STREAMS);
                 }
                 break;
             }
@@ -842,6 +843,15 @@ int h3conn_write(h3conn_t* c, quicconn_t* qc) {
         }
     }
 
+    /* Field encoding above may have admitted dynamic entries and queued their
+     * encoder instructions. Drain again in this same turn: otherwise the
+     * dependent HEADERS is queued while the encoder stream stays pending with
+     * no response_ready edge left to schedule another application write. */
+    if (!__write_qpack_encoder(c, qc) || !__write_qpack_decoder(c, qc)) {
+        quicconn_budget_close(qc);
+        return 0;
+    }
+
     quicconn_budget_close(qc);
 
     return 1;
@@ -849,6 +859,9 @@ int h3conn_write(h3conn_t* c, quicconn_t* qc) {
 
 int h3conn_has_pending(const h3conn_t* c, const quicconn_t* qc) {
     if (c == NULL || qc == NULL) return 0;
+
+    if (qpack_encoder_pending(c->session->qenc, NULL) != 0 ||
+        qpack_decoder_pending(c->session->qdec, NULL) != 0) return 1;
 
     for (quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
         const h3stream_t* st = h3conn_request_of(qs);

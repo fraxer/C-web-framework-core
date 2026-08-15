@@ -414,9 +414,8 @@ Acknowledgment; RESET_STREAM либо ошибка повторного decode �
 позволяет корректно иметь несколько секций на одном request stream.
 
 Старые функции кодирования сохранены как совместимые обёртки и не регистрируют
-stream-specific состояние. Production SETTINGS пока остаются нулевыми, поэтому
-этот путь не меняет wire format действующих ответов до отдельного включения
-capacity/blocked streams и политики наполнения encoder table.
+stream-specific состояние. Production response path использует stream-aware
+варианты.
 
 ### 6.2e. SETTINGS клиента и лимиты исходящего encoder
 
@@ -427,9 +426,8 @@ capacity/blocked streams и политики наполнения encoder table.
 ёмкости `Set Dynamic Table Capacity` ставится в очередь encoder stream.
 
 Лимиты принимаются только у pristine encoder и становятся неизменяемыми после
-первой инструкции, вставки или field section. Наши входящие SETTINGS пока
-остаются `0/0`: клиент всё ещё не может создавать динамические записи в decoder
-server-side, пока их память не включена в общий HTTP/3 memory budget.
+первой инструкции, вставки или field section. Наши входящие SETTINGS равны
+`4096/16`, поэтому клиент также может использовать dynamic table для запросов.
 
 Encoder отдельно соблюдает `QPACK_BLOCKED_STREAMS`: считаются уникальные request
 streams с Required Insert Count выше уже подтверждённого клиентом insert count.
@@ -437,6 +435,53 @@ streams с Required Insert Count выше уже подтверждённого 
 динамической ссылки. Несколько outstanding sections одного уже блокированного
 stream не расходуют дополнительные слоты; после acknowledgment слот снова
 доступен.
+
+### 6.2f. Two-hit admission исходящих полей
+
+Response encoder автоматически наполняет dynamic table, но только после второго
+наблюдения одинаковой пары name/value. Первое наблюдение хранится в ограниченном
+64-слотовом hash-sketch без копирования содержимого. Sensitive (`never-indexed`),
+уже представленные точной static entry и занимающие более четверти таблицы поля
+не рассматриваются. Это не позволяет одноразовым `date`, `content-length`, trace
+ID и большим значениям постоянно вытеснять полезные записи.
+
+При втором наблюдении encoder предпочитает Insert With Static Name Reference и
+использует literal name только при отсутствии имени в static table. Если eviction
+временно запрещён outstanding sections, текущий ответ остаётся literal и
+наблюдение сохраняется для следующей попытки; OOM возвращается вызывающему как
+ошибка памяти.
+
+Автоматическая response policy не создаёт QPACK head-of-line blocking: новая
+запись отправляется на encoder stream немедленно, но field section начинает
+ссылаться на неё только после `Insert Count Increment` клиента. Ядро умеет
+кодировать потенциально blocked sections и соблюдает их лимит, однако штатные
+ответы выбирают предсказуемую latency вместо выигрыша нескольких байт на самом
+первом повторе.
+
+### 6.2g. Production-включение, память и метрики
+
+На каждую HTTP/3-сессию до создания QPACK state атомарно резервируется 32 KiB
+из process-wide `http3_buffer_memory_limit`. Квота покрывает две таблицы по
+4096 байт, массивы записей, outstanding sections и штатные instruction queues.
+Она откатывается при ошибке и полностью освобождается вместе с сессией.
+
+Reassembly buffers входящих encoder/decoder streams учитываются дополнительно
+по фактической capacity при каждом росте. Неудачная резервация не оставляет
+частичного charge и завершает виновное соединение с `H3_EXCESSIVE_LOAD`; лимит
+накопления одного служебного потока остаётся 1 MiB.
+
+В `http3` metrics публикуются `qpack.inserts`, `qpack.evictions`,
+`qpack.blocked_streams`, `qpack.literal_fields` и `qpack.dynamic_fields`.
+Последние два счётчика позволяют вычислить literal ratio на стороне системы
+мониторинга без floating-point операций в response hot path.
+
+Interop с nghttp2 `h2load` выявил и закрыл важную границу: второй проход encoder
+не имеет права выбрать dynamic entry выше уже вычисленного Required Insert
+Count. На смешанной секции с подтверждённой и ещё неподтверждённой записью
+последняя теперь остаётся literal. Regression-тест декодирует такую секцию на
+peer state, где присутствует только подтверждённая вставка. После исправления
+профиль `h2load -n 10000 -c 100 -m 30` завершает все запросы без
+`ERR_QPACK_DECOMPRESSION_FAILED`.
 
 ### 6.2c. Инвариант blocked request stream
 

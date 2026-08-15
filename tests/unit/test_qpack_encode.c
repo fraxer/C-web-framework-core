@@ -299,6 +299,41 @@ TEST(test_qpack_encode_dynamic_tracks_stream) {
     qpack_encoder_free(e);
 }
 
+TEST(test_qpack_confirmed_section_never_references_beyond_ric) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(256, 4);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 256) == QPACK_OK, "capacity");
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "a", 1, "one", 3, NULL) == QPACK_OK,
+                "confirmed entry inserted");
+    e->known_received_count = 1;
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "b", 1, "two", 3, NULL) == QPACK_OK,
+                "unconfirmed entry inserted");
+    qpack_header_t fields[] = {
+        { "a", 1, "one", 3, 0 }, { "b", 1, "two", 3, 0 }
+    };
+    uint8_t block[64];
+    const size_t n = qpack_encode_block_for_stream_confirmed(
+        e, 4, fields, 2, block, sizeof block);
+    TEST_ASSERT(n > 3, "mixed section encoded");
+    TEST_ASSERT(e->section_count == 1, "confirmed reference tracked");
+
+    qpack_decoder_t* d = qpack_decoder_create(256, 4);
+    static const uint8_t cap_and_first[] = {
+        0x3f, 0xe1, 0x01, /* capacity 256 */
+        0x41, 'a', 0x03, 'o', 'n', 'e'
+    };
+    size_t consumed = 0;
+    TEST_ASSERT(qpack_decoder_read_encoder(d, cap_and_first, sizeof cap_and_first,
+                                           &consumed) == QPACK_OK, "peer has first insert only");
+    qpack_header_t* decoded = NULL; size_t count = 0;
+    TEST_ASSERT(qpack_decode_block(d, block, n, 0, &decoded, &count) == QPACK_OK,
+                "section does not depend on the unconfirmed insert");
+    TEST_ASSERT(count == 2, "both fields decoded");
+    qpack_headers_free(decoded, count);
+    qpack_decoder_free(d);
+    qpack_encoder_free(e);
+}
+
 TEST(test_qpack_encoder_respects_blocked_stream_limit) {
     TEST_SUITE("qpack dynamic encoder");
     qpack_encoder_t* e = qpack_encoder_create(128, 1);

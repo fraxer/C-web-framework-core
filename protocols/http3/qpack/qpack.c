@@ -112,6 +112,7 @@ static void __dynamic_drop_oldest(qpack_decoder_t* d) {
     if (d->entry_count == 0) return;
     qpack_dynamic_entry_t* e = &d->entries[0];
     d->bytes -= e->size;
+    d->evictions++;
     free(e->name);
     free(e->value);
     d->entry_count--;
@@ -163,6 +164,7 @@ static int __dynamic_insert(qpack_decoder_t* d, const char* name, size_t name_le
     e->value = vcopy; e->value_len = value_len;
     e->size = size; e->absolute = d->insert_count++;
     d->bytes += size;
+    d->insertions++;
     return 1;
 }
 
@@ -533,6 +535,7 @@ static int __encoder_make_room(qpack_encoder_t* e, size_t size) {
             return 0;
         qpack_dynamic_entry_t* oldest = &e->entries[0];
         e->bytes -= oldest->size;
+        e->evictions++;
         free(oldest->name); free(oldest->value);
         e->entry_count--;
         if (e->entry_count != 0)
@@ -709,6 +712,68 @@ qpack_status_e qpack_encoder_duplicate(qpack_encoder_t* e, uint64_t relative_ind
     return QPACK_OK;
 }
 
+static uint64_t __admission_hash(const qpack_header_t* h) {
+    /* FNV-1a with a separator and non-zero result; this sketch controls only
+     * compression policy, never decoding correctness. */
+    uint64_t v = UINT64_C(1469598103934665603);
+    for (size_t i = 0; i < h->name_len; i++) { v ^= (uint8_t)h->name[i]; v *= UINT64_C(1099511628211); }
+    v ^= 0xff; v *= UINT64_C(1099511628211);
+    for (size_t i = 0; i < h->value_len; i++) { v ^= (uint8_t)h->value[i]; v *= UINT64_C(1099511628211); }
+    return v != 0 ? v : 1;
+}
+
+static int __encoder_has_exact(const qpack_encoder_t* e, const qpack_header_t* h) {
+    for (size_t i = 0; i < e->entry_count; i++) {
+        const qpack_dynamic_entry_t* de = &e->entries[i];
+        if (de->name_len == h->name_len && de->value_len == h->value_len &&
+            memcmp(de->name, h->name, h->name_len) == 0 &&
+            memcmp(de->value, h->value, h->value_len) == 0) return 1;
+    }
+    return 0;
+}
+
+qpack_status_e qpack_encoder_prepare_fields(qpack_encoder_t* e,
+                                             const qpack_header_t* fields,
+                                             size_t count) {
+    if (e == NULL || (fields == NULL && count != 0)) return QPACK_ERR_ENCODER_STREAM;
+    if (e->capacity == 0 || e->max_blocked == 0) return QPACK_OK;
+
+    for (size_t i = 0; i < count; i++) {
+        const qpack_header_t* h = &fields[i];
+        if (h->never_indexed || h->name_len > SIZE_MAX - h->value_len - 32) continue;
+        const size_t entry_size = h->name_len + h->value_len + 32;
+        /* One value may not monopolize the table. This also rejects volatile
+         * large fields before they occupy the admission sketch. */
+        if (entry_size > e->capacity / 4) continue;
+        size_t exact = 0;
+        if (qpack_static_find(h->name, h->name_len, h->value, h->value_len, 1, &exact) ||
+            __encoder_has_exact(e, h)) continue;
+
+        const uint64_t hash = __admission_hash(h);
+        size_t slot = 64;
+        for (size_t j = 0; j < 64; j++)
+            if (e->admission_hashes[j] == hash) { slot = j; break; }
+        if (slot == 64) {
+            e->admission_hashes[e->admission_next++ % 64] = hash;
+            continue;
+        }
+
+        qpack_status_e st;
+        size_t name_index = 0;
+        if (qpack_static_find(h->name, h->name_len, NULL, 0, 0, &name_index))
+            st = qpack_encoder_insert_static_name(e, name_index,
+                                                  h->value, h->value_len, NULL);
+        else
+            st = qpack_encoder_insert_literal(e, h->name, h->name_len,
+                                               h->value, h->value_len, NULL);
+        if (st == QPACK_ERR_MEMORY) return st;
+        if (st == QPACK_OK) e->admission_hashes[slot] = 0;
+        /* A table pinned by outstanding sections is normal backpressure: keep
+         * the observation and encode this response literally. */
+    }
+    return QPACK_OK;
+}
+
 static int __encoder_pending_int(qpack_encoder_t* e, uint64_t value,
                                  uint8_t prefix, uint8_t flags) {
     uint8_t buf[16];
@@ -749,13 +814,14 @@ void qpack_encoder_consume(qpack_encoder_t* e, size_t n) {
     e->pending_len -= n;
 }
 
-size_t qpack_encode_block_for_stream(qpack_encoder_t* e, uint64_t stream_id,
-                                     const qpack_header_t* fields, size_t count,
-                                     uint8_t* dst, size_t cap) {
+static size_t __qpack_encode_block(qpack_encoder_t* e, uint64_t stream_id,
+                                   const qpack_header_t* fields, size_t count,
+                                   uint8_t* dst, size_t cap, int allow_blocking) {
     if (e == NULL || (fields == NULL && count != 0) || dst == NULL || cap == 0) return 0;
 
     qpack_buf_t b;
     qpack_buf_init(&b);
+    uint64_t literal_fields = 0, dynamic_fields = 0;
 
     uint64_t required = 0;
     if (e->max_blocked > 0) {
@@ -767,6 +833,10 @@ size_t qpack_encode_block_for_stream(qpack_encoder_t* e, uint64_t stream_id,
                     de->value_len == fields[i].value_len &&
                     memcmp(de->name, fields[i].name, de->name_len) == 0 &&
                     memcmp(de->value, fields[i].value, de->value_len) == 0) {
+                    /* Production response policy avoids QPACK HOL blocking:
+                     * admit and transmit inserts eagerly, but reference them
+                     * only after the peer confirms receipt. */
+                    if (!allow_blocking && de->absolute + 1 > e->known_received_count) break;
                     if (required < de->absolute + 1) required = de->absolute + 1;
                     break;
                 }
@@ -817,6 +887,7 @@ size_t qpack_encode_block_for_stream(qpack_encoder_t* e, uint64_t stream_id,
             const qpack_dynamic_entry_t* match = NULL;
             for (size_t j = e->entry_count; j > 0; j--) {
                 const qpack_dynamic_entry_t* de = &e->entries[j - 1];
+                if (de->absolute + 1 > required) continue;
                 if (de->name_len == h->name_len && de->value_len == h->value_len &&
                     memcmp(de->name, h->name, de->name_len) == 0 &&
                     memcmp(de->value, h->value, de->value_len) == 0) {
@@ -826,6 +897,7 @@ size_t qpack_encode_block_for_stream(qpack_encoder_t* e, uint64_t stream_id,
             if (match != NULL) {
                 const uint64_t relative = base - match->absolute - 1;
                 if (!qpack_buf_int(&b, relative, 6, 0x80)) break;
+                dynamic_fields++;
                 continue;
             }
         }
@@ -862,6 +934,7 @@ size_t qpack_encode_block_for_stream(qpack_encoder_t* e, uint64_t stream_id,
         }
 
         if (!qpack_enc_value(&b, value, h->value_len)) break;
+        literal_fields++;
     }
 
     if (b.oom || b.len > cap) {
@@ -875,13 +948,27 @@ size_t qpack_encode_block_for_stream(qpack_encoder_t* e, uint64_t stream_id,
         free(b.data);
         return 0;
     }
+    e->literal_fields += literal_fields;
+    e->dynamic_fields += dynamic_fields;
     free(b.data);
     return b.len;
 }
 
 size_t qpack_encode_block(qpack_encoder_t* e, const qpack_header_t* fields, size_t count,
                           uint8_t* dst, size_t cap) {
-    return qpack_encode_block_for_stream(e, UINT64_MAX, fields, count, dst, cap);
+    return __qpack_encode_block(e, UINT64_MAX, fields, count, dst, cap, 1);
+}
+
+size_t qpack_encode_block_for_stream(qpack_encoder_t* e, uint64_t stream_id,
+                                     const qpack_header_t* fields, size_t count,
+                                     uint8_t* dst, size_t cap) {
+    return __qpack_encode_block(e, stream_id, fields, count, dst, cap, 1);
+}
+
+size_t qpack_encode_block_for_stream_confirmed(qpack_encoder_t* e, uint64_t stream_id,
+                                               const qpack_header_t* fields,
+                                               size_t count, uint8_t* dst, size_t cap) {
+    return __qpack_encode_block(e, stream_id, fields, count, dst, cap, 0);
 }
 
 /* ---- String literals ---- */

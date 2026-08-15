@@ -7,6 +7,7 @@
 #include "log.h"
 #include "metrics.h"
 #include "qpack.h"
+#include "quicmemory.h"
 #include "quictime.h"
 #include "varint.h"
 
@@ -23,6 +24,9 @@
  * small while still gaining reuse for ordinary response headers. */
 #define H3_QPACK_ENCODER_CAPACITY 4096u
 #define H3_QPACK_ENCODER_BLOCKED  16u
+#define H3_QPACK_DECODER_CAPACITY 4096u
+#define H3_QPACK_DECODER_BLOCKED  16u
+#define H3_QPACK_SESSION_MEMORY   (32u * 1024u)
 
 /* Replaced by h3_policy_init() on reload and read by both worker generations.
  * Atomics make that publication race-free; a session may observe either whole
@@ -195,6 +199,7 @@ void h3uni_recv_free(h3uni_recv_t* uni) {
     if (uni == NULL) return;
 
     h3frame_parser_free(&uni->frames);
+    quicmemory_release(uni->qpack_pending_cap);
     free(uni->qpack_pending);
     free(uni);
 }
@@ -203,11 +208,18 @@ h3session_t* h3session_create(uint64_t max_field_section_size, int enable_connec
     h3session_t* s = calloc(1, sizeof * s);
     if (s == NULL) return NULL;
 
+    if (!quicmemory_reserve(H3_QPACK_SESSION_MEMORY)) {
+        free(s);
+        return NULL;
+    }
+    s->qpack_memory_reserved = H3_QPACK_SESSION_MEMORY;
+
     /* Lite QPACK: no dynamic table, so no stream can ever block on one
      * (docs/http3/06-qpack.md §6, step 6.1). Both zeros are advertised
      * explicitly rather than left to default, because a peer reading them is
      * how it learns not to try. */
-    s->qdec = qpack_decoder_create(0, 0);
+    s->qdec = qpack_decoder_create(H3_QPACK_DECODER_CAPACITY,
+                                   H3_QPACK_DECODER_BLOCKED);
     s->qenc = qpack_encoder_create(0, 0);
     if (s->qdec == NULL || s->qenc == NULL) {
         h3session_free(s);
@@ -215,8 +227,8 @@ h3session_t* h3session_create(uint64_t max_field_section_size, int enable_connec
     }
 
     h3settings_defaults(&s->local_settings);
-    s->local_settings.qpack_max_table_capacity = 0;
-    s->local_settings.qpack_blocked_streams = 0;
+    s->local_settings.qpack_max_table_capacity = H3_QPACK_DECODER_CAPACITY;
+    s->local_settings.qpack_blocked_streams = H3_QPACK_DECODER_BLOCKED;
     s->local_settings.max_field_section_size = max_field_section_size;
     s->local_settings.enable_connect_protocol = enable_connect_protocol ? 1 : 0;
 
@@ -239,6 +251,7 @@ void h3session_free(h3session_t* s) {
 
     qpack_decoder_free(s->qdec);
     qpack_encoder_free(s->qenc);
+    quicmemory_release(s->qpack_memory_reserved);
     free(s);
 }
 
@@ -554,8 +567,10 @@ static int __qpack_append(h3uni_recv_t* uni, const uint8_t* data, size_t len) {
             }
             cap *= 2;
         }
+        const size_t growth = cap - uni->qpack_pending_cap;
+        if (!quicmemory_reserve(growth)) return 0;
         uint8_t* grown = realloc(uni->qpack_pending, cap);
-        if (grown == NULL) return 0;
+        if (grown == NULL) { quicmemory_release(growth); return 0; }
         uni->qpack_pending = grown;
         uni->qpack_pending_cap = cap;
     }
@@ -575,6 +590,8 @@ static h3session_verdict_t __qpack_encoder_feed(h3session_t* s, h3uni_recv_t* un
                                                 const uint8_t* data, size_t len) {
     if (!__qpack_append(uni, data, len)) return __conn(H3_EXCESSIVE_LOAD);
     size_t consumed = 0;
+    const uint64_t inserts_before = s->qdec->insertions;
+    const uint64_t evictions_before = s->qdec->evictions;
     const qpack_status_e st = qpack_decoder_read_encoder(
         s->qdec, uni->qpack_pending, uni->qpack_pending_len, &consumed);
     if (st == QPACK_ERR_MEMORY) return __conn(H3_INTERNAL_ERROR);
@@ -582,6 +599,10 @@ static h3session_verdict_t __qpack_encoder_feed(h3session_t* s, h3uni_recv_t* un
         return __conn(QPACK_ENCODER_STREAM_ERROR);
 
     __qpack_consume(uni, consumed);
+    metrics_h3_add(METRICS_H3_QPACK_INSERTS,
+                   s->qdec->insertions - inserts_before);
+    metrics_h3_add(METRICS_H3_QPACK_EVICTIONS,
+                   s->qdec->evictions - evictions_before);
 
     return __ok();
 }

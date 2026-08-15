@@ -290,12 +290,19 @@ typedef enum {
      * every 404 a handler produces. */
     METRICS_H3_MISDIRECTED,
 
+    METRICS_H3_QPACK_INSERTS,
+    METRICS_H3_QPACK_EVICTIONS,
+    METRICS_H3_QPACK_BLOCKED_STREAMS,
+    METRICS_H3_QPACK_LITERAL_FIELDS,
+    METRICS_H3_QPACK_DYNAMIC_FIELDS,
+
     METRICS_H3_STREAM_ERROR,        /* malformed message; the stream is reset */
     METRICS_H3_CONN_ERROR,          /* an h3 error that ends the connection */
     METRICS_H3__COUNT
 } metrics_h3_t;
 
 void metrics_h3(metrics_h3_t kind);
+void metrics_h3_add(metrics_h3_t kind, unsigned long long value);
 
 /* One final response, counted by class. The mapping from status code to class
  * lives here so the call sites cannot disagree about where 1xx ends. */

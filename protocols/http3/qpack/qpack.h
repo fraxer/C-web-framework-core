@@ -76,6 +76,8 @@ typedef struct qpack_decoder {
     uint8_t* pending;
     size_t pending_len;
     size_t pending_cap;
+    uint64_t insertions;
+    uint64_t evictions;
 } qpack_decoder_t;
 
 /* Create a decoder. For lite pass (0, 0); the full decoder (6.2) takes the
@@ -174,6 +176,11 @@ typedef struct qpack_encoder {
     qpack_outstanding_section_t* sections;
     size_t section_count;
     size_t section_cap;
+    uint64_t evictions;
+    uint64_t literal_fields;
+    uint64_t dynamic_fields;
+    uint64_t admission_hashes[64]; /* bounded two-hit admission sketch */
+    size_t admission_next;
 } qpack_encoder_t;
 
 qpack_encoder_t* qpack_encoder_create(size_t max_capacity, size_t max_blocked);
@@ -201,6 +208,9 @@ qpack_status_e qpack_encoder_insert_dynamic_name(qpack_encoder_t* e,
                                                   uint64_t* absolute);
 qpack_status_e qpack_encoder_duplicate(qpack_encoder_t* e, uint64_t relative_index,
                                         uint64_t* absolute);
+qpack_status_e qpack_encoder_prepare_fields(qpack_encoder_t* e,
+                                             const qpack_header_t* fields,
+                                             size_t count);
 
 /* Encode `count` fields into dst[0..cap). Returns bytes written, or 0 on error
  * (cap too small / OOM). Even an empty field section is two bytes (the prefix),
@@ -211,5 +221,8 @@ size_t qpack_encode_block(qpack_encoder_t* e, const qpack_header_t* fields, size
 size_t qpack_encode_block_for_stream(qpack_encoder_t* e, uint64_t stream_id,
                                      const qpack_header_t* fields, size_t count,
                                      uint8_t* dst, size_t cap);
+size_t qpack_encode_block_for_stream_confirmed(qpack_encoder_t* e, uint64_t stream_id,
+                                               const qpack_header_t* fields,
+                                               size_t count, uint8_t* dst, size_t cap);
 
 #endif

@@ -3,6 +3,7 @@
 #include "h3frame.h"
 #include "h3session.h"
 #include "qpack.h"
+#include "quicmemory.h"
 #include "varint.h"
 
 #include <string.h>
@@ -47,8 +48,8 @@ TEST(test_h3session_settings) {
     h3settings_defaults(&back);
     TEST_ASSERT(h3settings_decode(pre + off, (size_t)flen, &back) == H3SETTINGS_OK, "decodes");
     TEST_ASSERT(back.max_field_section_size == 65536, "field section size");
-    TEST_ASSERT(back.qpack_max_table_capacity == 0, "no dynamic table in lite");
-    TEST_ASSERT(back.qpack_blocked_streams == 0, "no blocked streams in lite");
+    TEST_ASSERT(back.qpack_max_table_capacity == 4096, "dynamic decoder table advertised");
+    TEST_ASSERT(back.qpack_blocked_streams == 16, "blocked request streams advertised");
     TEST_ASSERT(back.enable_connect_protocol == 1, "extended CONNECT advertised");
     h3session_free(s);
 
@@ -360,6 +361,7 @@ TEST(test_h3session_qpack_streams) {
     const uint8_t split2[] = { 'o', 'o', 0x03, 'b', 'a', 'r' };
     TEST_ASSERT(feed(s, uni, split1, sizeof split1, 0).action == H3SESSION_OK,
                 "first half retained");
+    TEST_ASSERT(uni->qpack_pending_cap != 0, "staging allocation is tracked");
     TEST_ASSERT(qpack_decoder_insert_count(s->qdec) == 0, "not inserted prematurely");
     TEST_ASSERT(feed(s, uni, split2, sizeof split2, 0).action == H3SESSION_OK,
                 "second half completes instruction");
@@ -368,24 +370,23 @@ TEST(test_h3session_qpack_streams) {
     h3uni_recv_free(uni);
     h3session_free(s);
 
-    TEST_CASE("an insert into a table we said we do not have is an encoder-stream error");
+    TEST_CASE("a complete insert is accepted after setting capacity");
     s = h3session_create(65536, 0);
     uni = h3uni_recv_create(6);
-    /* 0xc0 = Insert With Name Reference, static index 0. */
-    const uint8_t insert[] = { 0x02, 0xc0 };
+    const uint8_t insert[] = { 0x02, 0x3f, 0x21, 0xc0, 0x00 };
     h3session_verdict_t v = feed(s, uni, insert, sizeof insert, 0);
-    TEST_ASSERT(v.action == H3SESSION_CONN_ERROR, "fatal");
-    TEST_ASSERT(v.error == QPACK_ENCODER_STREAM_ERROR, "QPACK_ENCODER_STREAM_ERROR");
+    TEST_ASSERT(v.action == H3SESSION_OK, "accepted");
+    TEST_ASSERT(qpack_decoder_insert_count(s->qdec) == 1, "entry inserted");
     h3uni_recv_free(uni);
     h3session_free(s);
 
-    TEST_CASE("a non-zero capacity is refused too");
+    TEST_CASE("capacity above the advertised maximum is refused");
     s = h3session_create(65536, 0);
     uni = h3uni_recv_create(6);
-    const uint8_t cap1[] = { 0x02, 0x21 };   /* Set Dynamic Table Capacity 1 */
+    const uint8_t cap1[] = { 0x02, 0x3f, 0xe2, 0x1f }; /* capacity 4097 */
     v = feed(s, uni, cap1, sizeof cap1, 0);
     TEST_ASSERT(v.action == H3SESSION_CONN_ERROR && v.error == QPACK_ENCODER_STREAM_ERROR,
-                "capacity 1 > 0");
+                "capacity 4097 > 4096");
     h3uni_recv_free(uni);
     h3session_free(s);
 
@@ -423,6 +424,24 @@ TEST(test_h3session_qpack_streams) {
                 "increment 1");
     h3uni_recv_free(uni);
     h3session_free(s);
+}
+
+TEST(test_h3session_qpack_memory_budget) {
+    TEST_SUITE("h3session");
+    TEST_CASE("QPACK session reservation obeys the process memory limit");
+    TEST_ASSERT(quicmemory_current() == 0, "no charge leaked from earlier suites");
+    quicmemory_configure(32767, NULL);
+    h3session_t* s = h3session_create(65536, 0);
+    TEST_ASSERT(s == NULL, "session refused below its fixed QPACK reservation");
+    TEST_ASSERT(quicmemory_current() == 0, "failed reservation is atomic");
+
+    quicmemory_configure(32768, NULL);
+    s = h3session_create(65536, 0);
+    TEST_ASSERT(s != NULL && quicmemory_current() == 32768,
+                "successful session owns its reservation");
+    h3session_free(s);
+    TEST_ASSERT(quicmemory_current() == 0, "session returns its complete reservation");
+    quicmemory_configure(0, NULL);
 }
 
 TEST(test_h3session_goaway) {
