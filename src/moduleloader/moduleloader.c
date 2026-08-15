@@ -145,6 +145,10 @@ int module_loader_config_correct(const char* path) {
     config = appconfig_create(path);
     if (!module_loader_config_load(config, document))
         goto failed;
+#ifdef CWFR_HTTP3
+    if (!quic_policy_validate(&config->env))
+        goto failed;
+#endif
 
     result = 1;
 

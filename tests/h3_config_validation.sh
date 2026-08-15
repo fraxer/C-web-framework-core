@@ -58,4 +58,66 @@ run_invalid http3_pacing 2 || ok=0
 
 [ "$ok" -eq 1 ] || exit 1
 
-printf 'config validation: invalid HTTP/3 types and ranges rejected\n'
+# Reload uses the same validation before the current generation receives
+# shutdown. An invalid candidate must leave its Server worker serving.
+ACTIVE_CONFIG="$WORK_DIR/reload.json"
+sed 's/"http3_pacing": 2/"http3_pacing": true/' \
+    "$WORK_DIR/http3_pacing.json" > "$ACTIVE_CONFIG"
+
+SERVER_PID=
+cleanup() {
+    if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        kill -TERM "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
+"$SERVER" -c "$ACTIVE_CONFIG" -f > "$WORK_DIR/reload.log" 2>&1 &
+SERVER_PID=$!
+
+ready=0
+for _ in $(seq 1 50); do
+    if curl -ksS --max-time 1 -o /dev/null https://127.0.0.1:18458/; then
+        ready=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$ready" -ne 1 ]; then
+    printf 'config validation: valid reload fixture did not start\n' >&2
+    exit 1
+fi
+
+WORKER_TID=
+for task in "/proc/$SERVER_PID/task/"*; do
+    [ -r "$task/comm" ] || continue
+    IFS= read -r comm < "$task/comm"
+    if [ "$comm" = "Server worker" ]; then
+        WORKER_TID=${task##*/}
+        break
+    fi
+done
+if [ -z "$WORKER_TID" ]; then
+    printf 'config validation: Server worker TID not found\n' >&2
+    exit 1
+fi
+
+sed 's/"http3_pacing": true/"http3_pacing": 2/' \
+    "$ACTIVE_CONFIG" > "$ACTIVE_CONFIG.new"
+mv "$ACTIVE_CONFIG.new" "$ACTIVE_CONFIG"
+kill -USR1 "$SERVER_PID"
+sleep 0.5
+
+if ! kill -0 "$SERVER_PID" 2>/dev/null ||
+   [ ! -r "/proc/$SERVER_PID/task/$WORKER_TID/comm" ] ||
+   ! curl -ksS --max-time 2 -o /dev/null https://127.0.0.1:18458/; then
+    printf 'config validation: invalid reload stopped the current generation\n' >&2
+    exit 1
+fi
+
+cleanup
+SERVER_PID=
+trap - EXIT INT TERM
+
+printf 'config validation: invalid startup and reload candidates rejected\n'

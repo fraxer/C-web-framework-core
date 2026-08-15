@@ -261,6 +261,9 @@ typedef struct {
  * which sizes the table, only takes effect on a restart. Nothing frees any of
  * it -- see the comment at the split for why. */
 int quic_policy_init(void);
+/* Validate a parsed, unpublished reload candidate without touching process
+ * policy or exposing it to workers still using the current generation. */
+int quic_policy_validate(const env_t* candidate);
 
 /* The connection defaults, never NULL: before quic_policy_init() runs it
  * returns the built-in ones, which is what a unit test gets. */

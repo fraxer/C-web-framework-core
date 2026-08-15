@@ -304,16 +304,18 @@ const char* __appconfig_get_path(int argc, char* argv[]) {
     return path;
 }
 
-static json_token_t* __env_get_token(const char* key) {
-    if (key == NULL) return NULL;
-    appconfig_t* config = appconfig();
-    if (config == NULL) return NULL;
-    if (config->env.custom_store == NULL) return NULL;
+static json_token_t* __env_config_get_token(const env_t* source, const char* key) {
+    if (source == NULL || key == NULL || source->custom_store == NULL) return NULL;
 
-    json_token_t* root = json_root(config->env.custom_store);
+    json_token_t* root = json_root(source->custom_store);
     if (root == NULL) return NULL;
 
     return json_object_get(root, key);
+}
+
+static json_token_t* __env_get_token(const char* key) {
+    appconfig_t* config = appconfig();
+    return config == NULL ? NULL : __env_config_get_token(&config->env, key);
 }
 
 const char* env_get_string(const char* key, const char* default_value) {
@@ -324,7 +326,14 @@ const char* env_get_string(const char* key, const char* default_value) {
 }
 
 int env_get_string_checked(const char* key, const char** value) {
-    json_token_t* token = __env_get_token(key);
+    appconfig_t* config = appconfig();
+    return env_config_get_string_checked(config == NULL ? NULL : &config->env,
+                                         key, value);
+}
+
+int env_config_get_string_checked(const env_t* source, const char* key,
+                                  const char** value) {
+    json_token_t* token = __env_config_get_token(source, key);
     if (token == NULL) return 0;
     if (!json_is_string(token)) return -1;
     if (value != NULL) *value = json_string(token);
@@ -332,7 +341,14 @@ int env_get_string_checked(const char* key, const char** value) {
 }
 
 int env_get_llong_checked(const char* key, long long* value) {
-    json_token_t* token = __env_get_token(key);
+    appconfig_t* config = appconfig();
+    return env_config_get_llong_checked(config == NULL ? NULL : &config->env,
+                                        key, value);
+}
+
+int env_config_get_llong_checked(const env_t* source, const char* key,
+                                 long long* value) {
+    json_token_t* token = __env_config_get_token(source, key);
     if (token == NULL) return 0;
     if (!json_is_number(token)) return -1;
 
@@ -344,7 +360,14 @@ int env_get_llong_checked(const char* key, long long* value) {
 }
 
 int env_get_bool_checked(const char* key, bool* value) {
-    json_token_t* token = __env_get_token(key);
+    appconfig_t* config = appconfig();
+    return env_config_get_bool_checked(config == NULL ? NULL : &config->env,
+                                       key, value);
+}
+
+int env_config_get_bool_checked(const env_t* source, const char* key,
+                                bool* value) {
+    json_token_t* token = __env_config_get_token(source, key);
     if (token == NULL) return 0;
     if (!json_is_bool(token)) return -1;
     if (value != NULL) *value = json_bool(token);
