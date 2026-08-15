@@ -16,6 +16,9 @@
  *   quicclient [host] [port] [-q] [-p /path] [-a authority] [-n N] [--expect]
  *              [--handshake-only] [--path-challenge] [--key-update] [--cid]
  *              [--migrate] [--new-token [--pause N]]
+ *              [--pause-after-handshake N]
+ *              [--pause-after-request N]
+ *              [--pause-after-response N]
  *              [--loss N] [--loss-in N] [--reorder N] [--dup N] [--seed N]
  *              [--timeout MS]
  *
@@ -51,6 +54,9 @@ int main(int argc, char* argv[]) {
     int migrate = 0;
     int new_token = 0;
     int pause_ms = 0;
+    int pause_after_handshake_ms = 0;
+    int pause_after_request_ms = 0;
+    int pause_after_response_ms = 0;
     unsigned loss = 0, loss_in = 0, reorder = 0, dup = 0;
     unsigned long long seed = 0;
     /* How long to wait for a response. Five seconds is generous for the small
@@ -79,6 +85,12 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--migrate") == 0) migrate = 1;
         else if (strcmp(argv[i], "--new-token") == 0) new_token = 1;
         else if (strcmp(argv[i], "--pause") == 0 && i + 1 < argc) pause_ms = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--pause-after-handshake") == 0 && i + 1 < argc)
+            pause_after_handshake_ms = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--pause-after-request") == 0 && i + 1 < argc)
+            pause_after_request_ms = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--pause-after-response") == 0 && i + 1 < argc)
+            pause_after_response_ms = atoi(argv[++i]);
         else if (strcmp(argv[i], "--loss") == 0 && i + 1 < argc) loss = (unsigned)atoi(argv[++i]);
         else if (strcmp(argv[i], "--loss-in") == 0 && i + 1 < argc) loss_in = (unsigned)atoi(argv[++i]);
         else if (strcmp(argv[i], "--reorder") == 0 && i + 1 < argc) reorder = (unsigned)atoi(argv[++i]);
@@ -89,6 +101,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (concurrent < 1) concurrent = 1;
+    if (timeout_ms < 1) timeout_ms = 1;
 
     printf("connecting to %s:%u\n", host, port);
 
@@ -102,7 +115,7 @@ int main(int argc, char* argv[]) {
         size_t token_len = 0;
 
         if (quicclient_connect(&first, host, port, authority, 0) &&
-            quicclient_run(&first, 5000)) {
+            quicclient_run(&first, timeout_ms)) {
             for (int i = 0; i < 20 && !first.new_token_received; i++)
                 quicclient_pump(&first, 100);
 
@@ -133,7 +146,7 @@ int main(int argc, char* argv[]) {
         quicclient_t second;
         const int ok2 = quicclient_connect_token(&second, host, port, authority, verbose,
                                                  token, token_len) &&
-                        quicclient_run(&second, 5000);
+                        quicclient_run(&second, timeout_ms);
         const int retried = second.retry_seen;
         const int done = second.handshake_complete;
         quicclient_free(&second);
@@ -165,7 +178,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    int ok = quicclient_run(&client, 5000);
+    int ok = quicclient_run(&client, timeout_ms);
+    client.pause_after_request_ms = pause_after_request_ms;
+    client.pause_after_response_ms = pause_after_response_ms;
 
     printf("\n");
     printf("handshake complete:        %s\n", client.handshake_complete ? "yes" : "no");
@@ -184,6 +199,16 @@ int main(int argc, char* argv[]) {
         const SSL_CIPHER* cipher = SSL_get_current_cipher(client.tls.ssl);
         printf("cipher:                    %s\n",
                cipher != NULL ? SSL_CIPHER_get_name(cipher) : "(none)");
+    }
+
+    /* A reload test needs a deterministic point at which the connection has a
+     * live 1-RTT CID but no request has been sent yet.  Sleeping before the
+     * handshake would test only Initial routing; sleeping after the response
+     * would not prove the old routing/config context can still dispatch. */
+    if (ok && pause_after_handshake_ms > 0) {
+        printf("pausing after handshake %d ms\n", pause_after_handshake_ms);
+        fflush(stdout);
+        usleep((useconds_t)pause_after_handshake_ms * 1000);
     }
 
     /* Path validation, before HTTP/3: RFC 9000 §8.2.2 makes answering a

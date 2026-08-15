@@ -2,6 +2,7 @@
 #define __QUICENDPOINT__
 
 #include <stdatomic.h>
+#include <pthread.h>
 
 #include "connection_s.h"
 #include "multiplexing.h"
@@ -62,6 +63,9 @@ typedef struct quicendpoint {
      * before the worker returns to the event loop, and automatically whenever
      * it fills up. */
     udp_tx_batch_t* tx_batch;
+    /* Normally worker-local. During soft handoff the new UDP reader may route
+     * an old CID while the old endpoint's timer/wakeup worker is still alive. */
+    pthread_mutex_t tx_batch_mutex;
 
     /* Last value of the kernel's receive-overflow counter for this socket, so
      * the metric can report the step rather than the running total. */

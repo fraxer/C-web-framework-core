@@ -15,6 +15,7 @@
 #   h3unit   QUIC / HTTP/3 / QPACK unit runner only
 #   fuzz     build the fuzz targets         + FUZZ_SECONDS each
 #   reload   hard reload with live QUIC      + old worker retirement
+#   softreload shared UDP handoff             + old CID/config drain
 #   h3spec   run a server, run h3spec against it           (RFC conformance)
 #
 # The interop matrix (§8.6) is deliberately absent: it needs docker and tens of
@@ -197,6 +198,19 @@ stage_reload() {
     fi
 }
 
+stage_softreload() {
+    say "softreload: old HTTP/3 CID survives config handoff"
+
+    if build "$CI_BUILD_DIR/rel" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes &&
+       "$CORE_DIR/tests/h3_soft_reload.sh" "$CI_BUILD_DIR/rel" \
+             "$CI_BUILD_DIR/h3-soft-reload"; then
+        record softreload OK
+    else
+        record softreload FAIL
+    fi
+}
+
 stage_h3spec() {
     say "h3spec: RFC conformance against a running server"
 
@@ -283,7 +297,7 @@ JSON
 }
 
 STAGES=("$@")
-[ ${#STAGES[@]} -eq 0 ] && STAGES=(noh3 h3unit asan tsan fuzz reload h3spec)
+[ ${#STAGES[@]} -eq 0 ] && STAGES=(noh3 h3unit asan tsan fuzz reload softreload h3spec)
 
 for stage in "${STAGES[@]}"; do
     case "$stage" in
@@ -293,6 +307,7 @@ for stage in "${STAGES[@]}"; do
     h3unit) stage_h3unit ;;
     fuzz)   stage_fuzz ;;
     reload) stage_reload ;;
+    softreload) stage_softreload ;;
     h3spec) stage_h3spec ;;
     *)      echo "unknown stage: $stage" >&2; exit 2 ;;
     esac

@@ -477,6 +477,17 @@ capacity динамических receive/send/CRYPTO-буферов. При и�
 | `shutdown` (мягкий) | Перестать принимать новые Initial (отвечать `CONNECTION_REFUSED`); по каждому соединению — h3 GOAWAY, дождаться потоков, `CONNECTION_CLOSE(H3_NO_ERROR)`; закрыть UDP-сокет, когда соединений не осталось |
 | `reload: soft` | Новое поколение получает единственного UDP-reader общего socket handle; старые CID, соединения, reset/token keys и routing/config-контекст живут до дренажа; новые Initial принимает только новое поколение |
 | `reload: hard` | QUIC connections немедленно удаляются из CID/worker-учёта, listener/timer/eventfd снимаются из epoll, transport handle освобождается; GOAWAY и drain window нет |
+
+Переходное окно между `old_config.shutdown=1` и снятием старого reader тоже
+является частью контракта. Старый endpoint продолжает маршрутизировать известные
+CID, но молча пропускает неизвестный Initial: PTO клиента повторит его уже
+единственному reader нового поколения. Отвечать здесь `CONNECTION_REFUSED`
+нельзя — это превращает безопасную гонку handoff в отказ нового подключения.
+
+Datagram старого CID читает новый endpoint, но пакет ответа всё ещё строится в
+`tx_batch` endpoint-владельца старого соединения. Поэтому batch защищён
+коротким mutex, а cross-generation route явно flush-ит именно owner endpoint;
+обычный flush нового reader иначе оставляет старый ответ в памяти навсегда.
 | SIGTERM с таймаутом | По истечении — `CONNECTION_CLOSE(NO_ERROR)` всем и выход |
 
 Дренаж встраивается в `__mpx_on_tick` рядом с `h2_server_tick()`:

@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "h3frame.h"
 #include "h3unistream.h"
@@ -212,11 +213,19 @@ int h3client_get(quicclient_t* client, uint64_t stream_id,
      * until the request is complete. */
     if (!quicclient_stream_write(client, stream_id, req, n, 1)) return 0;
 
+    if (client->pause_after_request_ms > 0) {
+        if (!quicclient_flush(client)) return 0;
+        printf("pausing after request %d ms\n", client->pause_after_request_ms);
+        fflush(stdout);
+        usleep((useconds_t)client->pause_after_request_ms * 1000);
+    }
+
     h3frame_parser_t parser;
     h3frame_parser_init(&parser);
 
     int headers_seen = 0;
     int complete = 0;
+    int response_paused = 0;
     const uint64_t deadline = quic_now_us() + (uint64_t)timeout_ms * 1000;
 
     while (quic_now_us() < deadline) {
@@ -225,6 +234,13 @@ int h3client_get(quicclient_t* client, uint64_t stream_id,
         if (!__consume(client, stream_id, &parser, out, &headers_seen)) {
             h3frame_parser_free(&parser);
             return 0;
+        }
+
+        if (!response_paused && out->body_len > 0 && client->pause_after_response_ms > 0) {
+            response_paused = 1;
+            printf("pausing after response data %d ms\n", client->pause_after_response_ms);
+            fflush(stdout);
+            usleep((useconds_t)client->pause_after_response_ms * 1000);
         }
 
         /* Done when the server has finished its half, without gaps, and nothing

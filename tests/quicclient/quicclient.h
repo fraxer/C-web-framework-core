@@ -116,6 +116,9 @@ typedef struct quicclient_rxstats {
 
 typedef struct quicclient {
     int fd;
+    /* Test-only scheduling point used by the soft-reload integration case. */
+    int pause_after_request_ms;
+    int pause_after_response_ms;
     struct sockaddr_in server;
 
     SSL_CTX* ssl_ctx;

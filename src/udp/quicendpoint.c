@@ -837,6 +837,28 @@ static void __send_version_negotiation(quicendpoint_t* ep, const udp_datagram_t*
     metrics_quic_add(METRICS_QUIC_BYTES_SENT, (unsigned long long)sent);
 }
 
+static void __send_flush_locked(quicendpoint_t* endpoint) {
+    const size_t queued = udp_tx_batch_count(endpoint->tx_batch);
+    if (queued == 0) return;
+
+    size_t bytes = 0;
+    const int sent = udp_tx_batch_flush(endpoint->tx_batch, endpoint->fd, &bytes);
+    if (sent < 0) {
+        metrics_quic_add(METRICS_QUIC_SEND_ERROR, (unsigned long long)queued);
+        return;
+    }
+
+    if (sent > 0) {
+        metrics_quic_add(METRICS_QUIC_DGRAM_SENT, (unsigned long long)sent);
+        metrics_quic_add(METRICS_QUIC_BYTES_SENT, (unsigned long long)bytes);
+    }
+
+    QUICBEACON("TX    datagrams=%d bytes=%zu", sent, bytes);
+    if ((size_t)sent < queued)
+        metrics_quic_add(METRICS_QUIC_SEND_ERROR,
+                         (unsigned long long)(queued - (size_t)sent));
+}
+
 ssize_t quicendpoint_send(quicendpoint_t* endpoint, const uint8_t* data, size_t len,
                           const quicpath_t* path) {
     if (endpoint == NULL || data == NULL || path == NULL) return -1;
@@ -852,6 +874,7 @@ ssize_t quicendpoint_send(quicendpoint_t* endpoint, const uint8_t* data, size_t 
     const struct sockaddr_storage* local = path->local_len > 0 ? &path->local : NULL;
 
     if (endpoint->tx_batch != NULL) {
+        pthread_mutex_lock(&endpoint->tx_batch_mutex);
         int queued = udp_tx_batch_add(endpoint->tx_batch, data, len, peer,
                                       path->remote_len, local);
 
@@ -860,11 +883,12 @@ ssize_t quicendpoint_send(quicendpoint_t* endpoint, const uint8_t* data, size_t 
          * datagram) and falls through to the single send below, which reports
          * EMSGSIZE honestly. */
         if (queued == 0 && udp_tx_batch_count(endpoint->tx_batch) > 0) {
-            quicendpoint_send_flush(endpoint);
+            __send_flush_locked(endpoint);
             queued = udp_tx_batch_add(endpoint->tx_batch, data, len, peer,
                                       path->remote_len, local);
         }
 
+        pthread_mutex_unlock(&endpoint->tx_batch_mutex);
         if (queued == 1) return (ssize_t)len;
     }
 
@@ -886,31 +910,9 @@ ssize_t quicendpoint_send(quicendpoint_t* endpoint, const uint8_t* data, size_t 
 
 void quicendpoint_send_flush(quicendpoint_t* endpoint) {
     if (endpoint == NULL || endpoint->tx_batch == NULL || endpoint->fd == -1) return;
-
-    const size_t queued = udp_tx_batch_count(endpoint->tx_batch);
-    if (queued == 0) return;
-
-    size_t bytes = 0;
-    const int sent = udp_tx_batch_flush(endpoint->tx_batch, endpoint->fd, &bytes);
-
-    if (sent < 0) {
-        metrics_quic_add(METRICS_QUIC_SEND_ERROR, (unsigned long long)queued);
-        return;
-    }
-
-    /* Counted here rather than at queue time, so the metric keeps meaning what
-     * it always meant: datagrams the kernel took. What it refused is loss, and
-     * loss recovery is what answers for it. */
-    if (sent > 0) {
-        metrics_quic_add(METRICS_QUIC_DGRAM_SENT, (unsigned long long)sent);
-        metrics_quic_add(METRICS_QUIC_BYTES_SENT, (unsigned long long)bytes);
-    }
-
-    QUICBEACON("TX    datagrams=%d bytes=%zu", sent, bytes);
-
-    if ((size_t)sent < queued)
-        metrics_quic_add(METRICS_QUIC_SEND_ERROR,
-                         (unsigned long long)(queued - (size_t)sent));
+    pthread_mutex_lock(&endpoint->tx_batch_mutex);
+    __send_flush_locked(endpoint);
+    pthread_mutex_unlock(&endpoint->tx_batch_mutex);
 }
 
 void quicendpoint_wake(quicendpoint_t* endpoint, struct quicconn* conn) {
@@ -1277,7 +1279,7 @@ static int __h3_turn(quicconn_t* conn, uint64_t now) {
 
 /* Hand a datagram to a connection and let it answer. */
 static void __route(quicendpoint_t* ep, quicconn_t* conn, udp_datagram_t* dgram) {
-    (void)ep;
+    quicendpoint_t* owner = conn->endpoint;
 
     quicpath_t path;
     memset(&path, 0, sizeof path);
@@ -1345,10 +1347,12 @@ static void __route(quicendpoint_t* ep, quicconn_t* conn, udp_datagram_t* dgram)
 
     if (!alive || conn->state == QUICCONN_DEAD) {
         conn->conn.close(&conn->conn);   /* releases the lock */
+        if (owner != ep) quicendpoint_send_flush(owner);
         return;
     }
 
     connection_s_unlock(&conn->conn);
+    if (owner != ep) quicendpoint_send_flush(owner);
 }
 
 static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
@@ -1459,6 +1463,20 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
      * connection we never had would also land here, and quicconn_accept will
      * fail to make sense of it -- which is the right disposition for it
      * anyway, since without the Initial there are no keys to read it with. */
+    /* SIGUSR1 marks the generation before its worker gets another epoll turn.
+     * In that interval this old endpoint may still be the socket reader.  It
+     * must continue routing known CIDs above, but must not accept an Initial
+     * into a generation that is already shutting down.  Silence is deliberate:
+     * the new reader is about to take the same socket and the client's PTO will
+     * retransmit there.  CONNECTION_REFUSED would instead terminate a perfectly
+     * valid connection attempt solely because it landed in the handoff window. */
+    const appconfig_t* generation = (const appconfig_t*)ep->generation;
+    if (generation != NULL &&
+        atomic_load_explicit(&generation->shutdown, memory_order_acquire) &&
+        generation->env.main.reload == APPCONFIG_RELOAD_SOFT &&
+        !appconfig_terminating())
+        return;
+
     if (ep->draining) {
         /* §5 of docs/http3/07: a server on its way out says so rather than
          * going quiet, so the client can go elsewhere immediately instead of
@@ -1865,6 +1883,7 @@ static void __endpoint_free(quicendpoint_t* ep) {
 
     udp_rx_batch_free(ep->rx);
     udp_tx_batch_free(ep->tx_batch);
+    pthread_mutex_destroy(&ep->tx_batch_mutex);
     cqueue_clear(&ep->listener.servers);
     free(ep);
 }
@@ -1875,6 +1894,10 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server,
     if (ep == NULL) return NULL;
 
     memset(ep, 0, sizeof * ep);
+    if (pthread_mutex_init(&ep->tx_batch_mutex, NULL) != 0) {
+        free(ep);
+        return NULL;
+    }
     ep->fd = -1;
     ep->timerfd = -1;
     ep->eventfd = -1;
