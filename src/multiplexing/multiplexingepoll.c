@@ -144,9 +144,20 @@ void __mpx_epoll_free(void* arg) {
 
 /* A QUIC connection has no registration of its own: it shares the endpoint's
  * one socket, and readiness for it is not something epoll can report. The
- * bookkeeping -- the worker's connection list and count -- still applies, since
- * the timer sweep and the shutdown drain walk it. Only the epoll_ctl is
- * replaced (docs/http3/01-udp-endpoint.md §3). */
+ * count still applies -- it is what keeps a draining worker alive until the
+ * last connection is gone -- but the worker's connection *list* does not
+ * (docs/http3/01-udp-endpoint.md §3).
+ *
+ * The list is deliberate, not an oversight. It has exactly one reader, the
+ * worker tick, and that reader skips every QUIC connection: they are aged
+ * through their endpoint's own list instead, because the send queue that has
+ * to be drained with them belongs to the endpoint. So membership bought a QUIC
+ * connection nothing -- and cost something, because `api->conns` is unlocked
+ * on the premise that only the owning worker touches it, while a QUIC
+ * connection can be closed by whichever worker the kernel handed its last
+ * datagram to (docs/http3/09-options.md §2.6). Rehoming makes that no longer
+ * rare, so the premise is restored here rather than defended with a lock the
+ * TCP path would pay for. */
 #ifdef CWFR_HTTP3
 #define QUIC_CONNECTION(c) ((c)->transport == CONN_TRANSPORT_QUIC)
 #else
@@ -161,7 +172,8 @@ int __mpx_epoll_control_add(connection_t* connection, int events) {
     connection_server_ctx_t* ctx = connection->ctx;
     if (result) {
         ctx->listener->api->connection_count++;
-        __mpx_conns_add(ctx->listener->api, connection);
+        if (!QUIC_CONNECTION(connection))
+            __mpx_conns_add(ctx->listener->api, connection);
     }
 
     return result;
@@ -189,7 +201,8 @@ int __mpx_epoll_control_del(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
     if (result) {
         ctx->listener->api->connection_count--;
-        __mpx_conns_remove(ctx->listener->api, connection);
+        if (!QUIC_CONNECTION(connection))
+            __mpx_conns_remove(ctx->listener->api, connection);
     }
 
     return result;

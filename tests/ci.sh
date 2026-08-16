@@ -16,6 +16,7 @@
 #   config   invalid HTTP/3 types/ranges reject startup
 #   limits   process connection/memory exhaustion and drain
 #   soak     sustained requests, impairment, migration and RSS drain
+#   affinity a migrated connection follows its datagrams to the new worker
 #   benchmark median req/s and throughput against a runner-local baseline
 #   fuzz     build the fuzz targets         + FUZZ_SECONDS each
 #   reload   hard reload with live QUIC      + old worker retirement
@@ -177,6 +178,28 @@ stage_soak() {
         record soak OK
     else
         record soak FAIL
+    fi
+}
+
+stage_affinity() {
+    say "affinity: a migrated connection follows its datagrams to the new worker"
+    if ! build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+               -DINCLUDE_HTTP3=yes -DSANITIZE=none; then
+        record affinity FAIL
+        return
+    fi
+
+    H3_AFFINITY_PORT=18462 "$CORE_DIR/tests/h3_affinity.sh" \
+        "$CI_BUILD_DIR/limits" "$CI_BUILD_DIR/h3-affinity"
+    local status=$?
+    if [ "$status" -eq 0 ]; then
+        record affinity OK
+    elif [ "$status" -eq 77 ]; then
+        # Every migrated 4-tuple hashed back to its own worker. Rare, and not a
+        # failure: there was nothing for the mechanism to do.
+        record affinity SKIP
+    else
+        record affinity FAIL
     fi
 }
 
@@ -396,7 +419,7 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit config limits soak earlydata benchmark asan tsan fuzz reload softreload h3spec)
+ALL_STAGES=(noh3 h3unit config limits soak affinity earlydata benchmark asan tsan fuzz reload softreload h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
@@ -416,6 +439,7 @@ for stage in "${STAGES[@]}"; do
     config) stage_config ;;
     limits) stage_limits ;;
     soak)    stage_soak ;;
+    affinity) stage_affinity ;;
     earlydata) stage_earlydata ;;
     benchmark) stage_benchmark ;;
     fuzz)   stage_fuzz ;;

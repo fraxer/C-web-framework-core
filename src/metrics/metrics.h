@@ -246,6 +246,29 @@ typedef enum {
     METRICS_QUIC_MIGRATION_VALIDATED,
     METRICS_QUIC_MIGRATION_REJECTED,
 
+    /* Which worker a datagram was served on, relative to the worker that owns
+     * the connection (docs/http3/09-options.md §2.6).
+     *
+     * The kernel picks the worker by hashing the 4-tuple; QUIC addresses a
+     * connection by its id and survives the 4-tuple changing. So a datagram can
+     * arrive at a worker that does not own the connection, and is then served
+     * there -- correct, because the workers are threads of one process, but it
+     * costs the connection's cache lines a trip between cores.
+     *
+     * These two are what tells the routing anomaly apart from the routine case:
+     * `foreign` climbing while nothing migrates means a NAT is rewriting ports
+     * under the connection, and `foreign` in proportion to `migrations.validated`
+     * is simply what migration does here. */
+    METRICS_QUIC_ROUTE_LOCAL,
+    METRICS_QUIC_ROUTE_FOREIGN,
+    /* Connections that followed their datagrams to another worker. One per
+     * path move, so it tracks `migrations.validated` on a healthy server; a
+     * count far above it means something is moving clients between workers
+     * without a migration, and a count of zero while `foreign` climbs means
+     * every attempt was refused (a reload draining, or the connection waiting
+     * in the old worker's send queue). */
+    METRICS_QUIC_ROUTE_REHOMED,
+
     METRICS_QUIC__COUNT
 } metrics_quic_t;
 

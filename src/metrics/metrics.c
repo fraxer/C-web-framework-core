@@ -60,7 +60,8 @@ static const char* const __quic_name[METRICS_QUIC__COUNT] = {
     "closed.idle_timeout", "closed.local_error", "closed.peer",
     "refused.at_capacity", "refused.handshake_rate",
     "retry_sent", "token_valid", "token_invalid",
-    "migrations.attempted", "migrations.validated", "migrations.rejected"
+    "migrations.attempted", "migrations.validated", "migrations.rejected",
+    "routing.local", "routing.foreign", "routing.rehomed"
 };
 
 /* Index-matched to metrics_h3_t. */

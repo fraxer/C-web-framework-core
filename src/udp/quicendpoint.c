@@ -1469,10 +1469,99 @@ static int __h3_turn(quicconn_t* conn, uint64_t now) {
     return 1;
 }
 
+/* How many datagrams in a row have to arrive at the wrong worker before the
+ * connection follows them. Reached in microseconds once a path has moved, and
+ * never by a NAT that alternates between two ports, which is the whole point of
+ * counting a run rather than a total. */
+#define QUIC_REHOME_STREAK 8
+
+/* Move a connection to the worker its datagrams now arrive at
+ * (docs/http3/09-options.md §2.6).
+ *
+ * Called with the connection lock held and before the datagram is processed, so
+ * that everything this turn may do -- send, wake, and above all close -- happens
+ * on the endpoint that from now on owns the connection.
+ *
+ * What moves is the endpoint's own bookkeeping: the sweep list and the pointer
+ * every send path reads. What does not move is the connection_t's registration
+ * with the accepting worker's api, because nothing about it is per worker
+ * except a count that is atomic; a worker whose connection has been rehomed
+ * simply waits for it to close before it can retire, which a drain does anyway.
+ *
+ * Returns the endpoint that owns the connection afterwards. */
+static quicendpoint_t* __rehome(quicendpoint_t* ep, quicconn_t* conn,
+                                quicendpoint_t* owner) {
+    /* Not across reload generations: during a soft handoff exactly one endpoint
+     * reads the socket, so every datagram looks foreign and moving connections
+     * to it would defeat the drain that is retiring them. Nor into or out of an
+     * endpoint that is shutting down, for the same reason. */
+    if (ep == owner || ep->generation != owner->generation ||
+        ep->draining || owner->draining)
+        return owner;
+
+    /* A connection waiting in the old endpoint's send queue is moved anyway.
+     * Refusing on that condition was tried first and refused almost every time:
+     * a connection streaming a response is queued for send nearly continuously,
+     * so the one case rehoming is most worth doing is the one it never got to
+     * do (23 % of datagrams still foreign, against 1 % once this was dropped).
+     * The old worker serves that pending entry through the new endpoint's batch
+     * and flushes it there -- __endpoint_tick handles that explicitly -- and
+     * every publication after this point queues on the new endpoint, because
+     * publishers read conn->endpoint under the lock this call holds. */
+
+    /* Both lists at once, ordered by address: the sweep of either endpoint may
+     * be walking its own at this moment, and a connection must never be absent
+     * from both or present in both. */
+    quicendpoint_t* first = owner < ep ? owner : ep;
+    quicendpoint_t* second = owner < ep ? ep : owner;
+    pthread_mutex_lock(&first->conns_mutex);
+    pthread_mutex_lock(&second->conns_mutex);
+
+    quicconn_t** link = &owner->conns;
+    int unlinked = 0;
+
+    /* The check above again, now that the lists are held. A hard reload closes
+     * every connection of an endpoint once and then stops reading its socket
+     * (quicendpoints_abort), so a connection linked into it a moment later
+     * would be owned by a worker that has already said goodbye to all of them.
+     * Abort raises the flag under this same lock, which is what makes the two
+     * orders exclusive: either it is seen here, or the connection is already in
+     * the list abort is about to walk. */
+    if (ep->draining || owner->draining) link = NULL;
+
+    while (link != NULL && *link != NULL) {
+        if (*link == conn) {
+            *link = conn->ep_next;
+            if (owner->conn_count > 0) owner->conn_count--;
+            unlinked = 1;
+            break;
+        }
+        link = &(*link)->ep_next;
+    }
+
+    if (unlinked) {
+        conn->ep_next = ep->conns;
+        ep->conns = conn;
+        ep->conn_count++;
+        /* Last, and under both locks: a sweep that reads this field under the
+         * old endpoint's lock uses it to notice that the connection it is
+         * holding has left the list it is walking. */
+        conn->endpoint = ep;
+    }
+
+    pthread_mutex_unlock(&second->conns_mutex);
+    pthread_mutex_unlock(&first->conns_mutex);
+
+    if (!unlinked) return owner;
+
+    conn->foreign_streak = 0;
+    metrics_quic(METRICS_QUIC_ROUTE_REHOMED);
+
+    return ep;
+}
+
 /* Hand a datagram to a connection and let it answer. */
 static void __route(quicendpoint_t* ep, quicconn_t* conn, udp_datagram_t* dgram) {
-    quicendpoint_t* owner = conn->endpoint;
-
     quicpath_t path;
     memset(&path, 0, sizeof path);
     path.remote = dgram->peer;
@@ -1489,6 +1578,22 @@ static void __route(quicendpoint_t* ep, quicconn_t* conn, udp_datagram_t* dgram)
      * connection may land on a different worker, since the kernel hashes the
      * 4-tuple and QUIC does not (ADR-3). */
     connection_s_lock(&conn->conn, LOCK_SITE_QUIC_RECV);
+
+    /* Read under the lock: rehoming writes it there, and this is the field the
+     * whole turn below sends and wakes through. */
+    quicendpoint_t* owner = conn->endpoint;
+
+    if (owner == ep) {
+        conn->foreign_streak = 0;
+        metrics_quic(METRICS_QUIC_ROUTE_LOCAL);
+    }
+    else {
+        conn->foreign_streak++;
+        metrics_quic(METRICS_QUIC_ROUTE_FOREIGN);
+
+        if (conn->foreign_streak >= QUIC_REHOME_STREAK)
+            owner = __rehome(ep, conn, owner);
+    }
 
     /* Handshakes still in progress are what `http3_retry: auto` watches, and
      * this is the one place that sees a connection leave that state. */
@@ -1785,8 +1890,12 @@ static void __endpoint_timer_arm(quicendpoint_t* ep) {
     pthread_mutex_unlock(&ep->conns_mutex);
 
     while (conn != NULL) {
+        /* Same rule as the sweep: a rehomed connection's successor belongs to
+         * another endpoint's list, so the walk stops rather than follow it. The
+         * deadline it would have contributed is armed by the worker that now
+         * owns it, on its own timer. */
         pthread_mutex_lock(&ep->conns_mutex);
-        quicconn_t* next = conn->ep_next;
+        quicconn_t* next = conn->endpoint == ep ? conn->ep_next : NULL;
         if (next != NULL) connection_s_inc(&next->conn);
         pthread_mutex_unlock(&ep->conns_mutex);
 
@@ -2318,6 +2427,13 @@ static void __endpoint_tick(quicendpoint_t* ep, int shutdown_now) {
 
         connection_s_lock(&pending->conn, LOCK_SITE_QUIC_SEND);
 
+        /* Queued here, but rehomed to another worker since (§2.6): the packets
+         * this turn builds go into that endpoint's batch, so that is the one
+         * that has to be flushed. The turn itself runs here rather than being
+         * handed back, because the connection is already locked and the entry
+         * is the last one this queue will ever hold for it. */
+        quicendpoint_t* pending_owner = pending->endpoint;
+
         /* This is the path a handler thread's response arrives on: it set
          * need_write and queued the connection, and the filter chain has not
          * run yet. Running it here rather than in the handler thread keeps the
@@ -2333,6 +2449,8 @@ static void __endpoint_tick(quicendpoint_t* ep, int shutdown_now) {
         else
             connection_s_unlock(&pending->conn);
 
+        if (pending_owner != ep) quicendpoint_send_flush(pending_owner);
+
         pending = next;
     }
 
@@ -2344,9 +2462,17 @@ static void __endpoint_tick(quicendpoint_t* ep, int shutdown_now) {
     while (conn != NULL) {
         /* Capture a referenced successor under the list lock. A packet routed
          * by the new reload generation may close and unlink either connection
-         * while this old endpoint is sweeping its timers. */
+         * while this old endpoint is sweeping its timers.
+         *
+         * A connection that has been rehomed since the last iteration is no
+         * longer in this list, and its `ep_next` now belongs to another
+         * endpoint's -- which another worker is free to rewrite under a lock
+         * this thread does not hold. There is no way back to our place in the
+         * list from here, so the sweep ends and the remainder is aged on the
+         * next tick; anything receiving traffic is ticked on its receive path
+         * anyway. */
         pthread_mutex_lock(&ep->conns_mutex);
-        quicconn_t* next = conn->ep_next;
+        quicconn_t* next = conn->endpoint == ep ? conn->ep_next : NULL;
         if (next != NULL) connection_s_inc(&next->conn);
         pthread_mutex_unlock(&ep->conns_mutex);
 
@@ -2527,7 +2653,13 @@ void quicendpoints_handoff(quicendpoint_t* endpoints) {
 
 void quicendpoints_abort(quicendpoint_t* endpoints) {
     for (quicendpoint_t* ep = endpoints; ep != NULL; ep = ep->next) {
+        /* Under the list lock, so that a rehome deciding at this moment either
+         * sees the flag and leaves the connection where it is, or gets it into
+         * the list before the loop below empties it (§2.6). */
+        pthread_mutex_lock(&ep->conns_mutex);
         ep->draining = 1;
+        pthread_mutex_unlock(&ep->conns_mutex);
+
         while (ep->conns != NULL) {
             quicconn_t* conn = ep->conns;
             connection_s_lock(&conn->conn, LOCK_SITE_CLOSE);

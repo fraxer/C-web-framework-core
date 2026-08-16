@@ -301,6 +301,8 @@ quic.rtt_us{p50,p90,p99}, quic.cwnd_bytes{p50,p99}
 quic.packets_lost, quic.loss_rate, quic.pto_fired, quic.persistent_congestion
 quic.key_updates, quic.decrypt_failures
 quic.migrations{attempted,validated,rejected}
+quic.routing{local,foreign,rehomed}  — на каком воркере обслужена датаграмма
+                                       относительно владельца соединения (09 §2.6)
 quic.streams_open, quic.streams_reset
 quic.flow_blocked{conn,stream}
 quic.amplification_limited     — сколько раз упёрлись в 3x

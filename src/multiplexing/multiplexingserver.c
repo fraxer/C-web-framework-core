@@ -344,7 +344,10 @@ static void __mpx_on_tick(mpxapi_t* api) {
         connection_t* next = connection->next;
 
         /* QUIC connections are aged by their endpoint instead: the send queue
-         * they share belongs to it, and draining that is half the work. */
+         * they share belongs to it, and draining that is half the work. They no
+         * longer reach this list at all (__mpx_epoll_control_add), so the guard
+         * is what keeps the endpoint's own timer and eventfd connections -- TCP
+         * descriptors by construction -- out of the h2/h1.1 branches below. */
         if (connection->transport == CONN_TRANSPORT_TCP) {
             connection_server_ctx_t* ctx = connection->ctx;
             if (ctx->is_http2)

@@ -317,6 +317,22 @@ typedef struct quicconn {
 
     struct quicconn* ep_next;   /* endpoint's connection list */
     struct quicconn* tx_next;   /* endpoint's send queue */
+
+    /* Consecutive datagrams served by a worker other than the owner
+     * (docs/http3/09-options.md §2.6).
+     *
+     * The kernel picks the worker by hashing the 4-tuple, and a client that
+     * migrates or sits behind a NAT that rewrites its port changes that hash
+     * without changing the connection. From then on every datagram arrives at a
+     * worker that does not own the connection, while the owner keeps sweeping
+     * it and draining its send queue -- two cores on one connection for the
+     * rest of its life.
+     *
+     * Consecutive, not cumulative, on purpose: a run of them means the path
+     * moved, whereas a NAT alternating between two ports produces a steady
+     * trickle that no amount of rehoming would fix. Written under
+     * connection_s_lock, like everything else the receive path touches. */
+    uint32_t foreign_streak;
     /* One process-wide connection-limit reservation. It is acquired before
      * allocation and cleared exactly once by endpoint detach/error rollback. */
     int process_slot_reserved;
