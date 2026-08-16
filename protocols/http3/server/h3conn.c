@@ -502,6 +502,12 @@ static h3conn_result_t __read_request(h3conn_t* c, quicconn_t* qc, quicstream_t*
                  * honest reading: those responses answered no request. */
                 metrics_h3(METRICS_H3_REQUESTS);
 
+                /* A request is also what pays for the PRIORITY_UPDATE frames
+                 * that come with it (h3session.h). Granted on the request
+                 * itself rather than on the stream opening: a stream that never
+                 * produces a request bought nothing. */
+                h3session_priority_earn(c->session);
+
                 /* §5.2: once we have said we will not serve this stream, the
                  * honest answer is to say so at once. H3_REQUEST_REJECTED is
                  * the code that tells a client the request was untouched and is

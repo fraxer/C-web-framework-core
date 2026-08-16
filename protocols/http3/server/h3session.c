@@ -19,6 +19,16 @@
 #define H3_DEFAULT_CTRL_RATE   100
 #define H3_DEFAULT_CTRL_BURST  200
 
+/* PRIORITY_UPDATE credit (h3session.h). Not operator-tunable, because the
+ * numbers are not a policy choice: they follow from what clients send. Chrome
+ * sends two frames per request, so four per request never binds an honest
+ * peer; the initial grant covers the frames that arrive before the requests
+ * they refer to (§7 allows that order, and over QUIC it is routine); the cap
+ * stops an idle connection from banking credit forever. */
+#define H3_PRIORITY_CREDIT_INITIAL     256
+#define H3_PRIORITY_CREDIT_PER_REQUEST 4
+#define H3_PRIORITY_CREDIT_MAX         1024
+
 /* Encoder-side policy. The peer SETTINGS are upper bounds, not a request to
  * consume all advertised memory. Keep the first production step deliberately
  * small while still gaining reuse for ordinary response headers. */
@@ -168,6 +178,30 @@ int h3session_ctrl_spend(h3session_t* s) {
     return 0;
 }
 
+/* Not a leaky bucket: time grants nothing here. Credit comes from requests, so
+ * a peer that spends it without making any never gets more, however long it
+ * waits. */
+int h3session_priority_spend(h3session_t* s) {
+    if (s == NULL) return 1;
+
+    if (s->priority_credit > 0) {
+        s->priority_credit--;
+        return 1;
+    }
+
+    metrics_h3(METRICS_H3_ABUSE_PRIORITY_BUDGET);
+
+    return 0;
+}
+
+void h3session_priority_earn(h3session_t* s) {
+    if (s == NULL) return;
+
+    s->priority_credit += H3_PRIORITY_CREDIT_PER_REQUEST;
+    if (s->priority_credit > H3_PRIORITY_CREDIT_MAX)
+        s->priority_credit = H3_PRIORITY_CREDIT_MAX;
+}
+
 /* ---- Verdict helpers ---- */
 
 static h3session_verdict_t __ok(void) {
@@ -253,6 +287,7 @@ h3session_t* h3session_create(uint64_t max_field_section_size, int enable_connec
     s->ctrl_epoch_ms = s->abort_epoch_ms;
     s->abort_tokens = atomic_load(&h3_abort_burst) * 1000;
     s->ctrl_tokens = atomic_load(&h3_ctrl_burst) * 1000;
+    s->priority_credit = H3_PRIORITY_CREDIT_INITIAL;
 
     return s;
 }
@@ -350,7 +385,7 @@ int h3session_take_priority(h3session_t* s, h3session_priority_t* out) {
 
 static h3session_verdict_t __priority_update(h3session_t* s, h3uni_recv_t* uni,
                                              int push) {
-    if (!h3session_ctrl_spend(s)) return __conn(H3_EXCESSIVE_LOAD);
+    if (!h3session_priority_spend(s)) return __conn(H3_EXCESSIVE_LOAD);
 
     uint64_t element = 0;
     const size_t n = varint_read(uni->frames.payload, uni->frames.payload_len, &element);

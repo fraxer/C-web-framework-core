@@ -71,7 +71,7 @@ static const char* const __h3_name[METRICS_H3__COUNT] = {
     "requests",
     "responses.1xx", "responses.2xx", "responses.3xx", "responses.4xx", "responses.5xx",
     "streams_cancelled", "requests_rejected", "goaway_sent",
-    "abuse.abort_budget", "abuse.ctrl_budget",
+    "abuse.abort_budget", "abuse.ctrl_budget", "abuse.priority_budget",
     "abuse.field_section_too_large", "abuse.field_section_hard_cap",
     "abuse.body_too_large",
     "misdirected",

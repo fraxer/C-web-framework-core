@@ -159,6 +159,22 @@ typedef struct h3session {
     int64_t      ctrl_tokens;
     uint64_t     ctrl_epoch_ms;
 
+    /* PRIORITY_UPDATE is not paid for out of either bucket, and the reason is
+     * the frame itself: a browser sends one (Chrome sends two) per request, so
+     * its rate is the request rate, not a flood rate. Charging it to the
+     * control bucket -- 100 frames/s -- capped an honest client at ~50 requests
+     * per second per connection and closed the connection with
+     * H3_EXCESSIVE_LOAD on anything faster, which is what a page being reloaded
+     * quickly looks like. Chrome then marks the alternative service broken and
+     * stops offering h3 for hours.
+     *
+     * So the limit is tied to what actually bounds the peer: streams. Credit is
+     * granted per request accepted, which the peer cannot raise without opening
+     * streams -- and those are bounded by MAX_STREAMS. A peer that sends
+     * PRIORITY_UPDATE without ever making a request runs out of the initial
+     * grant and is closed; one that makes requests is never limited by this. */
+    int64_t      priority_credit;
+
     /* PRIORITY_UPDATE frames that have been accepted and not yet handed to the
      * transport (RFC 9218 §7). A queue rather than a field on the verdict,
      * because one feed can carry several frames and a verdict describes the
@@ -192,6 +208,14 @@ int h3session_abort_spend(h3session_t* s);
  * MAX_PUSH_ID that changes no state, or a frame type we skip. Each is legal,
  * costs the peer almost nothing to send, and makes us parse. */
 int h3session_ctrl_spend(h3session_t* s);
+
+/* Charge one PRIORITY_UPDATE. Returns 0 when the credit is spent and the caller
+ * must close the connection with H3_EXCESSIVE_LOAD. */
+int h3session_priority_spend(h3session_t* s);
+
+/* Grant the credit an accepted request carries. Called once per request, from
+ * the same place that counts one. */
+void h3session_priority_earn(h3session_t* s);
 
 /* What we advertise as SETTINGS_MAX_FIELD_SECTION_SIZE, from the policy. */
 uint64_t h3_policy_max_field_section_size(void);

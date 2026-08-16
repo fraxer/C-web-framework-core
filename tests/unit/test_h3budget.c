@@ -160,3 +160,106 @@ TEST(test_h3budget_abort) {
     }
     h3conn_free(c);
 }
+
+/* One PRIORITY_UPDATE naming `stream_id`, ready for the control stream. */
+static size_t priority_frame(uint8_t* out, size_t cap, uint64_t stream_id) {
+    uint8_t payload[32];
+    size_t n = varint_write(payload, sizeof payload, stream_id);
+    memcpy(payload + n, "u=3", 3);
+    n += 3;
+
+    return h3frame_write(out, cap, H3_FRAME_PRIORITY_UPDATE_REQUEST, payload, n);
+}
+
+TEST(test_h3budget_priority) {
+    TEST_SUITE("h3budget");
+
+    /* PRIORITY_UPDATE used to be charged to the control budget, and that made
+     * the limit fire on ordinary browsing: Chrome sends two frames per request,
+     * so 100 frames/s capped a connection at ~50 requests/s and closed it with
+     * H3_EXCESSIVE_LOAD on anything faster -- a page held on reload. The credit
+     * that replaced it comes from requests, so these two cases are the whole
+     * claim: requests pay for their own frames, and frames without requests
+     * still run out. */
+
+    TEST_CASE("a browser's rate -- two frames per request -- is never charged");
+    h3conn_t* c = h3conn_create(NULL, 65536, 0);
+
+    uint8_t ctrl[32];
+    ctrl[0] = 0x00;   /* control stream type */
+    size_t cn = 1 + h3frame_write(ctrl + 1, sizeof ctrl - 1, H3_FRAME_SETTINGS, NULL, 0);
+
+    quicstream_t* control = quicstream_create(2, STREAM_WINDOW, STREAM_WINDOW, 0);
+    quicstream_on_data(control, 0, ctrl, cn, 0);
+    TEST_ASSERT(h3conn_stream_read(c, NULL, control).status == H3CONN_OK, "SETTINGS");
+
+    qpack_encoder_t* enc = qpack_encoder_create(0, 0);
+    const qpack_header_t fields[] = {
+        { (char*)":method", 7, (char*)"GET", 3, 0 },
+        { (char*)":path", 5, (char*)"/", 1, 0 },
+        { (char*)":scheme", 7, (char*)"https", 5, 0 },
+        { (char*)":authority", 10, (char*)"example.com", 11, 0 },
+    };
+    uint8_t block[192];
+    const size_t blen = qpack_encode_block(enc, fields, 4, block, sizeof block);
+    qpack_encoder_free(enc);
+
+    uint8_t req[256];
+    const size_t rlen = h3frame_write(req, sizeof req, H3_FRAME_HEADERS, block, blen);
+
+    uint64_t offset = cn;
+    int broke_at = 0;
+
+    for (uint64_t i = 1; i <= 2000 && broke_at == 0; i++) {
+        const uint64_t id = i << 2;
+
+        uint8_t frame[32];
+        const size_t fn = priority_frame(frame, sizeof frame, id);
+
+        /* Both frames, as Chrome sends them: one when the request is issued and
+         * one when the renderer revises the priority. */
+        for (int k = 0; k < 2; k++) {
+            quicstream_on_data(control, offset, frame, fn, 0);
+            offset += fn;
+
+            if (h3conn_stream_read(c, NULL, control).status != H3CONN_OK)
+                broke_at = (int)i;
+        }
+
+        quicstream_t* qs = request_stream(i);
+        quicstream_on_data(qs, 0, req, rlen, 1);
+        h3conn_stream_read(c, NULL, qs);
+        h3conn_stream_release(qs);
+        quicstream_free(qs);
+    }
+
+    TEST_ASSERT(broke_at == 0, "2000 requests with their priorities, connection intact");
+
+    h3conn_stream_release(control);
+    quicstream_free(control);
+    h3conn_free(c);
+
+    TEST_CASE("PRIORITY_UPDATE without any request runs the credit out");
+    /* The credit is not refilled by time, so this ends however slowly it is
+     * sent -- which is the point: a peer that never opens a stream has no way
+     * to earn more. */
+    h3session_t* s = h3session_create(65536, 0);
+    h3uni_recv_t* uni = control_open(s);
+
+    uint8_t frame[32];
+    const size_t fn = priority_frame(frame, sizeof frame, 0);
+
+    int closed_at = 0;
+    uint64_t error = 0;
+    for (int i = 1; i <= 5000 && closed_at == 0; i++) {
+        const h3session_verdict_t v = h3session_uni_feed(s, uni, frame, fn, 0);
+        if (v.action == H3SESSION_CONN_ERROR) { closed_at = i; error = v.error; }
+    }
+
+    TEST_ASSERT(closed_at > 0, "the credit runs out");
+    TEST_ASSERT(error == H3_EXCESSIVE_LOAD, "H3_EXCESSIVE_LOAD");
+    TEST_ASSERT(closed_at > 200, "but not before a burst a real client might send");
+
+    h3uni_recv_free(uni);
+    h3session_free(s);
+}

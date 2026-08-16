@@ -342,6 +342,7 @@ typedef enum {
      * client this server has started rejecting wrongly. */
     METRICS_H3_ABUSE_ABORT_BUDGET,
     METRICS_H3_ABUSE_CTRL_BUDGET,
+    METRICS_H3_ABUSE_PRIORITY_BUDGET,    /* PRIORITY_UPDATE past its credit */
     METRICS_H3_FIELD_SECTION_TOO_LARGE,  /* → 431 */
     METRICS_H3_FIELD_SECTION_HARD,       /* → connection, decode abandoned */
     METRICS_H3_BODY_TOO_LARGE,           /* → 413 */
