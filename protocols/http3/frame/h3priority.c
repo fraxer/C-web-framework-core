@@ -102,10 +102,24 @@ int h3priority_parse(const uint8_t* value, size_t len, h3priority_t* out) {
 
     if (value == NULL) return len == 0;
 
+    /* Members are collected here and published only on success. A dictionary
+     * that goes wrong after a member we understood -- "u=7, 7;q=0.5" -- would
+     * otherwise leave `out` holding that member while the return value says the
+     * whole value was rejected, and a caller that trusts one and not the other
+     * would prioritise a stream from a value it refused. No caller does today;
+     * both discard `out` on 0. Found by tests/fuzz h3_priority in under a
+     * minute, which is the argument for fixing the contract rather than the
+     * callers (docs/http3/08 §7r). */
+    h3priority_t result;
+    h3priority_defaults(&result);
+
     size_t i = 0;
     while (i < len) {
         while (i < len && value[i] == ' ') i++;
-        if (i == len) return 1;             /* blank, or trailing whitespace */
+        if (i == len) {                     /* blank, or trailing whitespace */
+            *out = result;
+            return 1;
+        }
 
         const size_t key_start = i;
         if (!__key_char(value[i], 1)) return 0;
@@ -135,21 +149,27 @@ int h3priority_parse(const uint8_t* value, size_t len, h3priority_t* out) {
          * cosmetic bug into a failed page. */
         if (key_len == 1 && value[key_start] == 'u') {
             if (is_int && int_value >= 0 && int_value <= H3_PRIORITY_URGENCY_MAX) {
-                out->urgency = (uint8_t)int_value;
-                out->has_urgency = 1;
+                result.urgency = (uint8_t)int_value;
+                result.has_urgency = 1;
             }
         }
         else if (key_len == 1 && value[key_start] == 'i') {
             if (is_bool) {
-                out->incremental = (uint8_t)(bool_value != 0);
-                out->has_incremental = 1;
+                result.incremental = (uint8_t)(bool_value != 0);
+                result.has_incremental = 1;
             }
         }
 
-        if (i == len) return 1;
+        if (i == len) {
+            *out = result;
+            return 1;
+        }
+
         i++;                                /* the comma */
         if (i == len) return 0;             /* ... which must be followed by a member */
     }
+
+    *out = result;
 
     return 1;
 }

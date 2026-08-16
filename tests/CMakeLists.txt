@@ -160,7 +160,8 @@ endif()
 # the feedback. The target files do not know the difference.
 if(BUILD_FUZZERS STREQUAL "yes" AND INCLUDE_HTTP3 STREQUAL yes)
     set(FUZZ_TARGET_NAMES
-        quic_packet quic_frame quic_tp h3_frame qpack_decode qpack_streams huffman)
+        quic_packet quic_frame quic_tp h3_frame qpack_decode qpack_streams huffman
+        h3_priority)
 
     set(FUZZ_ID_quic_packet    1)
     set(FUZZ_ID_quic_frame     2)
@@ -169,6 +170,7 @@ if(BUILD_FUZZERS STREQUAL "yes" AND INCLUDE_HTTP3 STREQUAL yes)
     set(FUZZ_ID_qpack_decode   5)
     set(FUZZ_ID_qpack_streams  6)
     set(FUZZ_ID_huffman        7)
+    set(FUZZ_ID_h3_priority    8)
 
     foreach(name ${FUZZ_TARGET_NAMES})
         set(exe fuzz_${name})
@@ -191,6 +193,7 @@ if(BUILD_FUZZERS STREQUAL "yes" AND INCLUDE_HTTP3 STREQUAL yes)
             FUZZ_QPACK_DECODE=5
             FUZZ_QPACK_STREAMS=6
             FUZZ_HUFFMAN=7
+            FUZZ_H3_PRIORITY=8
             FUZZ_TARGET=${FUZZ_ID_${name}}
         )
 

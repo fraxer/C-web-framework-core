@@ -88,6 +88,18 @@ TEST(test_h3priority_malformed) {
 
     const uint8_t control[] = { 'u', '=', '1', ',', 'v', '=', 0x01 };
     TEST_ASSERT(h3priority_parse(control, sizeof control, &p) == 0, "control character");
+
+    /* And a refusal leaves nothing behind. A dictionary that goes wrong *after*
+     * a member we understood used to publish that member anyway, so `out` and
+     * the return value disagreed about whether the value was usable. Found by
+     * the fuzz target, not by this file (docs/http3/08 §7r). */
+    TEST_CASE("a refused value leaves the defaults in place");
+    TEST_ASSERT(parse("u=7;q=0.5, 7", &p) == 0, "refused");
+    TEST_ASSERT(p.urgency == H3_PRIORITY_URGENCY_DEFAULT && !p.has_urgency,
+                "the urgency it had already read is not published");
+    TEST_ASSERT(parse("u=0, i, x=", &p) == 0, "refused later still");
+    TEST_ASSERT(p.urgency == H3_PRIORITY_URGENCY_DEFAULT && p.incremental == 0 &&
+                !p.has_incremental, "neither member is published");
 }
 
 TEST(test_h3priority_merge) {

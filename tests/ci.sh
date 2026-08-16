@@ -292,7 +292,7 @@ stage_fuzz() {
     local ok=1
     local fuzz_names=(
         quic_packet quic_frame quic_tp h3_frame
-        qpack_decode qpack_streams huffman
+        qpack_decode qpack_streams huffman h3_priority
     )
     local fuzz_name target
     for fuzz_name in "${fuzz_names[@]}"; do

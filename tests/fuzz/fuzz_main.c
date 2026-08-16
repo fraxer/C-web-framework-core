@@ -18,6 +18,7 @@
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <stdint.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -237,6 +238,22 @@ static void __on_death(void) {
             __current_len, path);
 }
 
+/* A target may also fail an invariant of its own, by trapping or aborting.
+ * The sanitizer's death callback does not fire for those -- it is for errors
+ * the sanitizer itself detects -- so the process died silently and the input
+ * that caused it was lost. Which is the one thing this driver's whole crash
+ * path exists to prevent (see the header): a fuzzer that finds a crash and
+ * cannot say which bytes found it has reported nothing.
+ *
+ * SIGILL and SIGABRT only. SIGSEGV and friends belong to the sanitizer, and
+ * taking them from it would replace its report with this one. */
+static void __on_signal(int sig) {
+    __on_death();
+
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 static void __run(const uint8_t* data, size_t len) {
     __current = data;
     __current_len = len;
@@ -260,6 +277,8 @@ int main(int argc, char* argv[]) {
     }
 
     __sanitizer_set_death_callback(__on_death);
+    signal(SIGILL, __on_signal);
+    signal(SIGABRT, __on_signal);
 
     __corpus_dir = corpus_dir;
     if (corpus_dir != NULL) __corpus_load(corpus_dir);

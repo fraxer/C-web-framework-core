@@ -21,11 +21,13 @@
 #include <string.h>
 
 #include "h3frame.h"
+#include "h3priority.h"
 #include "huffman.h"
 #include "qpack.h"
 #include "quicframe.h"
 #include "quicpacket.h"
 #include "quictp.h"
+#include "varint.h"
 
 int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size);
 
@@ -201,6 +203,59 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     uint8_t enc[8192];
     const ssize_t n = huffman_encode(enc, sizeof enc, data, size > 2048 ? 2048 : size);
     if (n > 0) (void)huffman_decode(out, sizeof out, enc, (size_t)n);
+
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_H3_PRIORITY
+
+/* The Priority Field Value (RFC 9218 §4), which reaches this parser two ways
+ * and is attacker-chosen both times: as a `priority` request header field, and
+ * as the tail of a PRIORITY_UPDATE frame behind a varint element id.
+ *
+ * Worth a target of its own because of what the parser is: a hand-written walk
+ * over a structured-fields dictionary with quoted strings, backslash escapes
+ * and parameters -- indices advanced in half a dozen places, on bytes nobody
+ * has checked. The unit tests cover what its author thought of; this covers
+ * what a peer thinks of.
+ *
+ * And because a mistake here is not merely a crash: a malformed value on the
+ * frame path is H3_FRAME_ERROR, which ends the connection, so an accepted value
+ * that should be refused (or the reverse) is a protocol bug the transport
+ * cannot catch. */
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    h3priority_t field;
+    const int field_ok = h3priority_parse(data, size, &field);
+
+    /* The one invariant the callers rely on: what comes back is inside the
+     * range they will hand to the scheduler. The transport clamps urgency, so
+     * an out-of-range value here would be silently absorbed rather than
+     * reported -- exactly the kind of thing a fuzzer should turn into a crash. */
+    if (field_ok && (field.urgency > H3_PRIORITY_URGENCY_MAX ||
+                     field.incremental > 1)) __builtin_trap();
+
+    /* Defaults must survive a refusal too: h3conn keeps the struct it passed
+     * in, so a parser that half-fills it on the way to returning 0 would leave
+     * a stream prioritised by garbage. */
+    if (!field_ok && (field.urgency != H3_PRIORITY_URGENCY_DEFAULT ||
+                      field.incremental != 0)) __builtin_trap();
+
+    /* The frame path: a varint element id, then the same value. Split here the
+     * way __priority_update splits it, so the target walks the same boundary --
+     * including the length underflow a truncated varint would produce. */
+    uint64_t element = 0;
+    const size_t n = varint_read(data, size, &element);
+    if (n > 0 && n <= size) {
+        h3priority_t frame;
+        const int frame_ok = h3priority_parse(data + n, size - n, &frame);
+
+        if (frame_ok && frame.urgency > H3_PRIORITY_URGENCY_MAX) __builtin_trap();
+
+        /* Merging is what §7 does with a frame that carries only one member. */
+        h3priority_merge(&field, &frame);
+
+        if (field.urgency > H3_PRIORITY_URGENCY_MAX) __builtin_trap();
+    }
 
     return 0;
 }
