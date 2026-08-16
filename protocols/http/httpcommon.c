@@ -5,6 +5,7 @@
 #include "str.h"
 #include "helpers.h"
 #include "base64.h"
+#include "arena.h"
 #include "httpcommon.h"
 
 http_header_t* http_header_create(const char* key, size_t key_length, const char* value, size_t value_length) {
@@ -19,6 +20,32 @@ http_header_t* http_header_create(const char* key, size_t key_length, const char
         free(header);
         return NULL;
     }
+
+    header->key_length = key_length;
+    header->value_length = value_length;
+    header->next = NULL;
+
+    return header;
+}
+
+http_header_t* http_header_create_in(struct arena* arena, const char* key, size_t key_length,
+                                     const char* value, size_t value_length) {
+    /* One bump for all three pieces: the node, then the two strings behind it.
+     * That is the whole point — the three mallocs per header were the single
+     * largest item in the response profile (docs/http2/10 §10.2). */
+    const size_t total = sizeof(http_header_t) + key_length + 1 + value_length + 1;
+    http_header_t* header = arena_alloc((arena_t*)arena, total);
+    if (header == NULL) return NULL;
+
+    char* strings = (char*)(header + 1);
+
+    header->key = strings;
+    if (key_length > 0) memcpy(header->key, key, key_length);
+    header->key[key_length] = '\0';
+
+    header->value = strings + key_length + 1;
+    if (value_length > 0) memcpy(header->value, value, value_length);
+    header->value[value_length] = '\0';
 
     header->key_length = key_length;
     header->value_length = value_length;
@@ -66,6 +93,37 @@ http_header_t* http_header_delete(http_header_t* header, const char* key) {
         if (cmpstrn_lower(header->key, header->key_length, key, key_length)) {
             prev_header->next = next;
             http_header_free(header);
+            break;
+        }
+
+        prev_header = header;
+        header = next;
+    }
+
+    return first_header;
+}
+
+/* Same removal, without freeing: the node belongs to an arena, and its memory
+ * goes back only when the whole arena is reset. Returns the new head. */
+http_header_t* http_header_unlink(http_header_t* header, const char* key) {
+    if (header == NULL) return NULL;
+    if (key == NULL) return header;
+
+    const size_t key_length = strlen(key);
+
+    if (cmpstrn_lower(header->key, header->key_length, key, key_length))
+        return header->next;
+
+    http_header_t* first_header = header;
+    http_header_t* prev_header = header;
+
+    header = header->next;
+
+    while (header) {
+        http_header_t* next = header->next;
+
+        if (cmpstrn_lower(header->key, header->key_length, key, key_length)) {
+            prev_header->next = next;
             break;
         }
 

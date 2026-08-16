@@ -65,13 +65,16 @@ static int set_nonblock(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK) != -1;
 }
 
-static int fixture_setup(write_fixture_t* fx, size_t capture_capacity) {
+/* SOCK_SEQPACKET preserves write boundaries, so a test can count how many
+ * write(2) calls a response took — which is what §10.1 is about. SOCK_STREAM
+ * is the default because everything else here cares about bytes, not calls. */
+static int fixture_setup_type(write_fixture_t* fx, size_t capture_capacity, int sock_type) {
     memset(fx, 0, sizeof(*fx));
     fx->wr_fd = -1;
     fx->rd_fd = -1;
 
     int sv[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0)
+    if (socketpair(AF_UNIX, sock_type, 0, sv) != 0)
         return 0;
 
     fx->wr_fd = sv[0];
@@ -112,6 +115,10 @@ static int fixture_setup(write_fixture_t* fx, size_t capture_capacity) {
     close(fx->wr_fd);
     close(fx->rd_fd);
     return 0;
+}
+
+static int fixture_setup(write_fixture_t* fx, size_t capture_capacity) {
+    return fixture_setup_type(fx, capture_capacity, SOCK_STREAM);
 }
 
 static void fixture_teardown(write_fixture_t* fx) {
@@ -165,6 +172,20 @@ static int run_header(write_fixture_t* fx) {
 static int run_body(write_fixture_t* fx, bufo_t* parent) {
     fx->response->cur_filter = fx->filter;
     return fx->filter->handler_body(NULL, fx->response, parent);
+}
+
+/* The head is held back until something can be joined to it, so a test that
+ * only runs the header pass has to flush — exactly as __run_flush_filters does
+ * after the body filters. */
+static int run_flush(write_fixture_t* fx) {
+    fx->response->cur_filter = fx->filter;
+    return fx->filter->handler_flush(NULL, fx->response);
+}
+
+static int run_header_and_flush(write_fixture_t* fx) {
+    const int r = run_header(fx);
+    if (r != CWF_OK) return r;
+    return run_flush(fx);
 }
 
 static void parent_init(bufo_t* parent, char* data, size_t size, int is_last) {
@@ -229,22 +250,28 @@ TEST(test_write_header_basic) {
     const int r = run_header(&fx);
     TEST_ASSERT_EQUAL(CWF_OK, r, "header pass should finish with CWF_OK");
 
-    TEST_REQUIRE_GOTO(fixture_drain(&fx), "socket should be drained", cleanup);
-
     const char expected[] = "HTTP/1.1 200 OK\r\n"
                             "Content-Type: text/plain\r\n"
                             "Content-Length: 5\r\n"
                             "\r\n";
     const size_t expected_size = sizeof(expected) - 1;
 
+    /* §10.1: the header pass renders, it does not write. The head waits for a
+     * body chunk to ride along with. */
+    TEST_REQUIRE_GOTO(fixture_drain(&fx), "socket should be drained", cleanup);
+    TEST_ASSERT_EQUAL_SIZE(0, fx.captured_size, "header pass alone should send nothing");
+
+    TEST_ASSERT_EQUAL(CWF_OK, run_flush(&fx), "flush should finish with CWF_OK");
+    TEST_REQUIRE_GOTO(fixture_drain(&fx), "socket should be drained", cleanup);
+
     TEST_ASSERT(captured_equals(&fx, expected, expected_size),
                 "head on the wire should match byte for byte");
 
-    /* __head_size() accounting must agree with what __build_head appends:
-     * the buffer is allocated to the exact predicted size, so any drift
-     * would show up here as a capacity/size mismatch. */
-    TEST_ASSERT_EQUAL_SIZE(expected_size, fx.module->buf->capacity,
-                           "buffer should be allocated to the exact head size");
+    /* __head_size() accounting must agree with what __build_head appends: the
+     * buffer is the predicted head plus the join reserve, so any drift shows
+     * up here as a capacity/size mismatch. */
+    TEST_ASSERT_EQUAL_SIZE(expected_size + HTTP_WRITE_JOIN_MAX, fx.module->buf->capacity,
+                           "buffer should be the head size plus the join reserve");
     TEST_ASSERT_EQUAL_SIZE(expected_size, fx.module->buf->size,
                            "buffer size should equal the head size");
     TEST_ASSERT_EQUAL_SIZE(fx.module->buf->size, fx.module->buf->pos,
@@ -261,7 +288,7 @@ TEST(test_write_header_no_headers) {
     write_fixture_t fx;
     TEST_REQUIRE(fixture_setup(&fx, 4096), "fixture should be created");
 
-    const int r = run_header(&fx);
+    const int r = run_header_and_flush(&fx);
     TEST_ASSERT_EQUAL(CWF_OK, r, "header pass should finish with CWF_OK");
 
     TEST_REQUIRE_GOTO(fixture_drain(&fx), "socket should be drained", cleanup);
@@ -282,7 +309,7 @@ TEST(test_write_header_empty_header_value) {
     TEST_REQUIRE_GOTO(fx.response->add_header(fx.response, "X-Empty", ""),
                       "empty-valued header should be added", cleanup);
 
-    const int r = run_header(&fx);
+    const int r = run_header_and_flush(&fx);
     TEST_ASSERT_EQUAL(CWF_OK, r, "empty header value should not fail the head");
 
     TEST_REQUIRE_GOTO(fixture_drain(&fx), "socket should be drained", cleanup);
@@ -335,7 +362,12 @@ TEST(test_write_header_eagain_resume) {
     TEST_REQUIRE_GOTO(fx.response->add_header(fx.response, "X-Big", value),
                       "large header should be added", cleanup_buffers);
 
-    int r = run_header(&fx);
+    TEST_REQUIRE_GOTO(run_header(&fx) == CWF_OK, "header pass should render the head",
+                      cleanup_buffers);
+
+    /* The head is written by the flush pass now, so that is where a head too
+     * big for the send buffer runs into EAGAIN. */
+    int r = run_flush(&fx);
     TEST_ASSERT_EQUAL(CWF_EVENT_AGAIN, r, "head larger than the send buffer should hit EAGAIN");
     TEST_ASSERT_EQUAL_UINT(1, fx.response->event_again, "event_again should be set");
     TEST_ASSERT(fx.module->buf->pos < fx.module->buf->size,
@@ -345,10 +377,14 @@ TEST(test_write_header_eagain_resume) {
     while (r == CWF_EVENT_AGAIN && guard++ < 1000) {
         TEST_REQUIRE_GOTO(fixture_drain(&fx), "socket should be drained between resumes",
                           cleanup_buffers);
-        r = run_header(&fx);
+        /* Both passes are re-run on resume, as the engine does: the header pass
+         * must not rebuild the head over the bytes already in flight. */
+        TEST_REQUIRE_GOTO(run_header(&fx) == CWF_OK, "header pass stays a no-op on resume",
+                          cleanup_buffers);
+        r = run_flush(&fx);
     }
 
-    TEST_ASSERT_EQUAL(CWF_OK, r, "resumed header pass should finish with CWF_OK");
+    TEST_ASSERT_EQUAL(CWF_OK, r, "resumed flush should finish with CWF_OK");
     TEST_REQUIRE_GOTO(fixture_drain(&fx), "socket should be drained", cleanup_buffers);
 
     const int expected_size = snprintf(expected, value_size + 64,
@@ -373,12 +409,13 @@ TEST(test_write_header_second_call_is_noop) {
     write_fixture_t fx;
     TEST_REQUIRE(fixture_setup(&fx, 4096), "fixture should be created");
 
-    TEST_REQUIRE_GOTO(run_header(&fx) == CWF_OK, "first header pass should succeed", cleanup);
+    TEST_REQUIRE_GOTO(run_header_and_flush(&fx) == CWF_OK, "first header pass should succeed", cleanup);
     TEST_REQUIRE_GOTO(fixture_drain(&fx), "socket should be drained", cleanup);
 
     const size_t first_size = fx.captured_size;
+    TEST_REQUIRE_GOTO(first_size > 0, "the head should be on the wire by now", cleanup);
 
-    const int r = run_header(&fx);
+    const int r = run_header_and_flush(&fx);
     TEST_ASSERT_EQUAL(CWF_OK, r, "second header pass should still report CWF_OK");
 
     TEST_REQUIRE_GOTO(fixture_drain(&fx), "socket should be drained", cleanup);
@@ -557,7 +594,7 @@ TEST(test_write_reset_allows_reuse) {
 
     TEST_REQUIRE_GOTO(fx.response->add_header(fx.response, "X-Key", "value"),
                       "header should be added", cleanup);
-    TEST_REQUIRE_GOTO(run_header(&fx) == CWF_OK, "first header pass should succeed", cleanup);
+    TEST_REQUIRE_GOTO(run_header_and_flush(&fx) == CWF_OK, "first header pass should succeed", cleanup);
     TEST_REQUIRE_GOTO(fixture_drain(&fx), "socket should be drained", cleanup);
 
     const char expected[] = "HTTP/1.1 200 OK\r\nX-Key: value\r\n\r\n";
@@ -576,7 +613,7 @@ TEST(test_write_reset_allows_reuse) {
 
     fx.captured_size = 0;
 
-    TEST_REQUIRE_GOTO(run_header(&fx) == CWF_OK, "header pass should work after reset", cleanup);
+    TEST_REQUIRE_GOTO(run_header_and_flush(&fx) == CWF_OK, "header pass should work after reset", cleanup);
     TEST_REQUIRE_GOTO(fixture_drain(&fx), "socket should be drained", cleanup);
     TEST_ASSERT(captured_equals(&fx, expected, expected_size),
                 "head should be rebuilt correctly after reset");
@@ -610,6 +647,159 @@ TEST(test_write_header_then_body) {
     const char expected[] = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello";
     TEST_ASSERT(captured_equals(&fx, expected, sizeof(expected) - 1),
                 "wire bytes should form the complete response");
+
+    cleanup:
+    fixture_teardown(&fx);
+}
+
+// ============================================================================
+// Joining the head to the first body chunk (docs/http2/10-performance.md §10.1)
+// ============================================================================
+
+TEST(test_write_join_small_body_is_one_write) {
+    TEST_SUITE("http_write_filter: join");
+    TEST_CASE("a small response leaves in a single write(2)");
+
+    write_fixture_t fx;
+    /* SEQPACKET keeps write boundaries, so one recv == one write. */
+    TEST_REQUIRE(fixture_setup_type(&fx, 4096, SOCK_SEQPACKET), "fixture should be created");
+
+    TEST_REQUIRE_GOTO(fx.response->add_header(fx.response, "Content-Length", "5"),
+                      "Content-Length should be added", cleanup);
+    TEST_REQUIRE_GOTO(run_header(&fx) == CWF_OK, "header pass should succeed", cleanup);
+
+    char data[] = "Hello";
+    bufo_t parent;
+    parent_init(&parent, data, 5, 1);
+
+    TEST_REQUIRE_GOTO(run_body(&fx, &parent) == CWF_DATA_AGAIN, "body pass should succeed", cleanup);
+    TEST_ASSERT_EQUAL(CWF_OK, run_flush(&fx), "flush should have nothing left to do");
+
+    const char expected[] = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello";
+    char packet[256];
+    const ssize_t first = recv(fx.rd_fd, packet, sizeof(packet), 0);
+    TEST_ASSERT_EQUAL((long long)(sizeof(expected) - 1), (long long)first,
+                      "head and body should arrive as ONE datagram, i.e. one write");
+    TEST_ASSERT(first > 0 && memcmp(packet, expected, (size_t)first) == 0,
+                "the single write should carry the whole response");
+
+    const ssize_t second = recv(fx.rd_fd, packet, sizeof(packet), 0);
+    TEST_ASSERT(second < 0 && (errno == EAGAIN || errno == EWOULDBLOCK),
+                "there should be no second write");
+
+    cleanup:
+    fixture_teardown(&fx);
+}
+
+TEST(test_write_join_large_body_stays_two_writes) {
+    TEST_SUITE("http_write_filter: join");
+    TEST_CASE("a body over the join threshold keeps head and body separate");
+
+    const size_t body_size = HTTP_WRITE_JOIN_MAX + 1;
+
+    write_fixture_t fx;
+    TEST_REQUIRE(fixture_setup_type(&fx, 8192 + body_size, SOCK_SEQPACKET), "fixture should be created");
+
+    TEST_REQUIRE_GOTO(run_header(&fx) == CWF_OK, "header pass should succeed", cleanup);
+    const size_t head_size = fx.module->buf->size;
+
+    char* data = malloc(body_size);
+    TEST_REQUIRE_NOT_NULL_GOTO(data, "payload should be allocated", cleanup);
+    memset(data, 'x', body_size);
+
+    bufo_t parent;
+    parent_init(&parent, data, body_size, 1);
+
+    TEST_REQUIRE_GOTO(run_body(&fx, &parent) == CWF_DATA_AGAIN, "body pass should succeed",
+                      cleanup_data);
+
+    /* Copying a large chunk costs more than the write it saves, so the head
+     * goes out by itself and the body follows. */
+    char packet[8192];
+    const ssize_t first = recv(fx.rd_fd, packet, sizeof(packet), 0);
+    TEST_ASSERT_EQUAL((long long)head_size, (long long)first, "first write should be the head alone");
+
+    const ssize_t second = recv(fx.rd_fd, packet, sizeof(packet), 0);
+    TEST_ASSERT_EQUAL((long long)body_size, (long long)second, "second write should be the body");
+
+    cleanup_data:
+    free(data);
+
+    cleanup:
+    fixture_teardown(&fx);
+}
+
+TEST(test_write_join_partial_write_does_not_duplicate) {
+    TEST_SUITE("http_write_filter: join");
+    TEST_CASE("EAGAIN after a join resumes without repeating the joined bytes");
+
+    write_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx, 262144), "fixture should be created");
+    TEST_REQUIRE_GOTO(fixture_shrink_sndbuf(&fx), "send buffer should be shrunk", cleanup);
+
+    /* A head big enough that the joined body cannot fit in the send buffer:
+     * the write stops mid-way with the body already copied out of parent. */
+    char value[8192];
+    memset(value, 'h', sizeof(value) - 1);
+    value[sizeof(value) - 1] = '\0';
+    TEST_REQUIRE_GOTO(fx.response->add_header(fx.response, "X-Big", value),
+                      "large header should be added", cleanup);
+    TEST_REQUIRE_GOTO(run_header(&fx) == CWF_OK, "header pass should succeed", cleanup);
+
+    char body[64];
+    memset(body, 'b', sizeof(body));
+    bufo_t parent;
+    parent_init(&parent, body, sizeof(body), 1);
+
+    int r = run_body(&fx, &parent);
+    TEST_REQUIRE_GOTO(r == CWF_EVENT_AGAIN, "the oversized head should hit EAGAIN", cleanup);
+    TEST_ASSERT_EQUAL_SIZE(sizeof(body), parent.pos,
+                           "the joined bytes are owned by the write stage, so parent is consumed");
+
+    int guard = 0;
+    while (r == CWF_EVENT_AGAIN && guard++ < 1000) {
+        TEST_REQUIRE_GOTO(fixture_drain(&fx), "socket should be drained between resumes", cleanup);
+        r = run_body(&fx, &parent);
+    }
+    TEST_REQUIRE_GOTO(r == CWF_DATA_AGAIN, "the resumed response should complete", cleanup);
+    TEST_REQUIRE_GOTO(fixture_drain(&fx), "socket should be drained", cleanup);
+
+    /* The body must appear exactly once, at the very end: a resume that
+     * re-joined it would send it twice, and one that dropped it would end the
+     * response short. */
+    TEST_ASSERT_EQUAL_SIZE(fx.module->buf->size, fx.captured_size,
+                           "the wire should carry the head plus the joined body exactly once");
+    TEST_ASSERT(fx.captured_size >= sizeof(body) &&
+                memcmp(fx.captured + fx.captured_size - sizeof(body), body, sizeof(body)) == 0,
+                "the joined body should be the tail of the response");
+
+    cleanup:
+    fixture_teardown(&fx);
+}
+
+TEST(test_write_flush_sends_bodiless_head) {
+    TEST_SUITE("http_write_filter: join");
+    TEST_CASE("a response with no body pass still gets its head out");
+
+    write_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx, 4096), "fixture should be created");
+
+    /* 304/HEAD/204: http_data_filter returns CWF_OK without calling the write
+     * stage at all, so the head would sit in the buffer forever without flush. */
+    fx.response->status_code = 304;
+    TEST_REQUIRE_GOTO(run_header(&fx) == CWF_OK, "header pass should succeed", cleanup);
+
+    TEST_REQUIRE_GOTO(fixture_drain(&fx), "socket should be drained", cleanup);
+    TEST_ASSERT_EQUAL_SIZE(0, fx.captured_size, "nothing goes out before the flush");
+
+    TEST_ASSERT_EQUAL(CWF_OK, run_flush(&fx), "flush should send the head");
+    TEST_REQUIRE_GOTO(fixture_drain(&fx), "socket should be drained", cleanup);
+    TEST_ASSERT(captured_equals(&fx, "HTTP/1.1 304 Not Modified\r\n\r\n", 29),
+                "the bodiless head should be complete on the wire");
+
+    TEST_ASSERT_EQUAL(CWF_OK, run_flush(&fx), "a second flush is a no-op");
+    TEST_REQUIRE_GOTO(fixture_drain(&fx), "socket should be drained", cleanup);
+    TEST_ASSERT_EQUAL_SIZE(29, fx.captured_size, "and sends nothing extra");
 
     cleanup:
     fixture_teardown(&fx);

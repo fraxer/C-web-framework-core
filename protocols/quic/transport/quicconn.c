@@ -2743,10 +2743,21 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
 
     if (conn->state == QUICCONN_CLOSING) {
         if (conn->close_packet_len > 0) {
-            quicendpoint_send_ecn(conn->endpoint, conn->close_packet,
-                                  conn->close_packet_len, &conn->path,
-                                  conn->ecn_enabled ? 0x02 : 0);
+            const int queued = quicendpoint_send_ecn(conn->endpoint, conn->close_packet,
+                                                     conn->close_packet_len, &conn->path,
+                                                     conn->ecn_enabled ? 0x02 : 0);
+            /* The one datagram the ordinary send loop never logs, and the one
+             * whose absence is hardest to diagnose from the peer's side: a
+             * missing goodbye looks exactly like a server that hung up. */
+            log_debug("quic: close dgram cid=%02x%02x%02x%02x bytes=%zu queued=%d\n",
+                      conn->odcid.data[0], conn->odcid.data[1],
+                      conn->odcid.data[2], conn->odcid.data[3],
+                      conn->close_packet_len, queued);
         }
+        else
+            log_debug("quic: close cid=%02x%02x%02x%02x has no packet to send\n",
+                      conn->odcid.data[0], conn->odcid.data[1],
+                      conn->odcid.data[2], conn->odcid.data[3]);
         atomic_store_explicit(&conn->want_write, 0, memory_order_release);
         return 1;
     }

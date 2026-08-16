@@ -17,6 +17,7 @@ http_filter_t* http_gzip_filter_create(void) {
 
     filter->handler_header = __header;
     filter->handler_body = __body;
+    filter->handler_flush = NULL;
     filter->module = __create();
     filter->next = NULL;
 

@@ -6,6 +6,8 @@
 #include "file.h"
 #include "helpers.h"
 
+struct arena;
+
 typedef struct http_header {
     char* key;
     char* value;
@@ -66,6 +68,13 @@ typedef struct http_payload {
 } http_payload_t;
 
 http_header_t* http_header_create(const char*, size_t, const char*, size_t);
+/* Remove a header from an arena-owned list: unlinked, never freed. */
+http_header_t* http_header_unlink(http_header_t*, const char*);
+/* The same header, taken from an arena in ONE allocation instead of three
+ * (node, key, value). Nothing here may be passed to http_header_free: the
+ * arena owns it, and it is released wholesale by arena_reset. Used for
+ * response headers, whose lifetime is exactly the response. */
+http_header_t* http_header_create_in(struct arena* arena, const char*, size_t, const char*, size_t);
 void http_header_free(http_header_t*);
 void http_headers_free(http_header_t*);
 http_header_t* http_header_delete(http_header_t*, const char*);

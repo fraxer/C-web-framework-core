@@ -16,6 +16,7 @@ http_filter_t* http_chunked_filter_create(void) {
 
     filter->handler_header = http_chunked_header;
     filter->handler_body = http_chunked_body;
+    filter->handler_flush = NULL;
     filter->module = http_chunked_create();
     filter->next = NULL;
 

@@ -506,6 +506,7 @@ http_filter_t* h2_write_filter_create(void) {
 
     filter->handler_header = __header;
     filter->handler_body = __body;
+    filter->handler_flush = NULL;
     filter->module = module;
     filter->next = NULL;
 

@@ -24,6 +24,12 @@ typedef struct http_filter {
 
     int(*handler_header)(struct httprequest* request, struct httpresponse* response);
     int(*handler_body)(struct httprequest* request, struct httpresponse* response, bufo_t* buf);
+    /* Optional (NULL in most stages): run once after the body filters, for
+     * bytes a stage is holding that no body pass came to claim. The HTTP/1.1
+     * write stage needs it because it defers the head until the first body
+     * chunk (§10.1), and a bodiless response — HEAD, 304, 204 — never makes
+     * that chunk: http_data_filter returns CWF_OK without calling downstream. */
+    int(*handler_flush)(struct httprequest* request, struct httpresponse* response);
 
     struct http_filter* next;
 } http_filter_t;

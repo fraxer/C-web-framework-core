@@ -2,6 +2,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <glob.h>
+#include <libgen.h> /* dirname(); used to arrive through file.h */
 
 #include "array.h"
 #include "log.h"

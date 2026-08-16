@@ -325,6 +325,22 @@ void openssl_set_read_ahead(SSL* ssl, int on) {
     SSL_set_read_ahead(ssl, on);
 }
 
+/* How many bytes are already decrypted and waiting in the library's buffer.
+ *
+ * This is the other half of read ahead: epoll reports the socket, not the SSL
+ * buffer, so a reader that leaves its loop on a complete message has to ask
+ * this before it goes — otherwise the next pipelined request sits there until
+ * the peer sends something else, which for keep-alive means until it gives up.
+ *
+ * SSL_pending() counts only the current record; SSL_has_pending() also counts
+ * raw bytes not yet processed. The reader needs "is there more to read at all",
+ * so both are asked. */
+int openssl_pending(SSL* ssl) {
+    if (ssl == NULL) return 0;
+
+    return SSL_pending(ssl) > 0 || SSL_has_pending(ssl);
+}
+
 int openssl_write(SSL* ssl, const void* buffer, size_t num) {
     if (num == 0) return 0;
     if (num > INT_MAX) num = INT_MAX;

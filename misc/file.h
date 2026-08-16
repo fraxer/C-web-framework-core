@@ -3,7 +3,6 @@
 
 #include <sys/types.h>
 #include <time.h>
-#include <libgen.h>
 #include <fcntl.h>
 #include <linux/limits.h>
 
@@ -75,6 +74,13 @@ typedef struct file {
 
     /** File descriptor (-1 if file is not open) */
     int fd;
+
+    /**
+     * st_mode from the fstat() done at open time (0 when the file is not open
+     * or fstat failed). Carrying it here is what lets a caller answer
+     * "regular file or directory?" without a second stat() by name.
+     */
+    unsigned mode;
 
     /** Temporary file flag: 1 = file will be deleted on close() */
     unsigned tmp;

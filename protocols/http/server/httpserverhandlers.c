@@ -156,6 +156,15 @@ int set_http(connection_t* connection) {
     if (ctx->parser == NULL)
         return 0;
 
+    /* Read ahead: one read per record instead of two (five bytes of length,
+     * then the body). Safe here now that __read asks openssl_pending() before
+     * it leaves on a complete request — without that check the rest of a
+     * pipelined batch would sit in the library's buffer, invisible to epoll
+     * (docs/http2/10 §10.1). The WebSocket reader an upgrade leads to does the
+     * same check, so the flag can stay on across the upgrade. */
+    if (connection->ssl != NULL)
+        openssl_set_read_ahead(connection->ssl, 1);
+
     return 1;
 }
 
@@ -372,6 +381,15 @@ int __read(connection_t* connection) {
                         return 0;
 
                     httpparser_reset(parser);
+
+                    /* Read ahead pulls more than one TLS record off the socket,
+                     * so the next pipelined request may already be decrypted
+                     * inside the library — where epoll will never report it.
+                     * Leaving now would strand it until the peer sends again
+                     * (docs/http2/10 §10.1). */
+                    if (connection->ssl != NULL && openssl_pending(connection->ssl))
+                        goto read_data;
+
                     return 1;
                 }
                 default:
@@ -414,6 +432,24 @@ int __write(connection_t* connection) {
         return 1;
     if (r == CWF_ERROR)
         return 0;
+
+    /* A bodiless response (HEAD, 304, 204, empty body) never reaches the write
+     * stage through the body pass — http_data_filter answers CWF_OK without
+     * calling downstream — and the write stage now holds the head until it has
+     * something to join it to (§10.1). This is where that head goes out. */
+    r = __run_flush_filters(ctx->request, response);
+    if (r == CWF_EVENT_AGAIN)
+        return 1;
+    if (r == CWF_ERROR)
+        return 0;
+
+    /* Close on the answered request's terms, not on whatever the parser has
+     * read since. With pipelining those differ: a "Connection: close" on the
+     * third request had already cleared connection->keepalive by the time the
+     * FIRST response was written, so the connection went down with two
+     * responses still owed (RFC 9112 §9.6 — close applies to the request that
+     * carried it, and the ones before it must still be answered). */
+    connection->keepalive = response->keepalive;
 
     return connection_after_write(connection);
  }
@@ -583,18 +619,27 @@ int __handle(connection_t* connection, httprequest_t* request, deferred_handler 
 
     connection_server_ctx_t* ctx = connection->ctx;
     char file_full_path[PATH_MAX];
-    const file_status_e file_status = http_get_file_full_path(ctx->server, file_full_path, PATH_MAX, request->path, request->path_length);
+    file_t file;
+    const file_status_e file_status = http_open_file(ctx->server, file_full_path, PATH_MAX, request->path, request->path_length, &file);
 
     if (file_status == FILE_OK) {
+        /* The file is already open by the time the limiter is asked, because
+         * resolving the path is what opens it. A refused request closes it
+         * again: the rate-limited path pays one open, the served path saves a
+         * stat on every response. The order of the two checks is unchanged —
+         * a 404 still never counts against the limiter. */
         if (!ratelimiter_allow(ctx->server->http.ratelimiter, connection->remote_ip, 1)) {
+            file.close(&file);
             httpresponse_default(response, 429);
             response->add_header(response, "Retry-After", "1");
         }
         else
-            http_response_file(response, file_full_path);
+            http_response_file_opened(response, &file, file_full_path);
     }
     else if (file_status == FILE_FORBIDDEN)
         httpresponse_default(response, 403);
+    else if (file_status == FILE_UNAVAILABLE)
+        httpresponse_default(response, 503);
     else
         httpresponse_default(response, 404);
 
@@ -717,6 +762,12 @@ int __apply_redirect(httprequest_t* request, httpresponse_t* response, deferred_
     }
     case REDIRECT_FOUND:
     {
+        /* An external redirect clears connection->keepalive; the response was
+         * created before that, so its snapshot has to follow — the write path
+         * closes on the response's copy, not on the connection's. */
+        if (!connection->keepalive)
+            response->keepalive = 0;
+
         httpresponse_redirect(response, request->uri, 301);
         return handler(request, response);
     }
@@ -974,6 +1025,28 @@ int __run_header_filters(httprequest_t* request, httpresponse_t* response) {
             response->headers_sended = 1;
             return r;
         }
+    }
+
+    return CWF_OK;
+}
+
+/* Give every stage that is holding bytes a last chance to push them, after the
+ * body filters are done. Only the HTTP/1.1 write stage defines this today; the
+ * rest leave handler_flush NULL and are skipped. Runs on every exit path of a
+ * successful response, including EVENT_AGAIN resumes — the stage itself is
+ * responsible for being idempotent when it has nothing left. */
+int __run_flush_filters(httprequest_t* request, httpresponse_t* response) {
+    if (response == NULL || response->filter == NULL) {
+        log_error("__run_flush_filters: response or filter is NULL\n");
+        return CWF_ERROR;
+    }
+
+    for (http_filter_t* filter = response->filter; filter != NULL; filter = filter->next) {
+        if (filter->handler_flush == NULL) continue;
+
+        response->cur_filter = filter;
+        const int r = filter->handler_flush(request, response);
+        if (r != CWF_OK) return r;
     }
 
     return CWF_OK;

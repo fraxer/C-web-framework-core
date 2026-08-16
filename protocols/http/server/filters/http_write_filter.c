@@ -73,7 +73,11 @@ int __build_head(httpresponse_t* response, bufo_t* buf) {
     const size_t cont_left = ctx->cont_pending && ctx->cont_sent < HTTP_CONTINUE_LINE_LEN ?
         HTTP_CONTINUE_LINE_LEN - ctx->cont_sent : 0;
 
-    if (!bufo_alloc(buf, __head_size(response) + cont_left)) return 0;
+    /* Room for the head plus the first body chunk that will be joined to it
+     * (§10.1). The buffer is reallocated per response anyway, so the tail is
+     * not a permanent cost; what it buys is that the join never has to grow
+     * the buffer mid-response. */
+    if (!bufo_alloc(buf, __head_size(response) + cont_left + HTTP_WRITE_JOIN_MAX)) return 0;
 
     if (cont_left > 0) {
         if (!__append_full(buf, HTTP_CONTINUE_LINE + ctx->cont_sent, cont_left)) return 0;
@@ -108,6 +112,7 @@ http_filter_t* http_write_filter_create(void) {
 
     filter->handler_header = http_write_header;
     filter->handler_body = http_write_body;
+    filter->handler_flush = http_write_flush;
     filter->module = http_write_create();
     filter->next = NULL;
 
@@ -217,17 +222,83 @@ int http_write_header(httprequest_t* request, httpresponse_t* response) {
         if (!__build_head(response, buf))
             return CWF_ERROR;
 
-    return __wr(response, buf);
+    /* The head is NOT written here (§10.1). It waits for the first body chunk
+     * so that a small response leaves in one write instead of two: two writes
+     * are two TLS records, which is two reads on the client — the same
+     * arithmetic that §6 measured for HTTP/2, where merging them was worth
+     * +43% on a pipelined profile.
+     *
+     * Nothing is lost when no body pass comes (HEAD, 304, 204, empty body):
+     * http_write_flush runs after the body filters and pushes whatever is
+     * still buffered. */
+    return CWF_OK;
+}
+
+/* Copy the first body chunk in behind the head so both leave in one write.
+ * Returns the number of bytes taken from parent_buf (0 = no join). */
+static size_t __join_first_chunk(bufo_t* buf, bufo_t* parent_buf) {
+    /* Only before a single byte of the head has gone out: once the head is
+     * partially written, appending to the same buffer would insert bytes in
+     * the middle of what the peer is already reading. */
+    if (buf->pos != 0) return 0;
+
+    /* All of the chunk or none of it. Copying the first 2 KB of a 16 KB chunk
+     * saves no write at all — the rest still needs one — and costs the copy on
+     * every large response, which is the opposite of the point. */
+    const size_t body = bufo_chunk_size(parent_buf, SIZE_MAX);
+    if (body == 0 || body > HTTP_WRITE_JOIN_MAX) return 0;
+    if (buf->capacity - buf->size < body) return 0;
+
+    /* bufo's `pos` is both the append cursor and the read cursor. Park it at
+     * the end to append, then rewind so __wr sends head and body together. */
+    buf->pos = buf->size;
+    const ssize_t copied = bufo_append(buf, bufo_data(parent_buf), body);
+    buf->pos = 0;
+    if (copied != (ssize_t)body) {
+        /* Cannot happen — capacity was checked — but a short copy here would
+         * splice a truncated body into the head, so it is refused rather than
+         * trusted. The bytes are still owned by parent_buf. */
+        buf->size -= copied > 0 ? (size_t)copied : 0;
+        return 0;
+    }
+
+    /* The source advances by exactly what this buffer now owns: the join
+     * either sends these bytes or keeps them until it can. */
+    bufo_move_front_pos(parent_buf, body);
+
+    return body;
 }
 
 int http_write_body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf) {
     (void)request;
     http_module_write_t* module = response->cur_filter->module;
+    bufo_t* buf = module->buf;
     module->base.parent_buf = parent_buf;
+
+    /* Anything still in the own buffer goes first: the head, and possibly a
+     * body chunk joined to it that an earlier EAGAIN left half-written. Order
+     * matters — the peer must see the response in the order it was built. */
+    if (bufo_chunk_size(buf, BUF_SIZE) > 0) {
+        __join_first_chunk(buf, parent_buf);
+
+        const int r = __wr(response, buf);
+        if (r != CWF_OK) return r;
+    }
 
     const int r = __wr(response, parent_buf);
     if (r == CWF_OK)
         return CWF_DATA_AGAIN;
 
     return r;
+}
+
+int http_write_flush(httprequest_t* request, httpresponse_t* response) {
+    (void)request;
+    http_module_write_t* module = response->cur_filter->module;
+    bufo_t* buf = module->buf;
+
+    if (bufo_chunk_size(buf, BUF_SIZE) == 0)
+        return CWF_OK;
+
+    return __wr(response, buf);
 }

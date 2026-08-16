@@ -55,15 +55,40 @@ file_t file_create_tmp(const char* filename, const char* tmp_path) {
     return file;
 }
 
+/* basename(3) from libgen.h writes into its argument: it truncates trailing
+ * slashes in place, which means the "const char* path" below was a lie and a
+ * caller's buffer came back shortened ("/dir/" -> "/dir"). Callers that keep
+ * using the path afterwards — the static-file resolver appends an index name
+ * to it — silently got the wrong path; a string literal would fault outright.
+ *
+ * Same result, read-only. The segment is returned with its length because a
+ * borrowed slice cannot be NUL-terminated: with trailing slashes present the
+ * name does not end where the string does. */
+static const char* __path_basename(const char* path, size_t* out_len) {
+    size_t end = strlen(path);
+    while (end > 0 && path[end - 1] == '/') end--;
+
+    if (end == 0) { /* "" or nothing but slashes, as POSIX defines them */
+        *out_len = 1;
+        return path[0] == '/' ? "/" : ".";
+    }
+
+    size_t start = end;
+    while (start > 0 && path[start - 1] != '/') start--;
+
+    *out_len = end - start;
+    return path + start;
+}
+
 file_t file_open(const char* path, const int flags) {
     file_t file = file_alloc();
     if (path == NULL) return file;
     if (path[0] == 0) return file;
 
-    const char* filename = basename((char*)path);
-    if (strcmp(filename, "/") == 0) return file;
-    if (strcmp(filename, ".") == 0) return file;
-    if (strcmp(filename, "..") == 0) return file;
+    size_t name_len = 0;
+    const char* filename = __path_basename(path, &name_len);
+    if (name_len == 1 && (filename[0] == '/' || filename[0] == '.')) return file;
+    if (name_len == 2 && filename[0] == '.' && filename[1] == '.') return file;
 
     file.fd = open(path, flags, S_IRWXU);
     if (file.fd < 0) return file;
@@ -72,13 +97,18 @@ file_t file_open(const char* path, const int flags) {
     if (fstat(file.fd, &stat_buf) == 0) {
         file.size = stat_buf.st_size;
         file.mtime = stat_buf.st_mtime;
+        file.mode = stat_buf.st_mode;
     } else {
         file.size = 0;
         file.mtime = 0;
+        file.mode = 0;
     }
 
     file.ok = 1;
-    file.set_name(&file, filename);
+    /* The full path, not the borrowed segment: set_name extracts the name
+     * itself, and the segment is not NUL-terminated when the path ends in a
+     * slash. */
+    file.set_name(&file, path);
 
     return file;
 }
@@ -108,6 +138,7 @@ file_t file_alloc() {
         .tmp = 0,
         .size = 0,
         .mtime = 0,
+        .mode = 0,
         .name = {0},
 
         .set_name = __file_set_name,
@@ -321,12 +352,11 @@ int __file_internal_set_name(char* dest, const char* src) {
     if (psrc[0] == '/')
         psrc++;
 
-    const char* filename = basename((char*)psrc);
-    if (strcmp(filename, "/") == 0) return 0;
-    if (strcmp(filename, ".") == 0) return 0;
-    if (strcmp(filename, "..") == 0) return 0;
+    size_t length = 0;
+    const char* filename = __path_basename(psrc, &length);
+    if (length == 1 && (filename[0] == '/' || filename[0] == '.')) return 0;
+    if (length == 2 && filename[0] == '.' && filename[1] == '.') return 0;
 
-    size_t length = strlen(filename);
     if (length >= NAME_MAX)
         length = NAME_MAX - 1;
 

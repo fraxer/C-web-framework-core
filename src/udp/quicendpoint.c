@@ -1644,7 +1644,21 @@ static void __route(quicendpoint_t* ep, quicconn_t* conn, udp_datagram_t* dgram)
      * to the network rather than spinning on it. */
     __h3_rearm(conn);
 
-    if (!alive || conn->state == QUICCONN_DEAD) {
+    /* A connection that has just entered the closing period is NOT destroyed
+     * here, even though the datagram that put it there returned "not alive".
+     *
+     * §10.2.1 gives the closing state three PTOs of life, and it earns them:
+     * a peer whose CONNECTION_CLOSE was lost retransmits into the connection,
+     * and the state is what lets us answer with the close packet again instead
+     * of a stateless reset. Destroying it immediately turned every protocol
+     * error into "the server reset me" for anything the peer sent afterwards —
+     * which is what h3spec saw, intermittently, depending on whether its next
+     * packet raced the teardown. quicconn_tick moves it to DEAD when the
+     * deadline passes, and the worker sweep collects it then. */
+    const int closing = conn->state == QUICCONN_CLOSING ||
+                        conn->state == QUICCONN_DRAINING;
+
+    if (conn->state == QUICCONN_DEAD || (!alive && !closing)) {
         conn->conn.close(&conn->conn);   /* releases the lock */
         if (owner != ep) quicendpoint_send_flush(owner);
         return;

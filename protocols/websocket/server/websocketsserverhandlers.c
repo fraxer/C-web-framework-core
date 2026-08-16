@@ -10,6 +10,7 @@
 #include "wscontext.h"
 #include "middleware.h"
 #include "connection_s.h"
+#include "openssl.h"
 
 typedef struct connection_queue_websockets_data connection_queue_websockets_data_t;
 
@@ -351,6 +352,15 @@ int __read(connection_t* connection) {
                         return 0;
 
                     websocketsparser_reset(parser);
+
+                    /* Same reason as the HTTP/1.1 reader: with read ahead the
+                     * next frame can already be decrypted inside the library,
+                     * and epoll reports the socket, not that buffer. A
+                     * WebSocket connection inherits read ahead from the h1.1
+                     * connection it was upgraded from. */
+                    if (connection->ssl != NULL && openssl_pending(connection->ssl))
+                        goto read_data;
+
                     return 1;
                 }
                 default:

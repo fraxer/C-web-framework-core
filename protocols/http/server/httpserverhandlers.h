@@ -23,5 +23,6 @@ int http_server_dispatch(connection_t* connection, httprequest_t* request);
  * status line + chunked body). Return values are the CWF_* codes. */
 int __run_header_filters(httprequest_t* request, httpresponse_t* response);
 int __run_body_filters(httprequest_t* request, httpresponse_t* response);
+int __run_flush_filters(httprequest_t* request, httpresponse_t* response);
 
 #endif

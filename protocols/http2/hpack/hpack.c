@@ -231,8 +231,8 @@ hpack_status_e hpack_resolve_index(const hpack_dynamic_table_t* t, size_t idx,
     if (idx == 0) return HPACK_ERR_INVALID;
     if (idx < HPACK_STATIC_TABLE_SIZE) {
         const hpack_static_entry_t* e = &hpack_static_table[idx];
-        *name = e->name; *name_len = strlen(e->name);
-        *value = e->value; *value_len = strlen(e->value);
+        *name = e->name; *name_len = e->name_len;
+        *value = e->value; *value_len = e->value_len;
         return HPACK_OK;
     }
     size_t didx = idx - (HPACK_STATIC_TABLE_SIZE - 1); /* 62 → dynamic index 1 (newest) */
@@ -451,11 +451,13 @@ static size_t enc_find(const hpack_dynamic_table_t* t,
                        int match_value) {
     for (size_t i = 1; i < HPACK_STATIC_TABLE_SIZE; i++) {
         const hpack_static_entry_t* e = &hpack_static_table[i];
-        size_t en = strlen(e->name);
-        if (en == name_len && memcmp(e->name, name, name_len) == 0) {
+        /* Length first: it rejects nearly every entry without touching the
+         * strings, and the table carries its lengths precisely so that this
+         * scan costs no strlen at all. */
+        if (e->name_len == name_len && memcmp(e->name, name, name_len) == 0) {
             if (!match_value) return i;
-            size_t ev = strlen(e->value);
-            if (ev == value_len && memcmp(e->value, value, value_len) == 0) return i;
+            if (e->value_len == value_len && memcmp(e->value, value, value_len) == 0)
+                return i;
         }
     }
     for (size_t i = 0; i < t->count; i++) {

@@ -48,6 +48,7 @@ http_filter_t* http_range_filter_create(void) {
 
     filter->handler_header = range_handler_header;
     filter->handler_body = range_handler_body;
+    filter->handler_flush = NULL;
     filter->module = range_module_create();
     filter->next = NULL;
 

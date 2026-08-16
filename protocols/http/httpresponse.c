@@ -84,6 +84,8 @@ void httpresponse_free(void* arg) {
     __httpresponse_reset(response);
     filters_free(response->filter);
     httpresponseparser_free(response->parser);
+    /* Reset only recycles the blocks; this is where they go back. */
+    arena_free(&response->arena);
 
     free(response);
 }
@@ -154,9 +156,14 @@ static httpresponse_t* __httpresponse_create(connection_t* connection, http_chai
         free(response);
         return NULL;
     }
+    arena_init(&response->arena);
     response->cur_filter = response->filter;
     response->event_again = 0;
     response->headers_sended = 0;
+    /* The client-side response object is created without a connection, so the
+     * snapshot has to tolerate NULL — and defaults to "not persistent", which
+     * is the safe half of the choice. */
+    response->keepalive = connection != NULL && connection->keepalive ? 1 : 0;
     response->range = 0;
     response->last_modified = 0;
     response->client_gzip = 0;
@@ -211,6 +218,10 @@ void __httpresponse_reset(httpresponse_t* response) {
     response->content_length = 0;
     response->event_again = 0;
     response->headers_sended = 0;
+    /* Re-snapshotted, not cleared: a reused response object serves the request
+     * the connection is on now. */
+    const connection_t* conn = response->connection;
+    response->keepalive = conn != NULL && conn->keepalive ? 1 : 0;
     response->range = 0;
     response->last_modified = 0;
     response->client_gzip = 0;
@@ -225,7 +236,10 @@ void __httpresponse_reset(httpresponse_t* response) {
 
     bufo_clear(&response->body);
 
-    http_headers_free(response->header_);
+    /* One call instead of a walk with three frees per header: the arena takes
+     * the whole header block back and keeps the memory for the next request on
+     * this connection (docs/http2/10 §10.2). */
+    arena_reset(&response->arena);
     response->header_ = NULL;
     response->last_header = NULL;
 
@@ -252,6 +266,7 @@ void __httpresponse_datan(httpresponse_t* response, const char* data, size_t len
 
     if (!__httpresponse_alloc_body(response, data, length)) {
         connection->keepalive = 0;
+        response->keepalive = 0;
         ctx->destroyed = 1;
         return;
     }
@@ -263,6 +278,7 @@ void __httpresponse_datan(httpresponse_t* response, const char* data, size_t len
 
     if (!__httpresponse_prepare_body(response, length)) {
         connection->keepalive = 0;
+        response->keepalive = 0;
         ctx->destroyed = 1;
     }
 }
@@ -275,16 +291,31 @@ void __httpresponse_filen(httpresponse_t* response, const char* path, size_t len
     connection_t* connection = response->connection;
     connection_server_ctx_t* ctx = connection->ctx;
     char file_full_path[PATH_MAX];
-    const file_status_e status_code = http_get_file_full_path(ctx->server, file_full_path, PATH_MAX, path, length);
+    file_t file;
+    const file_status_e status_code = http_open_file(ctx->server, file_full_path, PATH_MAX, path, length, &file);
     if (status_code != FILE_OK) {
-        response->send_default(response, 404);
+        response->send_default(response, status_code == FILE_UNAVAILABLE ? 503 : 404);
         return;
     }
 
-    http_response_file(response, file_full_path);
+    http_response_file_opened(response, &file, file_full_path);
 }
 
-file_status_e http_get_file_full_path(server_t* server, char* file_full_path, size_t file_full_path_size, const char* path, size_t length) {
+/* open() failed: say which HTTP outcome that is.
+ *
+ * EMFILE/ENFILE/ENOMEM are the server running out of capacity, not a missing
+ * representation — calling those 404 once hid descriptor exhaustion in the h3
+ * benchmark and told clients to cache the lie (see http_response_file). Every
+ * other errno (ENOENT, EACCES, ENOTDIR, ELOOP, …) means the client cannot have
+ * this path, which is what stat() used to report here as FILE_NOTFOUND. */
+static file_status_e __open_errno_status(int err) {
+    return err == EMFILE || err == ENFILE || err == ENOMEM
+           ? FILE_UNAVAILABLE : FILE_NOTFOUND;
+}
+
+file_status_e http_open_file(server_t* server, char* file_full_path, size_t file_full_path_size, const char* path, size_t length, file_t* out) {
+    *out = file_alloc();
+
     size_t pos = 0;
 
     if (!data_appendn(file_full_path, &pos, file_full_path_size, server->root, server->root_length))
@@ -299,14 +330,37 @@ file_status_e http_get_file_full_path(server_t* server, char* file_full_path, si
 
     file_full_path[pos] = 0;
 
-    struct stat stat_obj;
-    // TODO: Optimize stat. Make cache.
-    /* Любая ошибка stat (ENOENT, EACCES, ENOTDIR, ...) — файла нет; иначе
-     * ниже читается неинициализированный stat_obj.st_mode. */
-    if (stat(file_full_path, &stat_obj) == -1)
-        return FILE_NOTFOUND;
+    /* Two syscalls per response, not three. The stat()-then-open() shape asked
+     * the kernel the same question twice: open() reports a missing path by
+     * itself, and file_open() already fstat()s the descriptor it returns, so
+     * S_ISDIR is answerable without a second lookup by name. A directory pays
+     * one extra open/close pair — the rare case pays for the hot one.
+     * docs/http2/10-performance.md §10.4. */
+    for (int attempt = 0; ; attempt++) {
+        errno = 0;
+        /* O_NONBLOCK is what makes opening-before-knowing-the-type safe: a fifo
+         * opened for reading blocks until a writer appears, and stat() used to
+         * be what kept the worker out of that. It has no effect on the regular
+         * files this actually serves, so nothing below has to clear it. */
+        *out = file_open(file_full_path, O_RDONLY | O_NONBLOCK);
+        if (!out->ok) {
+            /* An index that cannot be opened is a directory we refuse to list,
+             * not a missing path — the directory itself does exist. */
+            const file_status_e status = __open_errno_status(errno);
+            return attempt > 0 && status == FILE_NOTFOUND ? FILE_FORBIDDEN : status;
+        }
 
-    if (S_ISDIR(stat_obj.st_mode)) {
+        if (S_ISREG(out->mode))
+            return FILE_OK;
+
+        const int isdir = S_ISDIR(out->mode);
+        out->close(out);
+
+        /* A directory reached through the index is refused, as is anything that
+         * is neither a regular file nor a directory (socket, device, fifo). */
+        if (!isdir) return attempt > 0 ? FILE_FORBIDDEN : FILE_NOTFOUND;
+        if (attempt > 0) return FILE_FORBIDDEN;
+
         index_t* index = server->index;
         if (index == NULL)
             return FILE_FORBIDDEN;
@@ -319,31 +373,39 @@ file_status_e http_get_file_full_path(server_t* server, char* file_full_path, si
             return FILE_NOTFOUND;
 
         file_full_path[pos] = 0;
-
-        if (stat(file_full_path, &stat_obj) == -1)
-            return FILE_FORBIDDEN;
-
-        if (!S_ISREG(stat_obj.st_mode))
-            return FILE_FORBIDDEN;
     }
-    else if (!S_ISREG(stat_obj.st_mode))
-        return FILE_NOTFOUND;
-
-    return FILE_OK;
 }
 
 void http_response_file(httpresponse_t* response, const char* file_full_path) {
-    response->file_ = file_open(file_full_path, O_RDONLY);
-    if (!response->file_.ok) {
+    errno = 0;
+    file_t file = file_open(file_full_path, O_RDONLY | O_NONBLOCK);
+    if (!file.ok) {
         /* EMFILE/ENFILE is temporary server capacity exhaustion, not a missing
          * representation. Calling it 404 hid descriptor exhaustion in the
          * high-concurrency h3 benchmark and encouraged clients to cache the
          * lie. ENOMEM belongs to the same retryable resource class. */
-        const int status = errno == EMFILE || errno == ENFILE || errno == ENOMEM
-                           ? 503 : 404;
+        const int status = __open_errno_status(errno) == FILE_UNAVAILABLE ? 503 : 404;
         response->send_default(response, status);
         return;
     }
+
+    /* A route's static_file may expand {N} from the request path, so what it
+     * names is not necessarily a regular file. Only regular files have a size
+     * to serve and a descriptor sendfile() accepts. */
+    if (!S_ISREG(file.mode)) {
+        file.close(&file);
+        response->send_default(response, 404);
+        return;
+    }
+
+    http_response_file_opened(response, &file, file_full_path);
+}
+
+/* The response side of an already-open file: everything below needs only the
+ * descriptor and the name, which is why resolving a path and answering with it
+ * are two functions now — the resolver opens, this one answers. */
+void http_response_file_opened(httpresponse_t* response, file_t* file, const char* file_full_path) {
+    response->file_ = *file;
 
     const char* ext = file_extension(file_full_path);
     const char* mimetype = __httpresponse_get_mimetype(ext);
@@ -519,12 +581,9 @@ int __httpresponse_headern_add(httpresponse_t* response, const char* key, size_t
         return 1;
     }
 
-    http_header_t* header = http_header_create(key, key_length, value, value_length);
+    http_header_t* header = http_header_create_in(&response->arena, key, key_length,
+                                                 value, value_length);
     if (header == NULL) return 0;
-    if (header->key == NULL || header->value == NULL) {
-        http_header_free(header);
-        return 0;
-    }
 
     if (response->header_ == NULL)
         response->header_ = header;
@@ -582,11 +641,12 @@ int __httpresponse_header_remove(httpresponse_t* response, const char* key) {
     if (!__httpresponse_header_exist(response, key))
         return 0;
 
-    response->header_ = http_header_delete(response->header_, key);
+    response->header_ = http_header_unlink(response->header_, key);
 
-    /* http_header_delete мог освободить узел, на который указывал last_header
-     * (хвост списка). Перестраиваем last_header с нуля, иначе следующий
-     * add_header запишет через висячий указатель: last_header->next = new. */
+    /* Unlinking can drop the node last_header pointed at (the tail). The
+     * pointer is rebuilt from scratch, or the next add_header would write
+     * through a stale one: last_header->next = new. The node itself stays
+     * valid until the arena is reset — it is simply no longer in the list. */
     response->last_header = NULL;
     http_header_t* header = response->header_;
     while (header != NULL) {
@@ -912,8 +972,9 @@ void __httpresponse_models(httpresponse_t* response, array_t* models, ...) {
 }
 
 int __httpresponse_keepalive_enabled(httpresponse_t* response) {
-    connection_t* connection = response->connection;
-    return connection->keepalive;
+    /* The response's own snapshot, not the connection's current value — see
+     * httpresponse_t::keepalive. */
+    return response->keepalive;
 }
 
 void httpresponse_redirect(httpresponse_t* response, const char* path, int status_code) {

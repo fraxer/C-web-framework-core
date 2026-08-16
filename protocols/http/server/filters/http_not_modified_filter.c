@@ -28,6 +28,7 @@ http_filter_t* http_not_modified_filter_create(void) {
 
     filter->handler_header = http_not_modified_header;
     filter->handler_body = http_not_modified_body;
+    filter->handler_flush = NULL;
     filter->module = __create();
     filter->next = NULL;
 

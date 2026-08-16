@@ -4,6 +4,7 @@
 #include "connection_s.h"
 #include "server.h"
 #include "httpcommon.h"
+#include "arena.h"
 #include "array.h"
 #include "json.h"
 #include "response.h"
@@ -13,6 +14,9 @@ typedef enum {
     FILE_OK = 0,
     FILE_FORBIDDEN,
     FILE_NOTFOUND,
+    /* Server capacity, not the representation: EMFILE/ENFILE/ENOMEM. The
+     * caller answers 503, so descriptor exhaustion is not cached as a 404. */
+    FILE_UNAVAILABLE,
 } file_status_e;
 
 /*
@@ -32,6 +36,13 @@ typedef struct {
 
 typedef struct httpresponse {
     response_t base;
+
+    /* Where the response's headers live. It is reset, not freed, between
+     * requests, so a keep-alive connection allocates for its headers exactly
+     * once — see arena.h and docs/http2/10 §10.2. Only header_/last_header are
+     * on it: trailers and early hints are handed to the h2/h3 stream and
+     * outlive the response object. */
+    arena_t arena;
 
     http_header_t* header_;
     http_header_t* last_header;
@@ -277,6 +288,14 @@ typedef struct httpresponse {
     unsigned content_encoding : 2;
     unsigned event_again : 1;
     unsigned headers_sended : 1;
+    /* Whether the connection survives THIS response, snapshotted when the
+     * response is created — that is, while connection->keepalive still belongs
+     * to the request being answered. With pipelining the parser has already
+     * moved on to later requests by the time this response is written, so
+     * reading the connection at write time answers about the wrong request:
+     * a "Connection: close" three requests later closed the connection after
+     * the first response and swallowed the other two. */
+    unsigned keepalive : 1;
     unsigned range : 1;
     unsigned last_modified : 1;
     /* What the request's Accept-Encoding allows. Zero for a response built
@@ -307,8 +326,12 @@ int httpresponse_has_payload(httpresponse_t* response);
  * applied while the response is being built. A NULL value means the field was
  * absent, which RFC 9110 §12.5.3 reads as "identity only". */
 void httpresponse_set_accept_encoding(httpresponse_t* response, const char* value, size_t length);
-file_status_e http_get_file_full_path(server_t* server, char* file_full_path, size_t file_full_path_size, const char* path, size_t length);
+/* Resolve `path` under the server root and open it, writing the resolved name
+ * into `file_full_path` and the open file into `out` (FILE_OK only). On any
+ * other status `out` is a closed file_t and needs no cleanup. */
+file_status_e http_open_file(server_t* server, char* file_full_path, size_t file_full_path_size, const char* path, size_t length, file_t* out);
 void http_response_file(httpresponse_t* response, const char* file_full_path);
+void http_response_file_opened(httpresponse_t* response, file_t* file, const char* file_full_path);
 size_t httpresponse_status_length(int status_code);
 
 void httpresponse_default(httpresponse_t* response, int status_code);

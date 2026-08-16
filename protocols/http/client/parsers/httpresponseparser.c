@@ -11,6 +11,7 @@
 #include "log.h"
 #include "appconfig.h"
 #include "httpcommon.h"
+#include "arena.h"
 #include "httpresponseparser.h"
 #include "helpers.h"
 
@@ -471,15 +472,15 @@ void __try_set_content_encoding(httpresponseparser_t* parser) {
 int __httpresponseparser_set_header_key(httpresponse_t* response, httpresponseparser_t* parser) {
     char* string = bufferdata_get(&parser->buf);
     size_t length = bufferdata_writed(&parser->buf);
-    http_header_t* header = http_header_create(string, length, NULL, 0);
+    /* The response's arena, like every other header on this object: one bump
+     * instead of three mallocs, and released with the response (docs/http2/10
+     * §10.2). */
+    http_header_t* header = http_header_create_in(&response->arena, string, length, NULL, 0);
 
     if (header == NULL) {
         log_error("HTTP error: can't alloc header memory\n");
         return 0;
     }
-    
-    if (header->key == NULL)
-        return 0;
 
     if (response->header_ == NULL)
         response->header_ = header;
@@ -496,14 +497,11 @@ int __httpresponseparser_set_header_value(httpresponse_t* response, httpresponse
     char* string = bufferdata_get(&parser->buf);
     size_t length = bufferdata_writed(&parser->buf);
 
-    /*
-     * http_header_create() уже выделил value как пустую строку-заглушку.
-     * Освобождаем её перед перезаписью, иначе перезапись указателя утечёт
-     * (по 1 байту на каждый заголовок ответа).
-     */
-    free(response->last_header->value);
-
-    response->last_header->value = copy_cstringn(string, length);
+    /* The placeholder value the header was created with stays where it is: it
+     * is one byte in the arena, and the arena is reclaimed wholesale. Freeing
+     * it here — which is what this did while values were malloc'd — would now
+     * be a free() of memory this process does not own separately. */
+    response->last_header->value = arena_strndup(&response->arena, string, length);
     response->last_header->value_length = length;
 
     if (response->last_header->value == NULL)

@@ -217,7 +217,7 @@ qpack_status_e qpack_decoder_read_encoder(qpack_decoder_t* d, const uint8_t* dat
             if ((octet & 0x40) != 0) {
                 if (idx >= QPACK_STATIC_TABLE_SIZE) return QPACK_ERR_ENCODER_STREAM;
                 name = qpack_static_table[idx].name;
-                name_len = strlen(name);
+                name_len = qpack_static_table[idx].name_len;
             } else {
                 const qpack_dynamic_entry_t* ref = __dynamic_relative(d, idx);
                 if (ref == NULL) return QPACK_ERR_ENCODER_STREAM;
@@ -452,11 +452,14 @@ static int qpack_static_find(const char* name, size_t name_len,
                              int match_value, size_t* idx) {
     for (size_t i = 0; i < QPACK_STATIC_TABLE_SIZE; i++) {
         const qpack_static_entry_t* e = &qpack_static_table[i];
-        const size_t en = strlen(e->name);
-        if (en != name_len || memcmp(e->name, name, name_len) != 0) continue;
+        /* Length first: it rejects nearly every one of the 99 entries without
+         * touching the strings, and the table carries its lengths precisely so
+         * that this scan costs no strlen at all. */
+        if (e->name_len != name_len || memcmp(e->name, name, name_len) != 0) continue;
         if (!match_value) { *idx = i; return 1; }
-        const size_t ev = strlen(e->value);
-        if (ev == value_len && memcmp(e->value, value, value_len) == 0) { *idx = i; return 1; }
+        if (e->value_len == value_len && memcmp(e->value, value, value_len) == 0) {
+            *idx = i; return 1;
+        }
     }
     return 0;
 }
@@ -600,7 +603,7 @@ qpack_status_e qpack_encoder_insert_static_name(qpack_encoder_t* e,
     if (e == NULL || value == NULL || static_index >= QPACK_STATIC_TABLE_SIZE)
         return QPACK_ERR_ENCODER_STREAM;
     const char* name = qpack_static_table[static_index].name;
-    const size_t name_len = strlen(name);
+    const size_t name_len = qpack_static_table[static_index].name_len;
     if (name_len > SIZE_MAX - value_len - 32) return QPACK_ERR_ENCODER_STREAM;
     const size_t size = name_len + value_len + 32;
     if (!__encoder_make_room(e, size))
@@ -1020,16 +1023,6 @@ static qpack_status_e __decode_value(const uint8_t** pp, const uint8_t* end,
     return __decode_raw(data, (size_t)length, huffman, out, out_len);
 }
 
-/* Copy a static-table entry's name or value into a fresh malloc'd string. */
-static int __dup_static(const char* src, char** out, size_t* out_len) {
-    size_t len = strlen(src);
-    char* dst = malloc(len + 1);
-    if (dst == NULL) return 0;
-    memcpy(dst, src, len + 1);
-    *out = dst; *out_len = len;
-    return 1;
-}
-
 static int __dup_bytes(const char* src, size_t len, char** out, size_t* out_len) {
     char* dst = malloc(len + 1);
     if (dst == NULL) return 0;
@@ -1143,8 +1136,8 @@ qpack_status_e qpack_decode_block(qpack_decoder_t* d, const uint8_t* block, size
             if (T) {
                 if (idx >= QPACK_STATIC_TABLE_SIZE) { st = QPACK_ERR_DECOMPRESSION; goto fail; }
                 const qpack_static_entry_t* e = &qpack_static_table[idx];
-                if (!__dup_static(e->name, &h->name, &h->name_len) ||
-                    !__dup_static(e->value, &h->value, &h->value_len)) {
+                if (!__dup_bytes(e->name, e->name_len, &h->name, &h->name_len) ||
+                    !__dup_bytes(e->value, e->value_len, &h->value, &h->value_len)) {
                     st = QPACK_ERR_MEMORY; goto fail;
                 }
             } else {
@@ -1186,7 +1179,7 @@ qpack_status_e qpack_decode_block(qpack_decoder_t* d, const uint8_t* block, size
             if (T) {
                 if (nidx >= QPACK_STATIC_TABLE_SIZE) { st = QPACK_ERR_DECOMPRESSION; goto fail; }
                 const qpack_static_entry_t* e = &qpack_static_table[nidx];
-                if (!__dup_static(e->name, &h->name, &h->name_len)) {
+                if (!__dup_bytes(e->name, e->name_len, &h->name, &h->name_len)) {
                     st = QPACK_ERR_MEMORY; goto fail;
                 }
             } else {

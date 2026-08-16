@@ -55,6 +55,10 @@ void openssl_free(openssl_t* openssl);
 void openssl_set_sni_callback(openssl_t* openssl, int (*callback)(SSL*, int*, void*));
 int openssl_read(SSL*, void*, size_t);
 void openssl_set_read_ahead(SSL*, int);
+/* Non-zero when decrypted or unprocessed bytes are waiting inside the library,
+ * where epoll cannot see them. Must be checked by any reader that leaves its
+ * loop before SSL_read reports WANT_READ. */
+int openssl_pending(SSL*);
 int openssl_write(SSL*, const void*, size_t);
 openssl_io_status_e openssl_io_status(SSL*, int ret);
 

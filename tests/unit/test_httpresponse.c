@@ -13,8 +13,9 @@
  *     the freed node (heap-UAF).
  *   - httpresponse_default with an unlisted status code underflowed
  *     `status_length - 2` to SIZE_MAX and memcpy'd from a NULL status string.
- *   - http_get_file_full_path read an uninitialized `struct stat` when stat()
- *     failed with an errno other than ENOENT (e.g. ENOTDIR).
+ *   - the path resolver read an uninitialized `struct stat` when stat()
+ *     failed with an errno other than ENOENT (e.g. ENOTDIR). The resolver is
+ *     now http_open_file, which opens instead of stat'ing (§10.4).
  *   - __httpresponse_reset kept content_length/version from the previous
  *     response, so httpresponse_has_payload() lied on reused connections.
  *   - __httpresponse_headern_add ran strlen() on the key although the API
@@ -433,12 +434,45 @@ TEST(test_httpresponse_send_data_respects_keepalive) {
     httpresponse_t* response = make_response(&conn);
     TEST_REQUIRE_NOT_NULL(response, "response allocated");
 
+    /* The response answers on its own snapshot, taken when it was created —
+     * see the next test for why the connection's current value will not do. */
     conn->keepalive = 1;
+    response->keepalive = 1;
     response->send_data(response, "hi");
 
     http_header_t* header = response->get_header(response, "Connection");
     TEST_REQUIRE_NOT_NULL(header, "Connection present");
     TEST_ASSERT_STR_EQUAL("keep-alive", header->value, "keepalive on -> keep-alive");
+
+    free_response(response, conn);
+}
+
+TEST(test_httpresponse_keepalive_is_snapshotted_per_response) {
+    TEST_SUITE("httpresponse: send data");
+    TEST_CASE("REGRESSION: a later request's Connection: close does not close this one");
+
+    connection_t* conn = make_connection();
+    TEST_REQUIRE_NOT_NULL(conn, "connection allocated");
+
+    /* The request being answered was persistent... */
+    conn->keepalive = 1;
+    httpresponse_t* response = httpresponse_create(conn);
+    TEST_REQUIRE_NOT_NULL(response, "response allocated");
+    TEST_ASSERT_EQUAL_UINT(1, response->keepalive, "snapshot taken at creation");
+
+    /* ...and then the parser read the NEXT pipelined request, which said
+     * "Connection: close". That belongs to that request, not to this response:
+     * before the snapshot existed, this response advertised close and the
+     * connection went down with the remaining pipelined answers unsent. */
+    conn->keepalive = 0;
+
+    response->send_data(response, "hi");
+
+    http_header_t* header = response->get_header(response, "Connection");
+    TEST_REQUIRE_NOT_NULL(header, "Connection present");
+    TEST_ASSERT_STR_EQUAL("keep-alive", header->value,
+                          "this response still advertises keep-alive");
+    TEST_ASSERT_EQUAL_UINT(1, response->keepalive, "and still says so to the write path");
 
     free_response(response, conn);
 }
@@ -789,9 +823,24 @@ TEST(test_httpresponse_cookie_multiple_headers) {
 // Static file path resolution
 // ============================================================================
 
+/* http_open_file leaves an open descriptor behind on FILE_OK — the point of
+ * §10.4 is that resolving the path IS the open. Most assertions below care only
+ * about the status, so they close it here; the ones that check the descriptor
+ * call http_open_file directly. */
+static file_status_e resolve(server_t* server, char* full_path, size_t size,
+                             const char* path, size_t length) {
+    file_t file;
+    const file_status_e status = http_open_file(server, full_path, size, path, length, &file);
+    if (status == FILE_OK)
+        file.close(&file);
+    else if (file.fd != -1)
+        TEST_FAIL("http_open_file leaked a descriptor on a failed resolve");
+    return status;
+}
+
 TEST(test_http_get_file_full_path) {
     TEST_SUITE("httpresponse: file path resolution");
-    TEST_CASE("http_get_file_full_path resolves files, directories and errors");
+    TEST_CASE("http_open_file resolves files, directories and errors");
 
     char root[] = "/tmp/cwfr_httpresponse_XXXXXX";
     TEST_REQUIRE_NOT_NULL(mkdtemp(root), "test root created");
@@ -821,37 +870,64 @@ TEST(test_http_get_file_full_path) {
 
     char full_path[PATH_MAX];
 
-    TEST_ASSERT_EQUAL(FILE_OK, http_get_file_full_path(&server, full_path, PATH_MAX, "/index.html", 11), "existing file");
+    TEST_ASSERT_EQUAL(FILE_OK, resolve(&server, full_path, PATH_MAX, "/index.html", 11), "existing file");
     snprintf(path, sizeof(path), "%s/index.html", root);
     TEST_ASSERT_STR_EQUAL(path, full_path, "root + path concatenated");
 
-    TEST_ASSERT_EQUAL(FILE_OK, http_get_file_full_path(&server, full_path, PATH_MAX, "index.html", 10), "missing leading slash is inserted");
+    TEST_ASSERT_EQUAL(FILE_OK, resolve(&server, full_path, PATH_MAX, "index.html", 10), "missing leading slash is inserted");
     TEST_ASSERT_STR_EQUAL(path, full_path, "same resolved path");
 
-    TEST_ASSERT_EQUAL(FILE_OK, http_get_file_full_path(&server, full_path, PATH_MAX, "/file.txt", 9), "regular file");
+    TEST_ASSERT_EQUAL(FILE_OK, resolve(&server, full_path, PATH_MAX, "/file.txt", 9), "regular file");
 
-    TEST_ASSERT_EQUAL(FILE_NOTFOUND, http_get_file_full_path(&server, full_path, PATH_MAX, "/missing.html", 13), "missing file");
+    TEST_ASSERT_EQUAL(FILE_NOTFOUND, resolve(&server, full_path, PATH_MAX, "/missing.html", 13), "missing file");
 
-    TEST_ASSERT_EQUAL(FILE_FORBIDDEN, http_get_file_full_path(&server, full_path, PATH_MAX, "/sub", 4), "directory without configured index");
+    TEST_ASSERT_EQUAL(FILE_FORBIDDEN, resolve(&server, full_path, PATH_MAX, "/sub", 4), "directory without configured index");
 
     /* REGRESSION: a path through a regular file makes stat() fail with
      * ENOTDIR (not ENOENT); the old code then read an uninitialized
      * struct stat instead of failing deterministically. */
-    TEST_ASSERT_EQUAL(FILE_NOTFOUND, http_get_file_full_path(&server, full_path, PATH_MAX, "/file.txt/deeper", 16), "ENOTDIR is not found");
+    TEST_ASSERT_EQUAL(FILE_NOTFOUND, resolve(&server, full_path, PATH_MAX, "/file.txt/deeper", 16), "ENOTDIR is not found");
 
-    TEST_ASSERT_EQUAL(FILE_NOTFOUND, http_get_file_full_path(&server, full_path, 4, "/index.html", 11), "tiny output buffer");
+    TEST_ASSERT_EQUAL(FILE_NOTFOUND, resolve(&server, full_path, 4, "/index.html", 11), "tiny output buffer");
 
     server.index = server_index_create("index.html");
     TEST_REQUIRE_NOT_NULL_GOTO(server.index, "index created", cleanup);
 
-    TEST_ASSERT_EQUAL(FILE_OK, http_get_file_full_path(&server, full_path, PATH_MAX, "/sub", 4), "directory resolves to its index");
+    TEST_ASSERT_EQUAL(FILE_OK, resolve(&server, full_path, PATH_MAX, "/sub", 4), "directory resolves to its index");
     snprintf(path, sizeof(path), "%s/sub/index.html", root);
     TEST_ASSERT_STR_EQUAL(path, full_path, "index appended after slash");
 
-    TEST_ASSERT_EQUAL(FILE_OK, http_get_file_full_path(&server, full_path, PATH_MAX, "/sub/", 5), "trailing slash directory");
+    TEST_ASSERT_EQUAL(FILE_OK, resolve(&server, full_path, PATH_MAX, "/sub/", 5), "trailing slash directory");
     TEST_ASSERT_STR_EQUAL(path, full_path, "no double slash inserted");
 
-    TEST_ASSERT_EQUAL(FILE_FORBIDDEN, http_get_file_full_path(&server, full_path, PATH_MAX, "/emptydir", 9), "directory without index file");
+    TEST_ASSERT_EQUAL(FILE_FORBIDDEN, resolve(&server, full_path, PATH_MAX, "/emptydir", 9), "directory without index file");
+
+    /* The resolver hands back the open file, which is the whole point of §10.4:
+     * the caller must not have to open the path a second time. */
+    file_t opened;
+    TEST_ASSERT_EQUAL(FILE_OK, http_open_file(&server, full_path, PATH_MAX, "/file.txt", 9, &opened), "regular file resolves");
+    TEST_ASSERT(opened.ok && opened.fd >= 0, "descriptor is open");
+    TEST_ASSERT_EQUAL_SIZE(5, opened.size, "size comes from the fstat done at open");
+    char readback[8] = {0};
+    TEST_ASSERT_EQUAL(5, read(opened.fd, readback, sizeof(readback)), "descriptor reads the file");
+    TEST_ASSERT_STR_EQUAL("plain", readback, "and reads the right one");
+    opened.close(&opened);
+
+    /* A directory resolved through its index returns the index's descriptor,
+     * not the directory's — the extra open/close pair is the directory's cost. */
+    TEST_ASSERT_EQUAL(FILE_OK, http_open_file(&server, full_path, PATH_MAX, "/sub", 4, &opened), "directory resolves to its index");
+    TEST_ASSERT(opened.ok && opened.fd >= 0, "index descriptor is open");
+    TEST_ASSERT_EQUAL_SIZE(12, opened.size, "size is the index file's");
+    opened.close(&opened);
+
+    /* Neither regular nor directory: a fifo is not a representation this server
+     * serves, and answering it would block the worker on open(). */
+    char fifo[PATH_MAX];
+    snprintf(fifo, sizeof(fifo), "%s/pipe", root);
+    if (mkfifo(fifo, 0644) == 0) {
+        TEST_ASSERT_EQUAL(FILE_NOTFOUND, resolve(&server, full_path, PATH_MAX, "/pipe", 5), "fifo is not found");
+        unlink(fifo);
+    }
 
     cleanup:
     if (server.index != NULL) server_index_destroy(server.index);
