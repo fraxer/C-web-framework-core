@@ -61,7 +61,9 @@ static const char* const __quic_name[METRICS_QUIC__COUNT] = {
     "refused.at_capacity", "refused.handshake_rate",
     "retry_sent", "token_valid", "token_invalid",
     "migrations.attempted", "migrations.validated", "migrations.rejected",
-    "routing.local", "routing.foreign", "routing.rehomed"
+    "routing.local", "routing.foreign", "routing.rehomed",
+    "build.calls", "build.packets",
+    "build.visits.flow", "build.visits.data", "build.stream_frames"
 };
 
 /* Index-matched to metrics_h3_t. */

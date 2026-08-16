@@ -315,6 +315,29 @@ typedef struct quicconn {
      * carries next door. */
     atomic_int want_write;
 
+    /* Some stream may owe the peer a MAX_STREAM_DATA (docs/http3/09-options.md
+     * §2.7).
+     *
+     * Without it __build_packet walked conn->streams on every packet to ask
+     * each stream in turn, and the walk ran to the end of the list every time
+     * because it writes almost nothing and so never fills the packet that would
+     * stop it. Measured at a hundred streams: 104 node visits per packet for one
+     * frame, 1.6-3.3% of the server's cycles spent answering "no".
+     *
+     * A hint, not a record: it may be up when nothing is owed (one wasted walk),
+     * and the walk itself re-raises it when it could not finish. What it may not
+     * do is be down while a stream owes, so it is raised in exactly the place
+     * that can make quicflow_should_update true for a stream -- a receive
+     * recording new data against the window (quicstream_on_data, and the final
+     * size of a RESET_STREAM). Nothing else moves `used`: quicflow_consumed only
+     * auto-tunes, and the send side is a different flow object.
+     *
+     * Atomic and cleared before the walk rather than after it, for the reason
+     * the wake-up flag is (docs/http3/08 §7e): a receive concurrent with the
+     * walk then leaves it raised and costs a walk, instead of being swallowed
+     * and costing the peer its window. */
+    atomic_int stream_flow_pending;
+
     struct quicconn* ep_next;   /* endpoint's connection list */
     struct quicconn* tx_next;   /* endpoint's send queue */
 

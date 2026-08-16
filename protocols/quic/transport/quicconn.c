@@ -764,6 +764,12 @@ static int __on_stream_frame(quicconn_t* conn, const quicframe_t* frame,
         return 0;
     }
 
+    /* This is what moves a stream's receive window and so the only thing that
+     * can make it owe a MAX_STREAM_DATA. Raised unconditionally rather than by
+     * asking quicflow_should_update here: the answer changes as the application
+     * drains the stream, and the cheap place to ask is the send path, once. */
+    atomic_store_explicit(&conn->stream_flow_pending, 1, memory_order_release);
+
     return 1;
 }
 
@@ -812,6 +818,10 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
             quicconn_close(conn, err, 0, now_us);
             return 0;
         }
+
+        /* The final size is recorded against the stream's receive window like
+         * arriving data, so it moves the same limit -- see __on_stream_frame. */
+        atomic_store_explicit(&conn->stream_flow_pending, 1, memory_order_release);
 
         /* §4.5: "the final size is used to account for all bytes on the stream
          * in the connection-level flow controller" -- including the bytes that
@@ -1819,6 +1829,14 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
     int ack_eliciting = 0;
     quicframe_ref_t* refs = NULL;
 
+    /* Cost of assembling this one packet, in nodes of conn->streams touched by
+     * each of the two walks below and in streams that ended up writing data
+     * (docs/http3/09-options.md §2.7). On the stack, published once at the end:
+     * the walk is the hot path, and an atomic per node would measure itself. */
+    unsigned long long visits_flow = 0;
+    unsigned long long visits_data = 0;
+    unsigned long long stream_frames = 0;
+
     const size_t payload_cap =
         (cap - QUIC_AEAD_TAG_LEN > sizeof payload ? sizeof payload : cap - QUIC_AEAD_TAG_LEN)
         - QUICCONN_HEADER_RESERVE;
@@ -1940,10 +1958,19 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
         }
     }
 
-    /* The same for each stream that has been drained (§4.1). */
-    if (level == QUIC_ENC_APP) {
-        for (quicstream_t* s = conn->streams; s != NULL && p + 24 < payload_cap;
-             s = s->next) {
+    /* The same for each stream that has been drained (§4.1) -- but only when a
+     * receive has said one of them might owe it, because this walk is the one
+     * that never stops early (quicconn.h, stream_flow_pending). Taken down
+     * before the walk, so a receive that lands during it is not swallowed. */
+    if (level == QUIC_ENC_APP &&
+        atomic_exchange_explicit(&conn->stream_flow_pending, 0,
+                                 memory_order_acquire)) {
+        int owed = 0;
+        quicstream_t* s = conn->streams;
+
+        for (; s != NULL && p + 24 < payload_cap; s = s->next) {
+            visits_flow++;
+
             uint64_t limit = 0;
             if (!quicflow_should_update(&s->recv_flow, &limit)) continue;
 
@@ -1959,7 +1986,17 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
                 ack_eliciting = 1;
                 quicflow_update_sent(&s->recv_flow, limit);
             }
+            /* No room left in this packet for a frame that is owed. */
+            else owed = 1;
         }
+
+        /* `s != NULL` means the packet filled before the list ended, so the tail
+         * was never asked. Either way the hint goes back up: dropping it here is
+         * the one failure this may not have -- a stream whose window is never
+         * extended stalls the peer for good, and nothing would raise the hint
+         * again, because raising it takes the very data the peer cannot send. */
+        if (s != NULL || owed)
+            atomic_store_explicit(&conn->stream_flow_pending, 1, memory_order_release);
     }
 
     /* §4.6: hand back the credit of streams that have finished. Sent when it
@@ -2097,6 +2134,8 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
     if (level == QUIC_ENC_APP) {
         for (quicstream_t* s = conn->streams; s != NULL && p + 32 < payload_cap;
              s = s->next) {
+            visits_data++;
+
             /* STOP_SENDING is about the receive half, so it is not an
              * alternative to the RESET_STREAM below -- a stream can owe both,
              * and each is cleared on its own. */
@@ -2282,6 +2321,7 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
 
             p += n;
             ack_eliciting = 1;
+            stream_frames++;
 
             quicsendbuf_mark_sent(&s->send, offset, dlen, fin);
 
@@ -2315,6 +2355,14 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
             }
         }
     }
+
+    /* Before the early return below, not after it: the walks have already been
+     * paid for by the time we find out there is no packet, and hiding that cost
+     * is how the ratio this counts would flatter itself (§2.7). */
+    metrics_quic(METRICS_QUIC_BUILD_CALLS);
+    metrics_quic_add(METRICS_QUIC_BUILD_VISITS_FLOW, visits_flow);
+    metrics_quic_add(METRICS_QUIC_BUILD_VISITS_DATA, visits_data);
+    metrics_quic_add(METRICS_QUIC_BUILD_STREAM_FRAMES, stream_frames);
 
     /* Nothing to send -- or nothing but an ACK that is not due yet, which is
      * the piggyback above finding no ride. Either way no packet is built, and
@@ -2403,6 +2451,8 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
 
     quicloss_on_sent(&conn->loss, level, pn, total, ack_eliciting, 1, refs, now_us);
     if (conn->ecn_enabled) conn->ecn_sent[level]++;
+
+    metrics_quic(METRICS_QUIC_BUILD_PACKETS);
 
     QUICBEACON("cid=%02x%02x SENT  level=%d pn=%llu bytes=%zu payload=%zu ack_bytes=%zu elic=%d",
                conn->odcid.data[0], conn->odcid.data[1],

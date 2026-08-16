@@ -108,8 +108,6 @@ typedef struct quicstream {
     int    (*app_done)(void*);
 
     struct quicstream* next;
-    struct quicstream* send_next;   /* round-robin list of streams with data */
-    int      in_send_list;
 } quicstream_t;
 
 /* Every error in this module is a transport error code, returned rather than

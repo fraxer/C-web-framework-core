@@ -269,6 +269,34 @@ typedef enum {
      * in the old worker's send queue). */
     METRICS_QUIC_ROUTE_REHOMED,
 
+    /* What one packet costs to assemble (docs/http3/09-options.md §2.7).
+     *
+     * __build_packet walks conn->streams twice per packet -- once for
+     * MAX_STREAM_DATA, once for the data frames -- and both walks stop only when
+     * the packet is full, so N open streams cost O(N) node visits even when one
+     * stream is doing all the sending. Whether that is worth a second list of
+     * "streams with something to say" is a question about a *ratio*, and the
+     * ratio is what these measure: visits per packet against stream_frames per
+     * packet. If the first stays flat as N grows, the walk costs nothing and the
+     * item closes on the measurement.
+     *
+     * The two walks are counted apart because they end differently. The data
+     * walk stops as soon as the packet is full, so it usually gets no further
+     * than the one stream that is sending; the MAX_STREAM_DATA walk writes
+     * almost nothing and therefore runs the list to its end every time. Summed
+     * into one number, the cheap walk hides which of the two is the cost.
+     *
+     * Counted per call, not per visit: __build_packet accumulates on the stack
+     * and adds once, so a hundred visits cost one relaxed add and not a hundred.
+     * `calls` counts every attempt that got as far as the stream sections,
+     * `packets` only those that produced a packet -- the gap is work spent on
+     * packets that were never built. */
+    METRICS_QUIC_BUILD_CALLS,
+    METRICS_QUIC_BUILD_PACKETS,
+    METRICS_QUIC_BUILD_VISITS_FLOW,
+    METRICS_QUIC_BUILD_VISITS_DATA,
+    METRICS_QUIC_BUILD_STREAM_FRAMES,
+
     METRICS_QUIC__COUNT
 } metrics_quic_t;
 
