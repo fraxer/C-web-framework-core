@@ -115,9 +115,13 @@ size_t h3client_request_bytes(uint8_t* dst, size_t cap,
 }
 
 /* Feed everything readable on `id` through the frame parser, collecting the
- * field section and the body. Returns 0 on a protocol error. */
+ * field section and the body. Returns 0 on a protocol error.
+ *
+ * With `discard` the body is counted and dropped: a scenario that moves tens of
+ * megabytes only to check when they arrived would otherwise spend its time in
+ * realloc, and that time would land in the numbers it is there to produce. */
 static int __consume(quicclient_t* client, uint64_t id, h3frame_parser_t* parser,
-                     h3client_response_t* out, int* headers_seen) {
+                     h3client_response_t* out, int* headers_seen, int discard) {
     uint8_t buf[4096];
 
     for (;;) {
@@ -181,6 +185,11 @@ static int __consume(quicclient_t* client, uint64_t id, h3frame_parser_t* parser
             if (st == H3FRAME_DATA_CHUNK) {
                 if (parser->payload_len == 0) continue;
 
+                if (discard) {
+                    out->body_len += parser->payload_len;
+                    continue;
+                }
+
                 char* grown = realloc(out->body, out->body_len + parser->payload_len + 1);
                 if (grown == NULL) return 0;
 
@@ -236,7 +245,7 @@ int h3client_get(quicclient_t* client, uint64_t stream_id,
     while (quic_now_us() < deadline) {
         if (!quicclient_pump(client, 100)) break;
 
-        if (!__consume(client, stream_id, &parser, out, &headers_seen)) {
+        if (!__consume(client, stream_id, &parser, out, &headers_seen, 0)) {
             h3frame_parser_free(&parser);
             return 0;
         }
@@ -340,7 +349,7 @@ int h3client_get_many(quicclient_t* client, size_t count,
         for (size_t i = 0; i < count; i++) {
             if (complete[i]) continue;
 
-            if (!__consume(client, i * 4, &parsers[i], &out[i], &headers_seen[i]))
+            if (!__consume(client, i * 4, &parsers[i], &out[i], &headers_seen[i], 0))
                 goto finish;
 
             /* Complete, not merely finished: a FIN with a gap in front of it
@@ -363,6 +372,99 @@ finish:
     free(parsers); free(headers_seen); free(complete);
 
     return ok;
+}
+
+int h3client_get_staggered(quicclient_t* client, h3client_leg_t* legs, size_t count,
+                           const char* authority, int timeout_ms) {
+    if (client == NULL || legs == NULL || count == 0) return 0;
+
+    h3frame_parser_t* parsers = calloc(count, sizeof * parsers);
+    h3client_response_t* responses = calloc(count, sizeof * responses);
+    int* headers_seen = calloc(count, sizeof * headers_seen);
+    if (parsers == NULL || responses == NULL || headers_seen == NULL) {
+        free(parsers); free(responses); free(headers_seen);
+        return 0;
+    }
+
+    for (size_t i = 0; i < count; i++) h3frame_parser_init(&parsers[i]);
+
+    const uint64_t start = quic_now_us();
+    const uint64_t deadline = start + (uint64_t)timeout_ms * 1000;
+    size_t done = 0;
+
+    while (done < count && quic_now_us() < deadline) {
+        uint64_t now = quic_now_us();
+
+        for (size_t i = 0; i < count; i++) {
+            if (legs[i].sent_us != 0) continue;
+            if (now < start + (uint64_t)legs[i].start_ms * 1000) continue;
+
+            uint8_t req[1280];
+            const size_t n = __build_request(req, sizeof req, authority, legs[i].path);
+            if (n == 0 ||
+                !quicclient_stream_write(client, legs[i].stream_id, req, n, 1))
+                goto finish;
+
+            /* Stamped here, flushed by the pump below -- within the same turn,
+             * so the two are the same moment at this resolution. */
+            legs[i].sent_us = now;
+        }
+
+        /* Never wait past the next leg's turn. The default 100 ms pump would
+         * post a request due at 20 ms five times too late, and the stagger is
+         * the entire experiment. */
+        int slice = 20;
+        for (size_t i = 0; i < count; i++) {
+            if (legs[i].sent_us != 0) continue;
+
+            const uint64_t due = start + (uint64_t)legs[i].start_ms * 1000;
+            const int ms = due > now ? (int)((due - now) / 1000) : 0;
+            if (ms < slice) slice = ms;
+        }
+        if (slice < 1) slice = 1;
+
+        if (!quicclient_pump(client, slice)) break;
+
+        for (size_t i = 0; i < count; i++) {
+            if (legs[i].completed || legs[i].sent_us == 0) continue;
+
+            if (!__consume(client, legs[i].stream_id, &parsers[i], &responses[i],
+                           &headers_seen[i], 1))
+                goto finish;
+
+            now = quic_now_us();
+
+            if (legs[i].first_byte_us == 0 &&
+                (headers_seen[i] || responses[i].body_len > 0))
+                legs[i].first_byte_us = now;
+
+            /* Complete, not merely finished: a FIN with a gap in front of it is
+             * a response still arriving, and counting it as done here would
+             * report a loss as a fast response (quicclient.h). */
+            if (quicclient_stream_complete(client, legs[i].stream_id) &&
+                quicclient_stream_readable(client, legs[i].stream_id) == 0) {
+                legs[i].done_us = now;
+                legs[i].completed = 1;
+                done++;
+            }
+        }
+    }
+
+finish:
+    for (size_t i = 0; i < count; i++) {
+        legs[i].body_len = responses[i].body_len;
+        legs[i].status = responses[i].status;
+
+        h3frame_parser_free(&parsers[i]);
+        h3client_response_free(&responses[i]);
+    }
+
+    if (done != count)
+        printf("  [h3] %zu of %zu staggered responses completed\n", done, count);
+
+    free(parsers); free(responses); free(headers_seen);
+
+    return done == count;
 }
 
 int h3client_post_expect(quicclient_t* client, uint64_t stream_id,
@@ -393,7 +495,7 @@ int h3client_post_expect(quicclient_t* client, uint64_t stream_id,
     const uint64_t wait_until = quic_now_us() + 1500000;
     while (out->interim_count == 0 && quic_now_us() < wait_until) {
         if (!quicclient_pump(client, 100)) break;
-        if (!__consume(client, stream_id, &parser, out, &headers_seen)) {
+        if (!__consume(client, stream_id, &parser, out, &headers_seen, 0)) {
             h3frame_parser_free(&parser);
             return 0;
         }
@@ -411,7 +513,7 @@ int h3client_post_expect(quicclient_t* client, uint64_t stream_id,
     while (quic_now_us() < deadline) {
         if (!quicclient_pump(client, 100)) break;
 
-        if (!__consume(client, stream_id, &parser, out, &headers_seen)) {
+        if (!__consume(client, stream_id, &parser, out, &headers_seen, 0)) {
             h3frame_parser_free(&parser);
             return 0;
         }

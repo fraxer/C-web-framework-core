@@ -18,6 +18,7 @@
 #   soak     sustained requests, impairment, migration and RSS drain
 #   affinity a migrated connection follows its datagrams to the new worker
 #   vn       an unknown QUIC version draws a Version Negotiation packet
+#   priority what a small response pays for being asked for second (RFC 9218)
 #   benchmark median req/s and throughput against a runner-local baseline
 #   fuzz     build the fuzz targets         + FUZZ_SECONDS each
 #   reload   hard reload with live QUIC      + old worker retirement
@@ -228,6 +229,18 @@ stage_vn() {
     fi
 }
 
+stage_priority() {
+    say "priority: a small response behind a large one, and the same one ahead of it"
+    if build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes -DSANITIZE=none &&
+       H3_PRIORITY_PORT=18465 "$CORE_DIR/tests/h3_priority_starvation.sh" \
+             "$CI_BUILD_DIR/limits" "$CI_BUILD_DIR/h3-priority"; then
+        record priority OK
+    else
+        record priority FAIL
+    fi
+}
+
 stage_benchmark() {
     say "benchmark: median HTTP/3 req/s and throughput regression"
     if ! build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
@@ -432,7 +445,7 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit config limits soak affinity earlydata vn benchmark asan tsan fuzz reload softreload h3spec)
+ALL_STAGES=(noh3 h3unit config limits soak affinity earlydata vn priority benchmark asan tsan fuzz reload softreload h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
@@ -455,6 +468,7 @@ for stage in "${STAGES[@]}"; do
     affinity) stage_affinity ;;
     earlydata) stage_earlydata ;;
     vn)     stage_vn ;;
+    priority) stage_priority ;;
     benchmark) stage_benchmark ;;
     fuzz)   stage_fuzz ;;
     reload) stage_reload ;;

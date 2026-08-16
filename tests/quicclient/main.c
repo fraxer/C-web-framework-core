@@ -23,6 +23,7 @@
  *              [--pause-after-response N]
  *              [--loss N] [--loss-in N] [--reorder N] [--dup N] [--seed N]
  *              [--timeout MS] [--version [HEX]] [--version-flood N]
+ *              [--mix /small [--mix-delay MS]]
  *
  * --loss impairs what this client sends and --loss-in what it receives. Only
  * the second tests the server's loss recovery; the first tests that the server
@@ -63,6 +64,11 @@ int main(int argc, char* argv[]) {
      * implement (docs/http3/09 §3.2), and that therefore models the real case
      * this checks -- a peer from the future, not a random number. */
     uint32_t probe_version = 0x6b3343cfu;
+    /* The second, small request of the mixed-size scenario; `-p` is the large
+     * one. 20 ms of stagger, because the case is a small request arriving while
+     * a large response is under way -- not one that races it to the server. */
+    const char* mix_path = NULL;
+    int mix_delay_ms = 20;
     int pause_ms = 0;
     int pause_after_handshake_ms = 0;
     int pause_after_request_ms = 0;
@@ -119,7 +125,12 @@ int main(int argc, char* argv[]) {
         }
         else if (strcmp(argv[i], "--version-flood") == 0 && i + 1 < argc)
             version_flood = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--mix") == 0 && i + 1 < argc) mix_path = argv[++i];
+        else if (strcmp(argv[i], "--mix-delay") == 0 && i + 1 < argc)
+            mix_delay_ms = atoi(argv[++i]);
     }
+
+    if (mix_delay_ms < 0) mix_delay_ms = 0;
 
     if (concurrent < 1) concurrent = 1;
     if (timeout_ms < 1) timeout_ms = 1;
@@ -697,6 +708,108 @@ int main(int argc, char* argv[]) {
         quicclient_free(&client);
         printf("\n%s: %s\n", ok ? "OK" : "FAIL", ok ? what : why);
         return ok ? 0 : 1;
+    }
+
+    /* ---- Mixed response sizes on one connection ---- *
+     *
+     * What the send path does when a small response is asked for while a large
+     * one is already flowing. The three phases are not three measurements of
+     * the same thing; the second and third are what make the first mean
+     * anything:
+     *
+     *  1. the small response alone, which is what it costs when nothing else is
+     *     in the way;
+     *  2. the large one first on the lower stream id, the small one after
+     *     `--mix-delay`;
+     *  3. the same two, the same delay, the same bytes moving -- with only the
+     *     stream ids swapped, so the small one sits ahead of the large one in
+     *     the server's list.
+     *
+     * Phase 3 is the control, and it is the reason this can conclude anything
+     * at all. A small response that is slow in phase 2 could be the server's
+     * choice of what to send next or it could be this client, busy reading tens
+     * of megabytes and getting to the small stream late (docs/http3/08 §7c is
+     * that mistake, made once already). Phase 3 keeps the client's load
+     * identical and changes only the order the server sees, so whatever
+     * survives that swap is the server's. */
+    if (mix_path != NULL) {
+        printf("\nMIXED SIZES (big %s, small %s)\n", path, mix_path);
+
+        if (!h3client_start(&client)) {
+            printf("FAIL: could not open the control stream\n");
+            quicclient_free(&client);
+            return 1;
+        }
+
+        /* Generous, and per phase: a 64 MB body over loopback is fast, the same
+         * body under a sanitiser is not, and a timeout that fits the first
+         * would report the second as a server failure. */
+        const int mix_timeout = timeout_ms > 30000 ? timeout_ms : 30000;
+
+        h3client_leg_t alone = { .stream_id = 0, .path = mix_path, .start_ms = 0 };
+
+        h3client_leg_t behind[2] = {
+            { .stream_id = 4, .path = path,     .start_ms = 0 },
+            { .stream_id = 8, .path = mix_path, .start_ms = mix_delay_ms },
+        };
+
+        /* The big one on the higher id, so the small one is ahead of it in the
+         * server's list: streams are opened in id order regardless of which was
+         * used first, so asking for 16 creates 12 alongside it. */
+        h3client_leg_t ahead[2] = {
+            { .stream_id = 16, .path = path,     .start_ms = 0 },
+            { .stream_id = 12, .path = mix_path, .start_ms = mix_delay_ms },
+        };
+
+        int mix_ok = h3client_get_staggered(&client, &alone, 1, authority, mix_timeout);
+        if (mix_ok)
+            mix_ok = h3client_get_staggered(&client, behind, 2, authority, mix_timeout);
+        if (mix_ok)
+            mix_ok = h3client_get_staggered(&client, ahead, 2, authority, mix_timeout);
+
+        if (!mix_ok) {
+            printf("FAIL: not every response completed\n");
+            quicclient_free(&client);
+            return 1;
+        }
+
+        const double alone_ms   = (double)(alone.done_us - alone.sent_us) / 1000.0;
+        const double big_ms     = (double)(behind[0].done_us - behind[0].sent_us) / 1000.0;
+        const double behind_ms  = (double)(behind[1].done_us - behind[1].sent_us) / 1000.0;
+        const double behind_fb  = (double)(behind[1].first_byte_us - behind[1].sent_us) / 1000.0;
+        const double ahead_big  = (double)(ahead[0].done_us - ahead[0].sent_us) / 1000.0;
+        const double ahead_ms   = (double)(ahead[1].done_us - ahead[1].sent_us) / 1000.0;
+        const double ahead_fb   = (double)(ahead[1].first_byte_us - ahead[1].sent_us) / 1000.0;
+
+        printf("stagger:                   %d ms\n", mix_delay_ms);
+        printf("big body:                  %zu bytes\n", behind[0].body_len);
+        printf("small body:                %zu bytes\n", alone.body_len);
+        printf("small alone:               %.1f ms\n", alone_ms);
+        printf("small behind the big one:  %.1f ms (first byte %.1f)\n", behind_ms, behind_fb);
+        printf("  big alongside it:        %.1f ms\n", big_ms);
+        printf("small ahead of it:         %.1f ms (first byte %.1f)\n", ahead_ms, ahead_fb);
+        printf("  big alongside it:        %.1f ms\n", ahead_big);
+
+        /* The number this exists to produce: what the small response pays for
+         * being asked for second, with the client's own load subtracted by the
+         * control rather than assumed away. */
+        printf("scheduling cost:           %.1f ms\n", behind_ms - ahead_ms);
+
+        int sizes_ok = alone.body_len > 0 && behind[0].body_len > 0 &&
+                       behind[1].body_len == alone.body_len &&
+                       ahead[1].body_len == alone.body_len &&
+                       ahead[0].body_len == behind[0].body_len;
+        int status_ok = alone.status == 200 && behind[0].status == 200 &&
+                        behind[1].status == 200 && ahead[0].status == 200 &&
+                        ahead[1].status == 200;
+
+        if (!sizes_ok) printf("FAIL: the same file arrived at different lengths\n");
+        if (!status_ok) printf("FAIL: not every response was a 200\n");
+
+        quicclient_free(&client);
+        printf("\n%s: mixed-size scheduling measured\n",
+               sizes_ok && status_ok ? "OK" : "FAIL");
+        return sizes_ok && status_ok ? 0 : 1;
     }
 
     /* ---- HTTP/3 ---- */

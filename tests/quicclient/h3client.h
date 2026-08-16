@@ -85,6 +85,39 @@ int h3client_get_many(quicclient_t* client, size_t count,
                       const char* authority, const char* path,
                       int timeout_ms, h3client_response_t* out);
 
+/* ---- Staggered requests ---- *
+ *
+ * Several requests on one connection, each sent at a moment the caller picks,
+ * each timed on its own. What this buys over h3client_get_many is the stagger:
+ * requests that go out together are all equally old, and a server that serves
+ * them in any order at all looks the same from outside. A small request issued
+ * while a large response is already flowing is the case where the server's
+ * choice of what to send next becomes visible -- and it is the case RFC 9218
+ * exists for (docs/http3/08-testing.md §7p).
+ *
+ * Bodies are counted, not kept. The scenario this is for moves tens of
+ * megabytes, and storing them would put the client's own memory traffic into a
+ * measurement about the server's send order. */
+typedef struct {
+    uint64_t    stream_id;
+    const char* path;
+    int         start_ms;        /* when to send, relative to the first leg */
+
+    /* Filled in by the run, microseconds on the quic_now_us clock. */
+    uint64_t    sent_us;
+    uint64_t    first_byte_us;
+    uint64_t    done_us;
+    size_t      body_len;
+    int         status;
+    int         completed;
+} h3client_leg_t;
+
+/* Run the legs. Returns 1 only if every one of them completed; a leg whose
+ * response never ended keeps whatever it managed, so the caller can tell a slow
+ * response from a missing one. */
+int h3client_get_staggered(quicclient_t* client, h3client_leg_t* legs, size_t count,
+                           const char* authority, int timeout_ms);
+
 /* A POST that withholds its body until the server says to send it
  * (`Expect: 100-continue`, RFC 9110 §10.1.1).
  *
