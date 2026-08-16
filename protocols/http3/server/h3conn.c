@@ -138,6 +138,111 @@ static h3app_t* __app_of(h3conn_t* c, quicstream_t* qs) {
     return app;
 }
 
+/* ---- Priority (RFC 9218) ---- *
+ *
+ * Two sources, one destination. The `priority` request header field is read
+ * when the request is parsed; PRIORITY_UPDATE arrives on the control stream at
+ * a moment of the peer's choosing, which over QUIC may be before the request
+ * stream exists, between its frames, or long after the response has started.
+ * Both end at quicconn_stream_priority, which is the only thing the send loop
+ * reads. */
+
+/* Remember a signal for a stream that has not been opened yet. */
+static void __priority_defer(h3conn_t* c, uint64_t stream_id,
+                             const h3priority_t* prio) {
+    /* One entry per stream: a second signal for the same id replaces the first
+     * rather than filling the table with a history nobody will read. */
+    for (size_t i = 0; i < H3CONN_PRIORITY_PENDING; i++) {
+        if (!c->priority_pending[i].used ||
+            c->priority_pending[i].stream_id != stream_id) continue;
+
+        c->priority_pending[i].urgency = prio->urgency;
+        c->priority_pending[i].incremental = prio->incremental;
+        return;
+    }
+
+    const size_t slot = c->priority_pending_next % H3CONN_PRIORITY_PENDING;
+    c->priority_pending_next++;
+
+    c->priority_pending[slot].stream_id = stream_id;
+    c->priority_pending[slot].urgency = prio->urgency;
+    c->priority_pending[slot].incremental = prio->incremental;
+    c->priority_pending[slot].used = 1;
+}
+
+/* Apply a PRIORITY_UPDATE. */
+static void __priority_apply(h3conn_t* c, quicconn_t* qc, uint64_t stream_id,
+                             const h3priority_t* prio) {
+    quicstream_t* qs = quicconn_stream_find(qc, stream_id);
+    if (qs == NULL) {
+        __priority_defer(c, stream_id, prio);
+        return;
+    }
+
+    quicconn_stream_priority(qc, qs, prio->urgency, prio->incremental);
+
+    h3app_t* app = qs->app;
+    if (app != NULL) app->priority_from_frame = 1;
+
+    metrics_h3(METRICS_H3_PRIORITY_APPLIED);
+}
+
+/* Everything the session accepted since the last drain. */
+static void __priority_drain(h3conn_t* c, quicconn_t* qc) {
+    h3session_priority_t update;
+
+    while (h3session_take_priority(c->session, &update))
+        __priority_apply(c, qc, update.stream_id, &update.priority);
+}
+
+/* A stream has just been opened and parsed: does anything remembered apply to
+ * it? Returns 1 when a deferred frame was applied, which is also the answer to
+ * "may the header field still speak" (§7: it may not). */
+static int __priority_deferred_take(h3conn_t* c, quicconn_t* qc, quicstream_t* qs) {
+    for (size_t i = 0; i < H3CONN_PRIORITY_PENDING; i++) {
+        if (!c->priority_pending[i].used ||
+            c->priority_pending[i].stream_id != qs->id) continue;
+
+        quicconn_stream_priority(qc, qs, c->priority_pending[i].urgency,
+                                 c->priority_pending[i].incremental);
+        c->priority_pending[i].used = 0;
+
+        metrics_h3(METRICS_H3_PRIORITY_APPLIED);
+
+        return 1;
+    }
+
+    return 0;
+}
+
+/* The `priority` request header field (§5). Absent, unparseable or empty of
+ * anything we know: the stream keeps the defaults, which is what it already
+ * has. */
+static void __priority_from_request(h3conn_t* c, quicconn_t* qc, quicstream_t* qs,
+                                    h3app_t* app) {
+    if (__priority_deferred_take(c, qc, qs)) {
+        app->priority_from_frame = 1;
+        return;
+    }
+
+    if (app->priority_from_frame || app->req == NULL || app->req->request == NULL)
+        return;
+
+    const http_header_t* field =
+        app->req->request->get_headern(app->req->request, "Priority", 8);
+    if (field == NULL) return;
+
+    h3priority_t prio;
+    if (!h3priority_parse((const uint8_t*)field->value, field->value_length, &prio))
+        return;   /* §5: a header field we cannot read is ignored, not an error */
+
+    if (!prio.has_urgency && !prio.has_incremental) return;
+
+    quicconn_stream_priority(qc, qs, prio.urgency, prio.incremental);
+
+    metrics_h3(METRICS_H3_PRIORITY_APPLIED);
+}
+
 /* ---- Our own service streams ---- */
 
 /* Open one server-initiated unidirectional stream and write `len` opening
@@ -336,6 +441,15 @@ static h3conn_result_t __read_uni(h3conn_t* c, quicconn_t* qc, quicstream_t* qs,
 
         const h3conn_result_t r =
             __apply_uni_verdict(qs, app, h3session_uni_feed(c->session, app->uni, buf, n, fin));
+
+        /* Drained after every feed, and before the verdict is acted on: one
+         * feed can carry several PRIORITY_UPDATE frames, and a feed that ends
+         * in a connection error may still have carried a valid one before it.
+         * Leaving them queued would apply them to the next connection's session
+         * -- there is no next; the queue dies with it -- or, worse, silently
+         * never. */
+        __priority_drain(c, qc);
+
         if (r.status != H3CONN_OK) return r;
 
         if (fin || n < sizeof buf) return __ok();
@@ -374,6 +488,11 @@ static h3conn_result_t __read_request(h3conn_t* c, quicconn_t* qc, quicstream_t*
                         return __closed(H3_INTERNAL_ERROR);
                 }
                 headers_became_ready = 1;
+
+                /* Before dispatch, so the response is scheduled by what the
+                 * request asked for from its very first byte rather than from
+                 * whenever the signal happens to be noticed. */
+                __priority_from_request(c, qc, qs, app);
 
                 /* A request exists from here: the field section decoded into
                  * one. The outcomes that replace this event rather than follow
@@ -775,6 +894,85 @@ static int __write_stream(quicstream_t* qs, h3stream_t* st) {
     return 1;
 }
 
+/* One pass over the streams that have a response waiting.
+ *
+ * `bucket` selects an urgency: with `match` it writes only that bucket, without
+ * it everything else. A bucket of -1 means this connection has no priorities to
+ * honour and the pass writes every ready stream, which is one walk and exactly
+ * what the loop did before scheduling existed. */
+static void __write_ready_pass(h3conn_t* c, quicconn_t* qc, int bucket, int match,
+                               uint64_t only_id) {
+    /* Not enough left of the write-ahead budget to be worth a turn: a response
+     * that has already sent its headers has only body to add, and the body
+     * writer would refuse it -- or, worse, accept a few hundred bytes.
+     * Running the whole filter chain to be refused is what the turn used to do
+     * -- 145 entries into the body writer per request against 9 frames actually
+     * written, because thirty streams share one 256 KB budget and most turns
+     * find it spent (docs/http3/08 §7g).
+     *
+     * A response that has *not* sent its headers is let through: its headers
+     * are not body, they are small, and holding them back would delay every new
+     * response behind whatever is draining.
+     *
+     * Read per pass rather than per turn: the urgent pass is expected to spend
+     * it, and the second pass has to see that it did. */
+    const int budget_spent = quicconn_write_room(qc) < H3_WRITE_MIN_ROOM;
+
+    for (quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
+        h3stream_t* st = h3conn_request_of(qs);
+        if (st == NULL || st->response_done) continue;
+        if (!atomic_load_explicit(&st->response_ready, memory_order_acquire)) continue;
+        if (budget_spent && st->response_headers_sent) continue;
+        if (bucket >= 0 && (qs->sched_urgency == bucket) != match) continue;
+        if (only_id != H3_STREAM_ID_NONE && qs->id != only_id) continue;
+
+        log_debug("h3: response cid=%02x%02x%02x%02x stream=%llu urgency=%u\n",
+                  qc->odcid.data[0], qc->odcid.data[1],
+                  qc->odcid.data[2], qc->odcid.data[3],
+                  (unsigned long long)qs->id, (unsigned)qs->sched_urgency);
+
+        if (!__write_stream(qs, st)) {
+            log_error("h3: write failed on stream %llu\n", (unsigned long long)qs->id);
+            /* A response buffer that cannot grow is local resource pressure,
+             * not a protocol defect. Isolate the culprit stream and report
+             * the application error RFC 9114 reserves for that condition. */
+            quicstream_reset(qs, H3_EXCESSIVE_LOAD);
+            st->response_done = 1;
+            atomic_store_explicit(&st->response_ready, 0, memory_order_release);
+        }
+    }
+}
+
+/* Whether this stream is one the write loop could write to right now. */
+static int __write_ready(quicstream_t* qs) {
+    const h3stream_t* st = h3conn_request_of(qs);
+    if (st == NULL || st->response_done) return 0;
+
+    return atomic_load_explicit(&st->response_ready, memory_order_acquire) != 0;
+}
+
+/* One turn of an all-incremental bucket: the stream after the cursor gets it,
+ * wrapping. Ids only ever grow, so the cursor needs no per-stream state to stay
+ * in step with a list that streams join and leave. */
+static void __write_incremental_turn(h3conn_t* c, quicconn_t* qc, int bucket) {
+    quicstream_t* first = NULL;
+    quicstream_t* turn = NULL;
+
+    for (quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
+        if (qs->sched_urgency != bucket || !__write_ready(qs)) continue;
+
+        if (first == NULL) first = qs;
+        if (turn == NULL && qs->id > c->write_rr_id) turn = qs;
+    }
+
+    if (turn == NULL) turn = first;
+    if (turn == NULL) return;
+
+    c->write_rr_id = turn->id;
+
+    __write_ready_pass(c, qc, bucket, 1, turn->id);
+}
+
 int h3conn_write(h3conn_t* c, quicconn_t* qc) {
     if (c == NULL || qc == NULL) return 0;
 
@@ -808,40 +1006,50 @@ int h3conn_write(h3conn_t* c, quicconn_t* qc) {
      * for it per dribble walked the stream list 146 times per request. */
     quicconn_budget_open(qc);
 
-    /* Not enough left of the write-ahead budget to be worth a turn: a response
-     * that has already sent its headers has only body to add, and the body
-     * writer would refuse it -- or, worse, accept a few hundred bytes.
-     * Running the whole filter chain to be refused is what the turn used to do
-     * -- 145 entries into the body writer per request against 9 frames actually
-     * written, because thirty streams share one 256 KB budget and most turns
-     * find it spent (docs/http3/08 §7g).
+    /* The write-ahead budget goes to the most urgent bucket first, and only
+     * what is left of it to the rest.
      *
-     * A response that has *not* sent its headers is let through: its headers
-     * are not body, they are small, and holding them back would delay every new
-     * response behind whatever is draining. */
-    const int budget_spent = quicconn_write_room(qc) < H3_WRITE_MIN_ROOM;
+     * This is the half of scheduling that is not in the send loop, and the more
+     * decisive half for a large response: the transport can only order bytes
+     * that have been written into a stream, and this loop is what writes them.
+     * One 256 KB budget is shared by every response of the turn, so a large one
+     * earlier in the list took all of it and an urgent request that arrived
+     * afterwards waited for the transfer to drain -- with its *headers* out
+     * (they are exempt below) and its body nowhere. Measured before this
+     * existed: a `priority: u=0` request behind a 64 MB response was served in
+     * 77 ms rather than 0.1 ms, with the send loop already ordering correctly
+     * and nothing to order (docs/http3/08 §7q). */
+    int bucket = -1;
+    int incremental_only = 0;
 
-    for (quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
-        h3stream_t* st = h3conn_request_of(qs);
-        if (st == NULL || st->response_done) continue;
-        if (!atomic_load_explicit(&st->response_ready, memory_order_acquire)) continue;
-        if (budget_spent && st->response_headers_sent) continue;
+    if (qc->prio_streams > 0) {
+        for (quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
+            const h3stream_t* st = h3conn_request_of(qs);
+            if (st == NULL || st->response_done) continue;
+            if (!atomic_load_explicit(&st->response_ready, memory_order_acquire)) continue;
 
-        log_debug("h3: response cid=%02x%02x%02x%02x stream=%llu\n",
-                  qc->odcid.data[0], qc->odcid.data[1],
-                  qc->odcid.data[2], qc->odcid.data[3],
-                  (unsigned long long)qs->id);
-
-        if (!__write_stream(qs, st)) {
-            log_error("h3: write failed on stream %llu\n", (unsigned long long)qs->id);
-            /* A response buffer that cannot grow is local resource pressure,
-             * not a protocol defect. Isolate the culprit stream and report
-             * the application error RFC 9114 reserves for that condition. */
-            quicstream_reset(qs, H3_EXCESSIVE_LOAD);
-            st->response_done = 1;
-            atomic_store_explicit(&st->response_ready, 0, memory_order_release);
+            if (bucket < 0 || qs->sched_urgency < bucket) {
+                bucket = qs->sched_urgency;
+                incremental_only = 1;
+            }
+            if (qs->sched_urgency == bucket && !qs->sched_incremental) incremental_only = 0;
         }
     }
+
+    /* A bucket of incremental responses shares the budget by taking turns with
+     * it -- one whole turn each, rotating -- rather than by splitting it.
+     *
+     * Splitting was the obvious design and it does not work: the budget is
+     * spent by the body filter, which writes until it is told to stop, and a
+     * share small enough to be fair is also small enough that most of the turn
+     * goes into running the filter chain for a few hundred bytes -- the exact
+     * cost §7g removed. Taking turns keeps the whole budget useful and shares
+     * at a coarser grain, which is what "incremental" asks for: pieces, not
+     * simultaneity. */
+    if (bucket >= 0 && incremental_only) __write_incremental_turn(c, qc, bucket);
+    else __write_ready_pass(c, qc, bucket, 1, H3_STREAM_ID_NONE);
+
+    if (bucket >= 0) __write_ready_pass(c, qc, bucket, 0, H3_STREAM_ID_NONE);
 
     /* Field encoding above may have admitted dynamic entries and queued their
      * encoder instructions. Drain again in this same turn: otherwise the

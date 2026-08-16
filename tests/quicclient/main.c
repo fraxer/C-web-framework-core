@@ -23,7 +23,7 @@
  *              [--pause-after-response N]
  *              [--loss N] [--loss-in N] [--reorder N] [--dup N] [--seed N]
  *              [--timeout MS] [--version [HEX]] [--version-flood N]
- *              [--mix /small [--mix-delay MS]]
+ *              [--mix /small [--mix-delay MS] [--mix-priority VALUE]]
  *
  * --loss impairs what this client sends and --loss-in what it receives. Only
  * the second tests the server's loss recovery; the first tests that the server
@@ -69,6 +69,9 @@ int main(int argc, char* argv[]) {
      * a large response is under way -- not one that races it to the server. */
     const char* mix_path = NULL;
     int mix_delay_ms = 20;
+    /* What the small request asks for. `u=0` is the most urgent bucket there
+     * is, which is what a browser puts a blocking stylesheet in. */
+    const char* mix_priority = "u=0";
     int pause_ms = 0;
     int pause_after_handshake_ms = 0;
     int pause_after_request_ms = 0;
@@ -128,6 +131,8 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--mix") == 0 && i + 1 < argc) mix_path = argv[++i];
         else if (strcmp(argv[i], "--mix-delay") == 0 && i + 1 < argc)
             mix_delay_ms = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--mix-priority") == 0 && i + 1 < argc)
+            mix_priority = argv[++i];
     }
 
     if (mix_delay_ms < 0) mix_delay_ms = 0;
@@ -761,11 +766,53 @@ int main(int argc, char* argv[]) {
             { .stream_id = 12, .path = mix_path, .start_ms = mix_delay_ms },
         };
 
+        /* The same arrangement as `behind` -- large one first, small one second
+         * and later -- with the small request carrying a `priority` header
+         * field. Everything the server could use to serve it sooner is
+         * identical except the signal, which is the only way to attribute a
+         * difference to the signal. */
+        h3client_leg_t signalled[2] = {
+            { .stream_id = 20, .path = path,     .start_ms = 0 },
+            { .stream_id = 24, .path = mix_path, .start_ms = mix_delay_ms,
+              .priority = mix_priority },
+        };
+
+        /* And the same again, signalled by a PRIORITY_UPDATE frame that is sent
+         * *before* the request it prioritises -- the case where the server has
+         * no stream to apply it to yet. */
+        h3client_leg_t framed[2] = {
+            { .stream_id = 28, .path = path,     .start_ms = 0 },
+            { .stream_id = 32, .path = mix_path, .start_ms = mix_delay_ms },
+        };
+
+        /* Two large responses of the same size, asked for together. Whether
+         * they come back one after the other or side by side is the whole of
+         * what `i` means (§10), and the ratio of their completion times says
+         * which happened without needing a byte-level trace. */
+        h3client_leg_t sequential[2] = {
+            { .stream_id = 36, .path = path, .start_ms = 0 },
+            { .stream_id = 40, .path = path, .start_ms = 0 },
+        };
+
+        h3client_leg_t incremental[2] = {
+            { .stream_id = 44, .path = path, .start_ms = 0, .priority = "u=3, i" },
+            { .stream_id = 48, .path = path, .start_ms = 0, .priority = "u=3, i" },
+        };
+
         int mix_ok = h3client_get_staggered(&client, &alone, 1, authority, mix_timeout);
         if (mix_ok)
             mix_ok = h3client_get_staggered(&client, behind, 2, authority, mix_timeout);
         if (mix_ok)
             mix_ok = h3client_get_staggered(&client, ahead, 2, authority, mix_timeout);
+        if (mix_ok)
+            mix_ok = h3client_get_staggered(&client, signalled, 2, authority, mix_timeout);
+        if (mix_ok)
+            mix_ok = h3client_priority_update(&client, framed[1].stream_id, mix_priority) &&
+                     h3client_get_staggered(&client, framed, 2, authority, mix_timeout);
+        if (mix_ok)
+            mix_ok = h3client_get_staggered(&client, sequential, 2, authority, mix_timeout);
+        if (mix_ok)
+            mix_ok = h3client_get_staggered(&client, incremental, 2, authority, mix_timeout);
 
         if (!mix_ok) {
             printf("FAIL: not every response completed\n");
@@ -780,8 +827,13 @@ int main(int argc, char* argv[]) {
         const double ahead_big  = (double)(ahead[0].done_us - ahead[0].sent_us) / 1000.0;
         const double ahead_ms   = (double)(ahead[1].done_us - ahead[1].sent_us) / 1000.0;
         const double ahead_fb   = (double)(ahead[1].first_byte_us - ahead[1].sent_us) / 1000.0;
+        const double signal_big = (double)(signalled[0].done_us - signalled[0].sent_us) / 1000.0;
+        const double signal_ms  = (double)(signalled[1].done_us - signalled[1].sent_us) / 1000.0;
+        const double framed_big = (double)(framed[0].done_us - framed[0].sent_us) / 1000.0;
+        const double framed_ms  = (double)(framed[1].done_us - framed[1].sent_us) / 1000.0;
 
         printf("stagger:                   %d ms\n", mix_delay_ms);
+        printf("priority signalled:        %s\n", mix_priority);
         printf("big body:                  %zu bytes\n", behind[0].body_len);
         printf("small body:                %zu bytes\n", alone.body_len);
         printf("small alone:               %.1f ms\n", alone_ms);
@@ -789,19 +841,47 @@ int main(int argc, char* argv[]) {
         printf("  big alongside it:        %.1f ms\n", big_ms);
         printf("small ahead of it:         %.1f ms (first byte %.1f)\n", ahead_ms, ahead_fb);
         printf("  big alongside it:        %.1f ms\n", ahead_big);
+        printf("small with priority field: %.1f ms\n", signal_ms);
+        printf("  big alongside it:        %.1f ms\n", signal_big);
+        printf("small with priority frame: %.1f ms\n", framed_ms);
+        printf("  big alongside it:        %.1f ms\n", framed_big);
+
+        /* Which of the pair finished first, over which finished last. One means
+         * they shared the connection all the way; a half means one was served
+         * to completion before the other started. */
+        const double seq_first = (double)(sequential[0].done_us - sequential[0].sent_us) / 1000.0;
+        const double seq_last  = (double)(sequential[1].done_us - sequential[1].sent_us) / 1000.0;
+        const double inc_first = (double)(incremental[0].done_us - incremental[0].sent_us) / 1000.0;
+        const double inc_last  = (double)(incremental[1].done_us - incremental[1].sent_us) / 1000.0;
+
+        const double seq_ratio = seq_last > 0 ? seq_first / seq_last : 0;
+        const double inc_ratio = inc_last > 0 ? inc_first / inc_last : 0;
+
+        printf("two large, sequential:     %.1f / %.1f ms (ratio %.2f)\n",
+               seq_first, seq_last, seq_ratio);
+        printf("two large, incremental:    %.1f / %.1f ms (ratio %.2f)\n",
+               inc_first, inc_last, inc_ratio);
 
         /* The number this exists to produce: what the small response pays for
          * being asked for second, with the client's own load subtracted by the
          * control rather than assumed away. */
         printf("scheduling cost:           %.1f ms\n", behind_ms - ahead_ms);
 
-        int sizes_ok = alone.body_len > 0 && behind[0].body_len > 0 &&
-                       behind[1].body_len == alone.body_len &&
-                       ahead[1].body_len == alone.body_len &&
-                       ahead[0].body_len == behind[0].body_len;
-        int status_ok = alone.status == 200 && behind[0].status == 200 &&
-                        behind[1].status == 200 && ahead[0].status == 200 &&
-                        ahead[1].status == 200;
+        const h3client_leg_t* every[] = {
+            &alone, &behind[0], &behind[1], &ahead[0], &ahead[1],
+            &signalled[0], &signalled[1], &framed[0], &framed[1],
+            &sequential[0], &sequential[1], &incremental[0], &incremental[1]
+        };
+
+        int sizes_ok = alone.body_len > 0 && behind[0].body_len > 0;
+        int status_ok = 1;
+
+        for (size_t i = 0; i < sizeof every / sizeof every[0]; i++) {
+            const size_t expected = every[i]->path == path ? behind[0].body_len
+                                                           : alone.body_len;
+            if (every[i]->body_len != expected) sizes_ok = 0;
+            if (every[i]->status != 200) status_ok = 0;
+        }
 
         if (!sizes_ok) printf("FAIL: the same file arrived at different lengths\n");
         if (!status_ok) printf("FAIL: not every response was a 200\n");

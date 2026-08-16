@@ -57,6 +57,122 @@ static void __touch(quicconn_t* conn, uint64_t now_us) {
     conn->last_activity_us = now_us;
 }
 
+/* ---- Send scheduling (RFC 9218 §10, applied by the layer above) ----
+ *
+ * Two questions, kept apart on purpose.
+ *
+ * **Whether to schedule at all.** A connection where nobody signalled a
+ * priority has every stream at the default urgency, and RFC 9218's own
+ * recommendation for that case -- finish equal-urgency, non-incremental
+ * responses one at a time, lowest stream id first -- is exactly what the list
+ * order already produces. So `prio_streams` gates the whole thing: while it is
+ * zero the send loop does what it did before this existed, at the cost it did
+ * it before, and no traffic that does not ask for scheduling pays for it.
+ *
+ * **Our own service streams are outside the scheme.** The control and QPACK
+ * streams carry protocol machinery, not responses, and RFC 9218 has nothing to
+ * say about them. Ranking them by urgency would mean a client that asks for one
+ * urgent response could delay a GOAWAY or a QPACK instruction behind it. They
+ * are opened before any request, so leaving them out of the ranking keeps them
+ * where the list already put them: first. */
+
+static int __sched_is_service(const quicstream_t* s) {
+    return quic_stream_kind(s->id) == QUIC_STREAM_SERVER_UNI;
+}
+
+static int __sched_is_prioritised(const quicstream_t* s) {
+    return s->sched_urgency != QUIC_SCHED_URGENCY_DEFAULT || s->sched_incremental;
+}
+
+typedef struct {
+    int      active;        /* rank streams at all */
+    uint8_t  urgency;       /* the bucket whose turn it is */
+    int      incremental;   /* that bucket holds only incremental streams */
+    uint64_t stream_id;     /* and this one's turn it is within it */
+} quicsched_t;
+
+/* One pass over the streams, and only for a connection that signalled
+ * something. Picks the bucket to serve, and within it decides between the two
+ * rules RFC 9218 §10 gives:
+ *
+ *   - non-incremental responses are finished one at a time, lowest id first,
+ *     because a resource that is useless until complete is worth finishing;
+ *   - incremental ones share, one turn each, so a response that is useful in
+ *     pieces gets its pieces out.
+ *
+ * The RFC says nothing about a bucket holding both. We finish the
+ * non-incremental ones first, for the same reason the RFC gives for finishing
+ * them at all -- what they gate cannot start until they are done, while an
+ * incremental response loses only latency by waiting. */
+static void __sched_select(quicconn_t* conn, quicsched_t* out) {
+    out->active = 0;
+    out->urgency = QUIC_SCHED_URGENCY_DEFAULT;
+    out->incremental = 0;
+    out->stream_id = 0;
+
+    if (conn->prio_streams == 0) return;
+
+    int best = -1;
+    int bucket_sequential = 0;
+    quicstream_t* first_incremental = NULL;
+    quicstream_t* after_cursor = NULL;
+
+    for (quicstream_t* s = conn->streams; s != NULL; s = s->next) {
+        if (__sched_is_service(s) || !quicstream_wants_send(s)) continue;
+
+        const int urgency = s->sched_urgency;
+
+        if (urgency > best && best >= 0) continue;
+
+        if (best < 0 || urgency < best) {
+            /* A more urgent bucket than anything seen so far discards what was
+             * gathered for the old one. */
+            best = urgency;
+            bucket_sequential = 0;
+            first_incremental = NULL;
+            after_cursor = NULL;
+        }
+
+        if (!s->sched_incremental) {
+            bucket_sequential = 1;
+            continue;
+        }
+
+        if (first_incremental == NULL) first_incremental = s;
+        if (after_cursor == NULL && s->id > conn->sched_rr_id) after_cursor = s;
+    }
+
+    if (best < 0) return;   /* only service streams have anything to send */
+
+    out->active = 1;
+    out->urgency = (uint8_t)best;
+
+    if (bucket_sequential) return;   /* list order settles the bucket */
+
+    quicstream_t* turn = after_cursor != NULL ? after_cursor : first_incremental;
+    if (turn != NULL) {
+        out->incremental = 1;
+        out->stream_id = turn->id;
+    }
+}
+
+void quicconn_stream_priority(quicconn_t* conn, quicstream_t* s,
+                              uint8_t urgency, int incremental) {
+    if (conn == NULL || s == NULL) return;
+
+    if (urgency > QUIC_SCHED_URGENCY_MAX) urgency = QUIC_SCHED_URGENCY_MAX;
+
+    const int was = __sched_is_prioritised(s);
+
+    s->sched_urgency = urgency;
+    s->sched_incremental = incremental ? 1 : 0;
+
+    const int now = __sched_is_prioritised(s);
+
+    if (!was && now) conn->prio_streams++;
+    else if (was && !now && conn->prio_streams > 0) conn->prio_streams--;
+}
+
 static quicstream_t* __stream_find(quicconn_t* conn, uint64_t id) {
     for (quicstream_t* s = conn->streams; s != NULL; s = s->next)
         if (s->id == id) return s;
@@ -1078,6 +1194,11 @@ static void __streams_reap(quicconn_t* conn) {
         }
 
         metrics_quic(METRICS_QUIC_STREAMS_RELEASED);
+
+        /* A prioritised stream that dies takes its count with it, or the
+         * connection stays on the scheduling path for the rest of its life
+         * after the one request that asked for it has finished. */
+        if (__sched_is_prioritised(s) && conn->prio_streams > 0) conn->prio_streams--;
 
         quicstream_free(s);
     }
@@ -2132,6 +2253,12 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
      * first file a client asked for was the last one it got. See
      * __stream_append. */
     if (level == QUIC_ENC_APP) {
+        /* Which streams may put data in *this* packet. Decided once per packet
+         * rather than per stream: the answer is a property of the whole set,
+         * and asking it per stream would make it O(n²). */
+        quicsched_t sched;
+        __sched_select(conn, &sched);
+
         for (quicstream_t* s = conn->streams; s != NULL && p + 32 < payload_cap;
              s = s->next) {
             visits_data++;
@@ -2188,6 +2315,27 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
              * frames above are not, which is why the gate sits here and not at
              * the top of the loop. */
             if (!cc_room || !quicstream_wants_send(s)) continue;
+
+            /* Not this stream's turn. The terminal frames above are deliberately
+             * above this line: RESET_STREAM and STOP_SENDING are how a stream
+             * *ends*, they cost nothing the congestion window cares about, and
+             * making them wait on urgency would let one prioritised transfer
+             * hold up the cleanup of every other stream. */
+            if (sched.active && !__sched_is_service(s)) {
+                if (s->sched_urgency != sched.urgency) continue;
+
+                if (sched.incremental) {
+                    if (s->id != sched.stream_id) continue;
+
+                    /* The turn is spent by being offered, not by being used. A
+                     * stream that is chosen and then finds its window shut
+                     * would otherwise hold the cursor for good, and every other
+                     * incremental stream would wait behind a stream that is not
+                     * sending. */
+                    conn->sched_rr_id = s->id;
+                }
+                else if (s->sched_incremental) continue;
+            }
 
             uint64_t offset = 0;
             const uint8_t* data = NULL;

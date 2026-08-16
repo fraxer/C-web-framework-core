@@ -322,67 +322,29 @@ int h3session_accepts_request(const h3session_t* s, uint64_t stream_id) {
 
 /* ---- The control stream ---- */
 
-static int __priority_key_char(uint8_t c, int first) {
-    if (c >= 'a' && c <= 'z') return 1;
-    if (!first && c >= '0' && c <= '9') return 1;
-    return !first && (c == '_' || c == '-' || c == '.' || c == '*');
+/* Queue an accepted signal for the transport glue to apply. Oldest first, and
+ * the oldest is what a full queue drops. */
+static void __priority_queue(h3session_t* s, uint64_t stream_id,
+                             const h3priority_t* prio) {
+    if (s->priority_count == H3SESSION_PRIORITY_QUEUE) {
+        s->priority_head = (s->priority_head + 1) % H3SESSION_PRIORITY_QUEUE;
+        s->priority_count--;
+    }
+
+    const size_t slot = (s->priority_head + s->priority_count) % H3SESSION_PRIORITY_QUEUE;
+
+    s->priority_queue[slot].stream_id = stream_id;
+    s->priority_queue[slot].priority = *prio;
+    s->priority_count++;
 }
 
-/* RFC 9218 carries an RFC 8941 Dictionary. We consume the two defined keys and
- * validate unknown members conservatively so a syntactically broken value is
- * never mistaken for an extension we can ignore. */
-static int __priority_value_valid(const uint8_t* p, size_t len) {
-    size_t i = 0;
-    while (i < len) {
-        while (i < len && p[i] == ' ') i++;
-        if (i == len) return 1; /* empty dictionary means defaults */
+int h3session_take_priority(h3session_t* s, h3session_priority_t* out) {
+    if (s == NULL || out == NULL || s->priority_count == 0) return 0;
 
-        const size_t key_start = i;
-        if (!__priority_key_char(p[i], 1)) return 0;
-        while (++i < len && __priority_key_char(p[i], 0)) {}
-        const size_t key_len = i - key_start;
+    *out = s->priority_queue[s->priority_head];
+    s->priority_head = (s->priority_head + 1) % H3SESSION_PRIORITY_QUEUE;
+    s->priority_count--;
 
-        while (i < len && p[i] == ' ') i++;
-        const size_t value_start = i;
-        if (i < len && p[i] == '=') {
-            i++;
-            if (i == len) return 0;
-            if (p[i] == '?') {
-                i++;
-                if (i == len || (p[i] != '0' && p[i] != '1')) return 0;
-                i++;
-            } else {
-                if (p[i] == '-') i++;
-                const size_t digits = i;
-                while (i < len && p[i] >= '0' && p[i] <= '9') i++;
-                if (i == digits) return 0;
-            }
-        }
-
-        /* Parameters and extension members use visible ASCII up to the next
-         * comma. This accepts extensions while excluding control characters,
-         * non-ASCII and malformed empty list members. */
-        while (i < len && p[i] != ',') {
-            if (p[i] < 0x20 || p[i] > 0x7e) return 0;
-            i++;
-        }
-
-        if (key_len == 1 && p[key_start] == 'u') {
-            if (value_start >= len || p[value_start] != '=' ||
-                value_start + 1 >= len || p[value_start + 1] < '0' ||
-                p[value_start + 1] > '7') return 0;
-            if (value_start + 2 < i && p[value_start + 2] != ';' &&
-                p[value_start + 2] != ' ') return 0;
-        } else if (key_len == 1 && p[key_start] == 'i' && value_start < len &&
-                   p[value_start] == '=') {
-            if (value_start + 2 >= len || p[value_start + 1] != '?' ||
-                (p[value_start + 2] != '0' && p[value_start + 2] != '1')) return 0;
-        }
-
-        if (i == len) return 1;
-        i++; /* comma */
-        if (i == len) return 0;
-    }
     return 1;
 }
 
@@ -397,10 +359,18 @@ static h3session_verdict_t __priority_update(h3session_t* s, h3uni_recv_t* uni,
     if ((!push && (element & 0x03) != 0) || push)
         return __conn(H3_ID_ERROR);
 
-    if (!__priority_value_valid(uni->frames.payload + n, uni->frames.payload_len - n))
+    h3priority_t prio;
+    if (!h3priority_parse(uni->frames.payload + n, uni->frames.payload_len - n, &prio))
         return __conn(H3_FRAME_ERROR);
 
-    return __ok(); /* scheduling intentionally unchanged */
+    /* Queued rather than applied: this module deliberately knows nothing of
+     * quicconn_t, and the stream this refers to may not even exist yet -- §7
+     * allows the frame to arrive before the request it prioritises, and over
+     * QUIC it routinely does, because streams are ordered only within
+     * themselves. h3conn drains the queue and decides both questions. */
+    __priority_queue(s, element, &prio);
+
+    return __ok();
 }
 
 /* One frame off the peer's control stream. `uni->frames.payload` holds it. */

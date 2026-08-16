@@ -353,6 +353,13 @@ typedef enum {
      * every 404 a handler produces. */
     METRICS_H3_MISDIRECTED,
 
+    /* Priority signals that reached the send scheduler (RFC 9218): a
+     * `priority` header field or a PRIORITY_UPDATE frame that named a stream we
+     * could act on. Worth its own counter because "the client sends priorities"
+     * and "the server acts on them" are different claims, and only this one
+     * distinguishes them from outside. */
+    METRICS_H3_PRIORITY_APPLIED,
+
     METRICS_H3_QPACK_INSERTS,
     METRICS_H3_QPACK_EVICTIONS,
     METRICS_H3_QPACK_BLOCKED_STREAMS,

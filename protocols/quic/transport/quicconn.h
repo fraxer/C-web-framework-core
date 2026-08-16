@@ -170,6 +170,17 @@ typedef struct quicconn {
     quicstream_t* streams;
     quicstream_t* streams_tail;
     size_t    stream_count;
+
+    /* Streams whose priority the layer above actually set to something other
+     * than the default (RFC 9218). Zero -- which is every connection whose peer
+     * sends no priority signals -- means the send loop keeps the list order it
+     * always had, and pays nothing for a scheduler it is not using. */
+    size_t    prio_streams;
+
+    /* Whose turn it was, last time an incremental bucket was served. Ids only
+     * grow, so "the first one past the cursor, wrapping" is a round robin
+     * without a per-stream field to keep in step. */
+    uint64_t  sched_rr_id;
     uint64_t  next_peer_bidi;   /* lowest client bidi id not yet opened */
     uint64_t  next_peer_uni;
     uint64_t  next_local_uni;
@@ -434,6 +445,16 @@ void quicconn_close(quicconn_t* conn, uint64_t error_code, int is_app,
 
 /* Find an open stream by id, or NULL. */
 quicstream_t* quicconn_stream_find(quicconn_t* conn, uint64_t id);
+
+/* Set a stream's send priority (RFC 9218 for HTTP/3: urgency 0..7, lower is
+ * more urgent, and whether the response may be interleaved with its peers).
+ *
+ * On the connection rather than on the stream because the connection keeps the
+ * count that decides whether the send loop ranks streams at all -- and because
+ * a priority that only the stream knew about would be a priority the scheduler
+ * never learned of. Calling it with the defaults is how a signal is withdrawn. */
+void quicconn_stream_priority(quicconn_t* conn, quicstream_t* s,
+                              uint8_t urgency, int incremental);
 
 /* The application took `bytes` off a stream, so that much of the
  * connection-level receive window is free again. The stream's own window is

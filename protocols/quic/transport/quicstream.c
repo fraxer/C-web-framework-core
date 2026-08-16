@@ -16,6 +16,12 @@ quicstream_t* quicstream_create(uint64_t id,
     memset(stream, 0, sizeof * stream);
     stream->id = id;
 
+    /* RFC 9218's defaults, so a stream nobody prioritises is scheduled exactly
+     * as it was before scheduling existed. memset would leave urgency 0, which
+     * is the *most* urgent -- every stream would claim the top bucket. */
+    stream->sched_urgency = QUIC_SCHED_URGENCY_DEFAULT;
+    stream->sched_incremental = 0;
+
     /* The receive buffer's cap is the flow control window: a peer may reorder
      * within what it is allowed to send, but not beyond it, so anything past
      * the window is either a bug or an attempt to make us allocate. */

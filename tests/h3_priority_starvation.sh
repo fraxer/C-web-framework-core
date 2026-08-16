@@ -2,16 +2,14 @@
 
 # What a small response pays for being asked for second (RFC 9218 §7).
 #
-# The send path walks its stream list in the order the streams were opened and
-# gives the first one that can send as much of the packet as it will hold
-# (quicconn.c). There is no per-stream quantum, so a large response owns the
-# connection until it ends. RFC 9218 exists to tell a server when that is right
-# -- it is the recommended behaviour for equal-urgency, non-incremental
-# responses -- and when it is not. We accept and validate PRIORITY_UPDATE and
-# ignore what it says (h3session.c), which is permitted (§2, the signals are
-# advisory) and leaves the question open: what would honouring it be worth?
+# Without a priority signal the send path serves streams in the order they were
+# opened, with no per-stream quantum, so a large response owns the connection
+# until it ends. That is what RFC 9218 §10 recommends for equal-urgency,
+# non-incremental responses -- and it is why a small request that arrives second
+# waits for a transfer it has nothing to do with. This measures what that costs
+# and then checks that a signal changes it.
 #
-# This measures the ceiling of that answer. Three phases on one connection:
+# Three phases on one connection establish the cost:
 #
 #   1. the small response alone -- what it costs with nothing in the way;
 #   2. the large one first on the lower stream id, the small one 20 ms later;
@@ -24,11 +22,19 @@
 # §7c, a mistake this project has already made once). Phase 3 holds the client's
 # load constant and changes only what the server sees.
 #
-# What is asserted here is what must be true whether or not priorities are ever
-# implemented: every response arrives whole, and a small response that IS ahead
-# in the list is served at once. The scheduling cost itself is measured and
-# printed, not bounded from below -- when RFC 9218 scheduling lands, that number
-# drops towards zero and this test must keep passing.
+# Since 2026-08-16 the server acts on those signals, so the same run also checks
+# that they work: the small request is repeated with a `priority: u=0` header
+# field and again with a PRIORITY_UPDATE frame sent before the request it
+# prioritises, and both must be served as fast as if nothing were in the way.
+# The unsignalled case is kept, and kept unbounded from below, because it is the
+# measurement the decision was made on -- and because a server that served
+# *everything* small-first would pass the priority checks while ignoring
+# priorities entirely.
+#
+# The last pair of phases checks the other half of §10: two large responses of
+# the same size asked for together, first with no signal and then with
+# `u=3, i` on both. Non-incremental must finish one after the other (the first
+# at about half the elapsed time), incremental must finish together.
 
 set -u -o pipefail
 
@@ -172,11 +178,48 @@ else
     fail "the small response waited $behind ms behind a $big ms transfer -- longer than the transfer itself"
 fi
 
-# 3. HTTP/2, same server, same two files, one connection. Not a nicety: it says
-#    whether this is a property of our server or of h3 specifically, and the
-#    answer decides whether the fix belongs in the QUIC send loop or nowhere.
 #    curl must actually multiplex for the comparison to mean anything, which is
 #    what num_connects=0 on the second transfer proves.
+# 3. The signals the server now acts on. Same arrangement as check 2 -- large
+#    response first, small one 20 ms later, second in the list -- with the only
+#    difference being that the small one asks.
+signalled=$(value 'small with priority field')
+framed=$(value 'small with priority frame')
+
+for pair in "field:$signalled" "frame:$framed"; do
+    how=${pair%%:*}
+    got=${pair#*:}
+
+    if [ -z "$got" ]; then
+        fail "the client printed no timing for the priority $how"
+    elif awk -v v="$got" -v a="$alone" 'BEGIN { exit !(v <= a + 20) }'; then
+        printf 'ok: with a priority %s the small response took %s ms (alone: %s)\n' \
+            "$how" "$got" "$alone"
+    else
+        fail "a priority $how did not help: $got ms against $behind ms unsignalled"
+    fi
+done
+
+# 4. Incremental (§10). The ratio is first-finished over last-finished: a half
+#    means one response was served to completion before the other started, one
+#    means they shared the connection the whole way.
+seq_ratio=$(sed -n 's/^two large, sequential:.*ratio \([0-9.]*\)).*/\1/p' "$WORK_DIR/mix.txt")
+inc_ratio=$(sed -n 's/^two large, incremental:.*ratio \([0-9.]*\)).*/\1/p' "$WORK_DIR/mix.txt")
+
+if [ -z "$seq_ratio" ] || [ -z "$inc_ratio" ]; then
+    fail "the client printed no incremental comparison"
+elif ! awk -v v="$seq_ratio" 'BEGIN { exit !(v <= 0.75) }'; then
+    fail "two non-incremental responses did not finish one at a time (ratio $seq_ratio)"
+elif ! awk -v v="$inc_ratio" 'BEGIN { exit !(v >= 0.8) }'; then
+    fail "two incremental responses did not share the connection (ratio $inc_ratio)"
+else
+    printf 'ok: sequential finish one at a time (%s), incremental together (%s)\n' \
+        "$seq_ratio" "$inc_ratio"
+fi
+
+# 5. HTTP/2, same server, same two files, one connection. Kept from before the
+#    scheduler existed: it is what said the gap was ours rather than h3's, and
+#    it is still the check that h2 has not regressed into the same behaviour.
 h2=$(curl -ks --http2 --parallel --resolve "localhost:$PORT:127.0.0.1" \
         -o /dev/null -o /dev/null \
         -w '%{url} %{num_connects} %{time_total}\n' \

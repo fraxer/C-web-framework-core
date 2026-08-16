@@ -103,6 +103,9 @@ typedef struct {
     const char* path;
     int         start_ms;        /* when to send, relative to the first leg */
 
+    /* A `priority` request header field (RFC 9218 §5), or NULL for none. */
+    const char* priority;
+
     /* Filled in by the run, microseconds on the quic_now_us clock. */
     uint64_t    sent_us;
     uint64_t    first_byte_us;
@@ -117,6 +120,13 @@ typedef struct {
  * response from a missing one. */
 int h3client_get_staggered(quicclient_t* client, h3client_leg_t* legs, size_t count,
                            const char* authority, int timeout_ms);
+
+/* Send a PRIORITY_UPDATE for a request stream on our control stream (RFC 9218
+ * §7.1). The stream need not exist yet -- that it need not is half of what this
+ * is for, since over QUIC the frame routinely overtakes the request it
+ * prioritises. */
+int h3client_priority_update(quicclient_t* client, uint64_t stream_id,
+                             const char* value);
 
 /* A POST that withholds its body until the server says to send it
  * (`Expect: 100-continue`, RFC 9110 §10.1.1).

@@ -23,6 +23,12 @@
 #define QUIC_STREAM_BIT_SERVER 0x01
 #define QUIC_STREAM_BIT_UNI    0x02
 
+/* Scheduling urgency: 0 goes first, 7 last, 3 is what a stream gets when
+ * nothing says otherwise. The scale is RFC 9218's, kept here because the send
+ * loop is what reads it. */
+#define QUIC_SCHED_URGENCY_DEFAULT 3
+#define QUIC_SCHED_URGENCY_MAX     7
+
 typedef enum {
     QUIC_STREAM_CLIENT_BIDI = 0x00,
     QUIC_STREAM_SERVER_BIDI = 0x01,
@@ -93,6 +99,21 @@ typedef struct quicstream {
     int      send_reset_pending;
     int      send_stop_sending_pending;
     uint64_t send_stop_sending_code;
+
+    /* Send scheduling, as the layer above defines it (RFC 9218 for HTTP/3).
+     *
+     * The transport does not interpret these beyond "smaller urgency goes
+     * first" and "incremental streams share their turn": what the numbers mean,
+     * and where they came from -- a `priority` header field, a PRIORITY_UPDATE
+     * frame, a default -- is the application's business. Keeping them here
+     * rather than in h3app_t is what lets the send loop order streams without
+     * reaching up into a protocol it must not know about.
+     *
+     * The defaults are RFC 9218's own: urgency 3, not incremental. A connection
+     * where nobody says otherwise therefore keeps the exact behaviour of before
+     * this existed -- see quicconn_t::prio_streams. */
+    uint8_t  sched_urgency;
+    uint8_t  sched_incremental;
 
     /* The application layer's per-stream state (an h3app_t) and how to release
      * it. The transport cannot know what it is -- that is the point of the void*

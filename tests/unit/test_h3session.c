@@ -321,11 +321,45 @@ TEST(test_h3session_control_frames) {
     TEST_CASE("PRIORITY_UPDATE rejects a malformed Priority field value");
     OPEN(s, uni);
     pp = varint_write(priority, sizeof priority, 0);
+    memcpy(priority + pp, "u=,i", 4); pp += 4;   /* a member with no value */
+    n = h3frame_write(frame, sizeof frame, H3_FRAME_PRIORITY_UPDATE_REQUEST,
+                      priority, pp);
+    v = feed(s, uni, frame, n, 0);
+    TEST_ASSERT(v.action == H3SESSION_CONN_ERROR && v.error == H3_FRAME_ERROR, "broken dictionary");
+    h3uni_recv_free(uni); h3session_free(s);
+
+    /* An urgency outside 0..7 is a value of the right shape and the wrong
+     * range, which RFC 9218 §4.1 says to ignore -- not to kill a connection
+     * over. Until 2026-08-16 this was H3_FRAME_ERROR; the change is deliberate
+     * (docs/http3/08 §7q) and this case is what pins it. */
+    TEST_CASE("PRIORITY_UPDATE ignores an out-of-range urgency");
+    OPEN(s, uni);
+    pp = varint_write(priority, sizeof priority, 0);
     memcpy(priority + pp, "u=9", 3); pp += 3;
     n = h3frame_write(frame, sizeof frame, H3_FRAME_PRIORITY_UPDATE_REQUEST,
                       priority, pp);
     v = feed(s, uni, frame, n, 0);
-    TEST_ASSERT(v.action == H3SESSION_CONN_ERROR && v.error == H3_FRAME_ERROR, "urgency range");
+    TEST_ASSERT(v.action == H3SESSION_OK, "out of range is ignored");
+
+    h3session_priority_t taken;
+    TEST_ASSERT(h3session_take_priority(s, &taken) == 1, "queued for the transport");
+    TEST_ASSERT(taken.stream_id == 0, "for the stream it named");
+    TEST_ASSERT(taken.priority.urgency == H3_PRIORITY_URGENCY_DEFAULT &&
+                !taken.priority.has_urgency, "with the default urgency intact");
+    TEST_ASSERT(h3session_take_priority(s, &taken) == 0, "and nothing else queued");
+    h3uni_recv_free(uni); h3session_free(s);
+
+    TEST_CASE("an accepted PRIORITY_UPDATE reaches the queue with its values");
+    OPEN(s, uni);
+    pp = varint_write(priority, sizeof priority, 12);
+    memcpy(priority + pp, "u=0, i", 6); pp += 6;
+    n = h3frame_write(frame, sizeof frame, H3_FRAME_PRIORITY_UPDATE_REQUEST,
+                      priority, pp);
+    TEST_ASSERT(feed(s, uni, frame, n, 0).action == H3SESSION_OK, "accepted");
+    TEST_ASSERT(h3session_take_priority(s, &taken) == 1, "queued");
+    TEST_ASSERT(taken.stream_id == 12, "stream id");
+    TEST_ASSERT(taken.priority.urgency == 0 && taken.priority.has_urgency, "urgency");
+    TEST_ASSERT(taken.priority.incremental && taken.priority.has_incremental, "incremental");
     h3uni_recv_free(uni); h3session_free(s);
 
     TEST_CASE("a push PRIORITY_UPDATE is an ID error when no push exists");

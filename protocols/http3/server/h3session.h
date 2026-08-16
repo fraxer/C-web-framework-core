@@ -6,6 +6,7 @@
 
 #include "h3error.h"
 #include "h3frame.h"
+#include "h3priority.h"
 #include "h3unistream.h"
 
 /* "No stream". Stream ids are 62-bit (RFC 9000 §2.1), so the top of the range
@@ -99,6 +100,17 @@ void h3uni_recv_free(h3uni_recv_t* uni);
 int h3_policy_validate(const struct env* candidate);
 int h3_policy_init(void);
 
+/* One accepted PRIORITY_UPDATE, waiting for the transport to apply it. */
+typedef struct {
+    uint64_t     stream_id;
+    h3priority_t priority;
+} h3session_priority_t;
+
+/* How many may be outstanding between two drains. Eight is well past what a
+ * browser sends in one flight; the queue exists to survive a burst, not to
+ * store a history. */
+#define H3SESSION_PRIORITY_QUEUE 8
+
 typedef struct h3session {
     /* Owned by h3conn, not by the connection context: it is h3conn_t that lives
      * in connection_server_ctx_t::parser and therefore h3conn_t that carries
@@ -146,7 +158,25 @@ typedef struct h3session {
     uint64_t     abort_epoch_ms;
     int64_t      ctrl_tokens;
     uint64_t     ctrl_epoch_ms;
+
+    /* PRIORITY_UPDATE frames that have been accepted and not yet handed to the
+     * transport (RFC 9218 §7). A queue rather than a field on the verdict,
+     * because one feed can carry several frames and a verdict describes the
+     * feed, not each frame in it -- reporting only the last would silently drop
+     * the others.
+     *
+     * Bounded and oldest-dropped: the peer chooses how fast these arrive, and
+     * they already cost a control-frame token, so the queue must not be a way
+     * to make the server allocate. Losing the oldest is safe in the way losing
+     * a priority signal always is -- it is advisory, and a later one for the
+     * same stream supersedes it anyway. */
+    h3session_priority_t priority_queue[H3SESSION_PRIORITY_QUEUE];
+    size_t               priority_head;    /* next to hand out */
+    size_t               priority_count;
 } h3session_t;
+
+/* Take the oldest pending PRIORITY_UPDATE. Returns 0 when there are none. */
+int h3session_take_priority(h3session_t* s, h3session_priority_t* out);
 
 /* Charge one stream cancellation. Returns 0 when the budget is spent and the
  * caller must close the connection with H3_EXCESSIVE_LOAD.

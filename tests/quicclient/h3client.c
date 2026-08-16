@@ -400,7 +400,10 @@ int h3client_get_staggered(quicclient_t* client, h3client_leg_t* legs, size_t co
             if (now < start + (uint64_t)legs[i].start_ms * 1000) continue;
 
             uint8_t req[1280];
-            const size_t n = __build_request(req, sizeof req, authority, legs[i].path);
+            const size_t n = legs[i].priority != NULL
+                ? __build_request_ex(req, sizeof req, "GET", authority, legs[i].path,
+                                     "priority", legs[i].priority)
+                : __build_request(req, sizeof req, authority, legs[i].path);
             if (n == 0 ||
                 !quicclient_stream_write(client, legs[i].stream_id, req, n, 1))
                 goto finish;
@@ -465,6 +468,30 @@ finish:
     free(parsers); free(responses); free(headers_seen);
 
     return done == count;
+}
+
+int h3client_priority_update(quicclient_t* client, uint64_t stream_id,
+                             const char* value) {
+    if (client == NULL || value == NULL) return 0;
+
+    uint8_t payload[128];
+    size_t n = varint_write(payload, sizeof payload, stream_id);
+    if (n == 0) return 0;
+
+    const size_t vlen = strlen(value);
+    if (n + vlen > sizeof payload) return 0;
+
+    memcpy(payload + n, value, vlen);
+    n += vlen;
+
+    uint8_t frame[192];
+    const size_t flen = h3frame_write(frame, sizeof frame,
+                                      H3_FRAME_PRIORITY_UPDATE_REQUEST, payload, n);
+    if (flen == 0) return 0;
+
+    /* On the control stream, which stays open for the life of the connection --
+     * closing it would be H3_CLOSED_CRITICAL_STREAM (§6.2.6). */
+    return quicclient_stream_write(client, H3CLIENT_CONTROL_STREAM, frame, flen, 0);
 }
 
 int h3client_post_expect(quicclient_t* client, uint64_t stream_id,

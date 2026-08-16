@@ -75,6 +75,7 @@ static const char* const __h3_name[METRICS_H3__COUNT] = {
     "abuse.field_section_too_large", "abuse.field_section_hard_cap",
     "abuse.body_too_large",
     "misdirected",
+    "priority_applied",
     "qpack.inserts", "qpack.evictions", "qpack.blocked_streams",
     "qpack.literal_fields", "qpack.dynamic_fields",
     "stream_errors", "connection_errors"

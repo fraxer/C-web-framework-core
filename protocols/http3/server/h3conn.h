@@ -57,6 +57,11 @@ typedef struct {
     int             http_status;  /* REFUSED */
 } h3conn_result_t;
 
+/* How many priority signals for not-yet-open streams are remembered. Browsers
+ * prioritise the requests they are sending, not a queue of future ones, so this
+ * is about reordering in flight rather than about capacity. */
+#define H3CONN_PRIORITY_PENDING 16
+
 /* Per-stream HTTP/3 state, in quicstream_t::app. */
 typedef struct h3app {
     int            is_request;
@@ -68,6 +73,12 @@ typedef struct h3app {
      * keeps moving, but nothing looks at them. */
     int            drained;
     int            qpack_blocked_counted;
+
+    /* A PRIORITY_UPDATE has been applied to this stream. RFC 9218 §7: the frame
+     * overrides the `priority` request header field, and it does so whichever
+     * order the two arrive in -- so once a frame has spoken, the header must
+     * not speak over it when the request is finally parsed. */
+    int            priority_from_frame;
 } h3app_t;
 
 typedef struct h3conn {
@@ -96,6 +107,28 @@ typedef struct h3conn {
      * when it goes out. */
     int          early_hints_pending;
     size_t       qpack_blocked_streams;
+
+    /* PRIORITY_UPDATE frames for streams that do not exist yet (RFC 9218 §7).
+     *
+     * Not an edge case over QUIC: streams are ordered only within themselves,
+     * so a frame sent on the control stream *after* the request can perfectly
+     * well arrive before it -- and a client is also entitled to prioritise a
+     * request it has not sent yet. Applying it needs a quicstream_t, and there
+     * is none until the peer uses the id, so it waits here.
+     *
+     * A small fixed table, oldest dropped: the peer picks the ids, and an
+     * unbounded one would be a way to make the server allocate for streams that
+     * may never open. */
+    struct {
+        uint64_t stream_id;
+        uint8_t  urgency;
+        uint8_t  incremental;
+        uint8_t  used;
+    } priority_pending[H3CONN_PRIORITY_PENDING];
+    size_t       priority_pending_next;   /* where the next one is written */
+
+    /* Which incremental stream last had a turn of the write-ahead budget. */
+    uint64_t     write_rr_id;
 } h3conn_t;
 
 h3conn_t* h3conn_create(connection_t* connection, uint64_t max_field_section_size,
