@@ -22,7 +22,7 @@
  *              [--pause-after-request N]
  *              [--pause-after-response N]
  *              [--loss N] [--loss-in N] [--reorder N] [--dup N] [--seed N]
- *              [--timeout MS]
+ *              [--timeout MS] [--version [HEX]] [--version-flood N]
  *
  * --loss impairs what this client sends and --loss-in what it receives. Only
  * the second tests the server's loss recovery; the first tests that the server
@@ -57,6 +57,12 @@ int main(int argc, char* argv[]) {
     int new_token = 0;
     int zero_rtt = 0;
     int zero_rtt_stall = 0;
+    int version_probe = 0;
+    int version_flood = 0;
+    /* QUIC v2 (RFC 9369): a version that exists, that we deliberately do not
+     * implement (docs/http3/09 §3.2), and that therefore models the real case
+     * this checks -- a peer from the future, not a random number. */
+    uint32_t probe_version = 0x6b3343cfu;
     int pause_ms = 0;
     int pause_after_handshake_ms = 0;
     int pause_after_request_ms = 0;
@@ -104,10 +110,109 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) seed = strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--timeout") == 0 && i + 1 < argc) timeout_ms = atoi(argv[++i]);
         else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) out_path = argv[++i];
+        else if (strcmp(argv[i], "--version") == 0) {
+            version_probe = 1;
+            /* The version is optional: without it the probe uses QUIC v2, which
+             * is what a peer from the future would actually send. */
+            if (i + 1 < argc && argv[i + 1][0] != '-')
+                probe_version = (uint32_t)strtoul(argv[++i], NULL, 16);
+        }
+        else if (strcmp(argv[i], "--version-flood") == 0 && i + 1 < argc)
+            version_flood = atoi(argv[++i]);
     }
 
     if (concurrent < 1) concurrent = 1;
     if (timeout_ms < 1) timeout_ms = 1;
+
+    /* ---- Version negotiation (RFC 9000 §6.1, §14.1, §17.2.1) ----
+     *
+     * No handshake, because there cannot be one: the whole point is that this
+     * peer speaks a version the server does not implement. Two datagrams settle
+     * the entire behaviour -- a full-sized one, which must be answered, and an
+     * undersized one, which must not, because answering it would make the
+     * server an amplifier for a spoofed source address. */
+    if (version_flood > 0) {
+        int sent = 0, answered = 0;
+
+        printf("flooding %s:%u with %d version 0x%08x probes\n",
+               host, port, version_flood, probe_version);
+
+        for (int i = 0; i < version_flood; i++) {
+            quicvnprobe_t probe;
+
+            /* Short timeout on purpose: a probe that was rate-limited away is
+             * answered by nothing, and waiting the usual five seconds for that
+             * would make the run longer than the token bucket it measures. */
+            if (!quicclient_probe_version(host, port, probe_version,
+                                          QUIC_MIN_INITIAL_DATAGRAM, 200, 0, &probe))
+                break;
+
+            sent++;
+            if (probe.answered && probe.is_vn) answered++;
+        }
+
+        printf("probes sent:               %d\n", sent);
+        printf("version negotiation:       %d\n", answered);
+
+        return sent == version_flood ? 0 : 1;
+    }
+
+    if (version_probe) {
+        printf("\nVERSION NEGOTIATION\n");
+
+        quicvnprobe_t probe;
+        if (!quicclient_probe_version(host, port, probe_version,
+                                      QUIC_MIN_INITIAL_DATAGRAM, timeout_ms,
+                                      verbose, &probe)) {
+            printf("FAIL: the probe could not be sent\n");
+            return 1;
+        }
+
+        int offers_v1 = 0, offers_grease = 0, offers_probed = 0;
+        for (size_t i = 0; i < probe.count; i++) {
+            if (probe.versions[i] == QUIC_VERSION_1) offers_v1 = 1;
+            /* §15: the reserved 0x?a?a?a?a pattern. A server that offers one
+             * cannot be depended on for an exact list, which is the point of
+             * offering it. */
+            if ((probe.versions[i] & 0x0f0f0f0fu) == 0x0a0a0a0au) offers_grease = 1;
+            if (probe.versions[i] == probe_version) offers_probed = 1;
+        }
+
+        printf("probed version:            0x%08x\n", probe_version);
+        printf("answered:                  %s\n", probe.answered ? "yes" : "no");
+        printf("version negotiation:       %s\n", probe.is_vn ? "yes" : "no");
+        printf("connection ids echoed:     %s\n", probe.cids_echoed ? "yes" : "no");
+        printf("version 1 offered:         %s\n", offers_v1 ? "yes" : "no");
+        printf("reserved version offered:  %s\n", offers_grease ? "yes" : "no");
+        printf("probed version offered:    %s\n", offers_probed ? "yes" : "no");
+        printf("reply / probe bytes:       %zu / %zu\n",
+               probe.datagram_len, probe.probe_len);
+
+        /* And the other half of the rule: below the minimum datagram size the
+         * server must stay silent (§14.1). Tested at one byte under, not at
+         * some obviously tiny size, because the interesting failure is an
+         * off-by-one in the comparison. */
+        quicvnprobe_t small;
+        const int small_ok =
+            quicclient_probe_version(host, port, probe_version,
+                                     QUIC_MIN_INITIAL_DATAGRAM - 1,
+                                     timeout_ms < 1000 ? timeout_ms : 1000,
+                                     verbose, &small);
+
+        printf("undersized probe answered: %s\n",
+               !small_ok ? "could not be sent" : small.answered ? "yes" : "no");
+
+        const int good = probe.answered && probe.is_vn && probe.cids_echoed &&
+                         offers_v1 && offers_grease && !offers_probed &&
+                         probe.datagram_len < probe.probe_len &&
+                         small_ok && !small.answered;
+
+        printf("\n%s\n", good
+               ? "OK: an unknown version is answered with the versions we do speak"
+               : "FAIL: version negotiation is not what RFC 9000 §6 requires");
+
+        return good ? 0 : 1;
+    }
 
     printf("connecting to %s:%u\n", host, port);
 

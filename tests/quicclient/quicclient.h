@@ -456,6 +456,37 @@ size_t quicclient_take_token(const quicclient_t* client, uint8_t* out, size_t ca
  * Returns 1 if it completed. */
 int quicclient_run(quicclient_t* client, int timeout_ms);
 
+/* ---- Version negotiation probe (RFC 9000 §6, §17.2.1) ---- *
+ *
+ * One datagram of a version the server does not implement, and whatever comes
+ * back. This is the whole of what a server owes a peer from the future, and
+ * until this existed it was the one server behaviour with no test above the
+ * unit level: the encoder was checked byte by byte, but nothing ever asked the
+ * running server for a Version Negotiation packet. */
+
+#define QUICVN_MAX_VERSIONS 16
+
+typedef struct {
+    int      answered;        /* anything at all came back */
+    int      is_vn;           /* and it was a Version Negotiation packet */
+    int      cids_echoed;     /* with the connection ids swapped, as §17.2.1 says */
+    size_t   probe_len;       /* what we sent */
+    size_t   datagram_len;    /* what came back -- must be smaller (§8, amplification) */
+    size_t   count;
+    uint32_t versions[QUICVN_MAX_VERSIONS];
+} quicvnprobe_t;
+
+/* Send one probe and report what happened. Returns 0 only when the probe could
+ * not be sent at all; an unanswered probe is a result, not a failure, because
+ * silence is the correct answer to a datagram below the §14.1 minimum.
+ *
+ * `datagram_len` is the size to pad to, which is the second half of what this
+ * tests: at or above QUIC_MIN_INITIAL_DATAGRAM the server must answer, below it
+ * the server must not. */
+int quicclient_probe_version(const char* host, uint16_t port, uint32_t version,
+                             size_t datagram_len, int timeout_ms, int verbose,
+                             quicvnprobe_t* out);
+
 /* ---- In-process transport ---- *
  *
  * The same client with no socket under it, for the deterministic stand of

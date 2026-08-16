@@ -511,6 +511,11 @@ quic.recvmmsg_calls, quic.sendmmsg_calls, quic.send_errors{eagain|emsgsize|other
 | 4000 неизвестных CID подряд | 213 ответов — бюджет сработал |
 | Штатное завершение по SIGTERM | чисто, ASan молчит |
 
+Пробник `probe.py` был разовым и в дерево не попал, поэтому строки про Version
+Negotiation оставались неповторяемыми до 2026-08-16: теперь это стадия гейта
+`tests/ci.sh vn` (`tests/h3_version_negotiation.sh`, зонд
+`quicclient --version`), разбор — `08` §8b.
+
 **Не входит и перенесено:** создание соединений (нужен TLS — фаза 3), поле
 `connection_t::transport` и обход `epoll_ctl` (§3), таймеры эндпоинта (§6 — в
 фазе 1 нет ни одного дедлайна, взводить нечего).

@@ -13,6 +13,7 @@
 #include "quicclient.h"
 #include "quicframe.h"
 #include "quichp.h"
+#include "quicinvariants.h"
 #include "quicpacket.h"
 #include "quictime.h"
 
@@ -1860,6 +1861,144 @@ int quicclient_pump(quicclient_t* client, int timeout_ms) {
 
     /* A pump that heard nothing is exactly when the probe matters. */
     return quicclient_tick(client);
+}
+
+/* ---- Version negotiation probe ---- */
+
+/* Everything above this line speaks QUIC version 1 and nothing else, which is
+ * exactly why it cannot test this: the one behaviour a server owes a peer of an
+ * unknown version is a Version Negotiation packet, and producing one requires
+ * sending a packet the rest of this client has no way to build.
+ *
+ * So the probe is deliberately not a connection. It has no keys, no TLS and no
+ * state machine -- the server answers before any of that is consulted -- and it
+ * is written straight onto its own socket. What comes back is read with the
+ * invariants parser, because that is all a reply of an unknown version may be
+ * read with (RFC 8999). */
+int quicclient_probe_version(const char* host, uint16_t port, uint32_t version,
+                             size_t datagram_len, int timeout_ms, int verbose,
+                             quicvnprobe_t* out) {
+    if (host == NULL || out == NULL) return 0;
+    if (datagram_len < 64 || datagram_len > CLIENT_MAX_PACKET) return 0;
+
+    memset(out, 0, sizeof * out);
+
+    quiccid_t dcid = { .len = 8 };
+    quiccid_t scid = { .len = 8 };
+    if (RAND_bytes(dcid.data, dcid.len) != 1 ||
+        RAND_bytes(scid.data, scid.len) != 1) return 0;
+
+    quicpkt_hdr_out_t hdr;
+    memset(&hdr, 0, sizeof hdr);
+    hdr.type = QUIC_PKT_INITIAL;
+    hdr.version = version;
+    hdr.dcid = &dcid;
+    hdr.scid = &scid;
+    hdr.pn = 0;
+    hdr.pn_len = 4;
+    /* Fixed width, so the Length field does not change size when the payload
+     * size is filled in below -- which is what makes the header length knowable
+     * before the payload is sized. */
+    hdr.length_field_bytes = 2;
+
+    uint8_t dgram[CLIENT_MAX_PACKET];
+    memset(dgram, 0, sizeof dgram);
+
+    size_t pn_offset = 0;
+    size_t header_len = quicpkt_write_header(dgram, sizeof dgram, &hdr, &pn_offset);
+    if (header_len == 0 || header_len >= datagram_len) return 0;
+
+    hdr.payload_len = datagram_len - header_len;
+    header_len = quicpkt_write_header(dgram, sizeof dgram, &hdr, &pn_offset);
+    if (header_len == 0) return 0;
+
+    /* Random rather than zero: a run of zero bytes after a packet is padding
+     * between coalesced packets (§12.2), and padding is not what is being
+     * tested. Nothing will decrypt it -- the version is unknown, so the server
+     * must answer without looking. */
+    if (RAND_bytes(dgram + header_len, (int)(datagram_len - header_len)) != 1) return 0;
+
+    out->probe_len = datagram_len;
+
+    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return 0;
+
+    struct sockaddr_in server;
+    memset(&server, 0, sizeof server);
+    server.sin_family = AF_INET;
+    server.sin_port = htons(port);
+
+    int ok = inet_pton(AF_INET, host, &server.sin_addr) == 1;
+
+    /* Connected, so a reply from anywhere else is not read as this one. */
+    ok = ok && connect(fd, (struct sockaddr*)&server, sizeof server) == 0;
+    ok = ok && send(fd, dgram, datagram_len, 0) == (ssize_t)datagram_len;
+
+    if (!ok) {
+        close(fd);
+        return 0;
+    }
+
+    if (verbose)
+        printf("  [probe] -> version 0x%08x, %zu bytes\n",
+               version, datagram_len);
+
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    const int r = poll(&pfd, 1, timeout_ms);
+
+    if (r <= 0) {
+        close(fd);
+        /* Silence is an answer too: it is what §14.1 requires for a datagram
+         * below the minimum. The caller decides which it wanted. */
+        if (verbose) printf("  [probe] <- nothing within %d ms\n", timeout_ms);
+        return r == 0 ? 1 : 0;
+    }
+
+    uint8_t buf[2048];
+    const ssize_t n = recv(fd, buf, sizeof buf, 0);
+    close(fd);
+
+    if (n <= 0) return 0;
+
+    out->answered = 1;
+    out->datagram_len = (size_t)n;
+
+    quicinvariants_t inv;
+    if (quic_invariants_parse(buf, (size_t)n, QUIC_LOCAL_CID_LEN, &inv) != QUICINV_OK) {
+        if (verbose) printf("  [probe] <- %zd bytes, unparsable\n", n);
+        return 1;
+    }
+
+    out->is_vn = quic_invariants_is_version_negotiation(&inv);
+
+    /* §17.2.1: the reply echoes our Source id as its Destination and ours as
+     * its Source. Getting this backwards produces a packet a real client
+     * silently ignores, so it is checked rather than assumed. */
+    out->cids_echoed = inv.dcid.len == scid.len &&
+                       memcmp(inv.dcid.data, scid.data, scid.len) == 0 &&
+                       inv.scid.len == dcid.len &&
+                       memcmp(inv.scid.data, dcid.data, dcid.len) == 0;
+
+    for (size_t off = inv.header_len;
+         off + 4 <= (size_t)n && out->count < QUICVN_MAX_VERSIONS;
+         off += 4)
+        out->versions[out->count++] = ((uint32_t)buf[off] << 24) |
+                                      ((uint32_t)buf[off + 1] << 16) |
+                                      ((uint32_t)buf[off + 2] << 8) |
+                                      (uint32_t)buf[off + 3];
+
+    if (verbose) {
+        printf("  [probe] <- %zd bytes, %s, %zu version(s):",
+               n, out->is_vn ? "version negotiation" : "NOT version negotiation",
+               out->count);
+
+        for (size_t i = 0; i < out->count; i++)
+            printf(" 0x%08x", out->versions[i]);
+
+        printf("\n");
+    }
+
+    return 1;
 }
 
 void quicclient_free(quicclient_t* client) {

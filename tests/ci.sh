@@ -17,6 +17,7 @@
 #   limits   process connection/memory exhaustion and drain
 #   soak     sustained requests, impairment, migration and RSS drain
 #   affinity a migrated connection follows its datagrams to the new worker
+#   vn       an unknown QUIC version draws a Version Negotiation packet
 #   benchmark median req/s and throughput against a runner-local baseline
 #   fuzz     build the fuzz targets         + FUZZ_SECONDS each
 #   reload   hard reload with live QUIC      + old worker retirement
@@ -212,6 +213,18 @@ stage_earlydata() {
         record earlydata OK
     else
         record earlydata FAIL
+    fi
+}
+
+stage_vn() {
+    say "vn: an unknown QUIC version is answered, an undersized one is not"
+    if build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes -DSANITIZE=none &&
+       H3_VN_PORT=18463 "$CORE_DIR/tests/h3_version_negotiation.sh" \
+             "$CI_BUILD_DIR/limits" "$CI_BUILD_DIR/h3-version-negotiation"; then
+        record vn OK
+    else
+        record vn FAIL
     fi
 }
 
@@ -419,7 +432,7 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit config limits soak affinity earlydata benchmark asan tsan fuzz reload softreload h3spec)
+ALL_STAGES=(noh3 h3unit config limits soak affinity earlydata vn benchmark asan tsan fuzz reload softreload h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
@@ -441,6 +454,7 @@ for stage in "${STAGES[@]}"; do
     soak)    stage_soak ;;
     affinity) stage_affinity ;;
     earlydata) stage_earlydata ;;
+    vn)     stage_vn ;;
     benchmark) stage_benchmark ;;
     fuzz)   stage_fuzz ;;
     reload) stage_reload ;;
