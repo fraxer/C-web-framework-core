@@ -52,6 +52,20 @@ typedef struct quicsent {
     size_t   size;             /* bytes on the wire, for the congestion window */
     int      ack_eliciting;
     int      in_flight;        /* counts against the congestion window */
+
+    /* Delivery rate sampling (draft-cheng-iccrg-delivery-rate-estimation).
+     *
+     * A rate is bytes over an interval, and neither end of that interval is
+     * knowable from the acknowledgement alone: the sender has to have written
+     * down, at send time, where the connection's delivery counter stood and
+     * when it last moved. These four fields are that note. They cost 25 bytes
+     * per outstanding packet and are what makes a rate-based controller
+     * possible at all -- without them BBR has nothing to build a model from. */
+    uint64_t delivered;        /* the connection's delivered count when sent */
+    uint64_t delivered_us;     /* when that count last advanced */
+    uint64_t first_sent_us;    /* start of the send interval this packet is in */
+    int      app_limited;      /* the sender was out of data, not out of window */
+
     quicframe_ref_t* frames;
     struct quicsent* next;     /* ascending by packet number */
 } quicsent_t;
@@ -86,6 +100,16 @@ typedef struct quicloss {
 
     uint32_t pto_count;         /* consecutive PTOs, for the backoff */
 
+    /* Connection-wide delivery rate estimator. One per connection, not one per
+     * packet number space: the path carries all three, and a rate measured over
+     * one of them alone would be a fraction of the truth. */
+    uint64_t delivered;         /* bytes acknowledged over this connection */
+    uint64_t delivered_us;      /* when `delivered` last advanced */
+    uint64_t first_sent_us;     /* start of the current send interval */
+    /* The value `delivered` must pass before samples stop being marked
+     * application-limited; 0 while the sender is keeping the path busy. */
+    uint64_t app_limited;
+
     quiccc_t* cc;
 
     /* Set while the handshake is unconfirmed: §6.2.1 excludes the peer's
@@ -107,6 +131,14 @@ void quicloss_free(quicloss_t* loss);
 /* Label this connection's debug lines. `cid` may be shorter than four bytes;
  * what is missing stays zero. Diagnostics only -- nothing branches on it. */
 void quicloss_set_cid_tag(quicloss_t* loss, const uint8_t* cid, size_t len);
+
+/* The sender stopped because it had nothing left to send, not because the
+ * window or the pacer stopped it. Every rate sampled from here on describes how
+ * fast the application produced data, and a controller that mistook that for
+ * the path's capacity would spend the next ten round trips sending at the speed
+ * of an idle moment. Ignored when the sender is in fact window-limited: then it
+ * is the path being measured after all. */
+void quicloss_app_limited(quicloss_t* loss);
 
 /* Record a packet as sent. Takes ownership of `frames`. */
 int quicloss_on_sent(quicloss_t* loss, quic_enc_level_e level, uint64_t pn,

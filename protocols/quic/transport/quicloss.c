@@ -42,6 +42,24 @@ void quicloss_init(quicloss_t* loss, quiccc_t* cc, uint64_t max_ack_delay_us) {
         loss->space[i].largest_acked = QUICPKT_NO_ACKED;
 }
 
+void quicloss_app_limited(quicloss_t* loss) {
+    if (loss == NULL) return;
+
+    const uint64_t in_flight = loss->cc != NULL ? loss->cc->bytes_in_flight : 0;
+
+    /* Window-limited, not application-limited: the sender has data and the
+     * controller is what is holding it back, so the samples in flight say
+     * exactly what the path is doing and must be believed. */
+    if (loss->cc != NULL && in_flight >= loss->cc->cwnd) return;
+
+    /* Everything already in flight belongs to the idle period too, so the mark
+     * is set past it: samples stop being application-limited only once the
+     * connection has delivered more than was outstanding when it went quiet.
+     * Never zero, which is the "not limited" value. */
+    loss->app_limited = loss->delivered + in_flight;
+    if (loss->app_limited == 0) loss->app_limited = 1;
+}
+
 void quicloss_set_cid_tag(quicloss_t* loss, const uint8_t* cid, size_t len) {
     if (loss == NULL || cid == NULL) return;
 
@@ -79,12 +97,24 @@ int quicloss_on_sent(quicloss_t* loss, quic_enc_level_e level, uint64_t pn,
         return 0;
     }
 
+    /* A connection with nothing in flight is starting a new send interval: the
+     * gap before it is the application's idleness, not the path's, and counting
+     * it would report a rate far below what the path can carry. */
+    if (loss->cc == NULL || loss->cc->bytes_in_flight == 0) {
+        loss->first_sent_us = now_us;
+        loss->delivered_us = now_us;
+    }
+
     memset(sent, 0, sizeof * sent);
     sent->pn = pn;
     sent->sent_us = now_us;
     sent->size = size;
     sent->ack_eliciting = ack_eliciting;
     sent->in_flight = in_flight;
+    sent->delivered = loss->delivered;
+    sent->delivered_us = loss->delivered_us;
+    sent->first_sent_us = loss->first_sent_us;
+    sent->app_limited = loss->app_limited != 0;
     sent->frames = frames;
 
     quicpnspace_t* space = &loss->space[level];
@@ -205,7 +235,8 @@ static uint64_t __loss_delay(const quicloss_t* loss) {
 /* Detect losses in one space, unlink them, and chain their frame references
  * onto *out_lost. */
 static void __detect_lost(quicloss_t* loss, quic_enc_level_e level,
-                          uint64_t now_us, quicframe_ref_t** out_lost) {
+                          uint64_t now_us, quicframe_ref_t** out_lost,
+                          uint64_t* out_lost_bytes) {
     quicpnspace_t* space = &loss->space[level];
     if (space->largest_acked == QUICPKT_NO_ACKED) return;
 
@@ -275,8 +306,12 @@ static void __detect_lost(quicloss_t* loss, quic_enc_level_e level,
                   (unsigned long long)(now_us - sent->sent_us),
                   by_count ? "count" : "time");
 
-        if (sent->in_flight && loss->cc != NULL)
-            loss->cc->ops->on_loss(loss->cc, sent->size, sent->sent_us, now_us);
+        if (sent->in_flight) {
+            if (out_lost_bytes != NULL) *out_lost_bytes += sent->size;
+
+            if (loss->cc != NULL)
+                loss->cc->ops->on_loss(loss->cc, sent->size, sent->sent_us, now_us);
+        }
 
         /* Hand the frames back so the caller can queue them again. */
         if (sent->frames != NULL) {
@@ -318,6 +353,22 @@ int quicloss_on_ack(quicloss_t* loss, quic_enc_level_e level,
     uint64_t largest_sent_us = 0;
     int largest_was_ack_eliciting = 0;
 
+    /* What this acknowledgement will tell the controller once it has been
+     * processed in full. Filled in as the walk goes; handed over at the end. */
+    quiccc_sample_t sample;
+    memset(&sample, 0, sizeof sample);
+    sample.prior_in_flight = loss->cc != NULL ? loss->cc->bytes_in_flight : 0;
+
+    /* The rate sample is taken from ONE packet -- the most recently sent of the
+     * ones being acknowledged -- because that is the packet whose send interval
+     * and delivery interval bracket the same stretch of the path. Averaging
+     * over all of them would mix intervals that overlap. */
+    int      rs_found = 0;
+    uint64_t rs_prior_delivered = 0;
+    uint64_t rs_send_elapsed = 0;
+    uint64_t rs_ack_elapsed = 0;
+    int      rs_app_limited = 0;
+
     /* The last packet this walk decided to keep, which is the new tail if the
      * walk removes the old one. */
     quicsent_t* kept = NULL;
@@ -354,8 +405,32 @@ int quicloss_on_ack(quicloss_t* loss, quic_enc_level_e level,
         if (sent->ack_eliciting && space->ack_eliciting_in_flight > 0)
             space->ack_eliciting_in_flight--;
 
-        if (sent->in_flight && loss->cc != NULL)
-            loss->cc->ops->on_ack(loss->cc, sent->size, sent->sent_us, now_us);
+        if (sent->in_flight) {
+            /* The delivery counter advances by what actually arrived, which is
+             * the numerator of every rate this connection will ever measure. */
+            loss->delivered += sent->size;
+            loss->delivered_us = now_us;
+            sample.acked_bytes += sent->size;
+
+            /* `delivered` at send time increases with send order, so the
+             * largest is the most recently sent packet in this acknowledgement
+             * -- found without knowing the send order itself. */
+            if (!rs_found || sent->delivered > rs_prior_delivered) {
+                rs_found = 1;
+                rs_prior_delivered = sent->delivered;
+                rs_app_limited = sent->app_limited;
+                rs_send_elapsed = sent->sent_us > sent->first_sent_us
+                                  ? sent->sent_us - sent->first_sent_us : 0;
+                rs_ack_elapsed = loss->delivered_us > sent->delivered_us
+                                 ? loss->delivered_us - sent->delivered_us : 0;
+
+                /* The next send interval starts where this packet was sent. */
+                loss->first_sent_us = sent->sent_us;
+            }
+
+            if (loss->cc != NULL)
+                loss->cc->ops->on_ack(loss->cc, sent->size, sent->sent_us, now_us);
+        }
 
         *link = sent->next;
         space->sent_count--;
@@ -394,17 +469,55 @@ int quicloss_on_ack(quicloss_t* loss, quic_enc_level_e level,
     /* §5.1: only the largest acknowledged packet gives an RTT sample, and only
      * when it is newly acknowledged and was ack-eliciting. Sampling from any
      * other packet measures the peer's acknowledgement policy, not the path. */
-    if (largest_newly_acked && largest_was_ack_eliciting && now_us >= largest_sent_us)
+    if (largest_newly_acked && largest_was_ack_eliciting && now_us >= largest_sent_us) {
         __update_rtt(loss, level, largest, now_us - largest_sent_us, ack_delay_us);
+        sample.rtt_us = loss->latest_rtt_us;
+    }
 
     /* An acknowledgement means the peer is alive, so the backoff resets. */
     loss->pto_count = 0;
 
-    __detect_lost(loss, level, now_us, out_lost);
+    __detect_lost(loss, level, now_us, out_lost, &sample.lost_bytes);
 
-    /* Sampled after the loss detection above, so a window that an ACK grew and
-     * the losses in the same ACK then cut is recorded once, at the value the
-     * next packet will actually be sent under. */
+    /* The connection has delivered past the mark, so it is keeping the path
+     * busy again and its samples measure the path once more. */
+    if (loss->app_limited != 0 && loss->delivered > loss->app_limited)
+        loss->app_limited = 0;
+
+    if (rs_found) {
+        /* The interval is the longer of the two the packet brackets: how long
+         * the sender took to put those bytes out, and how long the receiver
+         * took to acknowledge them. The longer one is the bottleneck; taking
+         * the shorter would report the speed of whichever end was idle. */
+        const uint64_t interval = rs_send_elapsed > rs_ack_elapsed
+                                  ? rs_send_elapsed : rs_ack_elapsed;
+        const uint64_t delivered = loss->delivered - rs_prior_delivered;
+
+        /* Intervals below one round trip are noise: they time an
+         * acknowledgement's arrival, not a path's throughput, and dividing by
+         * them produces rates the path never carried. */
+        const uint64_t floor = loss->have_rtt_sample && loss->min_rtt_us != UINT64_MAX
+                               ? loss->min_rtt_us : QUICLOSS_GRANULARITY_US;
+
+        if (interval >= floor && interval > 0 && delivered > 0)
+            sample.delivery_rate = delivered * 1000000ULL / interval;
+
+        sample.prior_delivered = rs_prior_delivered;
+        sample.app_limited = rs_app_limited;
+    }
+
+    sample.delivered = loss->delivered;
+
+    /* Everything this acknowledgement said, in one call, after the losses it
+     * implied have been declared -- a controller that decides on rate has to
+     * see the acknowledgement whole, and half of it is what was NOT there. */
+    if (loss->cc != NULL && (sample.acked_bytes > 0 || sample.lost_bytes > 0))
+        loss->cc->ops->on_ack_end(loss->cc, &sample, now_us);
+
+    /* Sampled after the loss detection and the controller update above, so a
+     * window that an ACK grew and the losses in the same ACK then cut is
+     * recorded once, at the value the next packet will actually be sent
+     * under. */
     if (loss->cc != NULL) metrics_quic_cwnd(loss->cc->cwnd);
 
     return 1;
@@ -483,7 +596,7 @@ int quicloss_on_timeout(quicloss_t* loss, uint64_t now_us,
     const quic_enc_level_e loss_level = __earliest_loss_time(loss, &loss_time);
 
     if (loss_time != 0 && now_us >= loss_time) {
-        __detect_lost(loss, loss_level, now_us, out_lost);
+        __detect_lost(loss, loss_level, now_us, out_lost, NULL);
         if (out_level != NULL) *out_level = loss_level;
         return 1;
     }

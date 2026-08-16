@@ -148,6 +148,242 @@ TEST(test_quic_cc_cubic) {
     TEST_ASSERT(cc.cubic_w_max == 0, "old path history discarded");
 }
 
+/* One acknowledgement, as loss detection would report it: `bytes` newly
+ * delivered, measured at `rate`, with the round trip it produced.
+ *
+ * The delivered counter is threaded through by the caller because that is what
+ * BBR counts round trips with -- an acknowledgement for data sent before the
+ * current round began starts a new one. */
+static void __bbr_feed(quiccc_t* cc, uint64_t* delivered, uint64_t bytes,
+                       uint64_t rate, uint64_t rtt_us, uint64_t now_us,
+                       int app_limited) {
+    quiccc_sample_t s;
+    memset(&s, 0, sizeof s);
+
+    s.prior_delivered = *delivered;
+    *delivered += bytes;
+
+    s.delivered = *delivered;
+    s.acked_bytes = bytes;
+    s.delivery_rate = rate;
+    s.rtt_us = rtt_us;
+    s.app_limited = app_limited;
+    s.prior_in_flight = cc->bytes_in_flight;
+
+    cc->ops->on_ack(cc, bytes, now_us > rtt_us ? now_us - rtt_us : 0, now_us);
+    cc->ops->on_ack_end(cc, &s, now_us);
+}
+
+TEST(test_quic_cc_bbr) {
+    TEST_SUITE("quic_cc");
+
+    quiccc_t cc;
+    quiccc_init_algorithm(&cc, MTU, QUICCC_INITIAL_WINDOW_PACKETS, QUICCC_BBR);
+
+    uint64_t delivered = 0;
+    uint64_t now = 1000000;
+
+    TEST_CASE("BBR starts in STARTUP with no model at all");
+    TEST_ASSERT(cc.ops == &quiccc_bbr, "BBR selected");
+    TEST_ASSERT(cc.bbr.state == QUICBBR_STARTUP, "STARTUP");
+    TEST_ASSERT(cc.bbr.pacing_gain == QUICBBR_HIGH_GAIN, "2/ln2, to double every round");
+    TEST_ASSERT(cc.bbr.btlbw == 0 && cc.bbr.rtprop_us == UINT64_MAX,
+                "nothing measured yet");
+    /* Nothing to derive a rate from, so the pacer keeps §7.7 until the first
+     * round trip has been timed. */
+    TEST_ASSERT(cc.pacing_rate == 0, "no rate named before the first sample");
+
+    TEST_CASE("the first sample builds the model and drives the pacer");
+    __bbr_feed(&cc, &delivered, 12000, 250000, 50000, now, 0);
+    TEST_ASSERT(cc.bbr.btlbw == 250000, "bandwidth is the measured rate");
+    TEST_ASSERT(cc.bbr.rtprop_us == 50000, "and the round trip is the delay");
+    TEST_ASSERT(cc.pacing_rate == 250000 * QUICBBR_HIGH_GAIN / QUICBBR_GAIN_UNIT,
+                "the pacer is told to send at the STARTUP gain");
+    TEST_ASSERT(cc.cwnd > 12000, "and the window grew with the acknowledgement");
+
+    TEST_CASE("a faster path raises the estimate at once");
+    /* The maximum is the estimate, so an increase is adopted immediately --
+     * unlike a loss-based controller, which has to fill a queue first. */
+    now += 50000;
+    __bbr_feed(&cc, &delivered, 12000, 500000, 50000, now, 0);
+    TEST_ASSERT(cc.bbr.btlbw == 500000, "adopted without waiting");
+
+    TEST_CASE("an application-limited sample cannot lower it");
+    /* A pause in the application looks exactly like a slower path from the
+     * outside, and mistaking one for the other costs ten round trips of
+     * sending at the speed of an idle moment. */
+    now += 50000;
+    __bbr_feed(&cc, &delivered, 1200, 10000, 50000, now, 1);
+    TEST_ASSERT(cc.bbr.btlbw == 500000, "the estimate stood");
+
+    TEST_CASE("STARTUP ends when three rounds fail to raise the rate by 25%");
+    /* Something has to be in flight, or DRAIN is entered and left in the same
+     * acknowledgement -- there would be no queue to drain. */
+    cc.ops->on_sent(&cc, 100000);
+
+    for (int i = 0; i < QUICBBR_FULL_BW_COUNT + 1; i++) {
+        now += 50000;
+        __bbr_feed(&cc, &delivered, 1200, 500000, 50000, now, 0);
+    }
+
+    TEST_ASSERT(cc.bbr.filled_pipe, "the pipe is full");
+    TEST_ASSERT(cc.bbr.state == QUICBBR_DRAIN, "so STARTUP gives way to DRAIN");
+    TEST_ASSERT(cc.bbr.pacing_gain == QUICBBR_DRAIN_GAIN,
+                "and the rate drops below the estimate to give the queue back");
+
+    TEST_CASE("DRAIN ends when the path holds no more than one BDP");
+    /* 500 kB/s over 50 ms is 25000 bytes in the path; the acknowledgement below
+     * releases enough that what is left fits. */
+    now += 50000;
+    __bbr_feed(&cc, &delivered, 90000, 500000, 50000, now, 0);
+    TEST_ASSERT(cc.bbr.state == QUICBBR_PROBE_BW, "steady state reached");
+    TEST_ASSERT(cc.bbr.cwnd_gain == QUICBBR_CWND_GAIN,
+                "the window is two BDP -- room for the probe, not for a queue");
+
+    TEST_CASE("PROBE_BW cycles above and below the estimate");
+    /* One round trip 25% up to look for more bandwidth, one 25% down to return
+     * whatever queue that built. Without the second the probe would leave a
+     * standing queue behind on every cycle. */
+    /* The probing phase ends when the extra data is actually in flight, not
+     * merely when the clock says a round trip passed -- so the sender has to
+     * keep the path busy or the cycle stalls at the probe, which is exactly
+     * what it should do for a sender with nothing to probe with. */
+    cc.ops->on_sent(&cc, 50000);
+
+    int seen_up = 0, seen_down = 0, seen_unit = 0;
+    for (int i = 0; i < 3 * QUICBBR_CYCLE_LEN; i++) {
+        now += 60000;   /* more than rtprop, so the phase may advance */
+        cc.ops->on_sent(&cc, 12000);
+        __bbr_feed(&cc, &delivered, 12000, 500000, 50000, now, 0);
+
+        if (cc.bbr.pacing_gain > QUICBBR_GAIN_UNIT) seen_up = 1;
+        else if (cc.bbr.pacing_gain < QUICBBR_GAIN_UNIT) seen_down = 1;
+        else seen_unit = 1;
+    }
+    TEST_ASSERT(seen_up && seen_down && seen_unit, "all three phases occur");
+    TEST_ASSERT(cc.bbr.state == QUICBBR_PROBE_BW, "and it stays in PROBE_BW");
+
+    TEST_CASE("the bandwidth estimate falls once the window slides past it");
+    /* A maximum that only ever rises would keep sending at a rate the path
+     * stopped supporting. Ten round trips at a lower rate must lower it. */
+    for (int i = 0; i < QUICBBR_BW_WINDOW_ROUNDS + 3; i++) {
+        now += 60000;
+        cc.ops->on_sent(&cc, 12000);
+        __bbr_feed(&cc, &delivered, 12000, 200000, 50000, now, 0);
+    }
+    TEST_ASSERT(cc.bbr.btlbw == 200000, "the stale maximum expired");
+
+    TEST_CASE("PROBE_RTT re-measures the minimum RTT every ten seconds");
+    /* A standing queue inflates every RTT sample, and the only way to see past
+     * it is to stop sending long enough for the queue to leave. */
+    const uint64_t before_probe = cc.cwnd;
+    now += QUICBBR_RTPROP_WINDOW_US + 1000000;
+    /* REGRESSION: this sample ties the current minimum, and the first version
+     * treated that as "re-measured" and cleared the expiry flag. On a steady
+     * path every sample ties the minimum, so PROBE_RTT never happened and a
+     * standing queue would have been carried as path delay indefinitely. */
+    __bbr_feed(&cc, &delivered, 1200, 200000, 50000, now, 0);
+
+    TEST_ASSERT(cc.bbr.state == QUICBBR_PROBE_RTT, "entered on the timer");
+    TEST_ASSERT(cc.cwnd == QUICBBR_MIN_PIPE_CWND_PACKETS * MTU,
+                "the window collapses to four datagrams");
+    TEST_ASSERT(cc.bbr.prior_cwnd >= before_probe, "the old window is remembered");
+
+    TEST_CASE("and leaves after 200 ms and a round trip, window restored");
+    cc.bytes_in_flight = 0;                    /* the path drained */
+    now += 1000;
+    __bbr_feed(&cc, &delivered, 1200, 200000, 40000, now, 0);   /* starts the clock */
+    TEST_ASSERT(cc.bbr.probe_rtt_done_us == now + QUICBBR_PROBE_RTT_DURATION_US,
+                "the 200 ms begin only once the path is actually empty");
+
+    now += QUICBBR_PROBE_RTT_DURATION_US + 1000;
+    __bbr_feed(&cc, &delivered, 1200, 200000, 40000, now, 0);
+    TEST_ASSERT(cc.bbr.state == QUICBBR_PROBE_BW, "back to steady state");
+    TEST_ASSERT(cc.bbr.rtprop_us == 40000, "with the minimum RTT it went to measure");
+
+    /* Bigger than the PROBE_RTT floor it was held at, and set by the model
+     * rather than by the floor. Not "at least what it gave up": the probe found
+     * a shorter path than the model assumed, and a shorter path holds fewer
+     * bytes -- the window following that down is the measurement working, not
+     * the window being lost. */
+    TEST_ASSERT(cc.cwnd > QUICBBR_MIN_PIPE_CWND_PACKETS * MTU, "the floor is released");
+    TEST_ASSERT(before_probe > cc.cwnd && cc.cwnd == 19600,
+                "and the window is one cwnd_gain of the new, shorter BDP");
+
+    TEST_CASE("a loss is not a halving");
+    /* The whole point of a rate-based controller: loss on a lossy path is not
+     * evidence of congestion, so the window comes down by what was lost rather
+     * than by half. */
+    quiccc_t lossy;
+    quiccc_init_algorithm(&lossy, MTU, QUICCC_INITIAL_WINDOW_PACKETS, QUICCC_BBR);
+    lossy.ops->on_sent(&lossy, 12000);
+    lossy.ops->on_loss(&lossy, 1200, 1000, 2000);
+
+    TEST_ASSERT(lossy.cwnd == 10800, "down by the lost bytes, not to 6000");
+    TEST_ASSERT(lossy.bytes_in_flight == 10800, "and they are no longer in flight");
+    TEST_ASSERT(lossy.bbr.packet_conservation,
+                "but nothing new goes out beyond what came back, for a round");
+
+    TEST_CASE("packet conservation ends after one round");
+    uint64_t lossy_delivered = 0;
+    __bbr_feed(&lossy, &lossy_delivered, 1200, 250000, 50000, 3000, 0);
+    TEST_ASSERT(!lossy.bbr.packet_conservation, "released on the round boundary");
+
+    TEST_CASE("persistent congestion throws the model away");
+    /* Every estimate describes a path that has stopped working, so keeping any
+     * of them would send the reopened connection at the speed of a path that no
+     * longer exists. The propagation delay survives -- it is a property of the
+     * route, and re-measuring it costs a PROBE_RTT. */
+    lossy.ops->on_persistent_congestion(&lossy);
+    TEST_ASSERT(lossy.cwnd == QUICBBR_MIN_PIPE_CWND_PACKETS * MTU, "minimum window");
+    TEST_ASSERT(lossy.bbr.state == QUICBBR_STARTUP, "starting over");
+    TEST_ASSERT(lossy.bbr.btlbw == 0 && lossy.pacing_rate == 0,
+                "no bandwidth estimate and no rate to pace at");
+    TEST_ASSERT(lossy.bbr.rtprop_us == 50000, "the path's delay is kept");
+    TEST_ASSERT(quiccc_in_slow_start(&lossy),
+                "and STARTUP answers the slow-start question");
+}
+
+TEST(test_quic_cc_bbr_pacing) {
+    TEST_SUITE("quic_cc");
+
+    quiccc_t cc;
+    quiccc_init_algorithm(&cc, MTU, QUICCC_INITIAL_WINDOW_PACKETS, QUICCC_BBR);
+
+    quicpacer_t pacer;
+    quicpacer_init(&pacer, &cc, 1);
+
+    TEST_CASE("the controller's rate overrides the cwnd/RTT formula");
+    /* For a window-based controller the pacer smooths a decision the window
+     * already made. For BBR the pacer *is* the decision, and cwnd is only the
+     * bound that keeps a wrong rate from filling the path -- so a rate derived
+     * from cwnd here would quietly overrule the measurement. */
+    uint64_t delivered = 0;
+    __bbr_feed(&cc, &delivered, 12000, 250000, 50000, 1000000, 0);
+
+    const uint64_t rate = cc.pacing_rate;
+    TEST_ASSERT(rate > 0, "a rate was named");
+
+    /* Drain the bucket, then let exactly one second pass: what refills is the
+     * controller's rate, whatever RTT the pacer is handed. */
+    quicpacer_allowance(&pacer, &cc, 50000, 2000000);
+    quicpacer_consume(&pacer, pacer.tokens);
+
+    cc.cwnd = 1ULL << 40;   /* absurd, to prove the window is not the source */
+    quicpacer_allowance(&pacer, &cc, 50000, 3000000);
+
+    TEST_ASSERT(pacer.tokens <= pacer.burst_limit, "the burst cap still holds");
+    TEST_ASSERT(pacer.burst_limit < rate,
+                "and one second of the measured rate exceeds it, so the cap is what shows");
+
+    TEST_CASE("the deadline follows the controller's rate too");
+    quicpacer_consume(&pacer, pacer.tokens);
+    const uint64_t resume = quicpacer_next_time_us(&pacer, &cc, 50000, 3000000);
+    /* One datagram at `rate` bytes per second, rounded up. */
+    const uint64_t expected = 3000000 + (MTU * 1000000ULL + rate - 1) / rate;
+    TEST_ASSERT_EQUAL_UINT(expected, resume, "one datagram at the measured rate");
+}
+
 TEST(test_quic_ecn_accounting) {
     TEST_SUITE("quic_ecn");
     quicack_t ack;
@@ -629,6 +865,188 @@ TEST(test_quic_loss_spaces) {
                 "and the bytes stopped counting against the window");
 
     quicrange_free(&acked);
+    quicloss_free(&loss);
+    quic_time_set_source(NULL);
+}
+
+/* A controller that records what loss detection told it, so the estimator can
+ * be checked directly rather than through BBR's reaction to it. */
+static quiccc_sample_t __probe_sample;
+static int __probe_calls = 0;
+
+static void __probe_on_sent(quiccc_t* cc, size_t bytes) {
+    cc->bytes_in_flight += bytes;
+}
+
+static void __probe_on_ack(quiccc_t* cc, size_t bytes, uint64_t sent_us,
+                           uint64_t now_us) {
+    (void)sent_us; (void)now_us;
+    if (cc->bytes_in_flight >= bytes) cc->bytes_in_flight -= bytes;
+    else cc->bytes_in_flight = 0;
+}
+
+static void __probe_on_loss(quiccc_t* cc, size_t bytes, uint64_t sent_us,
+                            uint64_t now_us) {
+    __probe_on_ack(cc, bytes, sent_us, now_us);
+}
+
+static void __probe_noop(quiccc_t* cc) { (void)cc; }
+
+static void __probe_on_ack_end(quiccc_t* cc, const quiccc_sample_t* sample,
+                               uint64_t now_us) {
+    (void)cc; (void)now_us;
+    __probe_sample = *sample;
+    __probe_calls++;
+}
+
+static const quiccc_ops_t __probe_ops = {
+    .on_sent = __probe_on_sent,
+    .on_ack = __probe_on_ack,
+    .on_loss = __probe_on_loss,
+    .on_persistent_congestion = __probe_noop,
+    .on_pto = __probe_noop,
+    .on_ack_end = __probe_on_ack_end
+};
+
+TEST(test_quic_delivery_rate) {
+    TEST_SUITE("quic_loss");
+
+    /* Delivery rate sampling (draft-cheng-iccrg-delivery-rate-estimation).
+     *
+     * The rate is bytes delivered over the interval they took to be delivered,
+     * and neither end of that interval is visible in the acknowledgement -- the
+     * sender has to have written both down when it sent the packet. This is the
+     * measurement BBR is built on; if it is wrong, BBR is wrong quietly. */
+
+    quic_time_set_source(__clock);
+    __now = 1000000;
+
+    quiccc_t cc;
+    quiccc_init(&cc, MTU);
+    cc.ops = &__probe_ops;
+    __probe_calls = 0;
+
+    quicloss_t loss;
+    quicloss_init(&loss, &cc, 25000);
+    loss.handshake_confirmed = 1;
+
+    quicrange_t acked;
+    quicrange_init(&acked, 0);
+    quicframe_ref_t* lost = NULL;
+
+    TEST_CASE("a packet carries the delivery state it was sent under");
+    const uint64_t start = __now;
+    for (uint64_t pn = 0; pn < 10; pn++)
+        quicloss_on_sent(&loss, QUIC_ENC_APP, pn, 1200, 1, 1, NULL, start + pn * 1000);
+
+    TEST_ASSERT(loss.first_sent_us == start,
+                "an empty path starts a new send interval");
+    TEST_ASSERT(loss.delivered == 0, "nothing delivered yet");
+
+    TEST_CASE("half the flight is acknowledged one round trip later");
+    __now = start + 100000;
+    quicrange_add(&acked, 0, 4);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost, NULL);
+
+    TEST_ASSERT(__probe_calls == 1, "the controller heard one acknowledgement");
+    TEST_ASSERT(loss.delivered == 6000, "five datagrams delivered");
+    TEST_ASSERT(__probe_sample.acked_bytes == 6000, "and reported as such");
+    /* The largest acknowledged packet went out 4 ms after the first one. */
+    TEST_ASSERT(__probe_sample.rtt_us == 96000, "with the round trip it produced");
+    /* 6000 bytes over the 100 ms it took them to be acknowledged. */
+    TEST_ASSERT_EQUAL_UINT(60000, __probe_sample.delivery_rate,
+                           "bytes delivered over the interval that delivered them");
+    TEST_ASSERT(__probe_sample.prior_in_flight == 12000,
+                "the path was full when the acknowledgement arrived");
+
+    TEST_CASE("an interval shorter than one round trip is not a rate");
+    /* It times an acknowledgement's arrival, not a path's throughput. Dividing
+     * by it reports rates the path never carried, and BBR would adopt the
+     * largest of them for ten round trips. */
+    __now = start + 150000;
+    quicrange_clear(&acked);
+    quicrange_add(&acked, 5, 9);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost, NULL);
+    TEST_ASSERT(cc.bytes_in_flight == 0, "the path is empty again");
+
+    /* Sent into an empty path and acknowledged a millisecond later, on a path
+     * whose round trip is known to be 96 ms. Not ack-eliciting, so it produces
+     * no RTT sample of its own -- otherwise the 1 ms *would* be the round trip
+     * and the rate it implies would be real. */
+    quicloss_on_sent(&loss, QUIC_ENC_APP, 10, 1200, 0, 1, NULL, __now);
+    __now += 1000;
+    quicrange_clear(&acked);
+    quicrange_add(&acked, 10, 10);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost, NULL);
+
+    TEST_ASSERT_EQUAL_UINT(0, __probe_sample.delivery_rate, "discarded as noise");
+    TEST_ASSERT(__probe_sample.acked_bytes == 1200, "though the bytes still count");
+
+    TEST_CASE("losses in the same acknowledgement are reported with it");
+    /* Half of what an acknowledgement says is what it does not contain, and a
+     * controller deciding on rate has to see both at once. */
+    for (uint64_t pn = 11; pn < 20; pn++)
+        quicloss_on_sent(&loss, QUIC_ENC_APP, pn, 1200, 1, 1, NULL, __now);
+
+    __now += 100000;
+    quicrange_clear(&acked);
+    quicrange_add(&acked, 19, 19);      /* the rest are three behind: lost */
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost, NULL);
+
+    TEST_ASSERT(__probe_sample.lost_bytes > 0, "the gap was reported as loss");
+    TEST_ASSERT(__probe_sample.acked_bytes == 1200, "alongside what did arrive");
+    quicframe_ref_free(lost);
+    lost = NULL;
+
+    TEST_CASE("a sender that runs out of data marks its samples");
+    /* Otherwise an idle moment is indistinguishable from a slow path, and the
+     * bandwidth estimate follows the application instead of the network. */
+    quicloss_app_limited(&loss);
+    TEST_ASSERT(loss.app_limited != 0, "marked while the window is open");
+
+    quicloss_on_sent(&loss, QUIC_ENC_APP, 20, 1200, 1, 1, NULL, __now);
+    __now += 100000;
+    quicrange_clear(&acked);
+    quicrange_add(&acked, 20, 20);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost, NULL);
+
+    TEST_ASSERT(__probe_sample.app_limited, "the sample says so");
+
+    TEST_CASE("and stops marking them once it is busy again");
+    /* The mark sits past whatever was already in flight when the sender went
+     * quiet, so it survives the acknowledgements for that data and clears only
+     * once the connection has delivered more than it -- packets sent during the
+     * idle period are still application-limited when they come back. */
+    for (uint64_t pn = 21; pn < 40; pn++) {
+        quicloss_on_sent(&loss, QUIC_ENC_APP, pn, 1200, 1, 1, NULL, __now);
+        __now += 1000;
+    }
+    __now += 100000;
+    quicrange_clear(&acked);
+    quicrange_add(&acked, 21, 39);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost, NULL);
+    TEST_ASSERT(loss.app_limited == 0, "the mark cleared");
+
+    /* Sent after the mark cleared, so this one measures the path. */
+    quicloss_on_sent(&loss, QUIC_ENC_APP, 40, 1200, 1, 1, NULL, __now);
+    __now += 100000;
+    quicrange_clear(&acked);
+    quicrange_add(&acked, 40, 40);
+    quicloss_on_ack(&loss, QUIC_ENC_APP, &acked, 0, __now, &lost, NULL);
+
+    TEST_ASSERT(!__probe_sample.app_limited, "and the samples measure the path again");
+    TEST_ASSERT(__probe_sample.delivery_rate > 0, "which is a rate again");
+
+    TEST_CASE("a window-limited sender is not application-limited");
+    /* It has data and the controller is what is holding it back, so its samples
+     * describe the path exactly and must be believed. */
+    cc.cwnd = 1200;
+    cc.bytes_in_flight = 2400;
+    quicloss_app_limited(&loss);
+    TEST_ASSERT(loss.app_limited == 0, "not marked");
+
+    quicrange_free(&acked);
+    quicframe_ref_free(lost);
     quicloss_free(&loss);
     quic_time_set_source(NULL);
 }

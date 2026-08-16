@@ -451,8 +451,9 @@ static int __conn_policy_parse(const env_t* source, quic_conn_policy_t* next) {
     }
     if (strcmp(cc, "newreno") == 0) p->cc_algorithm = QUICCC_NEWRENO;
     else if (strcmp(cc, "cubic") == 0) p->cc_algorithm = QUICCC_CUBIC;
+    else if (strcmp(cc, "bbr") == 0) p->cc_algorithm = QUICCC_BBR;
     else {
-        log_error("quic: http3_cc must be newreno or cubic (got '%s')\n", cc);
+        log_error("quic: http3_cc must be newreno, cubic or bbr (got '%s')\n", cc);
         return 0;
     }
 
@@ -462,6 +463,19 @@ static int __conn_policy_parse(const env_t* source, quic_conn_policy_t* next) {
         return 0;
     }
     p->pacing = pacing;
+
+    /* BBR's output *is* the pacing rate: its congestion window is deliberately
+     * larger than the rate it means to send at, so an unpaced BBR sends a whole
+     * window at line rate and measures the queue it just built. That is not a
+     * degraded configuration, it is a broken one, so the combination is refused
+     * rather than quietly corrected -- an operator who turned pacing off asked
+     * for something specific, and picking one of their two settings for them
+     * would be a guess either way. */
+    if (p->cc_algorithm == QUICCC_BBR && !p->pacing) {
+        log_error("quic: http3_cc \"bbr\" requires http3_pacing -- BBR controls "
+                  "the sending rate through the pacer and cannot work without it\n");
+        return 0;
+    }
 
     if (!__policy_u64(source, "http3_amplification_factor", QUIC_DEFAULT_AMPLIFICATION,
                       1, 16, &p->amplification_factor)) return 0;

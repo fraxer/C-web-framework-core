@@ -2736,8 +2736,16 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
      * another reason to build a packet; a connection whose last request has
      * just finished has none, and stops at exactly initial_max_streams_bidi
      * with the credit sitting here (docs/http3/08 §3p). */
-    if (!more_pending)
+    /* The loop ran out of things to build rather than out of window, pacer or
+     * budget -- `more_pending` is exactly that distinction, and it is already
+     * computed. Telling the estimator matters only for a rate-based controller,
+     * and only in one direction: rates measured across an idle sender are the
+     * application's speed, and a controller that took them for the path's would
+     * spend the next ten round trips sending at the speed of a pause. */
+    if (!more_pending) {
+        quicloss_app_limited(&conn->loss);
         atomic_store_explicit(&conn->want_write, 0, memory_order_release);
+    }
 
     /* After the turn, not during it: the loop above walks conn->streams, and a
      * stream freed underneath it would be a use-after-free. */

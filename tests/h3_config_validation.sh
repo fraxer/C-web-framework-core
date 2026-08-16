@@ -14,8 +14,32 @@ printf 'validation\n' > "$WORK_DIR/www/index.html"
 
 run_invalid() {
     local name=$1 value=$2
+    __write_config "$name" "\"$name\": $value"
+    __expect_rejected "$name"
+}
+
+# Some settings are only invalid in combination, so the fixture takes a whole
+# env body rather than one key.
+run_invalid_env() {
+    local name=$1 env=$2
+    __write_config "$name" "$env"
+    __expect_rejected "$name"
+}
+
+__expect_rejected() {
+    local name=$1
+    "$SERVER" -c "$WORK_DIR/$name.json" -f > "$WORK_DIR/$name.log" 2>&1
+    local status=$?
+    if [ "$status" -eq 0 ]; then
+        printf 'config validation: %s was not rejected as expected (status %d)\n' \
+            "$name" "$status" >&2
+        return 1
+    fi
+}
+
+__write_config() {
+    local name=$1 env=$2
     local config="$WORK_DIR/$name.json"
-    local log="$WORK_DIR/$name.log"
 
     cat > "$config" <<JSON
 {
@@ -24,7 +48,7 @@ run_invalid() {
         "buffer_size": 16384, "client_max_body_size": 1048576,
         "tmp": "/tmp", "gzip": ["text/html"],
         "log": { "enabled": true, "level": "error" },
-        "env": { "$name": $value }
+        "env": { $env }
     },
     "servers": {
         "s1": {
@@ -41,14 +65,6 @@ run_invalid() {
     "mimetypes": { "text/html": ["html"] }
 }
 JSON
-
-    "$SERVER" -c "$config" -f > "$log" 2>&1
-    local status=$?
-    if [ "$status" -eq 0 ]; then
-        printf 'config validation: %s was not rejected as expected (status %d)\n' \
-            "$name" "$status" >&2
-        return 1
-    fi
 }
 
 ok=1
@@ -67,6 +83,14 @@ run_invalid http3_abort_rate -1 || ok=0
 run_invalid http3_abort_burst 0 || ok=0
 run_invalid http3_ctrl_rate '"fast"' || ok=0
 run_invalid http3_ctrl_burst 0 || ok=0
+run_invalid http3_cc '"quadratic"' || ok=0
+
+# BBR sends at a measured rate and keeps a window deliberately wider than that
+# rate; without the pacer it would send the whole window at line rate and then
+# measure the queue it built. The pair is refused rather than corrected --
+# either setting could be the one the operator meant.
+run_invalid_env http3_cc_bbr_needs_pacing \
+    '"http3_cc": "bbr", "http3_pacing": false' || ok=0
 
 [ "$ok" -eq 1 ] || exit 1
 

@@ -14,13 +14,21 @@ void quiccc_init_packets(quiccc_t* cc, size_t max_datagram_size, uint64_t packet
     quiccc_init_algorithm(cc, max_datagram_size, packets, QUICCC_NEWRENO);
 }
 
+static void __bbr_init(quiccc_t* cc);
+
 void quiccc_init_algorithm(quiccc_t* cc, size_t max_datagram_size,
                            uint64_t packets, quiccc_algorithm_e algorithm) {
     if (cc == NULL) return;
 
     memset(cc, 0, sizeof * cc);
 
-    cc->ops = algorithm == QUICCC_CUBIC ? &quiccc_cubic : &quiccc_newreno;
+    switch (algorithm) {
+        case QUICCC_CUBIC: cc->ops = &quiccc_cubic; break;
+        case QUICCC_BBR:   cc->ops = &quiccc_bbr; break;
+        default:           cc->ops = &quiccc_newreno; algorithm = QUICCC_NEWRENO; break;
+    }
+
+    cc->algorithm = algorithm;
     cc->max_datagram_size = max_datagram_size;
 
     uint64_t initial = packets * max_datagram_size;
@@ -37,10 +45,24 @@ void quiccc_init_algorithm(quiccc_t* cc, size_t max_datagram_size,
 
     cc->cwnd = initial;
     cc->ssthresh = UINT64_MAX;   /* slow start */
+
+    if (algorithm == QUICCC_BBR) __bbr_init(cc);
+}
+
+quiccc_algorithm_e quiccc_algorithm(const quiccc_t* cc) {
+    return cc == NULL ? QUICCC_NEWRENO : cc->algorithm;
 }
 
 int quiccc_in_slow_start(const quiccc_t* cc) {
-    return cc != NULL && cc->cwnd < cc->ssthresh;
+    if (cc == NULL) return 0;
+
+    /* BBR has no ssthresh at all -- it never halves anything -- so the
+     * window-based test would call it "slow start" forever. Its STARTUP is the
+     * same idea by a different mechanism, and that is what callers are asking
+     * about. */
+    if (cc->algorithm == QUICCC_BBR) return cc->bbr.state == QUICBBR_STARTUP;
+
+    return cc->cwnd < cc->ssthresh;
 }
 
 int quiccc_in_recovery(const quiccc_t* cc, uint64_t sent_us) {
@@ -133,12 +155,20 @@ static void __newreno_on_pto(quiccc_t* cc) {
     (void)cc;
 }
 
+/* A window-based controller has already done everything an acknowledgement can
+ * tell it, one packet at a time. */
+static void __window_on_ack_end(quiccc_t* cc, const quiccc_sample_t* sample,
+                                uint64_t now_us) {
+    (void)cc; (void)sample; (void)now_us;
+}
+
 const quiccc_ops_t quiccc_newreno = {
     .on_sent = __newreno_on_sent,
     .on_ack = __newreno_on_ack,
     .on_loss = __newreno_on_loss,
     .on_persistent_congestion = __newreno_on_persistent_congestion,
-    .on_pto = __newreno_on_pto
+    .on_pto = __newreno_on_pto,
+    .on_ack_end = __window_on_ack_end
 };
 
 /* ---- CUBIC (RFC 9438) ----
@@ -256,7 +286,479 @@ const quiccc_ops_t quiccc_cubic = {
     .on_ack = __cubic_on_ack,
     .on_loss = __cubic_on_loss,
     .on_persistent_congestion = __cubic_on_persistent_congestion,
-    .on_pto = __cubic_on_pto
+    .on_pto = __cubic_on_pto,
+    .on_ack_end = __window_on_ack_end
+};
+
+/* ---- BBR (draft-cardwell-iccrg-bbr-congestion-control) ----
+ *
+ * The window-based controllers above answer one question: how much may be in
+ * flight. BBR answers a different one -- how fast may bytes leave -- and treats
+ * the window only as the bound that keeps a mistaken rate from filling the
+ * path. That is why it needs the pacer to be its output rather than a smoothing
+ * device, and why it needs a measured delivery rate rather than a loss signal.
+ *
+ * It keeps two estimates and probes for each in turn: the bottleneck bandwidth
+ * (the maximum delivery rate seen recently, because the maximum is the one
+ * figure a queue cannot inflate) and the round-trip propagation delay (the
+ * minimum RTT seen recently, because the minimum is the one figure a queue
+ * cannot inflate either). Their product is the bytes the path holds; anything
+ * beyond it is queue, and queue is the thing loss-based controllers must build
+ * before they can react.
+ *
+ * Integers throughout, gains in 1/256ths -- see the header. */
+
+static void __bbr_enter_startup(quiccc_t* cc) {
+    cc->bbr.state = QUICBBR_STARTUP;
+    cc->bbr.pacing_gain = QUICBBR_HIGH_GAIN;
+    cc->bbr.cwnd_gain = QUICBBR_HIGH_GAIN;
+}
+
+static void __bbr_init(quiccc_t* cc) {
+    quiccc_bbr_t* b = &cc->bbr;
+
+    memset(b, 0, sizeof * b);
+
+    b->rtprop_us = UINT64_MAX;      /* no sample yet, not "instant path" */
+    b->initial_cwnd = cc->cwnd;
+    b->prior_cwnd = cc->cwnd;
+    b->next_round_delivered = 0;
+
+    __bbr_enter_startup(cc);
+
+    /* Left at zero deliberately: until one round trip has been timed there is
+     * nothing to derive a rate from, and the pacer falls back to §7.7 -- which
+     * for an opening flight is exactly the behaviour BBR wants anyway. */
+    cc->pacing_rate = 0;
+}
+
+static uint64_t __bbr_min_pipe_cwnd(const quiccc_t* cc) {
+    return (uint64_t)QUICBBR_MIN_PIPE_CWND_PACKETS * cc->max_datagram_size;
+}
+
+/* A running maximum over a sliding window of round trips, held in three
+ * entries: the current maximum, and the best candidates from the two
+ * sub-windows behind it. Storing every sample would be exact and pointless --
+ * the estimate only has to survive until a larger one replaces it or the window
+ * slides past it, and three entries guarantee both. */
+static uint64_t __bbr_bw_filter(quiccc_bbr_t* b, uint64_t rate, uint64_t round) {
+    const quiccc_bw_entry_t sample = { .round = round, .rate = rate };
+
+    /* A new maximum, or nothing left inside the window: the filter is this
+     * sample and nothing else. */
+    if (b->bw[0].rate == 0 || rate >= b->bw[0].rate ||
+        round - b->bw[2].round > QUICBBR_BW_WINDOW_ROUNDS) {
+        b->bw[0] = b->bw[1] = b->bw[2] = sample;
+        return b->bw[0].rate;
+    }
+
+    if (rate >= b->bw[1].rate) b->bw[1] = b->bw[2] = sample;
+    else if (rate >= b->bw[2].rate) b->bw[2] = sample;
+
+    const uint64_t age = round - b->bw[0].round;
+
+    /* The leading entry aged out: promote the sub-window candidates. This is
+     * the step that lets the estimate *fall*, which is the whole reason the
+     * filter is windowed -- a maximum that only ever rises would keep sending
+     * at a rate the path stopped supporting minutes ago. */
+    if (age > QUICBBR_BW_WINDOW_ROUNDS) {
+        b->bw[0] = b->bw[1];
+        b->bw[1] = b->bw[2];
+        b->bw[2] = sample;
+
+        if (round - b->bw[0].round > QUICBBR_BW_WINDOW_ROUNDS) {
+            b->bw[0] = b->bw[1];
+            b->bw[1] = b->bw[2];
+        }
+    }
+    /* The candidates have to age too. Without these two the sub-windows keep
+     * whatever entry the maximum was set from, and when the maximum finally
+     * expires it is replaced by something just as stale -- the estimate then
+     * falls in one step from a value ten rounds old to a value nine rounds old.
+     * Each candidate takes over its quarter and half of the window. */
+    else if (b->bw[1].round == b->bw[0].round && age > QUICBBR_BW_WINDOW_ROUNDS / 4)
+        b->bw[1] = b->bw[2] = sample;
+    else if (b->bw[2].round == b->bw[1].round && age > QUICBBR_BW_WINDOW_ROUNDS / 2)
+        b->bw[2] = sample;
+
+    return b->bw[0].rate;
+}
+
+/* Bytes the path holds at this gain: bandwidth * delay, plus a few datagrams so
+ * that a sender whose window rounds down cannot stall itself. */
+static uint64_t __bbr_inflight(const quiccc_t* cc, uint64_t gain) {
+    const quiccc_bbr_t* b = &cc->bbr;
+
+    if (b->btlbw == 0 || b->rtprop_us == UINT64_MAX) return b->initial_cwnd;
+
+    const uint64_t bdp = b->btlbw * b->rtprop_us / 1000000ULL;
+    const uint64_t quanta = 3 * (uint64_t)cc->max_datagram_size;
+
+    return bdp * gain / QUICBBR_GAIN_UNIT + quanta;
+}
+
+/* A round trip has passed when an acknowledgement arrives for something sent
+ * after the previous round began. Rounds, not microseconds, are BBR's clock for
+ * everything that has to happen "once per RTT" on a path whose RTT is itself
+ * one of the unknowns. */
+static void __bbr_update_round(quiccc_t* cc, const quiccc_sample_t* s) {
+    quiccc_bbr_t* b = &cc->bbr;
+
+    /* An acknowledgement that delivered nothing -- one that only declared
+     * losses -- carries no send-order information, and its zeroed
+     * prior_delivered would compare as "older than the round" and start a new
+     * one on every such call. */
+    if (s->acked_bytes == 0) {
+        b->round_start = 0;
+        return;
+    }
+
+    if (s->prior_delivered >= b->next_round_delivered) {
+        b->next_round_delivered = s->delivered;
+        b->round_count++;
+        b->round_start = 1;
+        return;
+    }
+
+    b->round_start = 0;
+}
+
+static void __bbr_update_btlbw(quiccc_t* cc, const quiccc_sample_t* s) {
+    __bbr_update_round(cc, s);
+
+    if (s->delivery_rate == 0) return;
+
+    /* An application-limited sample measures how fast the application had data,
+     * not how fast the path moves it -- so it may raise the estimate (the path
+     * demonstrably carried that much) but must never lower it. Without this
+     * rule an idle moment would look like a slow network for ten round trips. */
+    if (s->app_limited && s->delivery_rate < cc->bbr.btlbw) return;
+
+    cc->bbr.btlbw = __bbr_bw_filter(&cc->bbr, s->delivery_rate, cc->bbr.round_count);
+}
+
+static const uint64_t __bbr_cycle_gain[QUICBBR_CYCLE_LEN] = {
+    /* One round trip 25% above the estimate to find out whether more bandwidth
+     * is available, one 25% below to give back whatever queue that created,
+     * then six at the estimate itself. */
+    QUICBBR_GAIN_UNIT * 5 / 4,
+    QUICBBR_GAIN_UNIT * 3 / 4,
+    QUICBBR_GAIN_UNIT, QUICBBR_GAIN_UNIT, QUICBBR_GAIN_UNIT,
+    QUICBBR_GAIN_UNIT, QUICBBR_GAIN_UNIT, QUICBBR_GAIN_UNIT
+};
+
+static void __bbr_advance_cycle(quiccc_t* cc, uint64_t now_us) {
+    quiccc_bbr_t* b = &cc->bbr;
+
+    b->cycle_stamp_us = now_us;
+    b->cycle_index = (b->cycle_index + 1) % QUICBBR_CYCLE_LEN;
+    b->pacing_gain = __bbr_cycle_gain[b->cycle_index];
+}
+
+static void __bbr_enter_probe_bw(quiccc_t* cc, uint64_t now_us) {
+    quiccc_bbr_t* b = &cc->bbr;
+
+    b->state = QUICBBR_PROBE_BW;
+    b->pacing_gain = QUICBBR_GAIN_UNIT;
+    b->cwnd_gain = QUICBBR_CWND_GAIN;
+
+    /* Start at any phase except the draining one, so that connections which
+     * begin together do not probe and drain in lockstep -- a synchronised fleet
+     * measures its own convoy rather than the path. The clock is the entropy
+     * source: it costs nothing, and nothing here is a security decision. */
+    b->cycle_index = QUICBBR_CYCLE_LEN - 1 -
+                     (int)(now_us % (QUICBBR_CYCLE_LEN - 1));
+
+    __bbr_advance_cycle(cc, now_us);
+}
+
+static int __bbr_next_cycle_phase(const quiccc_t* cc, const quiccc_sample_t* s,
+                                  uint64_t now_us) {
+    const quiccc_bbr_t* b = &cc->bbr;
+    const uint64_t rtprop = b->rtprop_us == UINT64_MAX ? 0 : b->rtprop_us;
+    const int full_length = now_us > b->cycle_stamp_us + rtprop;
+
+    if (b->pacing_gain == QUICBBR_GAIN_UNIT) return full_length;
+
+    /* Probing up ends once the extra data is actually in flight (the probe
+     * happened) or the path answered with loss -- not merely once the clock
+     * says a round trip elapsed, which on a slow start-up would end the probe
+     * before it began. */
+    if (b->pacing_gain > QUICBBR_GAIN_UNIT) {
+        return full_length &&
+               (s->lost_bytes > 0 ||
+                s->prior_in_flight >= __bbr_inflight(cc, b->pacing_gain));
+    }
+
+    /* Draining ends early once the queue is gone: there is nothing to give back
+     * and holding the rate down only wastes the path. */
+    return full_length || s->prior_in_flight <= __bbr_inflight(cc, QUICBBR_GAIN_UNIT);
+}
+
+static void __bbr_check_cycle_phase(quiccc_t* cc, const quiccc_sample_t* s,
+                                    uint64_t now_us) {
+    if (cc->bbr.state != QUICBBR_PROBE_BW) return;
+    if (!__bbr_next_cycle_phase(cc, s, now_us)) return;
+
+    __bbr_advance_cycle(cc, now_us);
+}
+
+/* STARTUP doubles the sending rate every round trip and has to decide when to
+ * stop. The pipe is full when three rounds in a row fail to raise the delivery
+ * rate by 25%: after that, everything extra goes into a queue, and the queue is
+ * what DRAIN then removes. */
+static void __bbr_check_full_pipe(quiccc_t* cc, const quiccc_sample_t* s) {
+    quiccc_bbr_t* b = &cc->bbr;
+
+    if (b->filled_pipe || !b->round_start || s->app_limited) return;
+
+    if (b->btlbw >= b->full_bw * QUICBBR_FULL_BW_THRESHOLD_NUM /
+                    QUICBBR_FULL_BW_THRESHOLD_DEN) {
+        b->full_bw = b->btlbw;
+        b->full_bw_count = 0;
+        return;
+    }
+
+    if (++b->full_bw_count >= QUICBBR_FULL_BW_COUNT) b->filled_pipe = 1;
+}
+
+static void __bbr_check_drain(quiccc_t* cc, uint64_t now_us) {
+    quiccc_bbr_t* b = &cc->bbr;
+
+    if (b->state == QUICBBR_STARTUP && b->filled_pipe) {
+        b->state = QUICBBR_DRAIN;
+        b->pacing_gain = QUICBBR_DRAIN_GAIN;
+        /* The window stays where STARTUP left it: draining is done by sending
+         * slower, not by refusing to send. Cutting the window here would stall
+         * a sender that is merely carrying a queue it is already emptying. */
+        b->cwnd_gain = QUICBBR_HIGH_GAIN;
+    }
+
+    if (b->state == QUICBBR_DRAIN &&
+        cc->bytes_in_flight <= __bbr_inflight(cc, QUICBBR_GAIN_UNIT))
+        __bbr_enter_probe_bw(cc, now_us);
+}
+
+static void __bbr_update_rtprop(quiccc_t* cc, const quiccc_sample_t* s,
+                                uint64_t now_us) {
+    quiccc_bbr_t* b = &cc->bbr;
+
+    b->rtprop_expired = b->rtprop_stamp_us != 0 &&
+                        now_us > b->rtprop_stamp_us + QUICBBR_RTPROP_WINDOW_US;
+
+    if (s->rtt_us == 0) return;
+
+    if (b->rtprop_us == UINT64_MAX || s->rtt_us <= b->rtprop_us || b->rtprop_expired) {
+        b->rtprop_us = s->rtt_us;
+        b->rtprop_stamp_us = now_us;
+
+        /* The expiry flag is deliberately NOT cleared here. It says "ten
+         * seconds have passed since the last time this estimate was taken with
+         * an empty path", and taking a sample from a path that has a queue
+         * standing in it does not answer that -- the sample is only as good as
+         * the queue is short.
+         *
+         * Clearing it was the first version, and it made PROBE_RTT unreachable
+         * on exactly the paths that need it: on a steady path every sample ties
+         * the current minimum, so every sample cleared the flag a moment after
+         * the timer set it, and the connection went on believing a delay it had
+         * not re-measured since the handshake. PROBE_RTT clears it, on its way
+         * out, having actually emptied the path. */
+    }
+}
+
+/* The minimum RTT can only be measured when the path is briefly empty, and the
+ * path is only briefly empty if the sender makes it so. Hence PROBE_RTT: once
+ * every ten seconds, hold the window at four datagrams for 200 ms and take the
+ * measurement. It costs a fraction of the throughput and it is the only defence
+ * against a standing queue that every sender mistakes for a longer path. */
+static void __bbr_check_probe_rtt(quiccc_t* cc, const quiccc_sample_t* s,
+                                  uint64_t now_us) {
+    quiccc_bbr_t* b = &cc->bbr;
+
+    if (b->state != QUICBBR_PROBE_RTT && b->rtprop_expired) {
+        b->state = QUICBBR_PROBE_RTT;
+        b->pacing_gain = QUICBBR_GAIN_UNIT;
+        b->cwnd_gain = QUICBBR_GAIN_UNIT;
+
+        /* What to restore on the way out. Normally that is simply the window
+         * being given up; under packet conservation the current window is
+         * already a reduced one, and restoring *it* would make a loss during
+         * PROBE_RTT permanent, so the larger of the two is kept instead. */
+        b->prior_cwnd = b->packet_conservation && b->prior_cwnd > cc->cwnd
+                        ? b->prior_cwnd : cc->cwnd;
+
+        b->probe_rtt_done_us = 0;
+    }
+
+    if (b->state != QUICBBR_PROBE_RTT) return;
+
+    if (b->probe_rtt_done_us == 0) {
+        /* The clock does not start until the path has actually drained to the
+         * minimum window -- otherwise the 200 ms are spent waiting for the
+         * queue to leave and no low-RTT sample is ever taken. */
+        if (cc->bytes_in_flight <= __bbr_min_pipe_cwnd(cc) + cc->max_datagram_size) {
+            b->probe_rtt_done_us = now_us + QUICBBR_PROBE_RTT_DURATION_US;
+            b->probe_rtt_round_done = 0;
+            b->next_round_delivered = s->delivered;
+        }
+        return;
+    }
+
+    if (b->round_start) b->probe_rtt_round_done = 1;
+
+    if (!b->probe_rtt_round_done || now_us <= b->probe_rtt_done_us) return;
+
+    b->rtprop_stamp_us = now_us;
+    b->rtprop_expired = 0;
+
+    if (cc->cwnd < b->prior_cwnd) cc->cwnd = b->prior_cwnd;
+
+    if (b->filled_pipe) __bbr_enter_probe_bw(cc, now_us);
+    else __bbr_enter_startup(cc);
+}
+
+static void __bbr_set_pacing_rate(quiccc_t* cc) {
+    quiccc_bbr_t* b = &cc->bbr;
+    uint64_t rate;
+
+    if (b->btlbw != 0) {
+        rate = b->btlbw * b->pacing_gain / QUICBBR_GAIN_UNIT;
+    }
+    else if (b->rtprop_us != UINT64_MAX && b->rtprop_us != 0) {
+        /* Nothing measured yet: one initial window per round trip at the
+         * current gain, which is what a window-based sender would do anyway. */
+        rate = b->initial_cwnd * 1000000ULL / b->rtprop_us *
+               b->pacing_gain / QUICBBR_GAIN_UNIT;
+    }
+    else return;
+
+    if (rate == 0) return;
+
+    /* Before the pipe is known to be full the rate only ever rises: STARTUP is
+     * looking for the ceiling, and a single slow sample on the way up must not
+     * push the sender back down and make it look for the ceiling again. */
+    if (b->filled_pipe || rate > cc->pacing_rate) cc->pacing_rate = rate;
+}
+
+static void __bbr_set_cwnd(quiccc_t* cc, const quiccc_sample_t* s) {
+    quiccc_bbr_t* b = &cc->bbr;
+    const uint64_t floor = __bbr_min_pipe_cwnd(cc);
+
+    if (b->packet_conservation) {
+        /* §4.2.4: after a loss, put back only what came out, until a full round
+         * has passed. */
+        const uint64_t bound = cc->bytes_in_flight + s->acked_bytes;
+        if (cc->cwnd < bound) cc->cwnd = bound;
+    }
+    else {
+        const uint64_t target = __bbr_inflight(cc, b->cwnd_gain);
+
+        if (b->filled_pipe) {
+            cc->cwnd += s->acked_bytes;
+            if (cc->cwnd > target) cc->cwnd = target;
+        }
+        else if (cc->cwnd < target || s->delivered < b->initial_cwnd) {
+            /* Still hunting for the ceiling: grow one for one, exactly as slow
+             * start does, and let the pacing gain do the actual probing. */
+            cc->cwnd += s->acked_bytes;
+        }
+    }
+
+    if (cc->cwnd < floor) cc->cwnd = floor;
+
+    /* PROBE_RTT's whole point is the small window, so it is applied last: an
+     * earlier clamp would be undone by the growth above. */
+    if (b->state == QUICBBR_PROBE_RTT && cc->cwnd > floor) cc->cwnd = floor;
+}
+
+static void __bbr_on_sent(quiccc_t* cc, size_t bytes) {
+    cc->bytes_in_flight += bytes;
+}
+
+static void __bbr_on_ack(quiccc_t* cc, size_t bytes, uint64_t sent_us,
+                         uint64_t now_us) {
+    (void)sent_us; (void)now_us;
+
+    /* Only the accounting. Everything BBR does with an acknowledgement needs
+     * the interval it covered, and a per-packet callback does not have one --
+     * that is what on_ack_end is for. */
+    if (cc->bytes_in_flight >= bytes) cc->bytes_in_flight -= bytes;
+    else cc->bytes_in_flight = 0;
+}
+
+static void __bbr_on_loss(quiccc_t* cc, size_t bytes, uint64_t sent_us,
+                          uint64_t now_us) {
+    (void)sent_us; (void)now_us;
+
+    if (cc->bytes_in_flight >= bytes) cc->bytes_in_flight -= bytes;
+    else cc->bytes_in_flight = 0;
+
+    quiccc_bbr_t* b = &cc->bbr;
+
+    /* BBR does not treat loss as the congestion signal -- the model is built
+     * from delivery rate, and halving on loss is precisely what it exists to
+     * avoid. But it does not ignore loss either: the window comes down by what
+     * was lost and stays under packet conservation for a round, so that a path
+     * which really is dropping traffic does not keep receiving a full window
+     * while the model catches up. */
+    if (!b->packet_conservation) {
+        if (cc->cwnd > b->prior_cwnd) b->prior_cwnd = cc->cwnd;
+        b->packet_conservation = 1;
+    }
+
+    const uint64_t floor = __bbr_min_pipe_cwnd(cc);
+    cc->cwnd = cc->cwnd > bytes && cc->cwnd - bytes > floor ? cc->cwnd - bytes : floor;
+}
+
+static void __bbr_on_persistent_congestion(quiccc_t* cc) {
+    /* The path stopped working, so every estimate in the model describes a path
+     * that no longer exists. Start over: minimum window, no bandwidth estimate,
+     * STARTUP again -- the same reasoning as §7.6, reached from the other
+     * direction. */
+    const uint64_t rtprop = cc->bbr.rtprop_us;
+
+    cc->cwnd = __bbr_min_pipe_cwnd(cc);
+
+    __bbr_init(cc);   /* clears the rate estimate and the pacing rate with it */
+
+    /* The propagation delay is a property of the path, not of the congestion
+     * that just destroyed the rate estimate, so it is kept: re-measuring it
+     * would cost a PROBE_RTT the connection does not need. Its stamp is not
+     * kept -- the first acknowledgement after this sets it, and the ten-second
+     * window runs from there. */
+    cc->bbr.rtprop_us = rtprop;
+}
+
+static void __bbr_on_pto(quiccc_t* cc) { (void)cc; }
+
+static void __bbr_on_ack_end(quiccc_t* cc, const quiccc_sample_t* sample,
+                             uint64_t now_us) {
+    if (cc == NULL || sample == NULL) return;
+
+    quiccc_bbr_t* b = &cc->bbr;
+
+    __bbr_update_btlbw(cc, sample);
+
+    if (b->packet_conservation && b->round_start) b->packet_conservation = 0;
+
+    __bbr_check_cycle_phase(cc, sample, now_us);
+    __bbr_check_full_pipe(cc, sample);
+    __bbr_check_drain(cc, now_us);
+    __bbr_update_rtprop(cc, sample, now_us);
+    __bbr_check_probe_rtt(cc, sample, now_us);
+
+    __bbr_set_pacing_rate(cc);
+    __bbr_set_cwnd(cc, sample);
+}
+
+const quiccc_ops_t quiccc_bbr = {
+    .on_sent = __bbr_on_sent,
+    .on_ack = __bbr_on_ack,
+    .on_loss = __bbr_on_loss,
+    .on_persistent_congestion = __bbr_on_persistent_congestion,
+    .on_pto = __bbr_on_pto,
+    .on_ack_end = __bbr_on_ack_end
 };
 
 /* ---- Pacing ---- */
@@ -275,6 +777,12 @@ void quicpacer_init(quicpacer_t* pacer, const quiccc_t* cc, int enabled) {
  * N = 1.25 in congestion avoidance and 2 in slow start. Expressed as a rate,
  * that is N * cwnd / smoothed_rtt bytes per second. */
 static uint64_t __rate_bytes_per_sec(const quiccc_t* cc, uint64_t rtt_us) {
+    /* A rate-based controller has already answered this, from a measurement
+     * rather than from its own window. Deriving a second rate from cwnd here
+     * would quietly overrule it -- and cwnd, for BBR, is a safety bound that is
+     * deliberately larger than the rate it intends to send at. */
+    if (cc->pacing_rate != 0) return cc->pacing_rate;
+
     if (rtt_us == 0) return UINT64_MAX;
 
     const uint64_t numerator = quiccc_in_slow_start(cc) ? 200 : 125;

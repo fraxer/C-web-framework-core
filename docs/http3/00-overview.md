@@ -165,7 +165,7 @@ fork / BoringSSL) без изменений в транспорте. Свой TL
 | Возможность | Статус |
 |---|---|
 | QUIC v1, TLS 1.3, Retry, migration, loss recovery, pacing | Готово |
-| NewReno / CUBIC (`http3_cc`) | Готово |
+| NewReno / CUBIC / BBR (`http3_cc`) | Готово |
 | HTTP/3 server, Alt-Svc, graceful shutdown | Готово |
 | Soft reload с сохранением UDP socket/CID | Реализовано; production-статус ждёт integration-гейта с `SIGUSR1` |
 | Process connection/memory limits и process-wide rate buckets | Готово |
