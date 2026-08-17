@@ -380,6 +380,65 @@ TEST(test_qpack_encoder_outstanding_sections) {
     qpack_encoder_free(e);
 }
 
+TEST(test_qpack_encoder_cancellation_without_sections) {
+    TEST_SUITE("qpack dynamic encoder");
+
+    /* The asymmetry §4.4 draws, and the reason a browser reload used to kill the
+     * connection. §4.4.1 makes a Section Acknowledgment for a stream with
+     * nothing outstanding a connection error -- the decoder cannot have decoded
+     * a section that was never sent. §4.4.2 says nothing of the kind about
+     * Stream Cancellation, and Chrome announces one for every stream it resets
+     * as soon as a non-zero dynamic table is negotiated, whether or not the
+     * sections on that stream ever used the table. Hold F5 against a server with
+     * real latency and each cancelled request produced one of these. */
+
+    TEST_CASE("a cancellation for a stream with nothing outstanding is accepted");
+    qpack_encoder_t* e = qpack_encoder_create(128, 4);
+    size_t consumed = 0;
+
+    static const uint8_t cancel_unknown[] = { 0x50 };   /* 01ssssss, stream 16 */
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, cancel_unknown,
+                                                 sizeof cancel_unknown,
+                                                 &consumed) == QPACK_OK,
+                "no sections, no error");
+    TEST_ASSERT(consumed == sizeof cancel_unknown, "and the instruction is consumed");
+
+    /* Repeated, and mixed with a stream that does have a section: the encoder
+     * has to stay usable, because the reload that produced the first
+     * cancellation produces a dozen more. */
+    TEST_CASE("the encoder survives a run of them and still settles real sections");
+    e->insert_count = 2;
+    TEST_ASSERT(qpack_encoder_section_open(e, 4, 1) == QPACK_OK, "a real section");
+
+    for (int i = 0; i < 20; i++) {
+        static const uint8_t cancels[] = { 0x50, 0x54, 0x58 };
+        TEST_ASSERT(qpack_encoder_read_decoder_state(e, cancels, sizeof cancels,
+                                                     &consumed) == QPACK_OK,
+                    "cancellations for untracked streams");
+    }
+    TEST_ASSERT(e->section_count == 1, "the real section is untouched");
+
+    static const uint8_t ack_four[] = { 0x84 };
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, ack_four, sizeof ack_four,
+                                                 &consumed) == QPACK_OK,
+                "the real section still acknowledges");
+    TEST_ASSERT(e->section_count == 0, "and is released");
+
+    /* §2.1.4: the acknowledgment also proves the decoder holds insertion 1. */
+    TEST_ASSERT(e->known_received_count == 1,
+                "Known Received Count follows the acknowledged Required Insert Count");
+    qpack_encoder_free(e);
+
+    TEST_CASE("an acknowledgment still may not name an unknown stream");
+    /* The other half of the split: loosening cancellation must not loosen this,
+     * or §4.4.1 stops being enforced at all. */
+    e = qpack_encoder_create(128, 4);
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, ack_four, sizeof ack_four,
+                                                 &consumed)
+                    == QPACK_ERR_DECODER_STREAM, "unknown acknowledgment rejected");
+    qpack_encoder_free(e);
+}
+
 TEST(test_qpack_encoder_safe_eviction) {
     TEST_SUITE("qpack dynamic encoder");
     qpack_encoder_t* e = qpack_encoder_create(80, 4);

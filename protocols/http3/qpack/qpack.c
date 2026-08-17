@@ -348,15 +348,47 @@ qpack_status_e qpack_encoder_read_decoder_state(qpack_encoder_t* e,
                                                 (octet & 0x80) ? 7 : 6,
                                                 &stream_id);
             if (n == 0) break;
-            size_t found = e->section_count;
-            for (size_t i = 0; i < e->section_count; i++)
-                if (e->sections[i].stream_id == stream_id) { found = i; break; }
-            if (found == e->section_count) return QPACK_ERR_DECODER_STREAM;
             if ((octet & 0x80) != 0) {
+                /* Section Acknowledgment (§4.4.1). Sections of one stream are
+                 * acknowledged in the order they were sent, so the earliest
+                 * outstanding one is the section being settled. Naming a stream
+                 * with nothing outstanding is the one case §4.4.1 makes a
+                 * connection error: the decoder cannot have decoded a section
+                 * this encoder never sent. */
+                size_t found = e->section_count;
+                for (size_t i = 0; i < e->section_count; i++)
+                    if (e->sections[i].stream_id == stream_id) { found = i; break; }
+                if (found == e->section_count) return QPACK_ERR_DECODER_STREAM;
+
+                /* §2.1.4: an acknowledged section proves the decoder holds every
+                 * insertion that section referenced, so the Known Received Count
+                 * moves up to its Required Insert Count. Without this the count
+                 * advanced only on Insert Count Increment, and entries the peer
+                 * demonstrably had still counted as unacknowledged -- which is
+                 * what decides whether a stream would block. */
+                const uint64_t ric = e->sections[found].required_insert_count;
+                if (ric > e->known_received_count) e->known_received_count = ric;
+
                 memmove(e->sections + found, e->sections + found + 1,
                         (e->section_count - found - 1) * sizeof *e->sections);
                 e->section_count--;
             } else {
+                /* Stream Cancellation (§4.4.2). Deliberately NOT an error when
+                 * the stream has nothing outstanding, and this is the whole
+                 * point of the split: §4.4.2 states no such requirement, and a
+                 * decoder is entitled to announce a cancellation for any stream
+                 * it resets. Chrome does exactly that for *every* reset stream
+                 * once a non-zero dynamic table is negotiated, without checking
+                 * whether the sections it saw needed the table.
+                 *
+                 * Treating that as fatal is what turned an ordinary reload into
+                 * a dropped connection: hold F5 and the browser resets the
+                 * requests still in flight (a favicon, a prefetch), sends a
+                 * cancellation for each, and the connection died with
+                 * QPACK_DECODER_STREAM_ERROR. Chrome then marks the alternative
+                 * service broken and stops offering h3 for hours. It reproduced
+                 * only against a server with real latency -- on loopback the
+                 * responses finish before there is anything left to cancel. */
                 for (size_t i = 0; i < e->section_count; ) {
                     if (e->sections[i].stream_id != stream_id) { i++; continue; }
                     memmove(e->sections + i, e->sections + i + 1,
