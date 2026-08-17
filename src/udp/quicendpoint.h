@@ -225,6 +225,23 @@ typedef struct quicendpoint {
  * units the config uses, so the conversion happens once, here. */
 typedef struct {
     uint64_t idle_timeout_ms;
+    /* How long a connection may stay silent before we send an ack-eliciting
+     * PING to keep it alive (RFC 9000 §10.1.2). Zero -- the default -- means the
+     * server never does this, and a quiet connection dies at its idle timeout.
+     *
+     * Off by default because the cost is a connection that outlives its useful
+     * life: the effective idle timeout is the *smaller* of the two ends'
+     * (Chrome offers 30 s), so without keep-alive a paused tab loses its QUIC
+     * connection and the next navigation pays a fresh handshake -- and every
+     * handshake is another chance for the browser to mark h3 broken. With
+     * keep-alive it survives, but so does its memory, for as long as the peer
+     * answers. Which of the two an operator wants depends on their traffic, so
+     * neither is imposed.
+     *
+     * Safe in one direction by construction: only *received* bytes count as
+     * activity (quicconn.c, __touch), so pinging a peer that has gone away
+     * cannot keep the connection open -- our idle timer runs out regardless. */
+    uint64_t keepalive_ms;
     uint64_t max_udp_payload_size;
     uint64_t initial_max_data;
     uint64_t initial_max_stream_data;

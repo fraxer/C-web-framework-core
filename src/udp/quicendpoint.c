@@ -397,6 +397,17 @@ static int __conn_policy_parse(const env_t* source, quic_conn_policy_t* next) {
                       1, 3600, &idle_timeout_sec)) return 0;
     p->idle_timeout_ms = idle_timeout_sec * 1000;
 
+    /* Keep-alive (§10.1.2). Zero disables it, which is the default. The ceiling
+     * is the idle timeout itself rather than half of it: the connection clamps
+     * the interval to half of whatever timeout it ends up *negotiating* (which
+     * is the smaller of the two ends and therefore not known here), so refusing
+     * a larger value at startup would reject a setting that is perfectly
+     * sensible against a peer offering a longer timeout than ours. */
+    uint64_t keepalive_sec = 0;
+    if (!__policy_u64(source, "http3_keepalive_sec", 0, 0, 3600,
+                      &keepalive_sec)) return 0;
+    p->keepalive_ms = keepalive_sec * 1000;
+
     /* The floor is §14's minimum; the ceiling is the packet buffer quicconn
      * builds into, and advertising more than that would promise room the code
      * does not have. */

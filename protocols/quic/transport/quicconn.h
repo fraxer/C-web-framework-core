@@ -293,6 +293,32 @@ typedef struct quicconn {
     uint64_t last_activity_us;
     uint64_t close_deadline_us;
 
+    /* Keep-alive (§10.1.2). `keepalive_us` is the configured interval already
+     * clamped to half the *negotiated* idle timeout -- half, because the PING
+     * has to reach the peer and be acknowledged before the shorter of the two
+     * timers expires, and one interval of headroom is what pays for a lost
+     * probe. Zero means the feature is off, which is the default.
+     *
+     * `keepalive_pending` is the flag the timer raises and the packet builder
+     * clears, in the same shape as `pto_probes` next door -- deliberately not
+     * that field, so that a keep-alive never looks like loss recovery in the
+     * metrics or moves the PTO backoff.
+     *
+     * The timer does not check the flag before raising it: a probe the builder
+     * could not fit has to be asked for again, and `keepalive_next_us` is what
+     * keeps that retry to one per interval. An earlier version skipped the
+     * raise while the flag was set, and a probe that was never built then
+     * stopped the schedule dead -- caught by disabling the builder branch and
+     * watching the *other* case fail. */
+    uint64_t keepalive_conf_us;   /* what the policy asked for, unclamped */
+    uint64_t keepalive_us;        /* what this connection will use */
+    /* Earliest time another probe may be raised. Needed because `last_activity`
+     * only moves on *receive*: a probe that goes unanswered leaves the timer
+     * expired, and without this the tick would raise a fresh PING on every pass
+     * instead of once per interval. */
+    uint64_t keepalive_next_us;
+    int      keepalive_pending;
+
     /* ---- What this connection cost the endpoint (docs/http3/08 §7b) ---- *
      *
      * When it started, and what the kernel's receive-overflow counter stood at
@@ -429,6 +455,18 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us);
  * endpoint's leaf lock. Declared taking connection_t* so the epoll layer can
  * call it without knowing what a quicconn_t is. */
 void quicconn_want_write(connection_t* connection);
+
+/* The keep-alive interval a connection will use, given what the policy asked
+ * for and the idle timeout that was negotiated (§10.1.2). Zero configured means
+ * zero -- the feature is off. Otherwise the interval is at most half the idle
+ * timeout, because the PING must be sent *and answered* before the shorter of
+ * the two ends' timers expires, and never below one second.
+ *
+ * Exposed as a pure function so the rule can be tested apart from a connection:
+ * the interesting cases are arithmetic (a configured value larger than the
+ * negotiated timeout is the one that matters, and it is the peer that chooses
+ * that timeout), and reaching them through a handshake would prove less. */
+uint64_t quicconn_keepalive_interval(uint64_t configured_us, uint64_t idle_us);
 
 /* Timer work: idle timeout, loss detection, the close and drain periods.
  * Returns 0 when the connection has expired and must be freed. */

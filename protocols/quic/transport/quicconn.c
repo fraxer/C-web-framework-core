@@ -50,6 +50,36 @@ static quicconn_t* __conn_of(connection_t* connection) {
     return (quicconn_t*)connection;
 }
 
+/* The keep-alive interval this connection will actually use: what the operator
+ * configured, but never more than half the negotiated idle timeout (§10.1.2).
+ * Called both at accept and again when the peer's parameters arrive, because the
+ * peer may hand us a shorter timeout than our own -- Chrome offers 30 s -- and
+ * an interval computed against ours alone would then be useless: the PING would
+ * be sent after the connection had already died at the other end.
+ *
+ * The floor is one second: an interval below that turns a quiet connection into
+ * a packet generator, and nothing about §10.1.2 asks for it. */
+uint64_t quicconn_keepalive_interval(uint64_t configured_us, uint64_t idle_us) {
+    if (configured_us == 0) return 0;
+
+    /* No negotiated timeout means nothing to outrun, so the configured value
+     * stands as it is. */
+    uint64_t interval = configured_us;
+    if (idle_us > 0 && idle_us / 2 < interval) interval = idle_us / 2;
+
+    /* One second, whatever the arithmetic says. An idle timeout of a second or
+     * two would otherwise produce sub-second pinging, and a connection that
+     * cannot survive that gap is not worth the traffic. */
+    if (interval < 1000000) interval = 1000000;
+
+    return interval;
+}
+
+static void __keepalive_recompute(quicconn_t* conn) {
+    conn->keepalive_us = quicconn_keepalive_interval(conn->keepalive_conf_us,
+                                                     conn->idle_timeout_us);
+}
+
 static void __touch(quicconn_t* conn, uint64_t now_us) {
     /* Only bytes *received* count as activity: a server talking to a peer that
      * has gone away must still time out, so our own sends cannot keep the
@@ -440,6 +470,10 @@ static int __on_peer_params(void* ctx, const quictp_t* params) {
         if (conn->idle_timeout_us == 0 || peer_us < conn->idle_timeout_us)
             conn->idle_timeout_us = peer_us;
     }
+
+    /* The negotiated timeout is only known now, and the keep-alive interval is
+     * measured against it. */
+    __keepalive_recompute(conn);
 
     return 1;
 }
@@ -2011,6 +2045,26 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
         }
     }
 
+    /* A keep-alive probe (§10.1.2). Its own branch rather than a second reason
+     * to set `pto_probes`: this is not loss recovery, and counting it there
+     * would move the PTO backoff and report a healthy connection as one that
+     * keeps timing out. Like the probe above, it rides along with whatever else
+     * the packet carries -- if anything else is being sent, the PING is a spare
+     * frame, and if not, it is the whole packet. */
+    if (conn->keepalive_pending && level == QUIC_ENC_APP && p + 8 < payload_cap) {
+        quicframe_t f;
+        memset(&f, 0, sizeof f);
+        f.type = QUIC_FRAME_PING;
+
+        const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
+        if (n > 0) {
+            p += n;
+            ack_eliciting = 1;
+            conn->keepalive_pending = 0;
+            metrics_quic(METRICS_QUIC_KEEPALIVE_SENT);
+        }
+    }
+
     /* A pending PATH_RESPONSE next, ahead of everything that may be deferred:
      * §8.2.2 forbids delaying the packet that carries it for any reason but
      * congestion control. Only in the application space -- the peer cannot
@@ -3166,6 +3220,9 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
 
     conn->idle_timeout_us = conn->local_params.max_idle_timeout * 1000;
 
+    conn->keepalive_conf_us = policy->keepalive_ms * 1000;
+    __keepalive_recompute(conn);
+
     quicflow_init_recv(&conn->recv_flow, conn->local_params.initial_max_data,
                        policy->recv_window_max);
     quicflow_init_send(&conn->send_flow, 0);
@@ -3420,6 +3477,21 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
         return 0;
     }
 
+    /* §10.1.2: hold a quiet connection open by asking the peer to acknowledge
+     * something. Only in ACTIVE -- during the handshake there is always
+     * something in flight, and loss recovery owns that case.
+     *
+     * The interval is measured from the last packet *received*, so an active
+     * connection never gets one of these: any traffic at all pushes the
+     * deadline out. */
+    if (conn->state == QUICCONN_ACTIVE && conn->keepalive_us > 0 &&
+        now_us >= conn->last_activity_us + conn->keepalive_us &&
+        now_us >= conn->keepalive_next_us) {
+        conn->keepalive_pending = 1;
+        conn->keepalive_next_us = now_us + conn->keepalive_us;
+        atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+    }
+
     /* Repeat or abandon an outstanding path validation (§8.2.4). Abandoning is
      * not an error: the connection carries on where it was, which is exactly
      * what should happen when a spoofed address, or a NAT that closed again,
@@ -3563,6 +3635,15 @@ uint64_t quicconn_next_timeout(const quicconn_t* conn) {
     const uint64_t pmtu_deadline = quicpmtud_deadline(&conn->pmtud);
     if (pmtu_deadline != 0 && (earliest == 0 || pmtu_deadline < earliest))
         earliest = pmtu_deadline;
+
+    /* The keep-alive deadline, or the timer never fires: the endpoint arms its
+     * timerfd from this function, and a connection with nothing else pending is
+     * exactly the connection a keep-alive exists for. */
+    if (conn->keepalive_us > 0 && conn->state == QUICCONN_ACTIVE) {
+        uint64_t keepalive = conn->last_activity_us + conn->keepalive_us;
+        if (keepalive < conn->keepalive_next_us) keepalive = conn->keepalive_next_us;
+        if (earliest == 0 || keepalive < earliest) earliest = keepalive;
+    }
 
     return earliest;
 }

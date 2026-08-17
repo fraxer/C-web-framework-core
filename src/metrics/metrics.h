@@ -192,6 +192,14 @@ typedef enum {
      * leaves the connection stalled exactly as if nothing had fired, and the
      * first counter alone cannot tell the two apart (docs/http3/08 §2). */
     METRICS_QUIC_PTO_PROBE_SENT,
+    /* Keep-alive PINGs sent (§10.1.2, http3_keepalive_sec). Worth its own
+     * counter next to the PTO probes because the two look identical on the wire
+     * and mean opposite things: a probe says the path stopped answering, a
+     * keep-alive says nothing was happening and we chose to hold the connection
+     * open. Zero here while the key is set means the interval never elapses --
+     * either the connections are busy, or the clamp against the negotiated idle
+     * timeout pushed the interval past their lifetime. */
+    METRICS_QUIC_KEEPALIVE_SENT,
     METRICS_QUIC_PERSISTENT_CONGESTION,
 
     /* Why the send loop stopped short. Congestion is expected; the other two

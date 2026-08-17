@@ -1104,6 +1104,99 @@ TEST(test_quic_stand_idle_timeout) {
     __stand_free(s);
 }
 
+TEST(test_quic_keepalive_interval) {
+    TEST_SUITE("quic_stand");
+
+    /* The rule of §10.1.2, apart from a connection. Half the *negotiated*
+     * timeout is the ceiling, and the peer is what makes that interesting:
+     * Chrome offers 30 s, so a server configured for 60 s of quiet against its
+     * own 300 s timeout would otherwise ping long after the connection had
+     * died at the other end. */
+    TEST_CASE("the interval is clamped to half the negotiated idle timeout");
+    TEST_ASSERT(quicconn_keepalive_interval(0, 30000000) == 0, "off stays off");
+    TEST_ASSERT(quicconn_keepalive_interval(10000000, 30000000) == 10000000,
+                "a value under half the timeout is used as configured");
+    TEST_ASSERT(quicconn_keepalive_interval(60000000, 30000000) == 15000000,
+                "a value over it is clamped to half");
+    TEST_ASSERT(quicconn_keepalive_interval(60000000, 0) == 60000000,
+                "no negotiated timeout, nothing to clamp to");
+
+    TEST_CASE("and never drops below a second");
+    TEST_ASSERT(quicconn_keepalive_interval(1, 30000000) == 1000000, "tiny configured");
+    TEST_ASSERT(quicconn_keepalive_interval(10000000, 2000000) == 1000000,
+                "or a timeout so short that half of it would be sub-second");
+}
+
+TEST(test_quic_stand_keepalive) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("keep-alive holds a silent connection past its idle timeout");
+    stand_t* s = __stand_create(4);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    const uint64_t idle = s->conn->idle_timeout_us;
+    TEST_ASSERT(idle > 0, "an idle timeout was negotiated");
+
+    /* What the policy would have set at accept. Set here because the unit
+     * runner has no main.env, so http3_keepalive_sec is at its default of
+     * zero -- which is exactly what the case above this file's idle-timeout
+     * test proves still happens. */
+    s->conn->keepalive_conf_us = idle / 4;
+    s->conn->keepalive_us = quicconn_keepalive_interval(idle / 4, idle);
+    s->conn->keepalive_next_us = 0;
+
+    /* Three idle timeouts of complete application silence. Nothing but the
+     * keep-alive can carry this: only *received* bytes refresh the idle timer,
+     * and the client answers only what elicits an acknowledgment. */
+    const uint64_t started_at = __now_us;
+    const uint64_t delivered_before = s->delivered_to_client;
+
+    TEST_ASSERT(!__run(s, idle * 3, __conn_gone),
+                "still alive after three idle timeouts of silence");
+    TEST_REQUIRE_NOT_NULL(s->conn, "connection object intact");
+    TEST_ASSERT(s->conn->state == QUICCONN_ACTIVE, "and still active");
+
+    /* Both halves have to be asserted, and finding that out cost a control
+     * experiment: "the connection is alive" alone also passes when the stand's
+     * virtual clock never reached the timeout, which is precisely what happens
+     * if the probes stop being sent. So: the clock really advanced past three
+     * timeouts, and the client really received the packets that did it. */
+    TEST_ASSERT(__now_us - started_at >= idle * 3,
+                "the virtual clock really advanced three timeouts");
+    TEST_ASSERT(s->delivered_to_client - delivered_before >= 3,
+                "and the probes really reached the client");
+
+    __stand_free(s);
+
+    TEST_CASE("but a peer that has gone away still times out");
+    /* The property that makes this safe to switch on: pinging cannot keep a
+     * dead connection open, because our own sends never touch the idle timer
+     * (quicconn.c, __touch). Without that, a server with keep-alive on would
+     * accumulate connections for every client that vanished without closing. */
+    s = __stand_create(4);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    const uint64_t idle2 = s->conn->idle_timeout_us;
+    s->conn->keepalive_conf_us = idle2 / 4;
+    s->conn->keepalive_us = quicconn_keepalive_interval(idle2 / 4, idle2);
+    s->conn->keepalive_next_us = 0;
+
+    const uint64_t quiet_from = __now_us;
+    s->blackhole_to_server = 1;      /* the client's answers never arrive */
+
+    TEST_ASSERT(__run(s, idle2 * 2, __conn_gone),
+                "gone despite keep-alive, because nothing came back");
+    TEST_ASSERT(s->conn_gone_us - quiet_from >= idle2, "not one microsecond early");
+
+    __stand_free(s);
+}
+
 TEST(test_quic_stand_stream_under_loss) {
     TEST_SUITE("quic_stand");
 
