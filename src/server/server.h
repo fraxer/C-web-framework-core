@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <stdatomic.h>
 
+#include "ipaddr.h"
 #include "map.h"
 #include "redirect.h"
 #include "route.h"
@@ -79,7 +80,12 @@ struct broadcast;
 typedef struct server {
     unsigned short int port;
     size_t root_length;
-    in_addr_t ip;
+    /* The address this vhost is bound to, either family (misc/ipaddr.h). Also
+     * the address of its HTTP/3 endpoint: one `ip` per vhost, two transports on
+     * it. A vhost that should answer on both families is two vhost entries, the
+     * same as two IPv4 addresses have always been -- IPv6 sockets here are
+     * v6-only on purpose (src/udp/udpsocket.h). */
+    ipaddr_t ip;
     server_http_t http;
     server_websockets_t websockets;
     server_http3_t http3;

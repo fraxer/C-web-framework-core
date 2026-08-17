@@ -578,7 +578,7 @@ void websockets_queue_request_handler(void* arg) {
         return;
     }
 
-    if (!ratelimiter_allow(data->ratelimiter, connection->remote_ip, 1)) {
+    if (!ratelimiter_allow(data->ratelimiter, &connection->remote_ip, 1)) {
         websocketsresponse_default(response, "Too Many Requests");
         __publish(connection, data, response);
         return;

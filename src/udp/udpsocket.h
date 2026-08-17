@@ -12,10 +12,10 @@
  * local address of every datagram, batched receive, and the DF bit, none of
  * which the TCP path has any use for.
  *
- * Addresses are sockaddr_storage throughout. The rest of the framework is
- * AF_INET only (connection_t::ip is an in_addr_t), but QUIC has to carry a
- * local and a remote address per path and change them on migration, so
- * narrowing here would have to be undone in phase 4 (ADR-5). */
+ * Addresses are sockaddr_storage throughout, because QUIC has to carry a local
+ * and a remote address per path and change them on migration (ADR-5). That was
+ * once the only IPv6-capable layer in the framework; everything above it now
+ * carries an `ipaddr_t` (misc/ipaddr.h) rather than an IPv4 address. */
 
 typedef struct udp_socket_options {
     /* Several workers bind the same address; the kernel spreads datagrams by

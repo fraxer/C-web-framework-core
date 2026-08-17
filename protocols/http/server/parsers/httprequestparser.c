@@ -708,7 +708,7 @@ int httpparser_select_server(connection_t* connection, const char* host, size_t 
     while (item) {
         server_t* server = item->data;
 
-        if (server->ip == connection->ip && server->port == connection->port &&
+        if (ipaddr_equal(&server->ip, &connection->ip) && server->port == connection->port &&
             __server_matches_host(server, ascii_domain, ascii_length)) {
             ctx->server = server;
             free(ascii_domain);

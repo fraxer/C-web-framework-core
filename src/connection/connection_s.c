@@ -16,13 +16,16 @@ static connection_server_ctx_t* __ctx_create(listener_t* listener);
 static void __ctx_reset(void* arg);
 static void __ctx_free(void* arg);
 
-connection_t* connection_s_create(int fd, in_addr_t ip, unsigned short int port, connection_server_ctx_t* ctx, char* buffer, size_t buffer_size) {
+connection_t* connection_s_create(int fd, const ipaddr_t* ip, unsigned short int port, connection_server_ctx_t* ctx, char* buffer, size_t buffer_size) {
     connection_t* result = NULL;
-    struct sockaddr in_addr;
+    /* sockaddr_storage, not sockaddr: the latter is sixteen bytes, so an IPv6
+     * peer address arrived truncated -- with the port intact and the address
+     * cut in half, which is worse than not having it. */
+    struct sockaddr_storage in_addr;
     socklen_t in_len = sizeof(in_addr);
     connection_t* connection = NULL;
 
-    const int connfd = accept(fd, &in_addr, &in_len);
+    const int connfd = accept(fd, (struct sockaddr*)&in_addr, &in_len);
     if (connfd == -1)
         return NULL;
 
@@ -44,11 +47,15 @@ connection_t* connection_s_create(int fd, in_addr_t ip, unsigned short int port,
         goto failed;
     }
 
-    struct sockaddr_in* remote_addr = (struct sockaddr_in*)&in_addr;
-    in_addr_t remote_ip = remote_addr->sin_addr.s_addr;
-    unsigned short remote_port = ntohs(remote_addr->sin_port);
+    ipaddr_t remote_ip;
+    ipaddr_from_sockaddr(&remote_ip, (struct sockaddr*)&in_addr);
 
-    connection = connection_s_alloc(ctx->listener, connfd, ip, port, remote_ip, remote_port, buffer, buffer_size);
+    const unsigned short remote_port =
+        in_addr.ss_family == AF_INET6
+        ? ntohs(((struct sockaddr_in6*)&in_addr)->sin6_port)
+        : ntohs(((struct sockaddr_in*)&in_addr)->sin_port);
+
+    connection = connection_s_alloc(ctx->listener, connfd, ip, port, &remote_ip, remote_port, buffer, buffer_size);
     if (connection == NULL) goto failed;
 
     connection->close = connection_close;
@@ -64,7 +71,7 @@ connection_t* connection_s_create(int fd, in_addr_t ip, unsigned short int port,
     return result;
 }
 
-int connection_s_init(connection_t* connection, listener_t* listener, int fd, in_addr_t ip, unsigned short int port, in_addr_t remote_ip, unsigned short int remote_port, char* buffer, size_t buffer_size) {
+int connection_s_init(connection_t* connection, listener_t* listener, int fd, const ipaddr_t* ip, unsigned short int port, const ipaddr_t* remote_ip, unsigned short int remote_port, char* buffer, size_t buffer_size) {
     if (connection == NULL) return 0;
 
     connection_server_ctx_t* ctx = __ctx_create(listener);
@@ -72,9 +79,11 @@ int connection_s_init(connection_t* connection, listener_t* listener, int fd, in
 
     connection->fd = fd;
     connection->keepalive = 0;
-    connection->ip = ip;
+    memset(&connection->ip, 0, sizeof connection->ip);
+    memset(&connection->remote_ip, 0, sizeof connection->remote_ip);
+    if (ip != NULL) connection->ip = *ip;
+    if (remote_ip != NULL) connection->remote_ip = *remote_ip;
     connection->port = port;
-    connection->remote_ip = remote_ip;
     connection->remote_port = remote_port;
     connection->ctx = ctx;
     connection->ssl = NULL;
@@ -91,7 +100,7 @@ int connection_s_init(connection_t* connection, listener_t* listener, int fd, in
     return 1;
 }
 
-connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, unsigned short int port, in_addr_t remote_ip, unsigned short int remote_port, char* buffer, size_t buffer_size) {
+connection_t* connection_s_alloc(listener_t* listener, int fd, const ipaddr_t* ip, unsigned short int port, const ipaddr_t* remote_ip, unsigned short int remote_port, char* buffer, size_t buffer_size) {
     connection_t* connection = malloc(sizeof * connection);
     if (connection == NULL) return NULL;
 
@@ -105,7 +114,8 @@ connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, uns
 }
 
 connection_t* connection_s_create_local(server_t* server) {
-    connection_t* connection = connection_s_alloc(NULL, -1, inet_addr("127.0.0.1"), server->port, inet_addr("127.0.0.1"), server->port, NULL, 0);
+    const ipaddr_t loopback = ipaddr_from_v4(inet_addr("127.0.0.1"));
+    connection_t* connection = connection_s_alloc(NULL, -1, &loopback, server->port, &loopback, server->port, NULL, 0);
     if (connection == NULL) return NULL;
 
     connection_server_ctx_t* ctx = connection->ctx;

@@ -74,11 +74,21 @@ uint64_t ratelimiter_get_time_ns(void) {
 // =============================================================================
 
 static int compare_ip(const void* a, const void* b) {
-    in_addr_t ip_a = (in_addr_t)(uintptr_t)a;
-    in_addr_t ip_b = (in_addr_t)(uintptr_t)b;
-    if (ip_a < ip_b) return -1;
-    if (ip_a > ip_b) return 1;
+    uintptr_t key_a = (uintptr_t)a;
+    uintptr_t key_b = (uintptr_t)b;
+    if (key_a < key_b) return -1;
+    if (key_a > key_b) return 1;
     return 0;
+}
+
+/* Ключ клиента в том виде, в котором его хранит map_t (void*).
+ *
+ * На 64-битной цели это сам ключ; на 32-битной он складывается пополам, потому
+ * что map_t хранит ключ в указателе, а молчаливое усечение старших бит свело бы
+ * все IPv6-префиксы вида X:0:0:0 к одному bucket. */
+static uintptr_t bucket_key(uint64_t key) {
+    if (sizeof(uintptr_t) >= sizeof(uint64_t)) return (uintptr_t)key;
+    return (uintptr_t)(key ^ (key >> 32));
 }
 
 static void bucket_free_fn(void* data) {
@@ -89,11 +99,11 @@ static void bucket_free_fn(void* data) {
 // Bucket operations
 // =============================================================================
 
-static ratelimiter_bucket_t* bucket_create(in_addr_t ip, uint32_t initial_tokens) {
+static ratelimiter_bucket_t* bucket_create(uint64_t key, uint32_t initial_tokens) {
     ratelimiter_bucket_t* bucket = malloc(sizeof(ratelimiter_bucket_t));
     if (!bucket) return NULL;
 
-    bucket->ip = ip;
+    bucket->key = key;
     atomic_init(&bucket->tokens, initial_tokens);
     atomic_init(&bucket->last_refill_ns, ratelimiter_get_time_ns());
     atomic_init(&bucket->last_access_ns, ratelimiter_get_time_ns());
@@ -126,22 +136,22 @@ static void bucket_refill(ratelimiter_bucket_t* bucket, ratelimiter_config_t* co
 // Lock-free find with seqlock
 // =============================================================================
 
-static ratelimiter_bucket_t* find_bucket_lockfree(ratelimiter_t* limiter, in_addr_t ip) {
+static ratelimiter_bucket_t* find_bucket_lockfree(ratelimiter_t* limiter, uint64_t key) {
     ratelimiter_bucket_t* bucket;
     uint64_t seq;
 
     do {
         seq = seqlock_read_begin(&limiter->seqlock);
-        bucket = map_find(limiter->buckets, (void*)(uintptr_t)ip);
+        bucket = map_find(limiter->buckets, (void*)bucket_key(key));
     } while (seqlock_read_retry(&limiter->seqlock, seq));
 
     return bucket;
 }
 
-// Найти или создать bucket для IP
-static ratelimiter_bucket_t* find_or_create_bucket(ratelimiter_t* limiter, in_addr_t ip) {
+// Найти или создать bucket для клиента
+static ratelimiter_bucket_t* find_or_create_bucket(ratelimiter_t* limiter, uint64_t key) {
     // Сначала пробуем найти lock-free
-    ratelimiter_bucket_t* bucket = find_bucket_lockfree(limiter, ip);
+    ratelimiter_bucket_t* bucket = find_bucket_lockfree(limiter, key);
     if (bucket) {
         return bucket;
     }
@@ -150,16 +160,16 @@ static ratelimiter_bucket_t* find_or_create_bucket(ratelimiter_t* limiter, in_ad
     seqlock_write_lock(&limiter->seqlock);
 
     // Повторная проверка (другой поток мог создать)
-    bucket = map_find(limiter->buckets, (void*)(uintptr_t)ip);
+    bucket = map_find(limiter->buckets, (void*)bucket_key(key));
     if (bucket) {
         seqlock_write_unlock(&limiter->seqlock);
         return bucket;
     }
 
     // Создание нового bucket
-    bucket = bucket_create(ip, limiter->config.max_tokens);
+    bucket = bucket_create(key, limiter->config.max_tokens);
     if (bucket) {
-        map_insert(limiter->buckets, (void*)(uintptr_t)ip, bucket);
+        map_insert(limiter->buckets, (void*)bucket_key(key), bucket);
     }
 
     seqlock_write_unlock(&limiter->seqlock);
@@ -199,22 +209,22 @@ static void cleanup_old_buckets(ratelimiter_t* limiter) {
     }
 
     if (to_delete_count > 0) {
-        in_addr_t* ips_to_delete = malloc(to_delete_count * sizeof(in_addr_t));
-        if (ips_to_delete) {
+        uint64_t* keys_to_delete = malloc(to_delete_count * sizeof(uint64_t));
+        if (keys_to_delete) {
             size_t idx = 0;
             for (map_iterator_t it = map_begin(limiter->buckets); map_iterator_valid(it); it = map_next(it)) {
                 ratelimiter_bucket_t* bucket = map_iterator_value(it);
                 uint64_t last_access = atomic_load(&bucket->last_access_ns);
                 if (now - last_access > cleanup_interval_ns) {
-                    ips_to_delete[idx++] = bucket->ip;
+                    keys_to_delete[idx++] = bucket->key;
                 }
             }
 
             for (size_t i = 0; i < to_delete_count; i++) {
-                map_erase(limiter->buckets, (void*)(uintptr_t)ips_to_delete[i]);
+                map_erase(limiter->buckets, (void*)bucket_key(keys_to_delete[i]));
             }
 
-            free(ips_to_delete);
+            free(keys_to_delete);
         }
     }
 
@@ -252,7 +262,7 @@ void ratelimiter_free(ratelimiter_t* limiter) {
     free(limiter);
 }
 
-int ratelimiter_allow(ratelimiter_t* limiter, in_addr_t ip, uint32_t tokens_required) {
+int ratelimiter_allow(ratelimiter_t* limiter, const ipaddr_t* ip, uint32_t tokens_required) {
     if (!limiter) return 1;
 
     cleanup_old_buckets(limiter);
@@ -260,7 +270,7 @@ int ratelimiter_allow(ratelimiter_t* limiter, in_addr_t ip, uint32_t tokens_requ
     if (limiter->config.refill_rate == 0)
         return 1;
 
-    ratelimiter_bucket_t* bucket = find_or_create_bucket(limiter, ip);
+    ratelimiter_bucket_t* bucket = find_or_create_bucket(limiter, ipaddr_client_key(ip));
     if (!bucket) {
         log_error("Failed to create rate limiter bucket");
         return 1;

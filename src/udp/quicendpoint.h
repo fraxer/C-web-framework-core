@@ -7,6 +7,7 @@
 #include "connection_s.h"
 #include "multiplexing.h"
 #include "quiccidtable.h"
+#include "ipaddr.h"
 #include "quiccc.h"
 #include "server.h"
 #include "udpsocket.h"
@@ -389,8 +390,10 @@ void quicendpoint_recv_gap_reset(quicendpoint_t* endpoint);
  * A QUIC connection needs these because they are what selects the virtual
  * server: httpparser_select_server matches a vhost by (ip, port), and a
  * connection reporting 0/0 -- which is what it did before there was anywhere
- * to get them from -- matches nothing at all. */
-in_addr_t quicendpoint_ip(quicendpoint_t* endpoint);
+ * to get them from -- matches nothing at all. Either family: an IPv6 endpoint
+ * used to report the unset address here, which is why it could never have
+ * served a request even once it bound. */
+ipaddr_t quicendpoint_ip(quicendpoint_t* endpoint);
 unsigned short quicendpoint_port(quicendpoint_t* endpoint);
 
 /* Register one more connection id for a connection that already exists, and

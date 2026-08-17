@@ -33,9 +33,17 @@ typedef struct connection {
 
     SSL* ssl;
     SSL_CTX* ssl_ctx;
-    in_addr_t ip;
+    /* Local and peer address, either family (misc/ipaddr.h). `ip`/`port` are the
+     * address this connection was accepted on -- which is what selects the
+     * virtual server (httpparser_select_server) -- and for a client connection
+     * the address being connected to. `remote_ip`/`remote_port` are the peer,
+     * read by the rate limiter.
+     *
+     * These were `in_addr_t` until IPv6 arrived, and a QUIC connection over IPv6
+     * had to report 0.0.0.0 here, which matched no vhost at all. */
+    ipaddr_t ip;
     unsigned short int port;
-    in_addr_t remote_ip;
+    ipaddr_t remote_ip;
     unsigned short int remote_port;
     unsigned keepalive: 1;
     unsigned transport: 1;   /* connection_transport_e */

@@ -1160,20 +1160,27 @@ void quicendpoint_recv_gap_reset(quicendpoint_t* endpoint) {
     endpoint->rx_dwell_count = 0;
 }
 
-in_addr_t quicendpoint_ip(quicendpoint_t* endpoint) {
-    if (endpoint == NULL || endpoint->local.ss_family != AF_INET) return 0;
+ipaddr_t quicendpoint_ip(quicendpoint_t* endpoint) {
+    ipaddr_t out;
 
-    const struct sockaddr_in* in = (const struct sockaddr_in*)&endpoint->local;
+    memset(&out, 0, sizeof out);
 
-    return in->sin_addr.s_addr;
+    if (endpoint != NULL)
+        ipaddr_from_sockaddr(&out, (const struct sockaddr*)&endpoint->local);
+
+    return out;
 }
 
 unsigned short quicendpoint_port(quicendpoint_t* endpoint) {
-    if (endpoint == NULL || endpoint->local.ss_family != AF_INET) return 0;
+    if (endpoint == NULL) return 0;
 
-    const struct sockaddr_in* in = (const struct sockaddr_in*)&endpoint->local;
+    if (endpoint->local.ss_family == AF_INET)
+        return ntohs(((const struct sockaddr_in*)&endpoint->local)->sin_port);
 
-    return ntohs(in->sin_port);
+    if (endpoint->local.ss_family == AF_INET6)
+        return ntohs(((const struct sockaddr_in6*)&endpoint->local)->sin6_port);
+
+    return 0;
 }
 
 void quicendpoint_detach(quicendpoint_t* endpoint, quicconn_t* conn) {
@@ -2182,13 +2189,13 @@ static int __endpoint_close(connection_t* connection) {
 
 /* ---- Lifecycle ---- */
 
-static quicendpoint_t* __endpoint_get(quicendpoint_t* endpoints, in_addr_t ip,
+static quicendpoint_t* __endpoint_get(quicendpoint_t* endpoints, const ipaddr_t* ip,
                                       unsigned short int port) {
     while (endpoints != NULL) {
-        const struct sockaddr_in* sa = (const struct sockaddr_in*)&endpoints->local;
+        const ipaddr_t local = quicendpoint_ip(endpoints);
 
-        if (sa->sin_family == AF_INET && sa->sin_addr.s_addr == ip &&
-            ntohs(sa->sin_port) == port)
+        if (ipaddr_is_set(&local) && ipaddr_equal(&local, ip) &&
+            quicendpoint_port(endpoints) == port)
             return endpoints;
 
         endpoints = endpoints->next;
@@ -2282,11 +2289,11 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server,
 
     int result = 0;
 
-    struct sockaddr_in* sa = (struct sockaddr_in*)&ep->local;
-    sa->sin_family = AF_INET;
-    sa->sin_addr.s_addr = server->ip;
-    sa->sin_port = htons(server->http3.port);
-    ep->local_len = sizeof(struct sockaddr_in);
+    /* Either family, from the vhost's configured address: the UDP layer has
+     * been sockaddr_storage since phase 1 (ADR-5), and this is the one place
+     * that used to narrow it to IPv4. */
+    ep->local_len = ipaddr_to_sockaddr(&server->ip, server->http3.port, &ep->local);
+    if (ep->local_len == 0) goto failed;
 
     const udp_socket_options_t options = {
         .reuseport = 1,
@@ -2313,8 +2320,8 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server,
 
     /* The endpoint's own connection carries no buffer: datagrams live in the
      * batch, not in the shared per-worker scratch that TCP connections use. */
-    connection_t* connection = connection_s_alloc(&ep->listener, ep->fd, server->ip,
-                                                  server->http3.port, server->ip,
+    connection_t* connection = connection_s_alloc(&ep->listener, ep->fd, &server->ip,
+                                                  server->http3.port, &server->ip,
                                                   server->http3.port, NULL, 0);
     if (connection == NULL) goto failed;
 
@@ -2332,8 +2339,8 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server,
     if (ep->timerfd == -1) goto failed;
 
     ep->timer_connection = connection_s_alloc(&ep->listener, ep->timerfd,
-                                              server->ip, server->http3.port,
-                                              server->ip, server->http3.port, NULL, 0);
+                                              &server->ip, server->http3.port,
+                                              &server->ip, server->http3.port, NULL, 0);
     if (ep->timer_connection == NULL) goto failed;
 
     ep->timer_connection->read = __endpoint_timer_read;
@@ -2344,8 +2351,8 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server,
     if (ep->eventfd == -1) goto failed;
 
     ep->wake_connection = connection_s_alloc(&ep->listener, ep->eventfd,
-                                             server->ip, server->http3.port,
-                                             server->ip, server->http3.port, NULL, 0);
+                                             &server->ip, server->http3.port,
+                                             &server->ip, server->http3.port, NULL, 0);
     if (ep->wake_connection == NULL) goto failed;
 
     ep->wake_connection->read = __endpoint_wake_read;
@@ -2391,7 +2398,7 @@ quicendpoint_t* quicendpoints_create(mpxapi_t* api, server_t* first_server,
 
         /* Several vhosts on one address share one endpoint, exactly as they
          * share one TCP listener; SNI picks the vhost inside the handshake. */
-        quicendpoint_t* existing = __endpoint_get(head, server->ip, server->http3.port);
+        quicendpoint_t* existing = __endpoint_get(head, &server->ip, server->http3.port);
         if (existing != NULL) {
             if (!cqueue_append(&existing->listener.servers, server)) {
                 if (ok != NULL) *ok = 0;
@@ -2402,8 +2409,10 @@ quicendpoint_t* quicendpoints_create(mpxapi_t* api, server_t* first_server,
 
         quicendpoint_t* ep = __endpoint_create(api, server, generation);
         if (ep == NULL) {
-            log_error("Quic endpoint: cannot create endpoint on udp port %d\n",
-                      server->http3.port);
+            char authority[IPADDR_AUTHORITY_STRLEN];
+            log_error("Quic endpoint: cannot create endpoint on udp %s\n",
+                      ipaddr_authority(&server->ip, server->http3.port,
+                                       authority, sizeof authority));
             if (ok != NULL) *ok = 0;
             goto failed;
         }

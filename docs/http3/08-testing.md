@@ -3230,7 +3230,7 @@ docker run -d --name hap --network host --ulimit nofile=65536:65536 \
 7. quic-interop-runner против 3–4 клиентов (полная матрица — по расписанию,
    она долгая).
 
-### 8a. Сделано: `tests/ci.sh` (обновлено 2026-08-15)
+### 8a. Сделано: `tests/ci.sh` (обновлено 2026-08-17)
 
 **«Добавить в существующий прогон» упиралось в то, что прогона нет:** в
 репозитории нет ни GitHub Actions, ни GitLab CI, ни чего-либо ещё, и выбор CI —
@@ -3245,6 +3245,7 @@ tests/ci.sh limits               # connection/memory exhaustion и drain
 SOAK_REQUESTS=10000 tests/ci.sh soak
 tests/ci.sh earlydata            # 0-RTT: приём, счётчики и анти-повтор
 tests/ci.sh vn                   # неизвестная версия QUIC: ответ, молчание, лимит
+tests/ci.sh ipv6                 # vhost на ::1 отдаёт h1.1/h2/h3, отдельно от IPv4
 tests/ci.sh priority             # приоритеты RFC 9218 и цена их отсутствия
 BENCH_RECORD=/var/lib/cwfr/h3-baseline.json tests/ci.sh benchmark
 BENCH_BASELINE=/var/lib/cwfr/h3-baseline.json tests/ci.sh benchmark
@@ -3262,6 +3263,7 @@ REQUIRE_H3SPEC=1 tests/ci.sh h3spec  # только обязательный h3s
 | `soak` | 1000 запросов обычно, 10000 в release; loss/reorder/dup, migration, drain gauges и RSS около прогретого baseline | 7 |
 | `earlydata` | 0-RTT: запрос едет в early data и обслуживается, счётчики `early_data.*` растут, флайт с незавершённым рукопожатием **не** доходит до диспетчера (`http3.requests` не растёт), и без ключа early data отвергается | 1–3 |
 | `vn` | датаграмма 1200 байт с версией QUIC v2 получает Version Negotiation (v1 + резервная версия, cid'ы переставлены, ответ меньше запроса, сама v2 не предлагается); на 1199 байт сервер молчит; v1 не получает VN; `http3_version_negotiation_rate` ограничивает поток | 1–3, 7 |
+| `ipv6` | vhost на `::1`: h1.1, h2 и h3 отдают именно его root (то есть выбор vhost сработал по адресу); `quic.handshakes_completed` на сервере подтверждает IPv6-рукопожатие независимо от отчёта клиента; миграция по IPv6; IPv4-vhost на **том же номере порта** продолжает отдавать свой root по TCP и по h3; битый `ip` отклоняет конфиг. `SKIP` там, где нет IPv6-loopback | 1–3, 7 |
 | `priority` | RFC 9218: `priority: u=0` и `PRIORITY_UPDATE` до запроса дают маленький ответ за время «в одиночку»; две не-инкрементальные передачи идут по очереди (отношение ≤ 0,75), две инкрементальные делят соединение (≥ 0,8); контроль — тот же ответ впереди в списке не дороже 20 мс; h2 на одном соединении не морит маленький ответ; цена отсутствия сигнала печатается, снизу не ограничена | 7 |
 | `benchmark` | медиана 5 прогонов: short req/s, обязательный h2load-профиль 57074 байта `-n10000 -c100 -m30` и загрузка 64 МиБ; FAIL при неполных/не-2xx ответах или деградации любой метрики более 5% | 7 |
 | `asan` | сборка с h3 (ASan+LSan), unit + hard/soft reload | 2, 5 |

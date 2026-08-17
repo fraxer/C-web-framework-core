@@ -375,7 +375,7 @@ connection_t* __mail_connection_create() {
         return NULL;
     }
 
-    connection_t* connection = connection_c_create(fd, 0, 25);
+    connection_t* connection = connection_c_create(fd, NULL, 25);
     if (connection == NULL) return NULL;
 
     connection->close = __mail_connection_close;

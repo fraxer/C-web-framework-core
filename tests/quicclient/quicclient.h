@@ -2,6 +2,7 @@
 #define __QUICCLIENT__
 
 #include <netinet/in.h>
+#include <sys/socket.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -119,7 +120,12 @@ typedef struct quicclient {
     /* Test-only scheduling point used by the soft-reload integration case. */
     int pause_after_request_ms;
     int pause_after_response_ms;
-    struct sockaddr_in server;
+    /* Either family: the host string decides. sockaddr_storage rather than
+     * sockaddr_in because an IPv6 endpoint has to be reachable from the test
+     * client, and everything below the address here is family-agnostic
+     * already. */
+    struct sockaddr_storage server;
+    socklen_t server_len;
 
     SSL_CTX* ssl_ctx;
     quictls_t tls;

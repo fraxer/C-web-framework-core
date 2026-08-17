@@ -747,7 +747,15 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
                 __module_loader_config_error("__module_loader_servers_load: ip must be string\n");
                 goto failed;
             }
-            server->ip = inet_addr(json_string(token_ip));
+            /* Either family, and a bad literal is now a rejected config rather
+             * than 255.255.255.255: inet_addr reported failure as the same
+             * value as a valid broadcast address, so a typo turned into a bind
+             * error naming an address the operator never wrote. */
+            if (!ipaddr_parse(&server->ip, json_string(token_ip))) {
+                __module_loader_config_error("__module_loader_servers_load: ip is not a valid IPv4 or IPv6 address: %s\n",
+                                             json_string(token_ip));
+                goto failed;
+            }
         }
 
         const json_token_t* token_port = json_object_get(token_server, "port");
@@ -2419,6 +2427,14 @@ openssl_t* __module_loader_tls_load(const json_token_t* token_object) {
     return result;
 }
 
+/* A vhost is identified by (address, port, domain), and so is the collision.
+ *
+ * The address used not to be part of the key, which was harmless while it was
+ * always IPv4 -- but the ordinary way to serve one site over both families is
+ * two entries differing only in `ip`, and rejecting that would have made the
+ * IPv6 endpoint usable only for IPv6-only sites. The address is exactly what
+ * httpparser_select_server compares alongside the port, so it belongs here for
+ * the same reason. */
 int __module_loader_check_unique_domainport(server_t* first_server) {
     for (server_t* current_server = first_server; current_server; current_server = current_server->next) {
         unsigned short int current_port = current_server->port;
@@ -2426,11 +2442,16 @@ int __module_loader_check_unique_domainport(server_t* first_server) {
 
             for (server_t* server = first_server; server; server = server->next) {
                 unsigned short int port = server->port;
+                if (!ipaddr_equal(&current_server->ip, &server->ip)) continue;
+
                 for (domain_t* domain = server->domain; domain; domain = domain->next) {
                     if (current_domain == domain) continue;
 
                     if (strcmp(current_domain->template, domain->template) == 0 && current_port == port) {
-                        __module_loader_config_error("__module_loader_check_unique_domainport: domains with ports must be unique. %s %d\n", domain->template, port);
+                        char authority[IPADDR_AUTHORITY_STRLEN];
+                        __module_loader_config_error("__module_loader_check_unique_domainport: domains with addresses and ports must be unique. %s %s\n",
+                                                     domain->template,
+                                                     ipaddr_authority(&server->ip, port, authority, sizeof authority));
                         return 0;
                     }
                 }

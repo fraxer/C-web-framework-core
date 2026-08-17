@@ -414,8 +414,9 @@ connection_t* __httpclient_resolve(const char* host, const unsigned short port) 
     for (rp = result; rp != NULL; rp = rp->ai_next) {
         fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (fd >= 0) {
-            const in_addr_t ip = ((struct sockaddr_in*)rp->ai_addr)->sin_addr.s_addr;
-            connection = connection_c_create(fd, ip, port);
+            ipaddr_t ip;
+            ipaddr_from_sockaddr(&ip, rp->ai_addr);
+            connection = connection_c_create(fd, &ip, port);
             if (connection == NULL) {
                 close(fd);
                 fd = -1;
@@ -457,12 +458,15 @@ int __httpclient_establish_connection(httpclient_t* client) {
 }
 
 int __httpclient_connect(httpclient_t* client) {
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET; 
-    addr.sin_port = htons(client->connection->port); 
-    addr.sin_addr.s_addr = client->connection->ip;
+    struct sockaddr_storage addr;
+    const socklen_t addr_len = ipaddr_to_sockaddr(&client->connection->ip,
+                                                  client->connection->port, &addr);
+    if (addr_len == 0) {
+        log_error("connect error: no address for fd %d\n", client->connection->fd);
+        return 0;
+    }
 
-    if (connect(client->connection->fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+    if (connect(client->connection->fd, (struct sockaddr*)&addr, addr_len) == -1) {
         log_error("connect error %d %d\n", client->connection->fd, errno);
         return 0;
     }

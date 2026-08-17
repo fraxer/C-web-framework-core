@@ -78,7 +78,7 @@ static domain_t mock_domain = {
 };
 
 static server_t mock_server = {
-    .ip = 0x0100007F,  // 127.0.0.1
+    .ip = {.family = AF_INET, .u = {.v4 = {.s_addr = 0x0100007F}}},  // 127.0.0.1
     .port = 8080,
     .domain = &mock_domain,
     .http = {.route = NULL, .ratelimiter = NULL, .redirect = NULL, .middleware = NULL},
@@ -118,7 +118,7 @@ static connection_t* create_mock_connection(char* buffer, size_t buffer_size) {
     memset(conn, 0, sizeof(connection_t));
     conn->buffer = buffer;
     conn->buffer_size = buffer_size;
-    conn->ip = 0x0100007F;  // 127.0.0.1
+    conn->ip = ipaddr_from_v4(0x0100007F);  // 127.0.0.1
     conn->port = 8080;
     conn->ssl = NULL;
     conn->ctx = (connection_ctx_t*)&mock_server_ctx;

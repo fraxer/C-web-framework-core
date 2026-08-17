@@ -1,15 +1,17 @@
+#include <string.h>
+
 #include "connection_c.h"
 
-static connection_t* __connection_c_alloc(int fd, in_addr_t ip, unsigned short int port);
+static connection_t* __connection_c_alloc(int fd, const ipaddr_t* ip, unsigned short int port);
 static connection_client_ctx_t* __ctx_create(void);
 static void __ctx_reset(void* arg);
 static void __ctx_free(void* arg);
 
-connection_t* connection_c_create(const int fd, const in_addr_t ip, const unsigned short port) {
+connection_t* connection_c_create(const int fd, const ipaddr_t* ip, const unsigned short port) {
     return __connection_c_alloc(fd, ip, port);
 }
 
-connection_t* __connection_c_alloc(int fd, in_addr_t ip, unsigned short int port) {
+connection_t* __connection_c_alloc(int fd, const ipaddr_t* ip, unsigned short int port) {
     connection_t* connection = malloc(sizeof * connection);
     if (connection == NULL) return NULL;
 
@@ -21,9 +23,10 @@ connection_t* __connection_c_alloc(int fd, in_addr_t ip, unsigned short int port
 
     connection->fd = fd;
     connection->keepalive = 0;
-    connection->ip = ip;
+    memset(&connection->ip, 0, sizeof connection->ip);
+    memset(&connection->remote_ip, 0, sizeof connection->remote_ip);
+    if (ip != NULL) connection->ip = *ip;
     connection->port = port;
-    connection->remote_ip = 0;
     connection->remote_port = 0;
     connection->ctx = ctx;
     connection->ssl = NULL;

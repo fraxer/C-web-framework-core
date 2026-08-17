@@ -28,7 +28,7 @@ static domain_t mock_domain = {
 };
 
 static server_t mock_server = {
-    .ip = 0x0100007F,  // 127.0.0.1
+    .ip = {.family = AF_INET, .u = {.v4 = {.s_addr = 0x0100007F}}},  // 127.0.0.1
     .port = 8080,
     .domain = &mock_domain,
     .http = {.route = NULL, .ratelimiter = NULL, .redirect = NULL, .middleware = NULL},
@@ -93,7 +93,7 @@ static httprequestparser_t* setup_parser_with_data(const char* data, size_t data
 
     memcpy(conn->buffer, data, data_len);
     conn->buffer_size = data_len;
-    conn->ip = 0x0100007F;  // 127.0.0.1
+    conn->ip = ipaddr_from_v4(0x0100007F);  // 127.0.0.1
     conn->port = 8080;
     conn->ssl = NULL;
     conn->ctx = (connection_ctx_t*)&mock_server_ctx;

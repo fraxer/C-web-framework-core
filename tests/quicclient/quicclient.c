@@ -10,6 +10,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "ipaddr.h"
 #include "quicclient.h"
 #include "quicframe.h"
 #include "quichp.h"
@@ -162,7 +163,7 @@ static ssize_t __net_write(quicclient_t* c, const uint8_t* buf, size_t len) {
     }
 
     return sendto(c->fd, buf, len, 0,
-                  (struct sockaddr*)&c->server, sizeof c->server);
+                  (struct sockaddr*)&c->server, c->server_len);
 }
 
 /* Send, or lose, or hold back, or send twice. */
@@ -397,7 +398,7 @@ int quicclient_rebind(quicclient_t* client) {
     if (client->out == NULL) {
         if (client->fd < 0) return 0;
 
-        const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        const int fd = socket(client->server.ss_family, SOCK_DGRAM, 0);
         if (fd < 0) return 0;
 
         __stamp_incoming(fd);
@@ -1702,15 +1703,18 @@ static int __connect(quicclient_t* client, const char* host, uint16_t port,
     /* No socket in the in-process mode, and no address either: where the peer
      * is, is the emulator's business. */
     if (out == NULL) {
-        client->fd = socket(AF_INET, SOCK_DGRAM, 0);
+        /* The family comes from the address, not from a constant: the same
+         * client has to reach an IPv4 and an IPv6 endpoint. */
+        ipaddr_t addr;
+        if (!ipaddr_parse(&addr, host)) return 0;
+
+        client->server_len = ipaddr_to_sockaddr(&addr, port, &client->server);
+        if (client->server_len == 0) return 0;
+
+        client->fd = socket(client->server.ss_family, SOCK_DGRAM, 0);
         if (client->fd < 0) return 0;
 
         __stamp_incoming(client->fd);
-
-        memset(&client->server, 0, sizeof client->server);
-        client->server.sin_family = AF_INET;
-        client->server.sin_port = htons(port);
-        if (inet_pton(AF_INET, host, &client->server.sin_addr) != 1) return 0;
     }
 
     /* Produces the ClientHello, which lands in crypto_out via the callback. */
@@ -1920,18 +1924,18 @@ int quicclient_probe_version(const char* host, uint16_t port, uint32_t version,
 
     out->probe_len = datagram_len;
 
-    const int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    ipaddr_t addr;
+    if (!ipaddr_parse(&addr, host)) return 0;
+
+    struct sockaddr_storage server;
+    const socklen_t server_len = ipaddr_to_sockaddr(&addr, port, &server);
+    if (server_len == 0) return 0;
+
+    const int fd = socket(server.ss_family, SOCK_DGRAM, 0);
     if (fd < 0) return 0;
 
-    struct sockaddr_in server;
-    memset(&server, 0, sizeof server);
-    server.sin_family = AF_INET;
-    server.sin_port = htons(port);
-
-    int ok = inet_pton(AF_INET, host, &server.sin_addr) == 1;
-
     /* Connected, so a reply from anywhere else is not read as this one. */
-    ok = ok && connect(fd, (struct sockaddr*)&server, sizeof server) == 0;
+    int ok = connect(fd, (struct sockaddr*)&server, server_len) == 0;
     ok = ok && send(fd, dgram, datagram_len, 0) == (ssize_t)datagram_len;
 
     if (!ok) {

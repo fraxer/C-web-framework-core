@@ -156,7 +156,7 @@ static int conn_harness_init(conn_harness_t* h, int with_socket) {
         return 0;
     }
 
-    h->conn = connection_s_alloc(&h->listener, h->conn_fd, 0, 80, 0, 0, NULL, 0);
+    h->conn = connection_s_alloc(&h->listener, h->conn_fd, NULL, 80, NULL, 0, NULL, 0);
     if (h->conn == NULL) {
         cqueue_clear(&h->listener.servers);
         safe_close(&h->conn_fd);
@@ -318,14 +318,15 @@ TEST(test_connection_data_write_closed_peer) {
 TEST(test_connection_c_create_initializes_fields) {
     TEST_CASE("connection_c_create initializes every field");
 
-    connection_t* conn = connection_c_create(7, 0x0100007f, 8080);
+    const ipaddr_t loopback = ipaddr_from_v4(0x0100007f);
+    connection_t* conn = connection_c_create(7, &loopback, 8080);
     TEST_REQUIRE_NOT_NULL(conn, "client connection created");
 
     TEST_ASSERT_EQUAL(7, conn->fd, "fd stored");
-    TEST_ASSERT_EQUAL_UINT(0x0100007f, conn->ip, "ip stored");
+    TEST_ASSERT(ipaddr_equal(&loopback, &conn->ip), "ip stored");
     TEST_ASSERT_EQUAL(8080, conn->port, "port stored");
     TEST_ASSERT_EQUAL(0, conn->keepalive, "keepalive off by default");
-    TEST_ASSERT_EQUAL_UINT(0, conn->remote_ip, "remote_ip zeroed");
+    TEST_ASSERT(!ipaddr_is_set(&conn->remote_ip), "remote_ip zeroed");
     TEST_ASSERT_EQUAL(0, conn->remote_port, "remote_port zeroed");
     TEST_ASSERT_NULL(conn->ssl, "ssl NULL");
     TEST_ASSERT_NULL(conn->ssl_ctx, "ssl_ctx NULL");
@@ -349,7 +350,7 @@ TEST(test_connection_c_create_initializes_fields) {
 TEST(test_connection_c_reset_dispatches_to_request_response) {
     TEST_CASE("client ctx reset calls request->reset/response->reset");
 
-    connection_t* conn = connection_c_create(-1, 0, 0);
+    connection_t* conn = connection_c_create(-1, NULL, 0);
     TEST_REQUIRE_NOT_NULL(conn, "client connection created");
 
     stub_reqresp_reset();
@@ -377,7 +378,7 @@ TEST(test_connection_c_reset_dispatches_to_request_response) {
 TEST(test_connection_c_reset_free_tolerate_null_request) {
     TEST_CASE("client ctx reset/free with NULL request/response");
 
-    connection_t* conn = connection_c_create(-1, 0, 0);
+    connection_t* conn = connection_c_create(-1, NULL, 0);
     TEST_REQUIRE_NOT_NULL(conn, "client connection created");
 
     connection_reset(conn);
@@ -430,7 +431,7 @@ TEST(test_connection_s_alloc_initializes_fields) {
 TEST(test_connection_s_alloc_null_listener) {
     TEST_CASE("connection_s_alloc with NULL listener leaves server NULL");
 
-    connection_t* conn = connection_s_alloc(NULL, -1, 0, 0, 0, 0, NULL, 0);
+    connection_t* conn = connection_s_alloc(NULL, -1, NULL, 0, NULL, 0, NULL, 0);
     TEST_REQUIRE_NOT_NULL(conn, "connection created");
 
     connection_server_ctx_t* ctx = conn->ctx;
@@ -488,7 +489,7 @@ TEST(test_connection_s_lock_unlock) {
 TEST(test_connection_s_inc_dec) {
     TEST_CASE("connection_s_inc/dec: DECREMENT above zero, DESTROY at zero");
 
-    connection_t* conn = connection_s_alloc(NULL, -1, 0, 0, 0, 0, NULL, 0);
+    connection_t* conn = connection_s_alloc(NULL, -1, NULL, 0, NULL, 0, NULL, 0);
     TEST_REQUIRE_NOT_NULL(conn, "connection created");
 
     connection_server_ctx_t* ctx = conn->ctx;

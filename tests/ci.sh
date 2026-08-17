@@ -18,6 +18,8 @@
 #   soak     sustained requests, impairment, migration and RSS drain
 #   affinity a migrated connection follows its datagrams to the new worker
 #   vn       an unknown QUIC version draws a Version Negotiation packet
+#   ipv6     an IPv6 vhost serves h1.1/h2/h3, separately from IPv4 on the
+#            same port (skips where there is no IPv6 loopback)
 #   priority urgency and incremental scheduling, and what an unsignalled
 #            small response still pays for being asked for second (RFC 9218)
 #   benchmark median req/s and throughput against a runner-local baseline
@@ -227,6 +229,18 @@ stage_vn() {
         record vn OK
     else
         record vn FAIL
+    fi
+}
+
+stage_ipv6() {
+    say "ipv6: an IPv6 vhost serves all three protocols, apart from IPv4"
+    if build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes -DSANITIZE=none &&
+       H3_IPV6_PORT=18494 "$CORE_DIR/tests/h3_ipv6.sh" \
+             "$CI_BUILD_DIR/limits" "$CI_BUILD_DIR/h3-ipv6"; then
+        record ipv6 OK
+    else
+        record ipv6 FAIL
     fi
 }
 
@@ -446,7 +460,7 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit config limits soak affinity earlydata vn priority benchmark asan tsan fuzz reload softreload h3spec)
+ALL_STAGES=(noh3 h3unit config limits soak affinity earlydata vn ipv6 priority benchmark asan tsan fuzz reload softreload h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
@@ -469,6 +483,7 @@ for stage in "${STAGES[@]}"; do
     affinity) stage_affinity ;;
     earlydata) stage_earlydata ;;
     vn)     stage_vn ;;
+    ipv6)   stage_ipv6 ;;
     priority) stage_priority ;;
     benchmark) stage_benchmark ;;
     fuzz)   stage_fuzz ;;

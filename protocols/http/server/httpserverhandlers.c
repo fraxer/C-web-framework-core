@@ -628,7 +628,7 @@ int __handle(connection_t* connection, httprequest_t* request, deferred_handler 
          * again: the rate-limited path pays one open, the served path saves a
          * stat on every response. The order of the two checks is unchanged —
          * a 404 still never counts against the limiter. */
-        if (!ratelimiter_allow(ctx->server->http.ratelimiter, connection->remote_ip, 1)) {
+        if (!ratelimiter_allow(ctx->server->http.ratelimiter, &connection->remote_ip, 1)) {
             file.close(&file);
             httpresponse_default(response, 429);
             response->add_header(response, "Retry-After", "1");
@@ -926,7 +926,7 @@ void __queue_request_handler(void* arg) {
         connection_s_unlock(item->connection);
     }
 
-    if (!ratelimiter_allow(data->ratelimiter, item->connection->remote_ip, 1)) {
+    if (!ratelimiter_allow(data->ratelimiter, &item->connection->remote_ip, 1)) {
         if (data->response != NULL) {
             httpresponse_default(data->response, 429);
             data->response->add_header(data->response, "Retry-After", "1");
@@ -1229,7 +1229,7 @@ int __sni_callback(SSL* ssl, int* ad, void* arg) {
     while (item) {
         server_t* server = item->data;
 
-        if (server->ip == listener_connection->ip && server->port == listener_connection->port) {
+        if (ipaddr_equal(&server->ip, &listener_connection->ip) && server->port == listener_connection->port) {
             for (domain_t* domain = server->domain; domain; domain = domain->next) {
                 int matches_count = pcre_exec(domain->pcre_template, NULL, ascii_server_name, server_name_length, 0, 0, vector, vector_size);
                 if (matches_count > 0) {

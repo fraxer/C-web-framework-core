@@ -16,6 +16,6 @@ typedef struct {
     void* response;
 } connection_client_ctx_t;
 
-connection_t* connection_c_create(const int fd, const in_addr_t ip, const unsigned short port);
+connection_t* connection_c_create(const int fd, const ipaddr_t* ip, const unsigned short port);
 
 #endif

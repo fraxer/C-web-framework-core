@@ -3259,20 +3259,24 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
      * this object rather than beside it, because the connection layer casts
      * between the two. The fd is the endpoint's shared socket -- kept for
      * diagnostics only, since nothing here ever reads or writes it directly. */
-    const struct sockaddr_in* remote4 = (const struct sockaddr_in*)&path->remote;
-    const in_addr_t remote_ip = path->remote.ss_family == AF_INET
-                                ? remote4->sin_addr.s_addr : 0;
-    const unsigned short remote_port = path->remote.ss_family == AF_INET
-                                       ? ntohs(remote4->sin_port) : 0;
+    ipaddr_t remote_ip;
+    ipaddr_from_sockaddr(&remote_ip, (const struct sockaddr*)&path->remote);
+
+    const unsigned short remote_port =
+        path->remote.ss_family == AF_INET6
+        ? ntohs(((const struct sockaddr_in6*)&path->remote)->sin6_port)
+        : ntohs(((const struct sockaddr_in*)&path->remote)->sin_port);
 
     /* The local address matters: httpparser_select_server picks the virtual
      * server by (ip, port), so a connection that reports 0/0 matches no vhost
      * and every request is a 421. TCP gets these from accept(); QUIC has to
      * take them from the endpoint it arrived on. */
+    const ipaddr_t local_ip = quicendpoint_ip(endpoint);
+
     if (!connection_s_init(&conn->conn, quicendpoint_listener(endpoint),
                            quicendpoint_fd(endpoint),
-                           quicendpoint_ip(endpoint), quicendpoint_port(endpoint),
-                           remote_ip, remote_port, NULL, 0)) {
+                           &local_ip, quicendpoint_port(endpoint),
+                           &remote_ip, remote_port, NULL, 0)) {
         __quicconn_transport_free(conn);
         free(conn);
         return NULL;

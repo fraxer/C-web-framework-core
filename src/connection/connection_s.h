@@ -182,14 +182,14 @@ typedef struct connection_queue_item {
     connection_queue_item_data_t* data;
 } connection_queue_item_t;
 
-connection_t* connection_s_create(int fd, in_addr_t ip, unsigned short int port, connection_server_ctx_t* ctx, char* buffer, size_t buffer_size);
-connection_t* connection_s_alloc(listener_t* listener, int fd, in_addr_t ip, unsigned short int port, in_addr_t client_ip, unsigned short int client_port, char* buffer, size_t buffer_size);
+connection_t* connection_s_create(int fd, const ipaddr_t* ip, unsigned short int port, connection_server_ctx_t* ctx, char* buffer, size_t buffer_size);
+connection_t* connection_s_alloc(listener_t* listener, int fd, const ipaddr_t* ip, unsigned short int port, const ipaddr_t* client_ip, unsigned short int client_port, char* buffer, size_t buffer_size);
 
 /* Initialise a connection_t the caller already owns, rather than allocating
  * one. For transports that embed a connection in a larger object -- QUIC, where
  * quicconn_t starts with one so the two can be cast between. Returns 0 on
  * failure, in which case nothing was allocated. */
-int connection_s_init(connection_t* connection, listener_t* listener, int fd, in_addr_t ip, unsigned short int port, in_addr_t client_ip, unsigned short int client_port, char* buffer, size_t buffer_size);
+int connection_s_init(connection_t* connection, listener_t* listener, int fd, const ipaddr_t* ip, unsigned short int port, const ipaddr_t* client_ip, unsigned short int client_port, char* buffer, size_t buffer_size);
 connection_t* connection_s_create_local(server_t* server);
 void connection_s_free_local(connection_t* connection);
 

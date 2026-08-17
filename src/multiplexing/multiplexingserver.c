@@ -188,10 +188,10 @@ listener_t* __listener_create(mpxapi_t* api, char* buffer, server_t* server) {
     int result = 0;
     connection_t* connection = NULL;
 
-    const int socketfd = socket_listen_create(server->ip, server->port);
+    const int socketfd = socket_listen_create(&server->ip, server->port);
     if (socketfd == -1) goto failed;
 
-    connection = connection_s_alloc(listener, socketfd, server->ip, server->port, server->ip, server->port, buffer, BUFFER_SIZE);
+    connection = connection_s_alloc(listener, socketfd, &server->ip, server->port, &server->ip, server->port, buffer, BUFFER_SIZE);
     if (connection == NULL) goto failed;
 
     connection->read = __listener_read;
@@ -220,7 +220,7 @@ listener_t* __listener_create(mpxapi_t* api, char* buffer, server_t* server) {
 
 listener_t* __listener_get(listener_t* listener, server_t* server) {
     while (listener) {
-        if (listener->connection->ip == server->ip && listener->connection->port == server->port)
+        if (ipaddr_equal(&listener->connection->ip, &server->ip) && listener->connection->port == server->port)
             return listener;
 
         listener = listener->next;
@@ -280,7 +280,7 @@ void __listener_unlisten(listener_t* listener) {
 
 int __listener_read(connection_t* listener_connection) {
     const int fd = listener_connection->fd;
-    const in_addr_t ip = listener_connection->ip;
+    const ipaddr_t ip = listener_connection->ip;
     const unsigned short int port = listener_connection->port;
     connection_server_ctx_t* ctx = listener_connection->ctx;
     char* buffer = listener_connection->buffer;
@@ -291,7 +291,7 @@ int __listener_read(connection_t* listener_connection) {
     // EMFILE/ENFILE и т.п.) — возврат 0 приводил к закрытию самого слушающего
     // сокета. Очередь разбирается по соединению за итерацию; level-triggered
     // epoll снова сообщит EPOLLIN, пока accept-очередь не опустеет.
-    connection_t* connection = connection_s_create(fd, ip, port, ctx, buffer, buffer_size);
+    connection_t* connection = connection_s_create(fd, &ip, port, ctx, buffer, buffer_size);
     if (connection == NULL)
         return 1;
 

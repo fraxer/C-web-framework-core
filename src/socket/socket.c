@@ -79,42 +79,53 @@ int socket_set_timeouts(int socket) {
     return 0;
 }
 
-int socket_listen_create(in_addr_t ip, unsigned short int port) {
-    struct sockaddr_in sa = {0};
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-    sa.sin_addr.s_addr = ip;
+int socket_listen_create(const ipaddr_t* ip, unsigned short int port) {
+    struct sockaddr_storage sa;
+    const socklen_t sa_len = ipaddr_to_sockaddr(ip, port, &sa);
 
-    char ip_str[INET_ADDRSTRLEN];
-    if (inet_ntop(AF_INET, &sa.sin_addr, ip_str, sizeof(ip_str)) == NULL) {
-        log_error("Socket error: Can't resolve ip address\n");
+    char authority[IPADDR_AUTHORITY_STRLEN];
+    ipaddr_authority(ip, port, authority, sizeof authority);
+
+    if (sa_len == 0) {
+        log_error("Socket error: no address to listen on for port %d\n", port);
         return -1;
     }
 
-    const int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    const int fd = socket(sa.ss_family, SOCK_STREAM, IPPROTO_TCP);
     if (fd == -1) {
-        log_error("Socket error: Can't create socket on %s:%d\n", ip_str, port);
+        log_error("Socket error: Can't create socket on %s\n", authority);
         return -1;
     }
 
     int result = -1;
     if (__socket_set_options(fd) == -1) {
-        log_error("Socket error: Can't set options for socket on %s:%d\n", ip_str, port);
+        log_error("Socket error: Can't set options for socket on %s\n", authority);
         goto failed;
     }
 
-    if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) == -1) {
-        log_error("Socket bind error on %s:%d\n", ip_str, port);
+    /* v6-only, see socket.h. Without it a wildcard IPv6 bind also takes IPv4,
+     * and the same config would then mean different things depending on a
+     * sysctl. */
+    if (sa.ss_family == AF_INET6) {
+        int on = 1;
+        if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof on) == -1) {
+            log_error("Socket error: Can't set IPV6_V6ONLY on %s\n", authority);
+            goto failed;
+        }
+    }
+
+    if (bind(fd, (struct sockaddr*)&sa, sa_len) == -1) {
+        log_error("Socket bind error on %s\n", authority);
         goto failed;
     }
 
     if (socket_set_nonblocking(fd) == -1) {
-        log_error("Socket error: Can't make socket nonblocking on %s:%d\n", ip_str, port);
+        log_error("Socket error: Can't make socket nonblocking on %s\n", authority);
         goto failed;
     }
 
     if (listen(fd, SOMAXCONN) == -1) {
-        log_error("Socket error: listen socket failed on %s:%d\n", ip_str, port);
+        log_error("Socket error: listen socket failed on %s\n", authority);
         goto failed;
     }
 

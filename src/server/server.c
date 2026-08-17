@@ -16,8 +16,8 @@ server_t* server_create() {
     server->port = 0;
     server->root_length = 0;
     server->domain = NULL;
-    
-    server->ip = 0;
+
+    memset(&server->ip, 0, sizeof server->ip);
     server->root = NULL;
     server->index = NULL;
     server->http.route = NULL;
@@ -56,7 +56,7 @@ void servers_free(server_t* server) {
         if (server->domain) domains_free(server->domain);
         server->domain = NULL;
 
-        server->ip = 0;
+        memset(&server->ip, 0, sizeof server->ip);
 
         if (server->root) free(server->root);
         server->root = NULL;
