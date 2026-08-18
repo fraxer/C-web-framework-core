@@ -15,6 +15,8 @@
 #   h3unit   QUIC / HTTP/3 / QPACK unit runner only
 #   config   invalid HTTP/3 types/ranges reject startup
 #   startup  a server that did not start exits non-zero, in both start modes
+#   keepalive a quiet connection outlives the idle timeout, and does not
+#            without http3_keepalive_sec (both arms, ~90 s)
 #   limits   process connection/memory exhaustion and drain
 #   soak     sustained requests, impairment, migration and RSS drain
 #   affinity a migrated connection follows its datagrams to the new worker
@@ -172,6 +174,18 @@ stage_startup() {
         record startup OK
     else
         record startup FAIL
+    fi
+}
+
+stage_keepalive() {
+    say "keepalive: a quiet connection outlives the idle timeout"
+    if build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes -DSANITIZE=none &&
+       KEEPALIVE_PORT=18499 "$CORE_DIR/tests/h3_keepalive.sh" \
+             "$CI_BUILD_DIR/limits" "$CI_BUILD_DIR/h3-keepalive"; then
+        record keepalive OK
+    else
+        record keepalive FAIL
     fi
 }
 
@@ -474,7 +488,7 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit config startup limits soak affinity earlydata vn ipv6 priority benchmark asan tsan fuzz reload softreload h3spec)
+ALL_STAGES=(noh3 h3unit config startup keepalive limits soak affinity earlydata vn ipv6 priority benchmark asan tsan fuzz reload softreload h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
@@ -493,6 +507,7 @@ for stage in "${STAGES[@]}"; do
     h3unit) stage_h3unit ;;
     config) stage_config ;;
     startup) stage_startup ;;
+    keepalive) stage_keepalive ;;
     limits) stage_limits ;;
     soak)    stage_soak ;;
     affinity) stage_affinity ;;

@@ -18,7 +18,7 @@
  *   quicclient [host] [port] [-q] [-p /path] [-a authority] [-n N] [--expect]
  *              [--handshake-only] [--path-challenge] [--key-update] [--cid]
  *              [--migrate] [--new-token [--pause N]] [--0rtt] [--0rtt-stall]
- *              [--pause-after-handshake N]
+ *              [--pause-after-handshake N] [--idle MS]
  *              [--pause-after-request N]
  *              [--pause-after-response N]
  *              [--loss N] [--loss-in N] [--reorder N] [--dup N] [--seed N]
@@ -74,6 +74,7 @@ int main(int argc, char* argv[]) {
     const char* mix_priority = "u=0";
     int pause_ms = 0;
     int pause_after_handshake_ms = 0;
+    int idle_ms = 0;
     int pause_after_request_ms = 0;
     int pause_after_response_ms = 0;
     unsigned loss = 0, loss_in = 0, reorder = 0, dup = 0;
@@ -106,6 +107,7 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--0rtt") == 0) zero_rtt = 1;
         else if (strcmp(argv[i], "--0rtt-stall") == 0) zero_rtt_stall = 1;
         else if (strcmp(argv[i], "--pause") == 0 && i + 1 < argc) pause_ms = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--idle") == 0 && i + 1 < argc) idle_ms = atoi(argv[++i]);
         else if (strcmp(argv[i], "--pause-after-handshake") == 0 && i + 1 < argc)
             pause_after_handshake_ms = atoi(argv[++i]);
         else if (strcmp(argv[i], "--pause-after-request") == 0 && i + 1 < argc)
@@ -486,6 +488,48 @@ int main(int argc, char* argv[]) {
         printf("pausing after handshake %d ms\n", pause_after_handshake_ms);
         fflush(stdout);
         usleep((useconds_t)pause_after_handshake_ms * 1000);
+    }
+
+    /* An idle peer, as opposed to a dead one -- the only way to test a server's
+     * keep-alive.
+     *
+     * --pause-after-handshake sleeps, and a sleeping client acknowledges
+     * nothing. That is the wrong model here: RFC 9000 §10.1 restarts the idle
+     * timer on a packet *received*, so a server's keep-alive PING preserves the
+     * connection only because the peer answers it. Against a sleeping client
+     * the PINGs go unanswered, the server's own timer runs out regardless, and
+     * the connection dies -- which looks exactly like a keep-alive that does
+     * not work, and is not.
+     *
+     * A browser with a quiet tab is not asleep; its stack still acknowledges.
+     * So this pumps the loop and sends nothing of its own. */
+    if (ok && idle_ms > 0) {
+        printf("idling %d ms (acknowledging, sending nothing)\n", idle_ms);
+        fflush(stdout);
+
+        const uint64_t deadline = quic_now_us() + (uint64_t)idle_ms * 1000;
+        uint64_t now;
+
+        while ((now = quic_now_us()) < deadline) {
+            const uint64_t left_ms = (deadline - now) / 1000;
+            const int slice = left_ms > 200 ? 200 : (int)left_ms + 1;
+
+            if (!quicclient_pump(&client, slice)) {
+                printf("FAIL: the connection failed during %d ms of silence\n",
+                       idle_ms);
+                ok = 0;
+                break;
+            }
+
+            quicclient_tick(&client);
+        }
+
+        /* Deliberately not "still connected": a server that gave up on an idle
+         * connection says nothing at all about it, so silence here is not
+         * evidence of a live connection. The request that follows is the only
+         * thing that can tell the two apart. */
+        if (ok)
+            printf("idle period elapsed without error\n");
     }
 
     /* Path validation, before HTTP/3: RFC 9000 §8.2.2 makes answering a
