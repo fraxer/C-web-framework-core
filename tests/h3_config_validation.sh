@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
-# Invalid HTTP/3 policy must reject startup instead of being silently clamped.
+# Invalid HTTP/3 policy must reject startup instead of being silently clamped,
+# and must do so with a non-zero exit status in both start modes -- foreground
+# and daemonising.
 
 set -u -o pipefail
 
@@ -32,6 +34,21 @@ __expect_rejected() {
     local status=$?
     if [ "$status" -eq 0 ]; then
         printf 'config validation: %s was not rejected as expected (status %d)\n' \
+            "$name" "$status" >&2
+        return 1
+    fi
+
+    # And again WITHOUT -f, which is the mode a service unit uses.
+    #
+    # REGRESSION: a Release build detached with daemon(1, 1) before the config
+    # was read, so the parent returned 0 while the child parsed the config,
+    # failed and exited 1 where nobody was looking. Every `$?` in a deploy
+    # script read a server that never started as one that had. The two modes
+    # take different code paths to the same answer, so both are checked.
+    "$SERVER" -c "$WORK_DIR/$name.json" > "$WORK_DIR/$name.daemon.log" 2>&1
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        printf 'config validation: %s was not rejected when daemonising (status %d)\n' \
             "$name" "$status" >&2
         return 1
     fi

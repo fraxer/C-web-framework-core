@@ -261,8 +261,21 @@ cmake ... \
 ## 7. Running the server
 
 ```bash
-<prefix>/bin/cwfr -c /path/to/config.json
+<prefix>/bin/cwfr -c /path/to/config.json      # detaches (Release builds)
+<prefix>/bin/cwfr -c /path/to/config.json -f   # stays in the foreground
 ```
+
+A `Release` or `RelWithDebInfo` build detaches from the terminal unless `-f` is
+given; `-f` is what a container runtime wants, since a supervisor watching a
+process that forks and exits reads it as one that died.
+
+**Either way the exit status is meaningful.** The process does not report success
+until the configuration has been read, accepted and applied *and every worker is
+listening*, so `cwfr -c config.json && ...` behaves as written: a rejected
+configuration and a socket that cannot be bound both exit non-zero, and neither
+leaves a process behind. The detaching parent stays alive until the child gets
+that far, which also means the server is already accepting connections by the
+time the command returns.
 
 `config.json` defines workers/threads, servers (virtual hosts with
 route-to-handler mappings), database connections, storage backends, and the

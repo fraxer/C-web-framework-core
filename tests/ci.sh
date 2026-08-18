@@ -14,6 +14,7 @@
 #   tsan     build with h3, TSan            + unit tests   (data races)
 #   h3unit   QUIC / HTTP/3 / QPACK unit runner only
 #   config   invalid HTTP/3 types/ranges reject startup
+#   startup  a server that did not start exits non-zero, in both start modes
 #   limits   process connection/memory exhaustion and drain
 #   soak     sustained requests, impairment, migration and RSS drain
 #   affinity a migrated connection follows its datagrams to the new worker
@@ -35,6 +36,7 @@
 #   tests/ci.sh                  # every stage
 #   tests/ci.sh release          # every stage; h3spec must be installed
 #   tests/ci.sh asan tsan        # a subset, in the order given
+#   tests/ci.sh startup          # a failed start must exit non-zero
 #   FUZZ_SECONDS=600 tests/ci.sh fuzz
 #   CI_BUILD_DIR=/var/tmp/ci tests/ci.sh
 #
@@ -158,6 +160,18 @@ stage_h3unit() {
         record h3unit OK
     else
         record h3unit FAIL
+    fi
+}
+
+stage_startup() {
+    say "startup: a failed start exits non-zero and leaves nothing running"
+    if build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes -DSANITIZE=none &&
+       STARTUP_PORT=18496 "$CORE_DIR/tests/startup_failure.sh" \
+             "$CI_BUILD_DIR/limits" "$CI_BUILD_DIR/startup-failure"; then
+        record startup OK
+    else
+        record startup FAIL
     fi
 }
 
@@ -460,7 +474,7 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit config limits soak affinity earlydata vn ipv6 priority benchmark asan tsan fuzz reload softreload h3spec)
+ALL_STAGES=(noh3 h3unit config startup limits soak affinity earlydata vn ipv6 priority benchmark asan tsan fuzz reload softreload h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
@@ -478,6 +492,7 @@ for stage in "${STAGES[@]}"; do
     tsan)   stage_tsan ;;
     h3unit) stage_h3unit ;;
     config) stage_config ;;
+    startup) stage_startup ;;
     limits) stage_limits ;;
     soak)    stage_soak ;;
     affinity) stage_affinity ;;

@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -18,6 +19,77 @@
 #include "log.h"
 #include "signal/signal.h"
 
+/* Detach from the terminal, but keep the caller's exit status honest.
+ *
+ * `daemon(1, 1)` was the whole of this, and it made a Release build report
+ * success for a configuration it had not read yet: the parent returned the
+ * moment it forked, while the child went on to parse the config, fail, print
+ * the reason and exit 1 where nobody was looking. `cwfr -c broken.json` printed
+ * an error and exited 0, so every wrapper that tests `$?` -- a service unit, a
+ * deploy script, `&&` in a shell -- treated a server that never started as a
+ * server that had.
+ *
+ * So the parent does not exit on the fork; it waits to be told. The child writes
+ * one byte once the configuration has been applied *and every worker is
+ * listening* -- the second half being the startup barrier in appconfig.h, without
+ * which this would still have reported success for a server whose sockets failed
+ * to bind. Nothing is written on a failure path: the child's exit closes the
+ * descriptor, and the read ends in EOF, which is the same answer without a single
+ * error path having to remember to report itself.
+ *
+ * Deliberately unbounded. A timeout would have to choose between calling a slow
+ * but successful start a failure and calling a hung one a success, and both are
+ * the lie this exists to remove. The child cannot hang silently: if it dies, the
+ * descriptor closes.
+ *
+ * Returns the descriptor the child must signal readiness on, or -1 when there is
+ * nothing to signal (foreground, or a build that does not daemonise). */
+static int __daemonize(void) {
+    if (appconfig_foreground() ||
+        (strcmp(CMAKE_BUILD_TYPE, "Release") != 0 &&
+         strcmp(CMAKE_BUILD_TYPE, "RelWithDebInfo") != 0))
+        return -1;
+
+    int ready[2];
+    if (pipe(ready) == -1) {
+        log_error("daemonize: cannot create the readiness pipe (errno %d)\n", errno);
+        _exit(EXIT_FAILURE);
+    }
+
+    const pid_t pid = fork();
+    if (pid == -1) {
+        log_error("daemonize: fork failed (errno %d)\n", errno);
+        _exit(EXIT_FAILURE);
+    }
+
+    if (pid > 0) {
+        close(ready[1]);
+
+        char byte = 0;
+        ssize_t n;
+        do {
+            n = read(ready[0], &byte, 1);
+        } while (n == -1 && errno == EINTR);
+
+        close(ready[0]);
+
+        /* _exit, not exit: the child inherited this process's stdio buffers, so
+         * flushing them here would print whatever was buffered a second time,
+         * from the other process. */
+        _exit(n == 1 ? EXIT_SUCCESS : EXIT_FAILURE);
+    }
+
+    close(ready[0]);
+
+    /* Same as daemon(1, 1) did: a new session, and the standard descriptors left
+     * alone so that a configuration error still reaches the terminal the server
+     * was started from. */
+    if (setsid() == -1)
+        log_error("daemonize: setsid failed (errno %d)\n", errno);
+
+    return ready[1];
+}
+
 int main(int argc, char* argv[]) {
     int result = EXIT_FAILURE;
 
@@ -27,10 +99,7 @@ int main(int argc, char* argv[]) {
     log_init();
     signal_init();
 
-    if (!appconfig_foreground() &&
-        (strcmp(CMAKE_BUILD_TYPE, "Release") == 0 ||
-         strcmp(CMAKE_BUILD_TYPE, "RelWithDebInfo") == 0))
-        if (daemon(1, 1) < 0) goto failed;
+    const int ready_fd = __daemonize();
 
     /* Block control signals before module_loader_init creates any threads.
      * They inherit this mask, leaving the main thread's sigwait() as the sole
@@ -47,7 +116,35 @@ int main(int argc, char* argv[]) {
     if (!module_loader_init(appconfig()))
         goto failed;
 
+    /* module_loader_init returns as soon as the workers have been created, and
+     * each worker binds its own listening sockets afterwards -- so this is where
+     * "the server started" actually becomes true or false (appconfig.h).
+     *
+     * _exit rather than the failed label: the other workers are being shut down
+     * by the one that failed, so threads are still live, and exit() would run
+     * OPENSSL_cleanup and every other destructor underneath them -- the hazard
+     * the drain below documents. Nothing is lost by skipping the teardown of a
+     * process that is refusing to start, and the closed readiness descriptor is
+     * what the waiting parent turns into its own non-zero status. */
+    if (!appconfig_wait_workers()) {
+        log_error("startup: a worker could not start; the server is not listening\n");
+        fflush(NULL);
+        _exit(EXIT_FAILURE);
+    }
+
     result = EXIT_SUCCESS;
+
+    /* Configuration applied and every worker listening: the parent may stop
+     * waiting, and its exit status now means what a caller reads it to mean. */
+    if (ready_fd != -1) {
+        const char byte = 1;
+        ssize_t n;
+        do {
+            n = write(ready_fd, &byte, 1);
+        } while (n == -1 && errno == EINTR);
+
+        close(ready_fd);
+    }
 
     int sig;
     for (;;) {

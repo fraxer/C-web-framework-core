@@ -37,6 +37,13 @@ int thread_worker_run(appconfig_t* appconfig, int thread_count) {
 
         pthread_detach(thread);
         pthread_setname_np(thread, "Server worker");
+
+        /* One more worker the startup barrier must hear from (appconfig.h).
+         * After the create, not before: the count means "this thread exists and
+         * will report", and a thread that was never created never will. A create
+         * that fails takes startup down through the return above, so the caller
+         * never reaches the barrier with a count it cannot satisfy. */
+        appconfig_worker_expected();
     }
 
     return 1;

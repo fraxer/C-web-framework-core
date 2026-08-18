@@ -29,7 +29,13 @@ static void __mpx_http1_shutdown_tick(connection_t* connection);
 int mpxserver_run(appconfig_t* appconfig) {
     int result = 0;
     mpxapi_t* api = mpx_create();
-    if (api == NULL) return result;
+    if (api == NULL) {
+        /* Reported here rather than at the shared exit below, because this is
+         * the one failure that returns before reaching it -- and a worker that
+         * never reports leaves the startup barrier waiting for it forever. */
+        appconfig_worker_failed();
+        return result;
+    }
     api->owner_config = appconfig;
 
     listener_t* listeners = NULL;
@@ -67,6 +73,12 @@ int mpxserver_run(appconfig_t* appconfig) {
         goto failed;
 #endif
 
+    /* Listening: sockets bound, descriptors registered, nothing left that can
+     * refuse to start. This is what releases the main thread's startup barrier
+     * (appconfig.h), so it belongs immediately before the event loop and not one
+     * line earlier. */
+    appconfig_worker_listening();
+
     while (1) {
         api->process_events(appconfig, api);
 
@@ -101,6 +113,13 @@ int mpxserver_run(appconfig_t* appconfig) {
     result = 1;
 
     failed:
+
+    /* result is 0 only on the way out of a startup failure -- the event loop
+     * above sets it before it breaks -- so this is the single place every such
+     * path passes through, and reporting once here cannot be forgotten by a
+     * failure added later. */
+    if (!result)
+        appconfig_worker_failed();
 
 #ifdef CWFR_HTTP3
     quicendpoints_free(endpoints);

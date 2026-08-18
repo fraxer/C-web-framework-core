@@ -109,6 +109,40 @@ int appconfig_threads_alive(void);
 void appconfig_set_terminating(void);
 int  appconfig_terminating(void);
 
+/* ---- The worker startup barrier ---- *
+ *
+ * A worker binds its own listening sockets, and it does so *after*
+ * module_loader_init has returned -- all that function does on its way out is
+ * create the threads. So "the server has started" was not something the main
+ * thread could know, and a bind that failed (a privileged port, an address
+ * already taken) produced the worst possible outcome: a process that stayed
+ * alive, listened on nothing, and reported success. The failing worker did
+ * invoke the shutdown callback, but the main thread was parked in sigwait() and
+ * nothing woke it, so the process did not even exit.
+ *
+ * These counters are how the workers answer. Every thread that gets created is
+ * counted as expected, and each one then reports exactly once -- listening, or
+ * failed. appconfig_wait_workers() turns that into an answer the main thread can
+ * act on, which is what finally makes the process's exit status mean "the server
+ * is serving".
+ *
+ * File statics rather than fields of appconfig_t, for the two reasons the thread
+ * counter above gives: the struct crosses into application handlers through
+ * libcwfr_framework.so, and the last thread out frees the config. Process-wide is
+ * also the right scope -- only the initial startup waits, and a reload's workers
+ * go on counting into the same numbers with nobody reading them. */
+void appconfig_worker_expected(void);
+void appconfig_worker_listening(void);
+void appconfig_worker_failed(void);
+
+/* Block until every created worker has reported. 1 when all of them are
+ * listening, 0 when at least one could not start.
+ *
+ * Returns on the first failure rather than waiting for the rest: the worker that
+ * failed has already asked every other one to shut down, so what the remaining
+ * reports would add is delay, not information. */
+int appconfig_wait_workers(void);
+
 const char* env_get_string(const char* key, const char* default_value);
 /* 1 = present and valid, 0 = absent, -1 = present with the wrong type/range. */
 int env_get_string_checked(const char* key, const char** value);

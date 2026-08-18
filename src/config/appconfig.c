@@ -19,6 +19,12 @@ static _Atomic(appconfig_t*) __appconfig = NULL;
 static atomic_int __appconfig_threads_alive = 0;
 static atomic_int __appconfig_terminating = 0;
 
+/* The worker startup barrier -- see appconfig.h for why the workers have to
+ * report at all, and why these are file statics. */
+static atomic_int __appconfig_workers_expected = 0;
+static atomic_int __appconfig_workers_listening = 0;
+static atomic_int __appconfig_workers_failed = 0;
+
 static const char* __appconfig_get_path(int argc, char* argv[]);
 static void __appconfig_env_init(env_t* env);
 static void __appconfig_env_free(env_t* env);
@@ -176,6 +182,47 @@ void appconfig_set_terminating(void) {
 
 int appconfig_terminating(void) {
     return atomic_load(&__appconfig_terminating);
+}
+
+void appconfig_worker_expected(void) {
+    atomic_fetch_add(&__appconfig_workers_expected, 1);
+}
+
+void appconfig_worker_listening(void) {
+    atomic_fetch_add(&__appconfig_workers_listening, 1);
+}
+
+void appconfig_worker_failed(void) {
+    atomic_fetch_add(&__appconfig_workers_failed, 1);
+}
+
+int appconfig_wait_workers(void) {
+    /* Counted rather than signalled through a condition variable: this is waited
+     * on once, for a few milliseconds, by one thread. A condvar would have to be
+     * created, published to the workers and destroyed somewhere -- state that
+     * outlives the single moment it is for.
+     *
+     * `expected` is final by the time anybody gets here: it is raised as each
+     * thread is created, and every creation happens before module_loader_init
+     * returns, which is before the caller may wait. A worker that reports before
+     * its own count is raised is therefore harmless -- both numbers only grow,
+     * and "all of them reported" cannot be true early.
+     *
+     * Unbounded, deliberately. A worker's startup is a bind, an epoll
+     * registration and a few allocations; there is nothing in it to block on. A
+     * deadline here could only turn a slow start into a false failure, and the
+     * whole point of this function is to stop the process from lying about
+     * whether it started. */
+    for (;;) {
+        if (atomic_load(&__appconfig_workers_failed) > 0)
+            return 0;
+
+        if (atomic_load(&__appconfig_workers_listening) >=
+            atomic_load(&__appconfig_workers_expected))
+            return 1;
+
+        usleep(1000);
+    }
 }
 
 void __appconfig_env_init(env_t* env) {

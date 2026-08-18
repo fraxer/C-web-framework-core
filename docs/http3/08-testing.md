@@ -3241,6 +3241,7 @@ docker run -d --name hap --network host --ulimit nofile=65536:65536 \
 tests/ci.sh                      # все стадии
 tests/ci.sh release              # полный обязательный release-gate
 tests/ci.sh h3unit asan tsan     # подмножество, в указанном порядке
+tests/ci.sh startup              # неудачный старт даёт ненулевой код возврата
 tests/ci.sh limits               # connection/memory exhaustion и drain
 SOAK_REQUESTS=10000 tests/ci.sh soak
 tests/ci.sh earlydata            # 0-RTT: приём, счётчики и анти-повтор
@@ -3259,6 +3260,7 @@ REQUIRE_H3SPEC=1 tests/ci.sh h3spec  # только обязательный h3s
 | `noh3` | сборка без h3 + юнит-тесты | 1 |
 | `h3unit` | отдельный QUIC/H3/QPACK runner | 1–3 |
 | `config` | неверные типы/диапазоны HTTP/3 останавливают запуск; неверный reload-кандидат не останавливает текущее поколение | 1–3, 5 |
+| `startup` | сервер, который не поднялся, выходит с ненулевым кодом и не остаётся в живых — в обоих режимах запуска (`-f` и с отделением от терминала), для обеих причин: отвергнутый конфиг и адрес, который валиден, но не привязывается. Контроль — тот же конфиг на рабочем адресе стартует и отвечает | 1, 5 |
 | `limits` | 64 занятых QUIC slots, отказ лишним соединениям, CRYPTO memory refusal и возврат обоих gauges к нулю | 3, 7 |
 | `soak` | 1000 запросов обычно, 10000 в release; loss/reorder/dup, migration, drain gauges и RSS около прогретого baseline | 7 |
 | `earlydata` | 0-RTT: запрос едет в early data и обслуживается, счётчики `early_data.*` растут, флайт с незавершённым рукопожатием **не** доходит до диспетчера (`http3.requests` не растёт), и без ключа early data отвергается | 1–3 |
