@@ -372,9 +372,35 @@ TEST(test_quic_cc_bbr_pacing) {
     cc.cwnd = 1ULL << 40;   /* absurd, to prove the window is not the source */
     quicpacer_allowance(&pacer, &cc, 50000, 3000000);
 
-    TEST_ASSERT(pacer.tokens <= pacer.burst_limit, "the burst cap still holds");
-    TEST_ASSERT(pacer.burst_limit < rate,
-                "and one second of the measured rate exceeds it, so the cap is what shows");
+    /* One second of the measured rate refilled the bucket; what is left in it
+     * is the cap -- a millisecond of that same rate, or the initial window when
+     * that is larger. The window is absurd here on purpose, so it is not the
+     * bound; which of the other two applies depends on the rate BBR measured,
+     * and the point of the assertion is that a *second* of the rate is not it. */
+    const uint64_t rate_burst = rate / 1000;
+    const uint64_t expected_burst = rate_burst > pacer.burst_floor
+                                    ? rate_burst : pacer.burst_floor;
+    TEST_ASSERT(expected_burst < rate,
+                "the cap is far below a second of the measured rate");
+    TEST_ASSERT_EQUAL_UINT(expected_burst, pacer.tokens,
+                           "the bucket caps at a millisecond of the rate, or at the initial window");
+
+    TEST_CASE("a slow path keeps the initial window as its burst");
+    /* The floor is what applies wherever a millisecond of rate is less than a
+     * datagram -- which is every path this pacing was written for. */
+    quiccc_t slow;
+    quiccc_init(&slow, MTU);
+    quicpacer_t slow_pacer;
+    quicpacer_init(&slow_pacer, &slow, 1);
+
+    slow.cwnd = 1ULL << 40;
+    /* 10 Mbps at 200 ms: a millisecond of it is under one datagram. */
+    slow.pacing_rate = 1250000;
+    quicpacer_allowance(&slow_pacer, &slow, 200000, 1000000);
+    quicpacer_consume(&slow_pacer, slow_pacer.tokens);
+    quicpacer_allowance(&slow_pacer, &slow, 200000, 2000000);
+    TEST_ASSERT_EQUAL_UINT(slow_pacer.burst_floor, slow_pacer.tokens,
+                           "the initial window is the burst on a slow path");
 
     TEST_CASE("the deadline follows the controller's rate too");
     quicpacer_consume(&pacer, pacer.tokens);

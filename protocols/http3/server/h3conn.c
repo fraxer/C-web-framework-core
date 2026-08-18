@@ -922,13 +922,23 @@ static void __write_ready_pass(h3conn_t* c, quicconn_t* qc, int bucket, int matc
      *
      * Read per pass rather than per turn: the urgent pass is expected to spend
      * it, and the second pass has to see that it did. */
-    const int budget_spent = quicconn_write_room(qc) < H3_WRITE_MIN_ROOM;
-
     for (quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
         h3stream_t* st = h3conn_request_of(qs);
         if (st == NULL || st->response_done) continue;
         if (!atomic_load_explicit(&st->response_ready, memory_order_acquire)) continue;
-        if (budget_spent && st->response_headers_sent) continue;
+        /* Re-read per stream, not once per pass. One budget is shared by every
+         * stream of the connection, and the streams ahead in this very loop
+         * spend it: read once, the streams behind them still ran the whole
+         * filter chain to reach the terminal stage and be told room == 0.
+         * Measured on the 57 KB x c=100 profile: 2.01 M of 2.15 M entries into
+         * the body writer -- 94 % -- wrote nothing at all for that reason.
+         *
+         * It costs nothing to ask here: the turn opened the write budget
+         * (quicconn_budget_open), so quicconn_write_room is a subtraction on a
+         * cached value rather than the walk over every stream it is outside
+         * one. */
+        if (quicconn_write_room(qc) < H3_WRITE_MIN_ROOM &&
+            st->response_headers_sent) continue;
         if (bucket >= 0 && (qs->sched_urgency == bucket) != match) continue;
         if (only_id != H3_STREAM_ID_NONE && qs->id != only_id) continue;
 

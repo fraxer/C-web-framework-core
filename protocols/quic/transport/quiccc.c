@@ -769,8 +769,8 @@ void quicpacer_init(quicpacer_t* pacer, const quiccc_t* cc, int enabled) {
     memset(pacer, 0, sizeof * pacer);
 
     pacer->enabled = enabled;
-    pacer->burst_limit = cc->cwnd;   /* the initial window -- see the header */
-    pacer->tokens = pacer->burst_limit;
+    pacer->burst_floor = cc->cwnd;   /* the initial window -- see the header */
+    pacer->tokens = pacer->burst_floor;
 }
 
 /* §7.7: the interval between packets is smoothed_rtt * size / (N * cwnd), with
@@ -806,11 +806,19 @@ size_t quicpacer_allowance(quicpacer_t* pacer, const quiccc_t* cc,
     if (rate == UINT64_MAX) {
         /* No RTT sample yet -- the first flight of a connection. Pacing it
          * would delay the handshake for no benefit. */
-        pacer->tokens = pacer->burst_limit;
+        pacer->tokens = pacer->burst_floor;
     }
     else {
+        /* One millisecond of the current rate, never below the initial window
+         * and never above what may be in flight anyway: tokens past the window
+         * are unusable (the allowance below is the smaller of the two) and
+         * would only let an idle connection resume with a dump. */
+        uint64_t burst = rate / (1000000ULL / QUICPACER_BURST_US);
+        if (burst < pacer->burst_floor) burst = pacer->burst_floor;
+        if (burst > cc->cwnd) burst = cc->cwnd;
+
         pacer->tokens += rate * elapsed / 1000000ULL;
-        if (pacer->tokens > pacer->burst_limit) pacer->tokens = pacer->burst_limit;
+        if (pacer->tokens > burst) pacer->tokens = burst;
     }
 
     const size_t window = quiccc_available(cc);

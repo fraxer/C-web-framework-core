@@ -60,6 +60,12 @@ CORE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BACKEND_DIR=$(cd "$CORE_DIR/.." && pwd)
 
 CI_BUILD_DIR=${CI_BUILD_DIR:-/tmp/cwfr-ci}
+
+# Where the benchmark baseline lives when nobody names one. Outside the build
+# directory on purpose: a baseline is a property of the machine, and wiping a
+# build tree must not silently disarm the regression check. Under $HOME so it
+# survives a reboot, which /tmp does not.
+DEFAULT_BENCH_BASELINE=${DEFAULT_BENCH_BASELINE:-${XDG_STATE_HOME:-${HOME:-$CI_BUILD_DIR}/.local/state}/cwfr/h3-baseline.json}
 FUZZ_SECONDS=${FUZZ_SECONDS:-10}
 JOBS=${JOBS:-$(nproc)}
 H3SPEC=${H3SPEC:-$(command -v h3spec || true)}
@@ -305,8 +311,32 @@ stage_benchmark() {
         return
     fi
 
-    REQUIRE_BENCHMARK="${REQUIRE_BENCHMARK:-0}" \
-    BENCH_BASELINE="${BENCH_BASELINE:-}" BENCH_RECORD="${BENCH_RECORD:-}" \
+    # A baseline nobody records is a stage nobody ever fails.
+    #
+    # The numbers cannot live in the repository -- loopback req/s depends on the
+    # CPU, the kernel, OpenSSL and the runner's topology far more than the 5 %
+    # this stage calls a regression -- so the file is per machine. What was
+    # missing is that nothing ever created it: without BENCH_BASELINE the stage
+    # printed SKIP forever, which reads like "checked, nothing to report" and is
+    # in fact "not checked, ever".
+    #
+    # So the first run on a machine records one and says so; every run after it
+    # compares. `tests/ci.sh release` deliberately keeps the old behaviour --
+    # REQUIRE_BENCHMARK=1 still fails without a baseline, because a release must
+    # be measured against a figure someone chose, not against whatever the
+    # machine happened to do the first time it was asked.
+    local require="${REQUIRE_BENCHMARK:-0}"
+    local baseline="${BENCH_BASELINE:-$DEFAULT_BENCH_BASELINE}"
+    local record="${BENCH_RECORD:-}"
+
+    if [ -z "$record" ] && [ ! -r "$baseline" ] && [ "$require" != 1 ]; then
+        record="$baseline"
+        note "no baseline on this machine yet -- recording one in $baseline;"
+        note "the next run compares against it (BENCH_RECORD= refreshes it)."
+    fi
+
+    REQUIRE_BENCHMARK="$require" \
+    BENCH_BASELINE="$baseline" BENCH_RECORD="$record" \
     H3_BENCH_PORT=18461 "$CORE_DIR/tests/h3_benchmark.sh" \
         "$CI_BUILD_DIR/limits" "$CI_BUILD_DIR/h3-benchmark"
     local status=$?

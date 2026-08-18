@@ -226,22 +226,43 @@ int quiccc_in_recovery(const quiccc_t* cc, uint64_t sent_us);
  *
  * A token bucket refilled from the send rate, with the burst capped so that a
  * connection that has been idle does not resume by dumping a full window. */
+/* How far ahead of its own schedule the sender may run, in microseconds. The
+ * token bucket is capped at this much of the current rate rather than at a
+ * fixed number of bytes, which is the usual way to size a bucket and the only
+ * one that means the same thing on a 10 Mbps path and on a 10 Gbps one.
+ *
+ * A millisecond is the same quantum Linux's fq qdisc uses, and it is chosen for
+ * the same reason: below it the sender pays a wake-up per packet or two, above
+ * it the burst starts to be something a queue notices. */
+#define QUICPACER_BURST_US 1000
+
 typedef struct quicpacer {
     uint64_t tokens;         /* bytes that may be sent now */
     uint64_t last_us;
-    uint64_t burst_limit;
+    /* The floor under the bucket: the initial congestion window, which is what
+     * §7.7 permits a sender to burst with regardless of rate. On a slow path a
+     * millisecond of rate is less than one datagram, so this is what applies. */
+    uint64_t burst_floor;
     int      enabled;
 } quicpacer_t;
 
-/* The burst limit is the controller's *initial* window, which is why this takes
+/* The burst floor is the controller's *initial* window, which is why this takes
  * the controller and must be called right after it is initialised. §7.2 defines
- * the initial window as precisely the burst a sender may open a path with, and
- * §7.7 recommends no larger burst later on -- so a connection sends its opening
- * flight exactly as it would with no pacer at all, an operator who raised
- * http3_initcwnd_packets gets the burst they asked for, and every later release
- * of a grown window is spread instead of dumped. That last case is the one that
- * matters in steady state: a single cumulative acknowledgement can free a
- * window many times the initial one. */
+ * the initial window as precisely the burst a sender may open a path with, so a
+ * connection sends its opening flight exactly as it would with no pacer at all,
+ * and an operator who raised http3_initcwnd_packets gets the burst they asked
+ * for.
+ *
+ * Above that floor the bucket follows the rate (QUICPACER_BURST_US), bounded by
+ * the congestion window. Freezing it at the initial window instead -- which is
+ * what this did -- does not slow a fast connection down, because the *rate* is
+ * unchanged; it chops the flight into pieces of that size. Measured on the
+ * 57 KB x c=100 profile: 72 % of send turns ended on the pacer, each having
+ * produced 3.8 datagrams, so one 57 KB response cost twelve wake-ups and
+ * fourteen UDP messages instead of a couple of large ones -- pure syscall and
+ * cache cost for bytes the pacer was going to allow anyway (docs/http3/08 §11).
+ * The window still bounds what may be in flight, and on a path slow enough for
+ * the burst to matter a millisecond of rate is under one datagram. */
 void quicpacer_init(quicpacer_t* pacer, const quiccc_t* cc, int enabled);
 
 /* Bytes the pacer permits at `now_us`, given the window and RTT. Returns 0 when

@@ -1617,8 +1617,14 @@ TEST(test_quic_stand_stream_cancel) {
     TEST_ASSERT(__respond_body(s, qs, body, total, 0), "queued on the stream");
 
     /* Let a little of it out, so the cancellation lands in the middle of a
-     * transfer rather than before one. */
-    __run(s, 60000, NULL);
+     * transfer rather than before one.
+     *
+     * Short on purpose, and it had to get shorter: with the pacer's burst tied
+     * to the rate rather than frozen at the initial window (quiccc.h), 60 ms of
+     * this stand's path is enough for the whole 128 KB to leave the server, and
+     * the case being tested -- a reset that arrives while bytes are still
+     * queued -- stops happening at all. The assertion below is what noticed. */
+    __run(s, 20000, NULL);
 
     const size_t before = quicclient_stream_readable(&s->client, 0);
     TEST_ASSERT(before > 0 && before < total, "part of the body is on its way");
@@ -2826,6 +2832,12 @@ TEST(test_quic_stand_qlog) {
 }
 
 
+/* The search has finished: nothing outstanding, and the size has moved. */
+static int __pmtu_settled(stand_t* s) {
+    return s->conn != NULL && !s->conn->pmtud.outstanding &&
+           s->conn->pmtud.current == s->conn->pmtud.ceiling;
+}
+
 TEST(test_quic_stand_dplpmtud) {
     TEST_SUITE("quic_stand");
 
@@ -2854,12 +2866,9 @@ TEST(test_quic_stand_dplpmtud) {
     TEST_ASSERT(base == QUIC_DEFAULT_UDP_PAYLOAD, "the search starts at the safe base");
     TEST_ASSERT(ceiling > base, "and has somewhere to go over IPv4");
 
-    /* Big enough to outlast the first probe window: the search is held off for
-     * ten PTOs after the handshake (~1.5 s at this stand's 20 ms path), so a
-     * transfer that ends sooner never leaves the base size -- which is a real
-     * property of this server worth knowing, and the reason this test moves
-     * half a megabyte rather than the 64 KB the loss test moves. */
-    const size_t total = 512 * 1024;
+    /* A probe is only attempted when there is enough queued to make a larger
+     * packet worth having -- four datagrams' worth (quicconn_send). */
+    const size_t total = 256 * 1024;
     uint8_t* body = malloc(total);
     TEST_REQUIRE_NOT_NULL(body, "body allocated");
     memset(body, 'x', total);
@@ -2888,6 +2897,54 @@ TEST(test_quic_stand_dplpmtud) {
 
     TEST_ASSERT(have == total, "the whole body arrived");
     TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
+    TEST_ASSERT(s->conn->pmtud.current == base,
+                "the first transfer is still at the base size");
+
+    /* The search is held off for ten PTOs after the handshake, and on this
+     * stand's path that is longer than a 256 KB transfer takes -- which is
+     * itself worth knowing: a connection that serves one response and stops
+     * never leaves the base packet size, whatever the path allows.
+     *
+     * So the test does what a real connection does next: it waits out the
+     * window and asks again. */
+    const uint64_t wait_us = s->conn->pmtud.next_probe_us > __now_us
+                             ? s->conn->pmtud.next_probe_us - __now_us + 1000 : 1000;
+    __run(s, wait_us, NULL);
+
+    TEST_REQUIRE_NOT_NULL(s->conn, "still connected while the probe window opens");
+    TEST_ASSERT(quicpmtud_should_probe(&s->conn->pmtud, __now_us),
+                "and the search is now allowed to begin");
+
+    /* A second request on a second stream, with enough queued behind it that a
+     * probe is worth sending. */
+    TEST_ASSERT(quicclient_stream_write(&s->client, 4, (const uint8_t*)"GET", 3, 1), "second request");
+    TEST_ASSERT(quicclient_flush(&s->client), "sent");
+    __run(s, 200000, NULL);
+    TEST_ASSERT(__consume_request(s, 4), "the second request was read");
+
+    quicstream_t* qs2 = quicconn_stream_find(s->conn, 4);
+    TEST_REQUIRE_NOT_NULL(qs2, "the server has the second stream");
+    TEST_ASSERT(__respond_body(s, qs2, body, total, 1), "queued on the second stream");
+
+    size_t have2 = 0;
+    for (int round = 0; round < 40000 && have2 < total; round++) {
+        if (!__step(s, __now_us + 60000000)) break;
+
+        const size_t ready = quicclient_stream_readable(&s->client, 4);
+        if (ready == 0) continue;
+
+        have2 += quicclient_stream_read(&s->client, 4, got + have2,
+                                        total - have2 < ready ? total - have2 : ready);
+    }
+
+    TEST_ASSERT(have2 == total, "the second body arrived too");
+    TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
+
+    /* The probe rides the transfer, but its acknowledgement may arrive after
+     * the last body byte the client reads -- so the search is given the round
+     * trip it is waiting on rather than being judged at the moment the loop
+     * above happens to end. */
+    __run(s, 1000000, __pmtu_settled);
     TEST_ASSERT(s->conn->pmtud.current == ceiling,
                 "and the probe was acknowledged, so the packet size rose to the ceiling");
     TEST_ASSERT(s->conn->cc.max_datagram_size == s->conn->pmtud.current,

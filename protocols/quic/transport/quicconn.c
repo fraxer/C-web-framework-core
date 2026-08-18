@@ -23,8 +23,16 @@
 
 /* Datagrams built per quicconn_send call. A cap rather than a loop to
  * exhaustion: one connection must not hold the worker while a large flight or
- * a large response goes out. Whatever is left keeps want_write raised. */
-#define QUICCONN_SEND_ROUNDS 4
+ * a large response goes out. Whatever is left keeps want_write raised.
+ *
+ * Four for a long time, and four was too few for a reason that has nothing to
+ * do with fairness: consecutive datagrams of one connection are what the
+ * transmit batch coalesces into a single GSO message (udpsocket.c), so a turn
+ * that stops at four caps the run at four however much the pacer and the window
+ * would have allowed. The batch itself holds ~32 datagrams, which is where this
+ * number comes from; the congestion window and the pacer stop the loop long
+ * before it on any real path. */
+#define QUICCONN_SEND_ROUNDS 32
 
 /* What __build_packet holds back for the header it has not written yet: a long
  * header with two connection ids, a length and a packet number fits inside it
@@ -2152,11 +2160,77 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
      * a 1200-byte stack buffer. Such a `cap` is not hypothetical -- the tail of
      * the anti-amplification budget is exactly that shape, and it smashed the
      * stack a few hundred handshakes in. */
-    if (cap < QUIC_AEAD_TAG_LEN + QUICCONN_HEADER_RESERVE + QUICCONN_MIN_PAYLOAD)
+    /* What the header will actually take, rather than what would always be
+     * enough. For a 1-RTT packet -- every packet of a response -- it is one
+     * flags byte, the peer's connection id and the packet number, all three
+     * known before a single frame is written; the generous 64-byte reserve was
+     * 51 bytes of every datagram left empty, so no packet ever reached the
+     * PLPMTU. Long headers keep the reserve: their length field is sized from
+     * the payload that has not been written yet, they carry two connection ids
+     * and a token, and they exist only during a handshake -- the arithmetic is
+     * worth more there than the bytes.
+     *
+     * The point is not only the 4 % of capacity. Datagrams that stop short of
+     * the path MTU stop at *different* lengths, and a GSO run ends at the first
+     * size change (udpsocket.c), so short packets also shorten every send
+     * message the kernel receives. */
+    size_t header_reserve = QUICCONN_HEADER_RESERVE;
+
+    if (level == QUIC_ENC_APP && conn->peer_cid_count > 0)
+        header_reserve = 1 + conn->peer_cids[0].len +
+                         quicpkt_pn_length(conn->loss.space[level].next_pn,
+                                           conn->loss.space[level].largest_acked);
+
+    if (cap < QUIC_AEAD_TAG_LEN + header_reserve + QUICCONN_MIN_PAYLOAD)
         return 0;
 
-    uint8_t payload[QUICCONN_MAX_PACKET];
+    /* Where the frames are assembled.
+     *
+     * For a 1-RTT packet -- every packet of a response -- that is the datagram
+     * itself, right behind the header, and the AEAD then encrypts in place. The
+     * alternative, which this used to do, is to build in a stack buffer and let
+     * the AEAD copy it into the datagram: one full copy of every byte the
+     * server sends, and it was visible as such (memmove was the largest single
+     * symbol in the profile at 11 %).
+     *
+     * It is possible only because a short header's length is knowable before
+     * any frame is written -- one flags byte, the peer's connection id, the
+     * packet number -- so the header can go down first and the payload can
+     * start at a known offset. A long header cannot: its Length field is sized
+     * from the payload that does not exist yet, so Initial and Handshake keep
+     * the buffer. They are a handful of packets per connection. */
+    uint8_t staging[QUICCONN_MAX_PACKET];
+    uint8_t* payload = staging;
     size_t p = 0;
+
+    /* Written now for a short header, at the end for a long one. */
+    size_t header_len = 0;
+    size_t pn_offset = 0;
+    const uint64_t pn = conn->loss.space[level].next_pn;
+    const size_t pn_len = quicpkt_pn_length(pn, conn->loss.space[level].largest_acked);
+    quiccid_t* dcid = conn->peer_cid_count > 0 ? &conn->peer_cids[0] : NULL;
+
+    if (dcid == NULL) return 0;
+
+    quicpkt_hdr_out_t hdr;
+    memset(&hdr, 0, sizeof hdr);
+    hdr.type = level == QUIC_ENC_INITIAL ? QUIC_PKT_INITIAL
+             : level == QUIC_ENC_HANDSHAKE ? QUIC_PKT_HANDSHAKE
+                                           : QUIC_PKT_SHORT;
+    hdr.version = QUIC_VERSION_1;
+    hdr.dcid = dcid;
+    hdr.scid = &conn->local_cids[0].cid;
+    hdr.pn = pn;
+    hdr.pn_len = pn_len;
+    /* Ignored for long headers, which have no such bit. */
+    hdr.key_phase = conn->key_phase;
+
+    if (hdr.type == QUIC_PKT_SHORT) {
+        header_len = quicpkt_write_header(dst, cap, &hdr, &pn_offset);
+        if (header_len == 0) return 0;
+
+        payload = dst + header_len;
+    }
     int ack_eliciting = 0;
     quicframe_ref_t* refs = NULL;
 
@@ -2168,9 +2242,13 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
     unsigned long long visits_data = 0;
     unsigned long long stream_frames = 0;
 
-    const size_t payload_cap =
-        (cap - QUIC_AEAD_TAG_LEN > sizeof payload ? sizeof payload : cap - QUIC_AEAD_TAG_LEN)
-        - QUICCONN_HEADER_RESERVE;
+    /* What the frames may occupy: the datagram less the header that is already
+     * written (or reserved) and the tag the AEAD will append. The staging
+     * buffer bounds it too, for the long-header path that still uses one. */
+    const size_t room_after_header =
+        cap - QUIC_AEAD_TAG_LEN - (header_len > 0 ? header_len : header_reserve);
+    const size_t payload_cap = room_after_header > sizeof staging
+                               ? sizeof staging : room_after_header;
 
     /* An ACK first: it is what unblocks the peer, and it is cheap. */
     size_t ack_len = 0;
@@ -2772,36 +2850,37 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
      * protection sample exists. */
     const int needs_padding = (level == QUIC_ENC_INITIAL);
 
-    const uint64_t pn = conn->loss.space[level].next_pn;
-    const size_t pn_len = quicpkt_pn_length(pn, conn->loss.space[level].largest_acked);
-
-    quiccid_t* dcid = conn->peer_cid_count > 0 ? &conn->peer_cids[0] : NULL;
-    if (dcid == NULL) {
-        quicframe_ref_free(refs);
-        return 0;
-    }
-
-    quicpkt_hdr_out_t hdr;
-    memset(&hdr, 0, sizeof hdr);
-    hdr.type = level == QUIC_ENC_INITIAL ? QUIC_PKT_INITIAL
-             : level == QUIC_ENC_HANDSHAKE ? QUIC_PKT_HANDSHAKE
-             : QUIC_PKT_SHORT;
-    hdr.version = QUIC_VERSION_1;
-    hdr.dcid = dcid;
-    hdr.scid = &conn->local_cids[0].cid;
-    hdr.pn = pn;
-    hdr.pn_len = pn_len;
-    /* Ignored for long headers, which have no such bit. */
-    hdr.key_phase = conn->key_phase;
-    hdr.payload_len = p + QUIC_AEAD_TAG_LEN;
-
-    size_t pn_offset = 0;
-    const size_t header_len = quicpkt_write_header(dst, cap, &hdr, &pn_offset);
+    /* A long header could not be written before its payload existed: its Length
+     * field is sized from it. The short header went down before the frames. */
     if (header_len == 0) {
+        hdr.payload_len = p + QUIC_AEAD_TAG_LEN;
+
+        header_len = quicpkt_write_header(dst, cap, &hdr, &pn_offset);
+        if (header_len == 0) {
+            quicframe_ref_free(refs);
+            return 0;
+        }
+    }
+
+    /* The payload was sized against a header this code predicted. If the
+     * prediction was ever short, the seal below would write past `cap` -- so
+     * the prediction is checked rather than trusted, and a miss drops the
+     * packet instead of corrupting the datagram after it. It cannot fire for a
+     * short header (the header is already written, and the payload was sized
+     * against its actual length) and cannot fire for a long one (the reserve is
+     * far larger than any header): if it ever does, the arithmetic above and
+     * this line disagree, and that is a defect worth the log. */
+    if (header_len + p + QUIC_AEAD_TAG_LEN > cap) {
+        log_error("quic: header %zu + payload %zu + tag exceeds %zu at level %d\n",
+                  header_len, p, cap, (int)level);
         quicframe_ref_free(refs);
         return 0;
     }
 
+    /* In place when the frames were assembled in the datagram: `payload` is
+     * `dst + header_len` there, and AES-GCM and ChaCha20-Poly1305 both encrypt
+     * a buffer onto itself. Otherwise this is the copy out of the staging
+     * buffer that the long-header path still needs. */
     size_t sealed_len = 0;
     if (!quiccrypto_seal(keys, pn, dst, header_len, payload, p,
                          dst + header_len, &sealed_len)) {
@@ -3017,9 +3096,18 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
     if (conn->probe_active && conn->probe_pending)
         __path_probe_send(conn, now_us);
 
+    /* Order matters, and it is the expensive half that goes second:
+     * quicconn_unsent_bytes walks every stream of the connection, while
+     * quicpmtud_should_probe is three loads and is false almost always -- no
+     * probe is due until the timer opens, and once the search has finished
+     * (current == ceiling) it is false forever. Asked the other way round, this
+     * walk ran on every send turn of every connection: at a hundred streams it
+     * was the single hottest leaf in the profile (5.3 % in
+     * quicsendbuf_unsent_bytes alone) to answer a question whose answer was
+     * "no". */
     if (conn->state == QUICCONN_ACTIVE &&
-        quicconn_unsent_bytes(conn) >= 4 * conn->pmtud.current &&
-        quicpmtud_should_probe(&conn->pmtud, now_us))
+        quicpmtud_should_probe(&conn->pmtud, now_us) &&
+        quicconn_unsent_bytes(conn) >= 4 * conn->pmtud.current)
         __pmtu_probe_send(conn, now_us);
 
     uint8_t datagram[QUICCONN_MAX_PACKET];
@@ -3870,8 +3958,10 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
         if (pmtu_outcome & QUICPMTUD_CEILING_LOWERED)
             metrics_quic(METRICS_QUIC_PMTU_SEARCH_CEILING_LOWERED);
 
-        if (quicconn_unsent_bytes(conn) >= 4 * conn->pmtud.current &&
-            quicpmtud_should_probe(&conn->pmtud, now_us))
+        /* Same order as in the send path above, and for the same reason: the
+         * tick runs per received datagram, not per timer. */
+        if (quicpmtud_should_probe(&conn->pmtud, now_us) &&
+            quicconn_unsent_bytes(conn) >= 4 * conn->pmtud.current)
             atomic_store_explicit(&conn->want_write, 1, memory_order_release);
     }
 
