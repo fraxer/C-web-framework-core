@@ -12,6 +12,7 @@
 #include "quiccrypto.h"
 #include "quicloss.h"
 #include "quicpmtud.h"
+#include "quicqlog.h"
 #include "quicretry.h"
 #include "quicstream.h"
 #include "quictls.h"
@@ -141,6 +142,12 @@ typedef struct quicconn {
     quicack_t ack[QUIC_ENC_COUNT];
     uint8_t recv_ecn;
     int ecn_enabled;
+    /* The first ACK that echoed our ECT counts and passed §13.4.2 has been
+     * seen. Only to keep `ecn.validated` one count per connection rather than
+     * one per acknowledgement -- the transport itself needs no such state,
+     * since validation is re-checked against every ACK for the life of the
+     * connection. */
+    int ecn_validated;
     uint64_t ecn_sent[QUIC_ENC_COUNT];
     uint64_t ecn_peer_ect0[QUIC_ENC_COUNT];
     uint64_t ecn_peer_ect1[QUIC_ENC_COUNT];
@@ -318,6 +325,18 @@ typedef struct quicconn {
      * instead of once per interval. */
     uint64_t keepalive_next_us;
     int      keepalive_pending;
+
+    /* This connection's qlog, or NULL -- which is every connection unless
+     * http3_qlog_dir is set and the budget was still open when it arrived.
+     * Written only by the worker holding connection_s_lock, like everything
+     * else here. */
+    quicqlog_t* qlog;
+    /* The congestion state last written to the qlog, so the transition is what
+     * gets logged and not the state on every acknowledgement. A borrowed
+     * pointer to one of a fixed set of string literals, which is why nothing
+     * frees it. Meaningless without a log, and deliberately not readable by
+     * anything else: the controller's own state is quiccc_t's business. */
+    const char* qlog_cc_state;
 
     /* ---- What this connection cost the endpoint (docs/http3/08 §7b) ---- *
      *

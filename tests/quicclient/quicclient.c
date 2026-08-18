@@ -19,6 +19,19 @@
 #include "quictime.h"
 
 #define CLIENT_MAX_PACKET 1400
+/* What this client may RECEIVE in one packet, which is deliberately larger than
+ * what it builds.
+ *
+ * The server searches for a larger path MTU (RFC 8899) with a padded probe of
+ * up to QUIC_MAX_UDP_PAYLOAD_V4 bytes. A client that cannot open a packet that
+ * size does not reject it -- it skips it, silently, and never acknowledges it,
+ * so the probe times out and the server concludes the path is small. Against
+ * this client the search therefore failed on every path, loopback included, and
+ * that looked exactly like a defect in the server's DPLPMTUD.
+ *
+ * Found by the pmtu.* counters the moment they existed: three probes sent,
+ * three timed out, zero succeeded, on a path with a 65536-byte MTU. */
+#define CLIENT_MAX_RECV_PACKET 2048
 
 static void __log(quicclient_t* c, const char* fmt, ...)
     __attribute__((format(printf, 2, 3)));
@@ -1474,7 +1487,7 @@ static int __recv_datagram(quicclient_t* c, uint8_t* buf, size_t len) {
         const size_t header_len = pkt.pn_offset + pn_len;
         const size_t body_len = pkt.pkt_len - header_len;
 
-        uint8_t plain[CLIENT_MAX_PACKET];
+        uint8_t plain[CLIENT_MAX_RECV_PACKET];
         size_t plain_len = 0;
 
         if (body_len > sizeof plain) continue;

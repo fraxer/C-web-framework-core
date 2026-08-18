@@ -29,6 +29,7 @@
 #   fuzz     build the fuzz targets         + FUZZ_SECONDS each
 #   reload   hard reload with live QUIC      + old worker retirement
 #   softreload shared UDP handoff             + old CID/config drain
+#   qlog     traces written, bounded, off by default       (diagnostics)
 #   h3spec   run a server, run h3spec against it           (RFC conformance)
 #
 # The interop matrix (§8.6) is deliberately absent: it needs docker and tens of
@@ -272,6 +273,18 @@ stage_ipv6() {
     fi
 }
 
+stage_qlog() {
+    say "qlog: traces are written, readable, bounded, and off by default"
+    if build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes -DSANITIZE=none &&
+       H3_QLOG_PORT=18497 "$CORE_DIR/tests/h3_qlog.sh" \
+             "$CI_BUILD_DIR/limits" "$CI_BUILD_DIR/h3-qlog"; then
+        record qlog OK
+    else
+        record qlog FAIL
+    fi
+}
+
 stage_priority() {
     say "priority: urgency, incremental sharing, and the cost of no signal at all"
     if build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
@@ -488,7 +501,7 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit config startup keepalive limits soak affinity earlydata vn ipv6 priority benchmark asan tsan fuzz reload softreload h3spec)
+ALL_STAGES=(noh3 h3unit config startup keepalive limits soak affinity earlydata vn ipv6 qlog priority benchmark asan tsan fuzz reload softreload h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
@@ -514,6 +527,7 @@ for stage in "${STAGES[@]}"; do
     earlydata) stage_earlydata ;;
     vn)     stage_vn ;;
     ipv6)   stage_ipv6 ;;
+    qlog) stage_qlog ;;
     priority) stage_priority ;;
     benchmark) stage_benchmark ;;
     fuzz)   stage_fuzz ;;

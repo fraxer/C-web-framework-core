@@ -31,6 +31,7 @@
 #include "quicinvariants.h"
 #include "quicmemory.h"
 #include "quicpacket.h"
+#include "quicqlog.h"
 #include "quicretry.h"
 #include "quictime.h"
 #include "h3conn.h"
@@ -524,6 +525,11 @@ typedef struct {
     int64_t retry_threshold;
     int64_t token_lifetime_sec;
     bool new_token;
+    /* Borrowed from the env being loaded, so it is only valid for as long as
+     * the parse that produced it -- quic_policy_init copies it into the qlog
+     * module before returning, and nothing else keeps it. */
+    const char* qlog_dir;
+    int64_t qlog_connections;
 } quic_runtime_policy_t;
 
 static int __policy_i64(const env_t* source, const char* key, int64_t fallback,
@@ -603,6 +609,21 @@ static int __runtime_policy_parse(const env_t* source, quic_runtime_policy_t* p)
         log_error("quic: http3_new_token must be a boolean\n");
         return 0;
     }
+
+    /* Diagnostics (docs/http3/07 §1.2). Empty is off, which is the default:
+     * a qlog is a file per connection, and a server that writes one for every
+     * connection has been given a second denial-of-service vector by its own
+     * debugging. The ceiling on the count is not a resource bound but a
+     * reminder of the same thing. */
+    p->qlog_dir = "";
+    if (env_config_get_string_checked(source, "http3_qlog_dir", &p->qlog_dir) < 0) {
+        log_error("quic: http3_qlog_dir must be a string\n");
+        return 0;
+    }
+
+    if (!__policy_i64(source, "http3_qlog_connections", 10, 0, 100000,
+                      &p->qlog_connections)) return 0;
+
     return 1;
 }
 
@@ -662,6 +683,12 @@ int quic_policy_init(void) {
     atomic_store(&__quic_token_lifetime_us,
                  (uint64_t)runtime.token_lifetime_sec * 1000000ULL);
     atomic_store(&__quic_new_token, runtime.new_token);
+
+    /* After every value has been validated, like the rest of this function:
+     * a failed reload must not leave qlog pointing at a directory the rest of
+     * the configuration was rejected for. */
+    if (!quicqlog_configure(runtime.qlog_dir, (unsigned)runtime.qlog_connections))
+        return 0;
 
     /* ---- Everything below is created once per process ---- *
      *
@@ -1697,6 +1724,19 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
     metrics_quic(METRICS_QUIC_DGRAM_RECEIVED);
     metrics_quic_add(METRICS_QUIC_BYTES_RECEIVED, (unsigned long long)dgram->len);
 
+    /* The codepoint the path delivered, counted before anything can drop the
+     * datagram: what a middlebox does to the ECN field is a property of the
+     * path and not of the connection, and half the reason to look here at all
+     * is a datagram that never reaches one. rx.ce in particular is a router
+     * saying it is congested, which is worth seeing even when the datagram
+     * behind it turns out to be noise. */
+    switch (dgram->ecn & 0x03) {
+    case 0x00: metrics_quic(METRICS_QUIC_ECN_RX_NOT_ECT); break;
+    case 0x01: metrics_quic(METRICS_QUIC_ECN_RX_ECT1);    break;
+    case 0x02: metrics_quic(METRICS_QUIC_ECN_RX_ECT0);    break;
+    default:   metrics_quic(METRICS_QUIC_ECN_RX_CE);      break;
+    }
+
     /* The kernel's own drop counter is cumulative, so what is reported is the
      * step since the last datagram that carried it. Wrap-around is handled by
      * unsigned arithmetic; a step that huge means something else is wrong
@@ -2116,6 +2156,17 @@ static int __endpoint_read(connection_t* connection) {
                 dgram->len > dgram->gro_segment_size) {
                 const size_t total = dgram->len;
                 uint8_t* const data = dgram->data;
+
+                /* Counted here rather than per segment below, and as a pair:
+                 * one buffer, N datagrams out of it. The ratio is the only
+                 * report GRO makes of itself -- the socket option is allowed to
+                 * fail silently, so a kernel without offload looks exactly like
+                 * a quiet server unless these two are read. */
+                metrics_quic(METRICS_QUIC_RECV_GRO_MESSAGES);
+                metrics_quic_add(METRICS_QUIC_RECV_GRO_SEGMENTS,
+                                 (total + dgram->gro_segment_size - 1) /
+                                 dgram->gro_segment_size);
+
                 for (size_t off = 0; off < total; off += dgram->gro_segment_size) {
                     udp_datagram_t segment = *dgram;
                     segment.data = data + off;

@@ -120,6 +120,21 @@ typedef enum {
      * the number that says whether batching is earning anything. */
     METRICS_QUIC_RECV_CALLS,
 
+    /* Receive offload (UDP_GRO), the counterpart of the send.gso_* pair below.
+     * The kernel hands back one buffer holding several equally-sized datagrams,
+     * and the endpoint splits it again -- so without these two, a coalesced
+     * receive is indistinguishable from an ordinary one and `recv_calls`
+     * silently stops meaning "syscalls per datagram".
+     *
+     * `gro_messages` counts the coalesced buffers, `gro_segments` the datagrams
+     * taken out of them; segments/messages is the coalescing factor, and it
+     * being 1 (or messages staying at zero under load) is how a kernel or a
+     * container that refused UDP_GRO announces itself. There is no other sign:
+     * the setsockopt failure is tolerated on purpose, because an endpoint must
+     * start without offload. */
+    METRICS_QUIC_RECV_GRO_MESSAGES,
+    METRICS_QUIC_RECV_GRO_SEGMENTS,
+
     /* Transmit batching/offload. datagrams_sent alone cannot distinguish a
      * healthy GSO path from hundreds of thousands of one-packet messages. */
     METRICS_QUIC_SEND_BATCH_CALLS,
@@ -201,6 +216,54 @@ typedef enum {
      * timeout pushed the interval past their lifetime. */
     METRICS_QUIC_KEEPALIVE_SENT,
     METRICS_QUIC_PERSISTENT_CONGESTION,
+
+    /* ---- ECN (RFC 9000 §13.4) ---- *
+     *
+     * ECN is the one mechanism here whose failure mode is silence: packets are
+     * marked, the path bleaches or rewrites the codepoints, §13.4.2's
+     * validation turns ECN off for that connection, and nothing anywhere says
+     * so. From outside it looks exactly like a path that never congests.
+     *
+     * `tx_marked` is packets we sent as ECT(0); the rx.* four are what arrived
+     * at us, by codepoint (rx.ce is a router telling *us* to slow down, and it
+     * is what the peer's congestion response is owed to). `ce_congestion` is
+     * the other direction: an ACK reporting more CE-marked packets than last
+     * time, which is a congestion signal acted on without a single packet being
+     * lost -- the whole point of ECN, and invisible in packets_lost.
+     *
+     * `validated` counts connections whose first ECN-bearing ACK checked out,
+     * `validation_failed` those that lost ECN afterwards. Read as a pair they
+     * separate "this path does not support ECN" from "this path is mangling
+     * it", which are different operator problems: the first is normal, the
+     * second is a middlebox worth naming. */
+    METRICS_QUIC_ECN_TX_MARKED,
+    METRICS_QUIC_ECN_RX_NOT_ECT,
+    METRICS_QUIC_ECN_RX_ECT0,
+    METRICS_QUIC_ECN_RX_ECT1,
+    METRICS_QUIC_ECN_RX_CE,
+    METRICS_QUIC_ECN_CE_CONGESTION,
+    METRICS_QUIC_ECN_VALIDATED,
+    METRICS_QUIC_ECN_VALIDATION_FAILED,
+
+    /* ---- DPLPMTUD (RFC 8899) ---- *
+     *
+     * The search that decides how large every datagram of a connection may be.
+     * It costs throughput when it fails and connectivity when it fails badly
+     * (a raised size that the path silently drops is a black hole), and until
+     * now it reported neither: `probes_sent` against `probes_succeeded` says
+     * whether the search ever finishes, `probes_lost` how many attempts it
+     * costs, `search_ceiling_lowered` that it gave up below the link MTU, and
+     * `blackholes` that a raised size had to be taken back after repeated PTOs.
+     *
+     * The size actually in use is the `pmtu_bytes` histogram below rather than
+     * a counter: what matters is where the mass sits (everything stuck at the
+     * 1200-byte base is a very different server from everything at 1452), and
+     * a mean over connections would hide exactly that split. */
+    METRICS_QUIC_PMTU_PROBES_SENT,
+    METRICS_QUIC_PMTU_PROBES_SUCCEEDED,
+    METRICS_QUIC_PMTU_PROBES_LOST,
+    METRICS_QUIC_PMTU_SEARCH_CEILING_LOWERED,
+    METRICS_QUIC_PMTU_BLACKHOLES,
 
     /* Why the send loop stopped short. Congestion is expected; the other two
      * are the ones that turn into "the server is slow" reports. */
@@ -322,6 +385,9 @@ void metrics_quic_add(metrics_quic_t kind, unsigned long long amount);
  * answered by which bucket the mass sits in, and that costs one add. */
 void metrics_quic_rtt(uint64_t rtt_us);
 void metrics_quic_cwnd(uint64_t bytes);
+/* The packet size a connection settled on, sampled whenever DPLPMTUD changes
+ * it: once per successful probe, and once per black hole that takes it back. */
+void metrics_quic_pmtu(uint64_t bytes);
 void metrics_quic_connections(size_t current, size_t limit);
 void metrics_quic_handshakes(size_t inflight);
 void metrics_quic_memory(size_t current, size_t limit, unsigned long long refused);

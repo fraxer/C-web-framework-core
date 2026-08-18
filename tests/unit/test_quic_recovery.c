@@ -420,9 +420,39 @@ TEST(test_quic_dplpmtud) {
                 "the probe packet ACK confirms PLPMTU");
     TEST_ASSERT(p.current == 1472, "confirmed size becomes the packet size");
 
-    quicpmtud_on_blackhole(&p, 50000, 10000);
+    TEST_ASSERT(quicpmtud_on_blackhole(&p, 50000, 10000),
+                "a black hole reports that it took a raised size back");
     TEST_ASSERT(p.current == 1350, "black hole falls back to the safe base");
     TEST_ASSERT(p.ceiling == 1471, "failed size is excluded from the next search");
+    TEST_ASSERT(!quicpmtud_on_blackhole(&p, 60000, 10000),
+                "a second black hole at the base reports nothing to take back");
+
+    /* What the search reports when it fails, which is what /metrics and the
+     * qlog are written from: a lost probe every time, and the end of the search
+     * only on the last of them. Without the return value neither is visible --
+     * the size simply stops growing. */
+    TEST_CASE("a failing search reports every attempt");
+    quicpmtud_t f;
+    quicpmtud_init(&f, 1350, 1472);
+
+    uint64_t now = 1000;
+    int last = 0;
+    for (unsigned attempt = 1; attempt <= QUICPMTUD_MAX_PROBES; attempt++) {
+        TEST_ASSERT(quicpmtud_should_probe(&f, now), "another probe is due");
+        quicpmtud_candidate(&f);
+        quicpmtud_on_probe_sent(&f, 100 + attempt, now, 10000);
+        TEST_ASSERT(quicpmtud_on_timeout(&f, now + 1000) == 0,
+                    "nothing is reported before the probe deadline");
+        now += 30001;
+        last = quicpmtud_on_timeout(&f, now);
+        TEST_ASSERT(last & QUICPMTUD_PROBE_LOST, "each timed-out probe is reported lost");
+    }
+
+    TEST_ASSERT(last & QUICPMTUD_CEILING_LOWERED,
+                "the last attempt reports that the search gave up");
+    TEST_ASSERT(f.ceiling == f.current, "the ceiling drops to the size in use");
+    TEST_ASSERT(!quicpmtud_should_probe(&f, now + 1000000),
+                "and no further probe is attempted");
 }
 
 TEST(test_quic_pacer) {

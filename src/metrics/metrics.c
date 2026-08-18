@@ -41,7 +41,7 @@ static const char* const __h2_abuse_name[METRICS_H2_ABUSE__COUNT] = {
 static const char* const __quic_name[METRICS_QUIC__COUNT] = {
     "datagrams_received", "datagrams_sent",
     "bytes_received", "bytes_sent",
-    "recv_calls",
+    "recv_calls", "recv.gro_messages", "recv.gro_segments",
     "send.batch_calls", "send.messages", "send.gso_messages",
     "send.gso_segments", "send.gso_fallbacks", "send.partial",
     "drop.truncated", "drop.oversize", "drop.cid_too_long",
@@ -56,6 +56,11 @@ static const char* const __quic_name[METRICS_QUIC__COUNT] = {
     "decrypt_failures", "aead_limit_reached", "key_updates",
     "packets_lost", "pto_fired", "pto_probes_sent", "keepalive_sent",
     "persistent_congestion",
+    "ecn.tx_marked",
+    "ecn.rx.not_ect", "ecn.rx.ect0", "ecn.rx.ect1", "ecn.rx.ce",
+    "ecn.ce_congestion", "ecn.validated", "ecn.validation_failed",
+    "pmtu.probes_sent", "pmtu.probes_succeeded", "pmtu.probes_lost",
+    "pmtu.search_ceiling_lowered", "pmtu.blackholes",
     "flow_blocked.connection", "flow_blocked.stream", "amplification_limited",
     "cids_issued", "cids_announced", "streams_opened", "streams_released", "streams_reset_sent", "streams_reset_received",
     "closed.idle_timeout", "closed.local_error", "closed.peer",
@@ -66,6 +71,13 @@ static const char* const __quic_name[METRICS_QUIC__COUNT] = {
     "build.calls", "build.packets",
     "build.visits.flow", "build.visits.data", "build.stream_frames"
 };
+
+/* The names are index-matched by hand, and the enum is edited far away from
+ * them: a counter added in one place and not the other shifts every name after
+ * it, which reports real traffic under a neighbouring key -- wrong in the one
+ * way a metric must never be, and invisible until someone doubts a number. */
+_Static_assert(sizeof __quic_name / sizeof *__quic_name == METRICS_QUIC__COUNT,
+               "metrics_quic_t and __quic_name are out of step");
 
 /* Index-matched to metrics_h3_t. */
 static const char* const __h3_name[METRICS_H3__COUNT] = {
@@ -82,6 +94,9 @@ static const char* const __h3_name[METRICS_H3__COUNT] = {
     "stream_errors", "connection_errors"
 };
 
+_Static_assert(sizeof __h3_name / sizeof *__h3_name == METRICS_H3__COUNT,
+               "metrics_h3_t and __h3_name are out of step");
+
 /* Round-trip times span decades and the interesting boundaries are not decades:
  * a local test path is tens of microseconds, a healthy internet path tens of
  * milliseconds, and anything past a fifth of a second is what a user notices. */
@@ -94,6 +109,16 @@ static const char* const __rtt_bucket_name[METRICS_SAMPLE_BUCKETS] = {
  * is a different problem from a window that grew and then collapsed. */
 static const char* const __cwnd_bucket_name[METRICS_SAMPLE_BUCKETS] = {
     "<16k", "<64k", "<256k", "<1M", "<4M", ">=4M"
+};
+
+/* Packet sizes, and the boundaries are the ones the protocol and the wire put
+ * there rather than decades: 1200 is RFC 9000 §14's floor (anything below it is
+ * a black hole that went too far), 1350 the base this server starts every
+ * connection at, and 1452/1472 the payload an unencapsulated 1500-byte
+ * ethernet link leaves for IPv6 and IPv4. The question asked of this histogram
+ * is "did the search leave the base", and those are where the answer changes. */
+static const char* const __pmtu_bucket_name[METRICS_SAMPLE_BUCKETS] = {
+    "<1200", "1200-1349", "1350-1399", "1400-1451", "1452-1471", ">=1472"
 };
 #endif
 
@@ -111,6 +136,11 @@ static const char* const __lock_site_name[LOCK_SITE__COUNT] = {
     "quic.recv", "quic.send",
     "h3.publish", "h3.rearm"
 };
+
+_Static_assert(sizeof __lock_site_name / sizeof *__lock_site_name == LOCK_SITE__COUNT,
+               "metrics_lock_site_t and __lock_site_name are out of step");
+_Static_assert(sizeof __h2_abuse_name / sizeof *__h2_abuse_name == METRICS_H2_ABUSE__COUNT,
+               "metrics_h2_abuse_t and __h2_abuse_name are out of step");
 
 /* One of these per call site. The totals reported under `lock` are summed from
  * them at snapshot time rather than kept in their own counters: a second set of
@@ -164,6 +194,7 @@ typedef struct {
     atomic_ullong h3[METRICS_H3__COUNT];
     sample_series_t rtt_us;
     sample_series_t cwnd_bytes;
+    sample_series_t pmtu_bytes;
     atomic_ullong quic_connections_current;
     atomic_ullong quic_connections_limit;
     atomic_ullong quic_connections_peak;
@@ -206,6 +237,16 @@ static int __rtt_bucket(unsigned long long us) {
     if (us < 10000ULL) return 2;
     if (us < 50000ULL) return 3;
     if (us < 200000ULL) return 4;
+
+    return METRICS_SAMPLE_BUCKETS - 1;
+}
+
+static int __pmtu_bucket(unsigned long long bytes) {
+    if (bytes < 1200ULL) return 0;
+    if (bytes < 1350ULL) return 1;
+    if (bytes < 1400ULL) return 2;
+    if (bytes < 1452ULL) return 3;
+    if (bytes < 1472ULL) return 4;
 
     return METRICS_SAMPLE_BUCKETS - 1;
 }
@@ -357,6 +398,12 @@ void metrics_quic_cwnd(uint64_t bytes) {
     if (!metrics_enabled()) return;
 
     __sample_add(&__m.cwnd_bytes, bytes, __cwnd_bucket(bytes));
+}
+
+void metrics_quic_pmtu(uint64_t bytes) {
+    if (!metrics_enabled()) return;
+
+    __sample_add(&__m.pmtu_bytes, bytes, __pmtu_bucket(bytes));
 }
 
 void metrics_quic_connections(size_t current, size_t limit) {
@@ -604,6 +651,7 @@ json_doc_t* metrics_snapshot_json(void) {
 
     json_object_set(quic, "rtt_us", __sample_json(&__m.rtt_us, __rtt_bucket_name));
     json_object_set(quic, "cwnd_bytes", __sample_json(&__m.cwnd_bytes, __cwnd_bucket_name));
+    json_object_set(quic, "pmtu_bytes", __sample_json(&__m.pmtu_bytes, __pmtu_bucket_name));
 
     json_token_t* connections = json_create_object();
     if (connections != NULL) {
@@ -698,9 +746,9 @@ void metrics_reset(void) {
     for (int i = 0; i < METRICS_H3__COUNT; i++)
         atomic_store_explicit(&__m.h3[i], 0, memory_order_relaxed);
 
-    sample_series_t* series[2] = { &__m.rtt_us, &__m.cwnd_bytes };
+    sample_series_t* series[3] = { &__m.rtt_us, &__m.cwnd_bytes, &__m.pmtu_bytes };
 
-    for (int s = 0; s < 2; s++) {
+    for (int s = 0; s < 3; s++) {
         atomic_store_explicit(&series[s]->count, 0, memory_order_relaxed);
         atomic_store_explicit(&series[s]->sum, 0, memory_order_relaxed);
         atomic_store_explicit(&series[s]->max, 0, memory_order_relaxed);

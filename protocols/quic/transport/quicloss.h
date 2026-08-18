@@ -123,7 +123,19 @@ typedef struct quicloss {
      * connections produced them -- the same reason the PTO line carries the tag.
      * A copy rather than a back-pointer: this module owes nothing upwards. */
     uint8_t  cid_tag[4];
+
+    /* The connection's qlog, or NULL. Recovery is where the events a stalled
+     * connection is read from happen -- a packet declared lost, an RTT sample,
+     * a window that moved -- and only this module knows the packet numbers they
+     * refer to. A borrowed pointer, like cid_tag is a copy, for the same
+     * reason: the module owes nothing upwards and does not own the log. */
+    struct quicqlog* qlog;
 } quicloss_t;
+
+/* Borrow the connection's qlog. Pass NULL to stop logging; the pointer must
+ * outlive the quicloss_t, which is how it is used -- both are members of the
+ * same connection, and the log is closed after this module is freed. */
+void quicloss_set_qlog(quicloss_t* loss, struct quicqlog* qlog);
 
 void quicloss_init(quicloss_t* loss, quiccc_t* cc, uint64_t max_ack_delay_us);
 void quicloss_free(quicloss_t* loss);

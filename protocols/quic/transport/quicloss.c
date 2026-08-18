@@ -5,6 +5,7 @@
 #include "metrics.h"
 #include "quicloss.h"
 #include "quicpacket.h"
+#include "quicqlog.h"
 
 quicframe_ref_t* quicframe_ref_new(uint64_t type) {
     quicframe_ref_t* ref = malloc(sizeof * ref);
@@ -58,6 +59,12 @@ void quicloss_app_limited(quicloss_t* loss) {
      * Never zero, which is the "not limited" value. */
     loss->app_limited = loss->delivered + in_flight;
     if (loss->app_limited == 0) loss->app_limited = 1;
+}
+
+void quicloss_set_qlog(quicloss_t* loss, struct quicqlog* qlog) {
+    if (loss == NULL) return;
+
+    loss->qlog = qlog;
 }
 
 void quicloss_set_cid_tag(quicloss_t* loss, const uint8_t* cid, size_t len) {
@@ -294,6 +301,16 @@ static void __detect_lost(quicloss_t* loss, quic_enc_level_e level,
 
         metrics_quic(METRICS_QUIC_PACKETS_LOST);
 
+        QLOG(loss->qlog, "recovery", "packet_lost",
+             "\"header\":{\"packet_type\":\"%s\",\"packet_number\":%llu},"
+             "\"raw\":{\"length\":%zu},\"age_us\":%llu,\"trigger\":\"%s\"",
+             level == QUIC_ENC_INITIAL ? "initial"
+                 : level == QUIC_ENC_EARLY ? "0RTT"
+                 : level == QUIC_ENC_HANDSHAKE ? "handshake" : "1RTT",
+             (unsigned long long)sent->pn, sent->size,
+             (unsigned long long)(now_us - sent->sent_us),
+             by_count ? "reordering_threshold" : "time_threshold");
+
         /* Which of the two rules fired matters when reading a stalled
          * connection: by_count means a later packet got through and this one
          * did not, by_time means nothing has been heard for a loss delay and
@@ -519,6 +536,24 @@ int quicloss_on_ack(quicloss_t* loss, quic_enc_level_e level,
      * recorded once, at the value the next packet will actually be sent
      * under. */
     if (loss->cc != NULL) metrics_quic_cwnd(loss->cc->cwnd);
+
+    /* The five numbers qvis draws a recovery diagram from, at the one moment
+     * they all change together. Emitted per acknowledgement rather than per
+     * change, because a window read without the round trip that produced it
+     * says nothing: the question is always cwnd *against* rtt. */
+    if (loss->qlog != NULL && loss->cc != NULL)
+        QLOG(loss->qlog, "recovery", "metrics_updated",
+             "\"congestion_window\":%llu,\"bytes_in_flight\":%llu,"
+             "\"smoothed_rtt\":%.3f,\"latest_rtt\":%.3f,\"min_rtt\":%.3f,"
+             "\"ssthresh\":%llu,\"pacing_rate\":%llu",
+             (unsigned long long)loss->cc->cwnd,
+             (unsigned long long)loss->cc->bytes_in_flight,
+             (double)loss->smoothed_rtt_us / 1000.0,
+             (double)loss->latest_rtt_us / 1000.0,
+             (double)loss->min_rtt_us / 1000.0,
+             loss->cc->ssthresh == UINT64_MAX
+                 ? 0ULL : (unsigned long long)loss->cc->ssthresh,
+             (unsigned long long)loss->cc->pacing_rate);
 
     return 1;
 }

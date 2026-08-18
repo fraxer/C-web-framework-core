@@ -45,20 +45,23 @@ int quicpmtud_on_ack(quicpmtud_t* p, uint64_t pn, uint64_t now_us,
     return 1;
 }
 
-void quicpmtud_on_timeout(quicpmtud_t* p, uint64_t now_us) {
-    if (p == NULL || !p->outstanding || now_us < p->deadline_us) return;
+int quicpmtud_on_timeout(quicpmtud_t* p, uint64_t now_us) {
+    if (p == NULL || !p->outstanding || now_us < p->deadline_us) return 0;
     p->outstanding = 0;
     p->deadline_us = 0;
+    int outcome = QUICPMTUD_PROBE_LOST;
     if (p->attempts >= QUICPMTUD_MAX_PROBES) {
         p->ceiling = p->current;
         p->candidate = 0;
         p->attempts = 0;
+        outcome |= QUICPMTUD_CEILING_LOWERED;
     }
     p->next_probe_us = now_us;
+    return outcome;
 }
 
-void quicpmtud_on_blackhole(quicpmtud_t* p, uint64_t now_us, uint64_t pto_us) {
-    if (p == NULL || p->current == p->base) return;
+int quicpmtud_on_blackhole(quicpmtud_t* p, uint64_t now_us, uint64_t pto_us) {
+    if (p == NULL || p->current == p->base) return 0;
     const size_t failed = p->current;
     p->current = p->base;
     p->ceiling = failed - 1;
@@ -67,6 +70,7 @@ void quicpmtud_on_blackhole(quicpmtud_t* p, uint64_t now_us, uint64_t pto_us) {
     p->attempts = 0;
     p->deadline_us = 0;
     p->next_probe_us = now_us + 10 * pto_us;
+    return 1;
 }
 
 uint64_t quicpmtud_deadline(const quicpmtud_t* p) {

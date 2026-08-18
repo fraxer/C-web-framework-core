@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <openssl/rand.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +39,81 @@
 #define QUICCONN_MIN_PAYLOAD 32
 
 /* ---- Small helpers ---- */
+
+/* ---- qlog helpers (docs/http3/04 §10) ----
+ *
+ * The names are the ones draft-ietf-quic-qlog-quic-events uses, so that a trace
+ * written here opens in qvis without a translation step -- which is the whole
+ * reason for emitting a standard format rather than our own log lines. */
+static const char* __qlog_level(quic_enc_level_e level) {
+    switch (level) {
+    case QUIC_ENC_INITIAL:   return "initial";
+    case QUIC_ENC_EARLY:     return "0RTT";
+    case QUIC_ENC_HANDSHAKE: return "handshake";
+    default:                 return "1RTT";
+    }
+}
+
+/* Printable form of one endpoint of a path. Both halves are wanted together
+ * everywhere they are wanted at all, and inet_ntop plus a port is three lines
+ * every time. */
+static void __qlog_addr(const struct sockaddr_storage* addr, char* out,
+                        size_t out_len, unsigned* port) {
+    if (out_len > 0) out[0] = 0;
+    if (port != NULL) *port = 0;
+    if (addr == NULL) return;
+
+    if (addr->ss_family == AF_INET6) {
+        const struct sockaddr_in6* in6 = (const struct sockaddr_in6*)addr;
+        inet_ntop(AF_INET6, &in6->sin6_addr, out, (socklen_t)out_len);
+        if (port != NULL) *port = ntohs(in6->sin6_port);
+        return;
+    }
+
+    const struct sockaddr_in* in = (const struct sockaddr_in*)addr;
+    inet_ntop(AF_INET, &in->sin_addr, out, (socklen_t)out_len);
+    if (port != NULL) *port = ntohs(in->sin_port);
+}
+
+/* Congestion state as the recovery schema names it. Derived rather than stored
+ * because the controllers do not agree on what a state is: NewReno and CUBIC
+ * have slow start, recovery and congestion avoidance, and BBR has four phases
+ * of its own that mean something else entirely. What a reader wants is the
+ * one-word answer to "why is it sending this much". */
+static const char* __qlog_cc_state(const quicconn_t* conn, uint64_t now_us) {
+    if (conn->cc.algorithm == QUICCC_BBR) {
+        switch (conn->cc.bbr.state) {
+        case QUICBBR_STARTUP:   return "startup";
+        case QUICBBR_DRAIN:     return "drain";
+        case QUICBBR_PROBE_RTT: return "probe_rtt";
+        default:                return "probe_bw";
+        }
+    }
+
+    if (conn->cc.recovery_start_us != 0 && now_us < conn->cc.recovery_start_us)
+        return "recovery";
+
+    return conn->cc.cwnd < conn->cc.ssthresh ? "slow_start" : "congestion_avoidance";
+}
+
+/* The transition, not the state: a connection acknowledges thousands of times
+ * and changes state a handful, and a log that repeated the state per
+ * acknowledgement would bury every other event in it.
+ *
+ * Compared with strcmp rather than by a derived number, and that is not
+ * pedantry -- the first version added the first two characters, which makes
+ * BBR's "probe_bw" and "probe_rtt" the same state and hides exactly the
+ * transition BBR is read for. */
+static void __qlog_cc_state_update(quicconn_t* conn, uint64_t now_us) {
+    if (conn->qlog == NULL) return;
+
+    const char* state = __qlog_cc_state(conn, now_us);
+    if (conn->qlog_cc_state != NULL && strcmp(conn->qlog_cc_state, state) == 0)
+        return;
+
+    conn->qlog_cc_state = state;
+    QLOG(conn->qlog, "recovery", "congestion_state_updated", "\"new\":\"%s\"", state);
+}
 
 static int __key_update_arm(quicconn_t* conn);
 static void __cids_replenish(quicconn_t* conn);
@@ -689,10 +765,37 @@ static int __on_ack_frame(quicconn_t* conn, quic_enc_level_e level,
             frame->u.ack.ect1 < old1 || frame->u.ack.ce < oldce ||
             total > conn->ecn_sent[level]) {
             conn->ecn_enabled = 0;
+            metrics_quic(METRICS_QUIC_ECN_VALIDATION_FAILED);
+            QLOG(conn->qlog, "transport", "ecn_state_updated",
+                 "\"new\":\"failed\",\"level\":\"%s\",\"sent\":%llu,"
+                 "\"peer_ect0\":%llu,\"peer_ect1\":%llu,\"peer_ce\":%llu",
+                 __qlog_level(level),
+                 (unsigned long long)conn->ecn_sent[level],
+                 (unsigned long long)frame->u.ack.ect0,
+                 (unsigned long long)frame->u.ack.ect1,
+                 (unsigned long long)frame->u.ack.ce);
         }
         else {
-            if (frame->u.ack.ce > oldce)
+            if (!conn->ecn_validated) {
+                conn->ecn_validated = 1;
+                metrics_quic(METRICS_QUIC_ECN_VALIDATED);
+                QLOG(conn->qlog, "transport", "ecn_state_updated",
+                     "\"new\":\"capable\",\"level\":\"%s\"",
+                     __qlog_level(level));
+            }
+
+            if (frame->u.ack.ce > oldce) {
+                /* A congestion response with nothing lost: the counter is what
+                 * separates it from a quiet connection, since packets_lost
+                 * never moves for it. */
+                metrics_quic(METRICS_QUIC_ECN_CE_CONGESTION);
+                QLOG(conn->qlog, "recovery", "ecn_congestion",
+                     "\"level\":\"%s\",\"ce\":%llu,\"previous_ce\":%llu",
+                     __qlog_level(level),
+                     (unsigned long long)frame->u.ack.ce,
+                     (unsigned long long)oldce);
                 conn->cc.ops->on_loss(&conn->cc, 0, now_us, now_us);
+            }
             conn->ecn_peer_ect0[level] = frame->u.ack.ect0;
             conn->ecn_peer_ect1[level] = frame->u.ack.ect1;
             conn->ecn_peer_ce[level] = frame->u.ack.ce;
@@ -708,6 +811,11 @@ static int __on_ack_frame(quicconn_t* conn, quic_enc_level_e level,
         quicpmtud_on_ack(&conn->pmtud, conn->pmtud.probe_pn, now_us,
                          quicloss_pto_us(&conn->loss, QUIC_ENC_APP))) {
         conn->cc.max_datagram_size = conn->pmtud.current;
+        metrics_quic(METRICS_QUIC_PMTU_PROBES_SUCCEEDED);
+        metrics_quic_pmtu(conn->pmtud.current);
+        QLOG(conn->qlog, "recovery", "mtu_updated",
+             "\"new\":%zu,\"ceiling\":%zu,\"trigger\":\"probe_acknowledged\"",
+             conn->pmtud.current, conn->pmtud.ceiling);
     }
 
     /* Release what the peer has confirmed. Until this existed the send buffers
@@ -743,6 +851,11 @@ static int __on_ack_frame(quicconn_t* conn, quic_enc_level_e level,
 
     __requeue_lost(conn, level, lost);
     quicrange_free(&acked);
+
+    /* After the losses this acknowledgement implied have been fed to the
+     * controller, so the state reported is the one the next packet is sent
+     * under and not the one it was sent under. */
+    __qlog_cc_state_update(conn, now_us);
 
     atomic_store_explicit(&conn->want_write, 1, memory_order_release);
 
@@ -1121,6 +1234,22 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
                   frame->u.close.reason != NULL ? frame->u.close.reason : "");
 
         metrics_quic(METRICS_QUIC_CLOSED_PEER);
+
+        if (conn->qlog != NULL) {
+            /* The reason is bytes the peer chose, so it goes through the
+             * escaper before it touches the trace -- a quote in it would
+             * otherwise end the JSON object early and a newline would end the
+             * record, corrupting the whole file rather than one field. */
+            char reason[256];
+            quicqlog_escape(frame->u.close.reason,
+                            frame->u.close.reason_len, reason, sizeof reason);
+
+            QLOG(conn->qlog, "connectivity", "connection_closed",
+                 "\"owner\":\"remote\",\"%s_code\":%llu,\"reason\":\"%s\"",
+                 frame->type == QUIC_FRAME_CONNECTION_CLOSE_APP
+                     ? "application" : "connection",
+                 (unsigned long long)frame->u.close.error, reason);
+        }
 
         /* §10.2.2: enter draining and send nothing further -- not even an
          * acknowledgement. Answering would keep the exchange alive after both
@@ -1520,6 +1649,10 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
         /* Keys for this level do not exist yet -- a 1-RTT packet that overtook
          * the handshake, which is ordinary on a reordering path. Dropped rather
          * than buffered; the peer will retransmit. */
+        QLOG(conn->qlog, "transport", "packet_dropped",
+             "\"packet_type\":\"%s\",\"raw\":{\"length\":%zu},"
+             "\"trigger\":\"keys_unavailable\"",
+             __qlog_level(level), pkt->pkt_len);
         return 1;
     }
 
@@ -1529,8 +1662,13 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
     uint64_t truncated = 0;
     int key_phase = 0;
 
-    if (!quichp_remove(keys, buf, len, pkt->pn_offset, &pn_len, &truncated, &key_phase))
+    if (!quichp_remove(keys, buf, len, pkt->pn_offset, &pn_len, &truncated, &key_phase)) {
+        QLOG(conn->qlog, "transport", "packet_dropped",
+             "\"packet_type\":\"%s\",\"raw\":{\"length\":%zu},"
+             "\"trigger\":\"header_protection_error\"",
+             __qlog_level(level), pkt->pkt_len);
         return 1;
+    }
 
     /* §17.2/§17.3: the reserved bits must be zero once protection is off. They
      * are two bits that carry nothing, which is exactly why they are worth
@@ -1591,6 +1729,10 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
         /* Ordinary: a packet from a dead connection, or one that crossed a key
          * update. Only the §6.6 limit turns it into an error. */
         metrics_quic(METRICS_QUIC_DECRYPT_FAILURE);
+        QLOG(conn->qlog, "transport", "packet_dropped",
+             "\"packet_type\":\"%s\",\"raw\":{\"length\":%zu},"
+             "\"trigger\":\"decryption_failure\"",
+             __qlog_level(level), pkt->pkt_len);
 
         if (quiccrypto_open_limit_reached(keys)) {
             metrics_quic(METRICS_QUIC_AEAD_LIMIT);
@@ -1714,6 +1856,15 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
               (int)level, (unsigned long long)pn, ack_eliciting);
 
     if (ack_eliciting) atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+
+    QLOG(conn->qlog, "transport", "packet_received",
+         "\"header\":{\"packet_type\":\"%s\",\"packet_number\":%llu},"
+         "\"raw\":{\"length\":%zu},\"ack_eliciting\":%s,\"ecn\":\"%s\"",
+         __qlog_level(level), (unsigned long long)pn, pkt->pkt_len,
+         ack_eliciting ? "true" : "false",
+         (conn->recv_ecn & 0x03) == 0x03 ? "CE"
+             : (conn->recv_ecn & 0x03) == 0x02 ? "ECT(0)"
+             : (conn->recv_ecn & 0x03) == 0x01 ? "ECT(1)" : "Not-ECT");
 
     QUICBEACON("cid=%02x%02x RECV  level=%d pn=%llu elic=%d pending=%u deadline_in=%lld",
                conn->odcid.data[0], conn->odcid.data[1],
@@ -1868,6 +2019,31 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
                      (unsigned long long)conn->peer_params.initial_max_stream_data_uni);
 
             metrics_quic(METRICS_QUIC_HANDSHAKE_COMPLETED);
+
+            QLOG(conn->qlog, "connectivity", "connection_state_updated",
+                 "\"new\":\"handshake_confirmed\",\"elapsed_us\":%llu",
+                 (unsigned long long)(now_us > conn->accepted_us
+                                      ? now_us - conn->accepted_us : 0));
+
+            /* What the peer allowed us, at the moment it becomes binding. Half
+             * of every "the transfer stops after N bytes" question is answered
+             * by these four numbers, and they are otherwise nowhere in the
+             * trace: the flow-control limits that follow are increments on
+             * them. */
+            QLOG(conn->qlog, "transport", "parameters_set",
+                 "\"owner\":\"remote\",\"initial_max_data\":%llu,"
+                 "\"initial_max_stream_data_bidi_local\":%llu,"
+                 "\"initial_max_streams_bidi\":%llu,"
+                 "\"initial_max_streams_uni\":%llu,"
+                 "\"max_idle_timeout\":%llu,\"max_udp_payload_size\":%llu,"
+                 "\"active_connection_id_limit\":%llu",
+                 (unsigned long long)conn->peer_params.initial_max_data,
+                 (unsigned long long)conn->peer_params.initial_max_stream_data_bidi_local,
+                 (unsigned long long)conn->peer_params.initial_max_streams_bidi,
+                 (unsigned long long)conn->peer_params.initial_max_streams_uni,
+                 (unsigned long long)conn->peer_params.max_idle_timeout,
+                 (unsigned long long)conn->peer_params.max_udp_payload_size,
+                 (unsigned long long)conn->peer_params.active_connection_id_limit);
 
             /* Whether the client's early data was taken. Read here rather than
              * when the 0-RTT keys appeared: TLS only settles it after the
@@ -2652,9 +2828,19 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
     if (ack_len > 0) quicack_on_sent(&conn->ack[level]);
 
     quicloss_on_sent(&conn->loss, level, pn, total, ack_eliciting, 1, refs, now_us);
-    if (conn->ecn_enabled) conn->ecn_sent[level]++;
+    if (conn->ecn_enabled) {
+        conn->ecn_sent[level]++;
+        metrics_quic(METRICS_QUIC_ECN_TX_MARKED);
+    }
 
     metrics_quic(METRICS_QUIC_BUILD_PACKETS);
+
+    QLOG(conn->qlog, "transport", "packet_sent",
+         "\"header\":{\"packet_type\":\"%s\",\"packet_number\":%llu},"
+         "\"raw\":{\"length\":%zu,\"payload_length\":%zu},"
+         "\"ack_eliciting\":%s,\"acked_bytes\":%zu",
+         __qlog_level(level), (unsigned long long)pn, total, p,
+         ack_eliciting ? "true" : "false", ack_len);
 
     QUICBEACON("cid=%02x%02x SENT  level=%d pn=%llu bytes=%zu payload=%zu ack_bytes=%zu elic=%d",
                conn->odcid.data[0], conn->odcid.data[1],
@@ -2729,7 +2915,10 @@ static void __path_probe_send(quicconn_t* conn, uint64_t now_us) {
      * the path in use, and a probe on a different one must neither consume it
      * nor be treated as loss on it when the new path turns out to be dead. */
     quicloss_on_sent(&conn->loss, QUIC_ENC_APP, pn, total, 1, 0, NULL, now_us);
-    if (conn->ecn_enabled) conn->ecn_sent[QUIC_ENC_APP]++;
+    if (conn->ecn_enabled) {
+        conn->ecn_sent[QUIC_ENC_APP]++;
+        metrics_quic(METRICS_QUIC_ECN_TX_MARKED);
+    }
 
     quicendpoint_send_ecn(conn->endpoint, datagram, total, &conn->probe_path,
                           conn->ecn_enabled ? 0x02 : 0);
@@ -2784,9 +2973,16 @@ static void __pmtu_probe_send(quicconn_t* conn, uint64_t now_us) {
     /* Probe loss says the size may be wrong, not that the path is congested;
      * keep it in loss detection for its ACK, but outside bytes_in_flight. */
     quicloss_on_sent(&conn->loss, QUIC_ENC_APP, pn, total, 1, 0, ref, now_us);
-    if (conn->ecn_enabled) conn->ecn_sent[QUIC_ENC_APP]++;
+    if (conn->ecn_enabled) {
+        conn->ecn_sent[QUIC_ENC_APP]++;
+        metrics_quic(METRICS_QUIC_ECN_TX_MARKED);
+    }
     quicpmtud_on_probe_sent(&conn->pmtud, pn, now_us,
                             quicloss_pto_us(&conn->loss, QUIC_ENC_APP));
+    metrics_quic(METRICS_QUIC_PMTU_PROBES_SENT);
+    QLOG(conn->qlog, "recovery", "mtu_probe_sent",
+         "\"size\":%zu,\"packet_number\":%llu,\"current\":%zu",
+         total, (unsigned long long)pn, conn->pmtud.current);
     quicendpoint_send_ecn(conn->endpoint, datagram, total, &conn->path,
                           conn->ecn_enabled ? 0x02 : 0);
 }
@@ -3053,6 +3249,10 @@ static void __quicconn_transport_free(void* arg) {
 
     quicloss_free(&conn->loss);
 
+    /* Last, so anything the frees above chose to log still lands in the file. */
+    quicqlog_close(conn->qlog);
+    conn->qlog = NULL;
+
     quicstream_t* s = conn->streams;
     while (s != NULL) {
         quicstream_t* next = s->next;
@@ -3086,6 +3286,32 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     log_debug("quic: accepted cid=%02x%02x%02x%02x\n",
               odcid->data[0], odcid->data[1], odcid->data[2], odcid->data[3]);
 
+    /* Opened before anything can go wrong below, so that a connection which
+     * fails during accept still leaves a trace saying it existed -- that is the
+     * case a qlog is least able to be recreated for. NULL unless qlog is
+     * configured and the budget was open, which is the ordinary case. */
+    conn->qlog = quicqlog_open(odcid->data, odcid->len);
+
+    if (conn->qlog != NULL) {
+        char src[INET6_ADDRSTRLEN] = {0};
+        char dst[INET6_ADDRSTRLEN] = {0};
+        unsigned src_port = 0;
+        __qlog_addr(&path->remote, src, sizeof src, &src_port);
+        /* The local port is deliberately not reported: the address comes from
+         * the datagram's control message, which carries the address the peer
+         * addressed and not the port -- that one belongs to the endpoint's
+         * socket (udpsocket.h). Printing the zero it holds would be a number
+         * that reads as a port and is not one. */
+        __qlog_addr(&path->local, dst, sizeof dst, NULL);
+
+        QLOG(conn->qlog, "connectivity", "connection_started",
+             "\"ip_version\":\"%s\",\"src_ip\":\"%s\",\"src_port\":%u,"
+             "\"dst_ip\":\"%s\",\"address_validated\":%s",
+             path->remote.ss_family == AF_INET6 ? "v6" : "v4",
+             src, src_port, dst,
+             address_validated ? "true" : "false");
+    }
+
     const uint64_t now = quic_now_us();
     conn->last_activity_us = now;
     conn->accepted_us = now;
@@ -3114,6 +3340,10 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
      * (§5.1). */
     conn->local_cids[0].cid.len = QUIC_LOCAL_CID_LEN;
     if (RAND_bytes(conn->local_cids[0].cid.data, QUIC_LOCAL_CID_LEN) != 1) {
+        /* The two failure paths that free the connection directly, before any
+         * of its modules exist, have to close the trace themselves -- it is the
+         * one thing opened above them. */
+        quicqlog_close(conn->qlog);
         free(conn);
         return NULL;
     }
@@ -3129,6 +3359,7 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     uint8_t client_secret[32];
     uint8_t server_secret[32];
     if (!quiccrypto_initial_secrets(odcid, client_secret, server_secret)) {
+        quicqlog_close(conn->qlog);
         free(conn);
         return NULL;
     }
@@ -3163,6 +3394,7 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     conn->pace_until_us = 0;
     quicloss_init(&conn->loss, &conn->cc, policy->ack_delay_ms * 1000);
     quicloss_set_cid_tag(&conn->loss, conn->odcid.data, conn->odcid.len);
+    quicloss_set_qlog(&conn->loss, conn->qlog);
     const size_t pmtu_ceiling = conn->path.remote.ss_family == AF_INET6
                                 ? QUIC_MAX_UDP_PAYLOAD_V6 : QUIC_MAX_UDP_PAYLOAD_V4;
     quicpmtud_init(&conn->pmtud, QUIC_DEFAULT_UDP_PAYLOAD, pmtu_ceiling);
@@ -3413,6 +3645,11 @@ void quicconn_close(quicconn_t* conn, uint64_t error_code, int is_app,
 
     metrics_quic(METRICS_QUIC_CLOSED_LOCAL);
 
+    QLOG(conn->qlog, "connectivity", "connection_closed",
+         "\"owner\":\"local\",\"%s_code\":%llu",
+         is_app ? "application" : "connection",
+         (unsigned long long)error_code);
+
     conn->state = QUICCONN_CLOSING;
     conn->error_code = error_code;
     conn->error_is_app = is_app;
@@ -3470,6 +3707,12 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
     if (conn->idle_timeout_us > 0 &&
         now_us > conn->last_activity_us + conn->idle_timeout_us) {
         metrics_quic(METRICS_QUIC_CLOSED_IDLE);
+
+        QLOG(conn->qlog, "connectivity", "connection_closed",
+             "\"owner\":\"local\",\"trigger\":\"idle_timeout\","
+             "\"idle_us\":%llu,\"handshake\":%s",
+             (unsigned long long)(now_us - conn->last_activity_us),
+             conn->state == QUICCONN_HANDSHAKE ? "true" : "false");
 
         /* Timing out mid-handshake is a different failure: the peer never got
          * far enough to say anything, which is what a blocked UDP path and a
@@ -3545,6 +3788,12 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
         if (!quicloss_on_timeout(&conn->loss, now_us, &lost, &level)) {
             metrics_quic(METRICS_QUIC_PTO_FIRED);
 
+            QLOG(conn->qlog, "recovery", "loss_timer_expired",
+                 "\"event_type\":\"pto\",\"packet_number_space\":\"%s\","
+                 "\"pto_count\":%u,\"bytes_in_flight\":%llu",
+                 __qlog_level(level), conn->loss.pto_count,
+                 (unsigned long long)conn->cc.bytes_in_flight);
+
             /* §6.2.4 requires at least one ack-eliciting packet here, and two
              * is what the RFC suggests so that one loss does not cost another
              * whole PTO. The point is not the payload -- it is that the peer
@@ -3556,9 +3805,16 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
 
             /* Repeated PTO after a raised PLPMTU is the RFC 8899 black-hole
              * signal: return to the safe base before retransmitting data. */
-            if (level == QUIC_ENC_APP && conn->loss.pto_count >= 3)
+            if (level == QUIC_ENC_APP && conn->loss.pto_count >= 3 &&
                 quicpmtud_on_blackhole(&conn->pmtud, now_us,
-                                       quicloss_pto_us(&conn->loss, level));
+                                       quicloss_pto_us(&conn->loss, level))) {
+                conn->cc.max_datagram_size = conn->pmtud.current;
+                metrics_quic(METRICS_QUIC_PMTU_BLACKHOLES);
+                metrics_quic_pmtu(conn->pmtud.current);
+                QLOG(conn->qlog, "recovery", "mtu_updated",
+                     "\"new\":%zu,\"ceiling\":%zu,\"trigger\":\"black_hole\"",
+                     conn->pmtud.current, conn->pmtud.ceiling);
+            }
 
             /* The five numbers that named the cause in §3g, at the moment they
              * are worth having: a stalled connection is diagnosed by what its
@@ -3602,7 +3858,18 @@ int quicconn_tick(quicconn_t* conn, uint64_t now_us) {
     }
 
     if (conn->state == QUICCONN_ACTIVE) {
-        quicpmtud_on_timeout(&conn->pmtud, now_us);
+        const int pmtu_outcome = quicpmtud_on_timeout(&conn->pmtud, now_us);
+
+        if (pmtu_outcome & QUICPMTUD_PROBE_LOST) {
+            metrics_quic(METRICS_QUIC_PMTU_PROBES_LOST);
+            QLOG(conn->qlog, "recovery", "mtu_probe_lost",
+                 "\"current\":%zu,\"ceiling\":%zu,\"search_ended\":%s",
+                 conn->pmtud.current, conn->pmtud.ceiling,
+                 (pmtu_outcome & QUICPMTUD_CEILING_LOWERED) ? "true" : "false");
+        }
+        if (pmtu_outcome & QUICPMTUD_CEILING_LOWERED)
+            metrics_quic(METRICS_QUIC_PMTU_SEARCH_CEILING_LOWERED);
+
         if (quicconn_unsent_bytes(conn) >= 4 * conn->pmtud.current &&
             quicpmtud_should_probe(&conn->pmtud, now_us))
             atomic_store_explicit(&conn->want_write, 1, memory_order_release);

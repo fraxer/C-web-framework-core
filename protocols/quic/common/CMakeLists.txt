@@ -5,7 +5,9 @@ cmake_minimum_required(VERSION 3.12.4)
 # plus the monotonic clock and the qlog facility every other QUIC module emits
 # through.
 #
-# No connection state and no dependency beyond libc and pthreads (the CID
-# routing table shards a mutex), so the module stays unit-testable in isolation
-# -- the same contract h2frame and hpack hold for HTTP/2.
-cwfr_add_lib(quic_common)
+# No connection state, so the module stays unit-testable in isolation -- the
+# same contract h2frame and hpack hold for HTTP/2. `misc` is the one dependency
+# beyond libc and pthreads (the CID routing table shards a mutex): qlog writes
+# through log.h when a trace cannot be opened, and a diagnostics facility that
+# fails silently is worse than none.
+cwfr_add_lib(quic_common LINK_LIBS misc)

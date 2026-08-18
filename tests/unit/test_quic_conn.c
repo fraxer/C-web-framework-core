@@ -1,6 +1,8 @@
 #include "framework.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -12,6 +14,7 @@
 #include "quicendpoint.h"
 #include "quicinvariants.h"
 #include "quicloss.h"
+#include "quicqlog.h"
 #include "quicstream.h"
 #include "quictime.h"
 
@@ -2728,5 +2731,170 @@ TEST(test_quic_stand_migration) {
     TEST_ASSERT(old_port == 50000, "it started on the old port");
     TEST_ASSERT(s->client.path_challenge_received, "the client was asked");
 
+    __stand_free(s);
+}
+
+
+/* The qlog, against a real handshake rather than against the writer.
+ *
+ * The unit test in test_quic_common.c proves the file format; this proves the
+ * part that actually fails in practice -- that the events are emitted from the
+ * paths a connection really takes. A trace facility whose call sites are in the
+ * wrong place produces a perfectly valid file that says nothing, and nothing
+ * short of running a connection catches that. */
+static int __qlog_find(const char* dir, char* out, size_t out_len) {
+    DIR* d = opendir(dir);
+    if (d == NULL) return 0;
+
+    int found = 0;
+    struct dirent* entry;
+
+    while ((entry = readdir(d)) != NULL) {
+        const size_t len = strlen(entry->d_name);
+        if (len < 7 || strcmp(entry->d_name + len - 6, ".sqlog") != 0) continue;
+
+        snprintf(out, out_len, "%s/%s", dir, entry->d_name);
+        found = 1;
+        break;
+    }
+
+    closedir(d);
+    return found;
+}
+
+TEST(test_quic_stand_qlog) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a handshake writes a readable trace");
+
+    char dir[] = "/tmp/cwfr_qlog_standXXXXXX";
+    TEST_REQUIRE_NOT_NULL(mkdtemp(dir), "temporary directory for the trace");
+    TEST_ASSERT(quicqlog_configure(dir, 4), "qlog enabled for this test only");
+
+    stand_t* s = __stand_create(1);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_ASSERT(__start(s), "the first Initial went out");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    TEST_REQUIRE_NOT_NULL(s->conn, "the connection is still there");
+    TEST_ASSERT(s->conn->qlog != NULL, "the connection opened a trace");
+
+    char path[512];
+    TEST_ASSERT(__qlog_find(dir, path, sizeof path), "a .sqlog exists for it");
+
+    static char body[262144];
+    size_t len = 0;
+    FILE* f = fopen(path, "rb");
+    if (f != NULL) {
+        len = fread(body, 1, sizeof body - 1, f);
+        fclose(f);
+    }
+    body[len] = 0;
+
+    TEST_ASSERT(len > 0, "and it has been written to while the connection runs");
+    TEST_ASSERT(strstr(body, "\"name\":\"connectivity:connection_started\"") != NULL,
+                "the connection announced itself");
+    TEST_ASSERT(strstr(body, "\"name\":\"transport:packet_received\"") != NULL,
+                "packets the client sent are in the trace");
+    TEST_ASSERT(strstr(body, "\"name\":\"transport:packet_sent\"") != NULL,
+                "so are the ones the server built");
+    TEST_ASSERT(strstr(body, "\"name\":\"recovery:metrics_updated\"") != NULL,
+                "recovery reported the window and the round trip");
+    TEST_ASSERT(strstr(body, "\"name\":\"connectivity:connection_state_updated\"") != NULL,
+                "and the handshake completing is an event of its own");
+
+    /* Every record is one line and starts with the JSON-SEQ separator: a reader
+     * splits on newlines, so an event that emitted one of its own would corrupt
+     * the record after it rather than itself. */
+    int records = 0;
+    int malformed = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (body[i] != 0x1e) continue;
+        records++;
+        if (i > 0 && body[i - 1] != '\n') malformed++;
+    }
+
+    TEST_ASSERT(records > 4, "the trace holds more than the header");
+    TEST_ASSERT(malformed == 0, "and every record begins a line");
+
+    __stand_free(s);
+
+    /* Turned off before anything else runs in this process, and the file
+     * removed: the suite runs under the sanitizers and in CI. */
+    quicqlog_configure("", 0);
+    unlink(path);
+    rmdir(dir);
+}
+
+
+TEST(test_quic_stand_dplpmtud) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("the packet size search finishes over a clean path");
+    /* The counters this feature grew (pmtu.probes_*) reported three probes and
+     * three timeouts against the live stand, and the qlog said the probes were
+     * declared lost by the reordering threshold -- which on loopback means the
+     * client's receive queue overflowed, not that the path is small. The
+     * question that leaves open is whether the search can EVER finish, and only
+     * a path with no queue to overflow can answer it. That is this stand. */
+    stand_t* s = __stand_create(1);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+
+    TEST_ASSERT(quicclient_stream_write(&s->client, 0, (const uint8_t*)"GET", 3, 1), "request");
+    TEST_ASSERT(quicclient_flush(&s->client), "sent");
+    __run(s, 200000, NULL);
+
+    TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
+    quicstream_t* qs = quicconn_stream_find(s->conn, 0);
+    TEST_REQUIRE_NOT_NULL(qs, "the server has the stream");
+
+    const size_t base = s->conn->pmtud.current;
+    const size_t ceiling = s->conn->pmtud.ceiling;
+    TEST_ASSERT(base == QUIC_DEFAULT_UDP_PAYLOAD, "the search starts at the safe base");
+    TEST_ASSERT(ceiling > base, "and has somewhere to go over IPv4");
+
+    /* Big enough to outlast the first probe window: the search is held off for
+     * ten PTOs after the handshake (~1.5 s at this stand's 20 ms path), so a
+     * transfer that ends sooner never leaves the base size -- which is a real
+     * property of this server worth knowing, and the reason this test moves
+     * half a megabyte rather than the 64 KB the loss test moves. */
+    const size_t total = 512 * 1024;
+    uint8_t* body = malloc(total);
+    TEST_REQUIRE_NOT_NULL(body, "body allocated");
+    memset(body, 'x', total);
+
+    connection_s_lock(&s->conn->conn, LOCK_SITE_QUIC_SEND);
+    const int written = quicstream_write(qs, body, total);
+    quicstream_finish(qs);
+    connection_s_unlock(&s->conn->conn);
+    TEST_ASSERT(written, "queued on the stream");
+
+    quicconn_want_write(&s->conn->conn);
+
+    uint8_t* got = calloc(1, total);
+    TEST_REQUIRE_NOT_NULL(got, "sink allocated");
+    size_t have = 0;
+
+    for (int round = 0; round < 40000 && have < total; round++) {
+        if (!__step(s, __now_us + 60000000)) break;
+
+        const size_t ready = quicclient_stream_readable(&s->client, 0);
+        if (ready == 0) continue;
+
+        have += quicclient_stream_read(&s->client, 0, got + have,
+                                       total - have < ready ? total - have : ready);
+    }
+
+    TEST_ASSERT(have == total, "the whole body arrived");
+    TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
+    TEST_ASSERT(s->conn->pmtud.current == ceiling,
+                "and the probe was acknowledged, so the packet size rose to the ceiling");
+    TEST_ASSERT(s->conn->cc.max_datagram_size == s->conn->pmtud.current,
+                "the congestion controller counts in the new size too");
+    TEST_ASSERT(!s->conn->pmtud.outstanding, "no probe is left hanging");
+
+    free(got);
+    free(body);
     __stand_free(s);
 }
