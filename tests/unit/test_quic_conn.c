@@ -1634,6 +1634,104 @@ TEST(test_quic_stand_uniform_datagrams) {
 #undef UNIFORM_BODY
 }
 
+TEST(test_quic_stand_retransmit_behind_finished_stream) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("an older stream that needs a retransmission is served after it went quiet");
+    /* The send loop no longer starts every packet at the head of the stream
+     * list: it keeps a cursor and moves it past streams with nothing left to
+     * send, because the head is where finished responses pile up while their
+     * acknowledgements arrive (quicconn.h, send_cursor). This is the scenario
+     * that path has to survive -- the oldest stream finishes sending, a newer
+     * one keeps the connection busy, and then the loss of the older one's data
+     * has to bring it back from behind the cursor. Nothing else here reaches it
+     * deterministically: the parallel-streams test gets there by chance, with a
+     * loss percentage.
+     *
+     * What this does NOT prove, established by trying it: a cursor that
+     * outlived its turn passes as well. Such a cursor re-anchors at the head
+     * the moment it walks off the end of the list, and a connection reaches
+     * "nothing to send" constantly, so the window in which it could strand a
+     * stream closes on its own. The per-turn reset is kept because it is the
+     * rule that is obviously right, not because a test would catch its absence
+     * (docs/http3/08 §14). */
+    stand_t* s = __stand_create(37);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+
+    for (int i = 0; i < 2; i++) {
+        const uint8_t request[4] = { 'G', 'E', 'T', (uint8_t)i };
+        TEST_ASSERT(quicclient_stream_write(&s->client, (uint64_t)i * 4,
+                                            request, sizeof request, 1),
+                    "request queued");
+    }
+    TEST_ASSERT(quicclient_flush(&s->client), "sent");
+    __run(s, 500000, NULL);
+
+    const size_t first_len = 8 * 1024;
+    const size_t second_len = 128 * 1024;
+
+    uint8_t* first = malloc(first_len);
+    uint8_t* second = malloc(second_len);
+    TEST_REQUIRE_NOT_NULL(first, "first body allocated");
+    TEST_REQUIRE_NOT_NULL(second, "second body allocated");
+    for (size_t i = 0; i < first_len; i++) first[i] = (uint8_t)(i * 7 + 1);
+    for (size_t i = 0; i < second_len; i++) second[i] = (uint8_t)(i * 13 + 5);
+
+    /* Both responses are queued before anything moves, and the first one leaves
+     * with a hole in it: one datagram of it never arrives. The order that
+     * follows is the point -- the small response finishes *sending* while the
+     * large one is still going, so by the time the loss is declared the older
+     * stream has long been silent and everything the sender is doing is behind
+     * it in the list. */
+    s->drop_next_to_client = 1;
+    TEST_ASSERT(__serve(s, 0, first, first_len), "the first response is queued");
+    TEST_ASSERT(__serve(s, 4, second, second_len), "the second response is queued");
+
+    uint8_t* got0 = calloc(1, first_len);
+    uint8_t* got4 = calloc(1, second_len);
+    TEST_REQUIRE_NOT_NULL(got0, "sink allocated");
+    TEST_REQUIRE_NOT_NULL(got4, "sink allocated");
+
+    size_t have0 = 0, have4 = 0;
+    int done = 0;
+
+    for (int round = 0; round < 200000 && !done; round++) {
+        if (!__step(s, __now_us + 60000000)) break;
+
+        size_t ready = quicclient_stream_readable(&s->client, 0);
+        if (ready > 0 && have0 < first_len)
+            have0 += quicclient_stream_read(&s->client, 0, got0 + have0,
+                                            first_len - have0 < ready
+                                                ? first_len - have0 : ready);
+
+        ready = quicclient_stream_readable(&s->client, 4);
+        if (ready > 0 && have4 < second_len)
+            have4 += quicclient_stream_read(&s->client, 4, got4 + have4,
+                                            second_len - have4 < ready
+                                                ? second_len - have4 : ready);
+
+        done = have0 == first_len && have4 == second_len &&
+               quicclient_stream_fin(&s->client, 0) &&
+               quicclient_stream_fin(&s->client, 4);
+    }
+
+    TEST_ASSERT(s->lost_to_client > 0, "a datagram really was dropped");
+    TEST_ASSERT(have0 == first_len, "the first response arrived whole");
+    TEST_ASSERT(memcmp(got0, first, first_len) == 0, "and unaltered");
+    TEST_ASSERT(quicclient_stream_fin(&s->client, 0), "and finished");
+    TEST_ASSERT(have4 == second_len, "the second response arrived too");
+    TEST_ASSERT(memcmp(got4, second, second_len) == 0, "and unaltered");
+
+    free(first);
+    free(second);
+    free(got0);
+    free(got4);
+    __stand_free(s);
+}
+
 TEST(test_quic_stand_stream_credit) {
     TEST_SUITE("quic_stand");
 

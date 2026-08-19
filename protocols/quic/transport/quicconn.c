@@ -991,6 +991,23 @@ static size_t __stream_chunk_room(uint64_t id, uint64_t offset, size_t avail) {
     return best;
 }
 
+/* Nothing this stream could put in a packet, whatever room the packet has: no
+ * data, no end-of-stream marker, no lost range to resend, and neither of the
+ * two frames that end a stream. The send loop's cursor skips exactly these
+ * (quicconn.h, send_cursor).
+ *
+ * Deliberately not the wider `!quicstream_wants_send`, which would also skip a
+ * stream whose flow-control window is shut. That is just as safe -- a window
+ * opens only on something received, and nothing is received while a turn is
+ * being built -- and measured slightly *worse*: the extra call per skipped node
+ * costs more than the nodes it skips, because those streams sit among the
+ * sendable ones rather than in front of them, where a cursor cannot help
+ * (docs/http3/08 §14). */
+static int __stream_send_idle(const quicstream_t* s) {
+    return !s->send_reset_pending && !s->send_stop_sending_pending &&
+           !quicsendbuf_pending(&s->send);
+}
+
 static quicstream_t* __stream_for_send_frame(quicconn_t* conn, uint64_t id,
                                              uint64_t now_us, int* ignore) {
     return __stream_for_frame(conn, id, now_us, ignore, quicstream_can_send);
@@ -1341,6 +1358,10 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
  * itself: the h3 layer holds a pointer to the stream while it answers, and the
  * one place that knows both halves are done is here. */
 static void __streams_reap(quicconn_t* conn) {
+    /* Whatever it pointed at may be freed below, and it means nothing outside
+     * the turn that set it (quicconn.h, send_cursor). */
+    conn->send_cursor = NULL;
+
     quicstream_t** link = &conn->streams;
     /* The tail is rebuilt from the walk this function already makes, rather
      * than patched at the removal below: recovering the previous node from a
@@ -2639,7 +2660,14 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
         quicsched_t sched;
         __sched_select(conn, &sched);
 
-        for (quicstream_t* s = conn->streams; s != NULL && p + 32 < payload_cap;
+        /* Past the finished prefix, once per packet rather than once per turn:
+         * the streams that finish during this turn are exactly the ones the
+         * next packet would otherwise walk over again. */
+        quicstream_t* from = conn->send_cursor;
+        while (from != NULL && __stream_send_idle(from)) from = from->next;
+        conn->send_cursor = from;
+
+        for (quicstream_t* s = from; s != NULL && p + 32 < payload_cap;
              s = s->next) {
             visits_data++;
 
@@ -3185,6 +3213,10 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
         quicpmtud_should_probe(&conn->pmtud, now_us) &&
         quicconn_unsent_bytes(conn) >= 4 * conn->pmtud.current)
         __pmtu_probe_send(conn, now_us);
+
+    /* The walk of the stream list starts here and moves forward as streams
+     * finish; it is meaningless outside this turn (quicconn.h). */
+    conn->send_cursor = conn->streams;
 
     uint8_t datagram[QUICCONN_MAX_PACKET];
     int sent_anything = 0;

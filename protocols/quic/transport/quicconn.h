@@ -178,6 +178,22 @@ typedef struct quicconn {
     quicstream_t* streams_tail;
     size_t    stream_count;
 
+    /* Where the send loop starts walking that list, for the duration of one
+     * turn. The head of the list is where finished streams pile up -- a
+     * response whose last byte is out stays until its acknowledgements arrive
+     * and the reaper takes it -- so a packet built from the head walked past a
+     * dozen streams that could produce nothing to reach the one or two that
+     * could. At thirty streams and forty packets per response that came to 607
+     * visits for 45 STREAM frames (docs/http3/08 §14).
+     *
+     * Valid only inside a turn, and that is what makes it safe rather than a
+     * cache to keep in step: quicconn_send sets it to the head, and nothing
+     * that can make a finished stream sendable again -- a loss declaration, a
+     * PTO requeue, a reset, an arriving flow-control credit -- runs while a
+     * turn is in progress. Every one of them happens between turns, and the
+     * next turn starts from the head again. */
+    quicstream_t* send_cursor;
+
     /* Streams whose priority the layer above actually set to something other
      * than the default (RFC 9218). Zero -- which is every connection whose peer
      * sends no priority signals -- means the send loop keeps the list order it
