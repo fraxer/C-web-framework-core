@@ -943,6 +943,54 @@ static quicstream_t* __stream_for_frame(quicconn_t* conn, uint64_t id,
     return s;
 }
 
+/* The largest chunk of stream data whose frame fills `avail` exactly.
+ *
+ * The send loop used to reserve a flat 24 bytes for a STREAM frame header that
+ * actually costs between three and a dozen, so every packet stopped a handful
+ * of bytes short of the datagram it was sizing itself against. Wasting one
+ * percent of the payload was the smaller half of the damage. The larger half is
+ * that the error is not constant: the header carries the offset as a varint, so
+ * it grows by two bytes when a response passes 16 KB and shrinks by four when
+ * the next packet starts a stream at offset zero. Datagrams therefore left at
+ * 1331, 1333 and 1335 bytes in turn -- and a GSO run ends at the first change
+ * of size (udpsocket.c), so the kernel received runs of eleven segments where
+ * the traffic could have filled sixty. That is measured, not supposed: a trace
+ * of every datagram handed to the batch showed the two-byte step and the
+ * four-byte step accounting for essentially every run that ended without the
+ * batch being full (docs/http3/08 §12).
+ *
+ * The length field is itself a varint over a value this computes, so the four
+ * classes are tried in turn and the largest one that is self-consistent wins.
+ * `id` and `offset` are known before the chunk is asked for --
+ * quicsendbuf_next_offset exists for exactly this. */
+static size_t __stream_chunk_room(uint64_t id, uint64_t offset, size_t avail) {
+    /* Type byte plus the two fields that do not depend on the chunk size. The
+     * OFF bit is set only for a non-zero offset, which is where the four-byte
+     * step at the start of every stream comes from. */
+    const size_t fixed = 1 + varint_size(id) + (offset > 0 ? varint_size(offset) : 0);
+    if (avail <= fixed) return 0;
+
+    const size_t body = avail - fixed;   /* the Length field and the data */
+
+    static const size_t field[4] = { 1, 2, 4, 8 };
+    static const uint64_t limit[4] = { 63, 16383, 1073741823ULL, QUIC_VARINT_MAX };
+
+    size_t best = 0;
+
+    for (int i = 0; i < 4; i++) {
+        if (body <= field[i]) break;
+
+        uint64_t len = body - field[i];
+        if (len > limit[i]) len = limit[i];
+
+        /* Self-consistent only when a length of that size really encodes in
+         * that many bytes; otherwise this class cannot describe this chunk. */
+        if (varint_size(len) == field[i] && len > best) best = (size_t)len;
+    }
+
+    return best;
+}
+
 static quicstream_t* __stream_for_send_frame(quicconn_t* conn, uint64_t id,
                                              uint64_t now_us, int* ignore) {
     return __stream_for_frame(conn, id, now_us, ignore, quicstream_can_send);
@@ -2668,7 +2716,11 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
             const uint64_t conn_allowed = quicflow_available(&conn->send_flow);
             if (conn_allowed < allowed) allowed = conn_allowed;
 
-            size_t room = payload_cap - p - 24;
+            /* Exactly what is left, not what is left less a guess at the header
+             * -- see __stream_chunk_room for what the guess cost. */
+            size_t room = __stream_chunk_room(s->id,
+                                              quicsendbuf_next_offset(&s->send),
+                                              payload_cap - p);
             if (!resending && allowed < room) room = (size_t)allowed;
 
             /* A FIN with nothing in front of it left to send is the one thing a

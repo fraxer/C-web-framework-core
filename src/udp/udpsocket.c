@@ -390,6 +390,18 @@ static void __msg_set_local(struct msghdr* hdr, uint8_t* control,
 /* The kernel refuses more than this many segments in one message. */
 #define UDP_TX_MAX_SEGMENTS 64
 
+/* And it refuses a message whose segments do not fit one skb: everything a GSO
+ * send hands over travels as a single IP datagram until the device splits it,
+ * so the whole run is bounded by 65535 bytes less the IP and UDP headers. The
+ * margin below covers IPv6 and any tunnel header in the way.
+ *
+ * This is not a tuning constant but a guard: the refusal arrives as EINVAL from
+ * sendmmsg, and this batch answers one refusal by turning offload off for good.
+ * A single oversized run would therefore cost every later datagram its
+ * segmentation -- and at 1472 bytes a run of 45 is already over the line, which
+ * is inside what UDP_TX_MAX_SEGMENTS allows. */
+#define UDP_TX_MAX_MESSAGE_BYTES 64000
+
 struct udp_tx_batch {
     size_t msg_capacity;     /* messages */
     size_t datagram_size;    /* the largest single datagram */
@@ -420,6 +432,11 @@ struct udp_tx_batch {
     /* Offload is allowed until the kernel says otherwise, and then never
      * again for this batch -- one refusal is enough to know. */
     int gso;
+
+    /* Why runs ended since the last flush, published there. */
+    size_t break_peer;
+    size_t break_size;
+    size_t break_limit;
 };
 
 udp_tx_batch_t* udp_tx_batch_create(size_t count, size_t datagram_size) {
@@ -488,29 +505,49 @@ size_t udp_tx_batch_count(const udp_tx_batch_t* batch) {
     return batch != NULL ? batch->datagrams : 0;
 }
 
+size_t udp_tx_batch_messages(const udp_tx_batch_t* batch) {
+    return batch != NULL ? batch->queued : 0;
+}
+
 /* May this datagram join the message still open? Everything the kernel folds
  * into one skb has to agree: the destination, the source we pin, and the
  * segment size -- which may only differ for the *last* datagram, and that one
  * closes the run. */
-static int __tx_joins_open(const udp_tx_batch_t* batch, size_t len,
+static int __tx_joins_open(udp_tx_batch_t* batch, size_t len,
                            const struct sockaddr* peer, socklen_t peer_len,
                            const struct sockaddr_storage* local, uint8_t ecn) {
     if (!batch->gso || batch->open < 0) return 0;
 
     const size_t i = (size_t)batch->open;
 
-    if (batch->segments[i] >= UDP_TX_MAX_SEGMENTS) return 0;
-    if (batch->msgs[i].msg_hdr.msg_namelen != peer_len) return 0;
-    if (memcmp(&batch->peers[i], peer, peer_len) != 0) return 0;
+    if (batch->segments[i] >= UDP_TX_MAX_SEGMENTS ||
+        batch->iov[i].iov_len + len > UDP_TX_MAX_MESSAGE_BYTES) {
+        batch->break_limit++;
+        return 0;
+    }
+
+    if (batch->msgs[i].msg_hdr.msg_namelen != peer_len ||
+        memcmp(&batch->peers[i], peer, peer_len) != 0 ||
+        batch->ecn[i] != (ecn & 0x03)) {
+        batch->break_peer++;
+        return 0;
+    }
 
     const int valid = local != NULL && local->ss_family == peer->sa_family;
-    if (batch->local_valid[i] != valid) return 0;
-    if (valid && memcmp(&batch->locals[i], local, sizeof * local) != 0) return 0;
-    if (batch->ecn[i] != (ecn & 0x03)) return 0;
+    if (batch->local_valid[i] != valid ||
+        (valid && memcmp(&batch->locals[i], local, sizeof * local) != 0)) {
+        batch->break_peer++;
+        return 0;
+    }
 
     /* Equal to the run's segment size continues it; smaller ends it; larger
      * cannot belong to it at all. */
-    return len <= batch->seg_size[i];
+    if (len > batch->seg_size[i]) {
+        batch->break_size++;
+        return 0;
+    }
+
+    return 1;
 }
 
 int udp_tx_batch_add(udp_tx_batch_t* batch, const uint8_t* data, size_t len,
@@ -538,7 +575,10 @@ int udp_tx_batch_add_ecn(udp_tx_batch_t* batch, const uint8_t* data, size_t len,
         batch->datagrams++;
 
         /* A short segment can only be the last one. */
-        if (len < batch->seg_size[i]) batch->open = -1;
+        if (len < batch->seg_size[i]) {
+            batch->break_size++;
+            batch->open = -1;
+        }
 
         return 1;
     }
@@ -669,6 +709,16 @@ int udp_tx_batch_flush(udp_tx_batch_t* batch, int fd, size_t* out_bytes) {
     metrics_quic(METRICS_QUIC_SEND_BATCH_CALLS);
     metrics_quic_add(METRICS_QUIC_SEND_BATCH_MESSAGES,
                      (unsigned long long)queued);
+
+    metrics_quic_add(METRICS_QUIC_SEND_BREAK_PEER,
+                     (unsigned long long)batch->break_peer);
+    metrics_quic_add(METRICS_QUIC_SEND_BREAK_SIZE,
+                     (unsigned long long)batch->break_size);
+    metrics_quic_add(METRICS_QUIC_SEND_BREAK_LIMIT,
+                     (unsigned long long)batch->break_limit);
+    batch->break_peer = 0;
+    batch->break_size = 0;
+    batch->break_limit = 0;
 
     const int n = sendmmsg(fd, batch->msgs, (unsigned int)queued, MSG_NOSIGNAL);
     if (n < 0) {

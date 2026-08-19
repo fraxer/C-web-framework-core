@@ -144,6 +144,17 @@ typedef enum {
     METRICS_QUIC_SEND_GSO_FALLBACKS,
     METRICS_QUIC_SEND_PARTIAL,
 
+    /* Why a GSO run ended, which is the only thing that explains a low
+     * segments/messages ratio. `peer` is the batch moving on to another
+     * connection and is the floor set by the traffic itself; `size` is a
+     * datagram that did not match the run's segment size, and is ours to fix
+     * (docs/http3/08 §12); `limit` is a run that reached the kernel's ceiling,
+     * which is the healthy end. Counted in the batch and published per flush --
+     * an atomic per datagram would measure itself. */
+    METRICS_QUIC_SEND_BREAK_PEER,
+    METRICS_QUIC_SEND_BREAK_SIZE,
+    METRICS_QUIC_SEND_BREAK_LIMIT,
+
     /* Drops, by reason. */
     METRICS_QUIC_DROP_TRUNCATED,      /* buffer ended inside the invariant header */
     METRICS_QUIC_DROP_OVERSIZE,       /* larger than the receive buffer (MSG_TRUNC) */

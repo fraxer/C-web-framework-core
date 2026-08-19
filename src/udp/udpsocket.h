@@ -146,6 +146,12 @@ int udp_tx_batch_add_ecn(udp_tx_batch_t* batch, const uint8_t* data, size_t len,
 
 size_t udp_tx_batch_count(const udp_tx_batch_t* batch);
 
+/* How many *messages* those datagrams were folded into. The ratio of the two is
+ * the segmentation the kernel will be asked for, and it is the number a caller
+ * has to look at to know whether offload is doing anything: `count` alone
+ * cannot tell one message of sixteen datagrams from sixteen messages of one. */
+size_t udp_tx_batch_messages(const udp_tx_batch_t* batch);
+
 /* Send everything queued, in order, with one syscall. Returns the number of
  * datagrams the kernel accepted and writes the bytes accepted to `out_bytes`
  * when it is not NULL; the batch is emptied either way. A short send is not an

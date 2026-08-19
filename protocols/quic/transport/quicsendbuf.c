@@ -124,6 +124,23 @@ static void __slide(quicsendbuf_t* buf) {
     quicrange_trim_below(&buf->lost, new_base - 1);
 }
 
+uint64_t quicsendbuf_next_offset(const quicsendbuf_t* buf) {
+    if (buf == NULL) return 0;
+
+    /* The same three cases quicsendbuf_next chooses between, in the same order:
+     * the earliest hole, then new data, then the bare end-of-stream marker. */
+    if (!quicrange_empty(&buf->lost)) {
+        quicrange_span_t span;
+        if (quicrange_at_desc(&buf->lost, quicrange_count(&buf->lost) - 1, &span))
+            return span.start;
+        return 0;
+    }
+
+    if (buf->sent_off < buf->write_off) return buf->sent_off;
+
+    return buf->write_off;
+}
+
 int quicsendbuf_next(quicsendbuf_t* buf, size_t max_len,
                      uint64_t* out_offset, const uint8_t** out_data,
                      size_t* out_len, int* out_fin) {

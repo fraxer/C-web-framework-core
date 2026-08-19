@@ -258,6 +258,39 @@ TEST(test_quic_sendbuf) {
     TEST_ASSERT(quicsendbuf_inflight_bytes(&buf) == 0, "released once acknowledged");
     quicsendbuf_free(&buf);
 
+    TEST_CASE("the next offset is knowable before the chunk is asked for");
+    /* The packet builder needs it a step earlier than quicsendbuf_next gives
+     * it: how many bytes the offset varint costs decides how much data fits,
+     * and a guess there is what left every datagram a few bytes short of the
+     * path MTU -- by a different few each time, which is what ends a GSO run
+     * (docs/http3/08 §12). The two must agree in all three cases, or the frame
+     * header is sized for one offset and written with another. */
+    quicsendbuf_init(&buf);
+    quicsendbuf_write(&buf, (const uint8_t*)"0123456789", 10);
+
+    TEST_ASSERT(quicsendbuf_next_offset(&buf) == 0, "new data starts at zero");
+    quicsendbuf_next(&buf, 4, &offset, &data, &len, &fin);
+    TEST_ASSERT(offset == 0, "and so does the chunk");
+
+    quicsendbuf_mark_sent(&buf, 0, 4, 0);
+    TEST_ASSERT(quicsendbuf_next_offset(&buf) == 4, "then where sending stopped");
+    quicsendbuf_next(&buf, 4, &offset, &data, &len, &fin);
+    TEST_ASSERT(offset == 4, "and the chunk agrees");
+    quicsendbuf_mark_sent(&buf, 4, 4, 0);
+
+    quicsendbuf_lost(&buf, 0, 4, 0);
+    TEST_ASSERT(quicsendbuf_next_offset(&buf) == 0, "a hole comes first");
+    quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin);
+    TEST_ASSERT(offset == 0, "and the chunk agrees there too");
+    quicsendbuf_mark_sent(&buf, 0, 4, 0);
+
+    quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin);
+    quicsendbuf_mark_sent(&buf, offset, len, 0);
+    quicsendbuf_finish(&buf);
+    TEST_ASSERT(quicsendbuf_next_offset(&buf) == 10,
+                "and the bare end-of-stream marker sits at the final offset");
+    quicsendbuf_free(&buf);
+
     TEST_CASE("a lost range is retransmitted before new data");
     /* A hole in what the peer holds stalls the stream regardless of how much
      * new data is queued behind it, so retransmission has to win. */

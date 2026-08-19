@@ -104,6 +104,11 @@ typedef struct standpkt {
  * is when they were handed to the path. */
 #define STAND_MAX_MARKS 64
 
+/* How many outgoing datagram lengths to remember. Enough for a transfer of a
+ * couple of megabytes; the counter stops rather than wrapping, because a
+ * wrapped sequence would report runs that never existed. */
+#define STAND_MAX_DGRAM_LOG 4096
+
 typedef struct stand {
     /* ---- path ---- */
     standpkt_t q[STAND_MAX_QUEUE];
@@ -166,6 +171,14 @@ typedef struct stand {
 
     uint64_t marks[STAND_MAX_MARKS];   /* when the server handed over a datagram */
     size_t   mark_count;
+
+    /* The length of every datagram the server handed to the path, in order.
+     * A GSO run is built from exactly this sequence and ends at the first
+     * change of size (udpsocket.c), so whether the sender can be offloaded at
+     * all is a property visible here and nowhere else in the stand
+     * (docs/http3/08 §12). */
+    uint16_t dgram_len[STAND_MAX_DGRAM_LOG];
+    size_t   dgram_logged;
     uint64_t ticks;                    /* server timer sweeps run */
 
     /* Print every event as it happens: what left, what arrived, what was
@@ -349,6 +362,9 @@ static ssize_t __server_out(void* arg, const uint8_t* data, size_t len,
     if (s->mark_count < STAND_MAX_MARKS &&
         (s->mark_count == 0 || s->marks[s->mark_count - 1] != __now_us))
         s->marks[s->mark_count++] = __now_us;
+
+    if (s->dgram_logged < STAND_MAX_DGRAM_LOG)
+        s->dgram_len[s->dgram_logged++] = (uint16_t)len;
 
     __net_send(s, data, len, 0);
 
@@ -1507,6 +1523,115 @@ TEST(test_quic_stand_parallel_streams) {
     }
 
     __stand_free(s);
+}
+
+TEST(test_quic_stand_uniform_datagrams) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("every datagram that fills the packet is the same length");
+    /* The sender's own side of GSO. The kernel folds consecutive datagrams into
+     * one send only while they are the same size, and stops at the first that
+     * is not (udpsocket.c) -- so a builder that lands within a few bytes of the
+     * path MTU instead of on it costs the send path its offload, whatever the
+     * batch does.
+     *
+     * That is what happened: a flat 24-byte reserve for a STREAM frame header
+     * that really costs three to twelve bytes left every packet short by a
+     * varying amount, and the amount changed with the varint of the offset --
+     * two bytes longer past 16 KB, four bytes shorter on a packet that starts a
+     * stream at zero. Runs of sixty segments came out as eleven (docs/http3/08
+     * §12). Nothing in the tests could see it: every byte arrived, in order, on
+     * the right stream.
+     *
+     * Hence several streams and bodies past 16 KB: one stream would cross the
+     * varint boundary once and prove nothing. */
+    stand_t* s = __stand_create(31);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+
+#define UNIFORM_STREAMS 8
+#define UNIFORM_BODY    (48 * 1024)
+
+    for (int i = 0; i < UNIFORM_STREAMS; i++) {
+        const uint8_t request[4] = { 'G', 'E', 'T', (uint8_t)i };
+        TEST_ASSERT(quicclient_stream_write(&s->client, (uint64_t)i * 4,
+                                            request, sizeof request, 1),
+                    "request queued");
+    }
+
+    TEST_ASSERT(quicclient_flush(&s->client), "sent");
+    __run(s, 500000, NULL);
+
+    uint8_t* body = malloc(UNIFORM_BODY);
+    TEST_REQUIRE_NOT_NULL(body, "body allocated");
+    for (size_t j = 0; j < UNIFORM_BODY; j++) body[j] = (uint8_t)(j * 17 + 3);
+
+    for (int i = 0; i < UNIFORM_STREAMS; i++)
+        TEST_ASSERT(__serve(s, (uint64_t)i * 4, body, UNIFORM_BODY), "answered");
+
+    /* Only the sizes matter here, so the bytes are drained and dropped. */
+    uint8_t sink[16 * 1024];
+    size_t have[UNIFORM_STREAMS] = { 0 };
+    int complete = 0;
+
+    for (int round = 0; round < 200000 && complete < UNIFORM_STREAMS; round++) {
+        if (!__step(s, __now_us + 60000000)) break;
+
+        complete = 0;
+        for (int i = 0; i < UNIFORM_STREAMS; i++) {
+            const uint64_t id = (uint64_t)i * 4;
+            const size_t ready = quicclient_stream_readable(&s->client, id);
+
+            if (ready > 0)
+                have[i] += quicclient_stream_read(&s->client, id, sink,
+                                                  ready < sizeof sink ? ready : sizeof sink);
+
+            if (have[i] == UNIFORM_BODY && quicclient_stream_fin(&s->client, id))
+                complete++;
+        }
+    }
+
+    TEST_ASSERT(complete == UNIFORM_STREAMS, "every response arrived");
+    TEST_ASSERT(s->dgram_logged > 200, "and it took enough datagrams to judge by");
+
+    /* The largest datagram the connection produced is the size a packet that
+     * filled its capacity has; anything close to it was meant to be full. What
+     * is far below is a genuinely short packet -- the end of a response, an
+     * acknowledgement on its own -- and those may differ from each other. */
+    size_t widest = 0;
+    for (size_t i = 0; i < s->dgram_logged; i++)
+        if (s->dgram_len[i] > widest) widest = s->dgram_len[i];
+
+    const size_t full_floor = widest > 64 ? widest - 64 : 0;
+
+    size_t full = 0;
+    size_t wobbles = 0;
+
+    for (size_t i = 0; i < s->dgram_logged; i++) {
+        if (s->dgram_len[i] < full_floor) continue;
+
+        full++;
+
+        /* Two datagrams both meant to be full, one after the other, differing
+         * in length: that is the run ending for no reason but arithmetic. */
+        if (i > 0 && s->dgram_len[i - 1] >= full_floor &&
+            s->dgram_len[i - 1] != s->dgram_len[i]) wobbles++;
+    }
+
+    if (wobbles > 0)
+        printf("      %zu of %zu full datagrams (max %zu) differ from the one"
+               " before them\n", wobbles, full, widest);
+
+    TEST_ASSERT(full > 150, "most of the traffic was full-sized packets");
+    TEST_ASSERT(wobbles == 0, "and no two consecutive full datagrams differed in size");
+
+    free(body);
+    __stand_free(s);
+
+#undef UNIFORM_STREAMS
+#undef UNIFORM_BODY
 }
 
 TEST(test_quic_stand_stream_credit) {

@@ -74,6 +74,16 @@ int quicsendbuf_next(quicsendbuf_t* buf, size_t max_len,
                      uint64_t* out_offset, const uint8_t** out_data,
                      size_t* out_len, int* out_fin);
 
+/* The stream offset the next chunk would carry -- what quicsendbuf_next is
+ * about to return in `out_offset`, without asking for the chunk itself.
+ *
+ * It exists so the packet builder can size a STREAM frame *exactly*: the frame
+ * header costs a varint for the offset, and how many bytes that varint takes is
+ * the difference between a datagram that fills the path MTU and one that stops
+ * two bytes short of it (quicconn.c, __stream_chunk_room). Zero when there is
+ * nothing to send, which the caller has already established by other means. */
+uint64_t quicsendbuf_next_offset(const quicsendbuf_t* buf);
+
 /* Record that [offset, offset+len) has gone out, so quicsendbuf_next moves past
  * it. Called after the packet is built, not after it is acknowledged. */
 void quicsendbuf_mark_sent(quicsendbuf_t* buf, uint64_t offset, size_t len, int fin);

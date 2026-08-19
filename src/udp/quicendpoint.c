@@ -42,6 +42,13 @@
  * decrypt for reasons nobody can see. */
 #define QUIC_RX_DATAGRAM_SIZE 65535
 
+/* Datagrams the transmit batch holds before it has to go out. Not a policy
+ * knob: it is bounded above by what one GSO message may carry (64 KB of skb,
+ * i.e. about 44 full datagrams) plus room for the other peers a worker serves
+ * in the same turn, and below by that same 44 -- a batch shorter than one full
+ * run cannot produce one. */
+#define QUIC_TX_BATCH_DATAGRAMS 128
+
 /* One event drains at most this many batches. Level-triggered epoll will report
  * the socket again, so a busy endpoint cannot starve the rest of the worker. */
 #define QUIC_RX_MAX_BATCHES 8
@@ -2363,10 +2370,16 @@ static quicendpoint_t* __endpoint_create(mpxapi_t* api, server_t* server,
     ep->rx = udp_rx_batch_create(rx_batch, QUIC_RX_DATAGRAM_SIZE);
     if (ep->rx == NULL) goto failed;
 
-    /* Same depth as the receive batch: what arrives in one turn is roughly what
-     * leaves in one, and both are bounded by the worker's visit rather than by
-     * memory. */
-    ep->tx_batch = udp_tx_batch_create(rx_batch, QUIC_MAX_UDP_PAYLOAD_V4);
+    /* Deeper than the receive batch, and for a reason that has nothing to do
+     * with how much arrives: the transmit batch is where a GSO run is built,
+     * and a run ends when the batch is flushed. Sized to the receive batch it
+     * held 32 datagrams, so a connection with a hundred packets to send had its
+     * run cut into thirds by the arena alone -- a third of every run ended that
+     * way once the datagrams themselves stopped varying in size (docs/http3/08
+     * §12). The arena is the whole cost, and next to the 2 MB the receive batch
+     * already holds it is not one. */
+    ep->tx_batch = udp_tx_batch_create(QUIC_TX_BATCH_DATAGRAMS,
+                                       QUIC_MAX_UDP_PAYLOAD_V4);
     if (ep->tx_batch == NULL) goto failed;
 
     /* The endpoint's own connection carries no buffer: datagrams live in the
