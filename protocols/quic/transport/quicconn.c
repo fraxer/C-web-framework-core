@@ -412,11 +412,19 @@ void quicconn_consumed(quicconn_t* conn, uint64_t bytes) {
 uint64_t quicconn_unsent_bytes(const quicconn_t* conn) {
     if (conn == NULL) return 0;
 
-    /* Summed rather than counted incrementally. The list is bounded by
-     * initial_max_streams_bidi (100), and this runs once per chunk written --
-     * per 16 KB, not per byte -- so a walk costs less than the two hooks a
-     * running total would need in quicstream_write and quicsendbuf_mark_sent,
-     * and cannot drift out of step with the buffers it describes. */
+    /* Summed rather than counted incrementally, and that conclusion has now
+     * been tested rather than argued.
+     *
+     * The premise it used to rest on was wrong: this does not run once per
+     * 16 KB chunk written but once per *turn* (quicconn_budget_open), and turns
+     * are as frequent as arriving datagrams -- the walk is 2,6 % of the
+     * server's CPU, more than the send loop's own walk of the same list. The
+     * conclusion survives anyway. A running total needs a hook in
+     * quicstream_write and another around quicsendbuf_mark_sent, and the second
+     * one runs per STREAM frame -- forty times a response against a handful of
+     * walks over a dozen streams. Built and measured both ways: the count came
+     * out slower, 88 us of CPU per request against 85, and it costs the
+     * invariant that this cannot be wrong (docs/http3/08 §15). */
     uint64_t total = 0;
     for (const quicstream_t* s = conn->streams; s != NULL; s = s->next)
         total += quicsendbuf_unsent_bytes(&s->send);
