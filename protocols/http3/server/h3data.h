@@ -41,6 +41,17 @@ typedef struct h3_data_writer {
      * resume from. The flag below is the only state, and it exists because FIN
      * must be sent once. */
     int fin_sent;
+
+    /* How many body bytes the response says are coming, when it says so, and
+     * zero when nobody knows. Recorded by the header stage, which is the only
+     * place that can see it, and spent by the first body write, which is the
+     * only place that may act on it: reserving at the header stage reserves for
+     * every stream of the connection at once, and thirty streams of a 57 KB
+     * response come to more than the process-wide QUIC memory budget allows --
+     * measured as 362 refusals and four thousand failed requests
+     * (docs/http3/08 §13). The write-ahead budget already decides which streams
+     * are worth buffering; this only tells them how much to ask for. */
+    size_t expected;
 } h3_data_writer_t;
 
 void h3_data_writer_reset(h3_data_writer_t* w);

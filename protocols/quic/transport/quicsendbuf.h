@@ -57,6 +57,13 @@ void quicsendbuf_free(quicsendbuf_t* buf);
  * is the caller's business, not the buffer's. */
 int quicsendbuf_write(quicsendbuf_t* buf, const uint8_t* data, size_t len);
 
+/* Make room for `total` more bytes in one allocation, for a caller that knows
+ * how much is coming -- a response with a Content-Length, which is every static
+ * file this server serves. A hint only: too little just leaves the doubling to
+ * do the rest, too much costs memory and nothing else. Returns 0 only when the
+ * allocation (or the process-wide QUIC memory budget) refuses. */
+int quicsendbuf_reserve(quicsendbuf_t* buf, size_t total);
+
 /* Mark the stream finished; no further writes are accepted. */
 void quicsendbuf_finish(quicsendbuf_t* buf);
 

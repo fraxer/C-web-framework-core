@@ -2129,8 +2129,32 @@ int quicconn_recv(quicconn_t* conn, const uint8_t* datagram, size_t len,
                     conn->cc.max_datagram_size = conn->pmtud.current;
                 }
             }
-            conn->pmtud.next_probe_us = now_us +
-                10 * quicloss_pto_us(&conn->loss, QUIC_ENC_APP);
+            /* The search opens now, not ten PTO from now.
+             *
+             * The delay was caution about disturbing a connection that had only
+             * just finished its handshake, and it cost far more than it saved.
+             * A PTO is not a small number when the server is loaded: at a
+             * hundred concurrent connections the round trip this measures is
+             * mostly our own receive queue, so ten of them came to 400 ms --
+             * longer than a connection of a hundred requests lives. Measured on
+             * the profile of record, only twelve to forty-seven connections out
+             * of a hundred ever probed at all, and the rest spent their whole
+             * life sending 1350-byte datagrams into a path that takes 1472:
+             * 43,7 datagrams per response where 40 would do, every one of them
+             * paying for its own header, its own AEAD seal and its own entry in
+             * loss detection (docs/http3/08 §13).
+             *
+             * Nothing about a probe needs the delay. It is gated on there being
+             * four packets' worth of data waiting, so it never fires on an idle
+             * connection; it is deliberately outside bytes_in_flight, so it
+             * cannot push the congestion controller; and a path that will not
+             * carry it costs three probes and then lowers the ceiling for good
+             * (RFC 8899 §5.3, and its state machine goes to SEARCH as soon as
+             * the base size is confirmed -- the 15-second PROBE_TIMER it does
+             * define governs retries, not the first probe). The spacing that
+             * remains is where the caution belongs: after a probe, not before
+             * the first one. */
+            conn->pmtud.next_probe_us = now_us;
 
             /* §4.9.2: for a server the handshake is confirmed by its own
              * completion -- the client's Finished cannot exist unless the

@@ -27,46 +27,74 @@ void quicsendbuf_free(quicsendbuf_t* buf) {
     quicrange_free(&buf->lost);
 }
 
+/* Make room for `len` more bytes past what is already held, in one step of the
+ * same ladder of powers of two whatever the caller is: a write asking for its
+ * chunk and a reserve asking for a whole response both land on a size the
+ * allocator has chunks for. Sizing a reserve exactly instead measured *worse*
+ * end to end than the doubling it replaced -- 45 % of h2 against 55 % -- and
+ * the odd-sized blocks were the only difference (docs/http3/08 §13). */
+static int __grow(quicsendbuf_t* buf, size_t len) {
+    if (buf->head > SIZE_MAX - buf->len ||
+        len > SIZE_MAX - buf->head - buf->len) return 0;
+
+    if (buf->head + buf->len + len <= buf->cap) return 1;
+
+    /* Reclaim the dead prefix before growing: a buffer that is only being
+     * drained from the front would otherwise double forever. */
+    if (buf->head > 0) {
+        memmove(buf->data, buf->data + buf->head, buf->len);
+        buf->head = 0;
+    }
+
+    if (buf->len + len <= buf->cap) return 1;
+
+    const size_t need = buf->len + len;
+    size_t cap = buf->cap == 0 ? 4096 : buf->cap;
+
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2) {
+            cap = need;
+            break;
+        }
+        cap *= 2;
+    }
+
+    const size_t growth = cap - buf->cap;
+    if (!quicmemory_reserve(growth)) return 0;
+
+    uint8_t* grown = realloc(buf->data, cap);
+    if (grown == NULL) {
+        quicmemory_release(growth);
+        return 0;
+    }
+
+    buf->data = grown;
+    buf->cap = cap;
+
+    return 1;
+}
+
+int quicsendbuf_reserve(quicsendbuf_t* buf, size_t total) {
+    if (buf == NULL) return 0;
+    if (total == 0) return 1;
+
+    /* Once, instead of a dozen times. Doubling from 4 KB is the right policy
+     * for a buffer whose final size nobody knows, and the wrong one for a
+     * response whose length was in the header field: a 57 KB body arriving in
+     * 16 KB chunks grew 4 -> 8 -> ... -> 64 KB, and realloc copied the live
+     * bytes at each step. That came to more bytes moved than the body itself --
+     * 2,0 % of the server's CPU against 2,0 % for the copy that actually
+     * delivers the data (docs/http3/08 §13). Asking for the whole thing up
+     * front is one allocation and no intermediate copy. */
+    return __grow(buf, total);
+}
+
 int quicsendbuf_write(quicsendbuf_t* buf, const uint8_t* data, size_t len) {
     if (buf == NULL || buf->fin) return 0;
     if (len == 0) return 1;
     if (data == NULL) return 0;
 
-    if (buf->head > SIZE_MAX - buf->len ||
-        len > SIZE_MAX - buf->head - buf->len) return 0;
-
-    if (buf->head + buf->len + len > buf->cap) {
-        /* Reclaim the dead prefix before growing: a buffer that is only being
-         * drained from the front would otherwise double forever. */
-        if (buf->head > 0) {
-            memmove(buf->data, buf->data + buf->head, buf->len);
-            buf->head = 0;
-        }
-
-        if (buf->len + len > buf->cap) {
-            size_t cap = buf->cap == 0 ? 4096 : buf->cap;
-            const size_t need = buf->len + len;
-            while (cap < need) {
-                if (cap > SIZE_MAX / 2) {
-                    cap = need;
-                    break;
-                }
-                cap *= 2;
-            }
-
-            const size_t growth = cap - buf->cap;
-            if (!quicmemory_reserve(growth)) return 0;
-
-            uint8_t* grown = realloc(buf->data, cap);
-            if (grown == NULL) {
-                quicmemory_release(growth);
-                return 0;
-            }
-
-            buf->data = grown;
-            buf->cap = cap;
-        }
-    }
+    if (!__grow(buf, len)) return 0;
 
     memcpy(buf->data + buf->head + buf->len, data, len);
     buf->len += len;

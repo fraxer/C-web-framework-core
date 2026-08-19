@@ -84,6 +84,33 @@ static int __has_trailers(httpresponse_t* response) {
     return response->trailer_ != NULL;
 }
 
+/* Record how much body is coming, for the first write to act on.
+ *
+ * The size is the one the data filter put in Content-Length, and under the same
+ * conditions: a range, a transfer encoding or a content encoding all mean the
+ * bytes that reach the stream are not the bytes on disk, and then this knows
+ * nothing and says nothing. It is a hint either way -- too small leaves the
+ * doubling to finish the job, too large costs memory -- so being wrong is not a
+ * defect, only a missed saving. What it saves is real: without it a 57 KB
+ * response arriving in 16 KB chunks was copied from one buffer into the next
+ * four times on its way up to 64 KB (docs/http3/08 §13).
+ *
+ * The DATA frame headers ride along in the same buffer, so they are counted:
+ * one per chunk, at most eight bytes each. */
+static void __note_body_size(httpresponse_t* response, h3_data_writer_t* w) {
+    if (response->range || response->transfer_encoding != TE_NONE ||
+        response->content_encoding != CE_NONE)
+        return;
+
+    const size_t body = response->file_.fd > -1 ? response->file_.size
+                                                : response->body.size;
+    if (body == 0) return;
+
+    const size_t frames = body / H3_DATA_CHUNK_MAX + 1;
+
+    w->expected = body + frames * 8;
+}
+
 static int __header(httprequest_t* request, httpresponse_t* response) {
     h3_module_write_t* module = response->cur_filter->module;
 
@@ -132,6 +159,8 @@ static int __header(httprequest_t* request, httpresponse_t* response) {
             quicstream_finish(qs);
             module->writer.fin_sent = 1;
         }
+        else
+            __note_body_size(response, &module->writer);
     }
 
     quicconn_want_write(response->connection);

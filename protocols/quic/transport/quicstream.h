@@ -180,6 +180,11 @@ size_t quicstream_read(quicstream_t* stream, uint8_t* dst, size_t len);
 
 /* Queue data for sending; flow control is applied at packet build time. */
 int quicstream_write(quicstream_t* stream, const uint8_t* data, size_t len);
+
+/* Tell the send buffer how much is still coming, so it allocates once instead
+ * of doubling its way there (quicsendbuf_reserve). A hint; failure is not an
+ * error the caller has to act on, because the write path grows on its own. */
+void quicstream_reserve(quicstream_t* stream, size_t total);
 void quicstream_finish(quicstream_t* stream);
 
 /* Anything to put on the wire for this stream. */

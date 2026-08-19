@@ -258,6 +258,35 @@ TEST(test_quic_sendbuf) {
     TEST_ASSERT(quicsendbuf_inflight_bytes(&buf) == 0, "released once acknowledged");
     quicsendbuf_free(&buf);
 
+    TEST_CASE("a reserve makes room once instead of doubling its way there");
+    /* The saving is invisible from outside -- the same bytes arrive either way
+     * -- so what is checked is the only thing that can be: the buffer accepts
+     * the whole body without growing again, and what it holds is unchanged by
+     * having been reserved for (docs/http3/08 §13). */
+    quicsendbuf_init(&buf);
+    TEST_ASSERT(quicsendbuf_reserve(&buf, 40000), "reserved");
+    const size_t reserved_cap = buf.cap;
+    TEST_ASSERT(reserved_cap >= 40000, "and the room is really there");
+    TEST_ASSERT(buf.len == 0 && buf.write_off == 0,
+                "while nothing was written by asking");
+
+    uint8_t chunk[16384];
+    memset(chunk, 'z', sizeof chunk);
+    for (int i = 0; i < 2; i++)
+        TEST_ASSERT(quicsendbuf_write(&buf, chunk, sizeof chunk), "written");
+
+    TEST_ASSERT(buf.cap == reserved_cap, "no further growth was needed");
+    TEST_ASSERT(buf.write_off == 2 * sizeof chunk, "and every byte is held");
+
+    /* A reserve smaller than what is already there asks for nothing, and a
+     * reserve is never a promise: the write path still grows past it. */
+    TEST_ASSERT(quicsendbuf_reserve(&buf, 1), "a token reserve is accepted");
+    TEST_ASSERT(buf.cap == reserved_cap, "and changes nothing");
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT(quicsendbuf_write(&buf, chunk, sizeof chunk), "past the reserve");
+    TEST_ASSERT(buf.write_off == 5 * sizeof chunk, "which the buffer took anyway");
+    quicsendbuf_free(&buf);
+
     TEST_CASE("the next offset is knowable before the chunk is asked for");
     /* The packet builder needs it a step earlier than quicsendbuf_next gives
      * it: how many bytes the offset varint costs decides how much data fits,

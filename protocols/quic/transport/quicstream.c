@@ -232,6 +232,14 @@ size_t quicstream_read(quicstream_t* stream, uint8_t* dst, size_t len) {
     return n;
 }
 
+void quicstream_reserve(quicstream_t* stream, size_t total) {
+    if (stream == NULL) return;
+    if (stream->send_state == QUIC_SEND_RESET_SENT ||
+        stream->send_state == QUIC_SEND_RESET_RECVD) return;
+
+    quicsendbuf_reserve(&stream->send, total);
+}
+
 int quicstream_write(quicstream_t* stream, const uint8_t* data, size_t len) {
     if (stream == NULL) return 0;
     if (!quicstream_can_send(stream->id)) return 0;

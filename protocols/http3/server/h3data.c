@@ -8,6 +8,7 @@ void h3_data_writer_reset(h3_data_writer_t* w) {
     if (w == NULL) return;
 
     w->fin_sent = 0;
+    w->expected = 0;
 }
 
 /* Queue one DATA frame: header then payload, both or neither.
@@ -47,6 +48,20 @@ h3_data_status_e h3_data_write(h3_data_writer_t* w, quicconn_t* qc, quicstream_t
      * the write queues is exactly what the budget loses. */
     size_t room = quicconn_write_room(qc);
 
+    /* One allocation instead of a dozen doublings -- but never for more than
+     * this turn is allowed to write.
+     *
+     * The whole body would be the natural thing to ask for and is the wrong
+     * thing: every open stream reaches this line, so thirty streams would each
+     * reserve a whole response and the connection would hold thirty of them
+     * where the write-ahead budget means to hold four. Against the process-wide
+     * QUIC memory budget that is not a waste but a failure -- 666 refusals and
+     * half the requests reset (docs/http3/08 §13). Bounded by `room`, the sum
+     * of all these reservations is the budget itself, which is precisely the
+     * memory the connection is entitled to. */
+    if (w->expected > 0 && room > 0)
+        quicstream_reserve(qs, w->expected < room ? w->expected : room);
+
     for (;;) {
         const size_t remaining = src->size > src->pos ? src->size - src->pos : 0;
 
@@ -69,6 +84,7 @@ h3_data_status_e h3_data_write(h3_data_writer_t* w, quicconn_t* qc, quicstream_t
 
         src->pos += chunk;
         room = room > queued ? room - queued : 0;
+        w->expected = w->expected > queued ? w->expected - queued : 0;
 
         /* The connection keeps the budget across calls now, so what was queued
          * here has to be told to it -- otherwise the next stream's turn reads a

@@ -3022,59 +3022,34 @@ TEST(test_quic_stand_dplpmtud) {
 
     TEST_ASSERT(have == total, "the whole body arrived");
     TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
-    TEST_ASSERT(s->conn->pmtud.current == base,
-                "the first transfer is still at the base size");
 
-    /* The search is held off for ten PTOs after the handshake, and on this
-     * stand's path that is longer than a 256 KB transfer takes -- which is
-     * itself worth knowing: a connection that serves one response and stops
-     * never leaves the base packet size, whatever the path allows.
+    /* On the *first* transfer, and that is the assertion.
      *
-     * So the test does what a real connection does next: it waits out the
-     * window and asks again. */
-    const uint64_t wait_us = s->conn->pmtud.next_probe_us > __now_us
-                             ? s->conn->pmtud.next_probe_us - __now_us + 1000 : 1000;
-    __run(s, wait_us, NULL);
-
-    TEST_REQUIRE_NOT_NULL(s->conn, "still connected while the probe window opens");
-    TEST_ASSERT(quicpmtud_should_probe(&s->conn->pmtud, __now_us),
-                "and the search is now allowed to begin");
-
-    /* A second request on a second stream, with enough queued behind it that a
-     * probe is worth sending. */
-    TEST_ASSERT(quicclient_stream_write(&s->client, 4, (const uint8_t*)"GET", 3, 1), "second request");
-    TEST_ASSERT(quicclient_flush(&s->client), "sent");
-    __run(s, 200000, NULL);
-    TEST_ASSERT(__consume_request(s, 4), "the second request was read");
-
-    quicstream_t* qs2 = quicconn_stream_find(s->conn, 4);
-    TEST_REQUIRE_NOT_NULL(qs2, "the server has the second stream");
-    TEST_ASSERT(__respond_body(s, qs2, body, total, 1), "queued on the second stream");
-
-    size_t have2 = 0;
-    for (int round = 0; round < 40000 && have2 < total; round++) {
-        if (!__step(s, __now_us + 60000000)) break;
-
-        const size_t ready = quicclient_stream_readable(&s->client, 4);
-        if (ready == 0) continue;
-
-        have2 += quicclient_stream_read(&s->client, 4, got + have2,
-                                        total - have2 < ready ? total - have2 : ready);
-    }
-
-    TEST_ASSERT(have2 == total, "the second body arrived too");
-    TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
-
-    /* The probe rides the transfer, but its acknowledgement may arrive after
+     * The search used to be held off for ten PTOs after the handshake, so this
+     * same transfer ended at the base size and the test had to wait out the
+     * window and send a second request to see a probe at all. A PTO is not a
+     * small number on a loaded server -- most of it is the server's own receive
+     * queue -- and ten of them outlived the connections that were paying for
+     * them: measured on the profile of record, most of a hundred connections
+     * never probed once and spent their whole life at 1350 bytes into a path
+     * that takes 1472 (docs/http3/08 §13). The delay is gone, and with it the
+     * property the old version of this test recorded: a connection that serves
+     * one response and stops now does leave the base size.
+     *
+     * The probe rides the transfer, but its acknowledgement may arrive after
      * the last body byte the client reads -- so the search is given the round
      * trip it is waiting on rather than being judged at the moment the loop
      * above happens to end. */
     __run(s, 1000000, __pmtu_settled);
+
     TEST_ASSERT(s->conn->pmtud.current == ceiling,
-                "and the probe was acknowledged, so the packet size rose to the ceiling");
+                "the probe was acknowledged, so the packet size rose to the ceiling");
+    TEST_ASSERT(s->conn->pmtud.current > base, "which is above where it started");
     TEST_ASSERT(s->conn->cc.max_datagram_size == s->conn->pmtud.current,
                 "the congestion controller counts in the new size too");
     TEST_ASSERT(!s->conn->pmtud.outstanding, "no probe is left hanging");
+    TEST_ASSERT(!quicpmtud_should_probe(&s->conn->pmtud, __now_us),
+                "and the search is over: there is nowhere left to go");
 
     free(got);
     free(body);
