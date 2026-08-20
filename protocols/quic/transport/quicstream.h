@@ -20,6 +20,8 @@
  * does not do this fails against real clients, because a client may skip ids
  * it decided not to use. */
 
+struct quicconn;
+
 #define QUIC_STREAM_BIT_SERVER 0x01
 #define QUIC_STREAM_BIT_UNI    0x02
 
@@ -95,7 +97,13 @@ typedef struct quicstream {
     int      stop_sending_received;
     uint64_t stop_sending_code;
 
-    /* Frames owed to the peer about this stream. */
+    /* Frames owed to the peer about this stream. Both are mirrored in
+     * quicconn_t::ctrl_owed, which is the only reason a stream knows which
+     * connection it belongs to: the send loop has to answer "does anybody owe a
+     * terminal frame?" without walking the list, because when the congestion
+     * window is shut that walk is the whole cost of the turn (docs/http3/08
+     * §16). Set and cleared only through the two helpers below and
+     * quicstream_free, so the count cannot drift. */
     int      send_reset_pending;
     int      send_stop_sending_pending;
     uint64_t send_stop_sending_code;
@@ -127,6 +135,14 @@ typedef struct quicstream {
      * still writing a response onto it -- so it asks. NULL means "no opinion",
      * which counts as finished. */
     int    (*app_done)(void*);
+
+    /* The connection this stream hangs off, set when it is appended to the
+     * list. Used for one thing only -- keeping ctrl_owed in step -- and never
+     * as a way for stream code to reach into connection state. Deliberately
+     * down here with `next`: putting it at the top pushed every hot field of
+     * this struct along by eight bytes and cost more than the walk it saves
+     * (docs/http3/08 §16). */
+    struct quicconn* conn;
 
     struct quicstream* next;
 } quicstream_t;

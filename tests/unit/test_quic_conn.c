@@ -1949,6 +1949,108 @@ TEST(test_quic_stand_stop_sending) {
     __stand_free(s);
 }
 
+/* What quicconn_t::ctrl_owed is supposed to equal at every moment: the number
+ * of terminal frames the streams of this connection still owe. Counted the slow
+ * way, which is the whole point -- the field exists so the send loop does not
+ * have to do this. */
+static unsigned __ctrl_owed_walk(const quicconn_t* conn) {
+    unsigned owed = 0;
+    for (const quicstream_t* s = conn->streams; s != NULL; s = s->next) {
+        if (s->send_reset_pending) owed++;
+        if (s->send_stop_sending_pending) owed++;
+    }
+    return owed;
+}
+
+TEST(test_quic_stand_ctrl_owed) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("the terminal-frame count keeps step with the streams that owe one");
+    /* ctrl_owed is a cache, and a cache that drifts is worse than no cache at
+     * all here: too high and the send loop walks the stream list on every
+     * window-blocked packet, which is the cost it was added to remove; too low
+     * and a RESET_STREAM waits for a window that a cancelled stream has no
+     * reason to open (docs/http3/08 §16).
+     *
+     * So the field is compared against a walk after every operation that can
+     * move it, in a scenario that queues both flags at once -- one stream can
+     * owe two frames, which is the arithmetic most likely to be got wrong -- and
+     * then lets them go out. */
+    stand_t* s = __stand_create(23);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+
+    quicstream_t* qs = __open_request_stream(s);
+    TEST_REQUIRE_NOT_NULL(qs, "the server has the stream");
+
+    TEST_ASSERT(s->conn->ctrl_owed == 0, "nothing owed on a fresh stream");
+    TEST_ASSERT(s->conn->ctrl_owed == __ctrl_owed_walk(s->conn), "and the walk agrees");
+
+    const size_t total = 256 * 1024;
+    uint8_t* body = __body_make(total);
+    TEST_REQUIRE_NOT_NULL(body, "body allocated");
+    TEST_ASSERT(__respond(s, qs, body, total), "queued on the stream");
+
+    __run(s, 60000, NULL);
+    TEST_ASSERT(s->conn->ctrl_owed == 0, "a transfer in progress owes no terminal frame");
+
+    connection_s_lock(&s->conn->conn, LOCK_SITE_QUIC_SEND);
+    quicstream_reset(qs, 0x10d);
+    TEST_ASSERT(s->conn->ctrl_owed == 1, "the reset is owed");
+
+    /* Declined, and the count has to know it: this request arrived whole, so
+     * its receive side is finished and §3.5 has nothing left to stop. A count
+     * incremented before that early return would be permanently high, and a
+     * permanently high count is exactly the walk this field exists to skip. */
+    quicstream_stop_sending(qs, 0x10d);
+    TEST_ASSERT(s->conn->ctrl_owed == 1, "a STOP_SENDING with nothing to stop owes nothing");
+
+    /* Idempotence, the other trap: the h3 layer resets a stream from more than
+     * one place, and quicstream_reset returns early for a stream already
+     * reset. */
+    quicstream_reset(qs, 0x10d);
+    TEST_ASSERT(s->conn->ctrl_owed == 1, "asking twice owes the same one frame");
+    TEST_ASSERT(s->conn->ctrl_owed == __ctrl_owed_walk(s->conn), "the walk agrees");
+    connection_s_unlock(&s->conn->conn);
+
+    /* One stream owing two frames is the arithmetic most likely to be got
+     * wrong, and it needs a stream whose receive half is still open -- so this
+     * one is opened without a FIN. */
+    TEST_ASSERT(quicclient_stream_write(&s->client, 4, (const uint8_t*)"GET", 3, 0),
+                "a second request, left unfinished");
+    TEST_ASSERT(quicclient_flush(&s->client), "sent");
+    __run(s, 200000, NULL);
+
+    TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
+    quicstream_t* qs4 = quicconn_stream_find(s->conn, 4);
+    TEST_REQUIRE_NOT_NULL(qs4, "the server has the second stream");
+
+    /* Relative to whatever is owed now: the turns above may already have put
+     * the first stream's RESET_STREAM on the wire, and the count is about what
+     * is still owed, not about how many were ever queued. */
+    const unsigned owed_before = s->conn->ctrl_owed;
+
+    connection_s_lock(&s->conn->conn, LOCK_SITE_QUIC_SEND);
+    quicstream_reset(qs4, 0x10e);
+    quicstream_stop_sending(qs4, 0x10e);
+    connection_s_unlock(&s->conn->conn);
+    TEST_ASSERT(s->conn->ctrl_owed == owed_before + 2, "one stream, two frames");
+    TEST_ASSERT(s->conn->ctrl_owed == __ctrl_owed_walk(s->conn), "and the walk agrees");
+
+    quicconn_want_write(&s->conn->conn);
+    TEST_ASSERT(__run(s, 1000000, __stream0_reset), "the client was told");
+    __run(s, 300000, NULL);
+
+    TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
+    TEST_ASSERT(s->conn->ctrl_owed == 0, "and nothing is owed once the frames are out");
+    TEST_ASSERT(s->conn->ctrl_owed == __ctrl_owed_walk(s->conn), "walk agrees at the end");
+
+    free(body);
+    __stand_free(s);
+}
+
 TEST(test_quic_stand_peer_reset_accounting) {
     TEST_SUITE("quic_stand");
 

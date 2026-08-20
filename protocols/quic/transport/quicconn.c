@@ -318,6 +318,7 @@ static quicstream_t* __stream_find(quicconn_t* conn, uint64_t id) {
  * count the peer chooses (initial_max_streams_bidi goes to 65536). */
 static void __stream_append(quicconn_t* conn, quicstream_t* s) {
     s->next = NULL;
+    s->conn = conn;
 
     if (conn->streams_tail != NULL) conn->streams_tail->next = s;
     else conn->streams = s;
@@ -2661,7 +2662,14 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
      * built newest-first, which made this reverse order of arrival, and the
      * first file a client asked for was the last one it got. See
      * __stream_append. */
-    if (level == QUIC_ENC_APP) {
+    /* Nothing below can be produced with the window shut except the two
+     * terminal frames, and ctrl_owed says whether anybody owes one. Skipping
+     * the walk outright is what that count is for: a shut window is the normal
+     * state while a path is losing datagrams, and this walk was 94 % of the
+     * stream visits in that state (docs/http3/08 §16). The scheduler selection
+     * below goes with it -- it answers a question about a packet that is not
+     * going to carry any stream data. */
+    if (level == QUIC_ENC_APP && (cc_room || conn->ctrl_owed > 0)) {
         /* Which streams may put data in *this* packet. Decided once per packet
          * rather than per stream: the answer is a property of the whole set,
          * and asking it per stream would make it O(n²). */
@@ -2694,6 +2702,7 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
                     p += n;
                     ack_eliciting = 1;
                     s->send_stop_sending_pending = 0;
+                    if (conn->ctrl_owed > 0) conn->ctrl_owed--;
                 }
             }
 
@@ -2723,6 +2732,7 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
                     p += n;
                     ack_eliciting = 1;
                     s->send_reset_pending = 0;
+                    if (conn->ctrl_owed > 0) conn->ctrl_owed--;
                 }
                 continue;
             }

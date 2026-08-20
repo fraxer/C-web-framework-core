@@ -114,6 +114,17 @@ if [ "$ready" -ne 1 ]; then
     exit 1
 fi
 
+# What the kernel dropped into a *receiving* socket for want of room. It is a
+# host-wide counter, so it does not name the socket -- but on a loopback
+# benchmark, with the server given its own 4 MB receive buffer, the one that
+# overflows is h2load's: a single-process client at 90 % of a core stops
+# draining for a few milliseconds and 208 KB of default buffer (about 140
+# datagrams) is gone. The server then retransmits, and every number in the run
+# describes loss recovery instead of throughput (docs/http3/08 §16a).
+udp_rcvbuf_errors() {
+    sed -n '/^Udp:/{n;p}' /proc/net/snmp | head -1 | awk '{ print $6 }'
+}
+
 median() {
     sort -n "$1" | awk '{ v[NR]=$1 } END { if (NR) print v[(NR+1)/2] }'
 }
@@ -184,6 +195,7 @@ for i in $(seq 1 "$RUNS"); do
         representative_requests="$WORK_DIR/representative-$i.tsv"
         curl -fsk --resolve "localhost:$PORT:127.0.0.1" \
             "https://localhost:$PORT/metrics?reset=1" > /dev/null || exit 1
+        rcvbuf_before=$(udp_rcvbuf_errors)
         if ! "$H2LOAD" --alpn-list=h3 --connect-to="127.0.0.1:$PORT" \
                 --sni=localhost --log-file="$representative_requests" \
                 -n 10000 -c 100 -m 30 \
@@ -204,11 +216,16 @@ for i in $(seq 1 "$RUNS"); do
         fi
         printf '%s\n' "$value" >> "$WORK_DIR/representative.values"
 
+        rcvbuf_after=$(udp_rcvbuf_errors)
+        printf '%s %s\n' rcvbuf_errors \
+            "$(( ${rcvbuf_after:-0} - ${rcvbuf_before:-0} ))" >> "$WORK_DIR/gso.values"
+
         metrics_log="$WORK_DIR/representative-$i-metrics.json"
         curl -fsk --resolve "localhost:$PORT:127.0.0.1" \
             "https://localhost:$PORT/metrics" > "$metrics_log" || exit 1
         for key in datagrams_sent send.batch_calls send.messages \
-                   send.gso_messages send.gso_segments send.gso_fallbacks send.partial; do
+                   send.gso_messages send.gso_segments send.gso_fallbacks \
+                   send.partial packets_lost; do
             metric=$(sed -n "s/.*\"$key\":[[:space:]]*\([0-9][0-9]*\).*/\1/p" \
                 "$metrics_log")
             if [ -z "$metric" ]; then
@@ -251,9 +268,22 @@ if [ "$short_mode" = h2load ]; then
     gso_segments=$(metric_sum send.gso_segments)
     fallbacks=$(metric_sum send.gso_fallbacks)
     partial=$(metric_sum send.partial)
+    lost=$(metric_sum packets_lost)
+    rcvbuf=$(metric_sum rcvbuf_errors)
     awk -v d="$dgrams" -v c="$calls" -v m="$messages" -v gm="$gso_messages" \
         -v gs="$gso_segments" -v f="$fallbacks" -v p="$partial" \
         'BEGIN { printf "h3 benchmark: tx datagrams=%d batch_calls=%d messages=%d avg_batch=%.2f gso_messages=%d gso_segments=%d avg_gso=%.2f fallbacks=%d partial=%d\n", d, c, m, c ? d/c : 0, gm, gs, gm ? gs/gm : 0, f, p }'
+    awk -v l="$lost" -v d="$dgrams" -v r="$rcvbuf" \
+        'BEGIN { printf "h3 benchmark: loss declared=%d (%.3f%% of datagrams) client rcvbuf_errors=%d\n", l, d ? 100*l/d : 0, r }'
+    # Said out loud rather than folded into a threshold: a loopback path drops
+    # nothing on its own, so this is the stand's own client falling behind, and
+    # the sample above measures loss recovery. The counter is host-wide, so it
+    # is a warning and not a failure -- unrelated UDP traffic lands in it too.
+    if [ "$rcvbuf" -gt 0 ]; then
+        printf 'h3 benchmark: WARNING the client dropped datagrams for want of socket buffer;\n'
+        printf '              this sample measures loss recovery (docs/http3/08 §16a).\n'
+        printf '              Give the client more processes or raise net.core.rmem_default.\n'
+    fi
 fi
 
 if [ -n "$RECORD" ]; then

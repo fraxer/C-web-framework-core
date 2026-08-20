@@ -194,6 +194,24 @@ typedef struct quicconn {
      * next turn starts from the head again. */
     quicstream_t* send_cursor;
 
+    /* How many terminal frames the streams of this connection owe the peer --
+     * RESET_STREAM and STOP_SENDING, counted per flag, so one stream can add
+     * two.
+     *
+     * It exists to keep the send loop from walking the stream list when the
+     * congestion window is shut. Those two frames are the only thing that walk
+     * can produce with the window closed, and they are almost never owed: over
+     * 40 000 requests the benchmark queues about a hundred. Without the count,
+     * every window-blocked packet build walked every stream to discover that --
+     * 87 of 128 stream visits per request at rest, and 657 of 697 once the path
+     * starts losing datagrams, because a shut window is what loss produces
+     * (docs/http3/08 §16).
+     *
+     * Kept in step in three places and no others: the two helpers that set the
+     * flags, the two writers below that clear them, and quicstream_free for a
+     * stream that dies still owing. */
+    unsigned  ctrl_owed;
+
     /* Streams whose priority the layer above actually set to something other
      * than the default (RFC 9218). Zero -- which is every connection whose peer
      * sends no priority signals -- means the send loop keeps the list order it

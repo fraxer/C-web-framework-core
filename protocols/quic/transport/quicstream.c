@@ -3,6 +3,7 @@
 
 #include "metrics.h"
 #include "quicbeacon.h"
+#include "quicconn.h"
 #include "quicstream.h"
 
 quicstream_t* quicstream_create(uint64_t id,
@@ -40,6 +41,16 @@ void quicstream_free(quicstream_t* stream) {
     if (stream->app != NULL && stream->app_free != NULL) {
         stream->app_free(stream->app);
         stream->app = NULL;
+    }
+
+    /* A stream can die still owing a terminal frame -- a connection being torn
+     * down frees its list outright -- and the count has to lose what the stream
+     * takes with it. */
+    if (stream->conn != NULL) {
+        unsigned owed = (unsigned)(stream->send_reset_pending != 0) +
+                        (unsigned)(stream->send_stop_sending_pending != 0);
+        stream->conn->ctrl_owed = stream->conn->ctrl_owed > owed
+                                  ? stream->conn->ctrl_owed - owed : 0;
     }
 
     quicrecvbuf_free(&stream->recv);
@@ -175,7 +186,10 @@ void quicstream_reset(quicstream_t* stream, uint64_t error_code) {
 
     stream->send_state = QUIC_SEND_RESET_SENT;
     stream->send_reset_code = error_code;
-    stream->send_reset_pending = 1;
+    if (!stream->send_reset_pending) {
+        stream->send_reset_pending = 1;
+        if (stream->conn != NULL) stream->conn->ctrl_owed++;
+    }
 }
 
 void quicstream_stop_sending(quicstream_t* stream, uint64_t error_code) {
@@ -194,6 +208,7 @@ void quicstream_stop_sending(quicstream_t* stream, uint64_t error_code) {
 
     stream->send_stop_sending_pending = 1;
     stream->send_stop_sending_code = error_code;
+    if (stream->conn != NULL) stream->conn->ctrl_owed++;
 }
 
 size_t quicstream_readable(const quicstream_t* stream) {
