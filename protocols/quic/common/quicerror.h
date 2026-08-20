@@ -35,6 +35,10 @@
 #define QUIC_KEY_UPDATE_ERROR           0x0e
 #define QUIC_AEAD_LIMIT_REACHED         0x0f
 #define QUIC_NO_VIABLE_PATH             0x10
+/* RFC 9368 §10.2. Registered outside RFC 9000's own table because version
+ * negotiation got a document of its own -- the number is the next one after
+ * RFC 9000's last, not a coincidence. */
+#define QUIC_VERSION_NEGOTIATION_ERROR  0x11
 
 /* A TLS alert becomes a transport error in the range 0x0100-0x01ff (§20.1):
  * the low byte is the alert description from RFC 8446. */

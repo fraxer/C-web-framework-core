@@ -4,25 +4,22 @@
 
 #include "quicretry.h"
 
-/* RFC 9001 §5.8: fixed for QUIC v1 and published in the RFC. Their being public
- * is the point -- the tag proves the sender saw the original connection id, not
- * that it holds a secret. */
-static const uint8_t QUIC_RETRY_KEY[16] = {
-    0xbe, 0x0c, 0x69, 0x0b, 0x9f, 0x66, 0x57, 0x5a,
-    0x1d, 0x76, 0x6b, 0x54, 0xe3, 0x68, 0xc8, 0x4e
-};
-
-static const uint8_t QUIC_RETRY_NONCE[12] = {
-    0x46, 0x15, 0x99, 0xd3, 0x5d, 0x63, 0x2b, 0xf2, 0x23, 0x98, 0x25, 0xbb
-};
+/* The Retry key and nonce are published in the RFC and differ per version
+ * (RFC 9001 §5.8, RFC 9369 §3.3). Their being public is the point -- the tag
+ * proves the sender saw the original connection id, not that it holds a
+ * secret -- which is also why the version has to be right: a v2 Retry tagged
+ * with the v1 key is indistinguishable, to the client, from an off-path
+ * attacker's forgery, and is dropped without a word.
+ *
+ * They live in quicversion.h with the rest of the per-version constants. */
 
 #define QUIC_TOKEN_NONCE_LEN 12
 #define QUIC_TOKEN_TAG_LEN   16
 
-int quicretry_integrity_tag(const quiccid_t* odcid,
+int quicretry_integrity_tag(const quicversion_t* ver, const quiccid_t* odcid,
                             const uint8_t* retry, size_t retry_len,
                             uint8_t tag[16]) {
-    if (odcid == NULL || retry == NULL || tag == NULL) return 0;
+    if (ver == NULL || odcid == NULL || retry == NULL || tag == NULL) return 0;
 
     /* The "Retry Pseudo-Packet": the original connection id prefixed by its
      * length, then the Retry packet itself. It is all additional data -- there
@@ -45,8 +42,8 @@ int quicretry_integrity_tag(const quiccid_t* odcid,
     int len = 0;
     int ok = 1;
 
-    ok = ok && EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, QUIC_RETRY_KEY,
-                                  QUIC_RETRY_NONCE) == 1;
+    ok = ok && EVP_EncryptInit_ex(ctx, EVP_aes_128_gcm(), NULL, ver->retry_key,
+                                  ver->retry_nonce) == 1;
     ok = ok && EVP_EncryptUpdate(ctx, NULL, &len, pseudo, (int)n) == 1;
     ok = ok && EVP_EncryptFinal_ex(ctx, NULL, &len) == 1;
     ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, tag) == 1;
@@ -56,11 +53,12 @@ int quicretry_integrity_tag(const quiccid_t* odcid,
     return ok;
 }
 
-size_t quicretry_write(uint8_t* dst, size_t cap,
+size_t quicretry_write(const quicversion_t* ver, uint8_t* dst, size_t cap,
                        const quiccid_t* odcid,
                        const quiccid_t* dcid, const quiccid_t* scid,
                        const uint8_t* token, size_t token_len) {
-    if (dst == NULL || odcid == NULL || dcid == NULL || scid == NULL) return 0;
+    if (ver == NULL || dst == NULL || odcid == NULL || dcid == NULL || scid == NULL)
+        return 0;
     if (token == NULL || token_len == 0) return 0;
 
     const size_t need = 1 + 4 + 1 + dcid->len + 1 + scid->len + token_len + 16;
@@ -68,15 +66,16 @@ size_t quicretry_write(uint8_t* dst, size_t cap,
 
     size_t n = 0;
 
-    /* Long header, fixed bit, type 3 (Retry). The low four bits are unused in a
-     * Retry and are left zero; there is no header protection here, since there
-     * is no packet number to protect. */
-    dst[n++] = 0xf0;
+    /* Long header, fixed bit, and the version's own code for a Retry -- 3 in
+     * v1, 0 in v2. The low four bits are unused in a Retry and are left zero;
+     * there is no header protection here, since there is no packet number to
+     * protect. */
+    dst[n++] = (uint8_t)(0xc0 | (quicversion_wire_type(ver, QUIC_PKT_RETRY) << 4));
 
-    dst[n++] = (uint8_t)(QUIC_VERSION_1 >> 24);
-    dst[n++] = (uint8_t)(QUIC_VERSION_1 >> 16);
-    dst[n++] = (uint8_t)(QUIC_VERSION_1 >> 8);
-    dst[n++] = (uint8_t)(QUIC_VERSION_1);
+    dst[n++] = (uint8_t)(ver->number >> 24);
+    dst[n++] = (uint8_t)(ver->number >> 16);
+    dst[n++] = (uint8_t)(ver->number >> 8);
+    dst[n++] = (uint8_t)(ver->number);
 
     dst[n++] = dcid->len;
     if (dcid->len > 0) { memcpy(dst + n, dcid->data, dcid->len); n += dcid->len; }
@@ -88,7 +87,7 @@ size_t quicretry_write(uint8_t* dst, size_t cap,
     n += token_len;
 
     uint8_t tag[16];
-    if (!quicretry_integrity_tag(odcid, dst, n, tag)) return 0;
+    if (!quicretry_integrity_tag(ver, odcid, dst, n, tag)) return 0;
 
     memcpy(dst + n, tag, 16);
     n += 16;

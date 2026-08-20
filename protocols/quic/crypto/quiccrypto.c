@@ -5,14 +5,6 @@
 
 #include "quiccrypto.h"
 
-/* RFC 9001 §5.2: the salt is version-specific and fixed for QUIC v1. Kept in a
- * named constant rather than inline because QUIC v2 (RFC 9369) differs only in
- * this value and the labels. */
-static const uint8_t QUIC_V1_INITIAL_SALT[20] = {
-    0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17,
-    0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a
-};
-
 /* §6.6 confidentiality and integrity limits. */
 #define QUIC_AES_SEAL_LIMIT      (1ULL << 23)
 #define QUIC_AES_OPEN_LIMIT      (1ULL << 52)
@@ -152,16 +144,18 @@ static int __hkdf_extract(const EVP_MD* md,
     return ok;
 }
 
-int quiccrypto_initial_secrets(const quiccid_t* dcid,
+int quiccrypto_initial_secrets(const quicversion_t* ver, const quiccid_t* dcid,
                                uint8_t client_secret[32],
                                uint8_t server_secret[32]) {
-    if (dcid == NULL) return 0;
+    if (ver == NULL || dcid == NULL) return 0;
 
     uint8_t initial_secret[32];
 
     /* §5.2. Initial keys are always SHA-256 and AES-128-GCM, whatever the
      * handshake later negotiates -- neither side knows the suite yet. */
-    if (!__hkdf_extract(EVP_sha256(), QUIC_V1_INITIAL_SALT, sizeof QUIC_V1_INITIAL_SALT,
+    /* The salt is the version; "client in" and "server in" are not -- RFC 9369
+     * leaves those two labels alone, so only the extract step differs. */
+    if (!__hkdf_extract(EVP_sha256(), ver->initial_salt, 20,
                         dcid->data, dcid->len, initial_secret, sizeof initial_secret))
         return 0;
 
@@ -175,9 +169,9 @@ int quiccrypto_initial_secrets(const quiccid_t* dcid,
     return ok;
 }
 
-int quickeys_install(quickeys_t* keys, quic_aead_e suite,
+int quickeys_install(const quicversion_t* ver, quickeys_t* keys, quic_aead_e suite,
                      const uint8_t* secret, size_t secret_len) {
-    if (keys == NULL || secret == NULL) return 0;
+    if (ver == NULL || keys == NULL || secret == NULL) return 0;
 
     const EVP_MD* md = quiccrypto_md(suite);
     const size_t key_len = quiccrypto_key_len(suite);
@@ -188,11 +182,11 @@ int quickeys_install(quickeys_t* keys, quic_aead_e suite,
     uint8_t key[32];
     int ok = 1;
 
-    ok = ok && quic_hkdf_expand_label(md, secret, secret_len, "quic key", NULL, 0,
+    ok = ok && quic_hkdf_expand_label(md, secret, secret_len, ver->label_key, NULL, 0,
                                       key, key_len);
-    ok = ok && quic_hkdf_expand_label(md, secret, secret_len, "quic iv", NULL, 0,
+    ok = ok && quic_hkdf_expand_label(md, secret, secret_len, ver->label_iv, NULL, 0,
                                       keys->iv, sizeof keys->iv);
-    ok = ok && quic_hkdf_expand_label(md, secret, secret_len, "quic hp", NULL, 0,
+    ok = ok && quic_hkdf_expand_label(md, secret, secret_len, ver->label_hp, NULL, 0,
                                       keys->hp_key, key_len);
 
     if (!ok) {
@@ -202,6 +196,7 @@ int quickeys_install(quickeys_t* keys, quic_aead_e suite,
 
     keys->hp_key_len = key_len;
     keys->suite = suite;
+    keys->ver = ver;
     keys->sealed = 0;
     keys->open_failures = 0;
 
@@ -251,15 +246,17 @@ int quickeys_install(quickeys_t* keys, quic_aead_e suite,
     return 0;
 }
 
-int quiccrypto_next_secret(quic_aead_e suite,
+int quiccrypto_next_secret(const quicversion_t* ver, quic_aead_e suite,
                            const uint8_t* secret, size_t secret_len,
                            uint8_t* out) {
+    if (ver == NULL) return 0;
+
     const EVP_MD* md = quiccrypto_md(suite);
     if (md == NULL) return 0;
 
     /* §6.1: the next generation's secret, derived ahead of time so a key update
      * costs no key schedule work on the packet path. */
-    return quic_hkdf_expand_label(md, secret, secret_len, "quic ku", NULL, 0,
+    return quic_hkdf_expand_label(md, secret, secret_len, ver->label_ku, NULL, 0,
                                   out, secret_len);
 }
 
@@ -270,18 +267,19 @@ int quickeys_next(quickeys_t* into, const quickeys_t* from) {
     const EVP_MD* md = quiccrypto_md(from->suite);
     const EVP_CIPHER* aead = __aead_cipher(from->suite);
     const size_t key_len = quiccrypto_key_len(from->suite);
-    if (md == NULL || aead == NULL || key_len == 0) return 0;
+    if (md == NULL || aead == NULL || key_len == 0 || from->ver == NULL) return 0;
 
     uint8_t secret[sizeof from->secret];
     uint8_t key[32];
     uint8_t iv[12];
 
-    int ok = quiccrypto_next_secret(from->suite, from->secret, from->secret_len, secret);
+    int ok = quiccrypto_next_secret(from->ver, from->suite, from->secret,
+                                    from->secret_len, secret);
 
-    ok = ok && quic_hkdf_expand_label(md, secret, from->secret_len, "quic key", NULL, 0,
-                                      key, key_len);
-    ok = ok && quic_hkdf_expand_label(md, secret, from->secret_len, "quic iv", NULL, 0,
-                                      iv, sizeof iv);
+    ok = ok && quic_hkdf_expand_label(md, secret, from->secret_len, from->ver->label_key,
+                                      NULL, 0, key, key_len);
+    ok = ok && quic_hkdf_expand_label(md, secret, from->secret_len, from->ver->label_iv,
+                                      NULL, 0, iv, sizeof iv);
 
     /* The AEAD context is built before anything in `into` is touched, so a
      * failure here leaves the caller's current keys usable. That matters more
@@ -337,6 +335,7 @@ int quickeys_next(quickeys_t* into, const quickeys_t* from) {
         EVP_CIPHER_CTX_free(into->aead);
 
     into->aead = ctx;
+    into->ver = from->ver;
     memcpy(into->iv, iv, sizeof iv);
     memcpy(into->secret, secret, from->secret_len);
     into->secret_len = from->secret_len;

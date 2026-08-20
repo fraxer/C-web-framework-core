@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 
 #include "quic.h"
+#include "quicversion.h"
 
 /* Retry packets and address validation tokens (RFC 9000 §8, RFC 9001 §5.8).
  *
@@ -41,12 +42,12 @@
  *
  * `retry` is the Retry packet without its tag; `odcid` is the Destination
  * Connection ID of the Initial that provoked it. Writes 16 bytes. */
-int quicretry_integrity_tag(const quiccid_t* odcid,
+int quicretry_integrity_tag(const quicversion_t* ver, const quiccid_t* odcid,
                             const uint8_t* retry, size_t retry_len,
                             uint8_t tag[16]);
 
 /* Build a complete Retry packet, tag included. Returns its length, or 0. */
-size_t quicretry_write(uint8_t* dst, size_t cap,
+size_t quicretry_write(const quicversion_t* ver, uint8_t* dst, size_t cap,
                        const quiccid_t* odcid,
                        const quiccid_t* dcid, const quiccid_t* scid,
                        const uint8_t* token, size_t token_len);

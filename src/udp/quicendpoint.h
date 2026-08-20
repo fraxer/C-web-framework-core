@@ -7,6 +7,7 @@
 #include "connection_s.h"
 #include "multiplexing.h"
 #include "quiccidtable.h"
+#include "quicversion.h"
 #include "ipaddr.h"
 #include "quiccc.h"
 #include "server.h"
@@ -414,6 +415,15 @@ void quicendpoint_cid_forget(quicendpoint_t* endpoint, const quiccid_t* cid);
  * advance what the token for a new id will be. Both must produce the same 16
  * bytes or the peer cannot recognise a reset, so there is one derivation. */
 int  quicendpoint_reset_token(const quiccid_t* cid, uint8_t out[16]);
+
+/* The versions this server is willing to speak right now, most preferred
+ * first. Process-wide because the policy is (http3_version_2), and asked here
+ * rather than read from quicversion_all because that list says what the code
+ * implements, not what the operator turned on. Returns how many were written.
+ *
+ * The connection layer needs it for RFC 9368 §2.3: a version may only be
+ * chosen if both ends offer it, and "we offer it" is this list. */
+size_t quicendpoint_versions(const quicversion_t** out, size_t cap);
 
 /* A NEW_TOKEN for a peer whose address is now proven (§8.1.3): something it can
  * present on its *next* connection to skip the Retry round trip. Returns the

@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #include "quic.h"
+#include "quicversion.h"
 
 /* QUIC packet protection (RFC 9001 §5).
  *
@@ -51,6 +52,12 @@ typedef struct quickeys {
     quic_aead_e suite;
     int      valid;
 
+    /* Which version's labels derived this key set. Kept so that a key update
+     * does not have to be told again -- quickeys_next derives from `from`, and
+     * asking the caller for a version it has already given once is one more
+     * place to give a different answer. */
+    const quicversion_t* ver;
+
     /* The secret these keys came from, kept so a key update can derive the next
      * generation from it (§6.1).48 bytes covers SHA-384, the largest hash any
      * suite here uses. Zeroed by quickeys_free like the rest of the material. */
@@ -93,17 +100,22 @@ int quic_hkdf_expand_label(const EVP_MD* md,
  * the Source Connection ID we put in the Retry.
  *
  * Both outputs are 32 bytes (Initial is always SHA-256 / AES-128-GCM). */
-int quiccrypto_initial_secrets(const quiccid_t* dcid,
+int quiccrypto_initial_secrets(const quicversion_t* ver, const quiccid_t* dcid,
                                uint8_t client_secret[32],
                                uint8_t server_secret[32]);
 
-/* Turn a level secret into a usable key set: key, iv and hp key (§5.1). */
-int quickeys_install(quickeys_t* keys, quic_aead_e suite,
+/* Turn a level secret into a usable key set: key, iv and hp key (§5.1).
+ *
+ * The version decides the three labels. It is a parameter and not a constant
+ * because that is the whole of QUIC v2's difference here (RFC 9369 §3.1), and
+ * because getting it wrong is silent: the keys derive perfectly well and
+ * nothing the peer sends will ever open. */
+int quickeys_install(const quicversion_t* ver, quickeys_t* keys, quic_aead_e suite,
                      const uint8_t* secret, size_t secret_len);
 
-/* Derive the next generation's secret for a key update (§6): the "quic ku"
- * label applied to the current secret. */
-int quiccrypto_next_secret(quic_aead_e suite,
+/* Derive the next generation's secret for a key update (§6): the version's key
+ * update label ("quic ku", "quicv2 ku") applied to the current secret. */
+int quiccrypto_next_secret(const quicversion_t* ver, quic_aead_e suite,
                            const uint8_t* secret, size_t secret_len,
                            uint8_t* out);
 

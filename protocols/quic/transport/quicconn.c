@@ -500,7 +500,7 @@ static int __on_secret(void* ctx, quic_enc_level_e level, quictls_dir_e dir,
 
     quickeys_t* keys = dir == QUICTLS_DIR_READ ? &conn->rx[level] : &conn->tx[level];
 
-    if (!quickeys_install(keys, suite, secret, len)) {
+    if (!quickeys_install(conn->ver, keys, suite, secret, len)) {
         log_error("quicconn: cannot install keys for level %d\n", (int)level);
         return 0;
     }
@@ -521,6 +521,126 @@ static int __on_crypto(void* ctx, quic_enc_level_e level,
      * retransmitted exactly like stream data, and the packet builder decides
      * how much fits. */
     return quicsendbuf_write(&conn->crypto_out[level], data, len);
+}
+
+/* RFC 9368 §2.3: the best version both ends offer.
+ *
+ * "Best" is our order, not the client's: §2.3 leaves the choice to the server,
+ * and the client expresses preference only by listing its Chosen Version among
+ * the others. Returns NULL when nothing in the client's list is on offer here,
+ * which is the ordinary case for a client that does not implement RFC 9368 --
+ * and then the connection simply carries on in the version it started in. */
+static const quicversion_t* __select_version(const quictp_t* params) {
+    const quicversion_t* offered[4];
+    const size_t n = quicendpoint_versions(offered, sizeof offered / sizeof offered[0]);
+
+    for (size_t i = 0; i < n; i++)
+        for (size_t k = 0; k < params->available_count; k++)
+            if (params->available_versions[k] == offered[i]->number) return offered[i];
+
+    return NULL;
+}
+
+/* Move this connection onto `to`, mid-handshake.
+ *
+ * The Initial keys are the whole of the work: they are derived from the salt of
+ * the version and the client's first Destination Connection ID, so a switch
+ * means deriving them again -- and keeping the old read keys, because the
+ * client goes on sending its first flight in the version it started with until
+ * it sees ours (§2.3). Everything above Initial is derived from the TLS
+ * handshake, which has not produced a secret yet, so nothing else has to
+ * move. */
+static int __switch_version(quicconn_t* conn, const quicversion_t* to) {
+    uint8_t client_secret[32];
+    uint8_t server_secret[32];
+
+    if (!quiccrypto_initial_secrets(to, &conn->initial_dcid, client_secret, server_secret))
+        return 0;
+
+    /* The old read keys move aside before the new ones are installed over
+     * them, and only then does `ver` change: a failure below leaves the
+     * connection exactly as it was, still speaking the version it started in,
+     * which is a connection that works rather than one that is half converted. */
+    quickeys_t previous = conn->rx[QUIC_ENC_INITIAL];
+    memset(&conn->rx[QUIC_ENC_INITIAL], 0, sizeof conn->rx[QUIC_ENC_INITIAL]);
+
+    const int ok =
+        quickeys_install(to, &conn->rx[QUIC_ENC_INITIAL], QUIC_AEAD_AES_128_GCM,
+                         client_secret, sizeof client_secret) &&
+        quickeys_install(to, &conn->tx[QUIC_ENC_INITIAL], QUIC_AEAD_AES_128_GCM,
+                         server_secret, sizeof server_secret);
+
+    explicit_bzero(client_secret, sizeof client_secret);
+    explicit_bzero(server_secret, sizeof server_secret);
+
+    if (!ok) {
+        quickeys_free(&conn->rx[QUIC_ENC_INITIAL]);
+        conn->rx[QUIC_ENC_INITIAL] = previous;
+        return 0;
+    }
+
+    quickeys_free(&conn->rx_initial_original);
+    conn->rx_initial_original = previous;
+
+    conn->ver = to;
+
+    if (to->number == QUIC_VERSION_2) metrics_quic(METRICS_QUIC_VERSION_2_NEGOTIATED);
+
+    QLOG(conn->qlog, "transport", "version_information",
+         "\"chosen_version\":\"%08x\",\"original_version\":\"%08x\"",
+         to->number, conn->ver_original->number);
+
+    return 1;
+}
+
+/* The RFC 9368 half of the peer's parameters: validate what the client says it
+ * is doing, pick the version the rest of the connection will use, and put the
+ * answer into the parameters this server is about to send. */
+static int __version_information(quicconn_t* conn, const quictp_t* params) {
+    const quicversion_t* offered[4];
+    const size_t offered_count = quicendpoint_versions(offered,
+                                                       sizeof offered / sizeof offered[0]);
+
+    /* Nothing on offer beyond the one version means nothing to negotiate, and
+     * a server with nothing to negotiate is a server that has not implemented
+     * this document -- so it says nothing and ignores what it was told. That is
+     * what http3_version_2 being off has to look like from outside: a plain
+     * RFC 9000 server, byte for byte. */
+    if (offered_count < 2) return 1;
+
+    if (params->has_version_information) {
+        /* §4: the client's Chosen Version must be the version its packets are
+         * actually in. It cannot be anything else honestly -- the field exists
+         * so that an attacker who rewrote the unauthenticated version fields on
+         * the wire is caught by the authenticated copy inside the handshake. */
+        if (params->chosen_version != conn->ver_original->number) {
+            log_error("quic: version_information chosen_version %08x is not the "
+                      "version in use %08x\n",
+                      params->chosen_version, conn->ver_original->number);
+            conn->tls.transport_error = QUIC_VERSION_NEGOTIATION_ERROR;
+            return 0;
+        }
+
+        const quicversion_t* chosen = __select_version(params);
+        if (chosen != NULL && chosen != conn->ver && !__switch_version(conn, chosen)) {
+            log_error("quic: cannot switch to version %08x\n", chosen->number);
+            return 0;
+        }
+    }
+
+    /* Ours goes back either way. §3 does not require the Chosen Version to
+     * appear among the Available Versions of a *server* -- an operator may be
+     * withdrawing it -- but here it always does, because a version we are
+     * speaking is by definition one we offer. */
+    conn->local_params.chosen_version = conn->ver->number;
+    conn->local_params.available_count = 0;
+    for (size_t i = 0; i < offered_count &&
+                       i < QUICTP_MAX_AVAILABLE_VERSIONS; i++)
+        conn->local_params.available_versions[conn->local_params.available_count++] =
+            offered[i]->number;
+    conn->local_params.has_version_information = 1;
+
+    return quictls_update_params(&conn->tls, &conn->local_params);
 }
 
 static int __on_peer_params(void* ctx, const quictp_t* params) {
@@ -546,6 +666,11 @@ static int __on_peer_params(void* ctx, const quictp_t* params) {
         log_error("quic: initial_source_connection_id does not match the packet\n");
         return 0;
     }
+
+    /* Before anything else is taken from them: this can change the version the
+     * connection speaks, and everything below is about limits, which do not
+     * depend on it. */
+    if (!__version_information(conn, params)) return 0;
 
     conn->peer_params = *params;
     conn->peer_params_seen = 1;
@@ -1695,6 +1820,13 @@ static void __discard_space(quicconn_t* conn, quic_enc_level_e level) {
     quickeys_free(&conn->tx[level]);
     quickeys_free(&conn->rx[level]);
 
+    /* The other Initial read keys go with them: a version switch leaves the
+     * original version's set alive for the overlap of RFC 9368 §2.3, and the
+     * overlap cannot outlive the level itself. Same lesson as the ack ranges
+     * below -- a per-connection allocation nothing frees is invisible against
+     * an idle server and obvious to the stand. */
+    if (level == QUIC_ENC_INITIAL) quickeys_free(&conn->rx_initial_original);
+
     /* Freed before it is re-initialised: quicack_init memsets the struct, so
      * the range array the space accumulated would simply be forgotten. Two
      * spaces are discarded on every connection that completes a handshake, so
@@ -1731,6 +1863,16 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
     const quic_enc_level_e space = __ack_space(level);
 
     quickeys_t* keys = &conn->rx[level];
+
+    /* An Initial in the version the client started with, after we have moved on
+     * to another one: its first flight is still in flight, and it is read with
+     * the keys it was written with (RFC 9368 §2.3). Checked by the version in
+     * the packet rather than by a timer -- the overlap ends when the client
+     * stops sending the old version, which only the packets can say. */
+    if (level == QUIC_ENC_INITIAL && conn->ver != conn->ver_original &&
+        conn->rx_initial_original.valid && pkt->version == conn->ver_original->number)
+        keys = &conn->rx_initial_original;
+
     if (!keys->valid) {
         /* Keys for this level do not exist yet -- a 1-RTT packet that overtook
          * the handshake, which is ordinary on a reordering path. Dropped rather
@@ -2319,7 +2461,7 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
     hdr.type = level == QUIC_ENC_INITIAL ? QUIC_PKT_INITIAL
              : level == QUIC_ENC_HANDSHAKE ? QUIC_PKT_HANDSHAKE
                                            : QUIC_PKT_SHORT;
-    hdr.version = QUIC_VERSION_1;
+    hdr.version = conn->ver->number;
     hdr.dcid = dcid;
     hdr.scid = &conn->local_cids[0].cid;
     hdr.pn = pn;
@@ -2592,7 +2734,15 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
     }
 
     /* Handshake data. */
-    if (cc_room && quicsendbuf_pending(&conn->crypto_out[level]) && p + 16 < payload_cap) {
+    /* Held back for exactly one packet after a version switch: the packet that
+     * announces the new version is a signal, and a peer may read nothing else
+     * out of it (quicconn.h, ver_switch_announced). */
+    const int crypto_held = level == QUIC_ENC_INITIAL &&
+                            conn->ver != conn->ver_original &&
+                            !conn->ver_switch_announced;
+
+    if (!crypto_held && cc_room && quicsendbuf_pending(&conn->crypto_out[level]) &&
+        p + 16 < payload_cap) {
         uint64_t offset = 0;
         const uint8_t* data = NULL;
         size_t dlen = 0;
@@ -3010,6 +3160,20 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
         return 0;
     }
 
+    /* The announcement has now been written, so the CRYPTO held back above may
+     * go in the next Initial -- which the send loop builds in the very next
+     * round, not in the next flight.
+     *
+     * Only for an Initial of the *negotiated* version: an Initial sent before
+     * the switch announces nothing, and counting it left the ServerHello riding
+     * in the announcement after all. That is precisely the bug this flag
+     * exists to prevent, and it survived the first fix because our own client
+     * sends a ClientHello that spans two packets -- so the server acknowledged
+     * the first one, in the original version, before it had the parameters to
+     * switch on (docs/http3/08 §17g). */
+    if (level == QUIC_ENC_INITIAL && conn->ver != conn->ver_original)
+        conn->ver_switch_announced = 1;
+
     size_t total = header_len + sealed_len;
 
     if (!quichp_apply(keys, dst, total, pn_offset, pn_len)) {
@@ -3081,7 +3245,7 @@ static void __path_probe_send(quicconn_t* conn, uint64_t now_us) {
     quicpkt_hdr_out_t hdr;
     memset(&hdr, 0, sizeof hdr);
     hdr.type = QUIC_PKT_SHORT;
-    hdr.version = QUIC_VERSION_1;
+    hdr.version = conn->ver->number;
     hdr.dcid = dcid;
     hdr.scid = &conn->local_cids[0].cid;
     hdr.pn = pn;
@@ -3145,7 +3309,7 @@ static void __pmtu_probe_send(quicconn_t* conn, uint64_t now_us) {
     quicpkt_hdr_out_t hdr;
     memset(&hdr, 0, sizeof hdr);
     hdr.type = QUIC_PKT_SHORT;
-    hdr.version = QUIC_VERSION_1;
+    hdr.version = conn->ver->number;
     hdr.dcid = &conn->peer_cids[0];
     hdr.scid = &conn->local_cids[0].cid;
     hdr.pn = pn;
@@ -3453,6 +3617,7 @@ static void __quicconn_transport_free(void* arg) {
 
     quickeys_free(&conn->rx_next);
     quickeys_free(&conn->rx_prev);
+    quickeys_free(&conn->rx_initial_original);
 
     for (int i = 0; i < QUIC_ENC_COUNT; i++) {
         quickeys_free(&conn->rx[i]);
@@ -3478,6 +3643,7 @@ static void __quicconn_transport_free(void* arg) {
 }
 
 quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
+                            const quicversion_t* ver,
                             const quiccid_t* odcid, const quiccid_t* peer_scid,
                             const quicpath_t* path, server_t* server,
                             int address_validated, const quiccid_t* retry_odcid) {
@@ -3568,20 +3734,29 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     conn->local_cids[0].announced = 1;
     conn->next_cid_seq = 1;
 
+    /* The version the client opened with. Until compatible version negotiation
+     * says otherwise, it is also the version this connection speaks. */
+    conn->ver = ver;
+    conn->ver_original = ver;
+
+    if (ver->number == QUIC_VERSION_2) metrics_quic(METRICS_QUIC_VERSION_2_CONNECTIONS);
+
+    conn->initial_dcid = *odcid;
+
     /* Initial keys come from the client's original Destination Connection ID --
      * the only secret both sides share before any handshake (§5.2). */
     uint8_t client_secret[32];
     uint8_t server_secret[32];
-    if (!quiccrypto_initial_secrets(odcid, client_secret, server_secret)) {
+    if (!quiccrypto_initial_secrets(ver, odcid, client_secret, server_secret)) {
         quicqlog_close(conn->qlog);
         free(conn);
         return NULL;
     }
 
     const int keys_ok =
-        quickeys_install(&conn->rx[QUIC_ENC_INITIAL], QUIC_AEAD_AES_128_GCM,
+        quickeys_install(ver, &conn->rx[QUIC_ENC_INITIAL], QUIC_AEAD_AES_128_GCM,
                          client_secret, sizeof client_secret) &&
-        quickeys_install(&conn->tx[QUIC_ENC_INITIAL], QUIC_AEAD_AES_128_GCM,
+        quickeys_install(ver, &conn->tx[QUIC_ENC_INITIAL], QUIC_AEAD_AES_128_GCM,
                          server_secret, sizeof server_secret);
 
     explicit_bzero(client_secret, sizeof client_secret);
@@ -3813,7 +3988,7 @@ static size_t __write_close_packet(quicconn_t* conn, quic_enc_level_e level,
     hdr.type = level == QUIC_ENC_APP       ? QUIC_PKT_SHORT
              : level == QUIC_ENC_HANDSHAKE ? QUIC_PKT_HANDSHAKE
                                            : QUIC_PKT_INITIAL;
-    hdr.version = QUIC_VERSION_1;
+    hdr.version = conn->ver->number;
     hdr.dcid = dcid;
     hdr.scid = &conn->local_cids[0].cid;
     hdr.pn = pn;

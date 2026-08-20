@@ -17,6 +17,7 @@
 #include "quicinvariants.h"
 #include "quicpacket.h"
 #include "quictime.h"
+#include "quicversion.h"
 
 #define CLIENT_MAX_PACKET 1400
 /* What this client may RECEIVE in one packet, which is deliberately larger than
@@ -52,7 +53,7 @@ static int __on_secret(void* ctx, quic_enc_level_e level, quictls_dir_e dir,
     quicclient_t* c = ctx;
 
     quickeys_t* keys = dir == QUICTLS_DIR_READ ? &c->rx[level] : &c->tx[level];
-    if (!quickeys_install(keys, suite, secret, len)) return 0;
+    if (!quickeys_install(c->ver, keys, suite, secret, len)) return 0;
 
     __log(c, "  [client] keys installed: level %d %s\n",
           (int)level, dir == QUICTLS_DIR_READ ? "read" : "write");
@@ -868,7 +869,7 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
              : level == QUIC_ENC_HANDSHAKE ? QUIC_PKT_HANDSHAKE
              : level == QUIC_ENC_EARLY ? QUIC_PKT_0RTT
              : QUIC_PKT_SHORT;
-    hdr.version = QUIC_VERSION_1;
+    hdr.version = c->ver->number;
     hdr.dcid = c->dcid.len > 0 ? &c->dcid : &c->odcid;
     hdr.scid = &c->scid;
     hdr.pn = pn;
@@ -1165,6 +1166,7 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
 
         switch (f.type) {
         case QUIC_FRAME_CRYPTO:
+            if (c->in_switch_packet) c->switch_packet_carried_crypto = 1;
             if (!quictls_recv_crypto(&c->tls, level, f.u.crypto.offset,
                                      f.u.crypto.data, (size_t)f.u.crypto.len))
                 return 0;
@@ -1314,10 +1316,85 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
  * Called once at connect and again on a Retry: §5.2 derives the Initial keys
  * from the id the client addresses its Initial to, and a Retry changes that id,
  * so the whole handshake starts over -- keys, TLS session, packet numbers. */
-static int __handshake_start(quicclient_t* c, const quiccid_t* dcid) {
+static uint32_t __requested_version = QUIC_VERSION_1;
+static uint32_t __offered_versions[QUICTP_MAX_AVAILABLE_VERSIONS];
+static size_t   __offered_count = 0;
+
+void quicclient_use_version(uint32_t version) {
+    __requested_version = version != 0 ? version : QUIC_VERSION_1;
+}
+
+void quicclient_offer_versions(const uint32_t* versions, size_t count) {
+    __offered_count = 0;
+    if (versions == NULL) return;
+
+    for (size_t i = 0; i < count && __offered_count < QUICTP_MAX_AVAILABLE_VERSIONS; i++)
+        __offered_versions[__offered_count++] = versions[i];
+}
+
+int quicclient_switch_packet_carried_crypto(const quicclient_t* client) {
+    return client != NULL ? client->switch_packet_carried_crypto : 0;
+}
+
+uint32_t quicclient_version(const quicclient_t* client) {
+    return client != NULL && client->ver != NULL ? client->ver->number : 0;
+}
+
+/* Did we put this version on offer? A server may only move us to a version we
+ * listed (RFC 9368 §4), and taking one we did not list is how a downgrade would
+ * work if nobody checked. */
+static int __offered(const quicclient_t* c, uint32_t number) {
+    (void)c;
+
+    for (size_t i = 0; i < __offered_count; i++)
+        if (__offered_versions[i] == number) return 1;
+
+    return 0;
+}
+
+/* Move to the version the server answered in (RFC 9368 §2.3).
+ *
+ * Only the Initial keys exist yet, and only they are version-derived by hand;
+ * everything above comes from TLS and will be installed with whatever `ver`
+ * says by then -- which is why this has to happen before the packet that
+ * triggered it is decrypted, not after. */
+static int __adopt_version(quicclient_t* c, uint32_t number) {
+    const quicversion_t* to = quicversion_find(number);
+    if (to == NULL) return 0;
+
     uint8_t client_secret[32];
     uint8_t server_secret[32];
-    if (!quiccrypto_initial_secrets(dcid, client_secret, server_secret)) return 0;
+    if (!quiccrypto_initial_secrets(to, &c->initial_dcid, client_secret, server_secret))
+        return 0;
+
+    quickeys_free(&c->tx[QUIC_ENC_INITIAL]);
+    quickeys_free(&c->rx[QUIC_ENC_INITIAL]);
+
+    const int ok =
+        quickeys_install(to, &c->tx[QUIC_ENC_INITIAL], QUIC_AEAD_AES_128_GCM,
+                         client_secret, sizeof client_secret) &&
+        quickeys_install(to, &c->rx[QUIC_ENC_INITIAL], QUIC_AEAD_AES_128_GCM,
+                         server_secret, sizeof server_secret);
+
+    explicit_bzero(client_secret, sizeof client_secret);
+    explicit_bzero(server_secret, sizeof server_secret);
+
+    if (!ok) return 0;
+
+    __log(c, "  [client] server negotiated version %08x, switching from %08x\n",
+          number, c->ver->number);
+
+    c->ver = to;
+
+    return 1;
+}
+
+static int __handshake_start(quicclient_t* c, const quiccid_t* dcid) {
+    c->initial_dcid = *dcid;
+
+    uint8_t client_secret[32];
+    uint8_t server_secret[32];
+    if (!quiccrypto_initial_secrets(c->ver, dcid, client_secret, server_secret)) return 0;
 
     quickeys_free(&c->tx[QUIC_ENC_INITIAL]);
     quickeys_free(&c->rx[QUIC_ENC_INITIAL]);
@@ -1325,9 +1402,9 @@ static int __handshake_start(quicclient_t* c, const quiccid_t* dcid) {
     /* Mirror image of the server: we write with the client secret and read with
      * the server's. */
     const int keys_ok =
-        quickeys_install(&c->tx[QUIC_ENC_INITIAL], QUIC_AEAD_AES_128_GCM,
+        quickeys_install(c->ver, &c->tx[QUIC_ENC_INITIAL], QUIC_AEAD_AES_128_GCM,
                          client_secret, sizeof client_secret) &&
-        quickeys_install(&c->rx[QUIC_ENC_INITIAL], QUIC_AEAD_AES_128_GCM,
+        quickeys_install(c->ver, &c->rx[QUIC_ENC_INITIAL], QUIC_AEAD_AES_128_GCM,
                          server_secret, sizeof server_secret);
 
     explicit_bzero(client_secret, sizeof client_secret);
@@ -1337,6 +1414,29 @@ static int __handshake_start(quicclient_t* c, const quiccid_t* dcid) {
 
     quictp_t params;
     quictp_defaults(&params);
+
+    /* RFC 9368 §3. Sent only when a test asked for it: the default client is a
+     * plain RFC 9000 one, which is the case the server has to keep working
+     * for. */
+    if (__offered_count > 0) {
+        params.chosen_version = c->ver->number;
+        params.available_count = 0;
+
+        /* §3 makes the Chosen Version a MUST in this list, and puts it first
+         * unless the caller already placed it: preference is the order. */
+        int has_chosen = 0;
+        for (size_t i = 0; i < __offered_count; i++)
+            if (__offered_versions[i] == params.chosen_version) has_chosen = 1;
+
+        for (size_t i = 0; i < __offered_count &&
+                           params.available_count < QUICTP_MAX_AVAILABLE_VERSIONS; i++)
+            params.available_versions[params.available_count++] = __offered_versions[i];
+
+        if (!has_chosen && params.available_count < QUICTP_MAX_AVAILABLE_VERSIONS)
+            params.available_versions[params.available_count++] = params.chosen_version;
+
+        params.has_version_information = 1;
+    }
     /* Generous unless a test asked otherwise, and the default has to stay that
      * way: it must exceed the server's write-ahead budget several times over,
      * or every large response would stall on flow control and look like a
@@ -1439,6 +1539,19 @@ static int __recv_datagram(quicclient_t* c, uint8_t* buf, size_t len) {
         if (pkt.type == QUIC_PKT_RETRY) {
             if (!__on_retry(c, &pkt)) return 0;
             continue;
+        }
+
+        /* RFC 9368 §2.3: the server answers in the version it chose, and the
+         * packet header is where we learn it -- before its transport
+         * parameters, which are inside the very packet that has to be decrypted
+         * with the new version's keys. §4 makes taking one we never offered a
+         * connection error; here it is simply refused, which is the same thing
+         * to a test. */
+        c->in_switch_packet = 0;
+        if (level == QUIC_ENC_INITIAL && pkt.version != c->ver->number &&
+            __offered(c, pkt.version)) {
+            if (!__adopt_version(c, pkt.version)) return 0;
+            c->in_switch_packet = 1;
         }
 
         /* The server's first Initial tells us the connection id it wants us to
@@ -1641,6 +1754,8 @@ static int __connect(quicclient_t* client, const char* host, uint16_t port,
      * caller: reading one back across the wipe compiled, ran, and handed
      * OpenSSL a pointer made of stack garbage. */
     memset(client, 0, sizeof * client);
+    client->ver = quicversion_find(__requested_version);
+    if (client->ver == NULL) client->ver = quicversion_find(QUIC_VERSION_1);
     client->verbose = verbose;
     client->fd = -1;
     client->out = out;

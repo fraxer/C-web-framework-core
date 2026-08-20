@@ -1,6 +1,7 @@
 #include "framework.h"
 
 #include "quicretry.h"
+#include "quicversion.h"
 
 #include <arpa/inet.h>
 #include <string.h>
@@ -42,6 +43,64 @@ static struct sockaddr_in addr_v4(const char* ip, uint16_t port) {
     return sa;
 }
 
+TEST(test_quic_retry_integrity_v2) {
+    TEST_SUITE("quic_retry");
+
+    TEST_CASE("RFC 9369 Appendix A.4: the v2 Retry integrity tag");
+    /* The Retry key and nonce are published, so the tag proves only that the
+     * sender saw the client's original connection id -- and it proves it per
+     * version. A v2 Retry tagged with the v1 key is, to the client, exactly an
+     * off-path forgery: dropped without a word, handshake stalls, nothing in
+     * any log. */
+    const quicversion_t* v2 = quicversion_find(QUIC_VERSION_2);
+    TEST_REQUIRE_NOT_NULL(v2, "v2 is implemented");
+
+    quiccid_t odcid = { .len = 8 };
+    TEST_REQUIRE(from_hex("8394c8f03e515708", odcid.data, sizeof odcid.data) == 8, "odcid");
+
+    uint8_t packet[64];
+    const int packet_len = from_hex(
+        "cf6b3343cf0008f067a5502a4262b574 6f6b656ec8646ce8bfe33952d9555436"
+        "65dcc7b6", packet, sizeof packet);
+    TEST_REQUIRE(packet_len == 36, "retry packet hex");
+
+    TEST_ASSERT((packet[0] & 0x30) >> 4 == v2->wire_retry,
+                "the sample's type bits are the ones §3.2 assigns a v2 Retry");
+
+    uint8_t tag[16];
+    TEST_REQUIRE(quicretry_integrity_tag(v2, &odcid, packet, (size_t)packet_len - 16, tag),
+                 "computed");
+    TEST_ASSERT(memcmp(tag, packet + packet_len - 16, 16) == 0, "matches the RFC");
+
+    TEST_CASE("and the v1 key does not produce it");
+    /* The control. Without it, a build that ignored the version argument would
+     * pass everything above if the vector happened to be a v1 one. */
+    uint8_t v1_tag[16];
+    TEST_REQUIRE(quicretry_integrity_tag(quicversion_find(QUIC_VERSION_1), &odcid,
+                                         packet, (size_t)packet_len - 16, v1_tag),
+                 "computed");
+    TEST_ASSERT(memcmp(v1_tag, packet + packet_len - 16, 16) != 0, "a different tag");
+
+    TEST_CASE("what we build carries the v2 number and the v2 type code");
+    quiccid_t dcid = { .len = 4 };
+    memcpy(dcid.data, "\x01\x02\x03\x04", 4);
+    quiccid_t scid = { .len = 8 };
+    memcpy(scid.data, "\xa0\xa1\xa2\xa3\xa4\xa5\xa6\xa7", 8);
+    const uint8_t token[] = "opaque-token";
+
+    uint8_t built[128];
+    const size_t n = quicretry_write(v2, built, sizeof built, &odcid, &dcid, &scid,
+                                     token, sizeof token);
+    TEST_ASSERT(n > 0, "written");
+    TEST_ASSERT((built[0] & 0xc0) == 0xc0, "long header with the fixed bit");
+    TEST_ASSERT(((built[0] & 0x30) >> 4) == 0x00, "type 0 -- a Retry, in v2");
+    TEST_ASSERT(memcmp(built + 1, "\x6b\x33\x43\xcf", 4) == 0, "version 2");
+
+    uint8_t check[16];
+    TEST_ASSERT(quicretry_integrity_tag(v2, &odcid, built, n - 16, check), "recomputed");
+    TEST_ASSERT(memcmp(check, built + n - 16, 16) == 0, "self-consistent");
+}
+
 TEST(test_quic_retry_integrity) {
     TEST_SUITE("quic_retry");
 
@@ -60,7 +119,7 @@ TEST(test_quic_retry_integrity) {
 
     /* The last 16 bytes are the tag; recompute them over the rest. */
     uint8_t tag[16];
-    TEST_REQUIRE(quicretry_integrity_tag(&odcid, packet, (size_t)packet_len - 16, tag),
+    TEST_REQUIRE(quicretry_integrity_tag(quicversion_find(QUIC_VERSION_1), &odcid, packet, (size_t)packet_len - 16, tag),
                  "computed");
     TEST_ASSERT(memcmp(tag, packet + packet_len - 16, 16) == 0, "matches the RFC");
 
@@ -70,7 +129,7 @@ TEST(test_quic_retry_integrity) {
     quiccid_t other = odcid;
     other.data[0] ^= 0x01;
     uint8_t other_tag[16];
-    TEST_REQUIRE(quicretry_integrity_tag(&other, packet, (size_t)packet_len - 16, other_tag),
+    TEST_REQUIRE(quicretry_integrity_tag(quicversion_find(QUIC_VERSION_1), &other, packet, (size_t)packet_len - 16, other_tag),
                  "computed");
     TEST_ASSERT(memcmp(tag, other_tag, 16) != 0, "tags differ");
 
@@ -82,20 +141,20 @@ TEST(test_quic_retry_integrity) {
     const uint8_t token[] = "opaque-token";
 
     uint8_t built[128];
-    const size_t n = quicretry_write(built, sizeof built, &odcid, &dcid, &scid,
+    const size_t n = quicretry_write(quicversion_find(QUIC_VERSION_1), built, sizeof built, &odcid, &dcid, &scid,
                                      token, sizeof token);
     TEST_ASSERT(n > 0, "written");
     TEST_ASSERT((built[0] & 0xf0) == 0xf0, "long header, fixed bit, type Retry");
     TEST_ASSERT(memcmp(built + 1, "\x00\x00\x00\x01", 4) == 0, "version 1");
 
     uint8_t check[16];
-    TEST_ASSERT(quicretry_integrity_tag(&odcid, built, n - 16, check), "recomputed");
+    TEST_ASSERT(quicretry_integrity_tag(quicversion_find(QUIC_VERSION_1), &odcid, built, n - 16, check), "recomputed");
     TEST_ASSERT(memcmp(check, built + n - 16, 16) == 0, "self-consistent");
 
     TEST_CASE("refuses what it cannot write");
-    TEST_ASSERT(quicretry_write(built, 8, &odcid, &dcid, &scid, token, sizeof token) == 0,
+    TEST_ASSERT(quicretry_write(quicversion_find(QUIC_VERSION_1), built, 8, &odcid, &dcid, &scid, token, sizeof token) == 0,
                 "buffer too small");
-    TEST_ASSERT(quicretry_write(built, sizeof built, &odcid, &dcid, &scid, NULL, 0) == 0,
+    TEST_ASSERT(quicretry_write(quicversion_find(QUIC_VERSION_1), built, sizeof built, &odcid, &dcid, &scid, NULL, 0) == 0,
                 "a Retry with no token is pointless");
 }
 

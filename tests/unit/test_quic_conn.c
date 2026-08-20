@@ -16,6 +16,7 @@
 #include "quicloss.h"
 #include "quicqlog.h"
 #include "quicstream.h"
+#include "quicversion.h"
 #include "quictime.h"
 
 /* The deterministic in-process stand (docs/http3/08-testing.md §2).
@@ -179,6 +180,14 @@ typedef struct stand {
      * (docs/http3/08 §12). */
     uint16_t dgram_len[STAND_MAX_DGRAM_LOG];
     size_t   dgram_logged;
+
+    /* The first byte and the version field of the first long-header datagram
+     * the server sent. Recorded because "the connection worked" cannot tell a
+     * v2 handshake from a v1 one -- both work -- and the only external evidence
+     * of which version was spoken is on the wire (docs/http3/08 §17). */
+    uint8_t  first_long_byte;
+    uint32_t first_long_version;
+    int      first_long_seen;
     uint64_t ticks;                    /* server timer sweeps run */
 
     /* Print every event as it happens: what left, what arrived, what was
@@ -366,6 +375,13 @@ static ssize_t __server_out(void* arg, const uint8_t* data, size_t len,
     if (s->dgram_logged < STAND_MAX_DGRAM_LOG)
         s->dgram_len[s->dgram_logged++] = (uint16_t)len;
 
+    if (!s->first_long_seen && len >= 5 && (data[0] & 0x80) != 0) {
+        s->first_long_byte = data[0];
+        s->first_long_version = ((uint32_t)data[1] << 24) | ((uint32_t)data[2] << 16) |
+                                ((uint32_t)data[3] << 8) | (uint32_t)data[4];
+        s->first_long_seen = 1;
+    }
+
     __net_send(s, data, len, 0);
 
     return (ssize_t)len;
@@ -423,7 +439,10 @@ static quicconn_t* __lookup_or_accept(stand_t* s, const uint8_t* data, size_t le
     if (!inv.long_header || len < QUIC_MIN_INITIAL_DATAGRAM) return NULL;
     if (s->conn != NULL) return NULL;           /* one connection per stand */
 
-    conn = quicconn_accept(&s->ep, &inv.dcid, &inv.scid, &s->client_path,
+    const quicversion_t* ver = quicversion_find(inv.version);
+    if (ver == NULL) return NULL;
+
+    conn = quicconn_accept(&s->ep, ver, &inv.dcid, &inv.scid, &s->client_path,
                            &s->server, 0, NULL);
     if (conn == NULL) return NULL;
 
@@ -753,9 +772,15 @@ static void __addr(struct sockaddr_storage* ss, socklen_t* len,
 
 /* A stand with a clean 20 ms path (10 ms each way) and no impairment. Every
  * scenario starts here and then breaks exactly one thing. */
-static stand_t* __stand_create(uint64_t seed) {
+static stand_t* __stand_create_version(uint64_t seed, uint32_t version) {
     stand_t* s = calloc(1, sizeof * s);
     if (s == NULL) return NULL;
+
+    /* Set on every stand and not only on the one that wants v2. The client's
+     * version is a process-wide knob (quicclient_use_version), so a test that
+     * returned early after setting it would hand its version to whatever ran
+     * next; stating it here means there is nothing to leak. */
+    quicclient_use_version(version);
 
     __now_us = 1000000;   /* not 0: a zero timestamp reads as "never" in places */
     quic_time_set_source(__clock);
@@ -872,6 +897,10 @@ static int __start(stand_t* s) {
 }
 
 /* ---- Scenarios ---- */
+
+static stand_t* __stand_create(uint64_t seed) {
+    return __stand_create_version(seed, QUIC_VERSION_1);
+}
 
 TEST(test_quic_stand_handshake) {
     TEST_SUITE("quic_stand");
@@ -1945,6 +1974,59 @@ TEST(test_quic_stand_stop_sending) {
     TEST_REQUIRE_NOT_NULL(s->conn, "connected");
     TEST_ASSERT(s->conn->state == QUICCONN_ACTIVE, "and the connection carried on");
 
+    free(body);
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_version_2) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a whole connection in QUIC v2 (RFC 9369)");
+    /* The vectors in test_quic_crypto prove the constants; this proves they are
+     * wired to each other. Every one of v2's four differences is silent on its
+     * own -- wrong salt, wrong labels, wrong type codes and wrong Retry key all
+     * produce packets that are well formed and simply never open -- so the only
+     * assertion that means anything is a request going out and a response
+     * coming back, over a connection whose datagrams carry 0x6b3343cf. */
+    stand_t* s = __stand_create_version(41, QUIC_VERSION_2);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_ASSERT(__start(s), "the first Initial went out");
+
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete and confirmed");
+    TEST_REQUIRE_NOT_NULL(s->conn, "the connection is still there");
+    TEST_ASSERT(s->conn->state == QUICCONN_ACTIVE, "the server calls it active");
+
+    TEST_ASSERT(s->conn->ver != NULL && s->conn->ver->number == QUIC_VERSION_2,
+                "the server settled on v2");
+    TEST_ASSERT(s->conn->ver_original == s->conn->ver,
+                "and it is the version the client opened with");
+
+    TEST_CASE("and it is v2 on the wire, not merely in the server's opinion");
+    TEST_ASSERT(s->first_long_seen, "the server sent a long header");
+    TEST_ASSERT(s->first_long_version == QUIC_VERSION_2, "carrying the v2 number");
+    /* §3.2: an Initial is type 1 in v2 where it is type 0 in v1. This is the
+     * assertion a build that used the v1 codes would fail -- and the one no
+     * amount of "the handshake completed" would catch, because the two ends
+     * would agree with each other while disagreeing with the RFC. */
+    TEST_ASSERT(((s->first_long_byte & 0x30) >> 4) == 0x01,
+                "and the type code v2 assigns an Initial");
+
+    TEST_CASE("a request is answered over it");
+    quicstream_t* qs = __open_request_stream(s);
+    TEST_REQUIRE_NOT_NULL(qs, "the server has the stream");
+
+    const size_t total = 64 * 1024;
+    uint8_t* body = __body_make(total);
+    TEST_REQUIRE_NOT_NULL(body, "body allocated");
+    TEST_ASSERT(__respond(s, qs, body, total), "queued on the stream");
+
+    uint8_t* got = malloc(total);
+    TEST_REQUIRE_NOT_NULL(got, "receive buffer");
+    TEST_ASSERT(__drain(s, got, total) == total, "the whole body arrived");
+    TEST_ASSERT(memcmp(got, body, total) == 0, "byte for byte");
+    TEST_ASSERT(quicclient_stream_fin(&s->client, 0), "and the stream finished");
+
+    free(got);
     free(body);
     __stand_free(s);
 }

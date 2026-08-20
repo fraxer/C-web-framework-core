@@ -1,6 +1,7 @@
 #include <string.h>
 
 #include "quicpacket.h"
+#include "quicversion.h"
 #include "varint.h"
 
 #define QUICPKT_FORM_LONG   0x80
@@ -95,15 +96,17 @@ quicpkt_status_e quicpkt_parse(const uint8_t* buf, size_t len,
 
     if ((buf[0] & QUICPKT_FIXED_BIT) == 0) return QUICPKT_BAD_FORM;
 
-    /* The type bits mean what they mean only in version 1; for any other
-     * version the caller owes a Version Negotiation packet and must not read
-     * further. */
-    if (out->version != QUIC_VERSION_1) {
+    /* The type bits mean what they mean only within a version we implement --
+     * and what they mean differs between the two we do (RFC 9369 §3.2). For any
+     * other version the caller owes a Version Negotiation packet and must not
+     * read further. */
+    const quicversion_t* ver = quicversion_find(out->version);
+    if (ver == NULL) {
         out->pkt_len = len;
         return QUICPKT_UNSUPPORTED_VERSION;
     }
 
-    out->type = (quic_pkt_type_e)((buf[0] & QUICPKT_LONG_TYPE) >> 4);
+    out->type = quicversion_type_of_wire(ver, (buf[0] & QUICPKT_LONG_TYPE) >> 4);
 
     if (out->type == QUIC_PKT_RETRY) {
         /* §17.2.5: no length and no packet number -- the token runs to the
@@ -254,8 +257,25 @@ size_t quicpkt_write_header(uint8_t* dst, size_t cap, const quicpkt_hdr_out_t* h
 
         if (cap < 5) return 0;
 
+        /* The Type bits belong to the version being written, not to the name
+         * of the packet: the same Handshake packet is 0b10 in v1 and 0b11 in
+         * v2 (RFC 9369 §3.2). A header written with the wrong version's codes
+         * decrypts to nothing at the peer -- a silent failure -- so the version
+         * decides them.
+         *
+         * A version we do not implement is not refused, and that is deliberate:
+         * RFC 8999 defines only Form, Version and the two connection ids for
+         * such a packet, everything else being version-specific, so there is no
+         * wrong answer to give. The one caller that writes one is the version
+         * negotiation probe, whose packet exists to be answered without being
+         * read, and refusing it here made the probe unsendable -- caught by
+         * tests/ci.sh vn. The v1 layout is what it gets. */
+        const quicversion_t* ver = quicversion_find(hdr->version);
+        const uint8_t type_bits = ver != NULL ? quicversion_wire_type(ver, hdr->type)
+                                              : (uint8_t)(hdr->type & 0x03);
+
         dst[off++] = (uint8_t)(QUICPKT_FORM_LONG | QUICPKT_FIXED_BIT |
-                               ((uint8_t)hdr->type << 4) |
+                               (type_bits << 4) |
                                ((hdr->pn_len - 1) & QUICPKT_PN_LEN_MASK));
 
         dst[off++] = (uint8_t)(hdr->version >> 24);

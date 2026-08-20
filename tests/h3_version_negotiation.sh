@@ -8,10 +8,10 @@
 # by byte in tests/unit/test_quic_invariants.c, but nothing ever asked a running
 # server for a Version Negotiation packet. Four things are checked:
 #
-#   1. a full-sized Initial of an unknown version (QUIC v2, RFC 9369) is
-#      answered with a Version Negotiation packet that offers version 1 and a
-#      reserved version, echoes the connection ids swapped, is smaller than the
-#      probe, and does NOT offer the version that was probed;
+#   1. a full-sized Initial of an unknown version is answered with a Version
+#      Negotiation packet that offers version 1 and a reserved version, echoes
+#      the connection ids swapped, is smaller than the probe, and does NOT offer
+#      the version that was probed;
 #   2. one byte under the §14.1 minimum, the same probe is ignored -- otherwise
 #      the endpoint amplifies for a spoofed source address -- and the counters
 #      say which rule dropped it;
@@ -20,9 +20,15 @@
 #   4. http3_version_negotiation_rate caps the reply rate, so the packet cannot
 #      be used as an amplifier at volume.
 #
-# What this cannot check is a client that then falls back to version 1: this
-# client has no version 2 to fall back from. That belongs to the interop runner
-# (docs/http3/08 §2), where the peers are real implementations.
+# The probed version used to be QUIC v2, which was then a version this build did
+# not implement. It is implemented now, so it would test something narrower --
+# "a version the operator switched off" rather than "a version nobody has heard
+# of" -- and both cases are worth having: this stage keeps the second, and the
+# first belongs with the rest of v2 in tests/h3_version_2.sh.
+#
+# What this cannot check is a client that then falls back to version 1 after
+# being told: a fallback needs a second version to fall back *from*, and that is
+# what the interop runner is for (docs/http3/08 §2).
 
 set -u -o pipefail
 
@@ -137,7 +143,10 @@ start_server "$WORK_DIR/default.json" || exit 1
 vn_before=$(metric quic 'version_negotiation_sent')
 short_before=$(metric quic 'drop\.short_initial')
 
-if "$CLIENT" 127.0.0.1 "$PORT" -q --timeout 5000 --version \
+# Unregistered and not a reserved GREASE pattern: this has to be a version the
+# server genuinely does not know, or the stage tests the http3_version_2 switch
+# by accident.
+if "$CLIENT" 127.0.0.1 "$PORT" -q --timeout 5000 --version 0a1b2c3d \
         > "$WORK_DIR/probe.txt" 2>&1; then
     printf 'ok: an unknown version is answered with version negotiation\n'
 else
@@ -199,7 +208,7 @@ start_server "$WORK_DIR/limited.json" || exit 1
 
 budget_before=$(metric quic 'drop\.no_budget')
 
-"$CLIENT" 127.0.0.1 "$PORT" --version-flood 8 > "$WORK_DIR/flood.txt" 2>&1
+"$CLIENT" 127.0.0.1 "$PORT" --version 0a1b2c3d --version-flood 8 > "$WORK_DIR/flood.txt" 2>&1
 flood_status=$?
 answered=$(sed -n 's/^version negotiation: *\([0-9][0-9]*\)$/\1/p' "$WORK_DIR/flood.txt")
 

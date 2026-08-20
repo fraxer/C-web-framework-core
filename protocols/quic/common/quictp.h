@@ -42,8 +42,18 @@ typedef enum {
     QUICTP_PREFERRED_ADDRESS             = 0x0d,
     QUICTP_ACTIVE_CONNECTION_ID_LIMIT    = 0x0e,
     QUICTP_INITIAL_SCID                  = 0x0f,
-    QUICTP_RETRY_SCID                    = 0x10
+    QUICTP_RETRY_SCID                    = 0x10,
+    /* RFC 9368 §3. Not in RFC 9000's table: version negotiation got its own
+     * document, and its own parameter. */
+    QUICTP_VERSION_INFORMATION           = 0x11
 } quictp_id_e;
+
+/* How many versions of a peer's `available_versions` list are kept. The list is
+ * whatever the peer chose to advertise and has no bound of its own, so it needs
+ * one here; four is more than any deployed stack offers, and a peer with more
+ * simply has the tail ignored -- which costs nothing, because a version we
+ * cannot find in the prefix is a version we would not have chosen anyway. */
+#define QUICTP_MAX_AVAILABLE_VERSIONS 4
 
 typedef struct quictp {
     uint64_t max_idle_timeout;                        /* ms; 0 = no timeout */
@@ -65,6 +75,15 @@ typedef struct quictp {
 
     uint8_t  stateless_reset_token[16];
     int      has_stateless_reset_token;
+
+    /* RFC 9368 §3: the version the peer believes it is using, and the versions
+     * it would accept. `has_version_information` is load-bearing rather than
+     * informational -- a peer that sends none gets no compatible negotiation,
+     * because §2.3 forbids choosing a version it never offered. */
+    uint32_t chosen_version;
+    uint32_t available_versions[QUICTP_MAX_AVAILABLE_VERSIONS];
+    size_t   available_count;
+    int      has_version_information;
 } quictp_t;
 
 typedef enum {

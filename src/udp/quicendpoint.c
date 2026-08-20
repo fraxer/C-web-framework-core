@@ -267,6 +267,13 @@ static _Atomic uint64_t __quic_token_lifetime_us =
     (uint64_t)QUIC_DEFAULT_TOKEN_LIFETIME_SEC * 1000000ULL;
 static _Atomic int __quic_new_token = 1;
 
+/* Whether this server offers QUIC v2 (RFC 9369) at all: in the Version
+ * Negotiation list, in `available_versions`, and as a version it will accept an
+ * Initial in. Off by default -- 09-options.md §5 rule 1, and v2 exists to keep
+ * middleboxes honest rather than to serve anybody faster, so turning it on is a
+ * decision and not a default. */
+static _Atomic int __quic_version_2 = 0;
+
 static void __memory_metrics(size_t current, size_t limit,
                              unsigned long long refused) {
     metrics_quic_memory(current, limit, refused);
@@ -532,6 +539,7 @@ typedef struct {
     int64_t retry_threshold;
     int64_t token_lifetime_sec;
     bool new_token;
+    bool version_2;
     /* Borrowed from the env being loaded, so it is only valid for as long as
      * the parse that produced it -- quic_policy_init copies it into the qlog
      * module before returning, and nothing else keeps it. */
@@ -608,6 +616,12 @@ static int __runtime_policy_parse(const env_t* source, quic_runtime_policy_t* p)
     else {
         log_error("quic: http3_retry must be auto, always or never (got '%s')\n",
                   retry);
+        return 0;
+    }
+
+    p->version_2 = false;
+    if (env_config_get_bool_checked(source, "http3_version_2", &p->version_2) < 0) {
+        log_error("quic: http3_version_2 must be a boolean\n");
         return 0;
     }
 
@@ -690,6 +704,7 @@ int quic_policy_init(void) {
     atomic_store(&__quic_token_lifetime_us,
                  (uint64_t)runtime.token_lifetime_sec * 1000000ULL);
     atomic_store(&__quic_new_token, runtime.new_token);
+    atomic_store(&__quic_version_2, runtime.version_2);
 
     /* After every value has been validated, like the rest of this function:
      * a failed reload must not leave qlog pointing at a directory the rest of
@@ -898,7 +913,8 @@ static void __send_stateless_reset(quicendpoint_t* ep, const udp_datagram_t* dgr
  * client echoes back -- which is exactly why it is the answer to a flood of
  * spoofed Initials. It costs an honest client one round trip, so it is a
  * response to load rather than a default. */
-static void __send_retry(quicendpoint_t* ep, const udp_datagram_t* dgram,
+static void __send_retry(quicendpoint_t* ep, const quicversion_t* ver,
+                         const udp_datagram_t* dgram,
                          const quicinvariants_t* inv) {
     uint8_t token[QUIC_TOKEN_MAX_LEN];
     const size_t token_len =
@@ -915,7 +931,7 @@ static void __send_retry(quicendpoint_t* ep, const udp_datagram_t* dgram,
     if (RAND_bytes(scid.data, QUIC_LOCAL_CID_LEN) != 1) return;
 
     uint8_t packet[256];
-    const size_t len = quicretry_write(packet, sizeof packet, &inv->dcid,
+    const size_t len = quicretry_write(ver, packet, sizeof packet, &inv->dcid,
                                        &inv->scid, &scid, token, token_len);
     if (len == 0) return;
 
@@ -942,16 +958,17 @@ static void __send_retry(quicendpoint_t* ep, const udp_datagram_t* dgram,
  * Deliberately not used against a flood: it derives keys and builds a packet
  * per datagram, which is work done for whoever is sending them. The rate
  * budget drops those without a word (docs/http3/07 §4). */
-static void __send_initial_close(quicendpoint_t* ep, const udp_datagram_t* dgram,
+static void __send_initial_close(quicendpoint_t* ep, const quicversion_t* ver,
+                                 const udp_datagram_t* dgram,
                                  const quicinvariants_t* inv, uint64_t error) {
     uint8_t client_secret[32];
     uint8_t server_secret[32];
-    if (!quiccrypto_initial_secrets(&inv->dcid, client_secret, server_secret)) return;
+    if (!quiccrypto_initial_secrets(ver, &inv->dcid, client_secret, server_secret)) return;
 
     quickeys_t keys;
     memset(&keys, 0, sizeof keys);
 
-    if (!quickeys_install(&keys, QUIC_AEAD_AES_128_GCM, server_secret, sizeof server_secret)) {
+    if (!quickeys_install(ver, &keys, QUIC_AEAD_AES_128_GCM, server_secret, sizeof server_secret)) {
         explicit_bzero(client_secret, sizeof client_secret);
         explicit_bzero(server_secret, sizeof server_secret);
         return;
@@ -1004,6 +1021,36 @@ static void __send_initial_close(quicendpoint_t* ep, const udp_datagram_t* dgram
     explicit_bzero(server_secret, sizeof server_secret);
 }
 
+/* Whether this server is willing to speak a version right now. Separate from
+ * quicversion_find, which answers what the code implements: a version can be
+ * implemented and switched off, and every place that offers, accepts or lists a
+ * version has to give the same answer (07-integration.md, http3_version_2). */
+static int __version_offered(const quicversion_t* ver) {
+    if (ver == NULL) return 0;
+    if (ver->number == QUIC_VERSION_2) return atomic_load(&__quic_version_2);
+
+    return 1;
+}
+
+static const quicversion_t* __version_accept(uint32_t number) {
+    const quicversion_t* ver = quicversion_find(number);
+
+    return __version_offered(ver) ? ver : NULL;
+}
+
+size_t quicendpoint_versions(const quicversion_t** out, size_t cap) {
+    if (out == NULL || cap == 0) return 0;
+
+    size_t known = 0;
+    const quicversion_t* const* all = quicversion_all(&known);
+    size_t n = 0;
+
+    for (size_t i = 0; i < known && n < cap; i++)
+        if (__version_offered(all[i])) out[n++] = all[i];
+
+    return n;
+}
+
 static void __send_version_negotiation(quicendpoint_t* ep, const udp_datagram_t* dgram,
                                        const quicinvariants_t* inv) {
     if (!__budget_spend(&__quic_vn_bucket, atomic_load(&__quic_vn_rate),
@@ -1012,9 +1059,18 @@ static void __send_version_negotiation(quicendpoint_t* ep, const udp_datagram_t*
         return;
     }
 
-    /* Offer what we implement, plus a reserved version, so that a client cannot
-     * come to depend on the exact list (RFC 9000 §6.3). */
-    static const uint32_t versions[] = { QUIC_VERSION_1, QUIC_VERSION_GREASE };
+    /* Offer what we implement *and* are willing to speak, plus a reserved
+     * version, so that a client cannot come to depend on the exact list
+     * (RFC 9000 §6.3). Built rather than declared: the list has to match what
+     * __version_accept will actually let through, or a client takes the offer
+     * and is refused. */
+    uint32_t versions[8];
+    size_t version_count = 0;
+    size_t known = 0;
+    const quicversion_t* const* all = quicversion_all(&known);
+    for (size_t i = 0; i < known && version_count < (sizeof versions / sizeof versions[0]) - 1; i++)
+        if (__version_offered(all[i])) versions[version_count++] = all[i]->number;
+    versions[version_count++] = QUIC_VERSION_GREASE;
 
     uint8_t unused = 0;
     if (RAND_bytes(&unused, 1) != 1) unused = 0;
@@ -1024,7 +1080,7 @@ static void __send_version_negotiation(quicendpoint_t* ep, const udp_datagram_t*
      * round produces a packet the client silently ignores. */
     const size_t len = quic_invariants_write_version_negotiation(
         packet, sizeof packet, &inv->scid, &inv->dcid, unused,
-        versions, sizeof versions / sizeof versions[0]);
+        versions, version_count);
 
     if (len == 0 || len >= dgram->len) {
         metrics_quic(METRICS_QUIC_DROP_UNKNOWN_CID);
@@ -1326,7 +1382,8 @@ void quicendpoint_detach(quicendpoint_t* endpoint, quicconn_t* conn) {
 /* ---- Routing ---- */
 
 /* Create a connection for a client's first Initial packet. */
-static void __accept(quicendpoint_t* ep, udp_datagram_t* dgram,
+static void __accept(quicendpoint_t* ep, const quicversion_t* ver,
+                     udp_datagram_t* dgram,
                      const quicinvariants_t* inv,
                      int address_validated, const quiccid_t* retry_odcid) {
     server_t* server = NULL;
@@ -1341,7 +1398,7 @@ static void __accept(quicendpoint_t* ep, udp_datagram_t* dgram,
     const size_t memory_limit = quicmemory_limit();
     if (memory_limit != 0 && quicmemory_current() >= memory_limit) {
         metrics_quic(METRICS_QUIC_AT_CAPACITY);
-        __send_initial_close(ep, dgram, inv, QUIC_CONNECTION_REFUSED);
+        __send_initial_close(ep, ver, dgram, inv, QUIC_CONNECTION_REFUSED);
         return;
     }
 
@@ -1357,11 +1414,11 @@ static void __accept(quicendpoint_t* ep, udp_datagram_t* dgram,
     if (!quic_process_conn_try_acquire()) {
         metrics_quic(METRICS_QUIC_AT_CAPACITY);
         metrics_quic(METRICS_QUIC_DROP_NO_BUDGET);
-        __send_initial_close(ep, dgram, inv, QUIC_CONNECTION_REFUSED);
+        __send_initial_close(ep, ver, dgram, inv, QUIC_CONNECTION_REFUSED);
         return;
     }
 
-    quicconn_t* conn = quicconn_accept(ep, &inv->dcid, &inv->scid, &path, server,
+    quicconn_t* conn = quicconn_accept(ep, ver, &inv->dcid, &inv->scid, &path, server,
                                        address_validated, retry_odcid);
     if (conn == NULL) {
         quic_process_conn_release();
@@ -1813,7 +1870,13 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
         return;
     }
 
-    if (inv.version != QUIC_VERSION_1) {
+    /* The one place an unknown version is turned away. "Unknown" means either
+     * not implemented or implemented and switched off: a client that took v2
+     * from a Version Negotiation packet we sent while it was on, and comes back
+     * after a reload turned it off, gets another Version Negotiation rather
+     * than silence. */
+    const quicversion_t* ver = __version_accept(inv.version);
+    if (ver == NULL) {
         __send_version_negotiation(ep, dgram, &inv);
         return;
     }
@@ -1860,7 +1923,7 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
          * going quiet, so the client can go elsewhere immediately instead of
          * retransmitting its Initial for a handshake timeout. */
         metrics_quic(METRICS_QUIC_AT_CAPACITY);
-        __send_initial_close(ep, dgram, &inv, QUIC_CONNECTION_REFUSED);
+        __send_initial_close(ep, ver, dgram, &inv, QUIC_CONNECTION_REFUSED);
         return;
     }
 
@@ -1868,7 +1931,7 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
         metrics_quic(METRICS_QUIC_AT_CAPACITY);
         /* Told, not dropped. Being full is not an attack, and a client that
          * knows can go elsewhere now instead of at its handshake timeout. */
-        __send_initial_close(ep, dgram, &inv, QUIC_CONNECTION_REFUSED);
+        __send_initial_close(ep, ver, dgram, &inv, QUIC_CONNECTION_REFUSED);
         return;
     }
 
@@ -1898,7 +1961,7 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
              * rather than turned into another Retry: a client looping on a
              * token it cannot fix would never get anywhere. */
             metrics_quic(METRICS_QUIC_TOKEN_INVALID);
-            __send_initial_close(ep, dgram, &inv, QUIC_INVALID_TOKEN);
+            __send_initial_close(ep, ver, dgram, &inv, QUIC_INVALID_TOKEN);
             return;
         }
         else {
@@ -1925,7 +1988,7 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
         (retry_mode == QUIC_RETRY_ALWAYS ||
          atomic_load_explicit(&__quic_handshakes_inflight, memory_order_acquire) >=
              atomic_load(&__quic_retry_threshold))) {
-        __send_retry(ep, dgram, &inv);
+        __send_retry(ep, ver, dgram, &inv);
         return;
     }
 
@@ -1945,7 +2008,7 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
         return;
     }
 
-    __accept(ep, dgram, &inv, validated, have_retry_odcid ? &retry_odcid : NULL);
+    __accept(ep, ver, dgram, &inv, validated, have_retry_odcid ? &retry_odcid : NULL);
 }
 
 /* Arm the endpoint's timer for the earliest deadline any of its connections

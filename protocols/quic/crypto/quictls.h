@@ -178,6 +178,16 @@ int quictls_init_server(quictls_t* tls, SSL_CTX* ssl_ctx,
                         const quictls_ops_t* ops, void* ctx,
                         const quictp_t* params, const quictls_early_t* early);
 
+/* Replace the transport parameters this endpoint will send.
+ *
+ * Valid only before the handshake has produced the flight that carries them --
+ * on a server, that means from inside the peer_params callback and nowhere
+ * else. It exists for exactly one caller: compatible version negotiation
+ * (RFC 9368 §2.3) decides which version the server will speak from the client's
+ * own parameters, and the answer has to go back in the server's parameters of
+ * the same handshake. */
+int quictls_update_params(quictls_t* tls, const quictp_t* params);
+
 /* Whether this handshake actually accepted the client's early data. Only
  * meaningful once the handshake has read the ClientHello; a server that never
  * offered 0-RTT, or a client that did not attempt it, both report 0. */

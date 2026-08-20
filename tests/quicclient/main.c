@@ -23,6 +23,7 @@
  *              [--pause-after-response N]
  *              [--loss N] [--loss-in N] [--reorder N] [--dup N] [--seed N]
  *              [--timeout MS] [--version [HEX]] [--version-flood N]
+ *              [--quic-version HEX] [--offer-versions HEX[,HEX...]]
  *              [--mix /small [--mix-delay MS] [--mix-priority VALUE]]
  *
  * --loss impairs what this client sends and --loss-in what it receives. Only
@@ -59,8 +60,17 @@ int main(int argc, char* argv[]) {
     int zero_rtt = 0;
     int zero_rtt_stall = 0;
     int version_probe = 0;
+    uint32_t speak_version = 0;
+    uint32_t offer[4];
+    int offer_count = 0;
     int version_flood = 0;
-    /* QUIC v2 (RFC 9369): a version that exists, that we deliberately do not
+    /* QUIC v2 (RFC 9369). It is now implemented, so as a *probe* version it
+     * tests something narrower than it used to: that a version this build
+     * knows but the operator has switched off draws a Version Negotiation
+     * packet rather than a handshake. For the original question -- an unknown
+     * version -- pass a number nobody has registered.
+     *
+     * Was: a version that exists, that we deliberately do not
      * implement (docs/http3/09 §3.2), and that therefore models the real case
      * this checks -- a peer from the future, not a random number. */
     uint32_t probe_version = 0x6b3343cfu;
@@ -128,6 +138,21 @@ int main(int argc, char* argv[]) {
             if (i + 1 < argc && argv[i + 1][0] != '-')
                 probe_version = (uint32_t)strtoul(argv[++i], NULL, 16);
         }
+        else if (strcmp(argv[i], "--quic-version") == 0 && i + 1 < argc)
+            speak_version = (uint32_t)strtoul(argv[++i], NULL, 16);
+        else if (strcmp(argv[i], "--offer-versions") == 0 && i + 1 < argc) {
+            /* Comma-separated hex, most preferred first: the client's
+             * `available_versions` (RFC 9368 §3). */
+            const char* list = argv[++i];
+            offer_count = 0;
+            while (*list != '\0' && offer_count < (int)(sizeof offer / sizeof offer[0])) {
+                char* end = NULL;
+                const unsigned long v = strtoul(list, &end, 16);
+                if (end == list) break;
+                offer[offer_count++] = (uint32_t)v;
+                list = (*end == ',') ? end + 1 : end;
+            }
+        }
         else if (strcmp(argv[i], "--version-flood") == 0 && i + 1 < argc)
             version_flood = atoi(argv[++i]);
         else if (strcmp(argv[i], "--mix") == 0 && i + 1 < argc) mix_path = argv[++i];
@@ -141,6 +166,11 @@ int main(int argc, char* argv[]) {
 
     if (concurrent < 1) concurrent = 1;
     if (timeout_ms < 1) timeout_ms = 1;
+
+    /* Before any connect: both are process-wide knobs the client reads when it
+     * builds a connection (quicclient.h). */
+    if (speak_version != 0) quicclient_use_version(speak_version);
+    if (offer_count > 0) quicclient_offer_versions(offer, (size_t)offer_count);
 
     /* ---- Version negotiation (RFC 9000 §6.1, §14.1, §17.2.1) ----
      *
@@ -736,6 +766,15 @@ int main(int argc, char* argv[]) {
                client.path_response_matched ? "yes" : "no");
 
         if (!client.read_after_update || !client.path_response_matched) ok = 0;
+    }
+
+    /* Printed always and not only under -v: it is what a gate stage greps for,
+     * and the version a connection ended in is the whole observable of
+     * compatible version negotiation (RFC 9368). */
+    if (ok) {
+        printf("quic version: %08x\n", quicclient_version(&client));
+        printf("switch packet carried crypto: %s\n",
+               quicclient_switch_packet_carried_crypto(&client) ? "yes" : "no");
     }
 
     /* --migrate deliberately falls through to the HTTP/3 exchange below when it

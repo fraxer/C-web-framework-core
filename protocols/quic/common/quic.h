@@ -14,6 +14,10 @@
 /* ---- Versions (RFC 9000 §15) ---- */
 
 #define QUIC_VERSION_1              0x00000001u
+/* RFC 9369. The same protocol with four constants moved -- see quicversion.h
+ * for the whole of the difference, and 09-options.md §3.2 for why a second
+ * version exists at all. */
+#define QUIC_VERSION_2              0x6b3343cfu
 /* A Version Negotiation packet carries version 0 in the header (§17.2.1). */
 #define QUIC_VERSION_NEGOTIATION    0x00000000u
 /* Versions matching 0x?a?a?a?a are reserved to exercise version negotiation
@@ -69,9 +73,12 @@ typedef enum {
 
 /* ---- Packet types ----
  *
- * The wire values are the two Type bits of a long header (§17.2), already
- * shifted down. SHORT and VERSION_NEGOTIATION are not wire values: they are how
- * the parser reports a form that has no Type field of its own. */
+ * These are *names*, not wire values. They happen to equal the v1 Type bits,
+ * which is convenient and nothing more: v2 rotates the same four codes
+ * (RFC 9369 §3.2), so anything that reads or writes the two Type bits of a long
+ * header goes through quicversion_wire_type / quicversion_type_of_wire and
+ * never through the numbers below. SHORT and VERSION_NEGOTIATION have no Type
+ * field at all: they are how the parser reports a form that has none. */
 typedef enum {
     QUIC_PKT_INITIAL             = 0x00,
     QUIC_PKT_0RTT                = 0x01,

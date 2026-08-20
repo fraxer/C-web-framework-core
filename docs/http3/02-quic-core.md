@@ -364,7 +364,7 @@ size_t quicframe_write_stream(uint8_t* dst, size_t cap, uint64_t id, uint64_t of
 | 0x0e | `active_connection_id_limit` | 4 (минимум по RFC — 2) |
 | 0x0f | `initial_source_connection_id` | **обязателен**: SCID наших пакетов |
 | 0x10 | `retry_source_connection_id` | обязателен, **если** отправляли Retry |
-| 0x11 | `version_information` (RFC 9368) | опционально, фаза 9 |
+| 0x11 | `version_information` (RFC 9368) | **сделано** (`08` §17); отправляется только при `http3_version_2` |
 | 0x20 | `max_datagram_frame_size` (RFC 9221) | не ставим |
 
 ```c

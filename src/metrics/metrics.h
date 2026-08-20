@@ -172,6 +172,18 @@ typedef enum {
     METRICS_QUIC_VERSION_NEGOTIATION, /* Version Negotiation packets sent */
     METRICS_QUIC_STATELESS_RESET,     /* stateless resets sent */
 
+    /* Connections served in QUIC v2 (RFC 9369), and of those, the ones that got
+     * there by compatible version negotiation rather than by the client asking
+     * for v2 outright (RFC 9368 §2.3).
+     *
+     * Without the first, "http3_version_2 is on" and "anything ever used it"
+     * are indistinguishable -- and they differ, because a middlebox that drops
+     * unknown versions makes the option a no-op in a way nothing else reports.
+     * Without the second, a server that advertises v2 and never upgrades
+     * anybody looks exactly like one whose clients all prefer v1. */
+    METRICS_QUIC_VERSION_2_CONNECTIONS,
+    METRICS_QUIC_VERSION_2_NEGOTIATED,
+
     /* A connection is created by the first Initial that gets that far, so this
      * is also "handshakes started" -- the denominator of everything below. A
      * second counter for it would only be a second name for the same event. */

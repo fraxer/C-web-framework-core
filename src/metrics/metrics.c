@@ -49,6 +49,7 @@ static const char* const __quic_name[METRICS_QUIC__COUNT] = {
     "drop.short_initial", "drop.unknown_cid", "drop.no_budget", "drop.peer_version_negotiation",
     "drop.kernel_overflow",
     "version_negotiation_sent", "stateless_reset_sent",
+    "version2.connections", "version2.negotiated",
     "connections_accepted", "connections_closed",
     "send_error",
     "handshakes_completed", "handshakes_failed.tls", "handshakes_failed.timeout",

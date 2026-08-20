@@ -221,7 +221,13 @@ static int __cb_got_transport_params(SSL* ssl, const unsigned char* params,
      * packet the handshake arrived in, which this module never sees. Its
      * refusal is about a parameter too, so it carries the same code. */
     if (!tls->ops->peer_params(tls->ctx, &tp)) {
-        tls->transport_error = QUIC_TRANSPORT_PARAMETER_ERROR;
+        /* Only if the connection layer did not already name a better one. A
+         * version negotiation failure (RFC 9368 §4) is refused here like any
+         * other bad parameter, but it is not a TRANSPORT_PARAMETER_ERROR, and
+         * overwriting the code would tell the peer to look at the wrong
+         * field. */
+        if (tls->transport_error == 0)
+            tls->transport_error = QUIC_TRANSPORT_PARAMETER_ERROR;
         return 0;
     }
 
@@ -428,6 +434,20 @@ static int __init(quictls_t* tls, SSL_CTX* ssl_ctx,
     tls->ssl = NULL;
 
     return 0;
+}
+
+int quictls_update_params(quictls_t* tls, const quictp_t* params) {
+    if (tls == NULL || tls->ssl == NULL || params == NULL) return 0;
+
+    /* Re-encoded into the same buffer OpenSSL was given, and then handed over
+     * again: the pointer is kept rather than copied (quictls.h), so the second
+     * call is what makes the new length take effect. */
+    const size_t n = quictp_encode(tls->params, sizeof tls->params, params);
+    if (n == 0) return 0;
+
+    tls->params_len = n;
+
+    return SSL_set_quic_tls_transport_params(tls->ssl, tls->params, tls->params_len) == 1;
 }
 
 int quictls_init_server(quictls_t* tls, SSL_CTX* ssl_ctx,

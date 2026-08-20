@@ -194,6 +194,43 @@ typedef struct quicconn {
      * next turn starts from the head again. */
     quicstream_t* send_cursor;
 
+    /* The version this connection speaks, and the version the client opened it
+     * with. They differ only between the moment compatible version negotiation
+     * picks a different one (RFC 9368 §2.3) and the moment the client follows:
+     * the server sends its first flight in `ver` while the client is still
+     * sending its first flight in `ver_original`, so the Initial level has to
+     * be able to read one and write the other. Every other level exists only
+     * after the client has switched, so one version suffices for them. */
+    const quicversion_t* ver;
+    const quicversion_t* ver_original;
+
+    /* The Destination Connection ID the client's Initial keys were derived
+     * from -- its own first invention, or the Source Connection ID of our
+     * Retry. Kept because a version switch has to derive them again with the
+     * new version's salt, and by then the packet that carried it is long
+     * gone. */
+    quiccid_t initial_dcid;
+
+    /* The Initial read keys of `ver_original`, kept alive while the two
+     * versions differ. RFC 9368 §2.3 has the server answer in the negotiated
+     * version while the client is still sending its first flight in the
+     * original one -- so for the length of that overlap the Initial level
+     * reads with one version's keys and writes with another's, and a packet
+     * chooses between them by the version in its own header. */
+    quickeys_t rx_initial_original;
+
+    /* Whether an Initial packet has gone out in the negotiated version yet.
+     *
+     * A version switch is announced by the Version field of a long header and
+     * nothing else (RFC 9369 §4.1), and a client is entitled to take that first
+     * packet as the announcement and no more -- picoquic discards its frames,
+     * acknowledgement included, and its own server never puts anything in it.
+     * So this server does not either: while the flag is clear the Initial
+     * CRYPTO is held back, and the ServerHello goes in the packet after
+     * (docs/http3/08 §17g). One packet later on a switched connection, and
+     * nothing at all on a connection that never switches. */
+    int ver_switch_announced;
+
     /* How many terminal frames the streams of this connection owe the peer --
      * RESET_STREAM and STOP_SENDING, counted per flag, so one stream can add
      * two.
@@ -482,6 +519,7 @@ typedef struct quicconn {
  * it is now addressing), and a server that reports only what it can see today
  * fails that check. */
 quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
+                            const quicversion_t* ver,
                             const quiccid_t* odcid, const quiccid_t* peer_scid,
                             const quicpath_t* path, server_t* server,
                             int address_validated, const quiccid_t* retry_odcid);

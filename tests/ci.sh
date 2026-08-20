@@ -21,6 +21,8 @@
 #   soak     sustained requests, impairment, migration and RSS drain
 #   affinity a migrated connection follows its datagrams to the new worker
 #   vn       an unknown QUIC version draws a Version Negotiation packet
+#   version2 QUIC v2 (RFC 9369) is served, and a v1 client that offers it is
+#            moved to it (RFC 9368); with http3_version_2 off, neither happens
 #   ipv6     an IPv6 vhost serves h1.1/h2/h3, separately from IPv4 on the
 #            same port (skips where there is no IPv6 loopback)
 #   priority urgency and incremental scheduling, and what an unsignalled
@@ -264,6 +266,18 @@ stage_vn() {
         record vn OK
     else
         record vn FAIL
+    fi
+}
+
+stage_version2() {
+    say "version2: QUIC v2 is served, negotiated when offered, and absent when off"
+    if build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes -DSANITIZE=none &&
+       H3_V2_PORT=18466 "$CORE_DIR/tests/h3_version_2.sh" \
+             "$CI_BUILD_DIR/limits" "$CI_BUILD_DIR/h3-version-2"; then
+        record version2 OK
+    else
+        record version2 FAIL
     fi
 }
 
@@ -558,7 +572,7 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit config startup keepalive limits soak affinity earlydata vn ipv6 qlog priority benchmark asan tsan fuzz reload softreload h3spec)
+ALL_STAGES=(noh3 h3unit config startup keepalive limits soak affinity earlydata vn version2 ipv6 qlog priority benchmark asan tsan fuzz reload softreload h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
@@ -583,6 +597,7 @@ for stage in "${STAGES[@]}"; do
     affinity) stage_affinity ;;
     earlydata) stage_earlydata ;;
     vn)     stage_vn ;;
+    version2) stage_version2 ;;
     ipv6)   stage_ipv6 ;;
     qlog) stage_qlog ;;
     priority) stage_priority ;;

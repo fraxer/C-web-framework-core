@@ -3,6 +3,7 @@
 #include "quiccrypto.h"
 #include "quichp.h"
 #include "quicpacket.h"
+#include "quicversion.h"
 
 #include <string.h>
 
@@ -39,6 +40,88 @@ static int from_hex(const char* hex, uint8_t* out, size_t out_cap) {
     return (int)n;
 }
 
+TEST(test_quic_crypto_initial_secrets_v2) {
+    TEST_SUITE("quic_crypto");
+
+    TEST_CASE("RFC 9369 Appendix A: the same DCID, a different version, different keys");
+    /* QUIC v2 is v1 with four constants moved, and every one of them is silent
+     * when wrong: a connection with the v1 salt or the v1 labels derives keys
+     * perfectly well, and then nothing the peer sends will ever open. The
+     * vectors are the only thing that catches that, which is why they are here
+     * against the *same* connection id as the v1 case above -- the difference
+     * in the output is the version and nothing else. */
+    const quicversion_t* v2 = quicversion_find(QUIC_VERSION_2);
+    TEST_REQUIRE_NOT_NULL(v2, "v2 is implemented");
+    TEST_ASSERT(v2->number == 0x6b3343cfu, "and carries the number RFC 9369 §3.1 assigns");
+
+    quiccid_t dcid = { .len = 8 };
+    TEST_REQUIRE(from_hex("8394c8f03e515708", dcid.data, sizeof dcid.data) == 8,
+                 "dcid hex");
+
+    uint8_t client_secret[32];
+    uint8_t server_secret[32];
+    TEST_REQUIRE(quiccrypto_initial_secrets(v2, &dcid, client_secret, server_secret),
+                 "secrets derived");
+
+    uint8_t expected[32];
+    TEST_REQUIRE(from_hex("14ec9d6eb9fd7af83bf5a668bc17a7e2"
+                          "83766aade7ecd0891f70f9ff7f4bf47b", expected, sizeof expected) == 32,
+                 "client secret hex");
+    TEST_ASSERT(memcmp(client_secret, expected, 32) == 0, "client_initial_secret");
+
+    TEST_REQUIRE(from_hex("0263db1782731bf4588e7e4d93b74639"
+                          "07cb8cd8200b5da55a8bd488eafc37c1", expected, sizeof expected) == 32,
+                 "server secret hex");
+    TEST_ASSERT(memcmp(server_secret, expected, 32) == 0, "server_initial_secret");
+
+    TEST_CASE("A.1: the key, iv and header protection key carry the quicv2 labels");
+    uint8_t key[16], iv[12], hp[16];
+    TEST_ASSERT(quic_hkdf_expand_label(EVP_sha256(), client_secret, 32, v2->label_key,
+                                       NULL, 0, key, sizeof key), "key derived");
+    TEST_ASSERT(quic_hkdf_expand_label(EVP_sha256(), client_secret, 32, v2->label_iv,
+                                       NULL, 0, iv, sizeof iv), "iv derived");
+    TEST_ASSERT(quic_hkdf_expand_label(EVP_sha256(), client_secret, 32, v2->label_hp,
+                                       NULL, 0, hp, sizeof hp), "hp derived");
+
+    uint8_t want[16];
+    TEST_REQUIRE(from_hex("8b1a0bc121284290a29e0971b5cd045d", want, sizeof want) == 16, "key hex");
+    TEST_ASSERT(memcmp(key, want, 16) == 0, "client key");
+
+    TEST_REQUIRE(from_hex("91f73e2351d8fa91660e909f", want, 12) == 12, "iv hex");
+    TEST_ASSERT(memcmp(iv, want, 12) == 0, "client iv");
+
+    TEST_REQUIRE(from_hex("45b95e15235d6f45a6b19cbcb0294ba9", want, sizeof want) == 16, "hp hex");
+    TEST_ASSERT(memcmp(hp, want, 16) == 0, "client hp");
+
+    TEST_CASE("A.3: and so do the server's");
+    TEST_ASSERT(quic_hkdf_expand_label(EVP_sha256(), server_secret, 32, v2->label_key,
+                                       NULL, 0, key, sizeof key), "key derived");
+    TEST_ASSERT(quic_hkdf_expand_label(EVP_sha256(), server_secret, 32, v2->label_iv,
+                                       NULL, 0, iv, sizeof iv), "iv derived");
+    TEST_ASSERT(quic_hkdf_expand_label(EVP_sha256(), server_secret, 32, v2->label_hp,
+                                       NULL, 0, hp, sizeof hp), "hp derived");
+
+    TEST_REQUIRE(from_hex("82db637861d55e1d011f19ea71d5d2a7", want, sizeof want) == 16, "key hex");
+    TEST_ASSERT(memcmp(key, want, 16) == 0, "server key");
+
+    TEST_REQUIRE(from_hex("dd13c276499c0249d3310652", want, 12) == 12, "iv hex");
+    TEST_ASSERT(memcmp(iv, want, 12) == 0, "server iv");
+
+    TEST_REQUIRE(from_hex("edf6d05c83121201b436e16877593c3a", want, sizeof want) == 16, "hp hex");
+    TEST_ASSERT(memcmp(hp, want, 16) == 0, "server hp");
+
+    TEST_CASE("the two versions do not derive the same material from the same id");
+    /* The control: without this, a build that quietly ignored the version
+     * parameter and used v1 everywhere would still pass every assertion above
+     * if the vectors themselves were wrong. */
+    uint8_t v1_client[32];
+    uint8_t v1_server[32];
+    TEST_REQUIRE(quiccrypto_initial_secrets(quicversion_find(QUIC_VERSION_1), &dcid,
+                                            v1_client, v1_server), "v1 secrets");
+    TEST_ASSERT(memcmp(v1_client, client_secret, 32) != 0, "client secrets differ");
+    TEST_ASSERT(memcmp(v1_server, server_secret, 32) != 0, "server secrets differ");
+}
+
 TEST(test_quic_crypto_initial_secrets) {
     TEST_SUITE("quic_crypto");
 
@@ -50,7 +133,7 @@ TEST(test_quic_crypto_initial_secrets) {
 
     uint8_t client_secret[32];
     uint8_t server_secret[32];
-    TEST_REQUIRE(quiccrypto_initial_secrets(&dcid, client_secret, server_secret),
+    TEST_REQUIRE(quiccrypto_initial_secrets(quicversion_find(QUIC_VERSION_1), &dcid, client_secret, server_secret),
                  "secrets derived");
 
     uint8_t expected[32];
@@ -108,12 +191,12 @@ TEST(test_quic_crypto_seal_vector) {
     TEST_REQUIRE(from_hex("8394c8f03e515708", dcid.data, sizeof dcid.data) == 8, "dcid");
 
     uint8_t client_secret[32], server_secret[32];
-    TEST_REQUIRE(quiccrypto_initial_secrets(&dcid, client_secret, server_secret),
+    TEST_REQUIRE(quiccrypto_initial_secrets(quicversion_find(QUIC_VERSION_1), &dcid, client_secret, server_secret),
                  "secrets");
 
     quickeys_t keys;
     memset(&keys, 0, sizeof keys);
-    TEST_REQUIRE(quickeys_install(&keys, QUIC_AEAD_AES_128_GCM, client_secret, 32),
+    TEST_REQUIRE(quickeys_install(quicversion_find(QUIC_VERSION_1), &keys, QUIC_AEAD_AES_128_GCM, client_secret, 32),
                  "keys installed");
 
     /* The unprotected header from A.2: Initial, version 1, dcid as above, no
@@ -206,7 +289,7 @@ TEST(test_quic_crypto_aead) {
     TEST_CASE("a tampered tag fails to open");
     quickeys_t keys;
     memset(&keys, 0, sizeof keys);
-    TEST_REQUIRE(quickeys_install(&keys, QUIC_AEAD_AES_128_GCM, secret, 32), "keys");
+    TEST_REQUIRE(quickeys_install(quicversion_find(QUIC_VERSION_1), &keys, QUIC_AEAD_AES_128_GCM, secret, 32), "keys");
 
     const uint8_t aad[] = { 0xc0, 0x01, 0x02, 0x03 };
     const uint8_t pt[] = "the quick brown fox";
@@ -257,7 +340,7 @@ TEST(test_quic_crypto_aead) {
         quickeys_t k;
         memset(&k, 0, sizeof k);
 
-        if (!quickeys_install(&k, suites[i], secret, 32)) { all_ok = 0; continue; }
+        if (!quickeys_install(quicversion_find(QUIC_VERSION_1), &k, suites[i], secret, 32)) { all_ok = 0; continue; }
 
         size_t n = 0;
         if (!quiccrypto_seal(&k, 1, aad, sizeof aad, pt, sizeof pt, ct, &n)) all_ok = 0;
@@ -285,12 +368,12 @@ TEST(test_quic_crypto_key_update) {
     memset(secret, 0x11, sizeof secret);
 
     uint8_t next[32];
-    TEST_REQUIRE(quiccrypto_next_secret(QUIC_AEAD_AES_128_GCM, secret, 32, next),
+    TEST_REQUIRE(quiccrypto_next_secret(quicversion_find(QUIC_VERSION_1), QUIC_AEAD_AES_128_GCM, secret, 32, next),
                  "derived");
     TEST_ASSERT(memcmp(secret, next, 32) != 0, "differs from the current secret");
 
     uint8_t again[32];
-    TEST_ASSERT(quiccrypto_next_secret(QUIC_AEAD_AES_128_GCM, secret, 32, again) &&
+    TEST_ASSERT(quiccrypto_next_secret(quicversion_find(QUIC_VERSION_1), QUIC_AEAD_AES_128_GCM, secret, 32, again) &&
                 memcmp(next, again, 32) == 0, "deterministic");
 
     TEST_CASE("a packet sealed in one phase does not open in the next");
@@ -298,8 +381,8 @@ TEST(test_quic_crypto_key_update) {
     quickeys_t new_keys;
     memset(&old_keys, 0, sizeof old_keys);
     memset(&new_keys, 0, sizeof new_keys);
-    TEST_REQUIRE(quickeys_install(&old_keys, QUIC_AEAD_AES_128_GCM, secret, 32), "old");
-    TEST_REQUIRE(quickeys_install(&new_keys, QUIC_AEAD_AES_128_GCM, next, 32), "new");
+    TEST_REQUIRE(quickeys_install(quicversion_find(QUIC_VERSION_1), &old_keys, QUIC_AEAD_AES_128_GCM, secret, 32), "old");
+    TEST_REQUIRE(quickeys_install(quicversion_find(QUIC_VERSION_1), &new_keys, QUIC_AEAD_AES_128_GCM, next, 32), "new");
 
     const uint8_t aad[] = { 0x40, 0x01 };
     const uint8_t pt[] = "phase";
@@ -344,7 +427,7 @@ TEST(test_quic_crypto_key_update) {
     TEST_CASE("stepping in place is the same as stepping into a fresh key set");
     quickeys_t inplace;
     memset(&inplace, 0, sizeof inplace);
-    TEST_REQUIRE(quickeys_install(&inplace, QUIC_AEAD_AES_128_GCM, secret, 32), "installed");
+    TEST_REQUIRE(quickeys_install(quicversion_find(QUIC_VERSION_1), &inplace, QUIC_AEAD_AES_128_GCM, secret, 32), "installed");
     TEST_REQUIRE(quickeys_next(&inplace, &inplace), "stepped in place");
 
     ct_len = 0;
@@ -380,7 +463,7 @@ TEST(test_quic_hp) {
     TEST_CASE("apply then remove is the identity");
     quickeys_t keys;
     memset(&keys, 0, sizeof keys);
-    TEST_REQUIRE(quickeys_install(&keys, QUIC_AEAD_AES_128_GCM, secret, 32), "keys");
+    TEST_REQUIRE(quickeys_install(quicversion_find(QUIC_VERSION_1), &keys, QUIC_AEAD_AES_128_GCM, secret, 32), "keys");
 
     uint8_t packet[64];
     memset(packet, 0xaa, sizeof packet);
@@ -451,7 +534,7 @@ TEST(test_quic_hp) {
      * nonce rather than a block to encrypt -- so it needs its own exercise. */
     quickeys_t chacha;
     memset(&chacha, 0, sizeof chacha);
-    TEST_REQUIRE(quickeys_install(&chacha, QUIC_AEAD_CHACHA20_POLY1305, secret, 32),
+    TEST_REQUIRE(quickeys_install(quicversion_find(QUIC_VERSION_1), &chacha, QUIC_AEAD_CHACHA20_POLY1305, secret, 32),
                  "keys");
 
     memset(packet, 0x5c, sizeof packet);

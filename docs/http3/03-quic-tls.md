@@ -201,7 +201,7 @@ server_initial_secret = HKDF-Expand-Label(initial_secret, "server in", "", 32)
 Retry-SCID). Хеш — SHA-256, шифр — AES-128-GCM, фиксированно.
 
 Соль версии — константа в `quiccrypto.c`, вынесенная в таблицу на случай
-добавления QUIC v2 (там своя соль).
+добавления QUIC v2 (там своя соль) — **сделано**, соль и метки берутся из `quicversion.h`.
 
 ### 3.3 Ключи уровня
 

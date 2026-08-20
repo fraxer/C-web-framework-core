@@ -117,6 +117,13 @@ typedef struct quicclient_rxstats {
 
 typedef struct quicclient {
     int fd;
+
+    /* The QUIC version this connection speaks. Set from quicclient_use_version
+     * at connect time -- a field rather than a global because the packet path
+     * reads it per packet, and a global rather than a connect argument because
+     * every one of the eight connect entry points would otherwise have to grow
+     * one. */
+    const quicversion_t* ver;
     /* Test-only scheduling point used by the soft-reload integration case. */
     int pause_after_request_ms;
     int pause_after_response_ms;
@@ -135,6 +142,18 @@ typedef struct quicclient {
      * derive from it, which is what lets a server decrypt a packet from a
      * client it has never heard of. */
     quiccid_t odcid;
+    /* The id the Initial keys were derived from -- odcid, or the Retry's SCID
+     * after one. Kept for the same reason the server keeps it: a version switch
+     * derives them again. */
+    quiccid_t initial_dcid;
+
+    /* Whether the packet that announced a version switch also carried CRYPTO.
+     * A server may not rely on it being read: the announcement is the Version
+     * field of a long header, and an implementation is within its rights to
+     * take that packet as the signal and nothing more (docs/http3/08 §17g).
+     * Reported so a test can hold the server to it. */
+    int switch_packet_carried_crypto;
+    int in_switch_packet;
     quiccid_t scid;          /* ours, what the server addresses us by */
     quiccid_t dcid;          /* the server's, once known */
 
@@ -489,6 +508,26 @@ typedef struct {
  * `datagram_len` is the size to pad to, which is the second half of what this
  * tests: at or above QUIC_MIN_INITIAL_DATAGRAM the server must answer, below it
  * the server must not. */
+/* Which version the *next* connect will speak. QUIC_VERSION_1 unless a test
+ * says otherwise, and it stays set until changed -- test-only, and the tests
+ * that use it are single-threaded by construction. */
+void quicclient_use_version(uint32_t version);
+
+/* The `available_versions` this client advertises in version_information
+ * (RFC 9368 §3), most preferred first. Empty by default -- a client that sends
+ * no version_information is a client that predates RFC 9368, and that is the
+ * case the server has to keep working for. The chosen version is added by the
+ * client if the caller left it out, because §3 makes it a MUST. */
+void quicclient_offer_versions(const uint32_t* versions, size_t count);
+
+/* Which version the connection ended up in. Differs from the requested one when
+ * the server performed compatible version negotiation. */
+uint32_t quicclient_version(const quicclient_t* client);
+
+/* Did the packet that announced the negotiated version also carry CRYPTO?
+ * 0 when no switch happened. */
+int quicclient_switch_packet_carried_crypto(const quicclient_t* client);
+
 int quicclient_probe_version(const char* host, uint16_t port, uint32_t version,
                              size_t datagram_len, int timeout_ms, int verbose,
                              quicvnprobe_t* out);

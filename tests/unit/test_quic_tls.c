@@ -2,6 +2,7 @@
 
 #include "quictls.h"
 #include "quicmemory.h"
+#include "quicversion.h"
 
 #include <string.h>
 
@@ -264,7 +265,7 @@ static int peer_install_secret(void* ctx, quic_enc_level_e level, quictls_dir_e 
 
     quickeys_t keys;
     memset(&keys, 0, sizeof keys);
-    if (!quickeys_install(&keys, suite, secret, len)) {
+    if (!quickeys_install(quicversion_find(QUIC_VERSION_1), &keys, suite, secret, len)) {
         p->keys_ok = 0;
         return 0;
     }

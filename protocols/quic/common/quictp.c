@@ -81,7 +81,7 @@ quictp_status_e quictp_decode(const uint8_t* buf, size_t len, int from_client,
 
         /* Unknown but not reserved: §18.1 says ignore it too. Only the
          * identifiers below carry meaning. */
-        if (id > QUICTP_RETRY_SCID) continue;
+        if (id > QUICTP_VERSION_INFORMATION) continue;
 
         const uint32_t bit = 1u << id;
         if (seen & bit) return QUICTP_ERR_DUPLICATE;
@@ -181,6 +181,28 @@ quictp_status_e quictp_decode(const uint8_t* buf, size_t len, int from_client,
             out->disable_active_migration = 1;
             break;
 
+        case QUICTP_VERSION_INFORMATION: {
+            /* RFC 9368 §3. A Chosen Version and then a list, all 32-bit and
+             * unprefixed, so the length is the only thing that says how many --
+             * and a length that is not a multiple of four, or has no room for
+             * the Chosen Version, is a parameter error rather than something to
+             * read as far as it goes. */
+            if (vlen < 4 || (vlen % 4) != 0) return QUICTP_ERR_VALUE;
+
+            out->chosen_version = ((uint32_t)value[0] << 24) | ((uint32_t)value[1] << 16) |
+                                  ((uint32_t)value[2] << 8) | (uint32_t)value[3];
+
+            out->available_count = 0;
+            for (size_t k = 4; k + 4 <= vlen &&
+                               out->available_count < QUICTP_MAX_AVAILABLE_VERSIONS; k += 4)
+                out->available_versions[out->available_count++] =
+                    ((uint32_t)value[k] << 24) | ((uint32_t)value[k + 1] << 16) |
+                    ((uint32_t)value[k + 2] << 8) | (uint32_t)value[k + 3];
+
+            out->has_version_information = 1;
+            break;
+        }
+
         case QUICTP_ACTIVE_CONNECTION_ID_LIMIT:
             st = __value_varint(value, vlen, &out->active_connection_id_limit);
             /* §18.2: below 2 the peer could not rotate connection ids at all. */
@@ -279,6 +301,31 @@ size_t quictp_encode(uint8_t* dst, size_t cap, const quictp_t* tp) {
 
     if (tp->has_retry_scid)
         PUT_BYTES(QUICTP_RETRY_SCID, tp->retry_scid.data, tp->retry_scid.len);
+
+    /* RFC 9368 §3: the version in use, then every version we would accept. The
+     * peer validates the first against the packets it is receiving, which is
+     * what makes a downgrade visible: an attacker who rewrote a Version
+     * Negotiation packet cannot rewrite this, because it is inside the
+     * handshake's encryption. */
+    if (tp->has_version_information) {
+        uint8_t value[4 + 4 * QUICTP_MAX_AVAILABLE_VERSIONS];
+        size_t n = 0;
+
+        value[n++] = (uint8_t)(tp->chosen_version >> 24);
+        value[n++] = (uint8_t)(tp->chosen_version >> 16);
+        value[n++] = (uint8_t)(tp->chosen_version >> 8);
+        value[n++] = (uint8_t)(tp->chosen_version);
+
+        for (size_t i = 0; i < tp->available_count &&
+                           i < QUICTP_MAX_AVAILABLE_VERSIONS; i++) {
+            value[n++] = (uint8_t)(tp->available_versions[i] >> 24);
+            value[n++] = (uint8_t)(tp->available_versions[i] >> 16);
+            value[n++] = (uint8_t)(tp->available_versions[i] >> 8);
+            value[n++] = (uint8_t)(tp->available_versions[i]);
+        }
+
+        PUT_BYTES(QUICTP_VERSION_INFORMATION, value, n);
+    }
 
     if (tp->has_stateless_reset_token)
         PUT_BYTES(QUICTP_STATELESS_RESET_TOKEN, tp->stateless_reset_token, 16);
