@@ -164,7 +164,7 @@ fi
 # to read the Version field of that packet and discard the rest -- picoquic
 # does, and its own server never puts anything there -- so a ServerHello riding
 # in it is a handshake that dies of idle timeout against a real client while
-# passing every test written against our own (docs/http3/08 §17g).
+# passing every test written against our own (docs/http3/08 §17f).
 if grep -q '^switch packet carried crypto: no$' "$WORK_DIR/compat.txt"; then
     printf 'ok: the packet announcing the switch carried no CRYPTO\n'
 else

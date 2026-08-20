@@ -27,8 +27,10 @@
 # first belongs with the rest of v2 in tests/h3_version_2.sh.
 #
 # What this cannot check is a client that then falls back to version 1 after
-# being told: a fallback needs a second version to fall back *from*, and that is
-# what the interop runner is for (docs/http3/08 §2).
+# being told: a fallback needs a second version to fall back *from*. That gap is
+# closed outside the gate -- `quiche`, whose default probe version is the
+# reserved 0xbabababa, takes the Version Negotiation packet this stage checks,
+# retries in v1 and collects the body (docs/http3/08 §17g).
 
 set -u -o pipefail
 

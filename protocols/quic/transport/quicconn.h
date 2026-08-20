@@ -227,7 +227,7 @@ typedef struct quicconn {
      * acknowledgement included, and its own server never puts anything in it.
      * So this server does not either: while the flag is clear the Initial
      * CRYPTO is held back, and the ServerHello goes in the packet after
-     * (docs/http3/08 §17g). One packet later on a switched connection, and
+     * (docs/http3/08 §17f). One packet later on a switched connection, and
      * nothing at all on a connection that never switches. */
     int ver_switch_announced;
 

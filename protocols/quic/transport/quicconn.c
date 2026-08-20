@@ -3170,7 +3170,7 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
      * exists to prevent, and it survived the first fix because our own client
      * sends a ClientHello that spans two packets -- so the server acknowledged
      * the first one, in the original version, before it had the parameters to
-     * switch on (docs/http3/08 §17g). */
+     * switch on (docs/http3/08 §17f). */
     if (level == QUIC_ENC_INITIAL && conn->ver != conn->ver_original)
         conn->ver_switch_announced = 1;
 

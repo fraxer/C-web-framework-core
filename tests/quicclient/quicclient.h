@@ -150,7 +150,7 @@ typedef struct quicclient {
     /* Whether the packet that announced a version switch also carried CRYPTO.
      * A server may not rely on it being read: the announcement is the Version
      * field of a long header, and an implementation is within its rights to
-     * take that packet as the signal and nothing more (docs/http3/08 §17g).
+     * take that packet as the signal and nothing more (docs/http3/08 §17f).
      * Reported so a test can hold the server to it. */
     int switch_packet_carried_crypto;
     int in_switch_packet;
