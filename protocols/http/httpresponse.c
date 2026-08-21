@@ -19,6 +19,8 @@
 #include "mimetype.h"
 #include "httpresponse.h"
 #include "httpresponseparser.h"
+#include "http_gzip_filter.h"
+#include "httpgzipcache.h"
 #include "storage.h"
 #include "view.h"
 #include "json.h"
@@ -168,6 +170,10 @@ static httpresponse_t* __httpresponse_create(connection_t* connection, http_chai
     response->last_modified = 0;
     response->client_gzip = 0;
     response->vary_encoding = 0;
+    response->gzip_precompressed = 0;
+    response->validator_mtime = 0;
+    response->validator_size = 0;
+    response->body_cache = NULL;
     response->connection = connection;
     response->send_data = __httpresponse_data;
     response->send_datan = __httpresponse_datan;
@@ -226,6 +232,16 @@ void __httpresponse_reset(httpresponse_t* response) {
     response->last_modified = 0;
     response->client_gzip = 0;
     response->vary_encoding = 0;
+    response->gzip_precompressed = 0;
+    response->validator_mtime = 0;
+    response->validator_size = 0;
+
+    /* Before bufo_clear below, which is what un-points the body from the cached
+     * bytes: the reference must outlive every reader of them. */
+    if (response->body_cache != NULL) {
+        http_gzip_cache_release(response->body_cache);
+        response->body_cache = NULL;
+    }
 
     filters_reset(response->filter);
     response->cur_filter = response->filter;
@@ -299,6 +315,155 @@ void __httpresponse_filen(httpresponse_t* response, const char* path, size_t len
     }
 
     http_response_file_opened(response, &file, file_full_path);
+}
+
+/* Set once per config load by http_policy_init() and read by every worker
+ * afterwards -- never written while a thread that reads it runs. */
+static int http_gzip_static = 0;
+
+/* Defaults for the compressed-representation cache: off, and when switched on,
+ * a per-file ceiling that keeps one large asset from evicting a whole tree of
+ * small ones. Both are bytes. */
+#define HTTP_GZIP_CACHE_DEFAULT_MAX_FILE (1024 * 1024)
+
+void http_policy_init(void) {
+    /* Off by default: it costs one open() per compressible response on a tree
+     * that has no ".gz" files at all, and it is the operator who knows whether
+     * the build writes them. */
+    http_gzip_static = env_get_bool("gzip_static", 0) ? 1 : 0;
+
+    /* Also off by default, and for a stronger reason: this one spends memory,
+     * and how much is a decision only the operator can make. */
+    long long total = env_get_llong("gzip_cache_size", 0);
+    if (total < 0) total = 0;
+
+    long long max_file = env_get_llong("gzip_cache_max_file", HTTP_GZIP_CACHE_DEFAULT_MAX_FILE);
+    if (max_file < 0) max_file = 0;
+    /* A ceiling above the budget cannot be honoured -- an entry that large
+     * would never fit -- so it is clamped rather than silently disappointing. */
+    if (total > 0 && max_file > total) max_file = total;
+
+    http_gzip_cache_configure((size_t)total, (size_t)max_file);
+}
+
+int http_gzip_static_enabled(void) {
+    return http_gzip_static;
+}
+
+/* Serve "<path>.gz" instead of compressing <path>, when the build left one
+ * there (nginx calls this gzip_static). docs/http2/10 §10.5, step 1: the same
+ * 92 KB asset costs 410 us of zlib per request otherwise, paid again for every
+ * request of a file that never changes.
+ *
+ * Called only once the response knows it *would* compress -- CE_GZIP is set,
+ * which means main.gzip lists the type and this client accepts gzip -- so a
+ * client that gets identity bytes never pays the extra open().
+ *
+ * The freshness rule is the one rule that matters: a ".gz" older than its
+ * source is a stale build artefact, and serving it hands out content that no
+ * longer exists. mtime is compared against the original, which is already open
+ * and already fstat()ed, so the check costs nothing beyond the open.
+ *
+ * Nothing here falls back loudly: every rejection just leaves the original in
+ * place and the gzip filter compresses as before. */
+static void __try_gzip_static(httpresponse_t* response, const char* file_full_path) {
+    if (!http_gzip_static) return;
+    if (response->content_encoding != CE_GZIP) return;
+    /* Below the threshold the gzip filter would not have compressed either, so
+     * a ".gz" here would change the representation of a file that is served
+     * identity today -- and its ETag with it. */
+    if (response->file_.size < HTTP_GZIP_MIN_SIZE) return;
+
+    char gz_path[PATH_MAX];
+    const size_t length = strlen(file_full_path);
+    if (length + 3 >= sizeof(gz_path)) return;
+
+    memcpy(gz_path, file_full_path, length);
+    memcpy(gz_path + length, ".gz", 4);
+
+    errno = 0;
+    file_t gz = file_open(gz_path, O_RDONLY | O_NONBLOCK);
+    if (!gz.ok) return;
+
+    /* A directory or a fifo named "<file>.gz" is not a representation of
+     * anything, and an empty one is not a gzip stream. */
+    if (!S_ISREG(gz.mode) || gz.size == 0 || gz.mtime < response->file_.mtime) {
+        gz.close(&gz);
+        return;
+    }
+
+    /* The header goes first, and the swap only if it stuck: the header is what
+     * tells the client these bytes are compressed, and a response that failed
+     * to add it must still be the original file rather than undecodable
+     * garbage. Doing it the other way round left the failure path with no
+     * original to fall back to. */
+    if (!response->add_headeru(response, "Content-Encoding", 16, "gzip", 4)) {
+        gz.close(&gz);
+        return;
+    }
+
+    response->file_.close(&response->file_);
+    response->file_ = gz;
+
+    /* Nothing is left for the gzip filter to do, and the length is known: the
+     * response goes out as an ordinary file with a Content-Length, not chunked.
+     * `vary_encoding` stays as main.gzip set it -- the type is still negotiable,
+     * so the answer still needs Vary. */
+    response->content_encoding = CE_NONE;
+    response->transfer_encoding = TE_NONE;
+    response->gzip_precompressed = 1;
+}
+
+/* Serve the gzip representation of this file from memory, compressing it once
+ * on the first request instead of once per request (docs/http2/10 §10.5,
+ * step 2). Runs only where __try_gzip_static found nothing: a ".gz" on disk is
+ * cheaper still, because it costs no memory at all.
+ *
+ * The bytes come straight out of the cache -- the body buffer becomes a proxy
+ * over them, not a copy -- so a hit costs one hash lookup and no allocation of
+ * body memory whatsoever. The reference is released when the response is reset
+ * or freed.
+ *
+ * The file is closed here: nothing will read it, and holding a descriptor for
+ * the length of the response is the one cost this path can avoid outright.
+ * Its validators were captured before the swap and stay behind, which is what
+ * lets the cached and the runtime-compressed answers share an ETag. */
+static void __try_gzip_cache(httpresponse_t* response, const char* file_full_path) {
+    if (!http_gzip_cache_enabled()) return;
+    if (response->content_encoding != CE_GZIP) return;
+    if (response->file_.fd < 0) return;
+    /* The same threshold the gzip filter applies: below it nothing is
+     * compressed, so there is no representation to cache. */
+    if (response->file_.size < HTTP_GZIP_MIN_SIZE) return;
+    if (response->file_.size > http_gzip_cache_max_file()) return;
+
+    http_gzip_cache_entry_t* entry =
+        http_gzip_cache_acquire(file_full_path, response->file_.fd,
+                                response->file_.mtime, response->file_.size);
+    if (entry == NULL) return;
+
+    if (!response->add_headeru(response, "Content-Encoding", 16, "gzip", 4)) {
+        /* Nothing has been touched yet: release the reference and let the gzip
+         * filter compress from the still-open file, as it always did. */
+        http_gzip_cache_release(entry);
+        return;
+    }
+
+    response->file_.close(&response->file_);
+
+    bufo_clear(&response->body);
+    response->body.data = (char*)http_gzip_cache_data(entry);
+    response->body.capacity = http_gzip_cache_data_size(entry);
+    response->body.size = http_gzip_cache_data_size(entry);
+    response->body.pos = 0;
+    /* Borrowed memory: the proxy flag is what stops bufo_clear from freeing
+     * bytes that belong to the cache. */
+    response->body.is_proxy = 1;
+
+    response->body_cache = entry;
+    response->content_encoding = CE_NONE;
+    response->transfer_encoding = TE_NONE;
+    response->gzip_precompressed = 1;
 }
 
 /* open() failed: say which HTTP outcome that is.
@@ -407,11 +572,23 @@ void http_response_file(httpresponse_t* response, const char* file_full_path) {
 void http_response_file_opened(httpresponse_t* response, file_t* file, const char* file_full_path) {
     response->file_ = *file;
 
+    /* Captured before anything can swap the representation: these describe the
+     * resource, and every compressed form of it revalidates against them. */
+    response->validator_mtime = file->mtime;
+    response->validator_size = file->size;
+
     const char* ext = file_extension(file_full_path);
     const char* mimetype = __httpresponse_get_mimetype(ext);
     const char* connection = __httpresponse_keepalive_enabled(response) ? "keep-alive" : "close";
     response->add_headeru(response, "Connection", 10, connection, strlen(connection));
     response->add_headeru(response, "Content-Type", 12, mimetype, strlen(mimetype));
+
+    /* After Content-Type, never before: adding it is what applies the main.gzip
+     * rules, and these ask whether they decided to compress. Disk first, memory
+     * second: a ".gz" already on disk costs neither RAM nor compression. */
+    __try_gzip_static(response, file_full_path);
+    if (!response->gzip_precompressed)
+        __try_gzip_cache(response, file_full_path);
 
     if (!__httpresponse_prepare_body(response, response->file_.size))
         response->send_default(response, 500);
@@ -429,6 +606,9 @@ void __httpresponse_filef(httpresponse_t* response, const char* storage_name, co
         response->send_default(response, 404);
         return;
     }
+
+    response->validator_mtime = response->file_.mtime;
+    response->validator_size = response->file_.size;
 
     const char* ext = file_extension(response->file_.name);
     const char* mimetype = __httpresponse_get_mimetype(ext);
@@ -988,6 +1168,20 @@ void httpresponse_redirect(httpresponse_t* response, const char* path, int statu
 }
 
 int __httpresponse_alloc_body(httpresponse_t* response, const char* data, size_t length) {
+    /* The body may be borrowed -- a proxy over bytes owned by the gzip cache --
+     * and bufo_alloc keeps a buffer that already has data, so appending here
+     * would write into the cache's memory. Whoever is building a body of their
+     * own (a handler answering after send_file, an error page) is replacing the
+     * representation, so the reference goes back and the claim that the body is
+     * compressed goes with it. */
+    if (response->body_cache != NULL) {
+        http_gzip_cache_release(response->body_cache);
+        response->body_cache = NULL;
+        bufo_clear(&response->body);   /* proxy: un-points, frees nothing */
+        response->gzip_precompressed = 0;
+        response->remove_header(response, "Content-Encoding");
+    }
+
     if (!bufo_alloc(&response->body, length + 1)) return 0; // +1 for \0 only for http client
     if (bufo_append(&response->body, data, length) < 0) return 0;
 
@@ -1074,6 +1268,15 @@ static int __accept_encoding_allows_gzip(const char* value, size_t length) {
     if (gzip_q >= 0) return gzip_q > 0;
 
     return star_q > 0;
+}
+
+void httpresponse_reuse(httpresponse_t* response) {
+    /* Re-snapshotted at the start of the exchange this object is about to
+     * serve, for the reason httpresponse_t::keepalive documents: the field
+     * answers "does the connection survive THIS response", and when the object
+     * was parked the request it is about to answer had not been read yet. */
+    const connection_t* conn = response->connection;
+    response->keepalive = conn != NULL && conn->keepalive ? 1 : 0;
 }
 
 void httpresponse_set_accept_encoding(httpresponse_t* response, const char* value, size_t length) {

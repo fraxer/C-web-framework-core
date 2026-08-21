@@ -74,10 +74,13 @@ int http_not_modified_header(httprequest_t* request, httpresponse_t* response) {
     if (module->base.cont)
         goto cont;
 
-    // Add Last-Modified header for files with mtime
-    if (response->file_.fd > -1 && response->file_.mtime > 0) {
+    // Add Last-Modified header for responses that carry a file's validators.
+    // The validators, not the open file: a compressed representation may have
+    // replaced the file (a ".gz" from disk) or dropped it entirely (a cached
+    // one), and all of them still describe the same resource.
+    if (response->validator_mtime > 0) {
         char last_modified[64];
-        if (http_format_date(response->file_.mtime, last_modified, sizeof(last_modified)) > 0) {
+        if (http_format_date(response->validator_mtime, last_modified, sizeof(last_modified)) > 0) {
             response->add_header(response, "Last-Modified", last_modified);
         }
 
@@ -92,12 +95,20 @@ int http_not_modified_header(httprequest_t* request, httpresponse_t* response) {
         // same generated value. The matching Vary: Accept-Encoding is added by
         // the gzip filter downstream, which emits it for every negotiable type
         // and not only for the requests that ended up compressed.
-        const int will_gzip = response->content_encoding != CE_NONE &&
-                              response->file_.size >= HTTP_GZIP_MIN_SIZE;
+        // A pre-compressed body short-circuits the prediction: those bytes ARE
+        // the compressed representation, so there is nothing left to predict —
+        // the ETag must carry the suffix or a revalidation of cached gzipped
+        // bytes would be answered with the identity validator. Every gzip form
+        // of the file — runtime, ".gz" on disk, cached — tags the same
+        // validator, because a weak ETag is exactly the claim that they are
+        // interchangeable (RFC 9110 §8.8.1).
+        const int will_gzip = response->gzip_precompressed ||
+                              (response->content_encoding != CE_NONE &&
+                               response->validator_size >= HTTP_GZIP_MIN_SIZE);
 
         // Generate and add ETag header
         char etag[64];
-        if (__generate_etag(response->file_.mtime, response->file_.size, will_gzip,
+        if (__generate_etag(response->validator_mtime, response->validator_size, will_gzip,
                             etag, sizeof(etag)) > 0) {
             response->add_header(response, "ETag", etag);
         }

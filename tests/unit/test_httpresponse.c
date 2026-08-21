@@ -37,6 +37,7 @@
 #include "helpers.h"
 #include "json.h"
 #include "file.h"
+#include "httpgzipcache.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -44,6 +45,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 // ============================================================================
 // Helpers
@@ -1107,4 +1109,327 @@ TEST(test_response_accept_encoding_wildcard) {
     TEST_ASSERT_EQUAL(0, accepts_gzip("*, gzip;q=0"), "gzip refused past an allowing wildcard");
     TEST_ASSERT_EQUAL(0, accepts_gzip("gzip;q=0, *"), "the same with the wildcard last");
     TEST_ASSERT_EQUAL(1, accepts_gzip("*;q=0, gzip"), "gzip allowed past a refusing wildcard");
+}
+
+// ============================================================================
+// gzip_static — a pre-compressed ".gz" next to a static file is served instead
+// of compressing the original (docs/http2/10 §10.5, step 1).
+// ============================================================================
+
+/* main.gzip decides which content types are negotiable; the file tests below
+ * serve extensionless names, so the mimetype falls back to "text/plain" and
+ * this one entry is what makes them compressible. */
+static env_gzip_str_t gzip_static_type = { .mimetype = "text/plain", .next = NULL };
+
+typedef struct {
+    char root[64];
+    char path[PATH_MAX];
+    char gz_path[PATH_MAX];
+    connection_t* conn;
+    httpresponse_t* response;
+    env_gzip_str_t* saved_gzip;
+    json_doc_t* saved_store;
+} gzip_static_fixture_t;
+
+/* 1200 bytes: above HTTP_GZIP_MIN_SIZE, so the response is one the gzip filter
+ * would have compressed. Below it nothing negotiates and the ".gz" must be
+ * ignored — which is its own case. */
+static char* repeat_bytes(size_t length) {
+    char* data = malloc(length + 1);
+    if (data == NULL) return NULL;
+
+    memset(data, 'a', length);
+    data[length] = 0;
+
+    return data;
+}
+
+/* Push mtime back by `seconds`: a ".gz" older than its source is a stale build
+ * artefact and must not be served. utimes() rather than a sleep, so the case
+ * costs nothing. */
+static int set_mtime_offset(const char* path, int seconds) {
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+
+    struct timeval times[2];
+    times[0].tv_sec = st.st_atime; times[0].tv_usec = 0;
+    times[1].tv_sec = st.st_mtime + seconds; times[1].tv_usec = 0;
+
+    return utimes(path, times) == 0;
+}
+
+static void gzip_static_policy_set(gzip_static_fixture_t* fx, int enabled) {
+    appconfig_t* config = appconfig();
+
+    json_doc_t* store = json_root_create_object();
+    if (store == NULL) return;
+
+    json_token_t* value = json_create_bool(enabled);
+    if (value == NULL || !json_object_set(json_root(store), "gzip_static", value)) {
+        json_free(store);
+        return;
+    }
+
+    if (fx->saved_store == NULL)
+        fx->saved_store = config->env.custom_store;
+
+    config->env.custom_store = store;
+    http_policy_init();
+}
+
+static int gzip_static_setup(gzip_static_fixture_t* fx, size_t body_size, int enabled) {
+    memset(fx, 0, sizeof(*fx));
+
+    snprintf(fx->root, sizeof(fx->root), "/tmp/cwfr_gzipstatic_XXXXXX");
+    if (mkdtemp(fx->root) == NULL) return 0;
+
+    snprintf(fx->path, sizeof(fx->path), "%s/asset", fx->root);
+    snprintf(fx->gz_path, sizeof(fx->gz_path), "%s/asset.gz", fx->root);
+
+    char* body = repeat_bytes(body_size);
+    if (body == NULL) return 0;
+
+    const int written = write_whole_file(fx->path, body);
+    free(body);
+    if (!written) return 0;
+
+    fx->saved_gzip = env()->main.gzip;
+    env()->main.gzip = &gzip_static_type;
+
+    gzip_static_policy_set(fx, enabled);
+
+    fx->response = make_response(&fx->conn);
+    if (fx->response == NULL) return 0;
+
+    /* What the request said it would accept: without this the response never
+     * reaches CE_GZIP and the ".gz" is never looked for. */
+    httpresponse_set_accept_encoding(fx->response, "gzip", 4);
+
+    return 1;
+}
+
+/* The compressed twin. `mtime_offset` is applied to it relative to the
+ * original: 0 = same second (fresh), negative = stale. */
+static int gzip_static_write_gz(gzip_static_fixture_t* fx, const char* content, int mtime_offset) {
+    if (!write_whole_file(fx->gz_path, content)) return 0;
+    if (mtime_offset == 0) return 1;
+
+    return set_mtime_offset(fx->gz_path, mtime_offset);
+}
+
+static void gzip_static_teardown(gzip_static_fixture_t* fx) {
+    if (fx->response != NULL) {
+        fx->response->file_.close(&fx->response->file_);
+        free_response(fx->response, fx->conn);
+    }
+    else
+        free(fx->conn);
+
+    env()->main.gzip = fx->saved_gzip;
+
+    appconfig_t* config = appconfig();
+    if (config->env.custom_store != NULL && config->env.custom_store != fx->saved_store) {
+        json_free(config->env.custom_store);
+        config->env.custom_store = fx->saved_store;
+        http_policy_init();
+    }
+
+    unlink(fx->gz_path);
+    unlink(fx->path);
+    rmdir(fx->root);
+}
+
+/* Open the original the way the resolver does and hand it to the response. */
+static int gzip_static_serve(gzip_static_fixture_t* fx) {
+    file_t file = file_open(fx->path, O_RDONLY | O_NONBLOCK);
+    if (!file.ok) return 0;
+
+    http_response_file_opened(fx->response, &file, fx->path);
+
+    return 1;
+}
+
+TEST(test_gzip_static_serves_precompressed_twin) {
+    TEST_SUITE("httpresponse: gzip_static");
+    TEST_CASE("a fresh .gz is served in place of compressing the original");
+
+    gzip_static_fixture_t fx;
+    TEST_REQUIRE(gzip_static_setup(&fx, 1200, 1), "fixture created");
+    TEST_REQUIRE_GOTO(gzip_static_write_gz(&fx, "pretend-gzip-bytes", 0), ".gz written", cleanup);
+    TEST_REQUIRE_GOTO(gzip_static_serve(&fx), "original opened and served", cleanup);
+
+    TEST_ASSERT_EQUAL(1, (int)fx.response->gzip_precompressed, "the response says it carries the compressed twin");
+    TEST_ASSERT_EQUAL_SIZE(18, fx.response->file_.size, "the open file is the .gz, not the original");
+
+    http_header_t* encoding = fx.response->get_header(fx.response, "Content-Encoding");
+    TEST_REQUIRE_NOT_NULL_GOTO(encoding, "Content-Encoding is set", cleanup);
+    TEST_ASSERT_STR_EQUAL("gzip", encoding->value, "and it names gzip");
+
+    /* Nothing is left to compress and the length is known: the body goes out as
+     * an ordinary file, not chunked through the gzip filter. */
+    TEST_ASSERT_EQUAL(CE_NONE, fx.response->content_encoding, "the gzip filter has nothing to do");
+    TEST_ASSERT_EQUAL(TE_NONE, fx.response->transfer_encoding, "and the response is not chunked");
+
+    /* The type is still negotiable, so the answer still varies by the request
+     * field — the gzip filter reads this to emit Vary. */
+    TEST_ASSERT_EQUAL(1, (int)fx.response->vary_encoding, "the response still varies on Accept-Encoding");
+
+    http_header_t* type = fx.response->get_header(fx.response, "Content-Type");
+    TEST_REQUIRE_NOT_NULL_GOTO(type, "Content-Type is set", cleanup);
+    TEST_ASSERT_STR_EQUAL("text/plain", type->value, "and describes the original, not the .gz");
+
+    cleanup:
+    gzip_static_teardown(&fx);
+}
+
+TEST(test_gzip_static_ignores_stale_twin) {
+    TEST_SUITE("httpresponse: gzip_static");
+    TEST_CASE("a .gz older than its source is a stale build artefact");
+
+    gzip_static_fixture_t fx;
+    TEST_REQUIRE(gzip_static_setup(&fx, 1200, 1), "fixture created");
+    TEST_REQUIRE_GOTO(gzip_static_write_gz(&fx, "stale-bytes", -60), "stale .gz written", cleanup);
+    TEST_REQUIRE_GOTO(gzip_static_serve(&fx), "original opened and served", cleanup);
+
+    TEST_ASSERT_EQUAL(0, (int)fx.response->gzip_precompressed, "the stale twin is refused");
+    TEST_ASSERT_EQUAL_SIZE(1200, fx.response->file_.size, "the original is still the open file");
+    TEST_ASSERT_NULL(fx.response->get_header(fx.response, "Content-Encoding"),
+                     "and nothing claims the body is compressed");
+    TEST_ASSERT_EQUAL(CE_GZIP, fx.response->content_encoding, "the gzip filter compresses as before");
+
+    cleanup:
+    gzip_static_teardown(&fx);
+}
+
+TEST(test_gzip_static_without_twin_compresses_as_before) {
+    TEST_SUITE("httpresponse: gzip_static");
+    TEST_CASE("no .gz on disk leaves the runtime path untouched");
+
+    gzip_static_fixture_t fx;
+    TEST_REQUIRE(gzip_static_setup(&fx, 1200, 1), "fixture created");
+    TEST_REQUIRE_GOTO(gzip_static_serve(&fx), "original opened and served", cleanup);
+
+    TEST_ASSERT_EQUAL(0, (int)fx.response->gzip_precompressed, "nothing was swapped in");
+    TEST_ASSERT_EQUAL(CE_GZIP, fx.response->content_encoding, "the gzip filter still compresses");
+    TEST_ASSERT_EQUAL_SIZE(1200, fx.response->file_.size, "the original is the open file");
+
+    cleanup:
+    gzip_static_teardown(&fx);
+}
+
+TEST(test_gzip_static_off_by_default) {
+    TEST_SUITE("httpresponse: gzip_static");
+    TEST_CASE("with the setting off the .gz is not even looked for");
+
+    gzip_static_fixture_t fx;
+    TEST_REQUIRE(gzip_static_setup(&fx, 1200, 0), "fixture created");
+    TEST_ASSERT_EQUAL(0, http_gzip_static_enabled(), "the policy is off");
+
+    TEST_REQUIRE_GOTO(gzip_static_write_gz(&fx, "pretend-gzip-bytes", 0), ".gz written", cleanup);
+    TEST_REQUIRE_GOTO(gzip_static_serve(&fx), "original opened and served", cleanup);
+
+    TEST_ASSERT_EQUAL(0, (int)fx.response->gzip_precompressed, "the twin is ignored");
+    TEST_ASSERT_EQUAL_SIZE(1200, fx.response->file_.size, "the original is the open file");
+
+    cleanup:
+    gzip_static_teardown(&fx);
+}
+
+TEST(test_gzip_static_identity_client_gets_the_original) {
+    TEST_SUITE("httpresponse: gzip_static");
+    TEST_CASE("a client that did not accept gzip pays neither the swap nor the open");
+
+    gzip_static_fixture_t fx;
+    TEST_REQUIRE(gzip_static_setup(&fx, 1200, 1), "fixture created");
+
+    /* The whole negotiation in one field: no gzip accepted, so main.gzip marks
+     * the type negotiable (Vary) but nothing is compressed and no twin is
+     * looked for. */
+    httpresponse_set_accept_encoding(fx.response, "identity", 8);
+
+    TEST_REQUIRE_GOTO(gzip_static_write_gz(&fx, "pretend-gzip-bytes", 0), ".gz written", cleanup);
+    TEST_REQUIRE_GOTO(gzip_static_serve(&fx), "original opened and served", cleanup);
+
+    TEST_ASSERT_EQUAL(0, (int)fx.response->gzip_precompressed, "no swap for an identity client");
+    TEST_ASSERT_EQUAL_SIZE(1200, fx.response->file_.size, "the original is the open file");
+    TEST_ASSERT_EQUAL(1, (int)fx.response->vary_encoding, "the type is still negotiable");
+    TEST_ASSERT_NULL(fx.response->get_header(fx.response, "Content-Encoding"),
+                     "and the answer does not claim gzip");
+
+    cleanup:
+    gzip_static_teardown(&fx);
+}
+
+TEST(test_gzip_static_small_file_keeps_identity) {
+    TEST_SUITE("httpresponse: gzip_static");
+    TEST_CASE("below the gzip minimum the .gz is ignored, as the filter would");
+
+    gzip_static_fixture_t fx;
+    TEST_REQUIRE(gzip_static_setup(&fx, 512, 1), "fixture created");
+    TEST_REQUIRE_GOTO(gzip_static_write_gz(&fx, "pretend-gzip-bytes", 0), ".gz written", cleanup);
+    TEST_REQUIRE_GOTO(gzip_static_serve(&fx), "original opened and served", cleanup);
+
+    /* The gzip filter leaves bodies under HTTP_GZIP_MIN_SIZE alone. Serving the
+     * twin here would compress a response that is identity today and change its
+     * ETag with it. */
+    TEST_ASSERT_EQUAL(0, (int)fx.response->gzip_precompressed, "small files keep the original");
+    TEST_ASSERT_EQUAL_SIZE(512, fx.response->file_.size, "the original is the open file");
+
+    cleanup:
+    gzip_static_teardown(&fx);
+}
+
+TEST(test_gzip_static_rejects_non_regular_twin) {
+    TEST_SUITE("httpresponse: gzip_static");
+    TEST_CASE("a directory named <file>.gz is not a representation");
+
+    gzip_static_fixture_t fx;
+    TEST_REQUIRE(gzip_static_setup(&fx, 1200, 1), "fixture created");
+    TEST_REQUIRE_GOTO(mkdir(fx.gz_path, 0755) == 0, "<file>.gz directory created", cleanup);
+    TEST_REQUIRE_GOTO(gzip_static_serve(&fx), "original opened and served", cleanup);
+
+    TEST_ASSERT_EQUAL(0, (int)fx.response->gzip_precompressed, "the directory is refused");
+    TEST_ASSERT_EQUAL_SIZE(1200, fx.response->file_.size, "the original is the open file");
+
+    rmdir(fx.gz_path);
+
+    cleanup:
+    gzip_static_teardown(&fx);
+}
+
+// ============================================================================
+// A borrowed body — the gzip cache's bytes, served without a copy — must be let
+// go the moment anything builds a body of its own on the same response.
+// ============================================================================
+
+TEST(test_gzip_cache_body_is_released_when_overwritten) {
+    TEST_SUITE("httpresponse: gzip cache");
+    TEST_CASE("writing a new body drops the cached representation instead of scribbling on it");
+
+    gzip_static_fixture_t fx;
+    /* The fixture's setting is gzip_static; this case wants the memory cache,
+     * so it is configured directly. */
+    TEST_REQUIRE(gzip_static_setup(&fx, 4096, 0), "fixture created");
+    http_gzip_cache_configure(1024 * 1024, 512 * 1024);
+
+    TEST_REQUIRE_GOTO(gzip_static_serve(&fx), "file served", cleanup);
+    TEST_REQUIRE_GOTO(fx.response->gzip_precompressed == 1, "the body came from the cache", cleanup);
+    TEST_REQUIRE_NOT_NULL_GOTO(fx.response->body_cache, "and holds a reference to it", cleanup);
+    TEST_ASSERT_EQUAL_SIZE(1, http_gzip_cache_count(), "one entry is published");
+
+    /* What a handler answering after send_file does, and what an error page
+     * does: replace the representation. Without the release below this appends
+     * into memory the cache owns. */
+    fx.response->send_datan(fx.response, "replaced", 8);
+
+    TEST_ASSERT_NULL(fx.response->body_cache, "the reference went back");
+    TEST_ASSERT_EQUAL(0, (int)fx.response->gzip_precompressed, "and the response no longer claims gzip");
+    TEST_ASSERT_NULL(fx.response->get_header(fx.response, "Content-Encoding"),
+                     "nor carries the header that claimed it");
+    TEST_ASSERT_EQUAL_SIZE(8, fx.response->body.size, "the new body is the one that is served");
+    TEST_ASSERT(memcmp(fx.response->body.data, "replaced", 8) == 0, "and it is the caller's bytes");
+
+    cleanup:
+    gzip_static_teardown(&fx);
+    http_gzip_cache_configure(0, 0);
 }

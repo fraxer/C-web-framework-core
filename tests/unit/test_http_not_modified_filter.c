@@ -186,13 +186,17 @@ static int run_body(nm_fixture_t* fx, bufo_t* parent) {
     return fx->nm->handler_body(fx->request, fx->response, parent);
 }
 
-/* Arm the file path: a non-null fd with a positive mtime makes __header emit
- * Last-Modified + ETag. Use fd 0 (>= 0, satisfies > -1) but neutralize it in
- * teardown so nothing is actually closed. */
+/* Arm the file path the way http_response_file_opened does: the validators are
+ * what __header emits Last-Modified and ETag from, and they describe the
+ * resource rather than whatever bytes end up on the wire. The open file is set
+ * alongside them because the filters downstream read the body from it; fd 0
+ * (>= 0, satisfies > -1) is neutralized in teardown so nothing is closed. */
 static void arm_file(nm_fixture_t* fx, time_t mtime, size_t size) {
     fx->response->file_.fd = 0;
     fx->response->file_.mtime = mtime;
     fx->response->file_.size = size;
+    fx->response->validator_mtime = mtime;
+    fx->response->validator_size = size;
 }
 
 static int header_count(httpresponse_t* response, const char* key) {
@@ -362,6 +366,7 @@ TEST(test_nm_header_file_zero_mtime_adds_nothing) {
 
     fx.response->file_.fd = 0;   /* file path armed, but mtime unknown */
     fx.response->file_.size = TEST_SIZE;
+    fx.response->validator_size = TEST_SIZE;
 
     const int r = run_header(&fx);
     TEST_ASSERT_EQUAL(CWF_OK, r, "header chain should finish with CWF_OK");
@@ -387,6 +392,7 @@ TEST(test_nm_header_distinct_etags_per_version) {
 
     /* Different size on a second response -> different ETag string. */
     fx.response->file_.size = TEST_SIZE + 1;
+    fx.response->validator_size = TEST_SIZE + 1;
     /* Re-add would duplicate; remove first to inspect the fresh value cleanly. */
     fx.response->remove_header(fx.response, "ETag");
     char etag_buf[64];

@@ -40,15 +40,54 @@ static int __is_multiplexed(const connection_t* connection) {
     return ctx->is_http2 || __is_http3(connection);
 }
 
+/* A finished HTTP/1.1 response, parked for the next request on this connection
+ * rather than freed (docs/http2/10 §10.2). Installed as ctx->response_retire by
+ * __create_response, and called by the connection layer when it retires the
+ * response -- which is the only place that knows the exchange is over.
+ *
+ * The reset happens here, not on the way out: it closes the served file and
+ * releases the payload, and holding a descriptor open until the next request
+ * would be a leak in everything but name. */
+static void __retire_response(void* arg_ctx, void* arg_response) {
+    connection_server_ctx_t* ctx = arg_ctx;
+    httpresponse_t* response = arg_response;
+
+    /* One is all a connection can use: HTTP/1.1 answers one request at a time,
+     * and a pipeline that got ahead of the writer simply builds a fresh object,
+     * as it did before. */
+    if (ctx->response_cache != NULL) {
+        httpresponse_free(response);
+        return;
+    }
+
+    response->base.reset(response);
+    ctx->response_cache = response;
+}
+
 /* The response carries its protocol's filter chain, so which one is created is
  * the same decision as which terminal write stage will run. */
 static httpresponse_t* __create_response(connection_t* connection) {
-    const connection_server_ctx_t* ctx = connection->ctx;
+    connection_server_ctx_t* ctx = connection->ctx;
 
     if (ctx->is_http2) return httpresponse_create_h2(connection);
 #ifdef CWFR_HTTP3
     if (__is_http3(connection)) return httpresponse_create_h3(connection);
 #endif
+
+    /* Whichever way the object is obtained, this connection now retires its
+     * responses into the cache. */
+    ctx->response_retire = __retire_response;
+
+    httpresponse_t* recycled = ctx->response_cache;
+    if (recycled != NULL) {
+        ctx->response_cache = NULL;
+        /* Everything else was cleared when it was parked; keep-alive is the one
+         * thing that could not be, because it belongs to the request being
+         * answered and that request did not exist yet. */
+        httpresponse_reuse(recycled);
+
+        return recycled;
+    }
 
     return httpresponse_create(connection);
 }

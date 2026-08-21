@@ -517,6 +517,8 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
     ctx->server = NULL;
     ctx->request = NULL;
     ctx->response = NULL;
+    ctx->response_cache = NULL;
+    ctx->response_retire = NULL;
     ctx->queue = cqueue_create();
     ctx->broadcast_queue = cqueue_create();
     ctx->write_queue = cqueue_create();
@@ -565,11 +567,33 @@ void __ctx_reset(void* arg) {
             ctx->request = NULL;
         }
     }
+    else {
+        /* The connection is becoming something else -- WebSocket, or HTTP/2 over
+         * an h2c upgrade -- and the response that will sit here next belongs to
+         * that protocol. Whoever installed the recycling hook spoke for HTTP/1.1
+         * only, so it stops applying here, at the one moment the switch is
+         * still ahead of us. */
+        ctx->response_retire = NULL;
+
+        /* And whatever HTTP/1.1 already parked there will never be asked for
+         * again: nothing on the new protocol reads this. Freeing it now rather
+         * than at teardown keeps a long-lived WebSocket connection from holding
+         * an idle response object for its whole life. */
+        response_t* cached = ctx->response_cache;
+        if (cached != NULL) {
+            cached->free(cached);
+            ctx->response_cache = NULL;
+        }
+    }
 
     response_t* response = ctx->response;
     if (response != NULL) {
-        response->free(response);
         ctx->response = NULL;
+
+        if (ctx->response_retire != NULL)
+            ctx->response_retire(ctx, response);
+        else
+            response->free(response);
     }
 }
 
@@ -613,6 +637,12 @@ void __ctx_free(void* arg) {
     if (response != NULL) {
         response->free(response);
         ctx->response = NULL;
+    }
+
+    response_t* cached = ctx->response_cache;
+    if (cached != NULL) {
+        cached->free(cached);
+        ctx->response_cache = NULL;
     }
 
     /* Last, so the transport's teardown can still reach anything above. It

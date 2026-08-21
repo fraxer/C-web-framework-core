@@ -56,6 +56,27 @@ typedef struct {
     server_t* server;
     void* request;
     void* response;
+    /* One finished HTTP/1.1 response object, reset and kept for the next request
+     * on this connection instead of being freed and built again -- the response
+     * carries an arena, a parser and a chain of six filters (one of them a zlib
+     * stream), so rebuilding it per request was the largest remaining block of
+     * allocations on a keep-alive connection (docs/http2/10 §10.2).
+     *
+     * Filled and emptied by the worker only: both the read path that creates a
+     * response and the write path that retires one run there, and a connection
+     * belongs to a single worker. Never used by a multiplexed protocol, where a
+     * response belongs to its stream and several are in flight at once.
+     *
+     * Owned here: whatever is still parked in it is freed with the ctx. */
+    void* response_cache;
+    /* What to do with a finished response instead of freeing it. NULL means
+     * free; the HTTP/1.1 path installs a hook that parks it in response_cache.
+     * Cleared the moment the connection switches protocol, so a WebSocket or
+     * HTTP/2 response can never land in a cache the HTTP/1.1 path reads from.
+     *
+     * Void pointers rather than the real types: this header is the connection
+     * layer and knows nothing about either protocol's response. */
+    void (*response_retire)(void* ctx, void* response);
     cqueue_t* queue;
     cqueue_t* broadcast_queue;
     /* Ordered output slots (connection_out_slot_t*), WebSocket only. HTTP/1.1
