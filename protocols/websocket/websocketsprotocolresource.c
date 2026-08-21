@@ -89,7 +89,12 @@ int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t
     for (route_t* route = ctx->server->websockets.route; route; route = route->next) {
         ratelimiter_t* ratelimiter = __ratelimiter_find(&ctx->server->websockets, route);
 
-        if (route->is_primitive && route_compare_primitive(route, protocol->path, protocol->path_length)) {
+        /* Same shortcut as the HTTP dispatcher: a primitive location that did
+         * not compare equal cannot match its own pattern either. */
+        if (route->is_primitive) {
+            if (!route_compare_primitive(route, protocol->path, protocol->path_length))
+                continue;
+
             if (route->handler[protocol->method] == NULL) continue;
 
             if (!websockets_deferred_handler(connection, request, websockets_queue_request_handler, route->handler[protocol->method], websockets_queue_data_request_create, ratelimiter))

@@ -410,3 +410,106 @@ TEST(test_route_multiple_routes_free) {
     cleanup:
     routes_free(a);
 }
+
+// ============================================================================
+// The primitive shortcut — the dispatcher answers a primitive location with
+// route_compare_primitive alone and never runs its pattern. That is only sound
+// while the two agree, so what decides `is_primitive` is exactly "does the
+// pattern mean anything beyond this string".
+// ============================================================================
+
+/* The compiled pattern, asked directly. */
+static int route_pattern_matches(route_t* route, const char* path) {
+    int ovector[30];
+    return pcre_exec(route->location, NULL, path, (int)strlen(path), 0, 0, ovector, 30) >= 0;
+}
+
+TEST(test_route_primitive_flag_excludes_metacharacters) {
+    TEST_CASE("a location PCRE reads as more than itself is not primitive");
+
+    static const struct { const char* location; int primitive; } cases[] = {
+        {"/health", 1},
+        {"/api/v1/items", 1},
+        {"/a-b_c~d", 1},
+        /* REGRESSION: '.' and '?' were not counted, so "/api/v1.0" was called
+         * primitive while its pattern also matched "/api/v1x0" — the shortcut
+         * and the pattern disagreed on exactly those paths. */
+        {"/api/v1.0", 0},
+        {"/maybe?", 0},
+        {"/back\\slash", 0},
+        {"/wild*", 0},
+        {"/either|or", 0},
+        {"/group(a)", 0},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        route_t* r = route_create(cases[i].location);
+        TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
+
+        TEST_ASSERT_EQUAL(cases[i].primitive, r->is_primitive, cases[i].location);
+
+        routes_free(r);
+    }
+}
+
+TEST(test_route_primitive_shortcut_agrees_with_pattern) {
+    TEST_CASE("for a primitive location the comparison and the pattern answer identically");
+
+    static const char* locations[] = {
+        "/health", "/api/v1/items", "/", "/a-b_c~d",
+    };
+
+    static const char* paths[] = {
+        "/health", "/healtz", "/health/", "/api/v1/items", "/api/v1/items/2",
+        "/", "/a-b_c~d", "/a-b_c~dx", "", "/HEALTH",
+    };
+
+    for (size_t i = 0; i < sizeof(locations) / sizeof(locations[0]); i++) {
+        route_t* r = route_create(locations[i]);
+        TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
+        TEST_REQUIRE(r->is_primitive == 1, "the location under test is primitive");
+
+        for (size_t j = 0; j < sizeof(paths) / sizeof(paths[0]); j++) {
+            const int shortcut = route_compare_primitive(r, paths[j], strlen(paths[j]));
+            if (shortcut != route_pattern_matches(r, paths[j])) {
+                TEST_FAIL("the primitive shortcut disagreed with the pattern");
+                break;
+            }
+        }
+
+        routes_free(r);
+    }
+
+    TEST_ASSERT(1, "shortcut and pattern agree on every location/path pair");
+}
+
+TEST(test_route_dotted_location_still_matches_as_a_pattern) {
+    TEST_CASE("a location with a dot keeps its old regex behaviour, it just loses the shortcut");
+
+    route_t* r = route_create("/api/v1.0");
+    TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
+
+    TEST_ASSERT_EQUAL(0, r->is_primitive, "not eligible for the shortcut");
+    /* Unchanged on purpose: the dot is still a regex any-char here, as it has
+     * always been. Making it literal would be a change of routing behaviour and
+     * belongs to its own decision, not to a performance shortcut. */
+    TEST_ASSERT(route_pattern_matches(r, "/api/v1.0"), "the literal path matches");
+    TEST_ASSERT(route_pattern_matches(r, "/api/v1x0"), "and so does any-char, as before");
+
+    routes_free(r);
+}
+
+TEST(test_route_dot_with_named_param_is_still_allowed) {
+    TEST_CASE("'.' next to a named param is an ordinary route, not a regex/params clash");
+
+    /* The dot must not be counted as "regex symbols", or this route — a
+     * perfectly ordinary one — would be refused at config load. */
+    route_t* r = route_create("/files/{name|[a-z]+}.json");
+    TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
+
+    TEST_ASSERT_EQUAL(0, r->is_primitive, "a param makes it non-primitive anyway");
+    TEST_ASSERT_EQUAL(1, r->params_count, "the param is still parsed");
+    TEST_ASSERT(route_pattern_matches(r, "/files/report.json"), "and the route matches");
+
+    routes_free(r);
+}

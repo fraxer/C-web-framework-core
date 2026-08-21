@@ -735,7 +735,17 @@ int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
         ratelimiter_t* ratelimiter = __ratelimiter_find(&ctx->server->http, route);
         int queued = 0;
 
-        if (route->is_primitive && route_compare_primitive(route, request->path, request->path_length)) {
+        /* A primitive location is answered by the comparison alone, whichever
+         * way it goes. Its pattern is the same string anchored at both ends
+         * (route_parse_location clears `is_primitive` for anything PCRE reads as
+         * more than itself), so running it after a miss asks the same question
+         * a second time and pays a pcre_exec for the answer it already has.
+         * With a handful of routes on the server that was the top line of the
+         * profile -- 5.4% of the worker, all of it in libpcre. */
+        if (route->is_primitive) {
+            if (!route_compare_primitive(route, request->path, request->path_length))
+                continue;
+
             switch (__route_dispatch(connection, request, response, route, NULL, ratelimiter, &queued)) {
             case ROUTE_DISPATCH_ERROR: return 0;
             case ROUTE_DISPATCH_DONE: return queued;
@@ -1270,8 +1280,7 @@ int __sni_callback(SSL* ssl, int* ad, void* arg) {
 
         if (ipaddr_equal(&server->ip, &listener_connection->ip) && server->port == listener_connection->port) {
             for (domain_t* domain = server->domain; domain; domain = domain->next) {
-                int matches_count = pcre_exec(domain->pcre_template, NULL, ascii_server_name, server_name_length, 0, 0, vector, vector_size);
-                if (matches_count > 0) {
+                if (domain_matches(domain, ascii_server_name, server_name_length)) {
                     /* Which of the vhost's two contexts depends on the
                      * transport, and getting it wrong is not cosmetic: the TCP
                      * context offers `h2` in ALPN and a ciphersuite list that
