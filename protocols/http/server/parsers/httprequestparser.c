@@ -619,10 +619,8 @@ void httpparser_append_query(httprequest_t* request, query_t* query) {
 }
 
 int __server_matches_host(server_t* server, const char* host, size_t host_length) {
-    int vector[PCRE_VECTOR_SIZE];
-
     for (domain_t* domain = server->domain; domain; domain = domain->next) {
-        if (pcre_exec(domain->pcre_template, NULL, host, host_length, 0, 0, vector, PCRE_VECTOR_SIZE) > 0)
+        if (domain_matches(domain, host, host_length))
             return 1;
     }
 

@@ -22,12 +22,52 @@ void domain_parser_insert_symbol(domain_parser_t* parser);
 
 void domain_parser_insert_custom_symbol(domain_parser_t* parser, char ch);
 
+/* Whether the template means only itself. Everything PCRE treats as a
+ * metacharacter disqualifies it, with one exception: '.' is escaped by
+ * domain_parse, so a dotted name stays literal -- which is what makes the
+ * shortcut worth having, since every real domain has dots and nothing else. */
+static int __template_is_literal(const char* template) {
+    for (const char* p = template; *p != 0; p++) {
+        switch (*p) {
+        case '^': case '$': case '*': case '+': case '?':
+        case '(': case ')': case '[': case ']':
+        case '{': case '}': case '|': case '\\':
+            return 0;
+        default:
+            break;
+        }
+    }
+
+    return 1;
+}
+
+/* Capture groups a domain pattern may have. A vhost template captures nothing
+ * the caller reads -- only the yes/no answer is used -- so this is sized to hold
+ * pcre_exec's own bookkeeping with room to spare. */
+#define DOMAIN_PCRE_VECTOR_SIZE 120
+
+int domain_matches(const domain_t* domain, const char* host, size_t length) {
+    if (domain == NULL || host == NULL) return 0;
+
+    if (domain->is_literal)
+        return length == domain->ascii_length &&
+               memcmp(host, domain->ascii_template, length) == 0;
+
+    int vector[DOMAIN_PCRE_VECTOR_SIZE];
+
+    return pcre_exec(domain->pcre_template, NULL, host, (int)length, 0, 0,
+                     vector, DOMAIN_PCRE_VECTOR_SIZE) > 0;
+}
+
 domain_t* domain_create(const char* value) {
     domain_t* result = NULL;
     domain_t* domain = domain_alloc(value);
     if (domain == NULL) goto failed;
 
     if (domain_parse(domain) == -1) goto failed;
+
+    domain->is_literal = __template_is_literal(domain->ascii_template);
+    domain->ascii_length = strlen(domain->ascii_template);
 
     domain->pcre_template = pcre_compile(domain->prepared_template, 0, &domain->pcre_error, &domain->pcre_erroffset, NULL);
     if (domain->pcre_template == NULL) goto failed;
@@ -71,6 +111,8 @@ domain_t* domain_alloc(const char* value) {
     domain_t* domain = malloc(sizeof * domain);
     if (domain == NULL) return NULL;
 
+    domain->is_literal = 0;
+    domain->ascii_length = 0;
     domain->template = NULL;
     domain->ascii_template = NULL;
     domain->prepared_template = NULL;

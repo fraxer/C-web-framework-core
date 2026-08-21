@@ -155,6 +155,12 @@ int route_parse_location(route_parser_t* parser) {
                 break;
             }
             route_insert_symbol(parser);
+            /* The backslash reaches the compiled pattern, where it changes the
+             * meaning of what follows ("\d" is a digit class, "\{" a literal
+             * brace) -- and it also reaches `path`, which the primitive
+             * comparison matches byte for byte. The two would disagree, so a
+             * location with a backslash is not primitive. */
+            parser->is_primitive = 0;
             break;
         case '}':
             log_error(ROUTE_UNOPENED_TOKEN, parser->dirty_location);
@@ -170,6 +176,22 @@ int route_parse_location(route_parser_t* parser) {
         case '|':
         case '$':
             has_regex_symbols = 1;
+            route_insert_symbol(parser);
+            parser->is_primitive = 0;
+            break;
+        /* The two metacharacters that used to be missing here: '.' matches any
+         * character and '?' makes the previous one optional, so "/api/v1.0" was
+         * labelled primitive while its pattern also matched "/api/v1x0". The
+         * label decides whether the byte-for-byte comparison may stand in for
+         * the pattern, and it may only do so when the two answer identically.
+         *
+         * Deliberately NOT counted as `has_regex_symbols`, which is a different
+         * question -- it rejects a location mixing named params with regex, and
+         * "/files/{name}.json" is an ordinary route that has always been
+         * allowed. This only stops the comparison shortcut, it forbids
+         * nothing. */
+        case '.':
+        case '?':
             route_insert_symbol(parser);
             parser->is_primitive = 0;
             break;

@@ -720,8 +720,7 @@ server_t* __httpclient_is_self_invocation(httpclient_t* client) {
 
         domain_t* server_domain = server->domain;
         while (server_domain) {
-            const int matches_count = pcre_exec(server_domain->pcre_template, NULL, ascii_host, ascii_length, 0, 0, ovector, vector_size);
-            if (matches_count > 0) {
+            if (domain_matches(server_domain, ascii_host, ascii_length)) {
                 found_server = server;  // Self-invocation detected
                 goto cleanup;
             }
