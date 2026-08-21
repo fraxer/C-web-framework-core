@@ -31,6 +31,7 @@
 #include "connection_queue.h"
 #include "middleware_registry.h"
 #include "httpserverhandlers.h"
+#include "httpresponse.h"
 #include "h2session.h"
 #include "taskmanager.h"
 #include "metrics.h"
@@ -225,6 +226,7 @@ int __module_loader_init_modules(appconfig_t* config, json_doc_t* document) {
      * the first h2 session instead, which raced between workers and never
      * survived a reload. */
     metrics_init(env_get_bool("metrics", 0));
+    http_policy_init();
     h2_policy_init();
 
 #ifdef CWFR_HTTP3

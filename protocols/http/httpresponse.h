@@ -279,6 +279,24 @@ typedef struct httpresponse {
     bufo_t body;
     file_t file_;
 
+    /* What the validators describe: the mtime and length of the RESOURCE, not
+     * of the bytes on the wire. The two part company as soon as a compressed
+     * representation is served -- a ".gz" from disk has its own mtime and size,
+     * a cached one has no file at all -- and the ETag must not move with them:
+     * every gzip representation of one file is weakly equivalent to the runtime
+     * one, so all of them revalidate against the same validator. Zero when the
+     * response carries no file (a handler's body), which is what keeps
+     * Last-Modified and ETag off those responses. */
+    time_t validator_mtime;
+    size_t validator_size;
+
+    /* The cache entry whose bytes the body points at, when the compressed
+     * representation came from memory (http_gzip_cache_acquire). The body is a
+     * proxy over it, not a copy, so the reference has to outlive every filter
+     * that reads the body -- it is released when the response is reset or
+     * freed. NULL for every other kind of response. */
+    void* body_cache;
+
     http_version_e version;
     http_payload_t payload_;
 
@@ -306,6 +324,13 @@ typedef struct httpresponse {
      * bytes go out depends on Accept-Encoding and the answer must carry
      * Vary -- whether or not this particular client got the compressed ones. */
     unsigned vary_encoding : 1;
+    /* The body going out is already gzip and nothing compressed it on this
+     * request: either a ".gz" from disk (gzip_static) or a cached compressed
+     * representation (docs/http2/10 §10.5). content_encoding is CE_NONE for
+     * both -- there is nothing left for the gzip filter to do -- so this is what
+     * tells the rest of the response that these bytes are the compressed
+     * representation and its ETag has to be tagged accordingly. */
+    unsigned gzip_precompressed : 1;
 } httpresponse_t;
 
 httpresponse_t* httpresponse_create(connection_t* connection);
@@ -326,6 +351,20 @@ int httpresponse_has_payload(httpresponse_t* response);
  * applied while the response is being built. A NULL value means the field was
  * absent, which RFC 9110 §12.5.3 reads as "identity only". */
 void httpresponse_set_accept_encoding(httpresponse_t* response, const char* value, size_t length);
+/* Hand a reset response object back for one more request on the same
+ * connection (docs/http2/10 §10.2). The reset already restored everything the
+ * previous exchange touched; this restores the one thing that is a property of
+ * the exchange about to start rather than of the object. */
+void httpresponse_reuse(httpresponse_t* response);
+/* Read the HTTP-layer settings out of main.env into plain globals. Called once
+ * per config load, from module_loader, next to h2_policy_init() and for the same
+ * reason: no worker or handler thread exists yet, so the values these govern
+ * never change under a running thread except across a reload. */
+void http_policy_init(void);
+/* Whether pre-compressed ".gz" files next to a static file are served in place
+ * of compressing it (main.env "gzip_static", off by default). Exposed for the
+ * response path and the tests; everything else should not care. */
+int http_gzip_static_enabled(void);
 /* Resolve `path` under the server root and open it, writing the resolved name
  * into `file_full_path` and the open file into `out` (FILE_OK only). On any
  * other status `out` is a closed file_t and needs no cleanup. */
