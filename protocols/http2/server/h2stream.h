@@ -83,6 +83,8 @@ typedef struct h2stream {
      * which yields at the next DATA frame boundary once it runs out. Signed —
      * the frame that empties it overshoots, and the deficit is not carried. */
     int64_t write_credit;
+    uint8_t urgency;     /* RFC 9218: 0 most urgent, 7 least, default 3 */
+    uint8_t incremental; /* peers of equal urgency may share a write turn */
 
     /* The handler/worker seam — atomic, see the note at the top of the file. */
     atomic_bool handler_pending; /* queued for, or running in, a handler thread */
