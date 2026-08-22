@@ -8,7 +8,8 @@
 #include "httpcommon.h"         /* http_payload_t */
 #include "httpfields.h"         /* httpfields_to_request, httpfields_is_forbidden_header */
 #include "httprequest.h"        /* httprequest_create_payload_file, ..._trailern_add */
-#include "httpresponse.h"       /* httpresponse_free -- the stream owns its response */
+#include "httpresponse.h"
+#include "h3conn.h"       /* httpresponse_free -- the stream owns its response */
 #include "httprequestparser.h"  /* httpparser_select_server */
 #include "httpparsercommon.h"   /* HTTP1PARSER_CONTINUE */
 #include "log.h"
@@ -39,7 +40,8 @@ h3stream_t* h3stream_create(connection_t* connection, size_t max_field_section_s
     if (st == NULL) return NULL;
 
     h3frame_parser_init(&st->parser);
-    st->request = httprequest_create(connection);
+    /* From the connection's pool when one is parked there (docs/http2/10 §10.7). */
+    st->request = h3conn_take_request(h3_conn_of(connection), connection);
     if (st->request == NULL) {
         free(st);
         return NULL;
@@ -78,8 +80,12 @@ h3stream_t* h3stream_create(connection_t* connection, size_t max_field_section_s
 void h3stream_free(h3stream_t* st) {
     if (st == NULL) return;
     h3frame_parser_free(&st->parser);
-    if (st->request != NULL) httprequest_free(st->request);
-    if (st->response != NULL) httpresponse_free(st->response);
+    /* The session is gone by the time a stream is torn down with its connection,
+     * and h3_conn_of() says so — the objects are then simply freed. */
+    h3conn_t* c = st->request != NULL ? h3_conn_of(st->request->connection) : NULL;
+
+    if (st->request != NULL) h3conn_park_request(c, st->request);
+    if (st->response != NULL) h3conn_park_response(c, st->response);
     http_headers_free(st->early_hints);
     h3stream_qpack_deferred_clear(st);
     free(st);

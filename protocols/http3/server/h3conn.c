@@ -58,8 +58,96 @@ h3conn_t* h3conn_create(connection_t* connection, uint64_t max_field_section_siz
     return c;
 }
 
+httprequest_t* h3conn_take_request(h3conn_t* c, connection_t* connection) {
+    if (c != NULL) {
+        for (size_t i = 0; i < H3CONN_OBJECT_POOL; i++) {
+            httprequest_t* parked =
+                atomic_exchange_explicit(&c->request_pool[i], NULL, memory_order_acq_rel);
+            if (parked != NULL)
+                return parked;
+        }
+    }
+
+    return httprequest_create(connection);
+}
+
+void h3conn_park_request(h3conn_t* c, httprequest_t* request) {
+    if (request == NULL) return;
+
+    if (c == NULL) {
+        httprequest_free(request);
+        return;
+    }
+
+    /* Reset on the way in, not on the way out: the payload may be a temporary
+     * file, and holding it until some later stream wants the object is a leak
+     * in everything but name. */
+    request->base.reset(request);
+
+    for (size_t i = 0; i < H3CONN_OBJECT_POOL; i++) {
+        httprequest_t* expected = NULL;
+        if (atomic_compare_exchange_strong_explicit(&c->request_pool[i], &expected, request,
+                                                    memory_order_acq_rel, memory_order_relaxed))
+            return;
+    }
+
+    httprequest_free(request);
+}
+
+httpresponse_t* h3conn_take_response(h3conn_t* c, connection_t* connection) {
+    if (c != NULL) {
+        for (size_t i = 0; i < H3CONN_OBJECT_POOL; i++) {
+            httpresponse_t* parked =
+                atomic_exchange_explicit(&c->response_pool[i], NULL, memory_order_acq_rel);
+            if (parked == NULL) continue;
+
+            /* keepalive belongs to the exchange about to start, which did not
+             * exist when this object was parked. */
+            httpresponse_reuse(parked);
+
+            return parked;
+        }
+    }
+
+    return httpresponse_create_h3(connection);
+}
+
+httpresponse_t* h3_server_take_response(connection_t* connection) {
+    return h3conn_take_response(h3_conn_of(connection), connection);
+}
+
+void h3conn_park_response(h3conn_t* c, httpresponse_t* response) {
+    if (response == NULL) return;
+
+    if (c == NULL) {
+        httpresponse_free(response);
+        return;
+    }
+
+    response->base.reset(response);
+
+    for (size_t i = 0; i < H3CONN_OBJECT_POOL; i++) {
+        httpresponse_t* expected = NULL;
+        if (atomic_compare_exchange_strong_explicit(&c->response_pool[i], &expected, response,
+                                                    memory_order_acq_rel, memory_order_relaxed))
+            return;
+    }
+
+    httpresponse_free(response);
+}
+
 void h3conn_free(h3conn_t* c) {
     if (c == NULL) return;
+
+    for (size_t i = 0; i < H3CONN_OBJECT_POOL; i++) {
+        httprequest_t* request =
+            atomic_exchange_explicit(&c->request_pool[i], NULL, memory_order_acq_rel);
+        if (request != NULL) httprequest_free(request);
+
+        httpresponse_t* response =
+            atomic_exchange_explicit(&c->response_pool[i], NULL, memory_order_acq_rel);
+        if (response != NULL) httpresponse_free(response);
+    }
 
     h3session_free(c->session);
     free(c);
@@ -588,7 +676,7 @@ static void __answer_status(connection_t* connection, quicstream_t* qs, int stat
     h3stream_t* st = h3conn_request_of(qs);
     if (st == NULL) return;
 
-    httpresponse_t* response = httpresponse_create_h3(connection);
+    httpresponse_t* response = h3conn_take_response(h3_conn_of(connection), connection);
     if (response == NULL) return;
 
     httpresponse_default(response, status_code);
@@ -701,7 +789,7 @@ int h3_server_attach_response(connection_t* connection, httprequest_t* request,
 static int __publish_one(quicconn_t* qc, httpresponse_t* response) {
     quicstream_t* qs = h3conn_stream_by_response(qc, response);
     if (qs == NULL) {
-        httpresponse_free(response);
+        h3conn_park_response(h3_conn_of(&qc->conn), response);
         return 0;
     }
 

@@ -81,6 +81,12 @@ typedef struct h3app {
     int            priority_from_frame;
 } h3app_t;
 
+/* How many request/response objects one connection keeps parked. */
+#define H3CONN_OBJECT_POOL 8
+
+struct httprequest;
+struct httpresponse;
+
 typedef struct h3conn {
     /* MUST be first: an h3conn_t lives in connection_server_ctx_t::parser,
      * which __ctx_free releases through this pointer without knowing what it
@@ -129,11 +135,39 @@ typedef struct h3conn {
 
     /* Which incremental stream last had a turn of the write-ahead budget. */
     uint64_t     write_rr_id;
+
+    /* Finished request/response objects kept for the next stream on this
+     * connection instead of being freed and rebuilt — the same pools HTTP/2
+     * carries on its session (docs/http2/10 §10.7). HTTP/3 spent 54 allocations
+     * per request without them, more than h2 did.
+     *
+     * Atomic cells: a response is retired from the worker on most paths and
+     * from a handler thread on one, and an exchange is cheaper than adding a
+     * lock order. An object in a cell belongs to nobody, so whoever exchanges
+     * it out owns it.
+     *
+     * A stream reaches these through h3_conn_of(), which reads ctx->parser —
+     * cleared when the session is freed, so a stream torn down afterwards finds
+     * no pool and simply frees its objects. */
+    _Atomic(struct httprequest*)  request_pool[H3CONN_OBJECT_POOL];
+    _Atomic(struct httpresponse*) response_pool[H3CONN_OBJECT_POOL];
 } h3conn_t;
 
 h3conn_t* h3conn_create(connection_t* connection, uint64_t max_field_section_size,
                         int enable_connect_protocol);
 void h3conn_free(h3conn_t* c);
+
+/* Request/response objects for a new stream: recycled from the connection's
+ * pool when one is parked, freshly built otherwise. Retiring parks them back
+ * when there is room. `c` may be NULL — a stream torn down after its session
+ * has none, and then these fall back to plain create/free. */
+struct httprequest* h3conn_take_request(h3conn_t* c, connection_t* connection);
+void h3conn_park_request(h3conn_t* c, struct httprequest* request);
+struct httpresponse* h3conn_take_response(h3conn_t* c, connection_t* connection);
+/* The same, for callers that hold only the connection — the dispatcher builds
+ * every ordinary response through this. */
+struct httpresponse* h3_server_take_response(connection_t* connection);
+void h3conn_park_response(h3conn_t* c, struct httpresponse* response);
 
 /* Open our control, QPACK encoder, QPACK decoder and grease streams and write
  * their opening bytes -- for the control stream that is the SETTINGS frame

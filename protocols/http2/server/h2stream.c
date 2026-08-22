@@ -19,7 +19,8 @@ h2stream_t* h2stream_create(h2session_t* session, uint32_t id) {
     h2stream_t* stream = calloc(1, sizeof(*stream));
     if (stream == NULL) return NULL;
 
-    stream->request = httprequest_create(session->connection);
+    /* From the session's pool when one is parked there (docs/http2/10 §10.7). */
+    stream->request = h2_session_take_request(session);
     if (stream->request == NULL) {
         free(stream);
         return NULL;
@@ -65,7 +66,7 @@ h2stream_t* h2stream_find_by_response(h2session_t* session, const httpresponse_t
  * the pool's owner, and a stream torn down with its session has no next stream
  * to hand the object to. */
 static void h2stream_destroy(h2session_t* session, h2stream_t* stream) {
-    if (stream->request != NULL) httprequest_free(stream->request);
+    if (stream->request != NULL) h2_session_park_request(session, stream->request);
     if (stream->response != NULL) h2_server_park_response(session, stream->response);
     /* A tunnel dies with its stream — whether the stream ended cleanly, was
      * reset, or went down with the connection (h2stream_free_all). */

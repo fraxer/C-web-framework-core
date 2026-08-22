@@ -176,7 +176,13 @@ static char* __compress(const char* source, size_t size, size_t* out_size) {
     gzip_t gzip;
     gzip_init(&gzip);
 
-    if (!gzip_deflate_init(&gzip)) return NULL;
+    /* Maximum compression, unlike the response filter's Z_BEST_SPEED: an entry
+     * is compressed exactly once and then served until the file changes, so the
+     * trade the filter makes (CPU now, bytes forever) is the wrong way round
+     * here. The ETag is unaffected — it describes the resource, not the octets
+     * (validator_mtime/validator_size), so a cache entry and a runtime-
+     * compressed answer stay interchangeable. */
+    if (!gzip_deflate_init_level(&gzip, Z_BEST_COMPRESSION)) return NULL;
 
     const size_t capacity = (size_t)deflateBound(&gzip.stream, (uLong)size) + 32;
     char* out = malloc(capacity);

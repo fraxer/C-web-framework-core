@@ -51,6 +51,14 @@ int main(int argc, char* argv[]) {
     const char* path = "/";
     const char* authority = "localhost";
     int concurrent = 1;
+    /* Requests sent one after another on the same connection, each on its own
+     * stream. Distinct from -n on purpose: `-n` has them all outstanding at
+     * once, which is the concurrency case, while this is the keep-alive case —
+     * a connection that serves a sequence, the way a browser does. Anything the
+     * server reuses between exchanges (pooled request/response objects) only
+     * shows up here; with -n every object is alive at the same time and nothing
+     * can be handed on. */
+    int repeat = 1;
     int expect_continue = 0;
     int path_challenge = 0;
     int key_update = 0;
@@ -108,6 +116,7 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) path = argv[++i];
         else if (strcmp(argv[i], "-a") == 0 && i + 1 < argc) authority = argv[++i];
         else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) concurrent = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) repeat = atoi(argv[++i]);
         else if (strcmp(argv[i], "--expect") == 0) expect_continue = 1;
         else if (strcmp(argv[i], "--path-challenge") == 0) path_challenge = 1;
         else if (strcmp(argv[i], "--key-update") == 0) key_update = 1;
@@ -165,6 +174,7 @@ int main(int argc, char* argv[]) {
     if (mix_delay_ms < 0) mix_delay_ms = 0;
 
     if (concurrent < 1) concurrent = 1;
+    if (repeat < 1) repeat = 1;
     if (timeout_ms < 1) timeout_ms = 1;
 
     /* Before any connect: both are process-wide knobs the client reads when it
@@ -1005,6 +1015,18 @@ int main(int argc, char* argv[]) {
         if (!h3_ok) printf("FAIL: not every response completed\n");
         else response = many[0];
     }
+    else if (h3_ok && repeat > 1) {
+        for (int i = 0; i < repeat && h3_ok; i++) {
+            h3client_response_free(&response);
+            memset(&response, 0, sizeof response);
+
+            /* Client-initiated bidirectional stream ids: 0, 4, 8, ... */
+            h3_ok = h3client_get(&client, (uint64_t)(4 * i), authority, path,
+                                 timeout_ms, &response);
+        }
+
+        if (!h3_ok) printf("FAIL: a request in the sequence did not complete\n");
+    }
     else if (h3_ok && expect_continue) {
         h3_ok = h3client_post_expect(&client, 0, authority, path,
                                      "body-after-permission", 21, 8000, &response);
@@ -1041,6 +1063,9 @@ int main(int argc, char* argv[]) {
         printf("  max field section:       %llu\n",
                (unsigned long long)peer.max_field_section_size);
     }
+
+    if (h3_ok && repeat > 1)
+        printf("sequential requests:       %d\n", repeat);
 
     if (h3_ok && concurrent > 1) {
         printf("concurrent requests:       %d\n", concurrent);

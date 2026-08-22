@@ -51,6 +51,7 @@
 #   CI_BUILD_DIR   where build trees go (default: a temp dir, kept between runs)
 #   FUZZ_SECONDS   per fuzz target (default 60; §5 asks for 24h on a schedule)
 #   H3SPEC         path to the h3spec binary (default: found on PATH)
+#   H2WS_PYTHONPATH  where python-h2 lives, when it is not installed system-wide
 #   REQUIRE_H3SPEC fail instead of skip when h3spec is unavailable (default 0)
 #   SOAK_REQUESTS requests in the soak stage (default 1000; release 10000)
 #   SOAK_RSS_GROWTH_KB allowed post-warmup RSS growth (default 16384)
@@ -581,8 +582,20 @@ stage_h2ws() {
     # stage: the tunnel's Content-Length bug (RFC 9110 §9.3.6) survived our own
     # tests because they spoke our dialect. Absence of the library is a SKIP,
     # like h3spec's binary -- the gate must still run on a bare machine.
+    #
+    # H2WS_PYTHONPATH covers the machine where the distribution refuses `pip
+    # install` (PEP 668) and the package is unpacked somewhere by hand; it is
+    # prepended, so a system-wide h2 still wins.
+    if [ -n "${H2WS_PYTHONPATH:-}" ]; then
+        export PYTHONPATH="$H2WS_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}"
+    fi
+
     if ! python3 -c "import h2" 2>/dev/null; then
-        note "python-h2 not installed (pip install h2); skipping."
+        note "python-h2 not installed; skipping."
+        note "Install it one of these ways:"
+        note "  sudo apt install python3-h2        (Debian/Ubuntu)"
+        note "  pip install h2                     (where pip may write)"
+        note "  H2WS_PYTHONPATH=/path/to/site-packages tests/ci.sh h2ws"
         record h2ws SKIP
         return
     fi
