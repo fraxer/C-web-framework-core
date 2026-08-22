@@ -101,6 +101,12 @@ typedef struct h2session {
      * change" — this server ignores RFC 7540 priorities either way. */
     int      peer_no_rfc7540_priorities;
     int      peer_no_rfc7540_priorities_seen;
+    struct {
+        uint32_t stream_id;
+        uint8_t urgency;
+        uint8_t incremental;
+        unsigned used : 1;
+    } pending_priority[H2_MAX_CONCURRENT_STREAMS];
 
     /* Budget for stream aborts (docs/http2/08, phase A.2), in milli-tokens.
      * Spent by RST_STREAM on an unanswered stream and by streams we refuse over

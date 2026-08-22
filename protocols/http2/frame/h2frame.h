@@ -40,6 +40,7 @@ typedef enum {
     H2_FRAME_GOAWAY        = 7,
     H2_FRAME_WINDOW_UPDATE = 8,
     H2_FRAME_CONTINUATION  = 9,
+    H2_FRAME_PRIORITY_UPDATE = 0x10, /* RFC 9218 §7.1 */
 } h2_frame_type_e;
 
 #define H2_FLAG_END_STREAM  0x01

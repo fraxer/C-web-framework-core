@@ -26,6 +26,7 @@
 #include "h2_write_filter.h"
 #include "h2field.h"
 #include "httpfields.h"
+#include "h3priority.h"
 
 /* The decoded HPACK field array is handed to httpfields_to_request by viewing
  * it as httpfields_field_t. The two are layout-compatible by construction; this
@@ -813,6 +814,16 @@ static h2_request_status_e h2_build_request(h2session_t* s, h2stream_t* stream,
     }
     if (status != H2_REQUEST_OK) return status;
 
+    const http_header_t* priority = request->get_headern(request, "Priority", 8);
+    if (priority != NULL && priority->value != NULL) {
+        h3priority_t parsed;
+        if (h3priority_parse((const uint8_t*)priority->value,
+                             priority->value_length, &parsed)) {
+            stream->urgency = parsed.urgency;
+            stream->incremental = parsed.incremental;
+        }
+    }
+
     /* :authority (now Host) selects the virtual server and must agree with SNI
      * (RFC 9110 §7.4). Kept here: it needs the connection the shared builder
      * deliberately does not take. */
@@ -1133,6 +1144,63 @@ static h2_frame_result_e h2_on_priority(h2session_t* s, const h2_frame_t* frame)
     return H2_FRAME_OK;
 }
 
+static void h2_pending_priority_apply(h2session_t* s, h2stream_t* stream) {
+    for (size_t i = 0; i < H2_MAX_CONCURRENT_STREAMS; i++) {
+        if (!s->pending_priority[i].used ||
+            s->pending_priority[i].stream_id != stream->id) continue;
+        stream->urgency = s->pending_priority[i].urgency;
+        stream->incremental = s->pending_priority[i].incremental;
+        s->pending_priority[i].used = 0;
+        return;
+    }
+}
+
+static h2_frame_result_e h2_on_priority_update(h2session_t* s, const h2_frame_t* frame) {
+    if (frame->stream_id != 0) return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
+    if (frame->payload_len < 4) return h2_conn_error(s, H2_ERR_FRAME_SIZE_ERROR);
+
+    const uint32_t id = ((uint32_t)(frame->payload[0] & 0x7f) << 24) |
+                        ((uint32_t)frame->payload[1] << 16) |
+                        ((uint32_t)frame->payload[2] << 8) | frame->payload[3];
+    if (id == 0 || !(id & 1)) return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
+
+    h3priority_t update;
+    if (!h3priority_parse(frame->payload + 4, frame->payload_len - 4, &update))
+        return H2_FRAME_OK;
+
+    h2stream_t* stream = h2stream_find(s, id);
+    if (stream != NULL) {
+        /* A PRIORITY_UPDATE is a complete signal: omitted parameters revert to
+         * their defaults, and the newest frame overrides the header (§7). */
+        stream->urgency = update.urgency;
+        stream->incremental = update.incremental;
+        return H2_FRAME_OK;
+    }
+    if (id <= s->last_stream_id) return H2_FRAME_OK;
+
+    size_t free_slot = H2_MAX_CONCURRENT_STREAMS;
+    size_t pending_count = 0;
+    for (size_t i = 0; i < H2_MAX_CONCURRENT_STREAMS; i++) {
+        if (s->pending_priority[i].used) pending_count++;
+        if (s->pending_priority[i].used && s->pending_priority[i].stream_id == id) {
+            s->pending_priority[i].urgency = update.urgency;
+            s->pending_priority[i].incremental = update.incremental;
+            return H2_FRAME_OK;
+        }
+        if (!s->pending_priority[i].used && free_slot == H2_MAX_CONCURRENT_STREAMS)
+            free_slot = i;
+    }
+    if (free_slot < H2_MAX_CONCURRENT_STREAMS &&
+        h2stream_active_count(s) + pending_count < H2_MAX_CONCURRENT_STREAMS) {
+        s->pending_priority[free_slot].used = 1;
+        s->pending_priority[free_slot].stream_id = id;
+        s->pending_priority[free_slot].urgency = update.urgency;
+        s->pending_priority[free_slot].incremental = update.incremental;
+        return H2_FRAME_OK;
+    }
+    return h2_conn_error(s, H2_ERR_PROTOCOL_ERROR);
+}
+
 static h2_frame_result_e h2_on_rst_stream(h2session_t* s, const h2_frame_t* frame) {
     /* §6.4: RST_STREAM on an idle stream is a connection error. */
     if (h2_stream_state_of(s, frame->stream_id) == H2_STREAM_IDLE)
@@ -1384,6 +1452,7 @@ static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
     if (stream_id > s->last_stream_id) s->last_stream_id = stream_id;
 
     const h2_request_status_e status = h2_build_request(s, stream, block, len);
+    h2_pending_priority_apply(s, stream);
     if (status == H2_REQUEST_TOO_LARGE) {
         metrics_h2_abuse(METRICS_H2_HEADER_LIST);
 
@@ -1727,6 +1796,9 @@ static h2_frame_result_e h2_handle_frame(h2session_t* s, const h2_frame_t* frame
     case H2_FRAME_PRIORITY:
         return h2_on_priority(s, frame);
 
+    case H2_FRAME_PRIORITY_UPDATE:
+        return h2_on_priority_update(s, frame);
+
     case H2_FRAME_RST_STREAM:
         return h2_on_rst_stream(s, frame);
 
@@ -1996,7 +2068,7 @@ static h2_write_status_e h2_write_stream(h2session_t* s, h2stream_t* stream) {
     stream->window_blocked = 0;
     stream->yielded = 0;
     stream->served = 1;
-    stream->write_credit = h2_write_quantum;
+    stream->write_credit = stream->incremental ? h2_write_quantum : INT64_MAX;
 
     /* A tunnel past its handshake has no response staged — its output is
      * WebSocket frames, framed by the same DATA writer the filter chain uses
@@ -2169,14 +2241,16 @@ static int h2_write(connection_t* connection) {
         }
     }
 
-    /* Then serve every other stream whose handler has come back, in table order
-     * — which is round-robin order, since a stream that stops short goes to the
-     * back. Each gets at most one quantum per turn. */
-    h2stream_t* stream = s->streams;
-    while (stream != NULL) {
-        h2stream_t* next = stream->next;
+    /* Serve lower urgency values first. Incremental responses retain the old
+     * round-robin quantum; a non-incremental response runs until completion or
+     * socket/flow-control backpressure, as RFC 9218 §3 recommends. */
+    for (unsigned urgency = 0; urgency <= H3_PRIORITY_URGENCY_MAX; urgency++) {
+        h2stream_t* stream = s->streams;
+        while (stream != NULL) {
+            h2stream_t* next = stream->next;
 
-        if (stream->served || !h2_stream_writable(stream)) {
+        if (stream->served || stream->urgency != urgency ||
+            !h2_stream_writable(stream)) {
             stream = next;
             continue;
         }
@@ -2206,6 +2280,8 @@ static int h2_write(connection_t* connection) {
         h2_write_finished(s, stream);
 
         stream = next;
+        }
+        if (socket_full) break;
     }
 
     if (h2_flush_out(s) == 0) return 0;
