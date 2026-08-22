@@ -728,7 +728,11 @@ static route_dispatch_e __route_dispatch(connection_t* connection, httprequest_t
         /* Only once the file is actually open: __prepare_static_file_response
          * answers a missing file with 404, and a route that caches for a year
          * must not put that on it. */
-        if (response->file_.fd > -1)
+        /* A gzip-cache hit has already closed the source descriptor and moved
+         * the representation into response->body, but it is still the same
+         * successfully opened static resource. gzip_precompressed records
+         * both that case and an on-disk .gz twin. */
+        if (response->file_.fd > -1 || response->gzip_precompressed)
             __apply_route_cache_control(response, route, method);
 
         *queued = __deferred_handler(connection, request, response, __queue_response_handler, NULL, __queue_data_response_create, ratelimiter);
