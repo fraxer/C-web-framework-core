@@ -1293,6 +1293,10 @@ static h2_frame_result_e h2_open_tunnel(h2session_t* s, h2stream_t* stream, int 
     /* 200, not 101: HTTP/2 has no 101 at all (RFC 8441 §4). */
     response->status_code = 200;
 
+    /* And no Content-Length with it: what follows this response is the tunnel,
+     * not a body (RFC 9110 §9.3.6). The response filter reads this. */
+    response->connect_tunnel = 1;
+
     /* Echo the accepted subprotocol and extension, as the HTTP/1.1 handshake
      * does. Only what was actually accepted: the tunnel is already built, so
      * "negotiated" here means "in use". */

@@ -331,6 +331,13 @@ typedef struct httpresponse {
      * tells the rest of the response that these bytes are the compressed
      * representation and its ETag has to be tagged accordingly. */
     unsigned gzip_precompressed : 1;
+    /* The response opens a tunnel: a 2xx answer to CONNECT, which is not a
+     * representation but the near end of a byte stream. RFC 9110 §9.3.6 says a
+     * server MUST NOT send Content-Length or Transfer-Encoding on one, and the
+     * reason is practical rather than pedantic -- a client that believes the
+     * length stops reading the tunnel at it. Set for the RFC 8441 WebSocket
+     * tunnel (docs/http2/09); zero on every ordinary response. */
+    unsigned connect_tunnel : 1;
 } httpresponse_t;
 
 httpresponse_t* httpresponse_create(connection_t* connection);

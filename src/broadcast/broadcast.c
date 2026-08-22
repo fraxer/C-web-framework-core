@@ -382,6 +382,22 @@ int __broadcast_batch_append(char** buffer, size_t* size, size_t* capacity, cons
  * has to look atomic to the write path. It used to build into
  * conn_ctx->response, which is why the lock had to span the whole drain —
  * docs/concurrency/00 §4.4. */
+/* Does this queued message belong to the same output order as the batch being
+ * built? `out_queue` + `out_owner` is what a response is posted to: NULL/NULL
+ * for a plain connection, the tunnel's slot queue and stream for an RFC 8441
+ * tunnel. */
+static int __batch_accepts(const void* data, void* ctx) {
+    const connection_queue_item_t* candidate = data;
+    const connection_queue_broadcast_data_t* first = ctx;
+
+    if (candidate == NULL || candidate->data == NULL) return 0;
+
+    const connection_queue_broadcast_data_t* bdata =
+        (const connection_queue_broadcast_data_t*)candidate->data;
+
+    return bdata->out_queue == first->out_queue && bdata->out_owner == first->out_owner;
+}
+
 void __broadcast_queue_request_handler(void* arg) {
     connection_queue_item_t* first_item = arg;
     connection_t* connection = first_item->connection;
@@ -410,6 +426,12 @@ void __broadcast_queue_request_handler(void* arg) {
     size_t batch_capacity = 0;
     int processed = 0;
 
+    /* Messages taken out of the queue in one pass and still to be framed. The
+     * array is the batch limit, so it can live on the stack. */
+    connection_queue_item_t* batch_items[BROADCAST_BATCH_MESSAGES];
+    size_t batch_count = 0;
+    size_t batch_pos = 0;
+
     // первый элемент передан воркером и освобождается им после return;
     // остальные снимаем из очереди и освобождаем здесь
     connection_queue_item_t* item = first_item;
@@ -437,29 +459,68 @@ void __broadcast_queue_request_handler(void* arg) {
         if (processed >= BROADCAST_BATCH_MESSAGES || batch_size >= BROADCAST_BATCH_BYTES)
             break;
 
+        /* Still holding messages from the previous pass. */
+        if (batch_pos < batch_count) {
+            item = batch_items[batch_pos++];
+            continue;
+        }
+
+        const size_t remaining = (size_t)(BROADCAST_BATCH_MESSAGES - processed);
+
         // продюсеры пишут в очередь под cqueue_lock — снимать под ним же
         // безопасно и без connection_s_lock
         //
-        // Merged only while the next message belongs to the SAME output order.
-        // One connection may host several RFC 8441 tunnels, and a batch is one
-        // response posted to one place — mixing two tunnels' frames into it
-        // would deliver each stream the other's bytes. What is left stays
-        // queued, and connection_after_read dispatches another runner for it.
-        cqueue_lock(conn_ctx->broadcast_queue);
-        cqueue_item_t* head = cqueue_first(conn_ctx->broadcast_queue);
-        connection_queue_item_t* candidate = head != NULL ? head->data : NULL;
-        const connection_queue_broadcast_data_t* cdata = candidate != NULL ?
-            (connection_queue_broadcast_data_t*)candidate->data : NULL;
-        const int same_target = cdata != NULL && cdata->out_queue == first_data->out_queue &&
-            cdata->out_owner == first_data->out_owner;
-        connection_queue_item_t* next = same_target ?
-            cqueue_pop(conn_ctx->broadcast_queue) : NULL;
-        cqueue_unlock(conn_ctx->broadcast_queue);
-
-        if (next == NULL)
+        // A batch is one response posted to one place, so it may only carry one
+        // output order: one connection may host several RFC 8441 tunnels, and
+        // mixing their frames would deliver each stream the other's bytes.
+        //
+        // Which is why the queue is *filtered* rather than popped: with two
+        // tunnels receiving the same fan-out, their messages alternate, and
+        // taking only from the head gave up on the very first foreign message —
+        // every delivery became its own response and its own socket write.
+        // Measured on two tunnels sharing a TLS connection, 2002 deliveries:
+        // 4021 writes and ~110 ms of server CPU that way, against 2060 writes
+        // and ~55 ms when the batch actually forms (docs/http2/09).
+        //
+        // The whole batch is collected in ONE pass: cqueue_take_matching costs
+        // a walk of the queue, so asking for messages one at a time would turn
+        // a linear drain into a quadratic one.
+        if (remaining == 0)
             break;
 
-        item = next;
+        cqueue_lock(conn_ctx->broadcast_queue);
+        const size_t taken = cqueue_take_matching(conn_ctx->broadcast_queue, __batch_accepts,
+                                                  first_data, remaining, (void**)batch_items);
+        cqueue_unlock(conn_ctx->broadcast_queue);
+
+        if (taken == 0)
+            break;
+
+        batch_count = taken;
+        batch_pos = 0;
+        item = batch_items[batch_pos++];
+    }
+
+    /* Taken out of the queue but never framed: the batch filled up on bytes, or
+     * the accumulator ran out of memory. These messages are owed to the tunnel,
+     * so they go back rather than being dropped — front first, in reverse, so
+     * their order within this output order is exactly what it was. Whatever is
+     * queued when the write finishes gets another runner from
+     * connection_after_write, which is the same path the un-batched remainder
+     * always took. */
+    while (batch_count > batch_pos) {
+        connection_queue_item_t* left = batch_items[--batch_count];
+
+        cqueue_lock(conn_ctx->broadcast_queue);
+        const int returned = cqueue_prepend(conn_ctx->broadcast_queue, left);
+        cqueue_unlock(conn_ctx->broadcast_queue);
+
+        if (!returned) {
+            /* Out of memory putting it back: the message is lost either way,
+             * and leaking it on top of that helps nobody. */
+            log_error("broadcast: dropped a queued message, out of memory\n");
+            left->free(left);
+        }
     }
 
     websocketsresponse_set_body(response, batch, batch_size);

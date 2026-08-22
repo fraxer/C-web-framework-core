@@ -87,6 +87,39 @@ void* cqueue_pop(cqueue_t* queue) {
     return data;
 }
 
+size_t cqueue_take_matching(cqueue_t* queue, int (*accepts)(const void* data, void* ctx),
+                            void* ctx, size_t max, void** out) {
+    if (queue == NULL || accepts == NULL || out == NULL || max == 0) return 0;
+
+    size_t taken = 0;
+    cqueue_item_t* item = queue->item;
+    cqueue_item_t* prev = NULL;
+
+    while (item != NULL && taken < max) {
+        cqueue_item_t* next = item->next;
+
+        if (!accepts(item->data, ctx)) {
+            prev = item;
+            item = next;
+            continue;
+        }
+
+        if (prev == NULL) queue->item = next;
+        else prev->next = next;
+
+        if (queue->last_item == item)
+            queue->last_item = prev;
+
+        out[taken++] = item->data;
+        cqueue_item_free(item);
+        queue->size--;
+
+        item = next;
+    }
+
+    return taken;
+}
+
 int cqueue_empty(cqueue_t* queue) {
     if (queue == NULL) return 1;
 

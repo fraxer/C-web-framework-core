@@ -22,6 +22,18 @@ void cqueue_freecb(cqueue_t*, void(*free_cb)(void*));
 int cqueue_append(cqueue_t*, void*);
 int cqueue_prepend(cqueue_t*, void*);
 void* cqueue_pop(cqueue_t*);
+/* Take up to `max` entries the predicate accepts, in queue order, leaving
+ * everything else where it is. Written for the broadcast fan-out, where several
+ * independent output orders share one queue and a batch may only carry one of
+ * them: popping from the head alone gives up as soon as another order's message
+ * is next, and walking with pop+prepend would reverse what stays behind.
+ *
+ * Returns how many entries were written into `out`; the caller owns them. The
+ * relative order of taken entries is preserved, and so is the order of those
+ * left in place. Cost is one pass over the queue, so a caller that wants a whole
+ * batch should ask for it in a single call rather than in a loop. */
+size_t cqueue_take_matching(cqueue_t*, int (*accepts)(const void* data, void* ctx),
+                            void* ctx, size_t max, void** out);
 int cqueue_empty(cqueue_t*);
 int cqueue_size(cqueue_t*);
 cqueue_item_t* cqueue_first(cqueue_t*);
