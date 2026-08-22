@@ -1115,3 +1115,138 @@ TEST(test_cqueue_stress_test) {
 
     cqueue_free(queue);
 }
+
+// ============================================================================
+// cqueue_take_matching — the broadcast fan-out drains one output order out of a
+// queue several orders share. What has to hold: order is preserved on both
+// sides (taken and left), the queue stays walkable afterwards, and nothing is
+// lost or duplicated.
+// ============================================================================
+
+typedef struct {
+    int tag;
+    int seq;
+} take_entry_t;
+
+static int take_accepts_tag(const void* data, void* ctx) {
+    const take_entry_t* entry = data;
+    return entry->tag == *(const int*)ctx;
+}
+
+static take_entry_t* take_entry(int tag, int seq) {
+    take_entry_t* e = malloc(sizeof(*e));
+    if (e != NULL) { e->tag = tag; e->seq = seq; }
+    return e;
+}
+
+TEST(test_cqueue_take_matching_interleaved) {
+    TEST_SUITE("cqueue: take_matching");
+    TEST_CASE("takes one order out of an interleaved queue, leaving the rest in place");
+
+    cqueue_t* q = cqueue_create();
+    TEST_REQUIRE_NOT_NULL(q, "queue created");
+
+    /* A,B,A,B,… — exactly the shape two tunnels on one connection produce. */
+    for (int i = 0; i < 8; i++)
+        cqueue_append(q, take_entry(i % 2, i));
+
+    void* out[8];
+    int wanted = 0;
+    const size_t taken = cqueue_take_matching(q, take_accepts_tag, &wanted, 8, out);
+
+    TEST_ASSERT_EQUAL_SIZE(4, taken, "every entry of that order is taken");
+    TEST_ASSERT_EQUAL_SIZE(4, (size_t)cqueue_size(q), "and only the others are left");
+
+    for (size_t i = 0; i < taken; i++) {
+        take_entry_t* e = out[i];
+        TEST_ASSERT_EQUAL(0, e->tag, "taken entries belong to the requested order");
+        TEST_ASSERT_EQUAL((int)(i * 2), e->seq, "in the order they were queued");
+        free(e);
+    }
+
+    /* What stayed behind must still be a walkable queue in its original order —
+     * the failure mode of a pop+prepend implementation is a reversed remainder. */
+    int expected_seq = 1;
+    while (!cqueue_empty(q)) {
+        take_entry_t* e = cqueue_pop(q);
+        TEST_ASSERT_EQUAL(1, e->tag, "the other order is untouched");
+        TEST_ASSERT_EQUAL(expected_seq, e->seq, "and keeps its order");
+        expected_seq += 2;
+        free(e);
+    }
+
+    cqueue_free(q);
+}
+
+TEST(test_cqueue_take_matching_respects_max) {
+    TEST_SUITE("cqueue: take_matching");
+    TEST_CASE("stops at max and leaves the rest queued");
+
+    cqueue_t* q = cqueue_create();
+    TEST_REQUIRE_NOT_NULL(q, "queue created");
+
+    for (int i = 0; i < 6; i++)
+        cqueue_append(q, take_entry(0, i));
+
+    void* out[3];
+    int wanted = 0;
+    const size_t taken = cqueue_take_matching(q, take_accepts_tag, &wanted, 3, out);
+
+    TEST_ASSERT_EQUAL_SIZE(3, taken, "no more than asked for");
+    TEST_ASSERT_EQUAL_SIZE(3, (size_t)cqueue_size(q), "the rest is still queued");
+
+    for (size_t i = 0; i < taken; i++) {
+        take_entry_t* e = out[i];
+        TEST_ASSERT_EQUAL((int)i, e->seq, "the first three, in order");
+        free(e);
+    }
+
+    /* The queue must still append correctly after a partial take: last_item is
+     * the field a naive removal gets wrong. */
+    cqueue_append(q, take_entry(0, 99));
+    TEST_ASSERT_EQUAL_SIZE(4, (size_t)cqueue_size(q), "append still works");
+
+    int seq_expected[] = {3, 4, 5, 99};
+    for (int i = 0; i < 4; i++) {
+        take_entry_t* e = cqueue_pop(q);
+        TEST_REQUIRE_NOT_NULL(e, "entry present");
+        TEST_ASSERT_EQUAL(seq_expected[i], e->seq, "order after append is intact");
+        free(e);
+    }
+
+    cqueue_free(q);
+}
+
+TEST(test_cqueue_take_matching_tail_and_empty_cases) {
+    TEST_SUITE("cqueue: take_matching");
+    TEST_CASE("taking the last entry, taking nothing, and the empty queue");
+
+    cqueue_t* q = cqueue_create();
+    TEST_REQUIRE_NOT_NULL(q, "queue created");
+
+    void* out[4];
+    int wanted = 0;
+
+    TEST_ASSERT_EQUAL_SIZE(0, cqueue_take_matching(q, take_accepts_tag, &wanted, 4, out),
+                           "an empty queue gives nothing");
+
+    cqueue_append(q, take_entry(1, 0));
+    cqueue_append(q, take_entry(0, 1));   /* the tail is the one we want */
+
+    const size_t taken = cqueue_take_matching(q, take_accepts_tag, &wanted, 4, out);
+    TEST_ASSERT_EQUAL_SIZE(1, taken, "the tail entry is taken");
+    free(out[0]);
+
+    /* last_item pointed at what was just removed: appending now is where a
+     * dangling tail would show up. */
+    cqueue_append(q, take_entry(1, 2));
+    TEST_ASSERT_EQUAL_SIZE(2, (size_t)cqueue_size(q), "queue still consistent");
+
+    int no_such_tag = 7;
+    TEST_ASSERT_EQUAL_SIZE(0, cqueue_take_matching(q, take_accepts_tag, &no_such_tag, 4, out),
+                           "nothing matches, nothing is taken");
+    TEST_ASSERT_EQUAL_SIZE(2, (size_t)cqueue_size(q), "and nothing is lost");
+
+    while (!cqueue_empty(q)) free(cqueue_pop(q));
+    cqueue_free(q);
+}

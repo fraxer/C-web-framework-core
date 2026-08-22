@@ -99,10 +99,18 @@ int __header(httprequest_t* request, httpresponse_t* response) {
     /* RFC 7232: 304 response MUST NOT contain Content-Length for body.
      * RFC 9110 §8.6 likewise forbids it on 1xx and 204 — both are terminated by
      * the end of the header section and cannot carry content. This covers the
-     * 101 Switching Protocols of an h2c or websocket upgrade. */
+     * 101 Switching Protocols of an h2c or websocket upgrade.
+     *
+     * A 2xx answer to CONNECT is the fourth case and the least obvious one: it
+     * has no body because everything after it is a tunnel, and RFC 9110 §9.3.6
+     * forbids the header outright. It is not cosmetic — a client that reads
+     * `content-length: 0` on an RFC 8441 tunnel treats the first DATA frame as
+     * a protocol violation and tears the stream down (python-h2 does exactly
+     * that: "Expected 0 bytes, received 18"). */
     const int bodiless_status = response->status_code == 304 ||
                                 response->status_code == 204 ||
-                                (response->status_code >= 100 && response->status_code < 200);
+                                (response->status_code >= 100 && response->status_code < 200) ||
+                                response->connect_tunnel;
 
     if (!response->range && response->transfer_encoding == TE_NONE && !bodiless_status) {
         size_t data_size = response->body.size;

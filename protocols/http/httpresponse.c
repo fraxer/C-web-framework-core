@@ -171,6 +171,7 @@ static httpresponse_t* __httpresponse_create(connection_t* connection, http_chai
     response->client_gzip = 0;
     response->vary_encoding = 0;
     response->gzip_precompressed = 0;
+    response->connect_tunnel = 0;
     response->validator_mtime = 0;
     response->validator_size = 0;
     response->body_cache = NULL;
@@ -233,6 +234,7 @@ void __httpresponse_reset(httpresponse_t* response) {
     response->client_gzip = 0;
     response->vary_encoding = 0;
     response->gzip_precompressed = 0;
+    response->connect_tunnel = 0;
     response->validator_mtime = 0;
     response->validator_size = 0;
 
