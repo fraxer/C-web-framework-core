@@ -46,12 +46,25 @@ static int __template_is_literal(const char* template) {
  * pcre_exec's own bookkeeping with room to spare. */
 #define DOMAIN_PCRE_VECTOR_SIZE 120
 
+/* ASCII case folding, deliberately not tolower(): the templates are punycode by
+ * the time they get here, so only ASCII letters can differ in case, and a locale
+ * that folds anything else would make vhost selection depend on the environment
+ * the server was started in. */
+static inline char __fold(char c) {
+    return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+}
+
 int domain_matches(const domain_t* domain, const char* host, size_t length) {
     if (domain == NULL || host == NULL) return 0;
 
-    if (domain->is_literal)
-        return length == domain->ascii_length &&
-               memcmp(host, domain->ascii_template, length) == 0;
+    if (domain->is_literal) {
+        if (length != domain->ascii_length) return 0;
+
+        for (size_t i = 0; i < length; i++)
+            if (__fold(host[i]) != __fold(domain->ascii_template[i])) return 0;
+
+        return 1;
+    }
 
     int vector[DOMAIN_PCRE_VECTOR_SIZE];
 
@@ -69,7 +82,13 @@ domain_t* domain_create(const char* value) {
     domain->is_literal = __template_is_literal(domain->ascii_template);
     domain->ascii_length = strlen(domain->ascii_template);
 
-    domain->pcre_template = pcre_compile(domain->prepared_template, 0, &domain->pcre_error, &domain->pcre_erroffset, NULL);
+    /* PCRE_CASELESS: a host is case-insensitive (RFC 9110 §4.2.3), and
+     * `Host: EXAMPLE.COM` used to miss the vhost `example.com` outright -- the
+     * pattern was compiled case-sensitive and the literal comparison matched it.
+     * Both halves fold now, and they must keep folding the same way: a shortcut
+     * that disagrees with the pattern is how a request lands on the wrong
+     * server. */
+    domain->pcre_template = pcre_compile(domain->prepared_template, PCRE_CASELESS, &domain->pcre_error, &domain->pcre_erroffset, NULL);
     if (domain->pcre_template == NULL) goto failed;
 
     result = domain;

@@ -61,9 +61,12 @@ h2stream_t* h2stream_find_by_response(h2session_t* session, const httpresponse_t
     return NULL;
 }
 
-static void h2stream_destroy(h2stream_t* stream) {
+/* `session` may be NULL only when there is nowhere to park a response — it is
+ * the pool's owner, and a stream torn down with its session has no next stream
+ * to hand the object to. */
+static void h2stream_destroy(h2session_t* session, h2stream_t* stream) {
     if (stream->request != NULL) httprequest_free(stream->request);
-    if (stream->response != NULL) httpresponse_free(stream->response);
+    if (stream->response != NULL) h2_server_park_response(session, stream->response);
     /* A tunnel dies with its stream — whether the stream ended cleanly, was
      * reset, or went down with the connection (h2stream_free_all). */
     if (stream->ws != NULL) h2_ws_tunnel_free(stream->ws);
@@ -99,7 +102,7 @@ void h2stream_close(h2session_t* session, h2stream_t* stream) {
         session->stream_count--;
     }
 
-    h2stream_destroy(stream);
+    h2stream_destroy(session, stream);
 }
 
 void h2stream_rotate(h2session_t* session, h2stream_t* stream) {
@@ -123,7 +126,9 @@ void h2stream_free_all(h2session_t* session) {
 
     while (stream != NULL) {
         h2stream_t* next = stream->next;
-        h2stream_destroy(stream);
+        /* NULL: the session is going away with these streams, so parking a
+         * response in its pool would only mean freeing it twice over. */
+        h2stream_destroy(NULL, stream);
         stream = next;
     }
 

@@ -19,6 +19,10 @@ typedef struct route_parser {
     int params_count;
     unsigned short int dirty_pos;
     unsigned short int pos;
+    /* `location` is the pattern and `path` is the literal string a primitive
+     * route is compared against, and they are no longer the same text: a dot is
+     * escaped in the pattern and plain in the path. Two cursors, one pass. */
+    unsigned short int path_pos;
     const char* dirty_location;
     char* path;
     char* location;
@@ -32,6 +36,7 @@ int route_parse_location(route_parser_t* parser);
 int route_parse_token(route_parser_t* parser);
 void route_insert_custom_symbol(route_parser_t* parser, char symbol);
 void route_insert_symbol(route_parser_t* parser);
+void route_insert_escaped_symbol(route_parser_t* parser);
 int route_alloc_param(route_parser_t* parser);
 int route_fill_param(route_parser_t* parser);
 void route_parser_free(route_parser_t* parser);
@@ -122,9 +127,13 @@ int route_init_parser(route_parser_t* parser, const char* dirty_location) {
     parser->params_count = 0;
     parser->dirty_pos = 0;
     parser->pos = 0;
+    parser->path_pos = 0;
     parser->dirty_location = dirty_location;
-    parser->path = calloc(strlen(dirty_location) + 3, 1); // +1 for ^, +1 for $, +1 for \0
-    parser->location = calloc(strlen(dirty_location) + 3, 1); // +1 for ^, +1 for $, +1 for \0
+    /* Twice the input plus the anchors: escaping a metacharacter adds a byte,
+     * and in the worst case every byte is one. */
+    const size_t room = strlen(dirty_location) * 2 + 3; // + ^, + $, + \0
+    parser->path = calloc(room, 1);
+    parser->location = calloc(room, 1);
     parser->first_param = NULL;
     parser->last_param = NULL;
 
@@ -136,9 +145,31 @@ int route_init_parser(route_parser_t* parser, const char* dirty_location) {
     return 0;
 }
 
+/* Is this location plain text -- no {param} tokens and nothing PCRE reads as an
+ * operator? Only then may '.' and '?' be taken literally: an operator anywhere
+ * in the string means the author is writing a pattern, and "/assets/(.*)" must
+ * keep meaning what it says.
+ *
+ * '.' and '?' are deliberately absent from this list: they are what the answer
+ * decides about, and counting them would make every dotted path a pattern. */
+static int __location_is_literal(const char* location) {
+    for (const char* p = location; *p != 0; p++) {
+        switch (*p) {
+        case '{': case '}': case '*': case '+': case '(': case ')':
+        case '[': case ']': case '|': case '^': case '$': case '\\':
+            return 0;
+        default:
+            break;
+        }
+    }
+
+    return 1;
+}
+
 int route_parse_location(route_parser_t* parser) {
     parser->is_primitive = 1;
     int has_regex_symbols = 0;
+    const int literal = __location_is_literal(parser->dirty_location);
 
     for (; parser->dirty_location[parser->dirty_pos] != 0; parser->dirty_pos++) {
         switch (parser->dirty_location[parser->dirty_pos]) {
@@ -179,19 +210,24 @@ int route_parse_location(route_parser_t* parser) {
             route_insert_symbol(parser);
             parser->is_primitive = 0;
             break;
-        /* The two metacharacters that used to be missing here: '.' matches any
-         * character and '?' makes the previous one optional, so "/api/v1.0" was
-         * labelled primitive while its pattern also matched "/api/v1x0". The
-         * label decides whether the byte-for-byte comparison may stand in for
-         * the pattern, and it may only do so when the two answer identically.
+        /* '.' and '?' outside a {param} are literal characters of a path, not
+         * regex operators: nobody writing "/api/v1.0" means "any character
+         * here", and the route silently matching "/api/v1x0" was a defect
+         * rather than a feature. Escaped into the pattern, kept plain in the
+         * path — so the location stays eligible for the comparison shortcut.
          *
-         * Deliberately NOT counted as `has_regex_symbols`, which is a different
-         * question -- it rejects a location mixing named params with regex, and
-         * "/files/{name}.json" is an ordinary route that has always been
-         * allowed. This only stops the comparison shortcut, it forbids
-         * nothing. */
+         * Inside a {name|pattern} token the opposite is true, and that text is
+         * handled by route_parse_token, which never reaches this switch. */
         case '.':
         case '?':
+            if (literal) {
+                route_insert_escaped_symbol(parser);
+                break;
+            }
+
+            /* Part of a pattern the author wrote on purpose: left as it was,
+             * and the comparison shortcut is off — the pattern means more than
+             * the string it is spelled with. */
             route_insert_symbol(parser);
             parser->is_primitive = 0;
             break;
@@ -200,8 +236,7 @@ int route_parse_location(route_parser_t* parser) {
         }
     }
 
-    memcpy(parser->path, parser->location, parser->pos);
-    parser->path[parser->pos] = 0;
+    parser->path[parser->path_pos] = 0;
 
     if (!parser->is_primitive && parser->first_param != NULL) {
         memmove(parser->location + 1, parser->location, parser->pos);
@@ -323,8 +358,27 @@ void route_insert_custom_symbol(route_parser_t* parser, char symbol) {
 }
 
 void route_insert_symbol(route_parser_t* parser) {
-    parser->location[parser->pos] = parser->dirty_location[parser->dirty_pos];
+    const char ch = parser->dirty_location[parser->dirty_pos];
+
+    parser->location[parser->pos] = ch;
     parser->pos++;
+
+    /* The path is only ever read for a primitive location, where it is the same
+     * text as the pattern; writing it unconditionally keeps the two cursors in
+     * step without asking every call site whether it matters here. */
+    parser->path[parser->path_pos] = ch;
+    parser->path_pos++;
+}
+
+/* A character that means itself in the location but is a metacharacter to PCRE:
+ * it goes escaped into the pattern and plain into the path. This is what makes
+ * "/api/v1.0" match "/api/v1.0" and nothing else -- before it, the pattern was
+ * "^/api/v1.0$" and matched "/api/v1x0" too. */
+void route_insert_escaped_symbol(route_parser_t* parser) {
+    parser->location[parser->pos] = '\\';
+    parser->pos++;
+
+    route_insert_symbol(parser);
 }
 
 int route_alloc_param(route_parser_t* parser) {

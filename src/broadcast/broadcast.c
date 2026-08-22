@@ -412,7 +412,14 @@ void __broadcast_queue_request_handler(void* arg) {
         websocketsresponse_set_deflate(response, first_data->out_deflate);
 
     if (response == NULL) {
-        // TODO: close connection, return error
+        /* Out of memory for the response, and there is nothing to fall back
+         * to: this message is owed to a subscriber and cannot be framed, so the
+         * connection goes. Same shape as the WebSocket publish path
+         * (websocketsserverhandlers.c) — mark it destroyed and let the worker
+         * reap it through connection_after_read; the item itself is freed by
+         * the caller after this returns. */
+        log_error("broadcast: no memory for a fan-out response, closing the connection\n");
+
         atomic_store(&conn_ctx->destroyed, 1);
 
         connection_s_lock(connection, LOCK_SITE_BROADCAST);

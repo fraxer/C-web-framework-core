@@ -69,7 +69,9 @@ static void __retire_response(void* arg_ctx, void* arg_response) {
 static httpresponse_t* __create_response(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
 
-    if (ctx->is_http2) return httpresponse_create_h2(connection);
+    /* h2 keeps a small pool of finished response objects on the session; a new
+     * stream takes one from there when it can (docs/http2/10 §10.2). */
+    if (ctx->is_http2) return h2_server_take_response(connection);
 #ifdef CWFR_HTTP3
     if (__is_http3(connection)) return httpresponse_create_h3(connection);
 #endif
@@ -858,9 +860,10 @@ int __get_redirect(connection_t* connection, httprequest_t* request) {
         // pcre_exec leaves entries of non-participating capture groups untouched,
         // so pre-mark all offsets as "unset" for redirect_get_uri
         memset(vector, -1, sizeof(vector));
-        int matches_count = pcre_exec(redirect->location, NULL, request->path, request->path_length, 0, 0, vector, vector_size);
 
-        if (matches_count < 0) {
+        /* A literal location is answered by a substring search; only a real
+         * pattern pays for PCRE (docs/http2/10 §10.6). */
+        if (!redirect_matches(redirect, request->path, request->path_length, vector, vector_size)) {
             redirect = redirect->next;
             continue;
         }

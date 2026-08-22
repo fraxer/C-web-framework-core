@@ -431,15 +431,15 @@ TEST(test_route_primitive_flag_excludes_metacharacters) {
         {"/health", 1},
         {"/api/v1/items", 1},
         {"/a-b_c~d", 1},
-        /* REGRESSION: '.' and '?' were not counted, so "/api/v1.0" was called
-         * primitive while its pattern also matched "/api/v1x0" — the shortcut
-         * and the pattern disagreed on exactly those paths. */
-        {"/api/v1.0", 0},
-        {"/maybe?", 0},
+        /* Plain text with a dot or a question mark: both are escaped into the
+         * pattern, so the location means itself and the shortcut applies. */
+        {"/api/v1.0", 1},
+        {"/maybe?", 1},
         {"/back\\slash", 0},
         {"/wild*", 0},
         {"/either|or", 0},
         {"/group(a)", 0},
+        {"/assets/(.*)", 0},
     };
 
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -483,19 +483,53 @@ TEST(test_route_primitive_shortcut_agrees_with_pattern) {
     TEST_ASSERT(1, "shortcut and pattern agree on every location/path pair");
 }
 
-TEST(test_route_dotted_location_still_matches_as_a_pattern) {
-    TEST_CASE("a location with a dot keeps its old regex behaviour, it just loses the shortcut");
+TEST(test_route_dot_in_a_plain_location_is_literal) {
+    TEST_CASE("a dot in plain text matches a dot, not any character");
 
+    /* REGRESSION: the location went into the pattern unescaped, so "/api/v1.0"
+     * matched "/api/v1x0" as well — a route answering paths its author never
+     * wrote. Nobody spelling a version number means "any character here". */
     route_t* r = route_create("/api/v1.0");
     TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
 
-    TEST_ASSERT_EQUAL(0, r->is_primitive, "not eligible for the shortcut");
-    /* Unchanged on purpose: the dot is still a regex any-char here, as it has
-     * always been. Making it literal would be a change of routing behaviour and
-     * belongs to its own decision, not to a performance shortcut. */
-    TEST_ASSERT(route_pattern_matches(r, "/api/v1.0"), "the literal path matches");
-    TEST_ASSERT(route_pattern_matches(r, "/api/v1x0"), "and so does any-char, as before");
+    TEST_ASSERT_EQUAL(1, r->is_primitive, "plain text, so the shortcut applies");
+    TEST_ASSERT(route_pattern_matches(r, "/api/v1.0"), "the path itself matches");
+    TEST_ASSERT(!route_pattern_matches(r, "/api/v1x0"), "any-char does not");
+    TEST_ASSERT_EQUAL(1, route_compare_primitive(r, "/api/v1.0", 9), "and so says the shortcut");
+    TEST_ASSERT_EQUAL(0, route_compare_primitive(r, "/api/v1x0", 9), "on both paths");
 
+    routes_free(r);
+
+    /* A question mark is the same story: "/maybe?" must not match "/mayb". */
+    route_t* q = route_create("/maybe?");
+    TEST_REQUIRE_NOT_NULL(q, "route_create should succeed");
+
+    TEST_ASSERT(route_pattern_matches(q, "/maybe?"), "the path itself matches");
+    TEST_ASSERT(!route_pattern_matches(q, "/mayb"), "the previous character is not optional");
+
+    routes_free(q);
+}
+
+TEST(test_route_regex_location_keeps_its_dot) {
+    TEST_CASE("a location that is a pattern keeps regex semantics for its dot");
+
+    /* The other half of the rule: an operator anywhere means the author is
+     * writing a pattern, and "(.*)" must go on meaning "anything". Escaping the
+     * dot here would turn a capture of the tail into a capture of dots — which
+     * is exactly what a first, too-eager version of this change did. */
+    route_t* r = route_create("/assets/(.*)");
+    TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
+
+    TEST_ASSERT_EQUAL(0, r->is_primitive, "a pattern is never primitive");
+
+    int ovector[30];
+    const char* path = "/assets/app/style.css";
+    const int rc = pcre_exec(r->location, NULL, path, (int)strlen(path), 0, 0, ovector, 30);
+    TEST_REQUIRE_GOTO(rc > 1, "the pattern matches and captures", cleanup);
+    TEST_ASSERT_EQUAL(8, ovector[2], "the capture starts after the prefix");
+    TEST_ASSERT_EQUAL((int)strlen(path), ovector[3], "and runs to the end of the path");
+
+    cleanup:
     routes_free(r);
 }
 

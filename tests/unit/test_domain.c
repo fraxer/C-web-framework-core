@@ -350,20 +350,36 @@ TEST(test_domain_literal_flag) {
     }
 }
 
-TEST(test_domain_literal_is_case_sensitive_like_the_pattern) {
-    TEST_SUITE("domain: literal shortcut");
-    TEST_CASE("the shortcut does not quietly become case-insensitive");
+TEST(test_domain_matching_is_case_insensitive) {
+    TEST_SUITE("domain: case folding");
+    TEST_CASE("a host matches its vhost whatever case it arrives in");
 
+    /* REGRESSION: the pattern was compiled without PCRE_CASELESS and the
+     * literal shortcut compared bytes, so `Host: EXAMPLE.COM` missed the vhost
+     * `example.com` entirely and the request was answered 404. A host is
+     * case-insensitive (RFC 9110 §4.2.3). */
     domain_t* d = domain_create("example.com");
     TEST_REQUIRE_NOT_NULL(d, "domain_create should succeed");
 
-    /* The compiled pattern has no PCRE_CASELESS, so an upper-case Host does not
-     * match today. Whether that is right is a separate question (RFC 9110 §4.2.3
-     * says host is case-insensitive); what this case pins down is that the
-     * shortcut did not change the answer on its own. */
-    TEST_ASSERT_EQUAL(0, domain_matches_host(d, "EXAMPLE.COM"), "upper case does not match");
-    TEST_ASSERT_EQUAL(1, domain_matches_host(d, "example.com"), "exact case does");
-    TEST_ASSERT(agrees(d, "EXAMPLE.COM"), "and both paths say the same");
+    TEST_ASSERT_EQUAL(1, domain_matches_host(d, "example.com"), "lower case matches");
+    TEST_ASSERT_EQUAL(1, domain_matches_host(d, "EXAMPLE.COM"), "upper case matches");
+    TEST_ASSERT_EQUAL(1, domain_matches_host(d, "ExAmPlE.CoM"), "mixed case matches");
+    TEST_ASSERT_EQUAL(0, domain_matches_host(d, "example.org"), "a different host still does not");
+
+    /* Both halves must fold the same way, or the shortcut and the pattern would
+     * disagree on exactly the hosts that differ in case. */
+    TEST_ASSERT(agrees(d, "EXAMPLE.COM"), "shortcut and pattern agree on upper case");
+    TEST_ASSERT(agrees(d, "ExAmPlE.CoM"), "and on mixed case");
 
     domains_free(d);
+
+    /* The same for a pattern that cannot take the shortcut. */
+    domain_t* w = domain_create("*.example.com");
+    TEST_REQUIRE_NOT_NULL(w, "wildcard domain created");
+
+    TEST_ASSERT_EQUAL(1, domain_matches_host(w, "sub.example.com"), "wildcard, lower case");
+    TEST_ASSERT_EQUAL(1, domain_matches_host(w, "SUB.EXAMPLE.COM"), "wildcard, upper case");
+    TEST_ASSERT_EQUAL(0, domain_matches_host(w, "example.com"), "and it still needs a label");
+
+    domains_free(w);
 }

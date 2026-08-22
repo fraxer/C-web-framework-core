@@ -286,3 +286,77 @@ TEST(test_redirect_free_null_and_chain) {
 
     TEST_ASSERT(1, "Chain freed without crash (leaks caught by ASan)");
 }
+
+// ============================================================================
+// The literal shortcut — a location spelled in plain text is matched by a
+// substring search instead of PCRE. The shortcut and the pattern must agree on
+// every path, because a redirect that fires on one and not the other sends the
+// client somewhere its author never wrote.
+// ============================================================================
+
+static int redirect_pattern_matches(redirect_t* r, const char* path) {
+    int vector[30];
+    memset(vector, -1, sizeof(vector));
+    return pcre_exec(r->location, NULL, path, (int)strlen(path), 0, 0, vector, 30) >= 0;
+}
+
+static int redirect_shortcut_matches(redirect_t* r, const char* path) {
+    int vector[30];
+    memset(vector, -1, sizeof(vector));
+    return redirect_matches(r, path, strlen(path), vector, 30);
+}
+
+TEST(test_redirect_literal_agrees_with_pattern) {
+    TEST_SUITE("redirect: literal shortcut");
+    TEST_CASE("substring search and the compiled pattern answer identically");
+
+    static const char* locations[] = {
+        "/user", "/old/path", "^/anchored$", "/user(.*)/(\\d)",
+    };
+    static const char* paths[] = {
+        "/user", "/users", "/user/42", "/prefix/user", "/old/path", "/old",
+        "/anchored", "/anchored/more", "/user7/9", "/", "",
+    };
+
+    for (size_t i = 0; i < sizeof(locations) / sizeof(locations[0]); i++) {
+        /* A destination without placeholders keeps every location legal here;
+         * the capture-count check is a separate case. */
+        const char* destination = i == 3 ? "/user-{1}-{2}" : "/persons";
+        redirect_t* r = redirect_create(locations[i], destination);
+        TEST_REQUIRE_NOT_NULL(r, "redirect_create should succeed");
+
+        for (size_t j = 0; j < sizeof(paths) / sizeof(paths[0]); j++) {
+            if (redirect_shortcut_matches(r, paths[j]) != redirect_pattern_matches(r, paths[j])) {
+                TEST_FAIL("the literal shortcut disagreed with the pattern");
+                break;
+            }
+        }
+
+        redirect_free(r);
+    }
+
+    TEST_ASSERT(1, "shortcut and pattern agree on every location/path pair");
+}
+
+TEST(test_redirect_literal_flag) {
+    TEST_SUITE("redirect: literal shortcut");
+    TEST_CASE("only plain text without capture groups takes the shortcut");
+
+    redirect_t* plain = redirect_create("/user", "/persons");
+    TEST_REQUIRE_NOT_NULL(plain, "plain redirect created");
+    TEST_ASSERT_EQUAL(1, plain->is_literal, "plain text takes the shortcut");
+    TEST_ASSERT_EQUAL_SIZE(5, plain->literal_length, "and remembers its length");
+    redirect_free(plain);
+
+    redirect_t* anchored = redirect_create("^/anchored$", "/persons");
+    TEST_REQUIRE_NOT_NULL(anchored, "anchored redirect created");
+    TEST_ASSERT_EQUAL(0, anchored->is_literal, "anchors are pattern syntax");
+    redirect_free(anchored);
+
+    /* Capture groups rule the shortcut out even before the metacharacters do:
+     * the destination needs the offsets a substring search cannot produce. */
+    redirect_t* captures = redirect_create("/user(.*)/(\\d)", "/user-{1}-{2}");
+    TEST_REQUIRE_NOT_NULL(captures, "capture redirect created");
+    TEST_ASSERT_EQUAL(0, captures->is_literal, "a location with groups is never literal");
+    redirect_free(captures);
+}
