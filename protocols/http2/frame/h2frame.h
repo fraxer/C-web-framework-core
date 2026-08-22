@@ -19,6 +19,12 @@
 
 #define H2_CONNECTION_PREFACE "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 #define H2_CONNECTION_PREFACE_LEN 24
+/* "PRI * HTTP/2.0\r\n" -- the request line the preface opens with. RFC 9113 §3.4
+ * reserves the PRI method for exactly this, so a plaintext connection that
+ * starts with these bytes is an HTTP/2 client whatever follows them: the rest
+ * of the preface may be garbage, but the peer is not speaking HTTP/1.1 and must
+ * not be answered as if it were. */
+#define H2_CONNECTION_PREFACE_PRI_LEN 16
 #define H2_FRAME_HEADER_LEN 9
 #define H2_MAX_FRAME_SIZE_DEFAULT 16384u
 #define H2_MAX_FRAME_SIZE_LIMIT   16777215u /* RFC §4.2 absolute max */
