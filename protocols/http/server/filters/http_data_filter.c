@@ -92,7 +92,7 @@ int __header(httprequest_t* request, httpresponse_t* response) {
      * default, not a rule: add_headeru leaves alone the value a route's
      * cache_control or a handler already put here, which is the only way a
      * static asset can be served with a long max-age. */
-    if (response->file_.fd > -1)
+    if (response->file_.fd > -1 || response->gzip_precompressed)
         if (!response->add_headeru(response, "Cache-Control", 13, "no-cache", 8))
             return CWF_ERROR;
 

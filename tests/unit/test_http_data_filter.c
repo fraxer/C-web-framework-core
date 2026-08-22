@@ -343,6 +343,28 @@ TEST(test_data_header_file_adds_cache_control_and_content_length) {
     fixture_teardown(&fx);
 }
 
+TEST(test_data_header_gzip_cache_keeps_file_cache_control) {
+    TEST_SUITE("http_data_filter: header");
+    TEST_CASE("a file moved into the gzip memory cache remains cacheable");
+
+    data_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx, 64), "fixture initialized");
+
+    /* __try_gzip_cache closes file_ and proxies cached bytes through body. */
+    fx.response->file_.fd = -1;
+    fx.response->gzip_precompressed = 1;
+    fx.response->body.size = 128;
+
+    const int r = run_header(&fx);
+    TEST_ASSERT_EQUAL(CWF_OK, r, "header filter succeeds");
+
+    http_header_t* cc = fx.response->get_header(fx.response, "Cache-Control");
+    TEST_REQUIRE_NOT_NULL(cc, "Cache-Control is retained for the cached file");
+    TEST_ASSERT_STR_EQUAL("no-cache", cc->value, "file default is used");
+
+    fixture_teardown(&fx);
+}
+
 TEST(test_data_header_chunked_no_content_length) {
     TEST_SUITE("http_data_filter: header");
     TEST_CASE("TE_CHUNKED responses defer length to the chunked filter");
