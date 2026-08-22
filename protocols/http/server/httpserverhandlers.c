@@ -286,8 +286,23 @@ static h2c_sniff_e __h2c_sniff_preface(connection_t* connection, size_t* len) {
 
     *len = total;
 
-    if (memcmp(connection->buffer, H2_CONNECTION_PREFACE, cmp) != 0)
+    if (memcmp(connection->buffer, H2_CONNECTION_PREFACE, cmp) != 0) {
+        /* The magic diverges -- but if the PRI request line is intact, the peer
+         * came here to speak HTTP/2 and got the preface wrong. RFC 9113 §3.4
+         * calls that a connection error of type PROTOCOL_ERROR, and answering
+         * it with `400 Bad Request` (which is what the HTTP/1.1 parser does with
+         * an unknown method) tells an HTTP/2 client nothing it can read.
+         *
+         * Handing it to the session is all it takes: the frame parser rejects
+         * the preface itself (H2PARSE_PREFACE_BAD), which becomes GOAWAY with
+         * PROTOCOL_ERROR and a closed connection -- no separate reject path to
+         * keep in step with the real one. */
+        if (total >= H2_CONNECTION_PREFACE_PRI_LEN &&
+            memcmp(connection->buffer, H2_CONNECTION_PREFACE, H2_CONNECTION_PREFACE_PRI_LEN) == 0)
+            return H2C_SNIFF_YES;
+
         return H2C_SNIFF_NO;
+    }
 
     if (total < H2_CONNECTION_PREFACE_LEN) {
         ctx->h2c_peeked = total & 0x1f; /* < 24, fits the bitfield */
