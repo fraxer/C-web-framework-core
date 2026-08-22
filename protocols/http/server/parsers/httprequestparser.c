@@ -101,11 +101,58 @@ void __clear(httprequestparser_t* parser) {
     if (parser->request != NULL) {
         // Only free if the request hasn't been registered with the connection yet
         // The connection layer will handle cleanup if the request was successfully registered
-        httprequest_free(parser->request);
+        //
+        // "Free" now means "retire": a half-parsed request the parser is giving
+        // up on is nobody else's, so it goes back to the connection's cell for
+        // the next one — the same path the connection layer uses when an
+        // exchange ends normally.
+        connection_server_ctx_t* ctx = parser->connection != NULL ? parser->connection->ctx : NULL;
+        if (ctx != NULL && ctx->request_retire != NULL)
+            ctx->request_retire(ctx, parser->request);
+        else
+            httprequest_free(parser->request);
+
         parser->request = NULL;
     }
 
     httpparser_reset(parser);
+}
+
+/* A finished HTTP/1.1 request, parked for the next one on this connection
+ * rather than freed (docs/http2/10 §10.7 — h2 and h3 do the same on their
+ * session and connection). Installed as ctx->request_retire by __take_request,
+ * and called by the connection layer, which is the only place that knows the
+ * exchange is over. */
+static void __retire_request(void* arg_ctx, void* arg_request) {
+    connection_server_ctx_t* ctx = arg_ctx;
+    httprequest_t* request = arg_request;
+
+    /* One is all a connection can use: HTTP/1.1 reads one request at a time,
+     * and a pipeline that got ahead simply builds a fresh object, as before. */
+    if (ctx->request_cache != NULL) {
+        httprequest_free(request);
+        return;
+    }
+
+    /* Reset on the way in: the payload may be a temporary file, and holding it
+     * open through an idle connection is a leak in everything but name. */
+    request->base.reset(request);
+    ctx->request_cache = request;
+}
+
+/* The object the parser fills for the request it is reading now. */
+static httprequest_t* __take_request(connection_t* connection) {
+    connection_server_ctx_t* ctx = connection->ctx;
+
+    ctx->request_retire = __retire_request;
+
+    httprequest_t* recycled = ctx->request_cache;
+    if (recycled != NULL) {
+        ctx->request_cache = NULL;
+        return recycled;
+    }
+
+    return httprequest_create(connection);
 }
 
 int httpparser_run(httprequestparser_t* parser) {
@@ -130,7 +177,7 @@ int httpparser_run(httprequestparser_t* parser) {
                 break;
 
             if (parser->request == NULL) {
-                parser->request = httprequest_create(parser->connection);
+                parser->request = __take_request(parser->connection);
                 if (parser->request == NULL)
                     return __clear_and_return(parser, HTTP1PARSER_OUT_OF_MEMORY);
 

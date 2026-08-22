@@ -132,22 +132,30 @@ file_content_t file_content_create(const int fd, const char* filename, const off
 }
 
 file_t file_alloc() {
-    return (file_t){
-        .fd = -1,
-        .ok = 0,
-        .tmp = 0,
-        .size = 0,
-        .mtime = 0,
-        .mode = 0,
-        .name = {0},
+    /* Field by field rather than a compound literal, for one field: `name` is
+     * NAME_MAX bytes, and any initializer for the struct zeroes all 255 of them.
+     * The name is a C string — a NUL in the first byte says "empty" just as
+     * well, and this function is on the path of every file the server opens
+     * (`__file_internal_set_name` and the zeroing around it showed up at 1.3% of
+     * the worker in the profile, docs/http2/10 §10.8). */
+    file_t file;
 
-        .set_name = __file_set_name,
-        .content = __file_content,
-        .set_content = __file_set_content,
-        .append_content = __file_append_content,
-        .close = __file_close,
-        .truncate = __file_truncate,
-    };
+    file.fd = -1;
+    file.ok = 0;
+    file.tmp = 0;
+    file.size = 0;
+    file.mtime = 0;
+    file.mode = 0;
+    file.name[0] = 0;
+
+    file.set_name = __file_set_name;
+    file.content = __file_content;
+    file.set_content = __file_set_content;
+    file.append_content = __file_append_content;
+    file.close = __file_close;
+    file.truncate = __file_truncate;
+
+    return file;
 }
 
 int __file_set_name(file_t* file, const char* name) {
@@ -248,7 +256,13 @@ void __file_reset(file_t* file) {
     file->tmp = 0;
     file->size = 0;
     file->mtime = 0;
-    memset(file->name, 0, NAME_MAX);
+    /* `mode` was missing here: a closed file kept the type bits of the last one
+     * it held, and http_open_file answers "regular file or directory?" from
+     * exactly this field. */
+    file->mode = 0;
+    /* One byte, not 255: the name is a C string and nothing reads past its
+     * terminator. */
+    file->name[0] = 0;
 }
 
 int __file_content_set_name(file_content_t* file_content, const char* name) {

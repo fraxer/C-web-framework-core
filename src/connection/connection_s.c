@@ -519,6 +519,8 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
     ctx->response = NULL;
     ctx->response_cache = NULL;
     ctx->response_retire = NULL;
+    ctx->request_cache = NULL;
+    ctx->request_retire = NULL;
     ctx->queue = cqueue_create();
     ctx->broadcast_queue = cqueue_create();
     ctx->write_queue = cqueue_create();
@@ -563,8 +565,12 @@ void __ctx_reset(void* arg) {
     if (ctx->switch_to_protocol.fn == NULL) {
         request_t* request = ctx->request;
         if (request != NULL) {
-            request->free(request);
             ctx->request = NULL;
+
+            if (ctx->request_retire != NULL)
+                ctx->request_retire(ctx, request);
+            else
+                request->free(request);
         }
     }
     else {
@@ -574,15 +580,22 @@ void __ctx_reset(void* arg) {
          * only, so it stops applying here, at the one moment the switch is
          * still ahead of us. */
         ctx->response_retire = NULL;
+        ctx->request_retire = NULL;
 
         /* And whatever HTTP/1.1 already parked there will never be asked for
          * again: nothing on the new protocol reads this. Freeing it now rather
          * than at teardown keeps a long-lived WebSocket connection from holding
-         * an idle response object for its whole life. */
+         * idle objects for its whole life. */
         response_t* cached = ctx->response_cache;
         if (cached != NULL) {
             cached->free(cached);
             ctx->response_cache = NULL;
+        }
+
+        request_t* cached_request = ctx->request_cache;
+        if (cached_request != NULL) {
+            cached_request->free(cached_request);
+            ctx->request_cache = NULL;
         }
     }
 
@@ -652,6 +665,12 @@ void __ctx_free(void* arg) {
     if (cached != NULL) {
         cached->free(cached);
         ctx->response_cache = NULL;
+    }
+
+    request_t* cached_request = ctx->request_cache;
+    if (cached_request != NULL) {
+        cached_request->free(cached_request);
+        ctx->request_cache = NULL;
     }
 
     /* Last, so the transport's teardown can still reach anything above. It
