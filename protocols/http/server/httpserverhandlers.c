@@ -73,7 +73,8 @@ static httpresponse_t* __create_response(connection_t* connection) {
      * stream takes one from there when it can (docs/http2/10 §10.2). */
     if (ctx->is_http2) return h2_server_take_response(connection);
 #ifdef CWFR_HTTP3
-    if (__is_http3(connection)) return httpresponse_create_h3(connection);
+    /* Same pool, on the h3 connection (docs/http2/10 §10.7). */
+    if (__is_http3(connection)) return h3_server_take_response(connection);
 #endif
 
     /* Whichever way the object is obtained, this connection now retires its

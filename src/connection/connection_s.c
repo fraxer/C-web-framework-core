@@ -620,7 +620,16 @@ void __ctx_free(void* arg) {
     connection_server_ctx_t* ctx = arg;
 
     if (ctx->parser != NULL)
+    {
         ((requestparser_t*)ctx->parser)->free(ctx->parser);
+        /* Cleared, not left dangling: the transport's teardown runs after this
+         * (transport_free, below) and its streams reach their protocol session
+         * through exactly this field — h3_conn_of() reads ctx->parser. A stale
+         * pointer here is a use-after-free with a stream's teardown on the
+         * other end of it; NULL makes those paths take their "no session"
+         * branch, which is the truth by then. */
+        ctx->parser = NULL;
+    }
 
     // Освобождаем очереди с callback'ом для освобождения item'ов
     cqueue_freecb(ctx->queue, __ctx_queue_item_free_callback);

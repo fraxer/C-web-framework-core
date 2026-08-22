@@ -21,6 +21,10 @@ int gzip_free(gzip_t* gzip) {
 }
 
 int gzip_deflate_init(gzip_t* const gzip) {
+    return gzip_deflate_init_level(gzip, Z_BEST_SPEED);
+}
+
+int gzip_deflate_init_level(gzip_t* const gzip, int level) {
     z_stream* const stream = &gzip->stream;
     gzip->is_deflate_init = 0;
 
@@ -28,7 +32,10 @@ int gzip_deflate_init(gzip_t* const gzip) {
     stream->zfree = Z_NULL;
     stream->opaque = Z_NULL;
 
-    if (deflateInit2(stream, Z_BEST_SPEED, Z_DEFLATED, MAX_WBITS + 16, MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY) != Z_OK)
+    if (level < Z_BEST_SPEED) level = Z_BEST_SPEED;
+    if (level > Z_BEST_COMPRESSION) level = Z_BEST_COMPRESSION;
+
+    if (deflateInit2(stream, level, Z_DEFLATED, MAX_WBITS + 16, MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY) != Z_OK)
         return 0;
 
     return 1;

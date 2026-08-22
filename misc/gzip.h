@@ -15,6 +15,11 @@ int gzip_init(gzip_t* gzip);
 int gzip_free(gzip_t* gzip);
 
 int gzip_deflate_init(gzip_t* gzip);
+/* The same, at a chosen zlib level (Z_BEST_SPEED … Z_BEST_COMPRESSION). The
+ * default is speed, which is right when the bytes are compressed once per
+ * response; a caller that compresses once and serves the result many times
+ * should pay for size instead. */
+int gzip_deflate_init_level(gzip_t* gzip, int level);
 size_t gzip_deflate(gzip_t* gzip, const char* compress_data, const size_t compress_length, const int end);
 void gzip_set_in(gzip_t* gzip, const char* data, size_t length);
 int gzip_deflate_free(gzip_t* gzip);

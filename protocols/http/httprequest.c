@@ -135,6 +135,12 @@ void httprequest_reset(httprequest_t* request) {
     request->method = ROUTE_NONE;
     request->asterisk_form = 0;
     request->version = HTTP1_VER_NONE;
+    /* Set by httprequest_create and, until the object started being recycled,
+     * never anywhere else — so a reused request carried the framing of the
+     * previous exchange into the next one. Same shape as the content_length bug
+     * this file already carries a comment about. */
+    request->transfer_encoding = TE_NONE;
+    request->content_encoding = CE_NONE;
     request->uri_length = 0;
     request->path_length = 0;
 

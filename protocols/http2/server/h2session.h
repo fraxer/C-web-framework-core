@@ -36,6 +36,7 @@
 #define H2_RESPONSE_POOL 8
 
 struct httpresponse;
+struct httprequest;
 
 typedef struct h2session {
     void (*free)(void*);            /* requestparser_t.base — must be first */
@@ -167,6 +168,11 @@ typedef struct h2session {
      * N objects alive, and beyond a handful the pool would keep memory for a
      * burst that already passed. */
     _Atomic(struct httpresponse*) response_pool[H2_RESPONSE_POOL];
+    /* And the same for the request objects streams are built with. Separate
+     * pools rather than a pair: a stream's request and response are created and
+     * retired at different moments, and pairing them would park one object
+     * waiting for the other. */
+    _Atomic(struct httprequest*) request_pool[H2_RESPONSE_POOL];
 
     /* Error code to report in GOAWAY once a connection error is raised. */
     uint32_t error_code;
@@ -247,6 +253,9 @@ struct httpresponse* h2_server_take_response(struct connection* connection);
 /* Retire a finished response: parked for reuse if the pool has room, freed
  * otherwise. Safe from any thread. */
 void h2_server_park_response(h2session_t* session, struct httpresponse* response);
+/* The same pair for request objects, used by the stream table. */
+struct httprequest* h2_session_take_request(h2session_t* session);
+void h2_session_park_request(h2session_t* session, struct httprequest* request);
 
 int h2_server_guard_read(connection_t* connection);
 int h2_server_guard_write(connection_t* connection);

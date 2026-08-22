@@ -2315,6 +2315,43 @@ void h2_server_park_response(h2session_t* session, httpresponse_t* response) {
     httpresponse_free(response);
 }
 
+httprequest_t* h2_session_take_request(h2session_t* session) {
+    if (session == NULL) return NULL;
+
+    for (size_t i = 0; i < H2_RESPONSE_POOL; i++) {
+        httprequest_t* parked =
+            atomic_exchange_explicit(&session->request_pool[i], NULL, memory_order_acq_rel);
+        if (parked != NULL)
+            return parked;
+    }
+
+    return httprequest_create(session->connection);
+}
+
+void h2_session_park_request(h2session_t* session, httprequest_t* request) {
+    if (request == NULL) return;
+
+    if (session == NULL) {
+        httprequest_free(request);
+        return;
+    }
+
+    /* Reset here, for the reason the response pool resets here: the payload of
+     * a request can be a temporary file, and keeping it open until some later
+     * stream happens to want the object is a leak wearing a different hat. */
+    request->base.reset(request);
+
+    for (size_t i = 0; i < H2_RESPONSE_POOL; i++) {
+        httprequest_t* expected = NULL;
+        if (atomic_compare_exchange_strong_explicit(&session->request_pool[i], &expected,
+                                                    request, memory_order_acq_rel,
+                                                    memory_order_relaxed))
+            return;
+    }
+
+    httprequest_free(request);
+}
+
 /* Free what is parked. Called once, when the session itself goes. */
 static void h2_response_pool_free(h2session_t* s) {
     for (size_t i = 0; i < H2_RESPONSE_POOL; i++) {
@@ -2322,6 +2359,11 @@ static void h2_response_pool_free(h2session_t* s) {
             atomic_exchange_explicit(&s->response_pool[i], NULL, memory_order_acq_rel);
         if (parked != NULL)
             httpresponse_free(parked);
+
+        httprequest_t* parked_request =
+            atomic_exchange_explicit(&s->request_pool[i], NULL, memory_order_acq_rel);
+        if (parked_request != NULL)
+            httprequest_free(parked_request);
     }
 }
 
