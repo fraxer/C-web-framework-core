@@ -1976,7 +1976,7 @@ static void h2_write_finished(h2session_t* s, h2stream_t* stream) {
     atomic_store_explicit(&stream->response_ready, 0, memory_order_release);
 
     if (stream->response != NULL) {
-        httpresponse_free(stream->response);
+        h2_server_park_response(s, stream->response);
         stream->response = NULL;
     }
 }
@@ -2269,6 +2269,60 @@ static int h2_publish_push(h2session_t* s, httpresponse_t* response) {
     const int ok = cqueue_append(s->publish_queue, response);
     cqueue_unlock(s->publish_queue);
     return ok;
+}
+
+httpresponse_t* h2_server_take_response(connection_t* connection) {
+    h2session_t* s = h2_session_of(connection);
+    if (s == NULL) return NULL;
+
+    for (size_t i = 0; i < H2_RESPONSE_POOL; i++) {
+        httpresponse_t* parked =
+            atomic_exchange_explicit(&s->response_pool[i], NULL, memory_order_acq_rel);
+        if (parked == NULL) continue;
+
+        /* Everything else was cleared when it was parked; keepalive belongs to
+         * the exchange about to start, which did not exist back then. */
+        httpresponse_reuse(parked);
+
+        return parked;
+    }
+
+    return httpresponse_create_h2(connection);
+}
+
+void h2_server_park_response(h2session_t* session, httpresponse_t* response) {
+    if (response == NULL) return;
+
+    if (session == NULL) {
+        httpresponse_free(response);
+        return;
+    }
+
+    /* Reset before parking, not on the way out: it closes the file the response
+     * served and releases its payload, and holding those until some later
+     * stream happens to need the object is a leak in everything but name. */
+    response->base.reset(response);
+
+    for (size_t i = 0; i < H2_RESPONSE_POOL; i++) {
+        httpresponse_t* expected = NULL;
+        if (atomic_compare_exchange_strong_explicit(&session->response_pool[i], &expected,
+                                                    response, memory_order_acq_rel,
+                                                    memory_order_relaxed))
+            return;
+    }
+
+    /* Pool full: this connection already has more objects than it can use. */
+    httpresponse_free(response);
+}
+
+/* Free what is parked. Called once, when the session itself goes. */
+static void h2_response_pool_free(h2session_t* s) {
+    for (size_t i = 0; i < H2_RESPONSE_POOL; i++) {
+        httpresponse_t* parked =
+            atomic_exchange_explicit(&s->response_pool[i], NULL, memory_order_acq_rel);
+        if (parked != NULL)
+            httpresponse_free(parked);
+    }
 }
 
 int h2_server_response_ready(connection_t* connection, httpresponse_t* response) {
@@ -2829,6 +2883,10 @@ void h2_session_free(void* arg) {
     h2session_t* s = arg;
 
     h2stream_free_all(s);
+
+    /* After the streams: their teardown parks responses here, and this is what
+     * gives those objects back. */
+    h2_response_pool_free(s);
 
     /* The publish queue holds response pointers the streams above already
      * owned and freed, so free only the queue wrappers — never the data. */

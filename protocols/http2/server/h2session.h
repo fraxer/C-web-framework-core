@@ -32,6 +32,11 @@
  * requests may be outstanding, not how many run at once. */
 #define H2_MAX_CONCURRENT_STREAMS 100
 
+/* How many response objects one connection keeps parked. */
+#define H2_RESPONSE_POOL 8
+
+struct httpresponse;
+
 typedef struct h2session {
     void (*free)(void*);            /* requestparser_t.base — must be first */
 
@@ -146,6 +151,23 @@ typedef struct h2session {
     size_t   out_pos;
     size_t   out_cap;
 
+    /* Finished response objects kept for the next stream on this connection
+     * instead of being freed and rebuilt (docs/http2/10 §10.2 — the same idea
+     * that took HTTP/1.1 from 32 allocations per request down to 11; HTTP/2
+     * still spends 41, and this is the largest single block of them).
+     *
+     * Atomic cells rather than a list with a lock: a response is retired from
+     * the worker on most paths but from a handler thread on one of them
+     * (h2_server_response_ready when the publish queue is out of memory), and
+     * an exchange is both cheaper and simpler to reason about than adding a
+     * lock order. An object living in a cell belongs to nobody, so whoever
+     * exchanges it out owns it outright.
+     *
+     * Small on purpose: a connection answering N streams at once needs at most
+     * N objects alive, and beyond a handful the pool would keep memory for a
+     * burst that already passed. */
+    _Atomic(struct httpresponse*) response_pool[H2_RESPONSE_POOL];
+
     /* Error code to report in GOAWAY once a connection error is raised. */
     uint32_t error_code;
     int      goaway_sent;
@@ -217,6 +239,14 @@ int h2c_upgrade(httpctx_t* ctx);
  * plain globals, and that ordering is the only thing making them safe to read
  * from every thread afterwards. Until it runs, the built-in defaults apply. */
 void h2_policy_init(void);
+
+/* A response object for a new stream on this connection: recycled from the
+ * session's pool when one is parked there, freshly built otherwise. NULL when
+ * the connection is not HTTP/2 (the caller then builds its own). */
+struct httpresponse* h2_server_take_response(struct connection* connection);
+/* Retire a finished response: parked for reuse if the pool has room, freed
+ * otherwise. Safe from any thread. */
+void h2_server_park_response(h2session_t* session, struct httpresponse* response);
 
 int h2_server_guard_read(connection_t* connection);
 int h2_server_guard_write(connection_t* connection);

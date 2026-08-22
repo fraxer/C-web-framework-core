@@ -33,6 +33,8 @@
 #   softreload shared UDP handoff             + old CID/config drain
 #   qlog     traces written, bounded, off by default       (diagnostics)
 #   h3spec   run a server, run h3spec against it           (RFC conformance)
+#   h2ws     RFC 8441 tunnels driven by python-h2, a client that enforces
+#            what we only intended (see tests/h2ws_probe.py)
 #
 # The interop matrix (§8.6) is deliberately absent: it needs docker and tens of
 # minutes, and belongs to a schedule rather than to a gate.
@@ -572,7 +574,98 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit config startup keepalive limits soak affinity earlydata vn version2 ipv6 qlog priority benchmark asan tsan fuzz reload softreload h3spec)
+stage_h2ws() {
+    say "h2ws: RFC 8441 tunnels against a strict third-party client"
+
+    # python-h2 rather than a client of ours, and that is the whole point of the
+    # stage: the tunnel's Content-Length bug (RFC 9110 §9.3.6) survived our own
+    # tests because they spoke our dialect. Absence of the library is a SKIP,
+    # like h3spec's binary -- the gate must still run on a bare machine.
+    if ! python3 -c "import h2" 2>/dev/null; then
+        note "python-h2 not installed (pip install h2); skipping."
+        record h2ws SKIP
+        return
+    fi
+
+    if ! build "$CI_BUILD_DIR/rel" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+               -DINCLUDE_HTTP3=yes; then
+        record h2ws FAIL
+        return
+    fi
+
+    local root="$CI_BUILD_DIR/www"
+    mkdir -p "$root"
+    echo '<html><body>ci</body></html>' > "$root/index.html"
+
+    # h2c on a port of its own: the probe speaks prior-knowledge HTTP/2, so no
+    # certificate is needed and the stage stays independent of the h3spec one.
+    # The WebSocket handlers come from the app the same build produced.
+    local handlers="$CI_BUILD_DIR/rel/exec/handlers/ws/lib_wsindex.so"
+    if [ ! -f "$handlers" ]; then
+        note "ws handlers not built at $handlers"
+        record h2ws FAIL
+        return
+    fi
+
+    local config="$CI_BUILD_DIR/h2ws.json"
+    cat > "$config" <<JSON
+{
+    "main": {
+        "workers": 1, "threads": 4, "reload": "hard",
+        "buffer_size": 16384, "client_max_body_size": 1048576, "tmp": "/tmp",
+        "gzip": ["text/html"],
+        "log": { "enabled": true, "level": "error" },
+        "env": {}
+    },
+    "servers": {
+        "s1": {
+            "domains": ["localhost", "127.0.0.1"],
+            "ip": "127.0.0.1", "port": 18099,
+            "root": "$root",
+            "index": "index.html",
+            "http": { "routes": {} },
+            "websockets": {
+                "default": { "file": "$handlers", "function": "default_" },
+                "routes": {
+                    "/join": { "GET": { "file": "$handlers", "function": "channel_join" } },
+                    "/send": { "POST": { "file": "$handlers", "function": "channel_send" } },
+                    "/echo": { "GET": { "file": "$handlers", "function": "echo" } }
+                }
+            }
+        }
+    },
+    "mimetypes": { "text/html": ["html"] }
+}
+JSON
+
+    "$CI_BUILD_DIR/rel/exec/cwfr" -c "$config" -f > "$CI_BUILD_DIR/h2ws-server.log" 2>&1 &
+    local server=$!
+    sleep 2
+
+    if ! kill -0 "$server" 2>/dev/null; then
+        note "server did not start, see $CI_BUILD_DIR/h2ws-server.log"
+        record h2ws FAIL
+        return
+    fi
+
+    local out="$CI_BUILD_DIR/h2ws.txt"
+    python3 "$CORE_DIR/tests/h2ws_probe.py" 127.0.0.1 18099 > "$out" 2>&1
+    local rc=$?
+
+    kill "$server" 2>/dev/null
+    wait "$server" 2>/dev/null
+
+    note "$(tail -1 "$out")"
+
+    if [ "$rc" -eq 0 ]; then
+        record h2ws OK
+    else
+        note "see $out"
+        record h2ws FAIL
+    fi
+}
+
+ALL_STAGES=(noh3 h3unit config startup keepalive limits soak affinity earlydata vn version2 ipv6 qlog priority benchmark asan tsan fuzz reload softreload h2ws h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
@@ -605,6 +698,7 @@ for stage in "${STAGES[@]}"; do
     fuzz)   stage_fuzz ;;
     reload) stage_reload ;;
     softreload) stage_softreload ;;
+    h2ws)   stage_h2ws ;;
     h3spec) stage_h3spec ;;
     *)      echo "unknown stage: $stage" >&2; exit 2 ;;
     esac
