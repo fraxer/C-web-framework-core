@@ -77,6 +77,11 @@ typedef struct {
      * Void pointers rather than the real types: this header is the connection
      * layer and knows nothing about either protocol's response. */
     void (*response_retire)(void* ctx, void* response);
+    /* The same pair for the request object. HTTP/1.1 builds one per request in
+     * the parser and freed it per request too — the last of the three protocols
+     * to do so, now that h2 and h3 take theirs from a pool. */
+    void* request_cache;
+    void (*request_retire)(void* ctx, void* request);
     cqueue_t* queue;
     cqueue_t* broadcast_queue;
     /* Ordered output slots (connection_out_slot_t*), WebSocket only. HTTP/1.1

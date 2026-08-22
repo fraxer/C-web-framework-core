@@ -999,3 +999,66 @@ TEST(test_file_special_chars_filename) {
     file.close(&file);
     cleanup_test_dir();
 }
+
+// ============================================================================
+// The name field is NAME_MAX bytes, and it used to be zeroed in full every time
+// a file_t was created or closed — on the path of every file the server serves.
+// Only the terminator matters, so only the terminator is written; these cases
+// pin down that "only" did not become "not at all".
+// ============================================================================
+
+TEST(test_file_alloc_name_is_empty_string) {
+    TEST_SUITE("file: name handling");
+    TEST_CASE("a fresh file_t has an empty name and no descriptor");
+
+    file_t file = file_alloc();
+
+    TEST_ASSERT_EQUAL(-1, file.fd, "no descriptor");
+    TEST_ASSERT_EQUAL(0, (int)file.ok, "not ok");
+    TEST_ASSERT_EQUAL(0, (int)file.tmp, "not temporary");
+    TEST_ASSERT_EQUAL_SIZE(0, file.size, "no size");
+    TEST_ASSERT_EQUAL(0, (int)file.mode, "no mode");
+    TEST_ASSERT_EQUAL_SIZE(0, strlen(file.name), "the name reads as empty");
+}
+
+TEST(test_file_close_clears_name_and_mode) {
+    TEST_SUITE("file: name handling");
+    TEST_CASE("closing a file leaves nothing of it behind");
+
+    char path[] = "/tmp/cwfr_file_name_XXXXXX";
+    const int fd = mkstemp(path);
+    TEST_REQUIRE(fd >= 0, "temp file created");
+    close(fd);
+
+    file_t file = file_open(path, O_RDONLY);
+    TEST_REQUIRE(file.ok, "file opened");
+    TEST_ASSERT(strlen(file.name) > 0, "an open file knows its name");
+    TEST_ASSERT(file.mode != 0, "and its mode");
+
+    file.close(&file);
+
+    TEST_ASSERT_EQUAL(-1, file.fd, "descriptor released");
+    TEST_ASSERT_EQUAL_SIZE(0, strlen(file.name), "the name reads as empty again");
+    /* REGRESSION: mode was not reset, so a closed file_t kept the type bits of
+     * the file it used to hold — and http_open_file decides "regular file or
+     * directory?" from exactly this field. */
+    TEST_ASSERT_EQUAL(0, (int)file.mode, "and the mode is gone with it");
+
+    unlink(path);
+}
+
+TEST(test_file_name_survives_a_shorter_replacement) {
+    TEST_SUITE("file: name handling");
+    TEST_CASE("a shorter name does not leave the tail of a longer one visible");
+
+    /* The case a partial clear could get wrong: write a long name, then a short
+     * one, and read it back as a string. */
+    file_t file = file_alloc();
+
+    TEST_ASSERT_EQUAL(1, file.set_name(&file, "/tmp/a-considerably-longer-name.txt"),
+                      "long name set");
+    TEST_ASSERT_STR_EQUAL("a-considerably-longer-name.txt", file.name, "and read back");
+
+    TEST_ASSERT_EQUAL(1, file.set_name(&file, "/tmp/s.txt"), "short name set");
+    TEST_ASSERT_STR_EQUAL("s.txt", file.name, "with no tail of the previous one");
+}

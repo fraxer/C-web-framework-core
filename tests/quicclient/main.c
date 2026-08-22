@@ -1021,8 +1021,18 @@ int main(int argc, char* argv[]) {
             memset(&response, 0, sizeof response);
 
             /* Client-initiated bidirectional stream ids: 0, 4, 8, ... */
-            h3_ok = h3client_get(&client, (uint64_t)(4 * i), authority, path,
+            const uint64_t stream_id = (uint64_t)(4 * i);
+            h3_ok = h3client_get(&client, stream_id, authority, path,
                                  timeout_ms, &response);
+
+            /* Let the finished stream go, exactly as quicclient_stream_release
+             * documents: the client has CLIENT_MAX_STREAMS slots, and a
+             * sequence that keeps them all would stop at ~56 requests — the
+             * harness running out, not the server. The peer's credit renews per
+             * closed stream, so releasing is also what keeps MAX_STREAMS
+             * flowing. The last one stays: `response` still points into it. */
+            if (h3_ok && i + 1 < repeat)
+                quicclient_stream_release(&client, stream_id);
         }
 
         if (!h3_ok) printf("FAIL: a request in the sequence did not complete\n");
