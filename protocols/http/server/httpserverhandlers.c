@@ -777,13 +777,27 @@ int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
 
         int vector_size = route->params_count > 0 ? route->params_count * 6 : 20 * 6;
         int vector[vector_size];
-        /* pcre_exec leaves the entries of non-participating capture groups
+        /* pcre2_match leaves the entries of non-participating capture groups
          * untouched, and both the named-param loop below and the static_file
          * template read them; pre-mark every offset as "unset". */
         memset(vector, -1, sizeof(vector));
 
-        // find resource by template
-        int matches_count = pcre_exec(route->location, NULL, request->path, request->path_length, 0, 0, vector, vector_size);
+        // find resource by template (PCRE2)
+        pcre2_match_data* match_data = pcre2_match_data_create_from_pattern(route->location, NULL);
+        if (match_data == NULL) return 0;
+
+        int matches_count = pcre2_match(route->location, (PCRE2_SPTR)request->path, request->path_length, 0, 0, match_data, NULL);
+
+        if (matches_count > 0) {
+            /* Copy ovector to vector for backward compatibility */
+            PCRE2_SIZE* ovector = pcre2_get_ovector_pointer(match_data);
+            int copy_count = (matches_count * 2 < vector_size) ? (matches_count * 2) : vector_size;
+            for (int i = 0; i < copy_count; i++) {
+                vector[i] = (int)ovector[i];
+            }
+        }
+        pcre2_match_data_free(match_data);
+
         if (matches_count < 1) continue;
 
         if (matches_count > 1) {

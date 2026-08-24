@@ -60,9 +60,18 @@ route_t* route_create(const char* dirty_location) {
 
     if (route_parse_location(&parser) == -1) goto failed;
 
-    route->location = pcre_compile(parser.location, 0, &route->location_error, &route->location_erroffset, NULL);
+    int error_code = 0;
+    PCRE2_SIZE error_offset = 0;
+    route->location = pcre2_compile((PCRE2_SPTR)parser.location, PCRE2_ZERO_TERMINATED, 0, &error_code, &error_offset, NULL);
 
-    if (route->location_error != NULL) goto failed;
+    if (route->location == NULL) {
+        /* Get error message */
+        PCRE2_UCHAR error_buffer[256];
+        pcre2_get_error_message(error_code, error_buffer, sizeof(error_buffer));
+        route->location_error = (char*)strdup((char*)error_buffer);
+        route->location_erroffset = (int)error_offset;
+        goto failed;
+    }
 
     route->is_primitive = parser.is_primitive;
     route->params_count = parser.params_count;
@@ -571,7 +580,8 @@ void routes_free(route_t* route) {
         }
 
         if (route->location != NULL)
-            pcre_free(route->location);
+            pcre2_code_free(route->location);
+        free((void*)route->location_error);  /* strdup'd in pcre2_compile error path */
 
         for (int i = 0; i < 7; i++) {
             strtemplate_free(route->static_file[i]);

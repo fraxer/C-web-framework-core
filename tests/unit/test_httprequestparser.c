@@ -7,7 +7,7 @@
 #include "helpers.h"
 #include <string.h>
 #include <stdlib.h>
-#include <pcre.h>
+#include <pcre2.h>
 
 // ============================================================================
 // Mock Configuration and Dependencies

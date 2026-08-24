@@ -106,8 +106,21 @@ int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t
         int vector_size = route->params_count > 0 ? route->params_count * 6 : 20 * 6;
         int vector[vector_size];
 
-        // find resource by template
-        int matches_count = pcre_exec(route->location, NULL, protocol->path, protocol->path_length, 0, 0, vector, vector_size);
+        // find resource by template (PCRE2)
+        pcre2_match_data* match_data = pcre2_match_data_create_from_pattern(route->location, NULL);
+        if (match_data == NULL) return 0;
+
+        int matches_count = pcre2_match(route->location, (PCRE2_SPTR)protocol->path, protocol->path_length, 0, 0, match_data, NULL);
+
+        if (matches_count > 0) {
+            /* Copy ovector to vector for backward compatibility */
+            PCRE2_SIZE* ovector = pcre2_get_ovector_pointer(match_data);
+            int copy_count = (matches_count * 2 < vector_size) ? (matches_count * 2) : vector_size;
+            for (int i = 0; i < copy_count; i++) {
+                vector[i] = (int)ovector[i];
+            }
+        }
+        pcre2_match_data_free(match_data);
 
         if (matches_count > 1) {
             /* Skip the route before materializing its params: a matching

@@ -1,7 +1,7 @@
 #ifndef __ROUTE__
 #define __ROUTE__
 
-#include <pcre.h>
+#include <pcre2.h>
 
 #include "request.h"
 #include "response.h"
@@ -34,7 +34,7 @@ typedef struct route {
     char* path;
     size_t path_length;
     const char* location_error;
-    pcre* location;
+    pcre2_code* location;
     route_param_t* param;
     struct route* next;
     void(*handler[7])(void*);

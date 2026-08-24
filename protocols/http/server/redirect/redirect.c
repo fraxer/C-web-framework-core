@@ -47,7 +47,23 @@ int redirect_matches(redirect_t* redirect, const char* path, size_t length,
     if (redirect->is_literal)
         return __contains(path, length, redirect->literal, redirect->literal_length);
 
-    return pcre_exec(redirect->location, NULL, path, (int)length, 0, 0, vector, vector_size) >= 0;
+    /* PCRE2: need match_data for pcre2_match */
+    pcre2_match_data* match_data = pcre2_match_data_create_from_pattern(redirect->location, NULL);
+    if (match_data == NULL) return 0;
+
+    int rc = pcre2_match(redirect->location, (PCRE2_SPTR)path, length, 0, 0, match_data, NULL);
+
+    if (rc >= 0 && vector != NULL && vector_size > 0) {
+        /* Copy ovector to vector for backward compatibility */
+        PCRE2_SIZE* ovector = pcre2_get_ovector_pointer(match_data);
+        int copy_count = (rc * 2 < vector_size) ? (rc * 2) : vector_size;
+        for (int i = 0; i < copy_count; i++) {
+            vector[i] = (int)ovector[i];
+        }
+    }
+
+    pcre2_match_data_free(match_data);
+    return rc >= 0;
 }
 
 redirect_t* redirect_create(const char* location, const char* destination) {
@@ -57,10 +73,19 @@ redirect_t* redirect_create(const char* location, const char* destination) {
 
     if (redirect == NULL) goto failed;
 
-    redirect->location = pcre_compile(location, 0, &redirect->location_error, &redirect->location_erroffset, NULL);
+    int error_code = 0;
+    PCRE2_SIZE error_offset = 0;
+    redirect->location = pcre2_compile((PCRE2_SPTR)location, PCRE2_ZERO_TERMINATED, 0,
+                                       &error_code, &error_offset, NULL);
 
-    if (redirect->location == NULL) goto failed;
-    if (redirect->location_error != NULL) goto failed;
+    if (redirect->location == NULL) {
+        /* Get error message */
+        PCRE2_UCHAR error_buffer[256];
+        pcre2_get_error_message(error_code, error_buffer, sizeof(error_buffer));
+        redirect->location_error = (char*)strdup((char*)error_buffer);
+        redirect->location_erroffset = (int)error_offset;
+        goto failed;
+    }
 
     if (redirect_check_params(redirect, destination) == -1) goto failed;
 
@@ -121,7 +146,10 @@ redirect_t* redirect_init(const char* destination) {
 int redirect_check_params(redirect_t* redirect, const char* destination) {
     int where = 0;
 
-    if (pcre_fullinfo(redirect->location, NULL, PCRE_INFO_CAPTURECOUNT, &where) != 0) return -1;
+    /* PCRE2: pattern info via pcre2_pattern_info */
+    uint32_t capture_count = 0;
+    if (pcre2_pattern_info(redirect->location, PCRE2_INFO_CAPTURECOUNT, &capture_count) != 0) return -1;
+    where = (int)capture_count;
 
     if (where != redirect->params_count) {
         log_error(REDIRECT_ERROR_CHECK_PARAM, destination);
@@ -140,7 +168,8 @@ void redirect_free(redirect_t* redirect) {
     while (redirect != NULL) {
         redirect_t* redirect_next = redirect->next;
 
-        if (redirect->location) pcre_free(redirect->location);
+        if (redirect->location) pcre2_code_free(redirect->location);
+        free((void*)redirect->location_error);  /* strdup'd in pcre2_compile error path */
 
         free(redirect->literal);
         strtemplate_free(redirect->destination);
