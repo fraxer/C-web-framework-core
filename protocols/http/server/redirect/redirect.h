@@ -1,7 +1,7 @@
 #ifndef __REDIRECT__
 #define __REDIRECT__
 
-#include <pcre.h>
+#include <pcre2.h>
 
 #include "strtemplate.h"
 
@@ -27,7 +27,7 @@ typedef struct redirect {
      * count does not match the capture count of the location. */
     int params_count;
     const char* location_error;
-    pcre* location;
+    pcre2_code* location;
     strtemplate_t* destination;
     struct redirect* next;
 } redirect_t;

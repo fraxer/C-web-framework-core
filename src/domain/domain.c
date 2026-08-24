@@ -66,10 +66,13 @@ int domain_matches(const domain_t* domain, const char* host, size_t length) {
         return 1;
     }
 
-    int vector[DOMAIN_PCRE_VECTOR_SIZE];
+    pcre2_match_data* match_data = pcre2_match_data_create(DOMAIN_PCRE_VECTOR_SIZE / 3, NULL);
+    if (match_data == NULL) return 0;
 
-    return pcre_exec(domain->pcre_template, NULL, host, (int)length, 0, 0,
-                     vector, DOMAIN_PCRE_VECTOR_SIZE) > 0;
+    int rc = pcre2_match(domain->pcre_template, (PCRE2_SPTR)host, length, 0, 0, match_data, NULL);
+    pcre2_match_data_free(match_data);
+
+    return rc > 0;
 }
 
 domain_t* domain_create(const char* value) {
@@ -88,8 +91,18 @@ domain_t* domain_create(const char* value) {
      * Both halves fold now, and they must keep folding the same way: a shortcut
      * that disagrees with the pattern is how a request lands on the wrong
      * server. */
-    domain->pcre_template = pcre_compile(domain->prepared_template, PCRE_CASELESS, &domain->pcre_error, &domain->pcre_erroffset, NULL);
-    if (domain->pcre_template == NULL) goto failed;
+    int error_code = 0;
+    PCRE2_SIZE error_offset = 0;
+    domain->pcre_template = pcre2_compile((PCRE2_SPTR)domain->prepared_template, PCRE2_ZERO_TERMINATED,
+                                          PCRE2_CASELESS, &error_code, &error_offset, NULL);
+    if (domain->pcre_template == NULL) {
+        /* Get error message */
+        PCRE2_UCHAR error_buffer[256];
+        pcre2_get_error_message(error_code, error_buffer, sizeof(error_buffer));
+        domain->pcre_error = (char*)strdup((char*)error_buffer);
+        domain->pcre_erroffset = (int)error_offset;
+        goto failed;
+    }
 
     result = domain;
 
@@ -115,7 +128,8 @@ void domains_free(domain_t* domain) {
             free(domain->prepared_template);
 
         if (domain->pcre_template != NULL)
-            pcre_free(domain->pcre_template);
+            pcre2_code_free(domain->pcre_template);
+        free((void*)domain->pcre_error);  /* strdup'd in pcre2_compile error path */
 
         free(domain);
 

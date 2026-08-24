@@ -40,7 +40,7 @@ list(APPEND FW_LIBS ${CWFR_EXTRA_FW_LIBS})
 
 target_link_libraries(cwfr_framework PRIVATE
 	"-Wl,--whole-archive" ${FW_LIBS} "-Wl,--no-whole-archive"
-	-l:libpcre.so.3 ZLIB::ZLIB OpenSSL::SSL OpenSSL::Crypto
+	${PCRE2_LIBRARIES} ZLIB::ZLIB OpenSSL::SSL OpenSSL::Crypto
 	${LIBXML2_LIBRARIES} ${IDN2_LIBRARIES} ${UNISTRING_LIBRARIES}
 	argon2 Threads::Threads ${CMAKE_DL_LIBS})
 

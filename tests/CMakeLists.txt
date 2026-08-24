@@ -59,7 +59,7 @@ add_executable(
 
 target_link_libraries(runner PRIVATE
     cwfr_framework
-    ${PCRE_LIBRARIES}
+    ${PCRE2_LIBRARIES}
     ${ZLIB_LIBRARIES}
     ${OPENSSL_LIBRARIES}
     idn2

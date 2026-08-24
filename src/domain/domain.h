@@ -1,7 +1,7 @@
 #ifndef __DOMAIN__
 #define __DOMAIN__
 
-#include "pcre.h"
+#include <pcre2.h>
 
 typedef struct domain {
     int pcre_erroffset;
@@ -19,7 +19,7 @@ typedef struct domain {
     size_t ascii_length;
     char* prepared_template;
     const char* pcre_error;
-    pcre* pcre_template;
+    pcre2_code* pcre_template;
     struct domain* next;
 } domain_t;
 

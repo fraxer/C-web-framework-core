@@ -772,7 +772,14 @@ httpresponse_t* __httpclient_self_invoke(httpclient_t* client, server_t* server)
             }
         } else {
             int ovector[vector_size];
-            int rc = pcre_exec(route->location, NULL, path, strlen(path), 0, 0, ovector, vector_size);
+            /* PCRE2: need match_data */
+            pcre2_match_data* match_data = pcre2_match_data_create_from_pattern(route->location, NULL);
+            if (match_data == NULL) {
+                route = route->next;
+                continue;
+            }
+            int rc = pcre2_match(route->location, (PCRE2_SPTR)path, strlen(path), 0, 0, match_data, NULL);
+            pcre2_match_data_free(match_data);
             if (rc >= 0) {
                 matched_route = route;
                 break;
