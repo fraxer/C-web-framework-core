@@ -2,6 +2,27 @@
 #include "route.h"
 #include <string.h>
 
+/* Core migrated from PCRE1 to PCRE2 (pcre2_match with a match_data); the tests
+ * below were written against the pcre_exec call shape. This wrapper keeps
+ * that shape: strlen-based subject, an int ovector, pairs matched as the
+ * return value (negative on no match / error). Unset groups keep whatever the
+ * caller pre-filled the vector with, as pcre_exec did. */
+static int pcre_exec_compat(const pcre2_code* code, const char* subject, int* vector, int veclen) {
+    pcre2_match_data* match_data = pcre2_match_data_create((uint32_t)(veclen / 3), NULL);
+    if (match_data == NULL) return PCRE2_ERROR_NOMEMORY;
+
+    const int rc = pcre2_match(code, (PCRE2_SPTR)subject, (PCRE2_SIZE)strlen(subject), 0, 0, match_data, NULL);
+    if (rc >= 0) {
+        const PCRE2_SIZE* ovector = pcre2_get_ovector_pointer(match_data);
+        for (int i = 0; i < rc * 2; i++)
+            vector[i] = ovector[i] == PCRE2_UNSET ? -1 : (int)ovector[i];
+    }
+
+    pcre2_match_data_free(match_data);
+    return rc;
+}
+
+
 // ============================================================================
 // Route $-anchor tests — ensures routes with params match exactly,
 // not by prefix (e.g. /users/{id} must NOT match /users/42/extra)
@@ -21,11 +42,11 @@ TEST(test_route_param_exact_match) {
     int ovector[30];
 
     // Exact match
-    int rc = pcre_exec(r->location, NULL, "/users/42", 9, 0, 0, ovector, 30);
+    int rc = pcre_exec_compat(r->location, "/users/42", ovector, 30);
     TEST_ASSERT(rc >= 0, "/users/42 should match /users/{id|[0-9]+}");
 
     // Prefix match should fail ($-anchor prevents this)
-    rc = pcre_exec(r->location, NULL, "/users/42/extra", 15, 0, 0, ovector, 30);
+    rc = pcre_exec_compat(r->location, "/users/42/extra", ovector, 30);
     TEST_ASSERT(rc < 0, "/users/42/extra should NOT match /users/{id|[0-9]+}");
 
     routes_free(r);
@@ -40,10 +61,10 @@ TEST(test_route_param_multiple_segments) {
 
     int ovector[30];
 
-    int rc = pcre_exec(r->location, NULL, "/users/1/posts/99", 16, 0, 0, ovector, 30);
+    int rc = pcre_exec_compat(r->location, "/users/1/posts/99", ovector, 30);
     TEST_ASSERT(rc >= 0, "/users/1/posts/99 should match");
 
-    rc = pcre_exec(r->location, NULL, "/users/1/posts/99/comments", 25, 0, 0, ovector, 30);
+    rc = pcre_exec_compat(r->location, "/users/1/posts/99/comments", ovector, 30);
     TEST_ASSERT(rc < 0, "/users/1/posts/99/comments should NOT match");
 
     routes_free(r);
@@ -75,10 +96,10 @@ TEST(test_route_root_param) {
 
     int ovector[30];
 
-    int rc = pcre_exec(r->location, NULL, "/hello", 6, 0, 0, ovector, 30);
+    int rc = pcre_exec_compat(r->location, "/hello", ovector, 30);
     TEST_ASSERT(rc >= 0, "/hello should match /{action|[a-z]+}");
 
-    rc = pcre_exec(r->location, NULL, "/hello/world", 12, 0, 0, ovector, 30);
+    rc = pcre_exec_compat(r->location, "/hello/world", ovector, 30);
     TEST_ASSERT(rc < 0, "/hello/world should NOT match /{action|[a-z]+}");
 
     routes_free(r);
@@ -93,7 +114,7 @@ TEST(test_route_param_with_slash_in_pattern) {
     int ovector[30];
 
     // Exact match with file path
-    int rc = pcre_exec(r->location, NULL, "/files/docs/readme.txt", 22, 0, 0, ovector, 30);
+    int rc = pcre_exec_compat(r->location, "/files/docs/readme.txt", ovector, 30);
     TEST_ASSERT(rc >= 0, "/files/docs/readme.txt should match /files/{path|.+}");
 
     routes_free(r);
@@ -154,16 +175,16 @@ TEST(test_route_param_alternation_in_expression) {
 
     int ovector[30];
 
-    int rc = pcre_exec(r->location, NULL, "/create", 7, 0, 0, ovector, 30);
+    int rc = pcre_exec_compat(r->location, "/create", ovector, 30);
     TEST_ASSERT(rc >= 0, "/create should match first alternative");
 
-    rc = pcre_exec(r->location, NULL, "/delete", 7, 0, 0, ovector, 30);
+    rc = pcre_exec_compat(r->location, "/delete", ovector, 30);
     TEST_ASSERT(rc >= 0, "/delete should match second alternative");
 
-    rc = pcre_exec(r->location, NULL, "/update", 7, 0, 0, ovector, 30);
+    rc = pcre_exec_compat(r->location, "/update", ovector, 30);
     TEST_ASSERT(rc < 0, "/update should NOT match");
 
-    rc = pcre_exec(r->location, NULL, "/create/x", 9, 0, 0, ovector, 30);
+    rc = pcre_exec_compat(r->location, "/create/x", ovector, 30);
     TEST_ASSERT(rc < 0, "/create/x should NOT match");
 
     cleanup:
@@ -178,13 +199,13 @@ TEST(test_route_nested_braces_quantifier) {
 
     int ovector[30];
 
-    int rc = pcre_exec(r->location, NULL, "/n/42", 5, 0, 0, ovector, 30);
+    int rc = pcre_exec_compat(r->location, "/n/42", ovector, 30);
     TEST_ASSERT(rc >= 0, "/n/42 should match [0-9]{2}");
 
-    rc = pcre_exec(r->location, NULL, "/n/4", 4, 0, 0, ovector, 30);
+    rc = pcre_exec_compat(r->location, "/n/4", ovector, 30);
     TEST_ASSERT(rc < 0, "/n/4 should NOT match [0-9]{2}");
 
-    rc = pcre_exec(r->location, NULL, "/n/423", 6, 0, 0, ovector, 30);
+    rc = pcre_exec_compat(r->location, "/n/423", ovector, 30);
     TEST_ASSERT(rc < 0, "/n/423 should NOT match [0-9]{2}");
 
     routes_free(r);
@@ -320,7 +341,7 @@ TEST(test_route_static_file_template) {
     int vector[30];
     memset(vector, -1, sizeof(vector));
 
-    int rc = pcre_exec(r->location, NULL, path, strlen(path), 0, 0, vector, 30);
+    int rc = pcre_exec_compat(r->location, path, vector, 30);
     TEST_ASSERT(rc > 1, "Location should match with a capture group");
 
     char* expanded = strtemplate_expand(r->static_file[ROUTE_GET], path, vector);
@@ -421,7 +442,7 @@ TEST(test_route_multiple_routes_free) {
 /* The compiled pattern, asked directly. */
 static int route_pattern_matches(route_t* route, const char* path) {
     int ovector[30];
-    return pcre_exec(route->location, NULL, path, (int)strlen(path), 0, 0, ovector, 30) >= 0;
+    return pcre_exec_compat(route->location, path, ovector, 30) >= 0;
 }
 
 TEST(test_route_primitive_flag_excludes_metacharacters) {
@@ -524,7 +545,7 @@ TEST(test_route_regex_location_keeps_its_dot) {
 
     int ovector[30];
     const char* path = "/assets/app/style.css";
-    const int rc = pcre_exec(r->location, NULL, path, (int)strlen(path), 0, 0, ovector, 30);
+    const int rc = pcre_exec_compat(r->location, path, ovector, 30);
     TEST_REQUIRE_GOTO(rc > 1, "the pattern matches and captures", cleanup);
     TEST_ASSERT_EQUAL(8, ovector[2], "the capture starts after the prefix");
     TEST_ASSERT_EQUAL((int)strlen(path), ovector[3], "and runs to the end of the path");

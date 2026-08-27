@@ -14,8 +14,13 @@
  * is what checks that domain_matches, which may skip PCRE entirely for a
  * literal template, answers the same. */
 static int pattern_matches(const domain_t* domain, const char* host) {
-    int vector[30];
-    return pcre_exec(domain->pcre_template, NULL, host, (int)strlen(host), 0, 0, vector, 30) > 0;
+    pcre2_match_data* match_data = pcre2_match_data_create(30, NULL);
+    if (match_data == NULL) return 0;
+
+    int rc = pcre2_match(domain->pcre_template, (PCRE2_SPTR)host, (PCRE2_SIZE)strlen(host), 0, 0, match_data, NULL);
+    pcre2_match_data_free(match_data);
+
+    return rc > 0;
 }
 
 /* What the server actually calls, with the same signature the cases use. */

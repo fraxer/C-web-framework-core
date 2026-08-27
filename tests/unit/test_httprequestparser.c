@@ -133,10 +133,10 @@ static void free_mock_connection(connection_t* conn) {
 
 static void setup_mock_domain(void) {
     const char* pattern = "^localhost$";
-    const char* error;
-    int erroffset;
+    int errorcode;
+    PCRE2_SIZE erroffset;
 
-    mock_domain.pcre_template = pcre_compile(pattern, PCRE_CASELESS, &error, &erroffset, NULL);
+    mock_domain.pcre_template = pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED, PCRE2_CASELESS, &errorcode, &erroffset, NULL);
     mock_listener.servers.item = &mock_queue_item;
     mock_listener.servers.last_item = &mock_queue_item;
     mock_listener.servers.size = 1;
@@ -144,7 +144,7 @@ static void setup_mock_domain(void) {
 
 static void cleanup_mock_domain(void) {
     if (mock_domain.pcre_template) {
-        pcre_free(mock_domain.pcre_template);
+        pcre2_code_free(mock_domain.pcre_template);
         mock_domain.pcre_template = NULL;
     }
 }

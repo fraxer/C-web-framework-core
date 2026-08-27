@@ -2,6 +2,27 @@
 #include "redirect.h"
 #include <string.h>
 
+/* Core migrated from PCRE1 to PCRE2 (pcre2_match with a match_data); the tests
+ * below were written against the pcre_exec call shape. This wrapper keeps
+ * that shape: strlen-based subject, an int ovector, pairs matched as the
+ * return value (negative on no match / error). Unset groups keep whatever the
+ * caller pre-filled the vector with, as pcre_exec did. */
+static int pcre_exec_compat(const pcre2_code* code, const char* subject, int* vector, int veclen) {
+    pcre2_match_data* match_data = pcre2_match_data_create((uint32_t)(veclen / 3), NULL);
+    if (match_data == NULL) return PCRE2_ERROR_NOMEMORY;
+
+    const int rc = pcre2_match(code, (PCRE2_SPTR)subject, (PCRE2_SIZE)strlen(subject), 0, 0, match_data, NULL);
+    if (rc >= 0) {
+        const PCRE2_SIZE* ovector = pcre2_get_ovector_pointer(match_data);
+        for (int i = 0; i < rc * 2; i++)
+            vector[i] = ovector[i] == PCRE2_UNSET ? -1 : (int)ovector[i];
+    }
+
+    pcre2_match_data_free(match_data);
+    return rc;
+}
+
+
 // ============================================================================
 // Redirect tests — destination template parsing ({N} tokens) and URI
 // substitution from pcre capture groups.
@@ -20,7 +41,7 @@ static char* redirect_exec_uri(redirect_t* redirect, const char* path) {
     int vector[30];
     memset(vector, -1, sizeof(vector));
 
-    int rc = pcre_exec(redirect->location, NULL, path, strlen(path), 0, 0, vector, 30);
+    int rc = pcre_exec_compat(redirect->location, path, vector, 30);
     if (rc < 0) return NULL;
 
     return redirect_get_uri(redirect, path, vector);
@@ -297,7 +318,7 @@ TEST(test_redirect_free_null_and_chain) {
 static int redirect_pattern_matches(redirect_t* r, const char* path) {
     int vector[30];
     memset(vector, -1, sizeof(vector));
-    return pcre_exec(r->location, NULL, path, (int)strlen(path), 0, 0, vector, 30) >= 0;
+    return pcre_exec_compat(r->location, path, vector, 30) >= 0;
 }
 
 static int redirect_shortcut_matches(redirect_t* r, const char* path) {
