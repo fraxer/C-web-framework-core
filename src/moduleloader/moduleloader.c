@@ -10,6 +10,7 @@
 
 #include "log.h"
 #include "file.h"
+#include "dotenv.h"
 #include "database.h"
 #include "json.h"
 #include "map.h"
@@ -108,6 +109,9 @@ static int __module_loader_thread_workers_load(appconfig_t* config);
 static int __module_loader_thread_handlers_load(appconfig_t* config);
 static void __module_loader_on_shutdown_cb(void);
 static map_t* __module_loader_ratelimits_configs_load(const json_token_t* token_object);
+static char* __module_loader_dotenv_path(const appconfig_t* config, const json_token_t* token_main);
+static int __module_loader_dotenv_pair(const char* key, const char* value, int quoted, void* userdata);
+static json_token_t* __module_loader_dotenv_value(const char* value, int quoted);
 static ratelimiter_config_t* __module_loader_ratelimits_config_load(const json_token_t* token_object);
 static int __module_loader_http_ratelimit_load(const json_token_t* token_string, ratelimiter_t** ratelimiter, map_t* ratelimits_config);
 static int __module_loader_websockets_ratelimit_load(const json_token_t* token_string, ratelimiter_t** ratelimiter, map_t* ratelimits_config);
@@ -267,6 +271,73 @@ int __module_loader_init_modules(appconfig_t* config, json_doc_t* document) {
     }
 
     return result;
+}
+
+/* --- .env file ---------------------------------------------------------- */
+
+/* A .env value has no types: the token type is inferred, so the same key reads
+ * the same from main.env and from a .env line. `quoted` skips the inference --
+ * quotes mean string, whatever the contents look like. */
+static json_token_t* __module_loader_dotenv_value(const char* value, int quoted) {
+    if (quoted)
+        return json_create_string(value);
+
+    if (strcmp(value, "true") == 0 || strcmp(value, "false") == 0)
+        return json_create_bool(strcmp(value, "true") == 0);
+
+    if (*value != '\0' && strpbrk(value, "0123456789") != NULL) {
+        char* end = NULL;
+        const long double number = strtold(value, &end);
+        if (end != value && *end == '\0')
+            return json_create_number(number);
+    }
+
+    return json_create_string(value);
+}
+
+/* <dir of config.json>/<name>, unless the name is absolute. The default name is
+ * ".env"; `main.env_file` overrides it. */
+static char* __module_loader_dotenv_path(const appconfig_t* config, const json_token_t* token_main) {
+    const char* name = ".env";
+
+    const json_token_t* token = json_object_get(token_main, "env_file");
+    if (token != NULL) {
+        if (!json_is_string(token)) {
+            __module_loader_config_error("module_loader_config_load: main.env_file must be string\n");
+            return NULL;
+        }
+        name = json_string(token);
+    }
+
+    const char* slash = strrchr(config->path, '/');
+    if (slash == NULL || name[0] == '/')
+        return strdup(name);
+
+    const size_t dirlen = (size_t)(slash - config->path);
+    char* path = malloc(dirlen + strlen(name) + 2);
+    if (path == NULL) {
+        log_error("module_loader_dotenv_path: memory alloc error\n");
+        return NULL;
+    }
+
+    memcpy(path, config->path, dirlen);
+    path[dirlen] = '/';
+    strcpy(path + dirlen + 1, name);
+
+    return path;
+}
+
+/* Pair callback for dotenv_parse: turns each line into a json token in the
+ * env's custom store. */
+static int __module_loader_dotenv_pair(const char* key, const char* value, int quoted, void* userdata) {
+    json_token_t* token = __module_loader_dotenv_value(value, quoted);
+    if (token == NULL) {
+        log_error("module_loader_dotenv_pair: failed to create value for %s\n", key);
+        return 1;
+    }
+
+    json_object_set(userdata, key, token);
+    return 1;
 }
 
 int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
@@ -501,6 +572,26 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     }
 
 
+    /* The store is created unconditionally: a .env file next to the config is a
+     * source on its own, even when main.env is absent. */
+    env->custom_store = json_root_create_object();
+    if (env->custom_store == NULL) {
+        log_error("module_loader_config_load: failed to create custom_store\n");
+        goto failed;
+    }
+    json_token_t* store_root = json_root(env->custom_store);
+
+    /* .env first, then main.env overrides it key by key -- the config file wins,
+     * so a deployment can pin a value without editing the shared .env. */
+    char* dotenv_path = __module_loader_dotenv_path(config, token_main);
+    if (dotenv_path != NULL) {
+        char* dotenv_data = dotenv_load(dotenv_path);
+        if (dotenv_data != NULL)
+            dotenv_parse(dotenv_data, dotenv_path, __module_loader_dotenv_pair, store_root);
+        free(dotenv_data);
+        free(dotenv_path);
+    }
+
     const json_token_t* token_env = json_object_get(token_main, "env");
     if (token_env != NULL) {
         if (!json_is_object(token_env)) {
@@ -508,13 +599,6 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
             goto failed;
         }
 
-        env->custom_store = json_root_create_object();
-        if (env->custom_store == NULL) {
-            log_error("module_loader_config_load: failed to create custom_store\n");
-            goto failed;
-        }
-
-        json_token_t* store_root = json_root(env->custom_store);
         for (json_it_t it = json_init_it(token_env); !json_end_it(&it); it = json_next_it(&it)) {
             const char* key = json_it_key(&it);
             json_token_t* value = json_it_value(&it);
