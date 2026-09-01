@@ -195,6 +195,43 @@ TEST(test_quic_frame_ack) {
     TEST_ASSERT(f.u.ack.ect0 == 1 && f.u.ack.ect1 == 2 && f.u.ack.ce == 3, "counts");
     TEST_ASSERT(off == sizeof ecn, "consumed");
 
+    TEST_CASE("hostile ACK encodings are rejected without partial consumption");
+    /* These are bytes a connected peer can send to the server after AEAD:
+     * false range counts, truncated ECN counters and ranges whose relative
+     * arithmetic would cross packet number zero. */
+    static const struct {
+        const uint8_t bytes[16];
+        size_t len;
+    } hostile[] = {
+        { { 0x02, 0x00, 0x00, 0x01, 0x00 }, 5 },       /* missing range */
+        { { 0x02, 0x00, 0x00, 0x00, 0x01 }, 5 },       /* first > largest */
+        { { 0x02, 0x03, 0x00, 0x01, 0x00, 0x03, 0x00 }, 7 }, /* gap below 0 */
+        { { 0x03, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02 }, 7 }, /* missing CE */
+        { { 0x02, 0x00, 0x00, 0x40 }, 4 },             /* cut range count varint */
+        { { 0x02, 0x00, 0x00, 0x01, 0x00, 0x40 }, 6 }  /* cut gap varint */
+    };
+    int hostile_rejected = 1;
+    for (size_t i = 0; i < sizeof hostile / sizeof hostile[0]; i++) {
+        off = 0;
+        if (quicframe_next(hostile[i].bytes, hostile[i].len, &off, &f) !=
+                QUICFRAME_ERR_ENCODING || off != 0) {
+            hostile_rejected = 0;
+            break;
+        }
+    }
+    TEST_ASSERT(hostile_rejected, "all malformed peer ACKs are rejected atomically");
+
+    TEST_CASE("every truncated prefix of ACK_ECN is rejected");
+    int prefixes_rejected = 1;
+    for (size_t len = 1; len < sizeof ecn; len++) {
+        off = 0;
+        if (quicframe_next(ecn, len, &off, &f) != QUICFRAME_ERR_ENCODING || off != 0) {
+            prefixes_rejected = 0;
+            break;
+        }
+    }
+    TEST_ASSERT(prefixes_rejected, "no truncated ACK_ECN reaches server state");
+
     TEST_CASE("writer round trip over several blocks");
     const quicack_block_t blocks[] = {
         { .largest = 100, .smallest = 98 },

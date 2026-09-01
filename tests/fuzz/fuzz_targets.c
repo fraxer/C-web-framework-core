@@ -56,7 +56,12 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
 /* A decrypted packet payload. Reached only after AEAD, but "authenticated" here
  * means the peer holds the keys -- it says nothing about the bytes being
- * well-formed, and a peer that has completed a handshake is still a peer. */
+ * well-formed, and a peer that has completed a handshake is still a peer.
+ *
+ * ACK gets more than the usual "did not crash" check.  Its ranges are
+ * attacker-controlled relative arithmetic used by loss recovery; accepting an
+ * overlapping, ascending or wrapped range could make the server discard data
+ * that never reached the peer. */
 int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     size_t off = 0;
     quicframe_t frame;
@@ -64,6 +69,31 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     for (;;) {
         const quicframe_status_e st = quicframe_next(data, size, &off, &frame);
         if (st != QUICFRAME_OK) break;
+
+        if (frame.type == QUIC_FRAME_ACK || frame.type == QUIC_FRAME_ACK_ECN) {
+            quicack_iter_t it;
+            quicack_block_t block;
+            quicack_iter_init(&frame, &it);
+
+            uint64_t previous_smallest = 0;
+            uint64_t count = 0;
+            int r;
+            while ((r = quicack_iter_next(&it, &block)) == 1) {
+                if (block.smallest > block.largest) __builtin_trap();
+                if (count > 0 && (block.largest >= previous_smallest ||
+                                  previous_smallest - block.largest < 2))
+                    __builtin_trap();
+
+                previous_smallest = block.smallest;
+                count++;
+            }
+
+            /* quicframe_next promises that a successful ACK has already been
+             * validated completely.  The iterator must therefore neither
+             * fail nor expose fewer/more ranges than the peer declared. */
+            if (r != 0 || count != frame.u.ack.range_count + 1)
+                __builtin_trap();
+        }
     }
 
     return 0;
