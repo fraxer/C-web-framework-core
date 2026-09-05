@@ -77,6 +77,7 @@ typedef struct h2stream {
 
     size_t  req_body_len;   /* DATA bytes spooled into request->payload_.file */
     int64_t content_length; /* declared, or -1 when the request carried none */
+    uint64_t request_progress_ms; /* last request-body progress, independent of PING */
 
     /* Scheduling: bytes this stream may still put on the wire during the current
      * write turn. Refilled per turn by the write path, spent by the write filter,

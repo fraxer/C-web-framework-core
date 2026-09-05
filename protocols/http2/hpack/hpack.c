@@ -409,13 +409,17 @@ hpack_encoder_t* hpack_encoder_create(size_t max_table_size) {
     if (e == NULL) return NULL;
     hpack_dynamic_table_init(&e->table, max_table_size);
     e->pending_size_update = SIZE_MAX;
+    e->pending_min_size = SIZE_MAX;
     return e;
 }
 
 void hpack_encoder_set_max_table_size(hpack_encoder_t* e, size_t max_table_size) {
     if (max_table_size > e->table.hard_max) max_table_size = e->table.hard_max;
     if (max_table_size == e->table.max) return;
+    if (max_table_size < e->pending_min_size) e->pending_min_size = max_table_size;
     e->pending_size_update = max_table_size;
+    /* Evict immediately, including when more SETTINGS arrive before encoding. */
+    hpack_dynamic_table_set_max(&e->table, max_table_size);
 }
 
 void hpack_encoder_free(hpack_encoder_t* e) {
@@ -481,13 +485,15 @@ hpack_status_e hpack_encoder_encode(hpack_encoder_t* e,
 
     /* Dynamic table size update (RFC §6.3) must lead the block. */
     if (e->pending_size_update != SIZE_MAX) {
-        if (!bb_encode_int(&b, (uint32_t)e->pending_size_update, 5, 0x20)) {
+        if ((e->pending_min_size < e->pending_size_update &&
+             !bb_encode_int(&b, (uint32_t)e->pending_min_size, 5, 0x20)) ||
+            !bb_encode_int(&b, (uint32_t)e->pending_size_update, 5, 0x20)) {
             free(b.data);
             *out = NULL; *out_len = 0;
             return HPACK_ERR_MEMORY;
         }
-        hpack_dynamic_table_set_max(&e->table, e->pending_size_update);
         e->pending_size_update = SIZE_MAX;
+        e->pending_min_size = SIZE_MAX;
     }
 
     for (size_t i = 0; i < count; i++) {

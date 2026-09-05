@@ -127,7 +127,9 @@ static int parse_content_length(const char* value, size_t len, int64_t* out) {
     int64_t n = 0;
     for (size_t i = 0; i < len; i++) {
         if (value[i] < '0' || value[i] > '9') return 0;
-        n = n * 10 + (value[i] - '0');
+        const int digit = value[i] - '0';
+        if (n > (INT64_MAX - digit) / 10) return 0;
+        n = n * 10 + digit;
     }
 
     *out = n;

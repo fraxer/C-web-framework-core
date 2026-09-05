@@ -51,6 +51,7 @@ _Static_assert(sizeof(hpack_header_t) == sizeof(httpfields_field_t),
 #define H2_ERR_STREAM_CLOSED      5
 #define H2_ERR_FRAME_SIZE_ERROR   6
 #define H2_ERR_REFUSED_STREAM     7
+#define H2_ERR_CANCEL            8
 #define H2_ERR_COMPRESSION_ERROR  9
 #define H2_ERR_ENHANCE_YOUR_CALM  11
 
@@ -173,6 +174,7 @@ static uint32_t h2_idle_timeout_sec = H2_DEFAULT_IDLE_TIMEOUT_SEC;
 static uint32_t h2_ping_interval_sec = 0;
 static uint32_t h2_ping_ack_timeout_sec = H2_DEFAULT_PING_ACK_TIMEOUT_SEC;
 static uint32_t h2_settings_ack_timeout_sec = H2_DEFAULT_SETTINGS_ACK_TIMEOUT_SEC;
+static uint32_t h2_request_timeout_sec = 120;
 static int64_t  h2_recv_window_initial = H2_DEFAULT_WINDOW;
 static int64_t  h2_recv_window_max = H2_DEFAULT_RECV_WINDOW_MAX;
 static int64_t  h2_write_quantum = H2_DEFAULT_WRITE_QUANTUM;
@@ -203,6 +205,8 @@ static size_t h2_header_block_cap(void) {
 }
 
 void h2_policy_init(void) {
+    const int request_timeout = env_get_int("http2_request_timeout_sec", 120);
+    h2_request_timeout_sec = request_timeout > 0 ? (uint32_t)request_timeout : 0;
     h2_idle_timeout_sec = (uint32_t)env_get_int("http2_idle_timeout_sec", H2_DEFAULT_IDLE_TIMEOUT_SEC);
     h2_ping_interval_sec = (uint32_t)env_get_int("http2_ping_interval_sec", 0);
     /* Default ack grace: the interval itself, capped so a stuck peer is caught
@@ -576,6 +580,7 @@ static int h2_recv_debit(h2_recv_window_t* w, uint32_t len) {
  * only the initial value, so the difference has to go out as a WINDOW_UPDATE). */
 static void h2_stream_recv_init(h2session_t* s, h2stream_t* stream) {
     stream->recv.epoch_ms = h2_now_ms();
+    stream->request_progress_ms = stream->recv.epoch_ms;
     /* SETTINGS_INITIAL_WINDOW_SIZE is all the peer credits a new stream with;
      * anything this connection has already learned above that is only ours to
      * count once the WINDOW_UPDATE below has been queued. */
@@ -1505,6 +1510,22 @@ static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
     return h2_dispatch(s, stream);
 }
 
+static h2_frame_result_e h2_finish_rejected_headers(h2session_t* s, uint32_t stream_id,
+                                                   const uint8_t* block, size_t len,
+                                                   uint32_t error) {
+    const h2_request_status_e status = h2_discard_header_block(s, block, len);
+    if (status != H2_REQUEST_OK)
+        return h2_conn_error(s, status == H2_REQUEST_TOO_LARGE_HARD ?
+                             H2_ERR_ENHANCE_YOUR_CALM : H2_ERR_COMPRESSION_ERROR);
+
+    /* Every rejected block costs decoding work, including self-dependencies. */
+    if (!h2_abort_budget_spend(s)) {
+        metrics_h2_abuse(METRICS_H2_RST_FLOOD);
+        return h2_conn_error(s, H2_ERR_ENHANCE_YOUR_CALM);
+    }
+    return h2_stream_error(s, stream_id, error);
+}
+
 static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) {
     /* §5.1.1: client-initiated streams are odd-numbered, and ids only ever
      * increase — reusing a closed one is a connection error. */
@@ -1560,32 +1581,13 @@ static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) 
           * announced it is going away. Refusing keeps the drain finite: every
           * accepted stream would push the close back another response. */
          s->peer_goaway);
-    if (self_dependent || refused || half_closed) {
-        if (frame->flags & H2_FLAG_END_HEADERS) {
-            const h2_request_status_e status = h2_discard_header_block(s, block, block_len);
-            if (status != H2_REQUEST_OK)
-                return h2_conn_error(s, status == H2_REQUEST_TOO_LARGE_HARD ?
-                                     H2_ERR_ENHANCE_YOUR_CALM : H2_ERR_COMPRESSION_ERROR);
-        }
-
+    const uint32_t reject_error = half_closed ? H2_ERR_STREAM_CLOSED :
+        refused ? H2_ERR_REFUSED_STREAM : self_dependent ? H2_ERR_PROTOCOL_ERROR : 0;
+    if (reject_error != 0) {
         if (frame->stream_id > s->last_stream_id) s->last_stream_id = frame->stream_id;
-
-        /* A refusal is work the peer made us do for a stream it never got to
-         * hold, exactly like a reset — same budget (phase A.2). Charged after
-         * the block is decoded, so the HPACK table is in step either way.
-         *
-         * A half-closed stream is not charged: the reset below drops it from the
-         * table, so the next block on that id is a "closed" stream and ends the
-         * connection anyway. One per id is not a loop. */
-        if (refused && !h2_abort_budget_spend(s)) {
-            metrics_h2_abuse(METRICS_H2_RST_FLOOD);
-            log_error("h2: refused-stream budget exhausted (fd %d)\n", s->connection->fd);
-            return h2_conn_error(s, H2_ERR_ENHANCE_YOUR_CALM);
-        }
-
-        return h2_stream_error(s, frame->stream_id,
-                               half_closed ? H2_ERR_STREAM_CLOSED :
-                               refused ? H2_ERR_REFUSED_STREAM : H2_ERR_PROTOCOL_ERROR);
+        if (frame->flags & H2_FLAG_END_HEADERS)
+            return h2_finish_rejected_headers(s, frame->stream_id, block, block_len,
+                                               reject_error);
     }
 
     if (!(frame->flags & H2_FLAG_END_HEADERS)) {
@@ -1600,6 +1602,8 @@ static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) 
         s->cont_stream_id = frame->stream_id;
         s->cont_end_stream = end_stream;
         s->cont_active = 1;
+        s->cont_reject_error = reject_error;
+        s->cont_started_ms = h2_now_ms();
         s->cont_frames = 1; /* this HEADERS counts towards the block's frame budget */
 
         return H2_FRAME_OK;
@@ -1635,6 +1639,10 @@ static h2_frame_result_e h2_on_continuation(h2session_t* s, const h2_frame_t* fr
     if (!(frame->flags & H2_FLAG_END_HEADERS)) return H2_FRAME_OK;
 
     s->cont_active = 0;
+
+    if (s->cont_reject_error != 0)
+        return h2_finish_rejected_headers(s, s->cont_stream_id, s->cont, s->cont_len,
+                                           s->cont_reject_error);
 
     return h2_on_header_block(s, s->cont_stream_id, s->cont, s->cont_len, s->cont_end_stream);
 }
@@ -1716,6 +1724,8 @@ static h2_frame_result_e h2_on_data(h2session_t* s, const h2_frame_t* frame) {
 
     if (!h2_body_append(stream, data, data_len))
         return h2_stream_error(s, stream->id, H2_ERR_INTERNAL_ERROR);
+
+    if (data_len != 0) stream->request_progress_ms = h2_now_ms();
 
     if (!(frame->flags & H2_FLAG_END_STREAM)) return H2_FRAME_OK;
 
@@ -1911,7 +1921,7 @@ static int h2_has_writable(const h2session_t* s) {
  * bootstrap, where __read had already recv'd the preface into connection->buffer
  * — and run the frame parser over them. On a connection error h2_fail() will have
  * queued a GOAWAY; the caller flushes it. Returns 0 on a connection error. */
-static int h2_session_feed(h2session_t* s, const uint8_t* data, size_t len) {
+int h2_session_feed(h2session_t* s, const uint8_t* data, size_t len) {
     if (s->read_len + len > s->read_cap) {
         size_t cap = s->read_cap ? s->read_cap : 16384;
         while (cap < s->read_len + len) cap *= 2;
@@ -2596,6 +2606,42 @@ void h2_server_tick(connection_t* connection, int shutdown_now) {
     connection_server_ctx_t* ctx = connection->ctx;
     h2session_t* s = ctx->parser;
     const uint64_t now = h2_now_ms();
+
+    /* Connection activity is not request progress: another stream or PING can
+     * keep a stalled upload alive forever. Bound incomplete field blocks by a
+     * deadline and body reads by their own inactivity clock. Tunnels and queued
+     * handlers have separate lifetimes and are not upload timeouts. */
+    if (h2_request_timeout_sec != 0) {
+        const uint64_t timeout_ms = (uint64_t)h2_request_timeout_sec * 1000u;
+        if (s->cont_active && now - s->cont_started_ms >= timeout_ms) {
+            h2_queue_goaway(s, H2_ERR_ENHANCE_YOUR_CALM);
+            (void)h2_flush_out(s);
+            connection_close_locked(connection);
+            return;
+        }
+        int expired = 0;
+        for (h2stream_t* stream = s->streams; stream != NULL;) {
+            h2stream_t* next = stream->next;
+            if (stream->state == H2_STREAM_OPEN && !stream->rejected &&
+                stream->ws == NULL && stream->request_progress_ms != 0 &&
+                now - stream->request_progress_ms >= timeout_ms) {
+                if (s->cont_active && s->cont_stream_id == stream->id)
+                    s->cont_reject_error = H2_ERR_STREAM_CLOSED;
+                if (h2_stream_error(s, stream->id, H2_ERR_CANCEL) != H2_FRAME_OK) {
+                    connection_close_locked(connection);
+                    return;
+                }
+                expired = 1;
+            }
+            stream = next;
+        }
+        if (expired) {
+            if (h2_flush_out(s) == 0) {
+                connection_close_locked(connection);
+                return;
+            }
+        }
+    }
 
     if (shutdown_now) {
         /* Tell the peer we will accept no new streams, then let the ones in

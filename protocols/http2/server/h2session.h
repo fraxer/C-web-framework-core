@@ -78,6 +78,8 @@ typedef struct h2session {
     uint32_t cont_stream_id;
     int      cont_end_stream;
     int      cont_active;
+    uint32_t cont_reject_error; /* decode a refused block before resetting it */
+    uint64_t cont_started_ms;
     /* Frames in the block being accumulated, HEADERS included. The byte limit
      * above bounds memory but not work: an empty CONTINUATION adds nothing to
      * cont_len and can be repeated forever (docs/http2/08, phase A.3). */
@@ -321,5 +323,10 @@ void h2_server_stream_release(connection_t* connection, h2stream_t* stream);
  * it should capture connection->next beforehand. shutdown_now is
  * appconfig->shutdown. */
 void h2_server_tick(connection_t* connection, int shutdown_now);
+
+/* Feed received wire bytes while holding the connection lock. Returns 0 when
+ * the transport must close; otherwise retains incomplete frames for the next
+ * call. Also used by the prior-knowledge bootstrap. */
+int h2_session_feed(h2session_t* session, const uint8_t* data, size_t len);
 
 #endif

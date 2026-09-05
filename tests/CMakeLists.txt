@@ -88,6 +88,16 @@ endif()
 
 add_test(NAME core_tests COMMAND runner)
 
+# HTTP/2 regressions can run independently of database and HTTP client suites.
+set(H2_UNIT_TEST_FILES ${UNIT_TEST_FILES})
+list(FILTER H2_UNIT_TEST_FILES INCLUDE REGEX "/test_(h2|hpack|httpfields)")
+add_executable(h2_runner
+    unit/runner.c ${H2_UNIT_TEST_FILES}
+    unit/h3_config_stubs.c unit/httpclient_stubs.c unit/mail_stubs.c)
+target_link_libraries(h2_runner PRIVATE cwfr_framework
+    ${OPENSSL_LIBRARIES} Threads::Threads ${CMAKE_DL_LIBS})
+add_test(NAME h2_unit_tests COMMAND h2_runner)
+
 # A small protocol-only runner keeps the QUIC/H3/QPACK signal visible when an
 # unrelated framework regression breaks the broad runner.  It is an additional
 # gate, not a replacement for core_tests.

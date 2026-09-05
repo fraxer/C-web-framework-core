@@ -76,6 +76,30 @@ TEST(test_httpfields_content_length) {
     httprequest_free(r);
 }
 
+TEST(test_httpfields_content_length_overflow) {
+    TEST_SUITE("httpfields");
+    TEST_CASE("content-length cannot overflow the signed body-length sentinel");
+    const char* values[] = {"9223372036854775807", "9223372036854775808",
+                            "9999999999999999999"};
+    for (size_t i = 0; i < sizeof values / sizeof values[0]; i++) {
+        const httpfields_field_t fields[] = {
+            F(":method", "POST"), F(":path", "/"), F(":scheme", "https"),
+            F(":authority", "example.com"), F("content-length", values[i]),
+        };
+        for (int p = HTTP_FIELDS_H2; p <= HTTP_FIELDS_H3; p++) {
+            httprequest_t* r = httprequest_create(NULL);
+            TEST_REQUIRE(r != NULL, "request created");
+            int64_t cl = -1;
+            const http_fields_status_e st = httpfields_to_request(
+                r, fields, sizeof fields / sizeof fields[0], p, &cl);
+            TEST_ASSERT(st == (i == 0 ? HTTP_FIELDS_OK : HTTP_FIELDS_MALFORMED),
+                        "INT64_MAX accepted, larger lengths rejected");
+            if (i == 0) TEST_ASSERT(cl == INT64_MAX, "maximum preserved exactly");
+            httprequest_free(r);
+        }
+    }
+}
+
 TEST(test_httpfields_violations) {
     TEST_SUITE("httpfields");
 

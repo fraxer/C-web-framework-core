@@ -827,6 +827,47 @@ TEST(test_hpack_ordinary_field_still_indexed) {
     hpack_encoder_free(e);
 }
 
+TEST(test_hpack_multiple_table_size_updates) {
+    TEST_SUITE("hpack");
+    TEST_CASE("a shrink followed by a raise evicts and announces both sizes");
+    hpack_encoder_t* e = hpack_encoder_create(4096);
+    hpack_decoder_t* d = hpack_decoder_create(4096);
+    TEST_REQUIRE(e != NULL && d != NULL, "codecs created");
+    hpack_header_t field = {(char*)"x-test", 6, (char*)"value", 5, 0};
+    uint8_t* block = NULL;
+    size_t len = 0, count = 0;
+    hpack_header_t* out = NULL;
+    TEST_REQUIRE(hpack_encoder_encode(e, &field, 1, 0, &block, &len) == HPACK_OK,
+                 "seed encoded");
+    TEST_REQUIRE(hpack_decoder_decode(d, block, len, 0, &out, &count) == HPACK_OK,
+                 "seed decoded");
+    free(block);
+    hpack_headers_free(out, count);
+
+    hpack_encoder_set_max_table_size(e, 0);
+    hpack_encoder_set_max_table_size(e, 128);
+    hpack_encoder_set_max_table_size(e, 4096);
+    TEST_REQUIRE(hpack_encoder_encode(e, &field, 1, 0, &block, &len) == HPACK_OK,
+                 "next block encoded");
+    const uint8_t* p = block;
+    hpack_status_e st;
+    TEST_ASSERT(len >= 4 && block[0] == 0x20, "smallest size zero leads the block");
+    (void)hpack_decode_int(&p, block + len, 5, &st);
+    const uint32_t final_size = hpack_decode_int(&p, block + len, 5, &st);
+    TEST_ASSERT(st == HPACK_OK && final_size == 4096, "final size follows minimum");
+    TEST_ASSERT(e->table.max == 4096, "latest setting wins");
+    /* The peer has already evicted entries when it reduced its table. */
+    TEST_ASSERT(hpack_dynamic_table_set_max(&d->table, 0) == HPACK_OK, "peer shrinks");
+    TEST_ASSERT(hpack_dynamic_table_set_max(&d->table, 4096) == HPACK_OK, "peer raises");
+    TEST_REQUIRE(hpack_decoder_decode(d, block, len, 0, &out, &count) == HPACK_OK,
+                 "no reference to an evicted entry");
+    TEST_ASSERT(count == 1 && hdr_eq(&out[0], "x-test", "value"), "field preserved");
+    hpack_headers_free(out, count);
+    free(block);
+    hpack_decoder_free(d);
+    hpack_encoder_free(e);
+}
+
 TEST(test_hpack_never_indexed_roundtrip) {
     TEST_CASE("the decoder reports how the peer classified the field");
 

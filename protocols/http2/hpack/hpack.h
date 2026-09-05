@@ -106,6 +106,9 @@ typedef struct hpack_encoder {
     /* Pending dynamic table size update (RFC §6.3), emitted at the head of the
      * next block. SIZE_MAX = none pending. */
     size_t pending_size_update;
+    /* RFC 7541 §4.2: also announce the smallest intervening size, so entries
+     * evicted during a shrink cannot survive a subsequent raise at the peer. */
+    size_t pending_min_size;
 } hpack_encoder_t;
 
 hpack_encoder_t* hpack_encoder_create(size_t max_table_size);
