@@ -160,7 +160,20 @@ quicframe_status_e quicframe_next(const uint8_t* buf, size_t len, size_t* off,
     memset(out, 0, sizeof * out);
 
     uint64_t type = 0;
-    READ_VARINT(type);
+    const size_t type_len = varint_read(buf + p, len - p, &type);
+    if (type_len == 0) return QUICFRAME_ERR_ENCODING;
+
+    /* §12.4 carves out the one exception to "any encoding is legal on input":
+     * a frame type MUST use the shortest form. Accepting `0x40 0x08` as a
+     * STREAM frame is not merely lax -- the padded forms are how a frame type
+     * is smuggled past a middlebox that inspects the short one, and the rule
+     * exists so that parsers need not agree on which spelling they saw.
+     *
+     * It also makes the PADDING run below exact: `p - 1` is the type byte only
+     * because a type of 0 can no longer arrive as two bytes. */
+    if (type_len != varint_size(type)) return QUICFRAME_ERR_ENCODING;
+
+    p += type_len;
     out->type = type;
 
     if (type >= QUIC_FRAME_STREAM && type < QUIC_FRAME_STREAM + 8) {

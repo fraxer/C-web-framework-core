@@ -85,12 +85,27 @@ int quicrange_add(quicrange_t* r, uint64_t start, uint64_t end) {
      * every one of them is what an attacker sending a comb of gaps wants. */
     if (r->max_spans != 0 && r->count > r->max_spans) {
         const size_t drop = r->count - r->max_spans;
+
+        /* Remember how far the set has forgotten, so a duplicate check can tell
+         * "never seen" from "no longer remembered" (quicrange.h). */
+        const uint64_t dropped_upto = r->spans[drop - 1].end;
+        if (!r->has_evicted || dropped_upto > r->evicted_upto) {
+            r->evicted_upto = dropped_upto;
+            r->has_evicted = 1;
+        }
+
         memmove(&r->spans[0], &r->spans[drop],
                 (r->count - drop) * sizeof * r->spans);
         r->count -= drop;
     }
 
     return 1;
+}
+
+int quicrange_evicted(const quicrange_t* r, uint64_t value) {
+    if (r == NULL || !r->has_evicted) return 0;
+
+    return value <= r->evicted_upto;
 }
 
 int quicrange_remove(quicrange_t* r, uint64_t start, uint64_t end) {
@@ -173,6 +188,14 @@ int quicrange_at_desc(const quicrange_t* r, size_t index, quicrange_span_t* out)
     if (r == NULL || out == NULL || index >= r->count) return 0;
 
     *out = r->spans[r->count - 1 - index];
+
+    return 1;
+}
+
+int quicrange_at_asc(const quicrange_t* r, size_t index, quicrange_span_t* out) {
+    if (r == NULL || out == NULL || index >= r->count) return 0;
+
+    *out = r->spans[index];
 
     return 1;
 }

@@ -125,6 +125,7 @@ static void __qlog_cc_state_update(quicconn_t* conn, uint64_t now_us) {
 
 static int __key_update_arm(quicconn_t* conn);
 static void __cids_replenish(quicconn_t* conn);
+static void __peer_cid_retire(quicconn_t* conn, uint64_t seq);
 static int __path_same(const quicpath_t* a, const quicpath_t* b);
 static void __path_probe_succeed(quicconn_t* conn);
 
@@ -769,6 +770,12 @@ static void __requeue_lost(quicconn_t* conn, quic_enc_level_e level,
                     break;
                 }
         }
+        else if (ref->type == QUIC_FRAME_RETIRE_CONNECTION_ID) {
+            /* §13.3, the mirror of the case above: a retirement the peer never
+             * heard is a sequence number it holds reserved forever. Back on the
+             * queue, which dedupes against anything already owed. */
+            __peer_cid_retire(conn, ref->offset);
+        }
         else if (ref->type == QUIC_FRAME_DATA_BLOCKED ||
                  ref->type == QUIC_FRAME_STREAM_DATA_BLOCKED) {
             /* §13.3: still blocked means still worth saying. Clearing the latch
@@ -1199,20 +1206,6 @@ static int __on_stream_frame(quicconn_t* conn, const quicframe_t* frame,
         }
     }
 
-    /* Connection-level flow control is separate from the stream's and applies
-     * to the same bytes: it is what stops a peer opening many streams and
-     * using each one's full window. */
-    const uint64_t end = frame->u.stream.offset + frame->u.stream.len;
-    const uint64_t previous = s->recv.max_offset;
-
-    if (end > previous) {
-        const uint64_t added = end - previous;
-        if (!quicflow_record_received(&conn->recv_flow, conn->recv_flow.used + added)) {
-            quicconn_close(conn, QUIC_FLOW_CONTROL_ERROR, 0, now_us);
-            return 0;
-        }
-    }
-
     /* The mirror of `send`: the request as it reaches the transport. A
      * connection that completes its handshake, keeps receiving packets and
      * never answers is either one whose request never arrived or one whose
@@ -1225,6 +1218,11 @@ static int __on_stream_frame(quicconn_t* conn, const quicframe_t* frame,
               (unsigned long long)id, (unsigned long long)frame->u.stream.offset,
               (unsigned long long)frame->u.stream.len, frame->u.stream.fin);
 
+    /* What this stream had already charged, so the connection is charged the
+     * difference and never the same bytes twice -- the same shape the
+     * RESET_STREAM handler uses. */
+    const uint64_t counted = s->recv_flow.used;
+
     const quicstream_err_t err =
         quicstream_on_data(s, frame->u.stream.offset, frame->u.stream.data,
                            (size_t)frame->u.stream.len, frame->u.stream.fin);
@@ -1234,11 +1232,129 @@ static int __on_stream_frame(quicconn_t* conn, const quicframe_t* frame,
         return 0;
     }
 
+    /* Connection-level flow control is separate from the stream's and applies
+     * to the same bytes: it is what stops a peer opening many streams and
+     * using each one's full window.
+     *
+     * Charged by what the *stream* accepted, not by the frame's own extent.
+     * The two agree for every ordinary frame, and differ for one the stream
+     * discards -- data past the final size of a stream the peer has reset. The
+     * old form measured such a frame against the receive buffer's high-water
+     * mark, which a reset stream stops moving, so every retransmission of it
+     * was charged again and the connection could be walked into a
+     * FLOW_CONTROL_ERROR of its own making. */
+    const uint64_t added = s->recv_flow.used > counted ? s->recv_flow.used - counted : 0;
+
+    if (added > 0 &&
+        !quicflow_record_received(&conn->recv_flow, conn->recv_flow.used + added)) {
+        quicconn_close(conn, QUIC_FLOW_CONTROL_ERROR, 0, now_us);
+        return 0;
+    }
+
     /* This is what moves a stream's receive window and so the only thing that
      * can make it owe a MAX_STREAM_DATA. Raised unconditionally rather than by
      * asking quicflow_should_update here: the answer changes as the application
      * drains the stream, and the cheap place to ask is the send path, once. */
     atomic_store_explicit(&conn->stream_flow_pending, 1, memory_order_release);
+
+    return 1;
+}
+
+/* Queue a RETIRE_CONNECTION_ID for a peer id we have stopped using (§5.1.2).
+ *
+ * Silently dropped when the queue is full, and that is the right failure: the
+ * queue holds two full tables, so filling it means the peer has issued more ids
+ * than it allowed us to hold and is not waiting on any one retirement in
+ * particular. */
+static void __peer_cid_retire(quicconn_t* conn, uint64_t seq) {
+    for (size_t i = 0; i < conn->retire_queue_len; i++)
+        if (conn->retire_queue[i] == seq) return;   /* already owed */
+
+    if (conn->retire_queue_len >= sizeof conn->retire_queue / sizeof conn->retire_queue[0])
+        return;
+
+    conn->retire_queue[conn->retire_queue_len++] = seq;
+
+    /* Not counted in ctrl_owed: that count exists to force the *stream* walk
+     * for a stream owing a terminal frame, and this frame is written well
+     * before that walk. want_write is the whole of what it needs. */
+    atomic_store_explicit(&conn->want_write, 1, memory_order_release);
+}
+
+/* Drop every peer id below `retire_prior_to`, owing a frame for each (§5.1.2).
+ *
+ * Entry 0 is the id we address packets to, so retiring it means moving onto a
+ * spare. A peer that retires everything it has given us leaves nothing to move
+ * onto -- that is its own protocol error, caught by the caller before this
+ * runs. */
+static void __peer_cids_apply_retire(quicconn_t* conn) {
+    size_t kept = 0;
+
+    for (size_t i = 0; i < conn->peer_cid_count; i++) {
+        if (conn->peer_cids[i].seq < conn->peer_retire_prior_to) {
+            __peer_cid_retire(conn, conn->peer_cids[i].seq);
+            continue;
+        }
+
+        if (kept != i) conn->peer_cids[kept] = conn->peer_cids[i];
+        kept++;
+    }
+
+    conn->peer_cid_count = kept;
+}
+
+static int __on_new_cid_frame(quicconn_t* conn, const quicframe_t* frame,
+                              uint64_t now_us) {
+    const uint64_t seq = frame->u.new_cid.seq;
+
+    /* §5.1.2: the demand is monotonic, and a reordered frame carrying a lower
+     * value must not resurrect what has already been retired. */
+    if (frame->u.new_cid.retire_prior_to > conn->peer_retire_prior_to) {
+        conn->peer_retire_prior_to = frame->u.new_cid.retire_prior_to;
+        __peer_cids_apply_retire(conn);
+    }
+
+    /* §19.15: a sequence number we have already been given must carry the same
+     * id. A different one is a protocol violation, and it is the only way to
+     * notice a peer rewriting its own table underneath us. */
+    for (size_t i = 0; i < conn->peer_cid_count; i++) {
+        if (conn->peer_cids[i].seq != seq) continue;
+
+        if (conn->peer_cids[i].cid.len != frame->u.new_cid.cid.len ||
+            memcmp(conn->peer_cids[i].cid.data, frame->u.new_cid.cid.data,
+                   frame->u.new_cid.cid.len) != 0) {
+            quicconn_close(conn, QUIC_PROTOCOL_VIOLATION, 0, now_us);
+            return 0;
+        }
+
+        return 1;   /* an ordinary retransmission */
+    }
+
+    /* §5.1.2: an id below the retirement watermark is retired the moment it
+     * arrives -- and still has to be acknowledged as retired, or the peer holds
+     * the number reserved forever. */
+    if (seq < conn->peer_retire_prior_to) {
+        __peer_cid_retire(conn, seq);
+        return 1;
+    }
+
+    /* §5.1.1: more concurrent ids than we said we would hold is
+     * CONNECTION_ID_LIMIT_ERROR. Silently dropping the surplus -- which is what
+     * this did -- leaves the peer believing we hold ids we have never stored,
+     * so a later RETIRE_CONNECTION_ID from it names nothing and its rotation
+     * stalls. The limit is ours to enforce and the array is what pays for it,
+     * so the smaller of the two decides. */
+    uint64_t limit = conn->local_params.active_connection_id_limit;
+    if (limit > QUICCONN_MAX_PEER_CIDS) limit = QUICCONN_MAX_PEER_CIDS;
+
+    if ((uint64_t)conn->peer_cid_count >= limit) {
+        quicconn_close(conn, QUIC_CONNECTION_ID_LIMIT_ERROR, 0, now_us);
+        return 0;
+    }
+
+    conn->peer_cids[conn->peer_cid_count].cid = frame->u.new_cid.cid;
+    conn->peer_cids[conn->peer_cid_count].seq = seq;
+    conn->peer_cid_count++;
 
     return 1;
 }
@@ -1314,6 +1430,14 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
             atomic_store_explicit(&conn->want_write, 1, memory_order_release);
         }
 
+        /* Nothing on this stream will ever reach the application: the reset
+         * abandoned whatever had arrived and everything that had not. The
+         * credit those bytes hold has to come back, or the advertised limit --
+         * which is built on what has been consumed, not on what has arrived --
+         * would never account for them and the connection's window would shrink
+         * by the abandoned remainder of every cancelled stream. */
+        quicconn_consumed(conn, quicflow_abandon(&s->recv_flow, s->recv_flow.used));
+
         return 1;
     }
 
@@ -1366,9 +1490,7 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
         return 1;
 
     case QUIC_FRAME_NEW_CONNECTION_ID:
-        if (conn->peer_cid_count < QUICCONN_MAX_PEER_CIDS)
-            conn->peer_cids[conn->peer_cid_count++] = frame->u.new_cid.cid;
-        return 1;
+        return __on_new_cid_frame(conn, frame, now_us);
 
     case QUIC_FRAME_RETIRE_CONNECTION_ID: {
         const uint64_t seq = frame->u.retire_cid.seq;
@@ -1399,18 +1521,26 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
     }
 
     case QUIC_FRAME_PATH_CHALLENGE:
-        /* §8.2.2: echo the data back. Answering a challenge and validating a
-         * path of our own are different jobs -- the second one (probing a new
-         * address before migrating to it) is docs/http3/09 §1.4 -- and this one
-         * is required regardless of whether we ever do the first.
+        /* §8.2.2: echo the data back, on the path it arrived on. Answering a
+         * challenge and validating a path of our own are different jobs -- the
+         * second one is __path_probe_start -- and this one is required
+         * regardless of whether we ever do the first.
          *
-         * The answer goes out on conn->path, which is the path recorded at
-         * accept. Until migration exists that is the only path we have; a
-         * challenge from a new address is answered to the old one, and fixing
-         * that is part of §1.4, not of this. */
+         * The path matters. A peer probes a *new* address before migrating
+         * onto it, and an echo that comes back by the old route says nothing
+         * about the new one -- which is the same reasoning PATH_RESPONSE below
+         * applies in the opposite direction. Answering everything on
+         * conn->path, which is what this did, left a client's own validation
+         * unanswerable and its migration impossible. */
         memcpy(conn->path_response_data, frame->u.path.data,
                sizeof conn->path_response_data);
         conn->path_response_pending = 1;
+        conn->path_response_offpath = 0;
+
+        if (conn->recv_path != NULL && !__path_same(conn->recv_path, &conn->path)) {
+            conn->path_response_path = *conn->recv_path;
+            conn->path_response_offpath = 1;
+        }
 
         atomic_store_explicit(&conn->want_write, 1, memory_order_release);
         return 1;
@@ -1744,12 +1874,17 @@ static int __key_update_arm(quicconn_t* conn) {
     return quickeys_next(&conn->rx_next, &conn->rx[QUIC_ENC_APP]);
 }
 
-/* The peer's update opened a packet: adopt it.
+/* Move both directions to the next generation.
  *
  * Both directions move together (§6.2). Ours has to: the peer switched its own
  * read keys when it updated, so a packet from us in the old phase is one it can
- * no longer open. */
-static int __key_update_commit(quicconn_t* conn, uint64_t pn, uint64_t now_us) {
+ * no longer open.
+ *
+ * `first_pn` is the lowest *received* packet number that belongs to the new
+ * phase. When the peer initiated, that is the packet that proved the update;
+ * when we initiate, the peer has sent nothing in the new phase yet and the
+ * caller passes the number after the highest it has sent. */
+static int __key_update_apply(quicconn_t* conn, uint64_t first_pn, uint64_t now_us) {
     /* The generation we are leaving becomes the retained one. Moved, not
      * copied -- the contexts are owned pointers, and rx_prev is released first
      * so the generation before last does not leak. */
@@ -1763,7 +1898,7 @@ static int __key_update_commit(quicconn_t* conn, uint64_t pn, uint64_t now_us) {
         return 0;
 
     conn->key_phase = !conn->key_phase;
-    conn->key_phase_first_pn = pn;
+    conn->key_phase_first_pn = first_pn;
 
     /* §6.3: the retained generation is good for as long as a packet sent before
      * the update could still be in flight. Three PTOs is the same figure the
@@ -1778,7 +1913,7 @@ static int __key_update_commit(quicconn_t* conn, uint64_t pn, uint64_t now_us) {
     metrics_quic(METRICS_QUIC_KEY_UPDATE);
 
     log_info("quic: key update to phase %d at pn %llu\n",
-             conn->key_phase, (unsigned long long)pn);
+             conn->key_phase, (unsigned long long)first_pn);
 
     /* Arming the next generation is deliberately last and its failure is not
      * fatal: the update itself has already succeeded, and a connection that
@@ -1786,6 +1921,37 @@ static int __key_update_commit(quicconn_t* conn, uint64_t pn, uint64_t now_us) {
     (void)__key_update_arm(conn);
 
     return 1;
+}
+
+/* The peer's update opened a packet: adopt it (§6.2). */
+static int __key_update_commit(quicconn_t* conn, uint64_t pn, uint64_t now_us) {
+    return __key_update_apply(conn, pn, now_us);
+}
+
+/* Start an update of our own, because the current key has sealed as many
+ * packets as §6.6 allows it to.
+ *
+ * Returns 0 when the update cannot be made, which is not a detail the caller
+ * may shrug off: §6.6 gives exactly two lawful responses to reaching the
+ * confidentiality limit, and if it is not this one it is closing the
+ * connection. The two ways it can fail are the two §6.1 preconditions -- the
+ * previous update is still unacknowledged, or the next generation was never
+ * armed because deriving it failed. */
+static int __key_update_initiate(quicconn_t* conn, uint64_t now_us) {
+    /* §6.1: never before the handshake is confirmed, and never twice at once. */
+    if (conn->state != QUICCONN_ACTIVE) return 0;
+    if (conn->key_update_unconfirmed) return 0;
+    if (!conn->tx[QUIC_ENC_APP].valid || !conn->rx[QUIC_ENC_APP].valid) return 0;
+    if (!conn->rx_next.valid) return 0;
+
+    /* The peer has sent nothing in the phase we are entering, so the boundary
+     * is the packet after the highest we have seen: anything at or below it
+     * that arrives with the new bit is a reordered old-phase packet and belongs
+     * to rx_prev. */
+    const uint64_t first_pn = conn->ack[QUIC_ENC_APP].any_received
+                              ? conn->ack[QUIC_ENC_APP].largest + 1 : 0;
+
+    return __key_update_apply(conn, first_pn, now_us);
 }
 
 /* ---- Receive path ---- */
@@ -2421,7 +2587,7 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
     size_t header_reserve = QUICCONN_HEADER_RESERVE;
 
     if (level == QUIC_ENC_APP && conn->peer_cid_count > 0)
-        header_reserve = 1 + conn->peer_cids[0].len +
+        header_reserve = 1 + conn->peer_cids[0].cid.len +
                          quicpkt_pn_length(conn->loss.space[level].next_pn,
                                            conn->loss.space[level].largest_acked);
 
@@ -2452,7 +2618,7 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
     size_t pn_offset = 0;
     const uint64_t pn = conn->loss.space[level].next_pn;
     const size_t pn_len = quicpkt_pn_length(pn, conn->loss.space[level].largest_acked);
-    quiccid_t* dcid = conn->peer_cid_count > 0 ? &conn->peer_cids[0] : NULL;
+    quiccid_t* dcid = conn->peer_cid_count > 0 ? &conn->peer_cids[0].cid : NULL;
 
     if (dcid == NULL) return 0;
 
@@ -2573,7 +2739,8 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
      * is not retransmitted, because a peer that did not get one sends another
      * challenge, and a stale echo would validate a path that may no longer
      * exist. */
-    if (level == QUIC_ENC_APP && conn->path_response_pending && p + 16 < payload_cap) {
+    if (level == QUIC_ENC_APP && conn->path_response_pending &&
+        !conn->path_response_offpath && p + 16 < payload_cap) {
         quicframe_t f;
         memset(&f, 0, sizeof f);
         f.type = QUIC_FRAME_PATH_RESPONSE;
@@ -2731,6 +2898,47 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
                 refs = ref;
             }
         }
+    }
+
+    /* Peer ids the peer has asked us to retire (§5.1.2). Until the frame
+     * arrives it keeps the sequence number reserved and issues no replacement,
+     * so a peer that rotates its ids -- which is how a client migrates -- runs
+     * out and is stuck on the path it has. */
+    if (level == QUIC_ENC_APP) {
+        size_t kept = 0;
+
+        for (size_t i = 0; i < conn->retire_queue_len; i++) {
+            const uint64_t seq = conn->retire_queue[i];
+
+            quicframe_t f;
+            memset(&f, 0, sizeof f);
+            f.type = QUIC_FRAME_RETIRE_CONNECTION_ID;
+            f.u.retire_cid.seq = seq;
+
+            const size_t n = p + 24 < payload_cap
+                             ? quicframe_write(payload + p, payload_cap - p, &f)
+                             : 0;
+            if (n == 0) {
+                /* No room left in this packet: the rest stays owed. */
+                conn->retire_queue[kept++] = seq;
+                continue;
+            }
+
+            p += n;
+            ack_eliciting = 1;
+
+            /* §13.3 retransmits this frame when lost. The reference carries the
+             * sequence number in `offset`, the same way NEW_CONNECTION_ID
+             * above does, so __requeue_lost can put it back on the queue. */
+            quicframe_ref_t* ref = quicframe_ref_new(QUIC_FRAME_RETIRE_CONNECTION_ID);
+            if (ref != NULL) {
+                ref->offset = seq;
+                ref->next = refs;
+                refs = ref;
+            }
+        }
+
+        conn->retire_queue_len = kept;
     }
 
     /* Handshake data. */
@@ -3236,7 +3444,7 @@ static void __path_probe_send(quicconn_t* conn, uint64_t now_us) {
     size_t p = quicframe_write(payload, sizeof payload, &f);
     if (p == 0) return;
 
-    quiccid_t* dcid = conn->peer_cid_count > 0 ? &conn->peer_cids[0] : NULL;
+    quiccid_t* dcid = conn->peer_cid_count > 0 ? &conn->peer_cids[0].cid : NULL;
     if (dcid == NULL) return;
 
     const uint64_t pn = conn->loss.space[QUIC_ENC_APP].next_pn;
@@ -3293,6 +3501,82 @@ static void __path_probe_send(quicconn_t* conn, uint64_t now_us) {
     conn->probe_next_us = now_us + quicloss_pto_us(&conn->loss, QUIC_ENC_APP);
 }
 
+/* The answer to a PATH_CHALLENGE that arrived from an address other than the
+ * one in use (§8.2.2).
+ *
+ * Its own datagram for the same reason __path_probe_send has one: everything
+ * else the send loop builds is addressed to conn->path, and an echo delivered
+ * there tests the wrong path.
+ *
+ * Deliberately *not* expanded to 1200 bytes. §8.2.2 asks for that expansion and
+ * exempts it under the anti-amplification limit, and this is exactly that case:
+ * the address is unvalidated by definition -- validating it is what the peer is
+ * doing -- so padding our reply would turn a 30-byte challenge, whose source
+ * address anyone can forge, into a 1200-byte datagram aimed wherever the
+ * forger liked. The peer loses a path-MTU signal it can obtain another way; a
+ * third party would lose rather more. */
+static void __path_response_send(quicconn_t* conn, uint64_t now_us) {
+    quickeys_t* keys = &conn->tx[QUIC_ENC_APP];
+    if (!keys->valid || conn->peer_cid_count == 0) return;
+
+    quicframe_t f;
+    memset(&f, 0, sizeof f);
+    f.type = QUIC_FRAME_PATH_RESPONSE;
+    memcpy(f.u.path.data, conn->path_response_data, sizeof f.u.path.data);
+
+    uint8_t payload[QUICCONN_MAX_PACKET];
+    size_t p = quicframe_write(payload, sizeof payload, &f);
+    if (p == 0) return;
+
+    /* Header protection samples four bytes past the packet number, so a payload
+     * this short needs padding to reach the sample -- the same rule
+     * __build_packet applies, and the reason a PING-only probe once failed to
+     * leave at all. */
+    if (p < 4 && p + 4 <= sizeof payload) {
+        memset(payload + p, 0, 4 - p);
+        p = 4;
+    }
+
+    const uint64_t pn = conn->loss.space[QUIC_ENC_APP].next_pn;
+    const size_t pn_len = quicpkt_pn_length(pn, conn->loss.space[QUIC_ENC_APP].largest_acked);
+
+    quicpkt_hdr_out_t hdr;
+    memset(&hdr, 0, sizeof hdr);
+    hdr.type = QUIC_PKT_SHORT;
+    hdr.version = conn->ver->number;
+    hdr.dcid = &conn->peer_cids[0].cid;
+    hdr.scid = &conn->local_cids[0].cid;
+    hdr.pn = pn;
+    hdr.pn_len = pn_len;
+    hdr.key_phase = conn->key_phase;
+    hdr.payload_len = p + QUIC_AEAD_TAG_LEN;
+
+    uint8_t datagram[QUICCONN_MAX_PACKET];
+    size_t pn_offset = 0;
+    const size_t header_len = quicpkt_write_header(datagram, sizeof datagram, &hdr, &pn_offset);
+    if (header_len == 0) return;
+
+    size_t sealed_len = 0;
+    if (!quiccrypto_seal(keys, pn, datagram, header_len, payload, p,
+                         datagram + header_len, &sealed_len))
+        return;
+
+    const size_t total = header_len + sealed_len;
+    if (!quichp_apply(keys, datagram, total, pn_offset, pn_len)) return;
+
+    /* Sent but not in flight, and carrying no frame reference: §13.3 does not
+     * retransmit a PATH_RESPONSE -- a peer that did not get one sends another
+     * challenge, and a stale echo would validate a path that may be gone. The
+     * congestion window belongs to the path in use, not to this one. */
+    quicloss_on_sent(&conn->loss, QUIC_ENC_APP, pn, total, 1, 0, NULL, now_us);
+
+    quicendpoint_send_ecn(conn->endpoint, datagram, total, &conn->path_response_path,
+                          conn->ecn_enabled ? 0x02 : 0);
+
+    conn->path_response_pending = 0;
+    conn->path_response_offpath = 0;
+}
+
 /* RFC 8899 probe: a probe-only 1-RTT packet padded to the candidate size.
  * Application data is deliberately excluded so loss of a probe never causes
  * head-of-line delay at the application. */
@@ -3310,7 +3594,7 @@ static void __pmtu_probe_send(quicconn_t* conn, uint64_t now_us) {
     memset(&hdr, 0, sizeof hdr);
     hdr.type = QUIC_PKT_SHORT;
     hdr.version = conn->ver->number;
-    hdr.dcid = &conn->peer_cids[0];
+    hdr.dcid = &conn->peer_cids[0].cid;
     hdr.scid = &conn->local_cids[0].cid;
     hdr.pn = pn;
     hdr.pn_len = pn_len;
@@ -3356,6 +3640,33 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
     if (conn == NULL) return 0;
     if (conn->state == QUICCONN_DRAINING || conn->state == QUICCONN_DEAD) return 1;
 
+    /* RFC 9001 §6.6: a key may seal only so many packets before the AEAD's
+     * confidentiality guarantee stops holding -- 2^23 for AES-GCM, which is
+     * about eleven gigabytes on one connection and therefore reachable by an
+     * ordinary long download rather than only by an attack. The limit was
+     * computed and exported (quiccrypto_seal_limit_reached) but never asked,
+     * and nothing else initiated an update: the server only ever answered the
+     * peer's. A peer that never updates would have carried us past the limit in
+     * silence.
+     *
+     * §6.6 allows two answers and no third. Update if we can; otherwise stop
+     * using the key, which for a server means closing the connection.
+     *
+     * Placed above the CLOSING branch rather than below it so the goodbye
+     * leaves in this same turn: quicconn_close only builds the datagram, and a
+     * send loop that returned here instead would be waiting on a second wake
+     * that nothing is obliged to deliver. Checked before anything is built, so
+     * the path response and the two probes below -- all of which seal with
+     * these keys -- are covered by it too. */
+    if (conn->state != QUICCONN_CLOSING &&
+        quiccrypto_seal_limit_reached(&conn->tx[QUIC_ENC_APP]) &&
+        !__key_update_initiate(conn, now_us)) {
+        metrics_quic(METRICS_QUIC_AEAD_LIMIT);
+        log_error("quic: AEAD confidentiality limit reached and no key update "
+                  "possible -- closing\n");
+        quicconn_close(conn, QUIC_AEAD_LIMIT_REACHED, 0, now_us);
+    }
+
     if (conn->state == QUICCONN_CLOSING) {
         if (conn->close_packet_len > 0) {
             const int queued = quicendpoint_send_ecn(conn->endpoint, conn->close_packet,
@@ -3379,6 +3690,9 @@ int quicconn_send(quicconn_t* conn, uint64_t now_us) {
 
     /* Ahead of the connection's own datagram: §8.2.2 will not have the answer
      * delayed, and the same urgency applies to the question. */
+    if (conn->path_response_pending && conn->path_response_offpath)
+        __path_response_send(conn, now_us);
+
     if (conn->probe_active && conn->probe_pending)
         __path_probe_send(conn, now_us);
 
@@ -3709,7 +4023,8 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     conn->amplification_budget = 0;
 
     /* The client's Source Connection ID is where our packets are addressed. */
-    conn->peer_cids[0] = *peer_scid;
+    conn->peer_cids[0].cid = *peer_scid;
+    conn->peer_cids[0].seq = 0;
     conn->peer_cid_count = 1;
     /* And the same value again, as the record of what that first packet said --
      * §7.3 checks the transport parameter against it (__on_peer_params). */
@@ -3964,7 +4279,7 @@ static size_t __write_close_packet(quicconn_t* conn, quic_enc_level_e level,
                                    uint8_t* dst, size_t cap) {
     if (!conn->tx[level].valid) return 0;
 
-    quiccid_t* dcid = conn->peer_cid_count > 0 ? &conn->peer_cids[0] : NULL;
+    quiccid_t* dcid = conn->peer_cid_count > 0 ? &conn->peer_cids[0].cid : NULL;
     if (dcid == NULL) return 0;
 
     uint8_t payload[64];

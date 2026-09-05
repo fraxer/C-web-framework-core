@@ -1,6 +1,7 @@
 #include "framework.h"
 
 #include "h3frame.h"
+#include "quicmemory.h"
 #include "varint.h"
 
 #include <string.h>
@@ -351,4 +352,76 @@ TEST(test_h3_settings) {
     h3settings_defaults(&back);
     TEST_ASSERT(h3settings_decode(truncated, sizeof truncated, &back)
                 == H3SETTINGS_ERR_ENCODING, "refused");
+}
+
+TEST(test_h3frame_accumulator_growth) {
+    TEST_SUITE("h3frame");
+
+    /* The accumulator is the one buffer in the h3 receive path a peer can grow
+     * fastest, and it used to be sized from the frame's *declared* length --
+     * five bytes on the wire bought a megabyte of heap, before a single payload
+     * byte arrived. A peer may open a request stream per such header, and the
+     * QUIC stream limit is a hundred, so one datagram of them bought a hundred
+     * megabytes. It also bypassed the shared budget, so
+     * http3_buffer_memory_limit could not see any of it. */
+
+    quicmemory_configure(0, NULL);
+    const size_t before = quicmemory_current();
+
+    /* HEADERS, length 1 MiB written as an 8-byte varint -- at the accumulation
+     * cap, so the frame itself is perfectly legal. Nine bytes in total. */
+    static const uint8_t claim[] = {
+        0x01, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00
+    };
+
+    h3frame_parser_t p;
+    h3frame_parser_init(&p);
+
+    TEST_CASE("a declared length buys no memory on its own");
+    const uint8_t* cursor = claim;
+    TEST_ASSERT(h3frame_parser_feed(&p, &cursor, claim + sizeof claim) == H3FRAME_CONTINUE,
+                "the header completes no frame");
+    TEST_ASSERT(p.length == 1024 * 1024, "the claim was read");
+    TEST_ASSERT(p.accum_cap == 0 && p.accum == NULL, "and nothing was reserved for it");
+    TEST_ASSERT(quicmemory_current() == before, "nor charged to the budget");
+
+    TEST_CASE("it grows with the payload that actually arrives");
+    uint8_t chunk[64];
+    memset(chunk, 'x', sizeof chunk);
+    cursor = chunk;
+    TEST_ASSERT(h3frame_parser_feed(&p, &cursor, chunk + sizeof chunk) == H3FRAME_CONTINUE,
+                "still incomplete");
+    TEST_ASSERT(p.accum_len == sizeof chunk, "the bytes are held");
+    TEST_ASSERT(p.accum_cap == 256, "one step of the ladder, not the megabyte claimed");
+    TEST_ASSERT(quicmemory_current() == before + p.accum_cap, "charged for exactly that");
+
+    TEST_CASE("and hands it all back");
+    h3frame_parser_free(&p);
+    TEST_ASSERT(quicmemory_current() == before, "released");
+
+    TEST_CASE("a frame smaller than the ladder step is not rounded up to it");
+    /* The cap at the declared length is what keeps an ordinary header section
+     * from taking 256 bytes to hold 40. */
+    h3frame_parser_init(&p);
+    static const uint8_t small[] = { 0x01, 0x04, 'a', 'b', 'c', 'd' };
+    cursor = small;
+    TEST_ASSERT(h3frame_parser_feed(&p, &cursor, small + sizeof small) == H3FRAME_READY,
+                "complete");
+    TEST_ASSERT(p.accum_cap == 4, "sized to the frame");
+    h3frame_parser_free(&p);
+    TEST_ASSERT(quicmemory_current() == before, "released");
+
+    TEST_CASE("the budget can refuse the accumulator");
+    /* The point of routing it through quicmemory: the limit an operator sets
+     * now covers this buffer too. */
+    quicmemory_configure(before + 64, NULL);
+    h3frame_parser_init(&p);
+    cursor = claim;
+    h3frame_parser_feed(&p, &cursor, claim + sizeof claim);
+    cursor = chunk;
+    TEST_ASSERT(h3frame_parser_feed(&p, &cursor, chunk + sizeof chunk) == H3FRAME_ERR_OOM,
+                "refused rather than allocated behind the limit's back");
+    h3frame_parser_free(&p);
+
+    quicmemory_configure(0, NULL);   /* do not constrain later suites */
 }

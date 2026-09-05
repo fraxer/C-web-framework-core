@@ -186,6 +186,22 @@ typedef struct quicclient {
     uint64_t retire_seq;
     int      retire_queued;
 
+    /* Connection ids of our own, offered to the server (§5.1.1). The server has
+     * three obligations here that only a peer issuing ids can exercise: refuse
+     * more than the active_connection_id_limit it advertised, refuse a repeated
+     * sequence number carrying a different id, and answer Retire Prior To with
+     * a RETIRE_CONNECTION_ID for everything it drops. */
+    int       new_cid_queued;
+    uint64_t  new_cid_seq;
+    uint64_t  new_cid_retire_prior_to;
+    quiccid_t new_cid;
+
+    /* RETIRE_CONNECTION_ID frames arriving from the server, which is how it
+     * says it has honoured a Retire Prior To. Without them the sequence number
+     * stays reserved at this end forever. */
+    int      retire_received_count;
+    uint64_t retire_received_seq[8];
+
     /* The server sent CONNECTION_CLOSE. A test that provokes a protocol error
      * on purpose needs to tell "it closed" from "it stopped answering", and
      * those look identical without this. */
@@ -421,6 +437,15 @@ int quicclient_use_cid(quicclient_t* client, size_t index);
 
 /* Queue a RETIRE_CONNECTION_ID for `seq`. */
 int quicclient_retire_cid(quicclient_t* client, uint64_t seq);
+
+/* Offer the server a connection id of ours. `fill` is repeated to make the id's
+ * bytes, so a caller can hand the same sequence number two different ids and
+ * see §19.15 enforced. One frame is queued at a time. */
+int quicclient_new_cid(quicclient_t* client, uint64_t seq,
+                       uint64_t retire_prior_to, uint8_t fill);
+
+/* Whether the server has sent RETIRE_CONNECTION_ID for `seq`. */
+int quicclient_saw_retire(const quicclient_t* client, uint64_t seq);
 
 /* Move both directions to the next key generation and flip the Key Phase bit
  * (§6.1). Only meaningful once 1-RTT keys exist. Returns 0 on failure. */

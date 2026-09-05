@@ -18,6 +18,15 @@ void quicack_free(quicack_t* ack) {
 int quicack_is_duplicate(const quicack_t* ack, uint64_t pn) {
     if (ack == NULL) return 0;
 
+    /* The set is capped at QUICACK_MAX_RANGES intervals, so it forgets -- and a
+     * number it has forgotten must be refused, not accepted. Otherwise a peer
+     * that sends a comb of gaps evicts the low end of the set and can then
+     * replay a packet it captured, which the AEAD cannot tell from the
+     * original: this check is the only thing that can (§9.5, §13.2). Anything
+     * below the mark is older than any reordering window the set could still
+     * be tracking. */
+    if (quicrange_evicted(&ack->received, pn)) return 1;
+
     return quicrange_contains(&ack->received, pn);
 }
 

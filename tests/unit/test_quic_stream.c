@@ -29,6 +29,21 @@ TEST(test_quic_ack) {
     TEST_ASSERT(quicack_is_duplicate(&ack, 5), "seen now");
     TEST_ASSERT(!quicack_is_duplicate(&ack, 6), "and only that one");
 
+    TEST_CASE("a number the bounded set has forgotten is refused, not accepted");
+    /* The set holds QUICACK_MAX_RANGES intervals and no more, so a peer that
+     * sends a comb of gaps can push the low end out of it. If that made an old
+     * number look new, the eviction would be the way *through* this check
+     * rather than a defence against the memory attack it exists for. */
+    quicack_free(&ack);
+    quicack_init(&ack);
+    for (uint64_t pn = 0; pn < QUICACK_MAX_RANGES * 4; pn += 2)
+        quicack_on_received(&ack, QUIC_ENC_APP, pn, 1, 1000, 25000);
+
+    TEST_ASSERT(!quicrange_contains(&ack.received, 0), "the oldest is no longer held");
+    TEST_ASSERT(quicack_is_duplicate(&ack, 0), "and a replay of it is still refused");
+    TEST_ASSERT(quicack_is_duplicate(&ack, QUICACK_MAX_RANGES * 4 - 2),
+                "while the newest is refused because it is held");
+
     TEST_CASE("a single ack-eliciting packet is held briefly");
     /* Batching acknowledgements is worth a few milliseconds of delay; sending
      * one per packet doubles the packet count on a busy connection. */
@@ -189,20 +204,43 @@ TEST(test_quic_flow) {
     TEST_ASSERT(!quicflow_record_received(&flow, 1001), "past the limit");
     TEST_ASSERT(quicflow_record_received(&flow, 1000), "exactly at it is fine");
 
-    TEST_CASE("credit is issued once half the window is gone");
+    TEST_CASE("credit is issued for what the application has taken, not for what arrived");
     /* Later and the peer stalls waiting for credit it has earned; earlier and
-     * we spend frames saying nothing new. */
+     * we spend frames saying nothing new -- or worse, credit the peer for
+     * bytes that are still sitting in our receive buffer, which is memory we
+     * have not got back. */
     quicflow_init_recv(&flow, 1000, 8000);
     quicflow_record_received(&flow, 400);
     uint64_t limit = 0;
     TEST_ASSERT(!quicflow_should_update(&flow, &limit), "not yet at 40%");
 
     quicflow_record_received(&flow, 600);
+    TEST_ASSERT(!quicflow_should_update(&flow, &limit),
+                "the window is spent, but the application still holds every byte of it");
+
+    quicflow_consumed(&flow, 600, 0, 0);
     TEST_ASSERT(quicflow_should_update(&flow, &limit), "now");
-    TEST_ASSERT(limit == 1600, "a fresh window beyond what has been sent");
+    TEST_ASSERT(limit == 1600, "a fresh window beyond what has been read");
 
     quicflow_update_sent(&flow, limit);
     TEST_ASSERT(!quicflow_should_update(&flow, &limit), "and nothing more is owed");
+
+    TEST_CASE("a stream nobody will ever read gives its credit back");
+    /* The tail a RESET_STREAM abandons frees no buffer, but it is equally never
+     * coming back. Without this the connection window shrinks by the abandoned
+     * remainder of every cancelled stream, permanently. */
+    quicflow_init_recv(&flow, 1000, 8000);
+    quicflow_record_received(&flow, 800);
+    quicflow_consumed(&flow, 300, 0, 0);
+    TEST_ASSERT(quicflow_abandon(&flow, 800) == 500, "the unread remainder");
+    TEST_ASSERT(quicflow_abandon(&flow, 800) == 0, "and only once");
+    TEST_ASSERT(quicflow_should_update(&flow, &limit), "the whole stream is accounted for");
+    TEST_ASSERT(limit == 1800, "so the peer gets a full window beyond it");
+
+    TEST_CASE("abandoning cannot credit more than arrived");
+    quicflow_init_recv(&flow, 1000, 8000);
+    quicflow_record_received(&flow, 200);
+    TEST_ASSERT(quicflow_abandon(&flow, 900) == 200, "clamped to the highest offset seen");
 
     TEST_CASE("the window grows when the peer can exhaust it inside a round trip");
     /* If the window empties faster than the path can refill it, the window is

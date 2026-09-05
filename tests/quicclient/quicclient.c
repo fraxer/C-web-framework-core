@@ -452,6 +452,29 @@ int quicclient_retire_cid(quicclient_t* client, uint64_t seq) {
     return 1;
 }
 
+int quicclient_new_cid(quicclient_t* client, uint64_t seq,
+                       uint64_t retire_prior_to, uint8_t fill) {
+    if (client == NULL || client->new_cid_queued) return 0;
+    if (retire_prior_to > seq) return 0;   /* the writer would refuse it anyway */
+
+    client->new_cid_seq = seq;
+    client->new_cid_retire_prior_to = retire_prior_to;
+    client->new_cid.len = QUIC_LOCAL_CID_LEN;
+    memset(client->new_cid.data, fill, QUIC_LOCAL_CID_LEN);
+    client->new_cid_queued = 1;
+
+    return 1;
+}
+
+int quicclient_saw_retire(const quicclient_t* client, uint64_t seq) {
+    if (client == NULL) return 0;
+
+    for (int i = 0; i < client->retire_received_count; i++)
+        if (client->retire_received_seq[i] == seq) return 1;
+
+    return 0;
+}
+
 int quicclient_key_update(quicclient_t* client) {
     if (client == NULL) return 0;
     if (!client->tx[QUIC_ENC_APP].valid || !client->rx[QUIC_ENC_APP].valid) return 0;
@@ -624,6 +647,27 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
             c->retire_queued = 0;
             __log(c, "  [client] -> RETIRE_CONNECTION_ID seq %llu\n",
                   (unsigned long long)c->retire_seq);
+        }
+    }
+
+    if (level == QUIC_ENC_APP && c->new_cid_queued) {
+        quicframe_t f;
+        memset(&f, 0, sizeof f);
+        f.type = QUIC_FRAME_NEW_CONNECTION_ID;
+        f.u.new_cid.seq = c->new_cid_seq;
+        f.u.new_cid.retire_prior_to = c->new_cid_retire_prior_to;
+        f.u.new_cid.cid = c->new_cid;
+        /* A reset token the server has no reason to look at, but the frame is
+         * malformed without one. */
+        memset(f.u.new_cid.token, 0x5a, sizeof f.u.new_cid.token);
+
+        const size_t n = quicframe_write(payload + p, payload_cap - p, &f);
+        if (n > 0) {
+            p += n;
+            c->new_cid_queued = 0;
+            __log(c, "  [client] -> NEW_CONNECTION_ID seq %llu, retire_prior_to %llu\n",
+                  (unsigned long long)c->new_cid_seq,
+                  (unsigned long long)c->new_cid_retire_prior_to);
         }
     }
 
@@ -1267,6 +1311,15 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
 
             __log(c, "  [client] <- NEW_CONNECTION_ID seq %llu, %u bytes\n",
                   (unsigned long long)f.u.new_cid.seq, (unsigned)f.u.new_cid.cid.len);
+            break;
+
+        case QUIC_FRAME_RETIRE_CONNECTION_ID:
+            if (c->retire_received_count <
+                (int)(sizeof c->retire_received_seq / sizeof c->retire_received_seq[0]))
+                c->retire_received_seq[c->retire_received_count++] = f.u.retire_cid.seq;
+
+            __log(c, "  [client] <- RETIRE_CONNECTION_ID seq %llu\n",
+                  (unsigned long long)f.u.retire_cid.seq);
             break;
 
         case QUIC_FRAME_HANDSHAKE_DONE:

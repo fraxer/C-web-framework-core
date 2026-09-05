@@ -1893,6 +1893,24 @@ static void __dispatch(quicendpoint_t* ep, udp_datagram_t* dgram) {
 
         if (quicpkt_next(dgram->data, dgram->len, &off, QUIC_LOCAL_CID_LEN, &first, &pst) &&
             first.type == QUIC_PKT_INITIAL) {
+            /* RFC 9000 §7.2: the Destination Connection ID a client puts in its
+             * first Initial is unpredictable and at least 8 bytes, and it is
+             * the sole input to the Initial secrets (RFC 9001 §5.2). A shorter
+             * one did not come from a conforming client, and honouring it
+             * derives the packet protection for a whole handshake from fewer
+             * bits than the design assumes.
+             *
+             * Only ever a new connection: an Initial that belongs to one we
+             * already have was routed by the connection id table long before
+             * this point, and after a Retry the client is addressing the
+             * 8-byte id we chose ourselves. */
+            if (inv.dcid.len < 8) {
+                metrics_quic(METRICS_QUIC_DROP_SHORT_INITIAL);
+                log_debug("quic: drop short_initial_dcid len=%u\n",
+                          (unsigned)inv.dcid.len);
+                return;
+            }
+
             pkt_token = first.token;
             pkt_token_len = first.token_len;
         }

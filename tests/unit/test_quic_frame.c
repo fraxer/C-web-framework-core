@@ -29,6 +29,32 @@ TEST(test_quic_frame_simple) {
     TEST_ASSERT(quicframe_next(padding, sizeof padding, &off, &f) == QUICFRAME_OK, "next");
     TEST_ASSERT(f.type == QUIC_FRAME_PING, "PING follows");
 
+    TEST_CASE("a frame type must use the shortest encoding (§12.4)");
+    /* The one exception to "any varint encoding is legal on input". The padded
+     * forms are how a frame type is smuggled past a middlebox that inspects
+     * only the short one, and accepting them means two parsers can disagree
+     * about which frame they just read. */
+    const uint8_t padded_ping[] = { 0x40, 0x01 };   /* PING in two bytes */
+    off = 0;
+    TEST_ASSERT(quicframe_next(padded_ping, sizeof padded_ping, &off, &f)
+                == QUICFRAME_ERR_ENCODING, "refused");
+
+    const uint8_t padded_stream[] = { 0x40, 0x08, 0x00 };  /* STREAM in two bytes */
+    off = 0;
+    TEST_ASSERT(quicframe_next(padded_stream, sizeof padded_stream, &off, &f)
+                == QUICFRAME_ERR_ENCODING, "including the STREAM range");
+
+    const uint8_t padded_padding[] = { 0x40, 0x00 };  /* PADDING in two bytes */
+    off = 0;
+    TEST_ASSERT(quicframe_next(padded_padding, sizeof padded_padding, &off, &f)
+                == QUICFRAME_ERR_ENCODING, "and PADDING, whose run count assumes it");
+
+    const uint8_t minimal_ping[] = { 0x01 };
+    off = 0;
+    TEST_ASSERT(quicframe_next(minimal_ping, sizeof minimal_ping, &off, &f)
+                == QUICFRAME_OK && f.type == QUIC_FRAME_PING,
+                "the short form still parses");
+
     TEST_CASE("an unknown frame type ends the connection");
     /* The opposite of HTTP/3: there is no length prefix to skip past, so an
      * unrecognised type cannot be ignored. */

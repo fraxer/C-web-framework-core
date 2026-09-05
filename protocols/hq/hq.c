@@ -226,6 +226,13 @@ int hq_turn(quicconn_t* conn, uint64_t* error) {
         __read(qs, st, server);
         if (before > 0) quicconn_consumed(conn, before - quicstream_readable(qs));
 
+        /* Answered means __read never looks at this stream again, so anything
+         * still held will never be delivered. The connection window is built on
+         * what has been consumed, so those bytes have to be released here or
+         * they hold their share of it for the life of the connection. */
+        if (st->answered)
+            quicconn_consumed(conn, quicflow_abandon(&qs->recv_flow, qs->recv_flow.used));
+
         __write(conn, qs, st);
     }
 

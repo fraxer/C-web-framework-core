@@ -57,6 +57,16 @@ typedef struct quiccid_entry {
 #define QUICCONN_MAX_LOCAL_CIDS 8
 #define QUICCONN_MAX_PEER_CIDS  8
 
+/* A connection id the peer issued, with the sequence number that names it.
+ *
+ * The number is not decoration: RETIRE_CONNECTION_ID speaks in sequence
+ * numbers, and §19.15 makes a repeated number carrying a *different* id a
+ * protocol violation -- neither is answerable by a bare list of ids. */
+typedef struct quicpeercid {
+    quiccid_t cid;
+    uint64_t  seq;
+} quicpeercid_t;
+
 typedef enum {
     QUICCONN_HANDSHAKE = 0,
     QUICCONN_ACTIVE,
@@ -89,9 +99,26 @@ typedef struct quicconn {
      * *that* packet, and the list is the peer's to rewrite at will. */
     quiccid_t peer_initial_scid;
     quiccid_entry_t local_cids[QUICCONN_MAX_LOCAL_CIDS];
-    quiccid_t peer_cids[QUICCONN_MAX_PEER_CIDS];
+    /* Entry 0 is the one in use -- every packet we send is addressed to it. The
+     * rest are spares the peer has offered. */
+    quicpeercid_t peer_cids[QUICCONN_MAX_PEER_CIDS];
     size_t    peer_cid_count;
     uint64_t  next_cid_seq;
+
+    /* The highest Retire Prior To the peer has ever sent (§5.1.2). Monotonic:
+     * a reordered frame carrying a lower value must not resurrect ids that
+     * have already been retired. */
+    uint64_t  peer_retire_prior_to;
+    /* Sequence numbers of the peer's ids we have retired and owe a
+     * RETIRE_CONNECTION_ID for. §5.1.2 makes the frame mandatory -- until it
+     * arrives the peer keeps the id reserved and will not issue a replacement,
+     * so a peer that rotates ids runs out and can no longer migrate.
+     *
+     * Sized for a full table twice over: the queue drains into the very next
+     * 1-RTT packet, and the only way to hold more than one table's worth is for
+     * that packet to be lost while another retirement arrives. */
+    uint64_t  retire_queue[QUICCONN_MAX_PEER_CIDS * 2];
+    size_t    retire_queue_len;
 
     /* Crypto: keys per level per direction, and the TLS bridge. */
     quictls_t tls;
@@ -307,6 +334,20 @@ typedef struct quicconn {
      * as necessary to evoke additional PATH_RESPONSE frames". */
     uint8_t  path_response_data[8];
     int      path_response_pending;
+    /* Where the challenge came from, when that is not the path in use.
+     *
+     * §8.2.2 requires the response to go back on the path the challenge
+     * arrived on, and it is the whole point of the frame: an echo delivered
+     * somewhere else proves nothing about the path being tested, so a peer
+     * probing a new address before migrating onto it never gets an answer and
+     * the migration cannot happen. Answering on `path` was fine only while
+     * there was one path and no migration to break.
+     *
+     * The answer to an off-path challenge needs its own datagram -- everything
+     * else this connection builds is addressed to `path` -- which is why it is
+     * a flag here rather than a field the packet builder reads. */
+    quicpath_t path_response_path;
+    int        path_response_offpath;
 
     /* ---- Migration (RFC 9000 §9) ---- *
      *

@@ -105,7 +105,26 @@ TEST(test_quic_range) {
     TEST_ASSERT(quicrange_max(&capped) == 18, "the newest survives");
     TEST_ASSERT(!quicrange_contains(&capped, 0), "the oldest was dropped");
 
+    TEST_CASE("and the set remembers how far it has forgotten");
+    /* A bounded set used as a duplicate check must know where its memory ends,
+     * or the eviction becomes the way through the check: a peer sends a comb of
+     * gaps to push old numbers out, then replays a packet it captured and the
+     * replay looks like a first arrival. */
+    TEST_ASSERT(quicrange_evicted(&capped, 0), "the oldest counts as seen");
+    TEST_ASSERT(quicrange_evicted(&capped, 10), "up to the highest value dropped");
+    TEST_ASSERT(!quicrange_evicted(&capped, 11), "not past it");
+    TEST_ASSERT(!quicrange_evicted(&capped, 12) && quicrange_contains(&capped, 12),
+                "and never for what is still held");
+
     quicrange_free(&capped);
+
+    TEST_CASE("an uncapped set never claims to have forgotten anything");
+    quicrange_t keeps;
+    quicrange_init(&keeps, 0);
+    for (uint64_t i = 0; i < 40; i += 2) quicrange_add(&keeps, i, i);
+    TEST_ASSERT(quicrange_count(&keeps) == 20, "all of them held");
+    TEST_ASSERT(!quicrange_evicted(&keeps, 0), "nothing evicted");
+    quicrange_free(&keeps);
 }
 
 TEST(test_quic_recvbuf) {
@@ -351,6 +370,62 @@ TEST(test_quic_sendbuf) {
 
     TEST_ASSERT(quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin), "has data");
     TEST_ASSERT(offset == 4 && len == 4, "only the unacknowledged half");
+    quicsendbuf_free(&buf);
+
+    TEST_CASE("a loss declaration over a comb of acknowledged ranges");
+    /* The complement has to come out exactly, and it has to come out without a
+     * pass per byte: __on_crypto_frame requeues the whole unacknowledged flight
+     * on every duplicate CRYPTO frame, and a peer can coalesce a hundred of
+     * those into one datagram. */
+    quicsendbuf_init(&buf);
+    quicsendbuf_write(&buf, (const uint8_t*)"0123456789abcdef", 16);
+    quicsendbuf_next(&buf, 16, &offset, &data, &len, &fin);
+    quicsendbuf_mark_sent(&buf, 0, 16, 0);
+    quicsendbuf_ack(&buf, 2, 2, 0);    /* [2,3] */
+    quicsendbuf_ack(&buf, 8, 4, 0);    /* [8,11] */
+    quicsendbuf_lost(&buf, 0, 16, 0);
+
+    TEST_ASSERT(quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin), "a hole");
+    TEST_ASSERT(offset == 0 && len == 2, "the first one, [0,1]");
+    quicsendbuf_mark_sent(&buf, offset, len, 0);
+
+    TEST_ASSERT(quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin), "another");
+    TEST_ASSERT(offset == 4 && len == 4, "[4,7], between the two confirmed runs");
+    quicsendbuf_mark_sent(&buf, offset, len, 0);
+
+    TEST_ASSERT(quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin), "and the tail");
+    TEST_ASSERT(offset == 12 && len == 4, "[12,15]");
+    quicsendbuf_mark_sent(&buf, offset, len, 0);
+
+    TEST_ASSERT(!quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin),
+                "the confirmed runs were not resent");
+    quicsendbuf_free(&buf);
+
+    TEST_CASE("a requeue begins at the first byte the peer has not confirmed");
+    quicsendbuf_init(&buf);
+    quicsendbuf_write(&buf, (const uint8_t*)"0123456789", 10);
+    quicsendbuf_next(&buf, 10, &offset, &data, &len, &fin);
+    quicsendbuf_mark_sent(&buf, 0, 10, 0);
+    quicsendbuf_ack(&buf, 4, 2, 0);    /* a confirmed island, so the base stays put */
+
+    TEST_ASSERT(quicsendbuf_requeue_unacked(&buf), "there is something to pull back");
+    TEST_ASSERT(quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin), "queued");
+    TEST_ASSERT(offset == 0 && len == 4, "the prefix before the island");
+    quicsendbuf_mark_sent(&buf, offset, len, 0);
+    TEST_ASSERT(quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin), "and the rest");
+    TEST_ASSERT(offset == 6 && len == 4, "the suffix after it");
+    quicsendbuf_free(&buf);
+
+    TEST_CASE("a requeue with a confirmed prefix skips it");
+    quicsendbuf_init(&buf);
+    quicsendbuf_write(&buf, (const uint8_t*)"0123456789", 10);
+    quicsendbuf_next(&buf, 10, &offset, &data, &len, &fin);
+    quicsendbuf_mark_sent(&buf, 0, 10, 0);
+    quicsendbuf_ack(&buf, 0, 4, 0);
+
+    TEST_ASSERT(quicsendbuf_requeue_unacked(&buf), "the remainder is still owed");
+    TEST_ASSERT(quicsendbuf_next(&buf, 100, &offset, &data, &len, &fin), "queued");
+    TEST_ASSERT(offset == 4 && len == 6, "from the first unconfirmed byte");
     quicsendbuf_free(&buf);
 
     TEST_CASE("a PTO probe can pull back what is still unacknowledged (§6.2.4)");

@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "h3frame.h"
+#include "quicmemory.h"
 #include "varint.h"
 
 void h3frame_parser_init(h3frame_parser_t* p) {
@@ -13,6 +14,7 @@ void h3frame_parser_init(h3frame_parser_t* p) {
 void h3frame_parser_free(h3frame_parser_t* p) {
     if (p == NULL) return;
 
+    quicmemory_release(p->accum_cap);
     free(p->accum);
     p->accum = NULL;
     p->accum_len = 0;
@@ -59,14 +61,47 @@ static int __feed_varint(h3frame_parser_t* p, const uint8_t** pp, const uint8_t*
     return 0;
 }
 
+/* Grow the accumulator to hold `need` bytes.
+ *
+ * Two properties this must have, and neither is decoration:
+ *
+ *   - it grows with the payload that has *arrived*, never with the length the
+ *     frame *claims*. The claim is one varint: `01 80 0f ff ff` is five bytes
+ *     on the wire and used to buy a megabyte of heap before a single payload
+ *     byte was read. A peer may open as many request streams as the QUIC stream
+ *     limit allows (a hundred by default), so one datagram of such headers
+ *     bought a hundred megabytes;
+ *   - it is charged to the shared quicmemory budget, like every other buffer a
+ *     peer can make this process hold (quicrecvbuf, quicsendbuf, the crypto
+ *     reassembly, the QPACK deferred and pending buffers). Bypassing it left
+ *     http3_buffer_memory_limit blind to the one allocation a peer could grow
+ *     fastest.
+ *
+ * The doubling ladder is kept -- the allocator has chunks for those sizes -- but
+ * capped at the frame's declared length, which is the ceiling for the whole
+ * payload and therefore for this buffer. */
 static int __accum_reserve(h3frame_parser_t* p, size_t need) {
     if (need <= p->accum_cap) return 1;
+    if (need > H3FRAME_MAX_ACCUMULATED) return 0;
 
     size_t cap = p->accum_cap == 0 ? 256 : p->accum_cap;
-    while (cap < need) cap *= 2;
+    while (cap < need) {
+        if (cap > H3FRAME_MAX_ACCUMULATED / 2) { cap = need; break; }
+        cap *= 2;
+    }
+
+    /* Never past what this frame can still deliver. */
+    if (p->length > 0 && p->length < (uint64_t)cap) cap = (size_t)p->length;
+    if (cap < need) cap = need;
+
+    const size_t growth = cap - p->accum_cap;
+    if (!quicmemory_reserve(growth)) return 0;
 
     uint8_t* grown = realloc(p->accum, cap);
-    if (grown == NULL) return 0;
+    if (grown == NULL) {
+        quicmemory_release(growth);
+        return 0;
+    }
 
     p->accum = grown;
     p->accum_cap = cap;
@@ -112,8 +147,9 @@ h3frame_status_e h3frame_parser_feed(h3frame_parser_t* p,
             if (keep && p->length > H3FRAME_MAX_ACCUMULATED)
                 return H3FRAME_ERR_TOO_LARGE;
 
-            if (keep && p->length > 0 && !__accum_reserve(p, (size_t)p->length))
-                return H3FRAME_ERR_OOM;
+            /* Deliberately no allocation here: see __accum_reserve. The length
+             * is checked against the cap and then believed only as far as
+             * bytes actually turn up. */
 
             p->stage = keep || p->type == H3_FRAME_DATA
                        ? H3FRAME_STAGE_PAYLOAD : H3FRAME_STAGE_SKIP;
@@ -158,6 +194,8 @@ h3frame_status_e h3frame_parser_feed(h3frame_parser_t* p,
 
                 return H3FRAME_DATA_CHUNK;
             }
+
+            if (!__accum_reserve(p, p->accum_len + take)) return H3FRAME_ERR_OOM;
 
             memcpy(p->accum + p->accum_len, *pp, take);
             p->accum_len += take;

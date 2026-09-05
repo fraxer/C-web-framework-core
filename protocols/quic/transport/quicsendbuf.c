@@ -286,17 +286,35 @@ void quicsendbuf_lost(quicsendbuf_t* buf, uint64_t offset, size_t len, int fin) 
         }
 
         /* Only what the peer has not confirmed. Loss detection is a heuristic;
-         * an ACK that crossed the declaration in flight is normal. */
-        for (uint64_t p = offset; p < offset + len; ) {
-            if (quicrange_contains(&buf->acked, p)) { p++; continue; }
+         * an ACK that crossed the declaration in flight is normal.
+         *
+         * Subtracted interval by interval, not byte by byte. The walk this
+         * replaces ran a binary search per byte of the declared range, and the
+         * caller that hurts is __on_crypto_frame: a duplicate CRYPTO frame
+         * requeues the whole unacknowledged flight at every level, and a peer
+         * may coalesce a hundred such frames into one 1200-byte Initial. That
+         * was six orders of magnitude of work bought with one datagram, none of
+         * it bounded by anti-amplification, which bounds only what goes out. */
+        const uint64_t stop = offset + len;   /* exclusive */
+        const size_t spans = quicrange_count(&buf->acked);
+        uint64_t cursor = offset;
 
-            uint64_t end = p;
-            while (end + 1 < offset + len && !quicrange_contains(&buf->acked, end + 1))
-                end++;
+        for (size_t i = 0; i < spans && cursor < stop; i++) {
+            quicrange_span_t span;
+            if (!quicrange_at_asc(&buf->acked, i, &span)) break;
 
-            quicrange_add(&buf->lost, p, end);
-            p = end + 1;
+            if (span.end < cursor) continue;   /* entirely behind the cursor */
+            if (span.start >= stop) break;     /* ascending: nothing left ahead */
+
+            if (span.start > cursor)
+                quicrange_add(&buf->lost, cursor, span.start - 1);
+
+            /* Past the confirmed run. Saturating at the top of the range rather
+             * than wrapping: there is nothing above UINT64_MAX to declare. */
+            cursor = span.end == UINT64_MAX ? stop : span.end + 1;
         }
+
+        if (cursor < stop) quicrange_add(&buf->lost, cursor, stop - 1);
     }
 
     if (fin && !buf->fin_acked) buf->fin_sent = 0;
@@ -326,16 +344,32 @@ int quicsendbuf_requeue_unacked(quicsendbuf_t* buf) {
      * up to what has been sent once. quicsendbuf_lost does the walk around
      * already-acknowledged holes; this only has to find the start and hand it
      * the range. A range already queued as lost is added again harmlessly --
-     * quicrange_add merges. */
-    for (uint64_t p = buf->base; p < buf->sent_off; p++) {
-        if (quicrange_contains(&buf->acked, p)) continue;
+     * quicrange_add merges.
+     *
+     * The start is found by stepping over the acknowledged prefix one interval
+     * at a time. Stepping one *byte* at a time is the same answer at a cost the
+     * peer chooses: this runs once per duplicate CRYPTO frame during the
+     * handshake, and the prefix is a certificate chain. */
+    uint64_t start = buf->base;
+    const size_t spans = quicrange_count(&buf->acked);
 
-        quicsendbuf_lost(buf, p, (size_t)(buf->sent_off - p), 0);
+    for (size_t i = 0; i < spans; i++) {
+        quicrange_span_t span;
+        if (!quicrange_at_asc(&buf->acked, i, &span)) break;
 
-        return 1;
+        /* A hole opens at `start`, and that is where the requeue begins. */
+        if (span.start > start) break;
+        if (span.end >= start) {
+            if (span.end == UINT64_MAX) return 0;
+            start = span.end + 1;
+        }
     }
 
-    return 0;
+    if (start >= buf->sent_off) return 0;
+
+    quicsendbuf_lost(buf, start, (size_t)(buf->sent_off - start), 0);
+
+    return 1;
 }
 
 int quicsendbuf_complete(const quicsendbuf_t* buf) {

@@ -76,6 +76,31 @@ TEST(test_h3stream_qpack_blocked_event) {
     h3stream_free(st);
     qpack_decoder_free(d);
 
+    TEST_CASE("reads that land while the section is still blocked are kept, in order");
+    /* h3conn reads a QUIC stream into a stack buffer before feeding it, so
+     * returning from here without consuming `pp` does not leave the bytes
+     * anywhere -- it drops them. That truncated the body by one read per
+     * datagram, and when the read carrying FIN was the one dropped the request
+     * was never dispatched at all and the stream hung to the idle timeout. */
+    st = h3stream_create(NULL, 0);
+    d = qpack_decoder_create(128, 4);
+    static const uint8_t head[] = { H3_FRAME_HEADERS, 0x02, 0x02, 0x00, 0xaa };
+    p = head;
+    TEST_ASSERT(h3stream_feed(st, d, &p, head + sizeof head, 0)
+                    == H3STREAM_QPACK_BLOCKED, "blocked on the first read");
+    TEST_ASSERT(st->qpack_deferred_len == 1, "with the tail of that read");
+
+    static const uint8_t more[] = { 0xbb, 0xcc, 0xdd };
+    p = more;
+    TEST_ASSERT(h3stream_feed(st, d, &p, more + sizeof more, 1)
+                    == H3STREAM_QPACK_BLOCKED, "still blocked on the second");
+    TEST_ASSERT(p == more + sizeof more, "and the read is taken, not dropped");
+    TEST_ASSERT(st->qpack_deferred_len == 4, "queued behind the first tail");
+    TEST_ASSERT(memcmp(st->qpack_deferred, "\xaa\xbb\xcc\xdd", 4) == 0, "in arrival order");
+    TEST_ASSERT(st->qpack_deferred_fin, "and the FIN came with them");
+    h3stream_free(st);
+    qpack_decoder_free(d);
+
     TEST_CASE("deferred DATA and FIN replay through the normal frame parser");
     st = h3stream_create(NULL, 0);
     d = qpack_decoder_create(128, 4);

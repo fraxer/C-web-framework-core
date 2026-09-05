@@ -85,7 +85,13 @@ void quicflow_consumed(quicflow_t* flow, uint64_t bytes,
                        uint64_t rtt_us, uint64_t elapsed_us) {
     if (flow == NULL) return;
 
-    (void)bytes;
+    /* What the limit below is built on. Saturating rather than wrapping: the
+     * counter can never legitimately pass `used`, and an accounting slip must
+     * not become a window of 2^64. */
+    if (bytes > UINT64_MAX - flow->consumed) flow->consumed = UINT64_MAX;
+    else flow->consumed += bytes;
+
+    if (flow->consumed > flow->used) flow->consumed = flow->used;
 
     /* Auto-tuning: if the peer can exhaust the whole window in less than two
      * round trips, the window is what is limiting the transfer rather than the
@@ -102,17 +108,35 @@ void quicflow_consumed(quicflow_t* flow, uint64_t bytes,
     }
 }
 
+uint64_t quicflow_abandon(quicflow_t* flow, uint64_t upto) {
+    if (flow == NULL) return 0;
+
+    if (upto > flow->used) upto = flow->used;
+    if (upto <= flow->consumed) return 0;
+
+    const uint64_t added = upto - flow->consumed;
+    flow->consumed = upto;
+
+    return added;
+}
+
 int quicflow_should_update(const quicflow_t* flow, uint64_t* out_limit) {
     if (flow == NULL) return 0;
 
-    /* Advertise a window of auto_window bytes beyond what the peer has already
-     * sent. Sent when more than half the current allowance is gone: any later
-     * and the peer stalls waiting for credit it has earned, any earlier and we
-     * spend frames saying nothing new. */
+    /* Advertise a window of auto_window bytes beyond what the application has
+     * taken -- not beyond what the peer has sent. The difference is everything
+     * still sitting in the receive buffer, and granting credit for it is
+     * granting credit for memory that is not free: the peer stays inside the
+     * limit, the buffer cap trips instead, and the connection dies with
+     * FLOW_CONTROL_ERROR for a limit we advertised ourselves.
+     *
+     * Sent when more than half the current allowance is gone, measured against
+     * what the peer may still send: any later and it stalls waiting for credit
+     * it has earned, any earlier and we spend frames saying nothing new. */
     const uint64_t remaining = flow->limit > flow->used ? flow->limit - flow->used : 0;
     if (remaining > flow->auto_window / 2) return 0;
 
-    const uint64_t next = flow->used + flow->auto_window;
+    const uint64_t next = flow->consumed + flow->auto_window;
     if (next <= flow->limit) return 0;
 
     if (out_limit != NULL) *out_limit = next;

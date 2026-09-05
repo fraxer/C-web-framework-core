@@ -9,9 +9,11 @@
 
 #include "quicclient.h"
 #include "quiccc.h"
+#include "quiccrypto.h"
 #include "quiccidtable.h"
 #include "quicconn.h"
 #include "quicendpoint.h"
+#include "quicerror.h"
 #include "quicinvariants.h"
 #include "quicloss.h"
 #include "quicqlog.h"
@@ -871,6 +873,12 @@ static int __read_after_update(stand_t* s) {
 
 static int __challenged(stand_t* s) {
     return s->client.path_challenge_received;
+}
+
+/* The client's own challenge came back -- and came back matching, which is the
+ * only thing that validates a path (§8.2.3). */
+static int __responded(stand_t* s) {
+    return s->client.path_response_received;
 }
 
 static int __draining(stand_t* s) {
@@ -2173,7 +2181,15 @@ TEST(test_quic_stand_peer_reset_accounting) {
      * stream. Its final size covers the lost part; ours has never seen it. */
     s->blackhole_to_server = 1;
     TEST_ASSERT(quicclient_stream_write(&s->client, 0, body, chunk, 0), "second half");
-    TEST_ASSERT(quicclient_flush(&s->client), "sent into the void");
+
+    /* Every datagram of it, not the first: once the handshake is done the
+     * client builds one datagram per flush, and the final size a RESET_STREAM
+     * declares is what reached the wire. Flushing once left a third of the
+     * chunk in the client's own send buffer, so the "abandoned tail" this case
+     * is about was partly a tail the client never sent. */
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT(quicclient_flush(&s->client), "sent into the void");
+
     s->blackhole_to_server = 0;
 
     TEST_ASSERT(quicclient_reset_stream(&s->client, 0, 0x11), "the client gives up");
@@ -2196,6 +2212,15 @@ TEST(test_quic_stand_peer_reset_accounting) {
      * for all of it. */
     TEST_ASSERT(counted_after >= counted_before + chunk,
                 "the abandoned tail was charged to the connection window");
+
+    /* Exactly the final size, and not a byte beyond it. The connection is
+     * charged by what the *stream* accepted, so a frame the stream discards --
+     * a retransmission of data past the final size, which this client does send
+     * -- costs the connection nothing. Charging by the frame's own extent
+     * instead measured it against a high-water mark the reset had frozen, so
+     * every arrival of it was charged afresh. */
+    TEST_ASSERT(counted_after == chunk * 2,
+                "and nothing beyond it, however often the tail is retransmitted");
 
     free(body);
     __stand_free(s);
@@ -3143,6 +3168,214 @@ TEST(test_quic_stand_migration) {
     TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
     TEST_ASSERT(old_port == 50000, "it started on the old port");
     TEST_ASSERT(s->client.path_challenge_received, "the client was asked");
+
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_path_challenge_offpath) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a challenge from a new address is answered on that address (§8.2.2)");
+    /* This is the client's own path validation, the mirror of the test above:
+     * before migrating, a peer probes the candidate address and waits for the
+     * echo to come back *there*. Answering on the path in use -- which is what
+     * every packet this server builds is addressed to -- means the probe is
+     * never answered on the path it tests, and the client cannot migrate.
+     *
+     * The stand routes by the emulator's own idea of the client address, so
+     * "the answer came back here" is exactly what the client observing a
+     * matching PATH_RESPONSE proves. */
+    stand_t* s = __stand_create(21);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    __run(s, 200000, NULL);   /* let the spare connection ids arrive */
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    /* Move first, then challenge: the challenge now arrives from an address the
+     * server has never seen, which is the case the fix is about. */
+    __addr(&s->client_path.remote, &s->client_path.remote_len, "127.0.0.1", 50002);
+    TEST_ASSERT(quicclient_rebind(&s->client), "the client moved");
+    TEST_ASSERT(quicclient_path_challenge(&s->client), "and challenged from there");
+    TEST_ASSERT(quicclient_flush(&s->client), "sent");
+
+    TEST_ASSERT(__run(s, 2000000, __responded), "the server answered");
+    TEST_ASSERT(s->client.path_response_matched,
+                "with the challenge's own bytes, delivered to the new address");
+
+    TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
+    TEST_ASSERT(s->conn->state == QUICCONN_ACTIVE, "and unharmed");
+
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_peer_cid_limit) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("more connection ids than we said we would hold is a §5.1.1 error");
+    /* Silently dropping the surplus -- which is what this did -- leaves the
+     * peer believing we hold ids we never stored, so a later
+     * RETIRE_CONNECTION_ID names nothing and its rotation stalls. */
+    stand_t* s = __stand_create(22);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    __run(s, 200000, NULL);
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    const uint64_t limit = s->conn->local_params.active_connection_id_limit;
+    TEST_ASSERT(limit >= 2 && limit < 32, "a sane advertised limit");
+
+    /* Sequence 0 is the id the handshake itself established, so `limit` further
+     * ids is one too many. */
+    for (uint64_t seq = 1; seq <= limit && s->conn != NULL; seq++) {
+        TEST_ASSERT(quicclient_new_cid(&s->client, seq, 0, (uint8_t)(0x10 + seq)),
+                    "offer another id");
+        quicclient_flush(&s->client);
+        __run(s, 300000, NULL);
+    }
+
+    TEST_ASSERT(s->client.close_received, "the server closed rather than dropping them");
+    TEST_ASSERT(s->client.close_error == QUIC_CONNECTION_ID_LIMIT_ERROR,
+                "with CONNECTION_ID_LIMIT_ERROR, which names the peer's actual mistake");
+
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_peer_cid_reuse) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a repeated sequence number carrying a different id is a violation");
+    /* §19.15. It is the only way to notice a peer rewriting its own table
+     * underneath us, and the retransmission it has to be told apart from is
+     * ordinary traffic. */
+    stand_t* s = __stand_create(23);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    __run(s, 200000, NULL);
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    TEST_ASSERT(quicclient_new_cid(&s->client, 1, 0, 0xa1), "offer id 1");
+    quicclient_flush(&s->client);
+    __run(s, 300000, NULL);
+    TEST_REQUIRE_NOT_NULL(s->conn, "a first offer is fine");
+
+    TEST_ASSERT(quicclient_new_cid(&s->client, 1, 0, 0xa1), "the same one again");
+    quicclient_flush(&s->client);
+    __run(s, 300000, NULL);
+    TEST_REQUIRE_NOT_NULL(s->conn, "a retransmission is not an error");
+    TEST_ASSERT(!s->client.close_received, "and does not close the connection");
+
+    TEST_ASSERT(quicclient_new_cid(&s->client, 1, 0, 0xb2), "now a different id at seq 1");
+    quicclient_flush(&s->client);
+    __run(s, 300000, NULL);
+
+    TEST_ASSERT(s->client.close_received, "closed");
+    TEST_ASSERT(s->client.close_error == QUIC_PROTOCOL_VIOLATION, "as a protocol violation");
+
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_peer_cid_retire_prior_to) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("Retire Prior To is honoured, and each id retired is acknowledged");
+    /* §5.1.2. Ignoring the field left the peer holding every sequence number it
+     * had ever issued: it will not reuse one until we say we have dropped it,
+     * so a client that rotates its ids -- which is how it migrates -- runs out
+     * and is stuck on the path it has. */
+    stand_t* s = __stand_create(24);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    __run(s, 200000, NULL);
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    TEST_ASSERT(s->conn->peer_cid_count == 1, "only the handshake id so far");
+    TEST_ASSERT(s->conn->peer_cids[0].seq == 0, "which is sequence zero");
+
+    /* One new id that retires everything before it -- the ordinary rotation. */
+    TEST_ASSERT(quicclient_new_cid(&s->client, 1, 1, 0xc3), "id 1, retiring id 0");
+    quicclient_flush(&s->client);
+    __run(s, 500000, NULL);
+
+    TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
+    TEST_ASSERT(!s->client.close_received, "and not closed");
+    TEST_ASSERT(s->conn->peer_cid_count == 1, "one id held");
+    TEST_ASSERT(s->conn->peer_cids[0].seq == 1, "the new one, addressed from now on");
+    TEST_ASSERT(s->conn->peer_retire_prior_to == 1, "the watermark moved");
+    TEST_ASSERT(quicclient_saw_retire(&s->client, 0),
+                "and the peer was told sequence 0 is gone");
+
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_aead_confidentiality_limit) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("reaching the §6.6 seal limit starts a key update rather than passing it");
+    /* 2^23 packets is about eleven gigabytes on one connection -- an ordinary
+     * long download, not only an attack. The limit was computed and exported
+     * and then never asked, and nothing initiated an update: the server only
+     * ever answered the peer's. So a peer that never updates carried us past
+     * the AEAD's confidentiality bound in silence.
+     *
+     * The counter is set rather than reached: sealing 2^23 packets for real
+     * would take the stand somewhat longer than the test budget. */
+    stand_t* s = __stand_create(25);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    __run(s, 200000, NULL);
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    const int phase_before = s->conn->key_phase;
+    TEST_ASSERT(quiccrypto_seal_limit_reached(&s->conn->tx[QUIC_ENC_APP]) == 0,
+                "nowhere near it yet");
+
+    s->conn->tx[QUIC_ENC_APP].sealed = (1ULL << 23);
+    TEST_ASSERT(quiccrypto_seal_limit_reached(&s->conn->tx[QUIC_ENC_APP]),
+                "and now at it");
+
+    /* Anything that makes the server build a packet will do. */
+    TEST_ASSERT(quicclient_ping(&s->client), "give it a reason to send");
+    TEST_ASSERT(quicclient_flush(&s->client), "sent");
+    __run(s, 500000, NULL);
+
+    TEST_REQUIRE_NOT_NULL(s->conn, "the connection survived");
+    TEST_ASSERT(!s->client.close_received, "it did not have to close");
+    TEST_ASSERT(s->conn->key_phase != phase_before, "it moved to the next generation");
+    TEST_ASSERT(s->conn->tx[QUIC_ENC_APP].sealed < (1ULL << 23),
+                "on a key whose count starts again");
+    TEST_ASSERT(s->conn->state == QUICCONN_ACTIVE, "and stayed active");
+
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_aead_limit_without_update) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("and closes when no update is available (§6.6 allows no third answer)");
+    stand_t* s = __stand_create(26);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    __run(s, 200000, NULL);
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    /* §6.1 forbids a second update while the first is unacknowledged, which is
+     * the realistic way the update can be unavailable. */
+    s->conn->key_update_unconfirmed = 1;
+    s->conn->tx[QUIC_ENC_APP].sealed = (1ULL << 23);
+
+    TEST_ASSERT(quicclient_ping(&s->client), "give it a reason to send");
+    TEST_ASSERT(quicclient_flush(&s->client), "sent");
+    __run(s, 500000, NULL);
+
+    TEST_ASSERT(s->client.close_received, "the server closed rather than sealing again");
+    TEST_ASSERT(s->client.close_error == QUIC_AEAD_LIMIT_REACHED,
+                "naming the limit it reached");
 
     __stand_free(s);
 }

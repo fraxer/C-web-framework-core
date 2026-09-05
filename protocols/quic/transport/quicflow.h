@@ -24,9 +24,21 @@ typedef struct quicflow {
     uint64_t limit;
     uint64_t used;
 
-    /* Receive side only. The window is raised when more than half of it has
-     * been consumed -- more often is wasted frames, less often stalls the peer
-     * for a round trip while it waits for credit it has already earned. */
+    /* Receive side only. Bytes the application has actually taken delivery of,
+     * plus those a reset or a torn-down stream means it never will.
+     *
+     * This -- not `used` -- is what the advertised limit is built on. The two
+     * differ by exactly what is sitting in the receive buffers, and building
+     * the limit on `used` made the credit slide forward on *arrival*: a peer
+     * always had a full window ahead of the highest offset it had reached,
+     * whatever the application had managed to read. The buffer cap then had to
+     * be the real limit, and hitting it reports FLOW_CONTROL_ERROR -- blaming
+     * the peer for staying inside a window we should not have granted. */
+    uint64_t consumed;
+
+    /* The window is raised when more than half of it has been consumed -- more
+     * often is wasted frames, less often stalls the peer for a round trip while
+     * it waits for credit it has already earned. */
     uint64_t auto_window;
     uint64_t max_window;
 
@@ -87,6 +99,14 @@ int quicflow_record_received(quicflow_t* flow, uint64_t highest_offset);
  * same idea as the HTTP/2 receive window scaling already in the codebase. */
 void quicflow_consumed(quicflow_t* flow, uint64_t bytes,
                        uint64_t rtt_us, uint64_t elapsed_us);
+
+/* Bytes charged to this window that will never be delivered: the tail a
+ * RESET_STREAM abandoned, or whatever a stream still held when it was torn
+ * down. They free no buffer, but they are equally never coming back, so the
+ * credit they occupy has to be returned or the window shrinks by the abandoned
+ * remainder of every cancelled stream -- permanently. Returns what it added, so
+ * a caller can pass the same amount up to the connection-level window. */
+uint64_t quicflow_abandon(quicflow_t* flow, uint64_t upto);
 
 /* Whether a MAX_DATA / MAX_STREAM_DATA frame is worth sending, and what limit
  * it should carry. */

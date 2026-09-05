@@ -350,8 +350,31 @@ h3stream_status_e h3stream_feed(h3stream_t* st, qpack_decoder_t* qdec,
     /* Retry a complete HEADERS payload retained by h3frame_parser. No request
      * bytes are consumed while the required insertion is still in the future. */
     if (st->qpack_blocked) {
-        if (!h3stream_qpack_can_resume(st, qpack_decoder_insert_count(qdec)))
+        if (!h3stream_qpack_can_resume(st, qpack_decoder_insert_count(qdec))) {
+            /* Everything that arrives while the section is still blocked joins
+             * the queue behind what h3stream_qpack_block already parked, in
+             * order. Returning without touching `pp` looks harmless and is not:
+             * the caller has already taken these bytes out of the QUIC receive
+             * buffer (h3conn's __read_request reads into a stack buffer), so
+             * anything left here is gone for good -- a body silently truncated,
+             * and, when the read carrying FIN is the one dropped, a request
+             * that is never dispatched and a stream that hangs to the idle
+             * timeout.
+             *
+             * Overflowing the deferred buffer reports EXCESSIVE_LOAD, the same
+             * connection error the accumulation cap reports and for the same
+             * reason: a peer that sends a megabyte of body while the header
+             * section it sent first is still undecodable is not going to send a
+             * smaller one next. Honest reordering costs a few packets here, not
+             * a megabyte. */
+            if (*pp < end || fin) {
+                if (!h3stream_qpack_defer(st, *pp, (size_t)(end - *pp), fin))
+                    return H3STREAM_ERR_EXCESSIVE_LOAD;
+                *pp = end;
+            }
+
             return H3STREAM_QPACK_BLOCKED;
+        }
 
         h3stream_status_e r = build_request(st, qdec, st->parser.payload,
                                              st->parser.payload_len);
@@ -369,6 +392,19 @@ h3stream_status_e h3stream_feed(h3stream_t* st, qpack_decoder_t* qdec,
      * allocation before recursion: replay may itself encounter blocked
      * trailers and must then be able to install a fresh deferred buffer. */
     if (st->qpack_deferred_len != 0 || st->qpack_deferred_fin) {
+        /* Bytes arriving in the same call that follows the unblock belong after
+         * the deferred ones, and the replay below returns without touching
+         * `pp` -- so they have to join the queue rather than be left behind it.
+         * The call that unblocked the stream consumed nothing (it returned
+         * REQUEST_READY straight from the retry above), so `pp` here is
+         * whatever the caller last read, and dropping it truncates the body by
+         * exactly one read. */
+        if (*pp < end || fin) {
+            if (!h3stream_qpack_defer(st, *pp, (size_t)(end - *pp), fin))
+                return H3STREAM_ERR_EXCESSIVE_LOAD;
+            *pp = end;
+        }
+
         uint8_t* saved = st->qpack_deferred;
         const size_t saved_len = st->qpack_deferred_len;
         const size_t saved_cap = st->qpack_deferred_cap;
