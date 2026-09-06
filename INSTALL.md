@@ -25,13 +25,12 @@ project](#integrating-into-a-host-project) for a minimal host `CMakeLists.txt`.
 
 | Library | Used for |
 |---------|----------|
-| PCRE 8.x (`libpcre.so.3`) | routing and redirect regular expressions |
+| PCRE2 (`libpcre2-8.so.0`) | routing and redirect regular expressions |
 | Zlib | gzip compression |
 | OpenSSL 1.1.1k+ | TLS/SSL, hashing |
 | LibXml2 | XML processing |
 | libidn2 | internationalized domain names |
 | libunistring | Unicode string handling |
-| Argon2 (`libargon2`) | password hashing |
 | POSIX threads (`pthread`) | worker threads |
 
 ### Optional libraries (database drivers)
@@ -52,8 +51,8 @@ Debian / Ubuntu:
 
 ```bash
 sudo apt install build-essential cmake ninja-build \
-    libpcre3-dev zlib1g-dev libssl-dev libxml2-dev \
-    libidn2-dev libunistring-dev libargon2-dev
+    libpcre2-dev zlib1g-dev libssl-dev libxml2-dev \
+    libidn2-dev libunistring-dev
 
 # Optional database drivers
 sudo apt install libpq-dev libmariadb-dev libhiredis-dev libsqlite3-dev
@@ -63,8 +62,8 @@ Fedora / RHEL:
 
 ```bash
 sudo dnf install gcc cmake ninja-build \
-    pcre-devel zlib-devel openssl-devel libxml2-devel \
-    libidn2-devel libunistring-devel libargon2-devel
+    pcre2-devel zlib-devel openssl-devel libxml2-devel \
+    libidn2-devel libunistring-devel
 
 # Optional database drivers
 sudo dnf install libpq-devel mariadb-connector-c-devel hiredis-devel sqlite-devel
@@ -102,7 +101,8 @@ add_link_options(-rdynamic)
 
 # Required dependencies
 find_package(Threads REQUIRED)
-find_package(PCRE REQUIRED)
+find_package(PCRE2 REQUIRED)
+add_definitions(-DPCRE2_CODE_UNIT_WIDTH=8)
 find_package(ZLIB REQUIRED)
 find_package(OpenSSL REQUIRED)
 find_package(LibXml2 REQUIRED)
@@ -290,8 +290,8 @@ Applying database migrations:
 
 ## Troubleshooting
 
-* **`Could NOT find PCRE`** — install the PCRE **8.x** development package
-  (`libpcre3-dev` / `pcre-devel`), not PCRE2.
+* **`Could NOT find PCRE2`** — install the PCRE2 development package
+  (`libpcre2-dev` / `pcre2-devel`), not the legacy PCRE 8.x one.
 * **A database driver silently missing** — the corresponding
   `-DINCLUDE_<DB>=yes` switch was not passed, or the client library was not
   found at configure time; check the CMake output for

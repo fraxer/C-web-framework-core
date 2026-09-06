@@ -42,7 +42,7 @@ target_link_libraries(cwfr_framework PRIVATE
 	"-Wl,--whole-archive" ${FW_LIBS} "-Wl,--no-whole-archive"
 	${PCRE2_LIBRARIES} ZLIB::ZLIB OpenSSL::SSL OpenSSL::Crypto
 	${LIBXML2_LIBRARIES} ${IDN2_LIBRARIES} ${UNISTRING_LIBRARIES}
-	argon2 Threads::Threads ${CMAKE_DL_LIBS})
+	Threads::Threads ${CMAKE_DL_LIBS})
 
 # Expose the framework include directories to consumers (cwfr, handlers, service
 # libs) via the interface -- WITHOUT making the static archives a link
