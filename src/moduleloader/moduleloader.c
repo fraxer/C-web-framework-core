@@ -985,7 +985,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             finded_fields[OPENSSL] = 1;
 
             if (!json_is_object(token_tls)) {
-                __module_loader_config_error("__module_loader_servers_load: database must be object\n");
+                __module_loader_config_error("__module_loader_servers_load: tls must be object\n");
                 goto failed;
             }
 
@@ -1624,11 +1624,11 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
         ratelimiter_t* ratelimiter = NULL;
         if (token_ratelimit != NULL) {
             if (!json_is_string(token_ratelimit)) {
-                __module_loader_config_error("__module_loader_set_http_route: http.route item.value.handler must be string\n");
+                __module_loader_config_error("__module_loader_set_http_route: http.route item.value.ratelimit must be string\n");
                 return 0;
             }
             if (json_string_size(token_ratelimit) == 0) {
-                __module_loader_config_error("__module_loader_set_http_route: http.route item.value.handler must be not empty string\n");
+                __module_loader_config_error("__module_loader_set_http_route: http.route item.value.ratelimit must be not empty string\n");
                 return 0;
             }
 
@@ -1688,20 +1688,20 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
 
         const json_token_t* token_file = json_object_get(token_item, "file");
         if (!json_is_string(token_file)) {
-            __module_loader_config_error("__module_loader_set_http_route: http.route item.value.route must be string\n");
+            __module_loader_config_error("__module_loader_set_http_route: http.route item.value.file must be string\n");
             return 0;
         }
         if (json_string_size(token_file) == 0) {
-            __module_loader_config_error("__module_loader_set_http_route: http.route item.value.route must be not empty string\n");
+            __module_loader_config_error("__module_loader_set_http_route: http.route item.value.file must be not empty string\n");
             return 0;
         }
         const json_token_t* token_function = json_object_get(token_item, "function");
         if (!json_is_string(token_function)) {
-            __module_loader_config_error("__module_loader_set_http_route: http.route item.value.handler must be string\n");
+            __module_loader_config_error("__module_loader_set_http_route: http.route item.value.function must be string\n");
             return 0;
         }
         if (json_string_size(token_function) == 0) {
-            __module_loader_config_error("__module_loader_set_http_route: http.route item.value.handler must be not empty string\n");
+            __module_loader_config_error("__module_loader_set_http_route: http.route item.value.function must be not empty string\n");
             return 0;
         }
 
@@ -1861,41 +1861,41 @@ int __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t
     *fn = (void(*)(void*))websockets_default_handler;
 
     if (!json_is_object(token_object)) {
-        __module_loader_config_error("__module_loader_websockets_default_load: websockets.route item.value must be object\n");
+        __module_loader_config_error("__module_loader_websockets_default_load: websockets.default item.value must be object\n");
         return 0;
     }
     if (json_object_size(token_object) < 2) {
-        __module_loader_config_error("__module_loader_websockets_default_load: websockets.route item.value must be object with at least 2 elements\n");
+        __module_loader_config_error("__module_loader_websockets_default_load: websockets.default item.value must be object with at least 2 elements\n");
         return 0;
     }
 
     const json_token_t* token_file = json_object_get(token_object, "file");
     if (!json_is_string(token_file)) {
-        __module_loader_config_error("__module_loader_websockets_default_load: websockets.route item.value.route must be string\n");
+        __module_loader_config_error("__module_loader_websockets_default_load: websockets.default item.value.file must be string\n");
         return 0;
     }
     if (json_string_size(token_file) == 0) {
-        __module_loader_config_error("__module_loader_websockets_default_load: websockets.route item.value.route must be not empty string\n");
+        __module_loader_config_error("__module_loader_websockets_default_load: websockets.default item.value.file must be not empty string\n");
         return 0;
     }
     const json_token_t* token_function = json_object_get(token_object, "function");
     if (!json_is_string(token_function)) {
-        __module_loader_config_error("__module_loader_websockets_default_load: websockets.route item.value.handler must be string\n");
+        __module_loader_config_error("__module_loader_websockets_default_load: websockets.default item.value.function must be string\n");
         return 0;
     }
     if (json_string_size(token_function) == 0) {
-        __module_loader_config_error("__module_loader_websockets_default_load: websockets.route item.value.handler must be not empty string\n");
+        __module_loader_config_error("__module_loader_websockets_default_load: websockets.default item.value.function must be not empty string\n");
         return 0;
     }
     const json_token_t* token_ratelimit = json_object_get(token_object, "ratelimit");
     ratelimiter_t* ratelimiter = NULL;
     if (token_ratelimit != NULL) {
         if (!json_is_string(token_ratelimit)) {
-            __module_loader_config_error("__module_loader_websockets_default_load: websockets.route item.value.handler must be string\n");
+            __module_loader_config_error("__module_loader_websockets_default_load: websockets.default item.value.ratelimit must be string\n");
             return 0;
         }
         if (json_string_size(token_ratelimit) == 0) {
-            __module_loader_config_error("__module_loader_websockets_default_load: websockets.route item.value.handler must be not empty string\n");
+            __module_loader_config_error("__module_loader_websockets_default_load: websockets.default item.value.ratelimit must be not empty string\n");
             return 0;
         }
 
@@ -2017,31 +2017,31 @@ int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloa
 
         const json_token_t* token_file = json_object_get(token_object, "file");
         if (!json_is_string(token_file)) {
-            __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.route must be string\n");
+            __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.file must be string\n");
             return 0;
         }
         if (json_string_size(token_file) == 0) {
-            __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.route must be not empty string\n");
+            __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.file must be not empty string\n");
             return 0;
         }
         const json_token_t* token_function = json_object_get(token_object, "function");
         if (!json_is_string(token_function)) {
-            __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.handler must be string\n");
+            __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.function must be string\n");
             return 0;
         }
         if (json_string_size(token_function) == 0) {
-            __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.handler must be not empty string\n");
+            __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.function must be not empty string\n");
             return 0;
         }
         const json_token_t* token_ratelimit = json_object_get(token_object, "ratelimit");
         ratelimiter_t* ratelimiter = NULL;
         if (token_ratelimit != NULL) {
             if (!json_is_string(token_ratelimit)) {
-                __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.handler must be string\n");
+                __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.ratelimit must be string\n");
                 return 0;
             }
             if (json_string_size(token_ratelimit) == 0) {
-                __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.handler must be not empty string\n");
+                __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.ratelimit must be not empty string\n");
                 return 0;
             }
 
