@@ -706,10 +706,6 @@ server_t* __httpclient_is_self_invocation(httpclient_t* client) {
     }
 
     const size_t ascii_length = strlen(ascii_host);
-    const int vector_struct_size = 6;
-    const int substring_count = 20;
-    const int vector_size = substring_count * vector_struct_size;
-    int ovector[vector_size];
     server_t* found_server = NULL;
     server_t* server = config->server_chain->server;
     while (server) {
@@ -758,9 +754,6 @@ httpresponse_t* __httpclient_self_invoke(httpclient_t* client, server_t* server)
         return client->response;
     }
 
-    const int vector_struct_size = 6;
-    const int substring_count = 20;
-    const int vector_size = substring_count * vector_struct_size;
     route_t* route = server->http.route;
     route_t* matched_route = NULL;
 
@@ -771,7 +764,6 @@ httpresponse_t* __httpclient_self_invoke(httpclient_t* client, server_t* server)
                 break;
             }
         } else {
-            int ovector[vector_size];
             /* PCRE2: need match_data */
             pcre2_match_data* match_data = pcre2_match_data_create_from_pattern(route->location, NULL);
             if (match_data == NULL) {

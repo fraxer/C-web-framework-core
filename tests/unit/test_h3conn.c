@@ -70,7 +70,7 @@ TEST(test_h3conn_request) {
     TEST_ASSERT(r.status == H3CONN_REQUEST_HEADERS, "headers reported");
 
     h3stream_t* st = h3conn_request_of(qs);
-    TEST_ASSERT(st != NULL, "request state attached");
+    TEST_REQUIRE_NOT_NULL(st, "request state attached");
     TEST_ASSERT(st->request->method == ROUTE_GET, "GET");
     TEST_ASSERT(st->request->path_length == 1 && st->request->path[0] == '/', "path /");
 
@@ -88,7 +88,9 @@ TEST(test_h3conn_request) {
     deliver(qs, 0, req, n, 1);
     r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_REQUEST_DONE, "done wins");
-    TEST_ASSERT(h3conn_request_of(qs)->headers_done, "headers were built");
+    st = h3conn_request_of(qs);
+    TEST_REQUIRE_NOT_NULL(st, "request state attached");
+    TEST_ASSERT(st->headers_done, "headers were built");
     stream_free(qs);
     h3conn_free(c);
 
@@ -104,7 +106,9 @@ TEST(test_h3conn_request) {
 
     r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_REQUEST_DONE, "done");
-    TEST_ASSERT(h3conn_request_of(qs)->req_body_len == 5, "5 bytes spooled");
+    st = h3conn_request_of(qs);
+    TEST_REQUIRE_NOT_NULL(st, "request state attached");
+    TEST_ASSERT(st->req_body_len == 5, "5 bytes spooled");
     stream_free(qs);
     h3conn_free(c);
 

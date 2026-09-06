@@ -336,6 +336,42 @@ int quicsendbuf_has_lost(const quicsendbuf_t* buf) {
     return !quicrange_empty(&buf->lost);
 }
 
+/* The first byte from `from` on that the peer has not acknowledged, into *out.
+ * Answers 0 when the acknowledged run reaches UINT64_MAX and there is no such
+ * byte -- there is nothing above it to requeue.
+ *
+ * The acknowledged prefix is stepped over one interval at a time. Stepping one
+ * *byte* at a time is the same answer at a cost the peer chooses: this runs
+ * once per duplicate CRYPTO frame during the handshake, and the prefix is a
+ * certificate chain.
+ *
+ * A function of its own rather than a loop in the caller, which is where it was
+ * written: with both in one body, -fanalyzer gave up part way through the
+ * second iteration and reported a use of an uninitialized value it could not
+ * name. There is none -- quicrange_at_asc fills *out on every true return, and
+ * quicrange never counts a span it has not written -- but a diagnostic that
+ * fires on every Debug build is worth the split, and the loop reads better with
+ * a name on it. */
+static int __first_unacked(const quicrange_t* acked, uint64_t from, uint64_t* out) {
+    const size_t spans = quicrange_count(acked);
+
+    for (size_t i = 0; i < spans; i++) {
+        quicrange_span_t span;
+        if (!quicrange_at_asc(acked, i, &span)) break;
+
+        /* A hole opens at `from`, and that is where the requeue begins. */
+        if (span.start > from) break;
+        if (span.end < from) continue;
+        if (span.end == UINT64_MAX) return 0;
+
+        from = span.end + 1;
+    }
+
+    *out = from;
+
+    return 1;
+}
+
 int quicsendbuf_requeue_unacked(quicsendbuf_t* buf) {
     if (buf == NULL) return 0;
     if (buf->sent_off <= buf->base) return 0;
@@ -344,26 +380,9 @@ int quicsendbuf_requeue_unacked(quicsendbuf_t* buf) {
      * up to what has been sent once. quicsendbuf_lost does the walk around
      * already-acknowledged holes; this only has to find the start and hand it
      * the range. A range already queued as lost is added again harmlessly --
-     * quicrange_add merges.
-     *
-     * The start is found by stepping over the acknowledged prefix one interval
-     * at a time. Stepping one *byte* at a time is the same answer at a cost the
-     * peer chooses: this runs once per duplicate CRYPTO frame during the
-     * handshake, and the prefix is a certificate chain. */
-    uint64_t start = buf->base;
-    const size_t spans = quicrange_count(&buf->acked);
-
-    for (size_t i = 0; i < spans; i++) {
-        quicrange_span_t span;
-        if (!quicrange_at_asc(&buf->acked, i, &span)) break;
-
-        /* A hole opens at `start`, and that is where the requeue begins. */
-        if (span.start > start) break;
-        if (span.end >= start) {
-            if (span.end == UINT64_MAX) return 0;
-            start = span.end + 1;
-        }
-    }
+     * quicrange_add merges. */
+    uint64_t start = 0;
+    if (!__first_unacked(&buf->acked, buf->base, &start)) return 0;
 
     if (start >= buf->sent_off) return 0;
 

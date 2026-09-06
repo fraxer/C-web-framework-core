@@ -251,12 +251,13 @@ TEST(test_write_post_plain_preserves_body) {
 
     const size_t PAYLOAD = 40960;
 
+    char* pattern = NULL;
     char tmppath[] = "/tmp/handler_plain_XXXXXX";
     int tmpfd = mkstemp(tmppath);
-    TEST_REQUIRE(tmpfd >= 0, "mkstemp");
+    TEST_REQUIRE_GOTO(tmpfd >= 0, "mkstemp", cleanup);
 
-    char* pattern = malloc(PAYLOAD);
-    TEST_REQUIRE_NOT_NULL(pattern, "pattern buffer");
+    pattern = malloc(PAYLOAD);
+    TEST_REQUIRE_GOTO(pattern != NULL, "pattern buffer", cleanup);
     for (size_t i = 0; i < PAYLOAD; i++) pattern[i] = (char)(i % 256);
 
     ssize_t wr = write(tmpfd, pattern, PAYLOAD);
@@ -280,12 +281,13 @@ TEST(test_write_post_plain_preserves_body) {
     TEST_ASSERT(wn > PAYLOAD, "peer received head + body");
 
     const char* body = find_head_end(wire, wn);
-    TEST_REQUIRE_NOT_NULL(body, "head terminator present");
+    TEST_REQUIRE_GOTO(body != NULL, "head terminator present", cleanup);
     body += 4;
     size_t body_len = wn - (size_t)(body - wire);
     TEST_ASSERT_EQUAL_SIZE(PAYLOAD, body_len, "plain body length equals payload");
     TEST_ASSERT(memcmp(body, pattern, PAYLOAD) == 0, "plain body matches payload");
 
+    cleanup:
     close(tmpfd);
     unlink(tmppath);
     free(pattern);
@@ -301,12 +303,13 @@ TEST(test_write_post_chunked_preserves_body) {
 
     const size_t PAYLOAD = 40960;  // > 16384 → более одного chunk'а
 
+    char* pattern = NULL;
     char tmppath[] = "/tmp/handler_chunk_XXXXXX";
     int tmpfd = mkstemp(tmppath);
-    TEST_REQUIRE(tmpfd >= 0, "mkstemp");
+    TEST_REQUIRE_GOTO(tmpfd >= 0, "mkstemp", cleanup);
 
-    char* pattern = malloc(PAYLOAD);
-    TEST_REQUIRE_NOT_NULL(pattern, "pattern buffer");
+    pattern = malloc(PAYLOAD);
+    TEST_REQUIRE_GOTO(pattern != NULL, "pattern buffer", cleanup);
     for (size_t i = 0; i < PAYLOAD; i++) pattern[i] = (char)(i % 256);
 
     ssize_t wr = write(tmpfd, pattern, PAYLOAD);
@@ -330,7 +333,7 @@ TEST(test_write_post_chunked_preserves_body) {
     TEST_ASSERT(wn > 0, "peer received bytes");
 
     const char* body = find_head_end(wire, wn);
-    TEST_REQUIRE_NOT_NULL(body, "head terminator present");
+    TEST_REQUIRE_GOTO(body != NULL, "head terminator present", cleanup);
     body += 4;
     size_t body_len = wn - (size_t)(body - wire);
 
@@ -340,6 +343,7 @@ TEST(test_write_post_chunked_preserves_body) {
     TEST_ASSERT_EQUAL_SIZE(PAYLOAD, (size_t)dn, "decoded body length equals payload");
     TEST_ASSERT(memcmp(decoded, pattern, PAYLOAD) == 0, "decoded chunked body matches payload");
 
+    cleanup:
     close(tmpfd);
     unlink(tmppath);
     free(pattern);

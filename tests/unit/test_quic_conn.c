@@ -3536,7 +3536,7 @@ TEST(test_quic_stand_dplpmtud) {
     }
 
     TEST_ASSERT(have == total, "the whole body arrived");
-    TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
+    TEST_REQUIRE_GOTO(s->conn != NULL, "still connected", cleanup);
 
     /* On the *first* transfer, and that is the assertion.
      *
@@ -3566,6 +3566,7 @@ TEST(test_quic_stand_dplpmtud) {
     TEST_ASSERT(!quicpmtud_should_probe(&s->conn->pmtud, __now_us),
                 "and the search is over: there is nowhere left to go");
 
+    cleanup:
     free(got);
     free(body);
     __stand_free(s);

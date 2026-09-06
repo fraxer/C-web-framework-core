@@ -557,6 +557,50 @@ int h3client_post_expect(quicclient_t* client, uint64_t stream_id,
     return complete && headers_seen;
 }
 
+/* One server-initiated unidirectional stream: whether it is the control stream
+ * and, if it is, whether its SETTINGS reached `out`.
+ *
+ * A function of its own rather than the body of the loop below, which is where
+ * it was written: with both in one body, -fanalyzer gave up part way through
+ * the second iteration and reported a use of an uninitialized value it could
+ * not name -- it cannot tell that quicclient_stream_read filled the first `n`
+ * bytes of the buffer it was handed. */
+static int __settings_from_uni(quicclient_t* client, uint64_t id, h3settings_t* out) {
+    uint8_t buf[2048];
+    const size_t n = quicclient_stream_read(client, id, buf, sizeof buf);
+    if (n == 0) return 0;
+
+    const uint8_t* p = buf;
+    const uint8_t* end = buf + n;
+
+    uint64_t type = 0;
+    const size_t tn = varint_read(p, (size_t)(end - p), &type);
+    if (tn == 0 || type != H3_UNI_STREAM_CONTROL) return 0;
+    p += tn;
+
+    h3frame_parser_t parser;
+    h3frame_parser_init(&parser);
+
+    int found = 0;
+    while (p < end) {
+        const h3frame_status_e st = h3frame_parser_feed(&parser, &p, end);
+        if (st == H3FRAME_CONTINUE) break;
+
+        if (st == H3FRAME_READY && parser.type == H3_FRAME_SETTINGS) {
+            found = h3settings_decode(parser.payload, parser.payload_len, out)
+                    == H3SETTINGS_OK;
+            break;
+        }
+
+        if (st == H3FRAME_SKIPPED || st == H3FRAME_READY) continue;
+        break;
+    }
+
+    h3frame_parser_free(&parser);
+
+    return found;
+}
+
 int h3client_peer_settings(quicclient_t* client, h3settings_t* out) {
     if (client == NULL || out == NULL) return 0;
 
@@ -566,43 +610,8 @@ int h3client_peer_settings(quicclient_t* client, h3settings_t* out) {
      * that is depends on the order it opened them in, so every server-initiated
      * unidirectional stream (3, 7, 11, ...) is examined until one announces
      * itself as the control stream. */
-    for (uint64_t index = 0; index < CLIENT_MAX_STREAMS; index++) {
-        const uint64_t id = (index << 2) | 0x03;
-
-        uint8_t buf[2048];
-        const size_t n = quicclient_stream_read(client, id, buf, sizeof buf);
-        if (n == 0) continue;
-
-        const uint8_t* p = buf;
-        const uint8_t* end = buf + n;
-
-        uint64_t type = 0;
-        const size_t tn = varint_read(p, (size_t)(end - p), &type);
-        if (tn == 0 || type != H3_UNI_STREAM_CONTROL) continue;
-        p += tn;
-
-        h3frame_parser_t parser;
-        h3frame_parser_init(&parser);
-
-        int found = 0;
-        while (p < end) {
-            const h3frame_status_e st = h3frame_parser_feed(&parser, &p, end);
-            if (st == H3FRAME_CONTINUE) break;
-
-            if (st == H3FRAME_READY && parser.type == H3_FRAME_SETTINGS) {
-                found = h3settings_decode(parser.payload, parser.payload_len, out)
-                        == H3SETTINGS_OK;
-                break;
-            }
-
-            if (st == H3FRAME_SKIPPED || st == H3FRAME_READY) continue;
-            break;
-        }
-
-        h3frame_parser_free(&parser);
-
-        if (found) return 1;
-    }
+    for (uint64_t index = 0; index < CLIENT_MAX_STREAMS; index++)
+        if (__settings_from_uni(client, (index << 2) | 0x03, out)) return 1;
 
     return 0;
 }

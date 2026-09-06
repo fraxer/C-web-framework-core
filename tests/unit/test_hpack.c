@@ -10,6 +10,8 @@
 static uint8_t* hex_to_bytes(const char* hex, size_t* out_len) {
     size_t n = strlen(hex) / 2;
     uint8_t* b = malloc(n ? n : 1);
+    if (b == NULL) { *out_len = 0; return NULL; }
+
     for (size_t i = 0; i < n; i++) {
         unsigned int v;
         sscanf(hex + 2 * i, "%2x", &v);

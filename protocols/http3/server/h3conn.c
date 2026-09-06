@@ -1085,7 +1085,7 @@ static int __write_stream(quicstream_t* qs, h3stream_t* st) {
  * it everything else. A bucket of -1 means this connection has no priorities to
  * honour and the pass writes every ready stream, which is one walk and exactly
  * what the loop did before scheduling existed. */
-static void __write_ready_pass(h3conn_t* c, quicconn_t* qc, int bucket, int match,
+static void __write_ready_pass(quicconn_t* qc, int bucket, int match,
                                uint64_t only_id) {
     /* Not enough left of the write-ahead budget to be worth a turn: a response
      * that has already sent its headers has only body to add, and the body
@@ -1165,7 +1165,7 @@ static void __write_incremental_turn(h3conn_t* c, quicconn_t* qc, int bucket) {
 
     c->write_rr_id = turn->id;
 
-    __write_ready_pass(c, qc, bucket, 1, turn->id);
+    __write_ready_pass(qc, bucket, 1, turn->id);
 }
 
 int h3conn_write(h3conn_t* c, quicconn_t* qc) {
@@ -1242,9 +1242,9 @@ int h3conn_write(h3conn_t* c, quicconn_t* qc) {
      * at a coarser grain, which is what "incremental" asks for: pieces, not
      * simultaneity. */
     if (bucket >= 0 && incremental_only) __write_incremental_turn(c, qc, bucket);
-    else __write_ready_pass(c, qc, bucket, 1, H3_STREAM_ID_NONE);
+    else __write_ready_pass(qc, bucket, 1, H3_STREAM_ID_NONE);
 
-    if (bucket >= 0) __write_ready_pass(c, qc, bucket, 0, H3_STREAM_ID_NONE);
+    if (bucket >= 0) __write_ready_pass(qc, bucket, 0, H3_STREAM_ID_NONE);
 
     /* Field encoding above may have admitted dynamic entries and queued their
      * encoder instructions. Drain again in this same turn: otherwise the

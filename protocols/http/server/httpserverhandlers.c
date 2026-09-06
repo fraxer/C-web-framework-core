@@ -1316,10 +1316,6 @@ int __sni_callback(SSL* ssl, int* ad, void* arg) {
     }
 
     size_t server_name_length = strlen(ascii_server_name);
-    int vector_struct_size = 6;
-    int substring_count = 20;
-    int vector_size = substring_count * vector_struct_size;
-    int vector[vector_size];
 
     connection_server_ctx_t* ctx = connection->ctx;
     connection_t* listener_connection = ctx->listener->connection;

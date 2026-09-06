@@ -480,10 +480,11 @@ TEST(test_data_body_multi_chunk_large) {
     TEST_CASE("a body larger than BUF_SIZE is reassembled across chunks");
 
     data_fixture_t fx;
+    char* data = NULL;
     TEST_REQUIRE(fixture_setup(&fx, 1 << 17), "fixture should be created");
 
     enum { data_size = 40000 };
-    char* data = malloc(data_size);
+    data = malloc(data_size);
     TEST_REQUIRE_GOTO(data != NULL, "data buffer should be allocated", cleanup);
 
     for (size_t i = 0; i < data_size; i++)
@@ -498,9 +499,8 @@ TEST(test_data_body_multi_chunk_large) {
     TEST_ASSERT(sink_equals(&fx, data, data_size), "reassembled payload should match the input");
     TEST_ASSERT(fx.sink.body_calls >= 3, "a 40000-byte body should span several BUF_SIZE chunks");
 
-    free(data);
-
     cleanup:
+    free(data);
     fixture_teardown(&fx);
 }
 

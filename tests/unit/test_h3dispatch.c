@@ -130,7 +130,8 @@ TEST(test_h3dispatch_publish) {
     quicstream_t* qs = add_request(&f, 0);
 
     h3stream_t* st = h3conn_request_of(qs);
-    TEST_ASSERT(st != NULL && st->headers_done, "request built");
+    TEST_REQUIRE_NOT_NULL(st, "request state attached");
+    TEST_ASSERT(st->headers_done, "request built");
     /* h3conn_t is what lives in ctx->parser, so it is h3conn_t that has to carry
      * the free-through-a-void* contract __ctx_free relies on. */
     TEST_ASSERT(f.c->free == (void(*)(void*))h3conn_free, "free is the first field");
@@ -159,6 +160,7 @@ TEST(test_h3dispatch_publish) {
     fixture_init(&f);
     qs = add_request(&f, 0);
     st = h3conn_request_of(qs);
+    TEST_REQUIRE_NOT_NULL(st, "request state attached");
     r = httpresponse_create_h3(&f.qc->conn);
     TEST_ASSERT(h3_server_attach_response(&f.qc->conn, st->request, r) == 1,
                 "response attached before detach");
@@ -185,6 +187,7 @@ TEST(test_h3dispatch_write_turn) {
     fixture_init(&f);
     quicstream_t* qs = add_request(&f, 0);
     h3stream_t* st = h3conn_request_of(qs);
+    TEST_REQUIRE_NOT_NULL(st, "request state attached");
 
     httpresponse_t* r = httpresponse_create_h3(&f.qc->conn);
     h3_server_attach_response(&f.qc->conn, st->request, r);
@@ -222,6 +225,7 @@ TEST(test_h3dispatch_write_turn) {
     fixture_init(&f);
     qs = add_request(&f, 0);
     st = h3conn_request_of(qs);
+    TEST_REQUIRE_NOT_NULL(st, "request state attached");
     r = httpresponse_create_h3(&f.qc->conn);
     h3_server_attach_response(&f.qc->conn, st->request, r);
     httpresponse_default(r, 204);
@@ -273,7 +277,9 @@ TEST(test_h3dispatch_qpack_blocked_limit_and_reset) {
     h3conn_result_t r = h3conn_stream_read(f.c, f.qc, first);
     TEST_ASSERT(r.status == H3CONN_OK, "blocking is not a stream error");
     TEST_ASSERT(f.c->qpack_blocked_streams == 1, "one blocked slot");
-    TEST_ASSERT(h3conn_request_of(first)->qpack_blocked, "stream carries threshold");
+    const h3stream_t* blocked = h3conn_request_of(first);
+    TEST_REQUIRE_NOT_NULL(blocked, "request state attached");
+    TEST_ASSERT(blocked->qpack_blocked, "stream carries threshold");
 
     TEST_CASE("a second blocked request over the advertised limit is fatal");
     quicstream_t* second = add_blocked_request(&f, 1);
@@ -352,6 +358,7 @@ TEST(test_h3dispatch_large_response) {
     fixture_init(&f);
     quicstream_t* qs = add_request(&f, 0);
     h3stream_t* st = h3conn_request_of(qs);
+    TEST_REQUIRE_NOT_NULL(st, "request state attached");
 
     httpresponse_t* r = httpresponse_create_h3(&f.qc->conn);
     h3_server_attach_response(&f.qc->conn, st->request, r);
@@ -422,7 +429,8 @@ TEST(test_h3dispatch_refused) {
     TEST_ASSERT(!qs->send_reset_pending, "stream not reset");
 
     h3stream_t* st = h3conn_request_of(qs);
-    TEST_ASSERT(st != NULL && st->response != NULL, "a response was staged");
+    TEST_REQUIRE_NOT_NULL(st, "request state attached");
+    TEST_REQUIRE_NOT_NULL(st->response, "a response was staged");
     TEST_ASSERT(st->response->status_code == 431, "431");
     TEST_ASSERT(atomic_load(&st->response_ready), "and published");
 

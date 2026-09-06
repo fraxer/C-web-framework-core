@@ -11,6 +11,10 @@
  * Compiled only in a BUILD_FUZZERS build; an ordinary build has neither the
  * instrumentation nor this file. */
 
+/* ISO C has no empty translation unit, and -Wpedantic says so on every build
+ * that is not a fuzzing one. A typedef costs nothing and keeps the file legal. */
+typedef int cwfr_fuzzcov_translation_unit;
+
 #ifdef CWFR_FUZZ_COVERAGE
 
 void __sanitizer_cov_trace_pc(void);

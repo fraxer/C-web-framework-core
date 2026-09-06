@@ -157,7 +157,7 @@ TEST(test_quic_qlog) {
                 "events keep arriving without a flush");
 
     size_t records = 0;
-    for (size_t i = 0; i < len; i++)
+    for (size_t i = 0; body != NULL && i < len; i++)
         if (body[i] == 0x1e) records++;
     TEST_ASSERT(records == 3, "one record for the header and one per event");
 

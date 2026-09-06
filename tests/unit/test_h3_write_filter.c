@@ -91,8 +91,13 @@ TEST(test_h3_write_filter_lookup) {
 
     httpresponse_t* ra = httpresponse_create_h3(NULL);
     httpresponse_t* rb = httpresponse_create_h3(NULL);
-    h3conn_request_of(a)->response = ra;
-    h3conn_request_of(b)->response = rb;
+    h3stream_t* sa = h3conn_request_of(a);
+    h3stream_t* sb = h3conn_request_of(b);
+    /* Guarded rather than TEST_REQUIRE'd: this test owns a connection and two
+     * streams by hand, and returning from the middle of it would leak them. */
+    TEST_ASSERT(sa != NULL && sb != NULL, "request state attached to both streams");
+    if (sa != NULL) sa->response = ra;
+    if (sb != NULL) sb->response = rb;
 
     TEST_ASSERT(h3conn_stream_by_response(qc, ra) == a, "ra -> a");
     TEST_ASSERT(h3conn_stream_by_response(qc, rb) == b, "rb -> b");
