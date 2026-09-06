@@ -5,6 +5,7 @@
 #include "httprequest.h"
 
 #include <string.h>
+#include <strings.h>
 
 /* The shared field→request builder (docs/http3/05-http3.md §6.1). The cases are
  * the §4.1/§8.3 violations h2spec probes over TLS, lifted into a unit test so
@@ -57,6 +58,83 @@ TEST(test_httpfields_valid) {
     httprequest_t* r = NULL;
     TEST_ASSERT(build(cookies, sizeof cookies / sizeof cookies[0], HTTP_FIELDS_H2, &r)
                 == HTTP_FIELDS_OK, "ok");
+    httprequest_free(r);
+}
+
+static size_t host_count(const httprequest_t* r) {
+    size_t n = 0;
+    for (const http_header_t* h = r->header_; h != NULL; h = h->next)
+        if (h->key_length == 4 && strncasecmp(h->key, "host", 4) == 0) n++;
+    return n;
+}
+
+TEST(test_httpfields_authority_and_host) {
+    TEST_SUITE("httpfields");
+
+    /* RFC 9114 §4.3.1 / RFC 9113 §8.3.1: ":authority" and "Host" may both be
+     * present, but then "they MUST contain the same value", and neither may be
+     * empty. Two that disagree are the request-smuggling shape: routing reads
+     * the first Host, while a handler or an upstream may read the second. */
+    TEST_CASE("a Host that agrees with :authority leaves exactly one Host");
+    const httpfields_field_t agree[] = {
+        F(":method", "GET"), F(":path", "/"), F(":scheme", "https"),
+        F(":authority", "example.com"), F("host", "example.com"),
+    };
+    for (int p = 0; p < 2; p++) {
+        httprequest_t* r = NULL;
+        const http_fields_proto_e proto = p == 0 ? HTTP_FIELDS_H2 : HTTP_FIELDS_H3;
+        TEST_ASSERT(build(agree, sizeof agree / sizeof agree[0], proto, &r)
+                    == HTTP_FIELDS_OK, "accepted");
+        TEST_ASSERT(host_is(r, "example.com"), "Host kept");
+        TEST_ASSERT(host_count(r) == 1, "not duplicated");
+        httprequest_free(r);
+    }
+
+    TEST_CASE("a Host that disagrees with :authority is malformed");
+    const httpfields_field_t clash[] = {
+        F(":method", "GET"), F(":path", "/"), F(":scheme", "https"),
+        F(":authority", "example.com"), F("host", "evil.example"),
+    };
+    httprequest_t* r = NULL;
+    TEST_ASSERT(build(clash, sizeof clash / sizeof clash[0], HTTP_FIELDS_H3, &r)
+                == HTTP_FIELDS_MALFORMED, "refused");
+    httprequest_free(r);
+
+    TEST_CASE("a repeated Host is malformed even with no :authority");
+    const httpfields_field_t twice[] = {
+        F(":method", "GET"), F(":path", "/"), F(":scheme", "https"),
+        F("host", "example.com"), F("host", "example.com"),
+    };
+    TEST_ASSERT(build(twice, sizeof twice / sizeof twice[0], HTTP_FIELDS_H2, &r)
+                == HTTP_FIELDS_MALFORMED, "refused");
+    httprequest_free(r);
+
+    TEST_CASE("an empty :authority is malformed");
+    const httpfields_field_t empty_authority[] = {
+        F(":method", "GET"), F(":path", "/"), F(":scheme", "https"),
+        F(":authority", ""),
+    };
+    TEST_ASSERT(build(empty_authority, sizeof empty_authority / sizeof empty_authority[0],
+                      HTTP_FIELDS_H3, &r) == HTTP_FIELDS_MALFORMED, "refused");
+    httprequest_free(r);
+
+    TEST_CASE("an empty Host is malformed");
+    const httpfields_field_t empty_host[] = {
+        F(":method", "GET"), F(":path", "/"), F(":scheme", "https"),
+        F("host", ""),
+    };
+    TEST_ASSERT(build(empty_host, sizeof empty_host / sizeof empty_host[0],
+                      HTTP_FIELDS_H2, &r) == HTTP_FIELDS_MALFORMED, "refused");
+    httprequest_free(r);
+
+    TEST_CASE("a Host alone still selects the request's host");
+    const httpfields_field_t host_only[] = {
+        F(":method", "GET"), F(":path", "/"), F(":scheme", "https"),
+        F("host", "example.com"),
+    };
+    TEST_ASSERT(build(host_only, sizeof host_only / sizeof host_only[0],
+                      HTTP_FIELDS_H3, &r) == HTTP_FIELDS_OK, "accepted");
+    TEST_ASSERT(host_is(r, "example.com") && host_count(r) == 1, "one Host");
     httprequest_free(r);
 }
 

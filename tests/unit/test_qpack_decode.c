@@ -44,6 +44,129 @@ TEST(test_qpack_static_table) {
                 && strcmp(qpack_static_table[98].value, "sameorigin") == 0, "index 98");
 }
 
+/* Every entry of RFC 9204 Appendix A, transcribed here independently of the
+ * generated header. A truncated static entry is invisible to every other test
+ * -- both sides of a decode agree on the same wrong string -- but it corrupts
+ * the message: index 47 once read "application/x-www-", and a body announced
+ * with that content-type is parsed as something it is not. The generator that
+ * produced those ten truncations read the RFC's plain text one physical line at
+ * a time, so this table is what stands between a regeneration and the wire. */
+static const struct { const char* name; const char* value; }
+qpack_static_golden[QPACK_STATIC_TABLE_SIZE] = {
+    { ":authority",                      "" },
+    { ":path",                           "/" },
+    { "age",                             "0" },
+    { "content-disposition",             "" },
+    { "content-length",                  "0" },
+    { "cookie",                          "" },
+    { "date",                            "" },
+    { "etag",                            "" },
+    { "if-modified-since",               "" },
+    { "if-none-match",                   "" },
+    { "last-modified",                   "" },
+    { "link",                            "" },
+    { "location",                        "" },
+    { "referer",                         "" },
+    { "set-cookie",                      "" },
+    { ":method",                         "CONNECT" },
+    { ":method",                         "DELETE" },
+    { ":method",                         "GET" },
+    { ":method",                         "HEAD" },
+    { ":method",                         "OPTIONS" },
+    { ":method",                         "POST" },
+    { ":method",                         "PUT" },
+    { ":scheme",                         "http" },
+    { ":scheme",                         "https" },
+    { ":status",                         "103" },
+    { ":status",                         "200" },
+    { ":status",                         "304" },
+    { ":status",                         "404" },
+    { ":status",                         "503" },
+    { "accept",                          "*/*" },
+    { "accept",                          "application/dns-message" },
+    { "accept-encoding",                 "gzip, deflate, br" },
+    { "accept-ranges",                   "bytes" },
+    { "access-control-allow-headers",    "cache-control" },
+    { "access-control-allow-headers",    "content-type" },
+    { "access-control-allow-origin",     "*" },
+    { "cache-control",                   "max-age=0" },
+    { "cache-control",                   "max-age=2592000" },
+    { "cache-control",                   "max-age=604800" },
+    { "cache-control",                   "no-cache" },
+    { "cache-control",                   "no-store" },
+    { "cache-control",                   "public, max-age=31536000" },
+    { "content-encoding",                "br" },
+    { "content-encoding",                "gzip" },
+    { "content-type",                    "application/dns-message" },
+    { "content-type",                    "application/javascript" },
+    { "content-type",                    "application/json" },
+    { "content-type",                    "application/x-www-form-urlencoded" },
+    { "content-type",                    "image/gif" },
+    { "content-type",                    "image/jpeg" },
+    { "content-type",                    "image/png" },
+    { "content-type",                    "text/css" },
+    { "content-type",                    "text/html; charset=utf-8" },
+    { "content-type",                    "text/plain" },
+    { "content-type",                    "text/plain;charset=utf-8" },
+    { "range",                           "bytes=0-" },
+    { "strict-transport-security",       "max-age=31536000" },
+    { "strict-transport-security",       "max-age=31536000; includesubdomains" },
+    { "strict-transport-security",       "max-age=31536000; includesubdomains; preload" },
+    { "vary",                            "accept-encoding" },
+    { "vary",                            "origin" },
+    { "x-content-type-options",          "nosniff" },
+    { "x-xss-protection",                "1; mode=block" },
+    { ":status",                         "100" },
+    { ":status",                         "204" },
+    { ":status",                         "206" },
+    { ":status",                         "302" },
+    { ":status",                         "400" },
+    { ":status",                         "403" },
+    { ":status",                         "421" },
+    { ":status",                         "425" },
+    { ":status",                         "500" },
+    { "accept-language",                 "" },
+    { "access-control-allow-credentials", "FALSE" },
+    { "access-control-allow-credentials", "TRUE" },
+    { "access-control-allow-headers",    "*" },
+    { "access-control-allow-methods",    "get" },
+    { "access-control-allow-methods",    "get, post, options" },
+    { "access-control-allow-methods",    "options" },
+    { "access-control-expose-headers",   "content-length" },
+    { "access-control-request-headers",  "content-type" },
+    { "access-control-request-method",   "get" },
+    { "access-control-request-method",   "post" },
+    { "alt-svc",                         "clear" },
+    { "authorization",                   "" },
+    { "content-security-policy",         "script-src 'none'; object-src 'none'; base-uri 'none'" },
+    { "early-data",                      "1" },
+    { "expect-ct",                       "" },
+    { "forwarded",                       "" },
+    { "if-range",                        "" },
+    { "origin",                          "" },
+    { "purpose",                         "prefetch" },
+    { "server",                          "" },
+    { "timing-allow-origin",             "*" },
+    { "upgrade-insecure-requests",       "1" },
+    { "user-agent",                      "" },
+    { "x-forwarded-for",                 "" },
+    { "x-frame-options",                 "deny" },
+    { "x-frame-options",                 "sameorigin" },
+};
+
+TEST(test_qpack_static_table_golden) {
+    TEST_SUITE("qpack");
+
+    TEST_CASE("all 99 entries match RFC 9204 Appendix A, lengths included");
+    for (size_t i = 0; i < QPACK_STATIC_TABLE_SIZE; i++) {
+        const qpack_static_entry_t* e = &qpack_static_table[i];
+        TEST_ASSERT(strcmp(e->name, qpack_static_golden[i].name) == 0, "name");
+        TEST_ASSERT(strcmp(e->value, qpack_static_golden[i].value) == 0, "value");
+        TEST_ASSERT(e->name_len == strlen(qpack_static_golden[i].name), "name_len");
+        TEST_ASSERT(e->value_len == strlen(qpack_static_golden[i].value), "value_len");
+    }
+}
+
 TEST(test_qpack_decode_b1) {
     TEST_SUITE("qpack");
 
@@ -377,6 +500,55 @@ TEST(test_qpack_decoder_stream_output) {
                 "suffix retained");
     qpack_decoder_consume(d, 99);
     TEST_ASSERT(qpack_decoder_pending(d, &pending) == 0, "oversized consume drains queue");
+
+    qpack_decoder_free(d);
+}
+
+TEST(test_qpack_reference_within_required_insert_count) {
+    TEST_SUITE("qpack");
+
+    /* RFC 9204 §2.1.2 defines the Required Insert Count as the absolute index of
+     * the newest entry the section references, plus one; §2.2.1 makes a count
+     * "smaller than expected" a connection error of type
+     * QPACK_DECOMPRESSION_FAILED. The Base check next to it does not cover this:
+     * with Sign=0 the Base sits *above* the Required Insert Count, so a section
+     * declaring RIC=0 -- which promises it needs no insertion, never blocks and
+     * is never acknowledged -- could still reach into the dynamic table. */
+    qpack_decoder_t* d = qpack_decoder_create(128, 4);
+    static const uint8_t insert[] = { 0x3f, 0x61, 0x41, 'x', 0x01, 'y' };
+    size_t consumed = 0;
+    TEST_ASSERT(qpack_decoder_read_encoder(d, insert, sizeof insert, &consumed) == QPACK_OK,
+                "one entry inserted");
+
+    qpack_header_t* h = NULL;
+    size_t count = 0;
+
+    TEST_CASE("RIC=0 with a dynamic reference is a decompression failure");
+    /* Prefix: Required Insert Count 0, Delta Base 1 (Sign=0) -- Base becomes 1,
+     * which is what lets the indexed representation name absolute index 0. */
+    static const uint8_t past_ric[] = { 0x00, 0x01, 0x80 };
+    TEST_ASSERT(qpack_decode_block(d, past_ric, sizeof past_ric, 0, &h, &count)
+                    == QPACK_ERR_DECOMPRESSION, "refused");
+    TEST_ASSERT(h == NULL && count == 0, "nothing handed back");
+
+    TEST_CASE("the same reference under a truthful RIC decodes");
+    static const uint8_t honest[] = { 0x02, 0x00, 0x80 };
+    TEST_ASSERT(qpack_decode_block(d, honest, sizeof honest, 0, &h, &count) == QPACK_OK,
+                "accepted");
+    TEST_ASSERT(count == 1 && field_eq(&h[0], "x", "y", 0), "the dynamic entry");
+    qpack_headers_free(h, count);
+    h = NULL; count = 0;
+
+    TEST_CASE("a post-base reference at the Required Insert Count is refused");
+    static const uint8_t second[] = { 0x41, 'a', 0x01, 'b' };
+    TEST_ASSERT(qpack_decoder_read_encoder(d, second, sizeof second, &consumed) == QPACK_OK,
+                "a second entry inserted");
+    /* RIC=1, Base=1, post-base index 0 -- absolute index 1, which the declared
+     * count says the section does not reference. */
+    static const uint8_t post_base[] = { 0x02, 0x00, 0x10 };
+    TEST_ASSERT(qpack_decode_block(d, post_base, sizeof post_base, 0, &h, &count)
+                    == QPACK_ERR_DECOMPRESSION, "refused");
+    TEST_ASSERT(h == NULL && count == 0, "nothing handed back");
 
     qpack_decoder_free(d);
 }

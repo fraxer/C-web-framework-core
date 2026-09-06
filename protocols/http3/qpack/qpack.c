@@ -50,6 +50,15 @@ uint64_t qpack_decoder_insert_count(const qpack_decoder_t* d) {
     return d ? d->insert_count : 0;
 }
 
+/* The decoder stream's outbound queue is drained on the write turn that follows
+ * the read, so what can pile up here is one read pass worth of instructions: an
+ * Insert Count Increment per insertion the peer sent, plus an acknowledgment per
+ * stream. Bounded by the peer's flow-control window rather than by anything this
+ * side chose, which is the one thing that makes it worth a ceiling -- a quarter
+ * megabyte of unsent decoder instructions is tens of thousands of insertions in
+ * a single pass, and no conforming encoder produces that. */
+#define QPACK_DECODER_PENDING_MAX (256u * 1024u)
+
 static int __decoder_pending_int(qpack_decoder_t* d, uint64_t value,
                                  uint8_t prefix, uint8_t flags) {
     uint8_t encoded[16];
@@ -57,6 +66,7 @@ static int __decoder_pending_int(qpack_decoder_t* d, uint64_t value,
     if (n == 0) return 0;
     if (d->pending_len > SIZE_MAX - n) return 0;
     const size_t need = d->pending_len + n;
+    if (need > QPACK_DECODER_PENDING_MAX) return 0;
     if (need > d->pending_cap) {
         size_t cap = d->pending_cap ? d->pending_cap : 32;
         while (cap < need) {
@@ -1096,6 +1106,22 @@ qpack_status_e qpack_required_insert_count(const qpack_decoder_t* d,
     return ric > d->insert_count ? QPACK_BLOCKED : QPACK_OK;
 }
 
+/* §2.1.2/§2.2.1: the Required Insert Count a field section declares is the
+ * absolute index of the newest entry it references, plus one. So every dynamic
+ * reference in the section must resolve below it -- a decoder that resolves one
+ * at or above the declared count has been told a Required Insert Count "smaller
+ * than expected", which §2.2.1 makes a connection error of type
+ * QPACK_DECOMPRESSION_FAILED.
+ *
+ * The bound is not the same as the Base check next to it. Base only says which
+ * entries a representation is allowed to name; with Sign=0 it sits *above* the
+ * Required Insert Count, so a block declaring RIC=0 (which promises the section
+ * needs no insertion at all, and therefore never blocks and never has to be
+ * acknowledged) could still reach into the dynamic table through the gap. */
+static int __reference_within_ric(uint64_t absolute, uint64_t ric) {
+    return absolute < ric;
+}
+
 qpack_status_e qpack_decode_block(qpack_decoder_t* d, const uint8_t* block, size_t len,
                                   size_t max_list_size,
                                   qpack_header_t** out, size_t* out_count) {
@@ -1174,6 +1200,9 @@ qpack_status_e qpack_decode_block(qpack_decoder_t* d, const uint8_t* block, size
                 }
             } else {
                 if (idx >= base) { st = QPACK_ERR_DECOMPRESSION; goto fail; }
+                if (!__reference_within_ric(base - idx - 1, ric)) {
+                    st = QPACK_ERR_DECOMPRESSION; goto fail;
+                }
                 const qpack_dynamic_entry_t* e = __dynamic_absolute(d, base - idx - 1);
                 if (e == NULL || !__dup_bytes(e->name, e->name_len, &h->name, &h->name_len) ||
                     !__dup_bytes(e->value, e->value_len, &h->value, &h->value_len)) {
@@ -1216,6 +1245,9 @@ qpack_status_e qpack_decode_block(qpack_decoder_t* d, const uint8_t* block, size
                 }
             } else {
                 if (nidx >= base) { st = QPACK_ERR_DECOMPRESSION; goto fail; }
+                if (!__reference_within_ric(base - nidx - 1, ric)) {
+                    st = QPACK_ERR_DECOMPRESSION; goto fail;
+                }
                 const qpack_dynamic_entry_t* e = __dynamic_absolute(d, base - nidx - 1);
                 if (e == NULL) { st = QPACK_ERR_DECOMPRESSION; goto fail; }
                 if (!__dup_bytes(e->name, e->name_len, &h->name, &h->name_len)) {
@@ -1232,6 +1264,9 @@ qpack_status_e qpack_decode_block(qpack_decoder_t* d, const uint8_t* block, size
             n = prefix_int_decode(p, (size_t)(end - p), 4, &idx);
             if (n == 0 || base > UINT64_MAX - idx) { st = QPACK_ERR_DECOMPRESSION; goto fail; }
             p += n;
+            if (!__reference_within_ric(base + idx, ric)) {
+                st = QPACK_ERR_DECOMPRESSION; goto fail;
+            }
             const qpack_dynamic_entry_t* e = __dynamic_absolute(d, base + idx);
             if (e == NULL || !__dup_bytes(e->name, e->name_len, &h->name, &h->name_len) ||
                 !__dup_bytes(e->value, e->value_len, &h->value, &h->value_len)) {
@@ -1245,6 +1280,9 @@ qpack_status_e qpack_decode_block(qpack_decoder_t* d, const uint8_t* block, size
             n = prefix_int_decode(p, (size_t)(end - p), 3, &idx);
             if (n == 0 || base > UINT64_MAX - idx) { st = QPACK_ERR_DECOMPRESSION; goto fail; }
             p += n;
+            if (!__reference_within_ric(base + idx, ric)) {
+                st = QPACK_ERR_DECOMPRESSION; goto fail;
+            }
             const qpack_dynamic_entry_t* e = __dynamic_absolute(d, base + idx);
             if (e == NULL || !__dup_bytes(e->name, e->name_len, &h->name, &h->name_len)) {
                 st = e == NULL ? QPACK_ERR_DECOMPRESSION : QPACK_ERR_MEMORY; goto fail;

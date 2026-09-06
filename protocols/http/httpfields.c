@@ -2,6 +2,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>   /* strncasecmp */
 
 #include "cookieparser.h"
 #include "h2field.h"
@@ -252,6 +253,13 @@ http_fields_status_e httpfields_to_request(httprequest_t* request,
      * is not ours to keep). */
     int connect_method = 0, protocol_seen = 0, protocol_websocket = 0;
     char protocol_name[32] = {0};
+    /* The :authority slice, kept to compare a later Host against. Pseudo-headers
+     * precede every regular field (the loop rejects the other order), so by the
+     * time a Host arrives this is either set or the request never had an
+     * authority. */
+    const char* authority = NULL;
+    size_t authority_len = 0;
+    int host_seen = 0;
 
     int64_t clength = -1;
 
@@ -287,10 +295,13 @@ http_fields_status_e httpfields_to_request(httprequest_t* request,
                 scheme_seen = 1;
             }
             else if (name_len == 10 && memcmp(name, ":authority", 10) == 0) {
-                if (authority_seen) { status = HTTP_FIELDS_MALFORMED; break; }
+                /* §4.3.1 / RFC 9113 §8.3.1: present means non-empty. */
+                if (value_len == 0 || authority_seen) { status = HTTP_FIELDS_MALFORMED; break; }
                 /* httprequest's add_headern returns 0 on success. */
                 if (request->add_headern(request, "Host", 4, value, value_len) != 0)
                     status = HTTP_FIELDS_INTERNAL;
+                authority = value;
+                authority_len = value_len;
                 authority_seen = 1;
             }
             else if (name_len == 9 && memcmp(name, ":protocol", 9) == 0) {
@@ -317,6 +328,27 @@ http_fields_status_e httpfields_to_request(httprequest_t* request,
         if (httpfields_is_forbidden_header(name, name_len)) {
             status = HTTP_FIELDS_MALFORMED;
             break;
+        }
+
+        /* RFC 9114 §4.3.1 and RFC 9113 §8.3.1, in the same words: if both
+         * :authority and Host are present "they MUST contain the same value",
+         * and neither may be empty. Two Host fields that do not agree are the
+         * classic request-smuggling shape -- routing reads the first, a handler
+         * or an upstream may read the other -- so a disagreement is refused
+         * rather than resolved, and an agreeing Host is dropped rather than
+         * appended, leaving exactly one for everything downstream to read. */
+        if (name_len == 4 && strncasecmp(name, "host", 4) == 0) {
+            if (value_len == 0 || host_seen) { status = HTTP_FIELDS_MALFORMED; break; }
+            host_seen = 1;
+
+            if (authority_seen) {
+                if (value_len != authority_len ||
+                    strncasecmp(value, authority, value_len) != 0) {
+                    status = HTTP_FIELDS_MALFORMED;
+                    break;
+                }
+                continue;
+            }
         }
 
         if (name_len == 2 && memcmp(name, "te", 2) == 0 && !te_is_valid(value, value_len)) {

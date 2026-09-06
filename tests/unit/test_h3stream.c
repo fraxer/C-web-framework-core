@@ -408,3 +408,125 @@ TEST(test_h3stream_field_limit) {
     qpack_encoder_free(enc);
     qpack_decoder_free(qdec);
 }
+
+TEST(test_h3stream_extended_connect) {
+    TEST_SUITE("h3stream");
+
+    /* RFC 9220 §3: :protocol is legal only where the server advertised
+     * SETTINGS_ENABLE_CONNECT_PROTOCOL, and h3 here never does. The field
+     * section has to be refused rather than announced ready: CONNECT leaves
+     * request->method at ROUTE_NONE (-1), and the dispatcher indexes
+     * route->handler[] and route->static_file[] with the method. */
+    TEST_CASE("extended CONNECT is a message error, not a ready request");
+    qpack_encoder_t* enc = qpack_encoder_create(0, 0);
+    qpack_decoder_t* d = qpack_decoder_create(0, 0);
+    h3stream_t* st = h3stream_create(NULL, 0);
+    const qpack_header_t f[] = {
+        QF(":method", "CONNECT"), QF(":scheme", "https"), QF(":path", "/chat"),
+        QF(":authority", "example.com"), QF(":protocol", "websocket"),
+    };
+    uint8_t frame[512];
+    const size_t n = headers_frame(enc, f, sizeof f / sizeof f[0], frame, sizeof frame);
+    TEST_ASSERT(feed(st, d, frame, n, 0) == H3STREAM_ERR_MESSAGE, "refused");
+    TEST_ASSERT(st->request->method == ROUTE_NONE, "and the method stayed unroutable");
+    h3stream_free(st);
+
+    TEST_CASE("a :protocol we do not serve is refused the same way");
+    st = h3stream_create(NULL, 0);
+    const qpack_header_t other[] = {
+        QF(":method", "CONNECT"), QF(":scheme", "https"), QF(":path", "/x"),
+        QF(":authority", "example.com"), QF(":protocol", "irc"),
+    };
+    const size_t m = headers_frame(enc, other, sizeof other / sizeof other[0],
+                                   frame, sizeof frame);
+    TEST_ASSERT(feed(st, d, frame, m, 0) == H3STREAM_ERR_MESSAGE, "refused");
+    h3stream_free(st);
+
+    qpack_decoder_free(d);
+    qpack_encoder_free(enc);
+}
+
+TEST(test_h3stream_blocked_trailers) {
+    TEST_SUITE("h3stream qpack blocked");
+
+    /* Trailers block on the dynamic table exactly as a header section does. The
+     * section used to be dropped on the floor when it did -- and the FIN behind
+     * it with it, so the request was never dispatched and the stream hung to
+     * the idle timeout. */
+    h3stream_t* st = h3stream_create(NULL, 0);
+    qpack_decoder_t* d = qpack_decoder_create(128, 4);
+    st->headers_done = 1;
+    st->stage = H3STREAM_BODY;
+
+    /* A trailer section whose prefix declares RIC=1 while nothing has been
+     * inserted yet, ended by FIN. */
+    static const uint8_t trailers[] = { H3_FRAME_HEADERS, 0x02, 0x02, 0x00 };
+
+    TEST_CASE("blocked trailers park the section and the FIN behind it");
+    TEST_ASSERT(feed(st, d, trailers, sizeof trailers, 1) == H3STREAM_QPACK_BLOCKED,
+                "blocked");
+    TEST_ASSERT(st->qpack_blocked && st->qpack_required_insert_count == 1,
+                "threshold stored");
+    TEST_ASSERT(st->stage == H3STREAM_BODY, "still the section that blocked");
+    TEST_ASSERT(st->qpack_deferred_fin, "the FIN is parked, not lost");
+
+    TEST_CASE("the insertion resumes them with no further stream bytes");
+    static const uint8_t insert[] = { 0x3f, 0x61, 0x41, 'x', 0x01, 'y' };
+    size_t consumed = 0;
+    TEST_ASSERT(qpack_decoder_read_encoder(d, insert, sizeof insert, &consumed) == QPACK_OK,
+                "one insertion");
+    TEST_ASSERT(h3stream_qpack_can_resume(st, qpack_decoder_insert_count(d)),
+                "the stream may resume");
+
+    const uint8_t* p = NULL;
+    TEST_ASSERT(h3stream_feed(st, d, &p, NULL, 0) == H3STREAM_DONE,
+                "the retry runs the trailers and the parked FIN");
+    TEST_ASSERT(st->stage == H3STREAM_TRAILERS, "the section was consumed");
+    TEST_ASSERT(!st->qpack_blocked && st->qpack_deferred == NULL, "nothing left parked");
+    TEST_ASSERT(st->qpack_sections_to_ack == 1,
+                "and the dynamic section owes a Section Acknowledgment");
+
+    h3stream_free(st);
+    qpack_decoder_free(d);
+}
+
+TEST(test_h3stream_section_ack_accounting) {
+    TEST_SUITE("h3stream qpack blocked");
+
+    /* RFC 9204 §4.4.1: every section with a Required Insert Count above zero is
+     * acknowledged once processed, whether or not it ever blocked. Acking only
+     * the blocked ones leaves the peer's encoder unable to advance its Known
+     * Received Count, and therefore unable to evict. */
+    TEST_CASE("a static-only section owes nothing");
+    qpack_encoder_t* enc = qpack_encoder_create(0, 0);
+    qpack_decoder_t* d = qpack_decoder_create(128, 4);
+    h3stream_t* st = h3stream_create(NULL, 0);
+    const qpack_header_t f[] = {
+        QF(":method", "GET"), QF(":path", "/"), QF(":scheme", "https"),
+        QF(":authority", "example.com"),
+    };
+    uint8_t frame[512];
+    const size_t n = headers_frame(enc, f, sizeof f / sizeof f[0], frame, sizeof frame);
+    TEST_ASSERT(feed(st, d, frame, n, 0) == H3STREAM_REQUEST_READY, "ready");
+    TEST_ASSERT(st->qpack_sections_to_ack == 0, "no dynamic reference, no ack");
+    h3stream_free(st);
+
+    TEST_CASE("a dynamic section that never blocked owes one");
+    static const uint8_t insert[] = { 0x3f, 0x61, 0x41, 'x', 0x01, 'y' };
+    size_t consumed = 0;
+    TEST_ASSERT(qpack_decoder_read_encoder(d, insert, sizeof insert, &consumed) == QPACK_OK,
+                "one insertion");
+    st = h3stream_create(NULL, 0);
+    st->headers_done = 1;
+    st->stage = H3STREAM_BODY;
+    /* Trailers: RIC=1 (already satisfied, so nothing blocks), Base=1, one
+     * indexed reference to absolute 0. */
+    static const uint8_t section[] = { H3_FRAME_HEADERS, 0x03, 0x02, 0x00, 0x80 };
+    TEST_ASSERT(feed(st, d, section, sizeof section, 0) == H3STREAM_NEED_MORE,
+                "decoded straight away");
+    TEST_ASSERT(st->qpack_sections_to_ack == 1, "and still owes the acknowledgment");
+    h3stream_free(st);
+
+    qpack_decoder_free(d);
+    qpack_encoder_free(enc);
+}

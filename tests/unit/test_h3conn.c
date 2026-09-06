@@ -300,3 +300,101 @@ TEST(test_h3conn_uni_streams) {
     stream_free(qs);
     h3conn_free(c);
 }
+
+/* The same GET, but with a Field Section Prefix that declares Required Insert
+ * Count 1: nothing in the section actually needs the dynamic table, so it
+ * decodes the moment the peer's first insertion arrives, and until then it is
+ * blocked. Written by hand because the encoder here has no dynamic table of its
+ * own to produce such a prefix. */
+static size_t blocked_request(uint8_t* out, size_t cap) {
+    qpack_encoder_t* enc = qpack_encoder_create(0, 0);
+    const qpack_header_t fields[] = {
+        { (char*)":method", 7, (char*)"GET", 3, 0 },
+        { (char*)":path", 5, (char*)"/", 1, 0 },
+        { (char*)":scheme", 7, (char*)"https", 5, 0 },
+        { (char*)":authority", 10, (char*)"example.com", 11, 0 },
+    };
+
+    uint8_t block[256];
+    const size_t blen = qpack_encode_block(enc, fields, 4, block, sizeof block);
+    qpack_encoder_free(enc);
+
+    block[0] = 0x02;   /* Required Insert Count 1 in its modulo form */
+
+    return h3frame_write(out, cap, H3_FRAME_HEADERS, block, blen);
+}
+
+TEST(test_h3conn_qpack_blocked_resume) {
+    TEST_SUITE("h3conn");
+
+    /* What unblocks a QPACK-blocked section arrives on the peer's *encoder*
+     * stream, not on the request stream, so the pass that can finally decode it
+     * finds the request stream silent. Leaving on "no new bytes" stranded the
+     * request until the client sent something else -- and a client waiting for
+     * a 100-continue, or one that has already sent everything, never does. */
+    TEST_CASE("a section blocked on the dynamic table is retried after the insert");
+    h3conn_t* c = h3conn_create(NULL, 65536, 0);
+    quicstream_t* qs = request_stream(0);
+
+    uint8_t req[256];
+    const size_t n = blocked_request(req, sizeof req);
+    deliver(qs, 0, req, n, 0);   /* deliberately no FIN: a body would follow */
+
+    h3conn_result_t r = h3conn_stream_read(c, NULL, qs);
+    TEST_ASSERT(r.status == H3CONN_OK, "nothing to report while blocked");
+    TEST_ASSERT(c->qpack_blocked_streams == 1, "the stream holds a blocked slot");
+
+    /* Reading it again with nothing new must not resolve anything by itself. */
+    TEST_ASSERT(h3conn_stream_read(c, NULL, qs).status == H3CONN_OK, "still blocked");
+    TEST_ASSERT(c->qpack_blocked_streams == 1, "and still holding the slot");
+
+    quicstream_t* enc = uni_stream(0);
+    const uint8_t insert[] = { 0x02, 0x3f, 0x61, 0x41, 'x', 0x01, 'y' };
+    deliver(enc, 0, insert, sizeof insert, 0);
+    TEST_ASSERT(h3conn_stream_read(c, NULL, enc).status == H3CONN_OK, "insertion accepted");
+    TEST_ASSERT(qpack_decoder_insert_count(c->session->qdec) == 1, "one entry");
+
+    r = h3conn_stream_read(c, NULL, qs);
+    TEST_ASSERT(r.status == H3CONN_REQUEST_HEADERS,
+                "the request completes with no further bytes of its own");
+    TEST_ASSERT(c->qpack_blocked_streams == 0, "and the blocked slot goes back");
+
+    TEST_CASE("the section is acknowledged on the decoder stream");
+    const uint8_t* pending = NULL;
+    const size_t plen = qpack_decoder_pending(c->session->qdec, &pending);
+    /* Insert Count Increment 1 (0x01), then Section Acknowledgment for stream 0
+     * (0x80): the acknowledgment is what lets the peer's encoder evict. */
+    TEST_ASSERT(plen == 2 && pending[0] == 0x01 && pending[1] == 0x80,
+                "increment then section acknowledgment");
+
+    stream_free(qs);
+    stream_free(enc);
+    h3conn_free(c);
+}
+
+TEST(test_h3conn_refusal_stops_the_upload) {
+    TEST_SUITE("h3conn");
+
+    /* RFC 9114 §4.1: a server that does not need the rest of the request "MAY
+     * abort reading the request stream", and H3_NO_ERROR is the code for asking
+     * a client to stop sending. Without it a client refused with a 431 goes on
+     * uploading the body that earned the refusal, and every byte is read,
+     * credited back and thrown away. */
+    TEST_CASE("a 431 asks the client to stop sending");
+    h3conn_t* c = h3conn_create(NULL, 64, 0);   /* any real request is over this */
+    quicstream_t* qs = request_stream(0);
+
+    uint8_t req[256];
+    const size_t n = get_request(req, sizeof req);
+    deliver(qs, 0, req, n, 0);
+
+    const h3conn_result_t r = h3conn_stream_read(c, NULL, qs);
+    TEST_ASSERT(r.status == H3CONN_REQUEST_REFUSED, "refused");
+    TEST_ASSERT(r.http_status == 431, "431");
+    TEST_ASSERT(qs->send_stop_sending_pending, "STOP_SENDING queued");
+    TEST_ASSERT(qs->send_stop_sending_code == H3_NO_ERROR, "with H3_NO_ERROR");
+    TEST_ASSERT(!qs->send_reset_pending, "the response still goes out on this stream");
+
+    stream_free(qs);
+    h3conn_free(c);
+}

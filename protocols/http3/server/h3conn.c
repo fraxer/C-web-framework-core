@@ -427,6 +427,34 @@ static h3conn_result_t __apply_uni_verdict(quicstream_t* qs, h3app_t* app,
     return __ok();
 }
 
+/* Whether this status ends the stream's field-section bookkeeping with a Stream
+ * Cancellation rather than an acknowledgment: everything that is not one of the
+ * five states the reader keeps going through. Kept next to the reader because
+ * that is what defines it -- the statuses below are exactly the ones its loop
+ * does *not* fall through to __apply_stream_status with. */
+static int __status_cancels(h3stream_status_e st) {
+    switch (st) {
+    case H3STREAM_OK:
+    case H3STREAM_NEED_MORE:
+    case H3STREAM_REQUEST_READY:
+    case H3STREAM_BODY_CHUNK:
+    case H3STREAM_QPACK_BLOCKED:
+    case H3STREAM_DONE:
+        return 0;
+    default:
+        return 1;
+    }
+}
+
+/* The request has been answered without the rest of it: stop reading and say so
+ * (RFC 9114 §4.1). Flow control is still credited for whatever has already
+ * arrived -- those bytes are spent at the connection level whether or not this
+ * stream wanted them -- so this shuts off the source rather than the accounting. */
+static void __stop_reading(quicstream_t* qs, h3app_t* app) {
+    app->drained = 1;
+    quicstream_stop_sending(qs, H3_NO_ERROR);
+}
+
 /* Map an h3stream status onto transport actions. */
 static h3conn_result_t __apply_stream_status(quicstream_t* qs, h3app_t* app,
                                              h3stream_status_e st) {
@@ -452,23 +480,30 @@ static h3conn_result_t __apply_stream_status(quicstream_t* qs, h3app_t* app,
     }
 
     /* The three that are answered rather than reset. The stream stays
-     * well-formed, so the response goes out on it normally. */
+     * well-formed, so the response goes out on it normally -- but the request
+     * body is over as far as this server is concerned. §4.1 says so in as many
+     * words: a server that does not need the rest of the request "MAY abort
+     * reading the request stream", and H3_NO_ERROR is the code for asking a
+     * client to stop sending. Without it a client refused a 413 may keep
+     * uploading the body that earned the 413, and every byte is read, credited
+     * back through quicconn_consumed and thrown away. The send side is
+     * untouched: the response still goes out on this stream. */
     case H3STREAM_ERR_BODY_TOO_LARGE:
         metrics_h3(METRICS_H3_BODY_TOO_LARGE);
-        app->drained = 1;
+        __stop_reading(qs, app);
         return __refused(413);
 
     case H3STREAM_ERR_FIELDS_TOO_LARGE:
         metrics_h3(METRICS_H3_FIELD_SECTION_TOO_LARGE);
-        app->drained = 1;
+        __stop_reading(qs, app);
         return __refused(431);
 
     case H3STREAM_ERR_MISDIRECTED:
         metrics_h3(METRICS_H3_MISDIRECTED);
-        app->drained = 1;
+        __stop_reading(qs, app);
         return __refused(404);
 
-    case H3STREAM_ERR_INTERNAL:         app->drained = 1; return __refused(500);
+    case H3STREAM_ERR_INTERNAL:         __stop_reading(qs, app); return __refused(500);
 
     default:
         return __ok();
@@ -495,6 +530,10 @@ static h3conn_result_t __on_reset(h3conn_t* c, quicstream_t* qs, h3app_t* app) {
     if (app->qpack_blocked_counted) {
         if (c->qpack_blocked_streams > 0) c->qpack_blocked_streams--;
         app->qpack_blocked_counted = 0;
+    }
+    if (app->req != NULL &&
+        (app->req->qpack_blocked || app->req->qpack_sections_to_ack > 0)) {
+        app->req->qpack_sections_to_ack = 0;
         if (qpack_decoder_cancel_stream(c->session->qdec, qs->id) != QPACK_OK)
             return __closed(H3_INTERNAL_ERROR);
         h3stream_qpack_unblock(app->req);
@@ -553,7 +592,20 @@ static h3conn_result_t __read_request(h3conn_t* c, quicconn_t* qc, quicstream_t*
         quicconn_consumed(qc, n);
         const int fin = (qs->recv_state == QUIC_RECV_DATA_READ);
 
-        if (n == 0 && !fin) break;
+        /* What unblocks a QPACK-blocked section arrives on the peer's *encoder*
+         * stream, not on this one, so the pass that can finally decode it may
+         * well find this stream silent. Leaving on `n == 0` then strands the
+         * request until the client happens to send something else -- and a
+         * client that is waiting for our 100-continue, or that sent its whole
+         * request already, never does. The same holds for bytes parked in the
+         * deferred buffer: they came off the transport long ago and nothing
+         * else will re-offer them. */
+        const int resume = !app->drained && app->req != NULL &&
+            (h3stream_qpack_deferred_pending(app->req) ||
+             h3stream_qpack_can_resume(app->req,
+                                       qpack_decoder_insert_count(c->session->qdec)));
+
+        if (n == 0 && !fin && !resume) break;
 
         if (app->drained) {
             if (fin || n < sizeof buf) break;
@@ -568,13 +620,30 @@ static h3conn_result_t __read_request(h3conn_t* c, quicconn_t* qc, quicstream_t*
         for (;;) {
             const h3stream_status_e st = h3stream_feed(app->req, c->session->qdec, &p, end, fin);
 
-            if (st == H3STREAM_REQUEST_READY) {
-                if (app->qpack_blocked_counted) {
-                    if (c->qpack_blocked_streams > 0) c->qpack_blocked_streams--;
-                    app->qpack_blocked_counted = 0;
+            /* The blocked slot is held by the *section*, not by the request:
+             * once h3stream has decoded it the slot goes back, whatever the
+             * section decoded into. Released before the status is read so that
+             * a stream whose trailers blocked and then resolved does not keep a
+             * slot for the rest of the connection. */
+            if (app->qpack_blocked_counted && !app->req->qpack_blocked) {
+                if (c->qpack_blocked_streams > 0) c->qpack_blocked_streams--;
+                app->qpack_blocked_counted = 0;
+            }
+
+            /* §4.4.1, for every dynamic section this stream decoded -- header or
+             * trailer, blocked or not. Skipped only on the paths below that
+             * cancel the stream instead, because a Stream Cancellation already
+             * releases everything the stream referenced and the peer's encoder
+             * must not be told both. */
+            if (!__status_cancels(st)) {
+                while (app->req->qpack_sections_to_ack > 0) {
+                    app->req->qpack_sections_to_ack--;
                     if (qpack_decoder_ack_section(c->session->qdec, qs->id) != QPACK_OK)
                         return __closed(H3_INTERNAL_ERROR);
                 }
+            }
+
+            if (st == H3STREAM_REQUEST_READY) {
                 headers_became_ready = 1;
 
                 /* Before dispatch, so the response is scheduled by what the
@@ -608,8 +677,12 @@ static h3conn_result_t __read_request(h3conn_t* c, quicconn_t* qc, quicstream_t*
                     return __reset(H3_REQUEST_REJECTED);
                 }
 
-                /* The rest of the buffer is body or trailers; keep going. */
-                if (p < end || fin) continue;
+                /* The rest of the buffer is body or trailers; keep going. The
+                 * deferred buffer counts as "the rest" too: the unblocking pass
+                 * hands REQUEST_READY back without consuming anything, and the
+                 * bytes that arrived behind the blocked section are replayed by
+                 * the next feed. */
+                if (p < end || fin || h3stream_qpack_deferred_pending(app->req)) continue;
                 break;
             }
 
@@ -641,12 +714,12 @@ static h3conn_result_t __read_request(h3conn_t* c, quicconn_t* qc, quicstream_t*
                 break;
             }
 
-            /* A formerly blocked section that decodes into a message/limit
-             * error is abandoned just like RESET_STREAM: release its blocked
-             * slot and tell the peer's encoder it may drop the references. */
-            if (app->qpack_blocked_counted) {
-                if (c->qpack_blocked_streams > 0) c->qpack_blocked_streams--;
-                app->qpack_blocked_counted = 0;
+            /* A section abandoned mid-flight is abandoned just like
+             * RESET_STREAM: tell the peer's encoder it may drop the references.
+             * That instruction covers every section of the stream, so the acks
+             * the decode queued are dropped rather than sent after it. */
+            if (app->req->qpack_blocked || app->req->qpack_sections_to_ack > 0) {
+                app->req->qpack_sections_to_ack = 0;
                 if (qpack_decoder_cancel_stream(c->session->qdec, qs->id) != QPACK_OK)
                     return __closed(H3_INTERNAL_ERROR);
                 h3stream_qpack_unblock(app->req);
@@ -967,13 +1040,31 @@ static int __write_stream(quicstream_t* qs, h3stream_t* st) {
         uint8_t* frame = NULL;
         size_t flen = 0;
 
-        if (c != NULL &&
-            h3response_trailers_for_stream(c->session->qenc, qs->id,
-                                           response->trailer_, &frame, &flen)
-                == H3RESPONSE_OK) {
+        const h3response_status_e tst =
+            c != NULL ? h3response_trailers_for_stream(c->session->qenc, qs->id,
+                                                       response->trailer_, &frame, &flen)
+                      : H3RESPONSE_ERR_ENCODE;
+
+        switch (tst) {
+        case H3RESPONSE_OK: {
             const int ok = quicstream_write(qs, frame, flen);
             free(frame);
             if (!ok) return 0;
+            break;
+        }
+        /* Every trailer the handler set was dropped by the §4.1 rules, so there
+         * is no section to send and the bare FIN below is the whole ending. */
+        case H3RESPONSE_EMPTY:
+            break;
+        /* A trailer section that would not encode is not a response that may be
+         * finished cleanly: the FIN would tell the peer it had received the
+         * whole message when a part of it was silently dropped, and a trailer
+         * is where a checksum or a final status lives. Fail the stream instead
+         * -- the caller resets it, and the peer knows the response is short. */
+        default:
+            log_error("h3: trailers would not encode on stream %llu\n",
+                      (unsigned long long)qs->id);
+            return 0;
         }
     }
 

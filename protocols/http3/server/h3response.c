@@ -262,7 +262,7 @@ h3response_status_e h3response_trailers_for_stream(struct qpack_encoder* enc,
         names_size += h->key_length;
     }
 
-    if (count == 0) return H3RESPONSE_ERR_ENCODE;
+    if (count == 0) return H3RESPONSE_EMPTY;
 
     h3fieldlist_t list;
     if (!__fieldlist_init(&list, count, names_size)) return H3RESPONSE_ERR_MEMORY;

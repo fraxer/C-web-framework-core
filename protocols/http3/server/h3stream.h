@@ -135,6 +135,11 @@ typedef struct h3stream {
     int      qpack_deferred_fin;
     int      qpack_blocked;
     uint64_t qpack_required_insert_count;
+    /* Field sections decoded on this stream that named the dynamic table and
+     * still owe the peer a Section Acknowledgment (RFC 9204 §4.4.1). The
+     * instruction goes on the connection's decoder stream, which h3stream
+     * cannot reach, so it is counted here and drained by h3conn. */
+    size_t   qpack_sections_to_ack;
 
     /* The response is filled and the write turn may run the filter chain for
      * this stream. Atomic because a handler thread sets it and the worker reads
@@ -187,6 +192,14 @@ int h3stream_qpack_block(h3stream_t* st, uint64_t required,
                          const uint8_t* tail, size_t tail_len, int fin);
 int h3stream_qpack_can_resume(const h3stream_t* st, uint64_t insert_count);
 void h3stream_qpack_unblock(h3stream_t* st);
+
+/* Bytes (or a FIN) taken off the stream while it was blocked and not yet fed
+ * back through h3stream_feed. The reader has to keep feeding while this is set
+ * even when the transport has nothing new: what is parked here is all that is
+ * left of those reads. */
+static inline int h3stream_qpack_deferred_pending(const h3stream_t* st) {
+    return st != NULL && (st->qpack_deferred_len != 0 || st->qpack_deferred_fin);
+}
 
 /* Feed bytes received on this request stream, advancing *pp. Processes complete
  * frames and stops on the first event the caller must act on (REQUEST_READY, an

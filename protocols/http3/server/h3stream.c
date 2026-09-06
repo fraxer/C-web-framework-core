@@ -63,6 +63,7 @@ h3stream_t* h3stream_create(connection_t* connection, size_t max_field_section_s
     st->qpack_deferred_fin = 0;
     st->qpack_blocked = 0;
     st->qpack_required_insert_count = 0;
+    st->qpack_sections_to_ack = 0;
     st->max_field_section_size = max_field_section_size;
 
     /* The factor HTTP/2 uses, not the ×2 the plan first guessed at: an operator
@@ -229,6 +230,19 @@ static h3stream_status_e decode_fields(h3stream_t* st, qpack_decoder_t* qdec,
         return H3STREAM_ERR_FIELDS_TOO_LARGE;
     }
 
+    /* RFC 9204 §4.4.1: a field section that declared a Required Insert Count
+     * above zero has to be acknowledged once it has been processed — that
+     * acknowledgement is what moves the peer encoder's Known Received Count and
+     * lets it evict the entries this section referenced. Counted rather than
+     * sent here: the decoder stream belongs to the connection, so h3conn drains
+     * this on the read path (h3stream owns no transport). A header section and
+     * a trailer section both count, and a section that decoded straight away
+     * counts exactly like one that had to block first — the peer's encoder is
+     * waiting on the same instruction either way. */
+    uint64_t ric = 0;
+    if (qpack_required_insert_count(qdec, block, len, &ric) == QPACK_OK && ric > 0)
+        st->qpack_sections_to_ack++;
+
     return H3STREAM_OK;
 }
 
@@ -246,17 +260,27 @@ static h3stream_status_e build_request(h3stream_t* st, qpack_decoder_t* qdec,
     qpack_headers_free(fields, count);
     st->content_length = cl;
 
-    /* EXTENDED_CONNECT/WEBSOCKET are dispatch verdicts, not assembly errors: the
-     * request is well-formed, so it is announced ready and h3session decides
-     * (501 for an unsupported :protocol, a tunnel for websocket — docs/http3/05
-     * §8). The common path is OK. */
+    /* RFC 9220 §3 / RFC 8441 §5.1: :protocol is legal only on a connection whose
+     * server advertised SETTINGS_ENABLE_CONNECT_PROTOCOL, and this one never
+     * does (quicendpoint.c passes 0, deliberately — docs/http3/05 §8). A
+     * CONNECT that reaches here is a peer ignoring our SETTINGS, and the
+     * request is malformed.
+     *
+     * It cannot be waved through the way h2 waves its own extended CONNECT
+     * through to a 501: httpfields leaves request->method at ROUTE_NONE for
+     * CONNECT (no route method names it), ROUTE_NONE is -1, and the dispatcher
+     * indexes route->static_file[] and route->handler[] with it. h2 never gets
+     * there because h2session intercepts both verdicts ahead of dispatch; h3
+     * has no such interception, so the field section is refused here instead.
+     * Serving Extended CONNECT over h3 means writing that interception first,
+     * not deleting this branch. */
     switch (hf) {
     case HTTP_FIELDS_OK:
-    case HTTP_FIELDS_EXTENDED_CONNECT:
-    case HTTP_FIELDS_WEBSOCKET:
         break;
     case HTTP_FIELDS_INTERNAL:
         return H3STREAM_ERR_INTERNAL;
+    case HTTP_FIELDS_EXTENDED_CONNECT:
+    case HTTP_FIELDS_WEBSOCKET:
     default:
         return H3STREAM_ERR_MESSAGE;
     }
@@ -376,14 +400,30 @@ h3stream_status_e h3stream_feed(h3stream_t* st, qpack_decoder_t* qdec,
             return H3STREAM_QPACK_BLOCKED;
         }
 
-        h3stream_status_e r = build_request(st, qdec, st->parser.payload,
-                                             st->parser.payload_len);
-        if (r != H3STREAM_REQUEST_READY) return r;
+        /* Which section blocked is written in the stage: a request stream only
+         * ever reaches EXPECT_HEADERS once, so a stream still in that stage is
+         * retrying its first HEADERS, and one in BODY is retrying trailers. */
+        if (st->stage == H3STREAM_EXPECT_HEADERS) {
+            h3stream_status_e r = build_request(st, qdec, st->parser.payload,
+                                                 st->parser.payload_len);
+            if (r != H3STREAM_REQUEST_READY) return r;
+            st->qpack_blocked = 0;
+            st->qpack_required_insert_count = 0;
+            st->headers_done = 1;
+            st->stage = H3STREAM_BODY;
+            return H3STREAM_REQUEST_READY;
+        }
+
+        /* Trailers have no event of their own to hand back — nothing downstream
+         * waits on them the way dispatch waits on REQUEST_READY — so the retry
+         * falls straight through into the replay below, which is where the FIN
+         * that followed them is still parked. */
+        const h3stream_status_e tr = consume_trailers(st, qdec, st->parser.payload,
+                                                       st->parser.payload_len);
+        if (tr != H3STREAM_OK) return tr;
         st->qpack_blocked = 0;
         st->qpack_required_insert_count = 0;
-        st->headers_done = 1;
-        st->stage = H3STREAM_BODY;
-        return H3STREAM_REQUEST_READY;
+        st->stage = H3STREAM_TRAILERS;
     }
 
     /* A successful retry returns REQUEST_READY first so dispatch ordering stays
@@ -466,6 +506,25 @@ h3stream_status_e h3stream_feed(h3stream_t* st, qpack_decoder_t* qdec,
                 }
                 if (st->stage == H3STREAM_BODY) {
                     const h3stream_status_e r = consume_trailers(st, qdec, st->parser.payload, st->parser.payload_len);
+                    /* Trailers block on the dynamic table exactly as a header
+                     * section does, and are parked exactly as one: the payload
+                     * stays in the frame parser, everything behind it (the FIN
+                     * included) goes to the deferred buffer. Returning BLOCKED
+                     * without parking any of that used to drop the trailer
+                     * section and, with it, the FIN — the request was then
+                     * never dispatched and the stream hung to the idle
+                     * timeout. */
+                    if (r == H3STREAM_QPACK_BLOCKED) {
+                        uint64_t required = 0;
+                        if (qpack_required_insert_count(qdec, st->parser.payload,
+                                                       st->parser.payload_len,
+                                                       &required) != QPACK_BLOCKED ||
+                            !h3stream_qpack_block(st, required, *pp,
+                                                 (size_t)(end - *pp), fin))
+                            return H3STREAM_ERR_INTERNAL;
+                        *pp = end;
+                        return H3STREAM_QPACK_BLOCKED;
+                    }
                     if (r != H3STREAM_OK) return r;
                     st->stage = H3STREAM_TRAILERS;
                     continue;

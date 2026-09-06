@@ -250,10 +250,12 @@ TEST(test_h3response_interim_and_trailers) {
     qpack_headers_free(fields, n);
     free(frame);
 
-    TEST_CASE("an empty trailer section is refused rather than framed");
+    TEST_CASE("an empty trailer section is reported as empty, not as a failure");
     /* Nothing left after the drops means there is no frame worth sending; the
-     * caller finishes the stream instead. */
-    TEST_ASSERT(h3response_trailers(enc, NULL, &frame, &flen) == H3RESPONSE_ERR_ENCODE,
+     * caller finishes the stream instead. It must not share a code with a real
+     * encode failure: that one has to reset the stream rather than close it
+     * cleanly on a response the peer would read as complete. */
+    TEST_ASSERT(h3response_trailers(enc, NULL, &frame, &flen) == H3RESPONSE_EMPTY,
                 "no trailers");
 
     httpresponse_free(r);

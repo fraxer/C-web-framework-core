@@ -25,6 +25,13 @@ struct qpack_encoder;
 
 typedef enum {
     H3RESPONSE_OK = 0,
+    /* There was nothing to encode: every field the caller offered was dropped
+     * by the §4.1 rules (a pseudo-header or content-length in a trailer
+     * section, a connection-specific field). Not an error -- the caller
+     * finishes the stream with a bare FIN -- but it must stay distinct from
+     * one, because "nothing to send" and "could not encode what you gave me"
+     * end the response in very different states. */
+    H3RESPONSE_EMPTY,
     H3RESPONSE_ERR_MEMORY,
     H3RESPONSE_ERR_ENCODE    /* QPACK refused the field list */
 } h3response_status_e;

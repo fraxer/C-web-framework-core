@@ -671,6 +671,19 @@ int __handle(connection_t* connection, httprequest_t* request, deferred_handler 
         break;
     }
 
+    /* Routing indexes route->static_file[] and route->handler[] with the method
+     * and nothing between here and there re-checks it, so the range is checked
+     * once, here, where every protocol's requests meet. Each parser is supposed
+     * to have refused an unroutable method already -- ROUTE_NONE is -1, and a
+     * negative index would read from before both arrays -- but "supposed to" is
+     * how h3 came to hand a CONNECT straight to the dispatcher. A method the
+     * server has no slot for is 501, the answer §9.1 of RFC 9110 gives for a
+     * method that is not supported. */
+    if (request->method < ROUTE_GET || request->method > ROUTE_HEAD) {
+        httpresponse_default(response, 501);
+        return handler(request, response);
+    }
+
     if (__handler_added_to_queue(request, response))
         return 1;
 
