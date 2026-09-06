@@ -2,12 +2,25 @@
 
 This document describes how to build, test, and install the cwfr framework.
 
-cwfr is not built standalone. The framework is embedded into a host project as a
-git submodule (conventionally at `core/`) and pulled in with
-`add_subdirectory(core)`. The host project owns the toolchain setup: it calls
-`project()`, locates the dependencies with `find_package()`, sets compile
-options, and defines the `install()` rules. See [Integrating into a host
-project](#integrating-into-a-host-project) for a minimal host `CMakeLists.txt`.
+There are two ways to build against cwfr, and they are not alternatives so much
+as two stages of the same workflow:
+
+* **Embedded** — the framework is a git submodule (conventionally at `core/`)
+  pulled into a host project with `add_subdirectory(core)`, which builds the
+  framework and the application together. See [Integrating into a host
+  project](#3-integrating-into-a-host-project).
+
+* **Against an installed framework** — the framework is built and installed
+  once, and the application is a separate CMake project that finds it with
+  `find_package(cwfr)`. Handlers are then written and rebuilt without the core
+  sources present at all. See [Building an application against an installed
+  framework](#8-building-an-application-against-an-installed-framework).
+
+Nothing from the application is compiled into `libcwfr_framework.so`: the
+framework binary is application-independent, so one installed copy serves any
+number of applications. An application reaches the framework through
+`main.modules` in its config — see
+[The application module](#the-application-module).
 
 ## 1. Requirements
 
@@ -117,35 +130,119 @@ if(PostgreSQL_FOUND AND INCLUDE_POSTGRESQL STREQUAL yes)
     add_definitions(-DPostgreSQL_FOUND)
 endif()
 
-# Application static archives to bake into libcwfr_framework.so
-# (models, middlewares, contexts, ...). Optional.
-set(CWFR_EXTRA_FW_LIBS mymodels mymiddlewares)
-
 add_subdirectory(core)
-add_subdirectory(myservice)
+add_subdirectory(myapp)
 
-install(TARGETS cwfr migrate RUNTIME DESTINATION bin)
-install(TARGETS cwfr_framework LIBRARY DESTINATION lib/cwfr)
+# cwfr, migrate, libcwfr_framework.so, the headers and the CMake package all
+# install themselves from core/cmake/install.cmake. Only the application's own
+# output is left to declare here.
+install(TARGETS app LIBRARY DESTINATION lib/cwfr)
+cwfr_install_handlers()
+cwfr_install_migrations()
 ```
+
+That listing is complete: everything the core needs beyond it, `CMAKE_BUILD_TYPE`
+included, it defines for itself. Drop the two application lines and it is also a
+valid **framework-only** host project — which is how the framework gets built and
+installed once, for applications that are built separately afterwards
+(section 8).
 
 What `add_subdirectory(core)` provides:
 
 * **`cwfr`** — the server executable.
 * **`migrate`** — the database migration runner.
-* **`cwfr_framework`** — a single shared library (`libcwfr_framework.so`)
+* **`cwfr::framework`** — a single shared library (`libcwfr_framework.so`)
   aggregating the entire framework. Both `cwfr` and every dynamically loaded
   handler `.so` link against it, so the framework state (database pools,
-  configuration, i18n) exists as one instance at runtime.
+  configuration, i18n) exists as one instance at runtime. The plain target name
+  `cwfr_framework` still works; `cwfr::framework` is the spelling that is also
+  valid against an installed package.
 * **CMake helpers** — `cwfr_add_lib()` and `cwfr_add_subdirs()` from
-  `cmake/cwfr.cmake` for declaring static libraries and recursing into
-  subdirectories.
-* **`CWFR_EXTRA_FW_LIBS` extension point** — set this list *before*
-  `add_subdirectory(core)` to aggregate your application's static archives
-  (models, middlewares implementing the `middlewares_init()` hook, contexts)
-  into `libcwfr_framework.so`, making their symbols visible to handler modules.
+  `cmake/cwfr.cmake`, and `cwfr_add_handlers()`, `cwfr_add_migrations()`,
+  `cwfr_install_handlers()`, `cwfr_install_migrations()` from `cmake/app.cmake`.
+* **`install()` rules** for everything the framework owns, from
+  `cmake/install.cmake`.
 
-Handlers are compiled as separate shared libraries linking `cwfr_framework`
+Handlers are compiled as separate shared libraries linking `cwfr::framework`
 and are mapped to routes in `config.json`.
+
+### The application module
+
+The framework needs three things from an application that it cannot invent
+itself: the middlewares the config refers to by name, and the destructors for
+whatever the application hangs off `httpctx_t`/`wsctx_t`. It obtains them at
+runtime, not at link time.
+
+Build the application's own code — models, middlewares, contexts, helpers — into
+one shared library, and have it export `app_init()`:
+
+```c
+/* app_init.c */
+#include "model.h"
+#include "httpcontext.h"
+#include "wscontext.h"
+#include "middleware_registry.h"
+
+int app_init(void) {
+    /* ctx->user_data is set by the application, so the application says how it
+     * is released. NULL (the default) means the core frees nothing.
+     *
+     * One owner per process: with several modules in main.modules, a second one
+     * claiming the destructor is refused rather than silently taking over. */
+    if (!httpctx_set_user_data_free(model_free) || !wsctx_set_user_data_free(model_free))
+        return 0;
+
+    if (!middleware_registry_register("middleware_http_auth", middleware_http_auth))
+        return 0;
+
+    return 1;
+}
+```
+
+```cmake
+add_library(app SHARED app_init.c)
+target_link_libraries(app PRIVATE
+    "-Wl,--whole-archive" mymodels mymiddlewares "-Wl,--no-whole-archive"
+    cwfr::framework)
+```
+
+Then name it in the config:
+
+```json
+"main": {
+    "modules": ["/opt/myapp/lib/cwfr/libapp.so"]
+}
+```
+
+`cwfr` and `migrate` `dlopen()` each listed module and call its `app_init()`
+before the `servers` section is parsed — the middleware names have to exist
+before a route can reference one. Paths are passed to `dlopen()` verbatim,
+exactly like a route's `"file"`.
+
+On a hard reload the middleware registry is cleared and `app_init()` runs again,
+so it must be idempotent. The module itself is never `dlclose()`d: a rebuilt
+application module needs a restart, not a reload — the same constraint handler
+`.so` files carry.
+
+> **Migrating from `CWFR_EXTRA_FW_LIBS`.** Applications used to be baked into
+> `libcwfr_framework.so` by listing their static archives in that variable, and
+> to supply `middlewares_init()`, `httpctx_init/clear` and `wsctx_init/clear` as
+> link-time symbols. All five are gone from the core:
+>
+> * `httpctx_init/clear` and `wsctx_init/clear` now **belong to the core**.
+>   Delete them from the application — leaving them in place is a
+>   `multiple definition` link error — and register the destructor for
+>   `ctx->user_data` with `httpctx_set_user_data_free()` /
+>   `wsctx_set_user_data_free()` instead.
+> * `middlewares_init()` is **no longer declared or called**. Rename it to
+>   `app_init()` and move the application into a module named by
+>   `main.modules`. A module that still exports `middlewares_init()` is
+>   diagnosed by name at start-up rather than failing later as an
+>   unrelated-looking "failed to find middleware".
+>
+> `CWFR_EXTRA_FW_LIBS` itself still works, but it produces an
+> application-specific framework binary that cannot be shared — and it can no
+> longer supply the registrations, which have to come from a module either way.
 
 ## 4. Configuring and building
 
@@ -238,15 +335,30 @@ Installed layout:
 ├── bin/
 │   ├── cwfr                      # server executable
 │   └── migrate                   # migration runner
-└── lib/cwfr/
-    ├── libcwfr_framework.so      # shared framework library
-    ├── handlers/                 # handler .so modules (per service/route)
-    └── migrations/               # migration .so modules
+├── include/cwfr/                 # public headers, flat (see below)
+└── lib/
+    ├── cwfr/
+    │   ├── libcwfr_framework.so  # shared framework library
+    │   ├── libapp.so             # the application module
+    │   ├── handlers/             # handler .so modules (per service/route)
+    │   └── migrations/           # migration .so modules
+    └── cmake/cwfr/               # the CMake package: find_package(cwfr)
 ```
 
 `cwfr` and `migrate` carry an `INSTALL_RPATH` of `$ORIGIN/../lib/cwfr`, so the
 installed tree is relocatable — no `ldconfig` or `LD_LIBRARY_PATH` needed as
 long as the `bin/` ↔ `lib/cwfr/` layout is preserved.
+
+`libcwfr_framework.so` carries a `SONAME` of `libcwfr_framework.so.<major>`.
+Handler modules record it, so a framework upgrade that breaks them fails at load
+time with a clear error instead of at runtime with a corrupt struct.
+
+The headers are installed **flat** into one directory. The framework's sources
+include each other by bare name (`"httprequest.h"`, not
+`"protocols/http/httprequest.h"`) and rely on some fifty include directories to
+resolve them; flattening reproduces that with a single `-I` and keeps the
+internal layout out of the published interface. The install refuses to run if two
+headers anywhere in the core ever share a basename.
 
 Host projects may redirect the handler and migration trees independently of
 the prefix at configure time:
@@ -287,6 +399,76 @@ Applying database migrations:
 ```bash
 <prefix>/bin/migrate -c /path/to/config.json up
 ```
+
+## 8. Building an application against an installed framework
+
+This is what makes the framework worth installing: build and install it once,
+then write and rebuild handlers afterwards, with the core sources absent.
+
+Install the framework (section 6), then point a standalone application project
+at the package:
+
+```bash
+cmake -S myapp -B build -DCMAKE_BUILD_TYPE=Release \
+      -Dcwfr_DIR=/opt/cwfr/lib/cmake/cwfr
+cmake --build build -j$(nproc)
+cmake --install build --prefix /srv/myapp
+```
+
+(`-Dcwfr_DIR=...` is only needed when the framework was installed to a prefix
+CMake does not search by default; with `--prefix /usr/local`, `find_package(cwfr)`
+locates it on its own.)
+
+The application's `CMakeLists.txt`:
+
+```cmake
+cmake_minimum_required(VERSION 3.12.4)
+project(myapp LANGUAGES C)
+
+find_package(cwfr 1.0 REQUIRED)
+
+add_compile_options(-fPIC)
+add_link_options(-rdynamic)
+
+add_subdirectory(models)        # cwfr_add_lib(models LINK_LIBS cwfr::framework)
+add_subdirectory(middlewares)
+
+# The application module -- see "The application module" in section 3.
+add_library(app SHARED app_init.c)
+target_link_libraries(app PRIVATE
+    "-Wl,--whole-archive" models middlewares "-Wl,--no-whole-archive"
+    cwfr::framework)
+set_target_properties(app PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/exec"
+    INSTALL_RPATH "$ORIGIN")
+
+add_subdirectory(routes)        # cwfr_add_handlers(LINK_LIBS cwfr::framework app)
+add_subdirectory(migrations)    # cwfr_add_migrations(LINK_LIBS cwfr::framework app)
+
+install(TARGETS app LIBRARY DESTINATION lib/cwfr)
+cwfr_install_handlers()
+cwfr_install_migrations()
+```
+
+`find_package(cwfr)` supplies:
+
+* **`cwfr::framework`** — the imported shared library, carrying the include path
+  for `<prefix>/include/cwfr` *and* the third-party include paths and feature
+  macros the public headers need (`PCRE2_CODE_UNIT_WIDTH`, `PostgreSQL_FOUND`,
+  …). Those macros gate struct members in the database headers, so the package
+  imposes exactly the set the framework was built with — an application does not
+  get to choose a different one.
+* **the build helpers** — `cwfr_add_lib()`, `cwfr_add_handlers()`,
+  `cwfr_add_migrations()`, `cwfr_add_subdirs()`, `cwfr_install_handlers()`,
+  `cwfr_install_migrations()`.
+
+`find_package(cwfr 1.0 REQUIRED)` matches by major version, so an application
+refuses to configure against a framework release it was not written for.
+
+The example application in this repository builds both ways from the same files:
+as `add_subdirectory(app)` from the monorepo root, and on its own with
+`cmake -S backend/app -B build -Dcwfr_DIR=...`. Its `CMakeLists.txt` shows how
+the standalone preamble is kept to the one `if()` block that differs.
 
 ## Troubleshooting
 

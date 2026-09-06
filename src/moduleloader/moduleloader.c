@@ -31,6 +31,7 @@
 #include "broadcast.h"
 #include "connection_queue.h"
 #include "middleware_registry.h"
+#include "appmodule.h"
 #include "httpserverhandlers.h"
 #include "httpresponse.h"
 #include "h2session.h"
@@ -56,18 +57,6 @@
 #endif
 
 #include "moduleloader.h"
-
-/*
- * Config validation errors (missing or invalid field/value) are reported both to
- * stderr and to the log. The log may be silent during early config parsing
- * (logging is configured by the config itself), and vsyslog never reaches the
- * terminal — so this guarantees a malformed config is always visible on startup.
- */
-#define __module_loader_config_error(fmt, ...) \
-    do { \
-        fprintf(stderr, fmt, ##__VA_ARGS__); \
-        log_error(fmt, ##__VA_ARGS__); \
-    } while (0)
 
 static atomic_bool __module_loader_wait_signal = 0;
 
@@ -119,15 +108,17 @@ static int __module_loader_websockets_ratelimit_load(const json_token_t* token_s
 int module_loader_init(appconfig_t* config) {
     int result = 0;
 
-
-    if (!middlewares_init()) {
-        log_error("module_loader_init: failed to initialize middlewares\n");
-        goto failed;
-    }
-
     json_doc_t* document = NULL;
     if (!module_loader_load_json_config(config->path, &document))
         goto failed;
+
+    /* Before __module_loader_init_modules parses `servers`: routes name their
+     * middlewares, and the names exist only once the application modules have
+     * registered them. On a reload this runs against the registry that
+     * module_loader_create_config_and_init() has just cleared. */
+    if (!app_modules_load(json_root(document)))
+        goto failed;
+
     if (!__module_loader_init_modules(config, document))
         goto failed;
 
@@ -190,11 +181,11 @@ int module_loader_load_json_config(const char* path, json_doc_t** document) {
 
     *document = json_parse(data);
     if (*document == NULL) {
-        __module_loader_config_error("module_loader_load_json_config: json_parse error\n");
+        log_error_stderr("module_loader_load_json_config: json_parse error\n");
         goto failed;
     }
     if (!json_is_object(json_root(*document))) {
-        __module_loader_config_error("module_loader_load_json_config: json document must be object\n");
+        log_error_stderr("module_loader_load_json_config: json document must be object\n");
         goto failed;
     }
 
@@ -303,7 +294,7 @@ static char* __module_loader_dotenv_path(const appconfig_t* config, const json_t
     const json_token_t* token = json_object_get(token_main, "env_file");
     if (token != NULL) {
         if (!json_is_string(token)) {
-            __module_loader_config_error("module_loader_config_load: main.env_file must be string\n");
+            log_error_stderr("module_loader_config_load: main.env_file must be string\n");
             return NULL;
         }
         name = json_string(token);
@@ -346,22 +337,22 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
 
     const json_token_t* token_main = json_object_get(root, "main");
     if (token_main == NULL) {
-        __module_loader_config_error("module_loader_config_load: main not found\n");
+        log_error_stderr("module_loader_config_load: main not found\n");
         return 0;
     }
     if (!json_is_object(token_main)) {
-        __module_loader_config_error("module_loader_config_load: main must be object\n");
+        log_error_stderr("module_loader_config_load: main must be object\n");
         return 0;
     }
 
 
     const json_token_t* token_reload = json_object_get(token_main, "reload");
     if (token_reload == NULL) {
-        __module_loader_config_error("module_loader_config_load: reload not found\n");
+        log_error_stderr("module_loader_config_load: reload not found\n");
         return 0;
     }
     if (!json_is_string(token_reload)) {
-        __module_loader_config_error("module_loader_config_load: reload must be string\n");
+        log_error_stderr("module_loader_config_load: reload must be string\n");
         return 0;
     }
     if (strcmp(json_string(token_reload), "hard") == 0) {
@@ -371,24 +362,24 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
         env->main.reload = APPCONFIG_RELOAD_SOFT;
     }
     else {
-        __module_loader_config_error("module_loader_config_load: reload must be contain soft or hard\n");
+        log_error_stderr("module_loader_config_load: reload must be contain soft or hard\n");
         return 0;
     }
 
 
     const json_token_t* token_workers = json_object_get(token_main, "workers");
     if (token_workers == NULL) {
-        __module_loader_config_error("module_loader_config_load: workers not found\n");
+        log_error_stderr("module_loader_config_load: workers not found\n");
         return 0;
     }
     if (!json_is_number(token_workers)) {
-        __module_loader_config_error("module_loader_config_load: workers must be int\n");
+        log_error_stderr("module_loader_config_load: workers must be int\n");
         return 0;
     }
     int ok = 0;
     int workers_count = json_int(token_workers, &ok);
     if (!ok || workers_count < 1) {
-        __module_loader_config_error("module_loader_config_load: workers must be >= 1\n");
+        log_error_stderr("module_loader_config_load: workers must be >= 1\n");
         return 0;
     }
     env->main.workers = workers_count;
@@ -396,17 +387,17 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
 
     const json_token_t* token_threads = json_object_get(token_main, "threads");
     if (token_threads == NULL) {
-        __module_loader_config_error("module_loader_config_load: threads not found\n");
+        log_error_stderr("module_loader_config_load: threads not found\n");
         return 0;
     }
     if (!json_is_number(token_threads)) {
-        __module_loader_config_error("module_loader_config_load: threads must be int\n");
+        log_error_stderr("module_loader_config_load: threads must be int\n");
         return 0;
     }
     ok = 0;
     int threads_count = json_int(token_threads, &ok);
     if (!ok || threads_count < 1) {
-        __module_loader_config_error("module_loader_config_load: threads must be >= 1\n");
+        log_error_stderr("module_loader_config_load: threads must be >= 1\n");
         return 0;
     }
     env->main.threads = threads_count;
@@ -414,17 +405,17 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
 
     const json_token_t* token_client_max_body_size = json_object_get(token_main, "client_max_body_size");
     if (token_client_max_body_size == NULL) {
-        __module_loader_config_error("module_loader_config_load: client_max_body_size not found\n");
+        log_error_stderr("module_loader_config_load: client_max_body_size not found\n");
         return 0;
     }
     if (!json_is_number(token_client_max_body_size)) {
-        __module_loader_config_error("module_loader_config_load: client_max_body_size must be int\n");
+        log_error_stderr("module_loader_config_load: client_max_body_size must be int\n");
         return 0;
     }
     ok = 0;
     unsigned int client_max_body_size = json_int(token_client_max_body_size, &ok);
     if (!ok || client_max_body_size < 1) {
-        __module_loader_config_error("module_loader_config_load: client_max_body_size must be >= 1\n");
+        log_error_stderr("module_loader_config_load: client_max_body_size must be >= 1\n");
         return 0;
     }
     env->main.client_max_body_size = client_max_body_size;
@@ -432,11 +423,11 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
 
     const json_token_t* token_tmp = json_object_get(token_main, "tmp");
     if (token_tmp == NULL) {
-        __module_loader_config_error("module_loader_config_load: tmp not found\n");
+        log_error_stderr("module_loader_config_load: tmp not found\n");
         return 0;
     }
     if (!json_is_string(token_tmp)) {
-        __module_loader_config_error("module_loader_config_load: tmp must be string\n");
+        log_error_stderr("module_loader_config_load: tmp must be string\n");
         return 0;
     }
     env->main.tmp = malloc(sizeof(char) * (json_string_size(token_tmp) + 1));
@@ -447,18 +438,18 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     strcpy(env->main.tmp, json_string(token_tmp));
     const size_t tmp_length = json_string_size(token_tmp);
     if (env->main.tmp[tmp_length - 1] == '/') {
-        __module_loader_config_error("module_loader_config_load: remove last slash from main.tmp\n");
+        log_error_stderr("module_loader_config_load: remove last slash from main.tmp\n");
         return 0;
     }
 
 
     const json_token_t* token_gzip = json_object_get(token_main, "gzip");
     if (token_gzip == NULL) {
-        __module_loader_config_error("module_loader_config_load: gzip not found\n");
+        log_error_stderr("module_loader_config_load: gzip not found\n");
         return 0;
     }
     if (!json_is_array(token_gzip)) {
-        __module_loader_config_error("module_loader_config_load: gzip must be array\n");
+        log_error_stderr("module_loader_config_load: gzip must be array\n");
         return 0;
     }
 
@@ -471,13 +462,13 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     for (; !json_end_it(&it); it = json_next_it(&it)) {
         const json_token_t* token_mimetype = json_it_value(&it);
         if (!json_is_string(token_mimetype)) {
-            __module_loader_config_error("module_loader_config_load: gzip must be array of strings\n");
+            log_error_stderr("module_loader_config_load: gzip must be array of strings\n");
             __free_gzip_list(env->main.gzip);
             env->main.gzip = NULL;
             return 0;
         }
         if (json_string_size(token_mimetype) == 0) {
-            __module_loader_config_error("module_loader_config_load: gzip item must be not empty\n");
+            log_error_stderr("module_loader_config_load: gzip item must be not empty\n");
             __free_gzip_list(env->main.gzip);
             env->main.gzip = NULL;
             return 0;
@@ -513,32 +504,32 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
 
     const json_token_t* token_log = json_object_get(token_main, "log");
     if (token_log == NULL) {
-        __module_loader_config_error("module_loader_config_load: log not found\n");
+        log_error_stderr("module_loader_config_load: log not found\n");
         goto failed;
     }
     if (!json_is_object(token_log)) {
-        __module_loader_config_error("module_loader_config_load: log must be object\n");
+        log_error_stderr("module_loader_config_load: log must be object\n");
         goto failed;
     }
 
     const json_token_t* token_log_enabled = json_object_get(token_log, "enabled");
     if (token_log_enabled == NULL) {
-        __module_loader_config_error("module_loader_config_load: log.enabled not found\n");
+        log_error_stderr("module_loader_config_load: log.enabled not found\n");
         goto failed;
     }
     if (!json_is_bool(token_log_enabled)) {
-        __module_loader_config_error("module_loader_config_load: log.enabled must be boolean\n");
+        log_error_stderr("module_loader_config_load: log.enabled must be boolean\n");
         goto failed;
     }
     env->main.log.enabled = json_bool(token_log_enabled);
 
     const json_token_t* token_log_level = json_object_get(token_log, "level");
     if (token_log_level == NULL) {
-        __module_loader_config_error("module_loader_config_load: log.level not found\n");
+        log_error_stderr("module_loader_config_load: log.level not found\n");
         goto failed;
     }
     if (!json_is_string(token_log_level)) {
-        __module_loader_config_error("module_loader_config_load: log.level must be string\n");
+        log_error_stderr("module_loader_config_load: log.level must be string\n");
         goto failed;
     }
     const char* level_str = json_string(token_log_level);
@@ -567,7 +558,7 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
         env->main.log.level = LOG_DEBUG;
     }
     else {
-        __module_loader_config_error("module_loader_config_load: log.level must be one of: emerg, alert, crit, err, warning, notice, info, debug\n");
+        log_error_stderr("module_loader_config_load: log.level must be one of: emerg, alert, crit, err, warning, notice, info, debug\n");
         goto failed;
     }
 
@@ -595,7 +586,7 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     const json_token_t* token_env = json_object_get(token_main, "env");
     if (token_env != NULL) {
         if (!json_is_object(token_env)) {
-            __module_loader_config_error("module_loader_config_load: main.env must be object\n");
+            log_error_stderr("module_loader_config_load: main.env must be object\n");
             goto failed;
         }
 
@@ -676,11 +667,11 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
         }
         else {
             if (!json_is_string(token_dkim_private)) {
-                __module_loader_config_error("module_loader_config_load: mail.dkim_private must be string\n");
+                log_error_stderr("module_loader_config_load: mail.dkim_private must be string\n");
                 goto failed;
             }
             if (json_string_size(token_dkim_private) == 0) {
-                __module_loader_config_error("module_loader_config_load: mail.dkim_private must be not empty\n");
+                log_error_stderr("module_loader_config_load: mail.dkim_private must be not empty\n");
                 goto failed;
             }
 
@@ -710,11 +701,11 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
         }
         else {
             if (!json_is_string(token_dkim_selector)) {
-                __module_loader_config_error("module_loader_config_load: mail.dkim_selector must be string\n");
+                log_error_stderr("module_loader_config_load: mail.dkim_selector must be string\n");
                 goto failed;
             }
             if (json_string_size(token_dkim_selector) == 0) {
-                __module_loader_config_error("module_loader_config_load: mail.dkim_selector must be not empty\n");
+                log_error_stderr("module_loader_config_load: mail.dkim_selector must be not empty\n");
                 goto failed;
             }
 
@@ -737,11 +728,11 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
         }
         else {
             if (!json_is_string(token_host)) {
-                __module_loader_config_error("module_loader_config_load: mail.host must be string\n");
+                log_error_stderr("module_loader_config_load: mail.host must be string\n");
                 goto failed;
             }
             if (json_string_size(token_host) == 0) {
-                __module_loader_config_error("module_loader_config_load: mail.host must be not empty\n");
+                log_error_stderr("module_loader_config_load: mail.host must be not empty\n");
                 goto failed;
             }
 
@@ -765,11 +756,11 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
 
 int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_servers) {
     if (token_servers == NULL) {
-        __module_loader_config_error("__module_loader_servers_load: servers not found\n");
+        log_error_stderr("__module_loader_servers_load: servers not found\n");
         return 0;
     }
     if (!json_is_object(token_servers)) {
-        __module_loader_config_error("__module_loader_servers_load: servers must be object\n");
+        log_error_stderr("__module_loader_servers_load: servers must be object\n");
         return 0;
     }
 
@@ -806,7 +797,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
 
         const json_token_t* token_server = json_it_value(&it_servers);
         if (!json_is_object(token_server)) {
-            __module_loader_config_error("__module_loader_servers_load: server must be object\n");
+            log_error_stderr("__module_loader_servers_load: server must be object\n");
             goto failed;
         }
 
@@ -815,7 +806,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             finded_fields[DOMAINS] = 1;
 
             if (!json_is_array(token_domains)) {
-                __module_loader_config_error("__module_loader_servers_load: domains must be array\n");
+                log_error_stderr("__module_loader_servers_load: domains must be array\n");
                 goto failed;
             }
             server->domain = __module_loader_domains_load(token_domains);
@@ -830,7 +821,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             finded_fields[IP] = 1;
 
             if (!json_is_string(token_ip)) {
-                __module_loader_config_error("__module_loader_servers_load: ip must be string\n");
+                log_error_stderr("__module_loader_servers_load: ip must be string\n");
                 goto failed;
             }
             /* Either family, and a bad literal is now a rejected config rather
@@ -838,7 +829,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
              * value as a valid broadcast address, so a typo turned into a bind
              * error naming an address the operator never wrote. */
             if (!ipaddr_parse(&server->ip, json_string(token_ip))) {
-                __module_loader_config_error("__module_loader_servers_load: ip is not a valid IPv4 or IPv6 address: %s\n",
+                log_error_stderr("__module_loader_servers_load: ip is not a valid IPv4 or IPv6 address: %s\n",
                                              json_string(token_ip));
                 goto failed;
             }
@@ -849,13 +840,13 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             finded_fields[PORT] = 1;
 
             if (!json_is_number(token_port)) {
-                __module_loader_config_error("__module_loader_servers_load: port must be number\n");
+                log_error_stderr("__module_loader_servers_load: port must be number\n");
                 goto failed;
             }
             int ok = 0;
             server->port = json_int(token_port, &ok);
             if (!ok) {
-                __module_loader_config_error("__module_loader_servers_load: port must be integer\n");
+                log_error_stderr("__module_loader_servers_load: port must be integer\n");
                 goto failed;
             }
         }
@@ -865,7 +856,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             finded_fields[ROOT] = 1;
 
             if (!json_is_string(token_root)) {
-                __module_loader_config_error("__module_loader_servers_load: root must be string\n");
+                log_error_stderr("__module_loader_servers_load: root must be string\n");
                 goto failed;
             }
             const char* value = json_string(token_root);
@@ -888,7 +879,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             struct stat stat_obj;
             stat(server->root, &stat_obj);
             if (!S_ISDIR(stat_obj.st_mode)) {
-                __module_loader_config_error("__module_loader_servers_load: root directory not found\n");
+                log_error_stderr("__module_loader_servers_load: root directory not found\n");
                 goto failed;
             }
         }
@@ -898,7 +889,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             finded_fields[INDEX] = 1;
 
             if (!json_is_string(token_index)) {
-                __module_loader_config_error("__module_loader_servers_load: index must be string\n");
+                log_error_stderr("__module_loader_servers_load: index must be string\n");
                 goto failed;
             }
 
@@ -914,7 +905,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             finded_fields[RATELIMITS] = 1;
 
             if (!json_is_object(token_ratelimits)) {
-                __module_loader_config_error("__module_loader_servers_load: ratelimits must be object\n");
+                log_error_stderr("__module_loader_servers_load: ratelimits must be object\n");
                 goto failed;
             }
 
@@ -930,7 +921,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             finded_fields[HTTP] = 1;
 
             if (!json_is_object(token_http)) {
-                __module_loader_config_error("__module_loader_servers_load: http must be object\n");
+                log_error_stderr("__module_loader_servers_load: http must be object\n");
                 goto failed;
             }
 
@@ -958,7 +949,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             server->websockets.configured = 1;
 
             if (!json_is_object(token_websockets)) {
-                __module_loader_config_error("__module_loader_servers_load: websockets must be object\n");
+                log_error_stderr("__module_loader_servers_load: websockets must be object\n");
                 goto failed;
             }
 
@@ -985,7 +976,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             finded_fields[OPENSSL] = 1;
 
             if (!json_is_object(token_tls)) {
-                __module_loader_config_error("__module_loader_servers_load: tls must be object\n");
+                log_error_stderr("__module_loader_servers_load: tls must be object\n");
                 goto failed;
             }
 
@@ -999,14 +990,14 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
         const json_token_t* token_http3 = json_object_get(token_server, "http3");
         if (token_http3 != NULL) {
             if (!json_is_object(token_http3)) {
-                __module_loader_config_error("__module_loader_servers_load: http3 must be object\n");
+                log_error_stderr("__module_loader_servers_load: http3 must be object\n");
                 goto failed;
             }
 
             const json_token_t* token_h3_enabled = json_object_get(token_http3, "enabled");
             if (token_h3_enabled != NULL) {
                 if (!json_is_bool(token_h3_enabled)) {
-                    __module_loader_config_error("__module_loader_servers_load: http3.enabled must be bool\n");
+                    log_error_stderr("__module_loader_servers_load: http3.enabled must be bool\n");
                     goto failed;
                 }
                 server->http3.enabled = json_bool(token_h3_enabled) ? 1 : 0;
@@ -1015,13 +1006,13 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             const json_token_t* token_h3_port = json_object_get(token_http3, "port");
             if (token_h3_port != NULL) {
                 if (!json_is_number(token_h3_port)) {
-                    __module_loader_config_error("__module_loader_servers_load: http3.port must be number\n");
+                    log_error_stderr("__module_loader_servers_load: http3.port must be number\n");
                     goto failed;
                 }
                 int ok = 0;
                 const int port = json_int(token_h3_port, &ok);
                 if (!ok || port < 1 || port > 65535) {
-                    __module_loader_config_error("__module_loader_servers_load: http3.port must be 1..65535\n");
+                    log_error_stderr("__module_loader_servers_load: http3.port must be 1..65535\n");
                     goto failed;
                 }
                 server->http3.port = (unsigned short int)port;
@@ -1030,7 +1021,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             const json_token_t* token_alt_svc = json_object_get(token_http3, "alt_svc");
             if (token_alt_svc != NULL) {
                 if (!json_is_bool(token_alt_svc)) {
-                    __module_loader_config_error("__module_loader_servers_load: http3.alt_svc must be bool\n");
+                    log_error_stderr("__module_loader_servers_load: http3.alt_svc must be bool\n");
                     goto failed;
                 }
                 server->http3.alt_svc = json_bool(token_alt_svc) ? 1 : 0;
@@ -1039,13 +1030,13 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             const json_token_t* token_alt_svc_age = json_object_get(token_http3, "alt_svc_max_age");
             if (token_alt_svc_age != NULL) {
                 if (!json_is_number(token_alt_svc_age)) {
-                    __module_loader_config_error("__module_loader_servers_load: http3.alt_svc_max_age must be number\n");
+                    log_error_stderr("__module_loader_servers_load: http3.alt_svc_max_age must be number\n");
                     goto failed;
                 }
                 int ok = 0;
                 const int age = json_int(token_alt_svc_age, &ok);
                 if (!ok || age < 0) {
-                    __module_loader_config_error("__module_loader_servers_load: http3.alt_svc_max_age must be >= 0\n");
+                    log_error_stderr("__module_loader_servers_load: http3.alt_svc_max_age must be >= 0\n");
                     goto failed;
                 }
                 server->http3.alt_svc_max_age = (unsigned int)age;
@@ -1056,13 +1047,13 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
              * section is a configuration mistake, not something to start and
              * fail at handshake time. */
             if (server->http3.enabled && server->openssl == NULL) {
-                __module_loader_config_error("__module_loader_servers_load: http3 requires a tls section\n");
+                log_error_stderr("__module_loader_servers_load: http3 requires a tls section\n");
                 goto failed;
             }
 
 #ifndef CWFR_HTTP3
             if (server->http3.enabled) {
-                __module_loader_config_error("__module_loader_servers_load: http3 is enabled in the config but this build has no HTTP/3 support (configure with -DINCLUDE_HTTP3=yes)\n");
+                log_error_stderr("__module_loader_servers_load: http3 is enabled in the config but this build has no HTTP/3 support (configure with -DINCLUDE_HTTP3=yes)\n");
                 goto failed;
             }
 #endif
@@ -1084,7 +1075,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
                                    (unsigned)server->http3.port,
                                    server->http3.alt_svc_max_age);
             if (n < 1 || (size_t)n >= sizeof server->http3.alt_svc_value) {
-                __module_loader_config_error("__module_loader_servers_load: cannot build the Alt-Svc value\n");
+                log_error_stderr("__module_loader_servers_load: cannot build the Alt-Svc value\n");
                 goto failed;
             }
             server->http3.alt_svc_length = (size_t)n;
@@ -1092,7 +1083,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
 
         for (int i = 0; i < R_FIELDS_COUNT; i++) {
             if (finded_fields[i] == 0) {
-                __module_loader_config_error("__module_loader_servers_load: Section %s not found in config\n", str_required_fields[i]);
+                log_error_stderr("__module_loader_servers_load: Section %s not found in config\n", str_required_fields[i]);
                 goto failed;
             }
         }
@@ -1109,13 +1100,13 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             server->websockets.default_handler = (void(*)(void*))websockets_default_handler;
 
         if (!__module_loader_check_unique_domainport(first_server)) {
-            __module_loader_config_error("__module_loader_servers_load: domains with ports must be unique\n");
+            log_error_stderr("__module_loader_servers_load: domains with ports must be unique\n");
             goto failed;
         }
     }
 
     if (first_server == NULL) {
-        __module_loader_config_error("__module_loader_servers_load: section server is empty\n");
+        log_error_stderr("__module_loader_servers_load: section server is empty\n");
         goto failed;
     }
 
@@ -1145,7 +1136,7 @@ domain_t* __module_loader_domains_load(const json_token_t* token_array) {
     for (json_it_t it = json_init_it(token_array); !json_end_it(&it); json_next_it(&it)) {
         json_token_t* token_domain = json_it_value(&it);
         if (!json_is_string(token_domain)) {
-            __module_loader_config_error("__module_loader_domains_load: domain must be string\n");
+            log_error_stderr("__module_loader_domains_load: domain must be string\n");
             goto failed;
         }
 
@@ -1177,7 +1168,7 @@ domain_t* __module_loader_domains_load(const json_token_t* token_array) {
 int __module_loader_databases_load(appconfig_t* config, const json_token_t* token_databases) {
     if (token_databases == NULL) return 1;
     if (!json_is_object(token_databases)) {
-        __module_loader_config_error("__module_loader_databases_load: databases must be object\n");
+        log_error_stderr("__module_loader_databases_load: databases must be object\n");
         return 0;
     }
 
@@ -1191,11 +1182,11 @@ int __module_loader_databases_load(appconfig_t* config, const json_token_t* toke
     for (json_it_t it = json_init_it(token_databases); !json_end_it(&it); json_next_it(&it)) {
         json_token_t* token_array = json_it_value(&it);
         if (!json_is_array(token_array)) {
-            __module_loader_config_error("__module_loader_databases_load: database driver must be array\n");
+            log_error_stderr("__module_loader_databases_load: database driver must be array\n");
             goto failed;
         }
         if (json_array_size(token_array) == 0) {
-            __module_loader_config_error("__module_loader_databases_load: database driver must be not empty\n");
+            log_error_stderr("__module_loader_databases_load: database driver must be not empty\n");
             goto failed;
         }
 
@@ -1223,7 +1214,7 @@ int __module_loader_databases_load(appconfig_t* config, const json_token_t* toke
         #endif
 
         if (database == NULL) {
-            __module_loader_config_error("__module_loader_databases_load: database driver <%s> not found\n", driver);
+            log_error_stderr("__module_loader_databases_load: database driver <%s> not found\n", driver);
             continue;
         }
 
@@ -1240,7 +1231,7 @@ int __module_loader_databases_load(appconfig_t* config, const json_token_t* toke
 int __module_loader_storages_load(appconfig_t* config, const json_token_t* token_storages) {
     if (token_storages == NULL) return 1;
     if (!json_is_object(token_storages)) {
-        __module_loader_config_error("__module_loader_storages_load: storages must be object\n");
+        log_error_stderr("__module_loader_storages_load: storages must be object\n");
         return 0;
     }
 
@@ -1249,19 +1240,19 @@ int __module_loader_storages_load(appconfig_t* config, const json_token_t* token
     for (json_it_t it = json_init_it(token_storages); !json_end_it(&it); json_next_it(&it)) {
         json_token_t* token_object = json_it_value(&it);
         if (!json_is_object(token_object)) {
-            __module_loader_config_error("__module_loader_storages_load: storage must be object\n");
+            log_error_stderr("__module_loader_storages_load: storage must be object\n");
             goto failed;
         }
 
         const char* storage_name = json_it_key(&it);
         if (strlen(storage_name) == 0) {
-            __module_loader_config_error("__module_loader_storages_load: storage name must be not empty\n");
+            log_error_stderr("__module_loader_storages_load: storage name must be not empty\n");
             goto failed;
         }
 
         json_token_t* token_storage_type = json_object_get(token_object, "type");
         if (!json_is_string(token_storage_type)) {
-            __module_loader_config_error("Field type must be string in storage %s\n", storage_name);
+            log_error_stderr("Field type must be string in storage %s\n", storage_name);
             goto failed;
         }
 
@@ -1272,7 +1263,7 @@ int __module_loader_storages_load(appconfig_t* config, const json_token_t* token
         else if (strcmp(storage_type, "s3") == 0)
             storage = __module_loader_storage_s3_load(token_object, storage_name);
         else {
-            __module_loader_config_error("__module_loader_storages_load: unknown storage type '%s' in storage %s\n", storage_type, storage_name);
+            log_error_stderr("__module_loader_storages_load: unknown storage type '%s' in storage %s\n", storage_type, storage_name);
             goto failed;
         }
 
@@ -1299,15 +1290,15 @@ int __module_loader_storages_load(appconfig_t* config, const json_token_t* token
 
 int __module_loader_mimetype_load(appconfig_t* config, const json_token_t* token_mimetypes) {
     if (token_mimetypes == NULL) {
-        __module_loader_config_error("__module_loader_mimetype_load: mimetypes not found\n");
+        log_error_stderr("__module_loader_mimetype_load: mimetypes not found\n");
         return 0;
     }
     if (!json_is_object(token_mimetypes)) {
-        __module_loader_config_error("__module_loader_mimetype_load: mimetypes must be object\n");
+        log_error_stderr("__module_loader_mimetype_load: mimetypes must be object\n");
         return 0;
     }
     if (json_object_size(token_mimetypes) == 0) {
-        __module_loader_config_error("__module_loader_mimetype_load: mimetypes must be not empty\n");
+        log_error_stderr("__module_loader_mimetype_load: mimetypes must be not empty\n");
         return 0;
     }
 
@@ -1323,11 +1314,11 @@ int __module_loader_mimetype_load(appconfig_t* config, const json_token_t* token
         const char* mimetype = json_it_key(&it_object);
         const json_token_t* token_array = json_it_value(&it_object);
         if (!json_is_array(token_array)) {
-            __module_loader_config_error("__module_loader_mimetype_load: mimetype item must be array\n");
+            log_error_stderr("__module_loader_mimetype_load: mimetype item must be array\n");
             goto failed;
         }
         if (json_array_size(token_array) == 0) {
-            __module_loader_config_error("__module_loader_mimetype_load: mimetype item must be not empty\n");
+            log_error_stderr("__module_loader_mimetype_load: mimetype item must be not empty\n");
             goto failed;
         }
 
@@ -1335,11 +1326,11 @@ int __module_loader_mimetype_load(appconfig_t* config, const json_token_t* token
             const int* index = json_it_key(&it_array);
             const json_token_t* token_value = json_it_value(&it_array);
             if (!json_is_string(token_value)) {
-                __module_loader_config_error("__module_loader_mimetype_load: mimetype item.value must be string\n");
+                log_error_stderr("__module_loader_mimetype_load: mimetype item.value must be string\n");
                 goto failed;
             }
             if (json_string_size(token_value) == 0) {
-                __module_loader_config_error("__module_loader_mimetype_load: mimetype item.value must be not empty\n");
+                log_error_stderr("__module_loader_mimetype_load: mimetype item.value must be not empty\n");
                 goto failed;
             }
 
@@ -1378,7 +1369,7 @@ int __module_loader_viewstore_load(appconfig_t* config) {
 int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* token_sessions) {
     if (token_sessions == NULL) return 1;
     if (!json_is_object(token_sessions)) {
-        __module_loader_config_error("__module_loader_sessionconfig_load: sessions must be object\n");
+        log_error_stderr("__module_loader_sessionconfig_load: sessions must be object\n");
         return 0;
     }
 
@@ -1399,7 +1390,7 @@ int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* 
         json_token_t* token_entry = json_it_value(&it);
 
         if (!json_is_object(token_entry)) {
-            __module_loader_config_error("__module_loader_sessionconfig_load: session entry %s must be object\n", name);
+            log_error_stderr("__module_loader_sessionconfig_load: session entry %s must be object\n", name);
             goto failed;
         }
 
@@ -1408,7 +1399,7 @@ int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* 
 
         json_token_t* token_driver = json_object_get(token_entry, "driver");
         if (!json_is_string(token_driver)) {
-            __module_loader_config_error("__module_loader_sessionconfig_load: field driver must be string in session %s\n", name);
+            log_error_stderr("__module_loader_sessionconfig_load: field driver must be string in session %s\n", name);
             free(sc);
             goto failed;
         }
@@ -1427,14 +1418,14 @@ int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* 
 
             json_token_t* token_storage_name = json_object_get(token_entry, "storage_name");
             if (!json_is_string(token_storage_name)) {
-                __module_loader_config_error("__module_loader_sessionconfig_load: field storage_name must be string in session %s\n", name);
+                log_error_stderr("__module_loader_sessionconfig_load: field storage_name must be string in session %s\n", name);
                 sessionconfig_free(sc);
                 goto failed;
             }
 
             const char* storage_name = json_string(token_storage_name);
             if (strlen(storage_name) == 0) {
-                __module_loader_config_error("__module_loader_sessionconfig_load: field storage_name must be not empty in session %s\n", name);
+                log_error_stderr("__module_loader_sessionconfig_load: field storage_name must be not empty in session %s\n", name);
                 sessionconfig_free(sc);
                 goto failed;
             }
@@ -1453,14 +1444,14 @@ int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* 
 
             json_token_t* token_host_id = json_object_get(token_entry, "host_id");
             if (!json_is_string(token_host_id)) {
-                __module_loader_config_error("__module_loader_sessionconfig_load: field host_id must be string in session %s\n", name);
+                log_error_stderr("__module_loader_sessionconfig_load: field host_id must be string in session %s\n", name);
                 sessionconfig_free(sc);
                 goto failed;
             }
 
             const char* host_id = json_string(token_host_id);
             if (strlen(host_id) == 0) {
-                __module_loader_config_error("__module_loader_sessionconfig_load: field host_id must be not empty in session %s\n", name);
+                log_error_stderr("__module_loader_sessionconfig_load: field host_id must be not empty in session %s\n", name);
                 sessionconfig_free(sc);
                 goto failed;
             }
@@ -1479,14 +1470,14 @@ int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* 
 
             json_token_t* token_host_id = json_object_get(token_entry, "host_id");
             if (!json_is_string(token_host_id)) {
-                __module_loader_config_error("__module_loader_sessionconfig_load: field host_id must be string in session %s\n", name);
+                log_error_stderr("__module_loader_sessionconfig_load: field host_id must be string in session %s\n", name);
                 sessionconfig_free(sc);
                 goto failed;
             }
 
             const char* host_id = json_string(token_host_id);
             if (strlen(host_id) == 0) {
-                __module_loader_config_error("__module_loader_sessionconfig_load: field host_id must be not empty in session %s\n", name);
+                log_error_stderr("__module_loader_sessionconfig_load: field host_id must be not empty in session %s\n", name);
                 sessionconfig_free(sc);
                 goto failed;
             }
@@ -1494,20 +1485,20 @@ int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* 
             strcpy(sc->host_id, host_id);
         }
         else {
-            __module_loader_config_error("__module_loader_sessionconfig_load: unknown driver %s in session %s\n", driver, name);
+            log_error_stderr("__module_loader_sessionconfig_load: unknown driver %s in session %s\n", driver, name);
             free(sc);
             goto failed;
         }
 
         json_token_t* token_secret = json_object_get(token_entry, "secret");
         if (token_secret == NULL) {
-            __module_loader_config_error("__module_loader_sessionconfig_load: field secret not found in session %s\n", name);
+            log_error_stderr("__module_loader_sessionconfig_load: field secret not found in session %s\n", name);
             sessionconfig_free(sc);
             goto failed;
         }
 
         if (!json_is_string(token_secret)) {
-            __module_loader_config_error("__module_loader_sessionconfig_load: field secret must be string in session %s\n", name);
+            log_error_stderr("__module_loader_sessionconfig_load: field secret must be string in session %s\n", name);
             sessionconfig_free(sc);
             goto failed;
         }
@@ -1539,7 +1530,7 @@ int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_t
 
     if (token_object == NULL) return 1;
     if (!json_is_object(token_object)) {
-        __module_loader_config_error("__module_loader_http_routes_load: http.route must be object\n");
+        log_error_stderr("__module_loader_http_routes_load: http.route must be object\n");
         goto failed;
     }
     if (json_object_size(token_object) == 0) return 1;
@@ -1552,7 +1543,7 @@ int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_t
     for (; !json_end_it(&it); json_next_it(&it)) {
         const char* route_path = json_it_key(&it);
         if (strlen(route_path) == 0) {
-            __module_loader_config_error("__module_loader_http_routes_load: route path is empty\n");
+            log_error_stderr("__module_loader_http_routes_load: route path is empty\n");
             goto failed;
         }
 
@@ -1590,11 +1581,11 @@ int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_t
 
 int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config) {
     if (token_object == NULL) {
-        __module_loader_config_error("__module_loader_set_http_route: http.route item is empty\n");
+        log_error_stderr("__module_loader_set_http_route: http.route item is empty\n");
         return 0;
     }
     if (!json_is_object(token_object)) {
-        __module_loader_config_error("__module_loader_set_http_route: http.route item must be object\n");
+        log_error_stderr("__module_loader_set_http_route: http.route item must be object\n");
         return 0;
     }
     json_it_t it = json_init_it(token_object);
@@ -1605,18 +1596,18 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
     for (; !json_end_it(&it); json_next_it(&it)) {
         const char* method = json_it_key(&it);
         if (strlen(method) == 0) {
-            __module_loader_config_error("__module_loader_set_http_route: http.route item.key must be not empty\n");
+            log_error_stderr("__module_loader_set_http_route: http.route item.key must be not empty\n");
             return 0;
         }
 
         json_token_t* token_item = json_it_value(&it);
         if (!json_is_object(token_item)) {
-            __module_loader_config_error("__module_loader_set_http_route: http.route item.value must be object\n");
+            log_error_stderr("__module_loader_set_http_route: http.route item.value must be object\n");
             return 0;
         }
 
         if (json_object_size(token_item) < 1) {
-            __module_loader_config_error("__module_loader_set_http_route: http.route item.value must be object with at least 1 element\n");
+            log_error_stderr("__module_loader_set_http_route: http.route item.value must be object with at least 1 element\n");
             return 0;
         }
 
@@ -1624,18 +1615,18 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
         ratelimiter_t* ratelimiter = NULL;
         if (token_ratelimit != NULL) {
             if (!json_is_string(token_ratelimit)) {
-                __module_loader_config_error("__module_loader_set_http_route: http.route item.value.ratelimit must be string\n");
+                log_error_stderr("__module_loader_set_http_route: http.route item.value.ratelimit must be string\n");
                 return 0;
             }
             if (json_string_size(token_ratelimit) == 0) {
-                __module_loader_config_error("__module_loader_set_http_route: http.route item.value.ratelimit must be not empty string\n");
+                log_error_stderr("__module_loader_set_http_route: http.route item.value.ratelimit must be not empty string\n");
                 return 0;
             }
 
             const char* ratelimit_name = json_string(token_ratelimit);
             ratelimiter_config_t* config = map_find(ratelimiter_config, ratelimit_name);
             if (config == NULL) {
-                __module_loader_config_error("__module_loader_set_http_route: ratelimiter %s not found\n", ratelimit_name);
+                log_error_stderr("__module_loader_set_http_route: ratelimiter %s not found\n", ratelimit_name);
                 return 0;
             }
 
@@ -1651,12 +1642,12 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
         const json_token_t* token_cache_control = json_object_get(token_item, "cache_control");
         if (token_cache_control != NULL) {
             if (!json_is_string(token_cache_control)) {
-                __module_loader_config_error("__module_loader_set_http_route: http.route item.value.cache_control must be string\n");
+                log_error_stderr("__module_loader_set_http_route: http.route item.value.cache_control must be string\n");
                 ratelimiter_free(ratelimiter);
                 return 0;
             }
             if (json_string_size(token_cache_control) == 0) {
-                __module_loader_config_error("__module_loader_set_http_route: http.route item.value.cache_control must be not empty string\n");
+                log_error_stderr("__module_loader_set_http_route: http.route item.value.cache_control must be not empty string\n");
                 ratelimiter_free(ratelimiter);
                 return 0;
             }
@@ -1670,11 +1661,11 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
         const json_token_t* token_static_file = json_object_get(token_item, "static_file");
         if (token_static_file != NULL) {
             if (!json_is_string(token_static_file)) {
-                __module_loader_config_error("__module_loader_set_http_route: http.route item.value.static_file must be string\n");
+                log_error_stderr("__module_loader_set_http_route: http.route item.value.static_file must be string\n");
                 return 0;
             }
             if (json_string_size(token_static_file) == 0) {
-                __module_loader_config_error("__module_loader_set_http_route: http.route item.value.static_file must be not empty string\n");
+                log_error_stderr("__module_loader_set_http_route: http.route item.value.static_file must be not empty string\n");
                 return 0;
             }
             const char* static_file = json_string(token_static_file);
@@ -1688,20 +1679,20 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
 
         const json_token_t* token_file = json_object_get(token_item, "file");
         if (!json_is_string(token_file)) {
-            __module_loader_config_error("__module_loader_set_http_route: http.route item.value.file must be string\n");
+            log_error_stderr("__module_loader_set_http_route: http.route item.value.file must be string\n");
             return 0;
         }
         if (json_string_size(token_file) == 0) {
-            __module_loader_config_error("__module_loader_set_http_route: http.route item.value.file must be not empty string\n");
+            log_error_stderr("__module_loader_set_http_route: http.route item.value.file must be not empty string\n");
             return 0;
         }
         const json_token_t* token_function = json_object_get(token_item, "function");
         if (!json_is_string(token_function)) {
-            __module_loader_config_error("__module_loader_set_http_route: http.route item.value.function must be string\n");
+            log_error_stderr("__module_loader_set_http_route: http.route item.value.function must be string\n");
             return 0;
         }
         if (json_string_size(token_function) == 0) {
-            __module_loader_config_error("__module_loader_set_http_route: http.route item.value.function must be not empty string\n");
+            log_error_stderr("__module_loader_set_http_route: http.route item.value.function must be not empty string\n");
             return 0;
         }
 
@@ -1746,7 +1737,7 @@ int __module_loader_http_redirects_load(const json_token_t* token_object, redire
 
     if (token_object == NULL) return 1;
     if (!json_is_object(token_object)) {
-        __module_loader_config_error("__module_loader_http_redirects_load: http.redirects must be object\n");
+        log_error_stderr("__module_loader_http_redirects_load: http.redirects must be object\n");
         goto failed;
     }
     if (json_object_size(token_object) == 0) return 1;
@@ -1754,21 +1745,21 @@ int __module_loader_http_redirects_load(const json_token_t* token_object, redire
     for (json_it_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
         json_token_t* token_value = json_it_value(&it);
         if (token_value == NULL) {
-            __module_loader_config_error("__module_loader_http_redirects_load: http.redirects item.value is empty\n");
+            log_error_stderr("__module_loader_http_redirects_load: http.redirects item.value is empty\n");
             goto failed;
         }
         if (!json_is_string(token_value)) {
-            __module_loader_config_error("__module_loader_http_redirects_load: http.redirects item.value must be string\n");
+            log_error_stderr("__module_loader_http_redirects_load: http.redirects item.value must be string\n");
             goto failed;
         }
         if (json_string_size(token_value) == 0) {
-            __module_loader_config_error("__module_loader_http_redirects_load: http.redirects item.value is empty\n");
+            log_error_stderr("__module_loader_http_redirects_load: http.redirects item.value is empty\n");
             goto failed;
         }
 
         const char* redirect_path = json_it_key(&it);
         if (strlen(redirect_path) == 0) {
-            __module_loader_config_error("__module_loader_http_redirects_load: http.redirects item.key is empty\n");
+            log_error_stderr("__module_loader_http_redirects_load: http.redirects item.key is empty\n");
             goto failed;
         }
 
@@ -1807,7 +1798,7 @@ int __module_loader_middlewares_load(const json_token_t* token_array, middleware
 
     if (token_array == NULL) return 1;
     if (!json_is_array(token_array)) {
-        __module_loader_config_error("__module_loader_middlewares_load: http.middlewares must be array\n");
+        log_error_stderr("__module_loader_middlewares_load: http.middlewares must be array\n");
         goto failed;
     }
     if (json_array_size(token_array) == 0) return 1;
@@ -1815,18 +1806,18 @@ int __module_loader_middlewares_load(const json_token_t* token_array, middleware
     for (json_it_t it = json_init_it(token_array); !json_end_it(&it); json_next_it(&it)) {
         json_token_t* token_value = json_it_value(&it);
         if (!json_is_string(token_value)) {
-            __module_loader_config_error("__module_loader_middlewares_load: http.middlewares item.value must be string\n");
+            log_error_stderr("__module_loader_middlewares_load: http.middlewares item.value must be string\n");
             goto failed;
         }
         if (json_string_size(token_value) == 0) {
-            __module_loader_config_error("__module_loader_middlewares_load: http.middlewares item.value is empty\n");
+            log_error_stderr("__module_loader_middlewares_load: http.middlewares item.value is empty\n");
             goto failed;
         }
 
         const char* middleware_name = json_string(token_value);
         middleware_fn_p fn = middleware_by_name(middleware_name);
         if (fn == NULL) {
-            __module_loader_config_error("__module_loader_middlewares_load: failed to find middleware %s\n", middleware_name);
+            log_error_stderr("__module_loader_middlewares_load: failed to find middleware %s\n", middleware_name);
             goto failed;
         }
 
@@ -1861,48 +1852,48 @@ int __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t
     *fn = (void(*)(void*))websockets_default_handler;
 
     if (!json_is_object(token_object)) {
-        __module_loader_config_error("__module_loader_websockets_default_load: websockets.default item.value must be object\n");
+        log_error_stderr("__module_loader_websockets_default_load: websockets.default item.value must be object\n");
         return 0;
     }
     if (json_object_size(token_object) < 2) {
-        __module_loader_config_error("__module_loader_websockets_default_load: websockets.default item.value must be object with at least 2 elements\n");
+        log_error_stderr("__module_loader_websockets_default_load: websockets.default item.value must be object with at least 2 elements\n");
         return 0;
     }
 
     const json_token_t* token_file = json_object_get(token_object, "file");
     if (!json_is_string(token_file)) {
-        __module_loader_config_error("__module_loader_websockets_default_load: websockets.default item.value.file must be string\n");
+        log_error_stderr("__module_loader_websockets_default_load: websockets.default item.value.file must be string\n");
         return 0;
     }
     if (json_string_size(token_file) == 0) {
-        __module_loader_config_error("__module_loader_websockets_default_load: websockets.default item.value.file must be not empty string\n");
+        log_error_stderr("__module_loader_websockets_default_load: websockets.default item.value.file must be not empty string\n");
         return 0;
     }
     const json_token_t* token_function = json_object_get(token_object, "function");
     if (!json_is_string(token_function)) {
-        __module_loader_config_error("__module_loader_websockets_default_load: websockets.default item.value.function must be string\n");
+        log_error_stderr("__module_loader_websockets_default_load: websockets.default item.value.function must be string\n");
         return 0;
     }
     if (json_string_size(token_function) == 0) {
-        __module_loader_config_error("__module_loader_websockets_default_load: websockets.default item.value.function must be not empty string\n");
+        log_error_stderr("__module_loader_websockets_default_load: websockets.default item.value.function must be not empty string\n");
         return 0;
     }
     const json_token_t* token_ratelimit = json_object_get(token_object, "ratelimit");
     ratelimiter_t* ratelimiter = NULL;
     if (token_ratelimit != NULL) {
         if (!json_is_string(token_ratelimit)) {
-            __module_loader_config_error("__module_loader_websockets_default_load: websockets.default item.value.ratelimit must be string\n");
+            log_error_stderr("__module_loader_websockets_default_load: websockets.default item.value.ratelimit must be string\n");
             return 0;
         }
         if (json_string_size(token_ratelimit) == 0) {
-            __module_loader_config_error("__module_loader_websockets_default_load: websockets.default item.value.ratelimit must be not empty string\n");
+            log_error_stderr("__module_loader_websockets_default_load: websockets.default item.value.ratelimit must be not empty string\n");
             return 0;
         }
 
         const char* ratelimit_name = json_string(token_ratelimit);
         ratelimiter_config_t* config = map_find(ratelimiter_config, ratelimit_name);
         if (config == NULL) {
-            __module_loader_config_error("__module_loader_websockets_default_load: ratelimiter %s not found\n", ratelimit_name);
+            log_error_stderr("__module_loader_websockets_default_load: ratelimiter %s not found\n", ratelimit_name);
             return 0;
         }
 
@@ -1945,7 +1936,7 @@ int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const 
 
     if (token_object == NULL) return 1;
     if (!json_is_object(token_object)) {
-        __module_loader_config_error("__module_loader_websockets_routes_load: websockets.routes must be object\n");
+        log_error_stderr("__module_loader_websockets_routes_load: websockets.routes must be object\n");
         goto failed;
     }
     if (json_object_size(token_object) == 0) return 1;
@@ -1953,7 +1944,7 @@ int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const 
     for (json_it_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
         const char* route_path = json_it_key(&it);
         if (strlen(route_path) == 0) {
-            __module_loader_config_error("__module_loader_websockets_routes_load: websockets.route path is empty\n");
+            log_error_stderr("__module_loader_websockets_routes_load: websockets.route path is empty\n");
             goto failed;
         }
 
@@ -1991,64 +1982,64 @@ int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const 
 
 int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config) {
     if (token_object == NULL) {
-        __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item is empty\n");
+        log_error_stderr("__module_loader_set_websockets_route: websockets.route item is empty\n");
         return 0;
     }
     if (!json_is_object(token_object)) {
-        __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item must be object\n");
+        log_error_stderr("__module_loader_set_websockets_route: websockets.route item must be object\n");
         return 0;
     }
     for (json_it_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
         const char* method = json_it_key(&it);
         if (strlen(method) == 0) {
-            __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.key is empty\n");
+            log_error_stderr("__module_loader_set_websockets_route: websockets.route item.key is empty\n");
             return 0;
         }
 
         json_token_t* token_object = json_it_value(&it);
         if (!json_is_object(token_object)) {
-            __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value must be object\n");
+            log_error_stderr("__module_loader_set_websockets_route: websockets.route item.value must be object\n");
             return 0;
         }
         if (json_object_size(token_object) < 2) {
-            __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value must be object with at least 2 elements\n");
+            log_error_stderr("__module_loader_set_websockets_route: websockets.route item.value must be object with at least 2 elements\n");
             return 0;
         }
 
         const json_token_t* token_file = json_object_get(token_object, "file");
         if (!json_is_string(token_file)) {
-            __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.file must be string\n");
+            log_error_stderr("__module_loader_set_websockets_route: websockets.route item.value.file must be string\n");
             return 0;
         }
         if (json_string_size(token_file) == 0) {
-            __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.file must be not empty string\n");
+            log_error_stderr("__module_loader_set_websockets_route: websockets.route item.value.file must be not empty string\n");
             return 0;
         }
         const json_token_t* token_function = json_object_get(token_object, "function");
         if (!json_is_string(token_function)) {
-            __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.function must be string\n");
+            log_error_stderr("__module_loader_set_websockets_route: websockets.route item.value.function must be string\n");
             return 0;
         }
         if (json_string_size(token_function) == 0) {
-            __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.function must be not empty string\n");
+            log_error_stderr("__module_loader_set_websockets_route: websockets.route item.value.function must be not empty string\n");
             return 0;
         }
         const json_token_t* token_ratelimit = json_object_get(token_object, "ratelimit");
         ratelimiter_t* ratelimiter = NULL;
         if (token_ratelimit != NULL) {
             if (!json_is_string(token_ratelimit)) {
-                __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.ratelimit must be string\n");
+                log_error_stderr("__module_loader_set_websockets_route: websockets.route item.value.ratelimit must be string\n");
                 return 0;
             }
             if (json_string_size(token_ratelimit) == 0) {
-                __module_loader_config_error("__module_loader_set_websockets_route: websockets.route item.value.ratelimit must be not empty string\n");
+                log_error_stderr("__module_loader_set_websockets_route: websockets.route item.value.ratelimit must be not empty string\n");
                 return 0;
             }
 
             const char* ratelimit_name = json_string(token_ratelimit);
             ratelimiter_config_t* config = map_find(ratelimiter_config, ratelimit_name);
             if (config == NULL) {
-                __module_loader_config_error("__module_loader_set_websockets_route: ratelimiter %s not found\n", ratelimit_name);
+                log_error_stderr("__module_loader_set_websockets_route: ratelimiter %s not found\n", ratelimit_name);
                 return 0;
             }
 
@@ -2113,7 +2104,7 @@ void __module_loader_on_shutdown_cb(void) {
 
 map_t* __module_loader_ratelimits_configs_load(const json_token_t* token_object) {
     if (!json_is_object(token_object)) {
-        __module_loader_config_error("__module_loader_ratelimits_config_load: ratelimits must be object\n");
+        log_error_stderr("__module_loader_ratelimits_config_load: ratelimits must be object\n");
         return NULL;
     }
 
@@ -2128,7 +2119,7 @@ map_t* __module_loader_ratelimits_configs_load(const json_token_t* token_object)
         json_token_t* token_object = json_it_value(&it);
 
         if (!json_is_object(token_object)) {
-            __module_loader_config_error("__module_loader_ratelimits_config_load: ratelimits.%s must be object\n", key);
+            log_error_stderr("__module_loader_ratelimits_config_load: ratelimits.%s must be object\n", key);
             map_free(map);
             return NULL;
         }
@@ -2152,7 +2143,7 @@ map_t* __module_loader_ratelimits_configs_load(const json_token_t* token_object)
 
 ratelimiter_config_t* __module_loader_ratelimits_config_load(const json_token_t* token_object) {
     if (!json_is_object(token_object)) {
-        __module_loader_config_error("__module_loader_ratelimits_config_load: ratelimits must be object\n");
+        log_error_stderr("__module_loader_ratelimits_config_load: ratelimits must be object\n");
         return NULL;
     }
 
@@ -2167,7 +2158,7 @@ ratelimiter_config_t* __module_loader_ratelimits_config_load(const json_token_t*
 
     const json_token_t* token_burst = json_object_get(token_object, "burst");
     if (!json_is_number(token_burst)) {
-        __module_loader_config_error("__module_loader_ratelimits_config_load: ratelimits.burst must be number\n");
+        log_error_stderr("__module_loader_ratelimits_config_load: ratelimits.burst must be number\n");
         free(config);
         return NULL;
     }
@@ -2175,7 +2166,7 @@ ratelimiter_config_t* __module_loader_ratelimits_config_load(const json_token_t*
     int ok = 0;
     const int burst = json_int(token_burst, &ok);
     if (!ok) {
-        __module_loader_config_error("__module_loader_ratelimits_config_load: ratelimits.burst must be integer\n");
+        log_error_stderr("__module_loader_ratelimits_config_load: ratelimits.burst must be integer\n");
         free(config);
         return NULL;
     }
@@ -2184,14 +2175,14 @@ ratelimiter_config_t* __module_loader_ratelimits_config_load(const json_token_t*
 
     const json_token_t* token_rate = json_object_get(token_object, "rate");
     if (!json_is_number(token_rate)) {
-        __module_loader_config_error("__module_loader_ratelimits_config_load: ratelimits.rate must be number\n");
+        log_error_stderr("__module_loader_ratelimits_config_load: ratelimits.rate must be number\n");
         free(config);
         return NULL;
     }
 
     const int rate = json_int(token_rate, &ok);
     if (!ok) {
-        __module_loader_config_error("__module_loader_ratelimits_config_load: ratelimits.rate must be integer\n");
+        log_error_stderr("__module_loader_ratelimits_config_load: ratelimits.rate must be integer\n");
         free(config);
         return NULL;
     }
@@ -2207,12 +2198,12 @@ int __module_loader_http_ratelimit_load(const json_token_t* token_string, rateli
     if (token_string == NULL) return 1;
 
     if (!json_is_string(token_string)) {
-        __module_loader_config_error("__module_loader_http_ratelimit_load: http.ratelimit must be string\n");
+        log_error_stderr("__module_loader_http_ratelimit_load: http.ratelimit must be string\n");
         return 0;
     }
 
     if (json_string_size(token_string) == 0) {
-        __module_loader_config_error("__module_loader_http_ratelimit_load: http.ratelimit must be not empty string\n");
+        log_error_stderr("__module_loader_http_ratelimit_load: http.ratelimit must be not empty string\n");
         return 0;
     }
 
@@ -2224,7 +2215,7 @@ int __module_loader_http_ratelimit_load(const json_token_t* token_string, rateli
     const char* ratelimit_name = json_string(token_string);
     ratelimiter_config_t* config = map_find(ratelimits_config, ratelimit_name);
     if (config == NULL) {
-        __module_loader_config_error("__module_loader_http_ratelimit_load: ratelimiter %s not found\n", ratelimit_name);
+        log_error_stderr("__module_loader_http_ratelimit_load: ratelimiter %s not found\n", ratelimit_name);
         return 0;
     }
 
@@ -2243,12 +2234,12 @@ int __module_loader_websockets_ratelimit_load(const json_token_t* token_string, 
     if (token_string == NULL) return 1;
 
     if (!json_is_string(token_string)) {
-        __module_loader_config_error("__module_loader_websockets_ratelimit_load: websockets.ratelimit must be string\n");
+        log_error_stderr("__module_loader_websockets_ratelimit_load: websockets.ratelimit must be string\n");
         return 0;
     }
 
     if (json_string_size(token_string) == 0) {
-        __module_loader_config_error("__module_loader_websockets_ratelimit_load: websockets.ratelimit must be not empty string\n");
+        log_error_stderr("__module_loader_websockets_ratelimit_load: websockets.ratelimit must be not empty string\n");
         return 0;
     }
 
@@ -2260,7 +2251,7 @@ int __module_loader_websockets_ratelimit_load(const json_token_t* token_string, 
     const char* ratelimit_name = json_string(token_string);
     ratelimiter_config_t* config = map_find(ratelimits_config, ratelimit_name);
     if (config == NULL) {
-        __module_loader_config_error("__module_loader_websockets_ratelimit_load: ratelimiter %s not found\n", ratelimit_name);
+        log_error_stderr("__module_loader_websockets_ratelimit_load: ratelimiter %s not found\n", ratelimit_name);
         return 0;
     }
 
@@ -2307,7 +2298,7 @@ void* __module_loader_storage_fs_load(const json_token_t* token_object, const ch
     }
 
     if (root_path_length == 0) {
-        __module_loader_config_error("__module_loader_storage_fs_load: storage %s has empty path\n", storage_name);
+        log_error_stderr("__module_loader_storage_fs_load: storage %s has empty path\n", storage_name);
         goto failed;
     }
 
@@ -2329,43 +2320,43 @@ void* __module_loader_storage_s3_load(const json_token_t* token_object, const ch
 
     const char* access_id = __module_loader_storage_field(storage_name, token_object, "access_id");
     if (access_id == NULL) {
-        __module_loader_config_error("__module_loader_storage_s3_load: storage %s has empty access_id\n", storage_name);
+        log_error_stderr("__module_loader_storage_s3_load: storage %s has empty access_id\n", storage_name);
         goto failed;
     }
 
     const char* access_secret = __module_loader_storage_field(storage_name, token_object, "access_secret");
     if (access_secret == NULL) {
-        __module_loader_config_error("__module_loader_storage_s3_load: storage %s has empty access_secret\n", storage_name);
+        log_error_stderr("__module_loader_storage_s3_load: storage %s has empty access_secret\n", storage_name);
         goto failed;
     }
 
     const char* protocol = __module_loader_storage_field(storage_name, token_object, "protocol");
     if (protocol == NULL) {
-        __module_loader_config_error("__module_loader_storage_s3_load: storage %s has empty protocol\n", storage_name);
+        log_error_stderr("__module_loader_storage_s3_load: storage %s has empty protocol\n", storage_name);
         goto failed;
     }
 
     const char* host = __module_loader_storage_field(storage_name, token_object, "host");
     if (host == NULL) {
-        __module_loader_config_error("__module_loader_storage_s3_load: storage %s has empty host\n", storage_name);
+        log_error_stderr("__module_loader_storage_s3_load: storage %s has empty host\n", storage_name);
         goto failed;
     }
 
     const char* port = __module_loader_storage_field(storage_name, token_object, "port");
     if (port == NULL) {
-        __module_loader_config_error("__module_loader_storage_s3_load: storage %s has empty port\n", storage_name);
+        log_error_stderr("__module_loader_storage_s3_load: storage %s has empty port\n", storage_name);
         goto failed;
     }
 
     const char* bucket = __module_loader_storage_field(storage_name, token_object, "bucket");
     if (bucket == NULL) {
-        __module_loader_config_error("__module_loader_storage_s3_load: storage %s has empty bucket\n", storage_name);
+        log_error_stderr("__module_loader_storage_s3_load: storage %s has empty bucket\n", storage_name);
         goto failed;
     }
 
     const char* region = __module_loader_storage_field(storage_name, token_object, "region");
     if (region == NULL) {
-        __module_loader_config_error("__module_loader_storage_s3_load: storage %s has empty region\n", storage_name);
+        log_error_stderr("__module_loader_storage_s3_load: storage %s has empty region\n", storage_name);
         goto failed;
     }
 
@@ -2385,13 +2376,13 @@ void* __module_loader_storage_s3_load(const json_token_t* token_object, const ch
 const char* __module_loader_storage_field(const char* storage_name, const json_token_t* token_object, const char* key) {
     json_token_t* token_value = json_object_get(token_object, key);
     if (!json_is_string(token_value)) {
-        __module_loader_config_error("__module_loader_storage_field: field %s must be string in storage %s\n", key, storage_name);
+        log_error_stderr("__module_loader_storage_field: field %s must be string in storage %s\n", key, storage_name);
         return NULL;
     }
 
     const char* value = json_string(token_value);
     if (json_string_size(token_value) == 0) {
-        __module_loader_config_error("__module_loader_storage_field: field %s is empty in storage %s\n", key, storage_name);
+        log_error_stderr("__module_loader_storage_field: field %s is empty in storage %s\n", key, storage_name);
         return NULL;
     }
 
@@ -2400,11 +2391,11 @@ const char* __module_loader_storage_field(const char* storage_name, const json_t
 
 openssl_t* __module_loader_tls_load(const json_token_t* token_object) {
     if (token_object == NULL) {
-        __module_loader_config_error("__module_loader_tls_load: openssl not found\n");
+        log_error_stderr("__module_loader_tls_load: openssl not found\n");
         return NULL;
     }
     if (!json_is_object(token_object)) {
-        __module_loader_config_error("__module_loader_tls_load: openssl must be object\n");
+        log_error_stderr("__module_loader_tls_load: openssl must be object\n");
         return NULL;
     }
 
@@ -2421,23 +2412,23 @@ openssl_t* __module_loader_tls_load(const json_token_t* token_object) {
     for (json_it_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
         const char* key = json_it_key(&it);
         if (strlen(key) == 0) {
-            __module_loader_config_error("__module_loader_tls_load: tls key is empty\n");
+            log_error_stderr("__module_loader_tls_load: tls key is empty\n");
             goto failed;
         }
 
         const json_token_t* token_value = json_it_value(&it);
         if (token_value == NULL) {
-            __module_loader_config_error("__module_loader_tls_load: tls value is empty\n");
+            log_error_stderr("__module_loader_tls_load: tls value is empty\n");
             goto failed;
         }
 
         if (strcmp(key, "fullchain") == 0) {
             if (!json_is_string(token_value)) {
-                __module_loader_config_error("__module_loader_tls_load: field fullchain must be string type\n");
+                log_error_stderr("__module_loader_tls_load: field fullchain must be string type\n");
                 goto failed;
             }
             if (json_string_size(token_value) == 0) {
-                __module_loader_config_error("__module_loader_tls_load: field fullchain is empty\n");
+                log_error_stderr("__module_loader_tls_load: field fullchain is empty\n");
                 goto failed;
             }
 
@@ -2453,11 +2444,11 @@ openssl_t* __module_loader_tls_load(const json_token_t* token_object) {
         }
         else if (strcmp(key, "private") == 0) {
             if (!json_is_string(token_value)) {
-                __module_loader_config_error("Openssl field private must be string type\n");
+                log_error_stderr("Openssl field private must be string type\n");
                 goto failed;
             }
             if (json_string_size(token_value) == 0) {
-                __module_loader_config_error("__module_loader_tls_load: field private is empty\n");
+                log_error_stderr("__module_loader_tls_load: field private is empty\n");
                 goto failed;
             }
 
@@ -2473,11 +2464,11 @@ openssl_t* __module_loader_tls_load(const json_token_t* token_object) {
         }
         else if (strcmp(key, "ciphers") == 0) {
             if (!json_is_string(token_value)) {
-                __module_loader_config_error("Openssl field ciphers must be string type\n");
+                log_error_stderr("Openssl field ciphers must be string type\n");
                 goto failed;
             }
             if (json_string_size(token_value) == 0) {
-                __module_loader_config_error("__module_loader_tls_load: field ciphers is empty\n");
+                log_error_stderr("__module_loader_tls_load: field ciphers is empty\n");
                 goto failed;
             }
 
@@ -2495,7 +2486,7 @@ openssl_t* __module_loader_tls_load(const json_token_t* token_object) {
 
     for (int i = 0; i < FIELDS_COUNT; i++) {
         if (finded_fields[i] == 0) {
-            __module_loader_config_error("__module_loader_tls_load: field %s not found in tls\n", finded_fields_str[i]);
+            log_error_stderr("__module_loader_tls_load: field %s not found in tls\n", finded_fields_str[i]);
             goto failed;
         }
     }
@@ -2535,7 +2526,7 @@ int __module_loader_check_unique_domainport(server_t* first_server) {
 
                     if (strcmp(current_domain->template, domain->template) == 0 && current_port == port) {
                         char authority[IPADDR_AUTHORITY_STRLEN];
-                        __module_loader_config_error("__module_loader_check_unique_domainport: domains with addresses and ports must be unique. %s %s\n",
+                        log_error_stderr("__module_loader_check_unique_domainport: domains with addresses and ports must be unique. %s %s\n",
                                                      domain->template,
                                                      ipaddr_authority(&server->ip, port, authority, sizeof authority));
                         return 0;
@@ -2579,7 +2570,7 @@ int __module_loader_taskmanager_init(appconfig_t* config, json_token_t* token_ta
         return 1;
 
     if (!json_is_array(token_taskmanager)) {
-        __module_loader_config_error("__module_loader_taskmanager_init: task_manager must be array\n");
+        log_error_stderr("__module_loader_taskmanager_init: task_manager must be array\n");
         return 0;
     }
 
@@ -2607,7 +2598,7 @@ int __module_loader_translations_load(appconfig_t* config, json_token_t* transla
     }
 
     if (!json_is_array(translations)) {
-        __module_loader_config_error("__module_loader_translations_load: translations must be array\n");
+        log_error_stderr("__module_loader_translations_load: translations must be array\n");
         return 0;
     }
 
@@ -2630,21 +2621,21 @@ int __module_loader_translations_load(appconfig_t* config, json_token_t* transla
         json_token_t* item = json_it_value(&it);
 
         if (!json_is_object(item)) {
-            __module_loader_config_error("__module_loader_translations_load: translation item must be object\n");
+            log_error_stderr("__module_loader_translations_load: translation item must be object\n");
             it = json_next_it(&it);
             continue;
         }
 
         const char* domain = json_string(json_object_get(item, "domain"));
         if (domain == NULL || *domain == '\0') {
-            __module_loader_config_error("__module_loader_translations_load: domain is required\n");
+            log_error_stderr("__module_loader_translations_load: domain is required\n");
             it = json_next_it(&it);
             continue;
         }
 
         const char* locale_dir = json_string(json_object_get(item, "path"));
         if (locale_dir == NULL || *locale_dir == '\0') {
-            __module_loader_config_error("__module_loader_translations_load: path is required\n");
+            log_error_stderr("__module_loader_translations_load: path is required\n");
             it = json_next_it(&it);
             continue;
         }
@@ -2675,34 +2666,34 @@ static int __module_loader_taskmanager_load(appconfig_t* config, taskmanager_t* 
         const json_token_t* token_task = json_array_get(token_taskmanager, i);
 
         if (!json_is_object(token_task)) {
-            __module_loader_config_error("__module_loader_taskmanager_load: task item must be object\n");
+            log_error_stderr("__module_loader_taskmanager_load: task item must be object\n");
             return 0;
         }
 
         const json_token_t* token_name = json_object_get(token_task, "name");
         if (token_name == NULL || !json_is_string(token_name)) {
-            __module_loader_config_error("__module_loader_taskmanager_load: task name is required and must be string\n");
+            log_error_stderr("__module_loader_taskmanager_load: task name is required and must be string\n");
             return 0;
         }
         const char* name = json_string(token_name);
 
         const json_token_t* token_type = json_object_get(token_task, "type");
         if (token_type == NULL || !json_is_string(token_type)) {
-            __module_loader_config_error("__module_loader_taskmanager_load: task type is required and must be string\n");
+            log_error_stderr("__module_loader_taskmanager_load: task type is required and must be string\n");
             return 0;
         }
         const char* type = json_string(token_type);
 
         const json_token_t* token_file = json_object_get(token_task, "file");
         if (token_file == NULL || !json_is_string(token_file)) {
-            __module_loader_config_error("__module_loader_taskmanager_load: task file is required and must be string\n");
+            log_error_stderr("__module_loader_taskmanager_load: task file is required and must be string\n");
             return 0;
         }
         const char* lib_file = json_string(token_file);
 
         const json_token_t* token_function = json_object_get(token_task, "function");
         if (token_function == NULL || !json_is_string(token_function)) {
-            __module_loader_config_error("__module_loader_taskmanager_load: task function is required and must be string\n");
+            log_error_stderr("__module_loader_taskmanager_load: task function is required and must be string\n");
             return 0;
         }
         const char* function_name = json_string(token_function);
@@ -2732,13 +2723,13 @@ static int __module_loader_taskmanager_load(appconfig_t* config, taskmanager_t* 
         if (strcmp(type, "interval") == 0) {
             const json_token_t* token_interval = json_object_get(token_task, "interval");
             if (token_interval == NULL || !json_is_number(token_interval)) {
-                __module_loader_config_error("__module_loader_taskmanager_load: interval is required for interval type\n");
+                log_error_stderr("__module_loader_taskmanager_load: interval is required for interval type\n");
                 return 0;
             }
             int ok = 0;
             int interval = json_int(token_interval, &ok);
             if (!ok || interval < 1) {
-                __module_loader_config_error("__module_loader_taskmanager_load: interval must be >= 1\n");
+                log_error_stderr("__module_loader_taskmanager_load: interval must be >= 1\n");
                 return 0;
             }
 
@@ -2752,25 +2743,25 @@ static int __module_loader_taskmanager_load(appconfig_t* config, taskmanager_t* 
         else if (strcmp(type, "daily") == 0) {
             const json_token_t* token_hour = json_object_get(token_task, "hour");
             if (token_hour == NULL || !json_is_number(token_hour)) {
-                __module_loader_config_error("__module_loader_taskmanager_load: hour is required for daily type\n");
+                log_error_stderr("__module_loader_taskmanager_load: hour is required for daily type\n");
                 return 0;
             }
             int ok = 0;
             int hour = json_int(token_hour, &ok);
             if (!ok || hour < 0 || hour > 23) {
-                __module_loader_config_error("__module_loader_taskmanager_load: hour must be 0-23\n");
+                log_error_stderr("__module_loader_taskmanager_load: hour must be 0-23\n");
                 return 0;
             }
 
             const json_token_t* token_minute = json_object_get(token_task, "minute");
             if (token_minute == NULL || !json_is_number(token_minute)) {
-                __module_loader_config_error("__module_loader_taskmanager_load: minute is required for daily type\n");
+                log_error_stderr("__module_loader_taskmanager_load: minute is required for daily type\n");
                 return 0;
             }
             ok = 0;
             int minute = json_int(token_minute, &ok);
             if (!ok || minute < 0 || minute > 59) {
-                __module_loader_config_error("__module_loader_taskmanager_load: minute must be 0-59\n");
+                log_error_stderr("__module_loader_taskmanager_load: minute must be 0-59\n");
                 return 0;
             }
 
@@ -2784,7 +2775,7 @@ static int __module_loader_taskmanager_load(appconfig_t* config, taskmanager_t* 
         else if (strcmp(type, "weekly") == 0) {
             const json_token_t* token_weekday = json_object_get(token_task, "weekday");
             if (token_weekday == NULL || !json_is_string(token_weekday)) {
-                __module_loader_config_error("__module_loader_taskmanager_load: weekday is required for weekly type\n");
+                log_error_stderr("__module_loader_taskmanager_load: weekday is required for weekly type\n");
                 return 0;
             }
             const char* weekday_str = json_string(token_weekday);
@@ -2798,31 +2789,31 @@ static int __module_loader_taskmanager_load(appconfig_t* config, taskmanager_t* 
             else if (strcmp(weekday_str, "friday") == 0)     weekday = FRIDAY;
             else if (strcmp(weekday_str, "saturday") == 0)   weekday = SATURDAY;
             else {
-                __module_loader_config_error("__module_loader_taskmanager_load: invalid weekday '%s'\n", weekday_str);
+                log_error_stderr("__module_loader_taskmanager_load: invalid weekday '%s'\n", weekday_str);
                 return 0;
             }
 
             const json_token_t* token_hour = json_object_get(token_task, "hour");
             if (token_hour == NULL || !json_is_number(token_hour)) {
-                __module_loader_config_error("__module_loader_taskmanager_load: hour is required for weekly type\n");
+                log_error_stderr("__module_loader_taskmanager_load: hour is required for weekly type\n");
                 return 0;
             }
             int ok = 0;
             int hour = json_int(token_hour, &ok);
             if (!ok || hour < 0 || hour > 23) {
-                __module_loader_config_error("__module_loader_taskmanager_load: hour must be 0-23\n");
+                log_error_stderr("__module_loader_taskmanager_load: hour must be 0-23\n");
                 return 0;
             }
 
             const json_token_t* token_minute = json_object_get(token_task, "minute");
             if (token_minute == NULL || !json_is_number(token_minute)) {
-                __module_loader_config_error("__module_loader_taskmanager_load: minute is required for weekly type\n");
+                log_error_stderr("__module_loader_taskmanager_load: minute is required for weekly type\n");
                 return 0;
             }
             ok = 0;
             int minute = json_int(token_minute, &ok);
             if (!ok || minute < 0 || minute > 59) {
-                __module_loader_config_error("__module_loader_taskmanager_load: minute must be 0-59\n");
+                log_error_stderr("__module_loader_taskmanager_load: minute must be 0-59\n");
                 return 0;
             }
 
@@ -2836,37 +2827,37 @@ static int __module_loader_taskmanager_load(appconfig_t* config, taskmanager_t* 
         else if (strcmp(type, "monthly") == 0) {
             const json_token_t* token_day = json_object_get(token_task, "day");
             if (token_day == NULL || !json_is_number(token_day)) {
-                __module_loader_config_error("__module_loader_taskmanager_load: day is required for monthly type\n");
+                log_error_stderr("__module_loader_taskmanager_load: day is required for monthly type\n");
                 return 0;
             }
             int ok = 0;
             int day = json_int(token_day, &ok);
             if (!ok || day < 1 || day > 31) {
-                __module_loader_config_error("__module_loader_taskmanager_load: day must be 1-31\n");
+                log_error_stderr("__module_loader_taskmanager_load: day must be 1-31\n");
                 return 0;
             }
 
             const json_token_t* token_hour = json_object_get(token_task, "hour");
             if (token_hour == NULL || !json_is_number(token_hour)) {
-                __module_loader_config_error("__module_loader_taskmanager_load: hour is required for monthly type\n");
+                log_error_stderr("__module_loader_taskmanager_load: hour is required for monthly type\n");
                 return 0;
             }
             ok = 0;
             int hour = json_int(token_hour, &ok);
             if (!ok || hour < 0 || hour > 23) {
-                __module_loader_config_error("__module_loader_taskmanager_load: hour must be 0-23\n");
+                log_error_stderr("__module_loader_taskmanager_load: hour must be 0-23\n");
                 return 0;
             }
 
             const json_token_t* token_minute = json_object_get(token_task, "minute");
             if (token_minute == NULL || !json_is_number(token_minute)) {
-                __module_loader_config_error("__module_loader_taskmanager_load: minute is required for monthly type\n");
+                log_error_stderr("__module_loader_taskmanager_load: minute is required for monthly type\n");
                 return 0;
             }
             ok = 0;
             int minute = json_int(token_minute, &ok);
             if (!ok || minute < 0 || minute > 59) {
-                __module_loader_config_error("__module_loader_taskmanager_load: minute must be 0-59\n");
+                log_error_stderr("__module_loader_taskmanager_load: minute must be 0-59\n");
                 return 0;
             }
 
@@ -2878,7 +2869,7 @@ static int __module_loader_taskmanager_load(appconfig_t* config, taskmanager_t* 
             log_info("taskmanager: loaded scheduled task '%s' (monthly: day %d at %02d:%02d)\n", name, day, hour, minute);
         }
         else {
-            __module_loader_config_error("__module_loader_taskmanager_load: unknown task type '%s'\n", type);
+            log_error_stderr("__module_loader_taskmanager_load: unknown task type '%s'\n", type);
             return 0;
         }
     }

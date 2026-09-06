@@ -15,7 +15,7 @@
 #include "model.h"
 #include "database.h"
 #include "moduleloader.h"
-#include "middleware_registry.h"
+#include "appmodule.h"
 #ifdef MySQL_FOUND
     #include "mysql.h"
 #endif
@@ -444,12 +444,16 @@ int main(int argc, char* argv[]) {
 
     appconfig_set(config.appconfig);
 
-    if (!middlewares_init()) {
-        printf("Error: failed to initialize middlewares\n");
-        goto failed;
-    }
     if (!module_loader_load_json_config(config.appconfig->path, &document)) {
         printf("Error: can't load config %s\n", config.appconfig->path);
+        goto failed;
+    }
+
+    /* module_loader_config_load below parses `servers`, whose routes reference
+     * middlewares by name -- so the application modules have to register them
+     * first, exactly as in module_loader_init(). */
+    if (!app_modules_load(json_root(document))) {
+        printf("Error: failed to load application modules\n");
         goto failed;
     }
     if (!module_loader_config_load(config.appconfig, document)) {

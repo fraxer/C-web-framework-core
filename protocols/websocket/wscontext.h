@@ -13,4 +13,10 @@ typedef struct wsctx {
 void wsctx_init(wsctx_t* ctx, void* request, void* response);
 void wsctx_clear(wsctx_t* ctx);
 
+/** Attach an application-owned payload. See httpctx_set_user_data(). */
+void wsctx_set_user_data(wsctx_t* ctx, void* user_data);
+
+/** Register the destructor wsctx_clear() calls. See httpctx_set_user_data_free(). */
+int wsctx_set_user_data_free(void (*fn)(void*));
+
 #endif

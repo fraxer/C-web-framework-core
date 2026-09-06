@@ -3,6 +3,11 @@
 #include "middleware_registry.h"
 #include "log.h"
 
+/* log_error_stderr, not log_error: a rejected registration makes app_init() fail,
+ * which refuses the whole start-up or reload -- exactly the case where losing the
+ * message leaves a failure with no explanation. On a first start the logger is
+ * not even configured yet (misc/log.h). */
+
 /* ============= STATIC REGISTRY DATA ============= */
 static middleware_registry_entry_t __middleware_list[MIDDLEWARE_REGISTRY_MAX];
 static int __middleware_count = 0;
@@ -11,30 +16,30 @@ static int __middleware_count = 0;
 
 int middleware_registry_register(const char* name, middleware_fn_p handler) {
     if (name == NULL || handler == NULL) {
-        log_error("middleware_registry_register: name and handler cannot be NULL\n");
+        log_error_stderr("middleware_registry_register: name and handler cannot be NULL\n");
         return 0;
     }
 
     const size_t name_length = strlen(name);
     if (name_length == 0) {
-        log_error("middleware_registry_register: name cannot be empty\n");
+        log_error_stderr("middleware_registry_register: name cannot be empty\n");
         return 0;
     }
     if (name_length >= MIDDLEWARE_NAME_MAX) {
-        log_error("middleware_registry_register: name is too long (max %d chars)\n", MIDDLEWARE_NAME_MAX - 1);
+        log_error_stderr("middleware_registry_register: name is too long (max %d chars)\n", MIDDLEWARE_NAME_MAX - 1);
         return 0;
     }
 
     /* Check for overflow */
     if (__middleware_count >= MIDDLEWARE_REGISTRY_MAX) {
-        log_error("middleware_registry_register: registry is full (max %d middlewares)\n", MIDDLEWARE_REGISTRY_MAX);
+        log_error_stderr("middleware_registry_register: registry is full (max %d middlewares)\n", MIDDLEWARE_REGISTRY_MAX);
         return 0;
     }
 
     /* Check for duplicates */
     for (int i = 0; i < __middleware_count; i++) {
         if (strcmp(__middleware_list[i].name, name) == 0) {
-            log_error("middleware_registry_register: middleware '%s' already registered\n", name);
+            log_error_stderr("middleware_registry_register: middleware '%s' already registered\n", name);
             return 0;
         }
     }

@@ -48,10 +48,31 @@ target_link_libraries(cwfr_framework PRIVATE
 # libs) via the interface -- WITHOUT making the static archives a link
 # requirement (the code already lives in this .so). This is what decouples
 # include propagation from link propagation.
+#
+# BUILD_INTERFACE only: these are source-tree paths that mean nothing to an
+# installed package. The installed tree gets every one of these headers flattened
+# into a single <prefix>/include/cwfr, added below -- which is why the flat
+# directory has to stay collision-free (cmake/install.cmake enforces that).
 foreach(_l ${FW_LIBS})
 	target_include_directories(cwfr_framework INTERFACE
-		$<TARGET_PROPERTY:${_l},INTERFACE_INCLUDE_DIRECTORIES>)
+		$<BUILD_INTERFACE:$<TARGET_PROPERTY:${_l},INTERFACE_INCLUDE_DIRECTORIES>>)
 endforeach()
+
+target_include_directories(cwfr_framework INTERFACE
+	$<INSTALL_INTERFACE:include/cwfr>)
+
+# Consumers spell it cwfr::framework whether they came through add_subdirectory()
+# or find_package(cwfr) -- the alias is what makes one cwfr_add_handlers() call
+# work in this repository and in a standalone application project alike.
+set_target_properties(cwfr_framework PROPERTIES EXPORT_NAME framework)
+add_library(cwfr::framework ALIAS cwfr_framework)
+
+# An application built against one framework release must not silently load the
+# next one: handler .so files record the SONAME, so bumping it is what turns an
+# incompatible framework into a load-time error instead of a crash.
+set_target_properties(cwfr_framework PROPERTIES
+	VERSION ${CWFR_VERSION}
+	SOVERSION ${CWFR_VERSION_MAJOR})
 
 # cwfr/migrate carry the INSTALL_RPATH that locates this .so; the framework .so
 # itself needs no RPATH.

@@ -28,6 +28,18 @@ static void log_message(int priority, const char* format, va_list args) {
     vsyslog(priority, format, args);
 }
 
+void log_error_stderr(const char* format, ...) {
+    va_list args;
+
+    va_start(args, format);
+    vfprintf(stderr, format, args);
+    va_end(args);
+
+    va_start(args, format);
+    log_message(LOG_ERR, format, args);
+    va_end(args);
+}
+
 void log_emerg(const char* format, ...) {
     va_list args;
 

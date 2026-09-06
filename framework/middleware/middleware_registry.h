@@ -3,14 +3,6 @@
 
 #include "middleware.h"
 
-/**
- * Initialize and register all application middlewares
- * Called from moduleloader during initialization
- *
- * @return 1 on success, 0 on error
- */
-int middlewares_init(void);
-
 /* ============= REGISTRY ENTRY STRUCTURE ============= */
 
 #define MIDDLEWARE_REGISTRY_MAX 256   /* Registry capacity */

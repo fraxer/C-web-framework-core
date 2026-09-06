@@ -16,6 +16,7 @@
 
 #include "appconfig.h"
 #include "moduleloader.h"
+#include "appmodule.h"
 #include "log.h"
 #include "signal/signal.h"
 
@@ -226,6 +227,12 @@ int main(int argc, char* argv[]) {
          * touched at all. The cost is the final log line, which env() now
          * refuses to emit; everything worth saying was said above. */
         appconfig_set(NULL);
+
+        /* The application modules themselves stay mapped -- nothing may still be
+         * holding a middleware pointer at this point, but dlclose() on the way
+         * out buys nothing and can only run atexit handlers that no longer have
+         * a config to log through. This just releases the list. */
+        app_modules_free();
     }
 
     failed:

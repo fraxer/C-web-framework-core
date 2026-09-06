@@ -1,6 +1,15 @@
 cmake_minimum_required(VERSION 3.12.4)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/cwfr.cmake)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/app.cmake)
+
+# Framework version. It is the SONAME of libcwfr_framework.so and the version a
+# standalone application checks with find_package(cwfr 1.0 REQUIRED), so bump the
+# major whenever a handler built against the previous release would break.
+set(CWFR_VERSION_MAJOR 1)
+set(CWFR_VERSION_MINOR 0)
+set(CWFR_VERSION_PATCH 0)
+set(CWFR_VERSION ${CWFR_VERSION_MAJOR}.${CWFR_VERSION_MINOR}.${CWFR_VERSION_PATCH})
 
 # QUIC / HTTP/3 is opt-in.
 #
@@ -80,6 +89,12 @@ if(INCLUDE_HQ_INTEROP STREQUAL yes)
 	message(STATUS "HTTP/0.9 interop shim enabled -- NOT for production builds")
 endif()
 
+# apps/server/main.c decides whether to daemonise from the build type, so the
+# definition belongs here, next to the code that reads it. It used to be left to
+# the host project, which meant a host that did not happen to set it -- the
+# minimal one in INSTALL.md included -- failed to compile the core.
+add_compile_definitions(CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}")
+
 add_subdirectory(framework)
 add_subdirectory(misc)
 add_subdirectory(protocols)
@@ -95,3 +110,7 @@ if(BUILD_TESTS STREQUAL yes)
 endif()
 
 add_subdirectory(apps)
+
+# Headers, the exported CMake package and the install() rules for cwfr, migrate
+# and libcwfr_framework.so. Last, so every target it names already exists.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/install.cmake)

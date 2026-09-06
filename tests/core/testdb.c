@@ -12,7 +12,6 @@
 #include "dbresult.h"
 #include "database.h"
 #include "moduleloader.h"
-#include "middleware_registry.h"
 
 #ifdef PostgreSQL_FOUND
     #include "postgresql.h"
@@ -162,10 +161,6 @@ int testdb_setup(const char* dbid, const char* config_path, const char* migratio
     }
     appconfig_set(__appconfig);
 
-    if (!middlewares_init()) {
-        fprintf(stderr, "testdb: failed to initialize middlewares\n");
-        return 0;
-    }
     if (!module_loader_load_json_config(config_path, &__document)) {
         fprintf(stderr, "testdb: cannot load json from %s\n", config_path);
         return 0;

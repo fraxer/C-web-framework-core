@@ -42,7 +42,6 @@ add_executable(
     unit/runner.c
     ${UNIT_TEST_FILES}
     ${QUIC_CLIENT_SOURCES}
-    unit/httpclient_stubs.c
     unit/mail_stubs.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../framework/taskmanager/taskmanager_calc.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../framework/session/session.c
@@ -93,7 +92,7 @@ set(H2_UNIT_TEST_FILES ${UNIT_TEST_FILES})
 list(FILTER H2_UNIT_TEST_FILES INCLUDE REGEX "/test_(h2|hpack|httpfields)")
 add_executable(h2_runner
     unit/runner.c ${H2_UNIT_TEST_FILES}
-    unit/h3_config_stubs.c unit/httpclient_stubs.c unit/mail_stubs.c)
+    unit/h3_config_stubs.c unit/mail_stubs.c)
 target_link_libraries(h2_runner PRIVATE cwfr_framework
     ${OPENSSL_LIBRARIES} Threads::Threads ${CMAKE_DL_LIBS})
 add_test(NAME h2_unit_tests COMMAND h2_runner)
@@ -109,8 +108,7 @@ if(INCLUDE_HTTP3 STREQUAL yes)
         ${H3_UNIT_TEST_FILES}
         ${QUIC_CLIENT_SOURCES}
         unit/h3_config_stubs.c
-        unit/httpclient_stubs.c
-        unit/mail_stubs.c
+            unit/mail_stubs.c
     )
     target_include_directories(h3_runner PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/quicclient

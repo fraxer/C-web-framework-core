@@ -1,0 +1,83 @@
+@PACKAGE_INIT@
+
+# cwfr -- the C web framework.
+#
+#   find_package(cwfr 1.0 REQUIRED)
+#   cwfr_add_handlers(LINK_LIBS cwfr::framework app)
+#
+# Provides:
+#   cwfr::framework       the shared framework library (headers, defines, deps)
+#   cwfr_add_lib()        an application static archive
+#   cwfr_add_handlers()   one handler .so per .c file under the current directory
+#   cwfr_add_migrations() one migration .so per .c file per <server> subdirectory
+#   cwfr_add_subdirs()    recurse into every subdirectory holding a CMakeLists.txt
+#   cwfr_install_handlers() / cwfr_install_migrations()
+#
+# The framework was built with a fixed set of database drivers. Those choices are
+# baked in below, because the public headers change shape with them -- an
+# application does not get to pick a different set.
+
+include(CMakeFindDependencyMacro)
+
+# The bundled Find modules (FindPCRE2, FindMySQL, ...) sit next to this file.
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}")
+
+set(CWFR_WITH_MYSQL      @CWFR_WITH_MYSQL@)
+set(CWFR_WITH_POSTGRESQL @CWFR_WITH_POSTGRESQL@)
+set(CWFR_WITH_REDIS      @CWFR_WITH_REDIS@)
+set(CWFR_WITH_SQLITE     @CWFR_WITH_SQLITE@)
+set(CWFR_WITH_HTTP3      @CWFR_WITH_HTTP3@)
+
+include("${CMAKE_CURRENT_LIST_DIR}/cwfrTargets.cmake")
+
+# The framework's libraries are PRIVATE to libcwfr_framework.so and reach it
+# through DT_NEEDED -- an application links none of them. What it does need is
+# the *headers* they contribute to the public API, and the feature macros that
+# decide which of them appear at all.
+find_dependency(Threads)
+find_dependency(PCRE2)
+find_dependency(OpenSSL)
+find_dependency(ZLIB)
+
+set(_cwfr_includes ${PCRE2_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR} ${ZLIB_INCLUDE_DIRS})
+
+# PCRE2_CODE_UNIT_WIDTH must be set before <pcre2.h> is reached, and route.h
+# reaches it from any handler that includes http.h.
+set(_cwfr_defines PCRE2_CODE_UNIT_WIDTH=8)
+
+if(CWFR_WITH_MYSQL)
+	find_dependency(MySQL)
+	list(APPEND _cwfr_includes ${MySQL_INCLUDE_DIRS})
+	list(APPEND _cwfr_defines MySQL_FOUND)
+endif()
+if(CWFR_WITH_POSTGRESQL)
+	find_dependency(PostgreSQL)
+	list(APPEND _cwfr_includes ${PostgreSQL_INCLUDE_DIRS})
+	list(APPEND _cwfr_defines PostgreSQL_FOUND)
+endif()
+if(CWFR_WITH_REDIS)
+	find_dependency(Redis)
+	list(APPEND _cwfr_includes ${Redis_INCLUDE_DIRS})
+	list(APPEND _cwfr_defines Redis_FOUND)
+endif()
+if(CWFR_WITH_SQLITE)
+	find_dependency(SQLite)
+	list(APPEND _cwfr_includes ${SQLite_INCLUDE_DIRS})
+	list(APPEND _cwfr_defines SQLite_FOUND)
+endif()
+if(CWFR_WITH_HTTP3 STREQUAL yes)
+	list(APPEND _cwfr_defines CWFR_HTTP3)
+endif()
+
+list(REMOVE_DUPLICATES _cwfr_includes)
+
+target_include_directories(cwfr::framework INTERFACE ${_cwfr_includes})
+target_compile_definitions(cwfr::framework INTERFACE ${_cwfr_defines})
+
+unset(_cwfr_includes)
+unset(_cwfr_defines)
+
+include("${CMAKE_CURRENT_LIST_DIR}/cwfr.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/app.cmake")
+
+check_required_components(cwfr)
