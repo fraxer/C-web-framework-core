@@ -7,6 +7,7 @@
 #include "route.h"
 #include "websocketsparser.h"
 #include "websocketsserverhandlers.h"
+#include "appconfig.h"
 #include "wscontext.h"
 #include "middleware.h"
 #include "connection_s.h"
@@ -586,7 +587,8 @@ void websockets_queue_request_handler(void* arg) {
 
     /* --- user code: middlewares and the route handler, no lock held --- */
     wsctx_t ctx;
-    wsctx_init(&ctx, data->request, response);
+    wsctx_init(&ctx, data->request, response,
+               data->server->config != NULL ? data->server->config->wsctx_user_data_free : NULL);
 
     /* handle is NULL-checked rather than trusted: every producer is supposed to
      * refuse the dispatch instead of queueing a message with no handler, and

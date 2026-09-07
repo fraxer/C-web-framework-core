@@ -452,7 +452,7 @@ int main(int argc, char* argv[]) {
     /* module_loader_config_load below parses `servers`, whose routes reference
      * middlewares by name -- so the application modules have to register them
      * first, exactly as in module_loader_init(). */
-    if (!app_modules_load(json_root(document))) {
+    if (!app_modules_load(config.appconfig, json_root(document))) {
         printf("Error: failed to load application modules\n");
         goto failed;
     }

@@ -420,14 +420,32 @@ process that was killed are swept by the next start. A copy deliberately outlive
 the library's unload, so a core dump has to be investigated *before* the server is
 restarted.
 
-The application module from `main.modules` is not covered by any of this and still
-needs a restart, for the reason in `docs/hotreload/00-shadow-copy.md`: handlers
-reach it by SONAME, and the loader would answer with the first copy loaded.
+The application module from `main.modules` is picked up the same way, with one
+extra step: handlers reach it by SONAME rather than by path, so its copy is given
+a SONAME of its own for each generation and the copies of the handlers that need
+it are pointed at that name (`docs/hotreload/01-soname-per-generation.md`). Two
+consequences for an application:
 
-**API change**: `routeloader_load_lib()` takes a second argument, the fallback
-directory for the copy. It is called only by the core -- an application has never
-had a reason to -- but it is a public header, so a consumer that did call it needs
-the extra argument.
+* a module built **without a SONAME** (`NO_SONAME` in CMake, no `-Wl,-soname`)
+  cannot be renamed, so it is not swapped -- the running one is kept, the reason
+  is logged, and the rest of the reload happens as usual. `cwfr_add_lib()` and a
+  plain `add_library(app SHARED ...)` both give one, so this is only reachable on
+  purpose;
+* **static state inside the module does not survive a reload.** Each generation
+  runs the `app_init()` of its own instance. Anything that must outlive a reload
+  belongs in the database, a cache or a session.
+
+**API changes** in the public headers. All three are called by the core only, but
+a consumer that did call them needs updating:
+
+* `routeloader_load_lib()` takes the fallback directory for the copy and the
+  generation's SONAME map;
+* `httpctx_init()` / `wsctx_init()` take the destructor for `ctx->user_data`,
+  which now belongs to the configuration generation rather than to the process;
+  `httpctx_t` and `wsctx_t` carry a field for it. `httpctx_set_user_data_free()`
+  and `wsctx_set_user_data_free()` keep their signatures and are still what an
+  `app_init()` calls -- they now record into the configuration being built, so
+  calling them from anywhere else fails and says so.
 
 Applying database migrations:
 

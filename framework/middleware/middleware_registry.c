@@ -74,3 +74,32 @@ void middleware_registry_clear(void) {
     __middleware_count = 0;
     memset(__middleware_list, 0, sizeof(__middleware_list));
 }
+
+struct middleware_registry_snapshot {
+    middleware_registry_entry_t list[MIDDLEWARE_REGISTRY_MAX];
+    int count;
+};
+
+middleware_registry_snapshot_t* middleware_registry_save(void) {
+    middleware_registry_snapshot_t* snapshot = malloc(sizeof * snapshot);
+    if (snapshot == NULL) {
+        log_error_stderr("middleware_registry_save: memory alloc error\n");
+        return NULL;
+    }
+
+    memcpy(snapshot->list, __middleware_list, sizeof __middleware_list);
+    snapshot->count = __middleware_count;
+
+    middleware_registry_clear();
+
+    return snapshot;
+}
+
+void middleware_registry_restore(middleware_registry_snapshot_t* snapshot) {
+    if (snapshot == NULL) return;
+
+    memcpy(__middleware_list, snapshot->list, sizeof __middleware_list);
+    __middleware_count = snapshot->count;
+
+    free(snapshot);
+}

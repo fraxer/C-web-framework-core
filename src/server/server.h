@@ -76,6 +76,7 @@ typedef struct server_http3 {
 } server_http3_t;
 
 struct broadcast;
+struct appconfig;
 
 typedef struct server {
     unsigned short int port;
@@ -96,6 +97,17 @@ typedef struct server {
     openssl_t* openssl;
     map_t* ratelimits_config; // ratelimiter_config_t
     struct broadcast* broadcast;
+
+    /* The configuration generation this vhost belongs to.
+     *
+     * Set while `servers` is parsed, and read where a request context is built:
+     * the destructor for the application's ctx->user_data lives in the
+     * configuration now, and `server` is the only thing all three of those places
+     * have in common (docs/hotreload/01-soname-per-generation.md §3.5). A back
+     * pointer and not a copy of the function, so a vhost never has to be kept in
+     * step with the configuration that owns it. */
+    struct appconfig* config;
+
     struct server* next;
 } server_t;
 

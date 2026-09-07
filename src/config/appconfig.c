@@ -9,8 +9,17 @@
 
 void taskmanager_free(taskmanager_t* manager);
 
+/* Declared rather than included, the same way taskmanager_free above is:
+ * moduleloader already links config, so reaching back for its headers would
+ * close the cycle. Both symbols resolve inside libcwfr_framework.so, which
+ * whole-archives every one of these. */
+void app_modules_free(app_module_t* modules);
+void shadow_sonames_free(shadow_sonames_t* map);
+
 static char* __appconfig_path = NULL;
 static _Atomic(appconfig_t*) __appconfig = NULL;
+/* See appconfig_loading() in the header for why this needs no synchronisation. */
+static appconfig_t* __appconfig_loading = NULL;
 
 /* Mirror of config->threads_count with process lifetime. The counter inside the
  * config cannot be polled by an observer: the thread that drops it to zero frees
@@ -77,6 +86,10 @@ appconfig_t* appconfig_create(const char* path) {
     config->taskmanager = NULL;
     config->translations = NULL;
     config->sessionconfigs = NULL;
+    config->modules = NULL;
+    config->sonames = NULL;
+    config->httpctx_user_data_free = NULL;
+    config->wsctx_user_data_free = NULL;
     config->path = strdup(path);
     if (config->path == NULL) {
         printf("Error: Memory allocation failed for config path\n");
@@ -89,6 +102,14 @@ appconfig_t* appconfig_create(const char* path) {
 
 appconfig_t* appconfig(void) {
     return atomic_load_explicit(&__appconfig, memory_order_acquire);
+}
+
+void appconfig_set_loading(appconfig_t* config) {
+    __appconfig_loading = config;
+}
+
+appconfig_t* appconfig_loading(void) {
+    return __appconfig_loading;
 }
 
 env_t* env(void) {
@@ -138,6 +159,20 @@ void appconfig_clear(appconfig_t* config) {
         map_free(config->translations);
         config->translations = NULL;
     }
+
+    /* Last, and after the route loaders above: a handler .so records the module
+     * in DT_NEEDED, so the module stays mapped until the handlers that need it
+     * are gone. Closing it here rather than never is what makes a rebuilt module
+     * a per-generation library instead of a permanent one
+     * (docs/hotreload/01-soname-per-generation.md). */
+    app_modules_free(config->modules);
+    config->modules = NULL;
+
+    shadow_sonames_free(config->sonames);
+    config->sonames = NULL;
+
+    config->httpctx_user_data_free = NULL;
+    config->wsctx_user_data_free = NULL;
 }
 
 void appconfig_free(appconfig_t* config) {

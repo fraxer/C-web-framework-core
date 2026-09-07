@@ -1,30 +1,36 @@
 #include <stddef.h>
 
 #include "log.h"
+#include "appconfig.h"
 
 #include "httpcontext.h"
 
-/* Set once at startup (app_init), read by every worker afterwards -- so it needs
- * no synchronisation, the same contract as the h2/h3 policy globals. */
-static void (*__user_data_free)(void*) = NULL;
-
 int httpctx_set_user_data_free(void (*fn)(void*)) {
-    if (__user_data_free != NULL && __user_data_free != fn) {
+    appconfig_t* config = appconfig_loading();
+    if (config == NULL) {
+        log_error_stderr("httpctx_set_user_data_free: called outside app_init() -- there is "
+                          "no configuration being built to register the destructor with\n");
+        return 0;
+    }
+
+    if (config->httpctx_user_data_free != NULL && config->httpctx_user_data_free != fn) {
         log_error_stderr("httpctx_set_user_data_free: a different destructor is already "
                           "registered -- ctx->user_data has one owner, so only one "
                           "application module may claim it\n");
         return 0;
     }
 
-    __user_data_free = fn;
+    config->httpctx_user_data_free = fn;
 
     return 1;
 }
 
-void httpctx_init(httpctx_t* ctx, void* request, void* response) {
+void httpctx_init(httpctx_t* ctx, void* request, void* response,
+                  void (*user_data_free)(void*)) {
     ctx->request = request;
     ctx->response = response;
     ctx->user_data = NULL;
+    ctx->user_data_free = user_data_free;
 }
 
 void httpctx_set_user_data(httpctx_t* ctx, void* user_data) {
@@ -32,8 +38,8 @@ void httpctx_set_user_data(httpctx_t* ctx, void* user_data) {
 }
 
 void httpctx_clear(httpctx_t* ctx) {
-    if (__user_data_free != NULL)
-        __user_data_free(ctx->user_data);
+    if (ctx->user_data_free != NULL)
+        ctx->user_data_free(ctx->user_data);
 
     ctx->user_data = NULL;
 }

@@ -34,7 +34,9 @@
 #   hotreload a handler rebuilt in place is picked up by SIGUSR1, its
 #            $ORIGIN dependency still resolves, the copies are cleaned up,
 #            and a broken main.modules path is refused instead of killing
-#            the server (docs/hotreload/00-shadow-copy.md §6)
+#            the server (docs/hotreload/00-shadow-copy.md §6); and the same
+#            for the application module, whose generations are told apart by
+#            SONAME (docs/hotreload/01-soname-per-generation.md §5)
 #   qlog     traces written, bounded, off by default       (diagnostics)
 #   h3spec   run a server, run h3spec against it           (RFC conformance)
 #   h2ws     RFC 8441 tunnels driven by python-h2, a client that enforces
@@ -495,7 +497,7 @@ stage_softreload() {
 }
 
 stage_hotreload() {
-    say "hotreload: a rebuilt handler is picked up, and a bad module is refused"
+    say "hotreload: rebuilt handlers and a rebuilt module are picked up in place"
 
     if build "$CI_BUILD_DIR/rel" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes &&
        "$CORE_DIR/tests/hot_reload_shadow.sh" "$CI_BUILD_DIR/rel" \

@@ -55,4 +55,23 @@ middleware_registry_entry_t* middleware_registry_get_all(int* out_count);
  */
 void middleware_registry_clear(void);
 
+/**
+ * Set the current registrations aside, leaving the registry empty.
+ *
+ * For the reload's validation pass: it runs the *new* modules' app_init() so
+ * that a route naming a middleware the new build introduces can be resolved --
+ * and the running configuration's registrations must not be disturbed while it
+ * does. The validation generation is thrown away afterwards, pointers and all,
+ * so what it registered has to go with it.
+ *
+ * @return the snapshot to hand back to middleware_registry_restore(), or NULL
+ *         on allocation failure -- in which case the registry is left untouched.
+ */
+typedef struct middleware_registry_snapshot middleware_registry_snapshot_t;
+
+middleware_registry_snapshot_t* middleware_registry_save(void);
+
+/** Put a saved registry back and release the snapshot. NULL is a no-op. */
+void middleware_registry_restore(middleware_registry_snapshot_t* snapshot);
+
 #endif /* MIDDLEWARE_REGISTRY_H */

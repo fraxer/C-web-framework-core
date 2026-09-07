@@ -97,10 +97,30 @@ set_target_properties(shadow_test_v2 PROPERTIES
     OUTPUT_NAME shadow_test_v1
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/shadow_v2)
 
+# A pair of SONAMEs where one is the tail of the other, and a library that needs
+# both: GNU ld then stores one string and points the second DT_NEEDED two bytes
+# into it, which is the case elfsoname.c must refuse instead of overwriting.
+add_library(shadow_dep_long SHARED ${CMAKE_CURRENT_SOURCE_DIR}/data/shadow_dep.c)
+set_target_properties(shadow_dep_long PROPERTIES
+    OUTPUT_NAME xxlibshadowdep
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/shadow_dep)
+target_compile_definitions(shadow_dep_long PRIVATE SHADOW_DEP_NAME="long")
+
+add_library(shadow_dep_short SHARED ${CMAKE_CURRENT_SOURCE_DIR}/data/shadow_dep_other.c)
+set_target_properties(shadow_dep_short PROPERTIES
+    OUTPUT_NAME shadowdep
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/shadow_dep)
+
+add_library(shadow_merged SHARED ${CMAKE_CURRENT_SOURCE_DIR}/data/shadow_merged.c)
+set_target_properties(shadow_merged PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/shadow_dep)
+target_link_libraries(shadow_merged PRIVATE shadow_dep_long shadow_dep_short)
+
 target_compile_definitions(runner PRIVATE
     TEST_SHADOW_V1="$<TARGET_FILE:shadow_test_v1>"
-    TEST_SHADOW_V2="$<TARGET_FILE:shadow_test_v2>")
-add_dependencies(runner shadow_test_v1 shadow_test_v2)
+    TEST_SHADOW_V2="$<TARGET_FILE:shadow_test_v2>"
+    TEST_SHADOW_MERGED="$<TARGET_FILE:shadow_merged>")
+add_dependencies(runner shadow_test_v1 shadow_test_v2 shadow_merged)
 
 add_test(NAME core_tests COMMAND runner)
 

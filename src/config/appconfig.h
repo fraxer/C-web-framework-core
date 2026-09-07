@@ -15,6 +15,10 @@
 #include "routeloader.h"
 
 typedef struct taskmanager taskmanager_t;
+/* Opaque on purpose: appconfig.h is installed and included by application
+ * handlers, and the module list is not theirs to look inside. shadow_sonames_t
+ * arrives through routeloader.h above. */
+typedef struct app_module app_module_t;
 
 typedef struct env_gzip_str {
     char* mimetype;
@@ -69,6 +73,23 @@ typedef struct appconfig {
     routeloader_lib_t* taskmanager_loader;
     taskmanager_t* taskmanager;
     map_t* translations;  // map: domain -> i18n_t*
+
+    /* The application modules of this generation, and the SONAME each of them
+     * was loaded under (shadowload.h). They belong to the configuration rather
+     * than to the process because a rebuilt module is a *different* library:
+     * appconfig_clear() dlcloses them once the last thread of the generation is
+     * gone, which is the first moment nobody can be executing a middleware from
+     * them. */
+    app_module_t* modules;
+    shadow_sonames_t* sonames;
+
+    /* Destructors for whatever the application hangs on httpctx_t/wsctx_t, as
+     * registered by this generation's app_init(). Per generation and not global:
+     * a rebuilt module's destructor is at a different address, and a request
+     * still running under the old configuration has to be freed by the old one
+     * (docs/hotreload/01-soname-per-generation.md §3.5). */
+    void (*httpctx_user_data_free)(void*);
+    void (*wsctx_user_data_free)(void*);
 } appconfig_t;
 
 int appconfig_init(int argc, char* argv[]);
@@ -79,6 +100,20 @@ int appconfig_init(int argc, char* argv[]);
 int appconfig_foreground(void);
 appconfig_t* appconfig_create(const char* path);
 appconfig_t* appconfig(void);
+
+/* The configuration currently being built, for the window in which it is not yet
+ * published through appconfig_set().
+ *
+ * It exists for one caller: app_init(), which runs while the modules are being
+ * loaded and registers the context destructors above. Those belong to the
+ * generation, so the registration has to reach it, and at that point env() and
+ * appconfig() still hand out the *previous* one.
+ *
+ * A plain pointer with no synchronisation, deliberately. Module loading is
+ * single-threaded at startup and holds module_loader_signal_lock() on a reload,
+ * so there is never a second writer -- and nothing outside that window reads it. */
+void appconfig_set_loading(appconfig_t* config);
+appconfig_t* appconfig_loading(void);
 env_t* env(void);
 void appconfig_set(appconfig_t* config);
 void appconfig_clear(appconfig_t* config);

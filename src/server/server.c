@@ -16,6 +16,7 @@ server_t* server_create() {
     server->port = 0;
     server->root_length = 0;
     server->domain = NULL;
+    server->config = NULL;
 
     memset(&server->ip, 0, sizeof server->ip);
     server->root = NULL;

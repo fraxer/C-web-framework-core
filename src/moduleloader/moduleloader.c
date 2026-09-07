@@ -32,6 +32,7 @@
 #include "connection_queue.h"
 #include "middleware_registry.h"
 #include "appmodule.h"
+#include "shadowload.h"
 #include "httpserverhandlers.h"
 #include "httpresponse.h"
 #include "h2session.h"
@@ -81,13 +82,13 @@ static int __module_loader_sessionconfig_load(appconfig_t* config, const json_to
 static int __module_loader_taskmanager_init(appconfig_t* config, json_token_t* task_manager);
 static int __module_loader_translations_load(appconfig_t* config, json_token_t* translations);
 
-static int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config, const char* tmpdir);
-static int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config, const char* tmpdir);
+static int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config, const appconfig_t* appconfig);
+static int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config, const appconfig_t* appconfig);
 static int __module_loader_http_redirects_load(const json_token_t* token_object, redirect_t** redirect);
 static int __module_loader_middlewares_load(const json_token_t* token_object, middleware_item_t** middleware_item);
-static int __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t** first_lib, const json_token_t* token_object, map_t* ratelimiter_config, const char* tmpdir);
-static int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config, const char* tmpdir);
-static int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config, const char* tmpdir);
+static int __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t** first_lib, const json_token_t* token_object, map_t* ratelimiter_config, const appconfig_t* appconfig);
+static int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config, const appconfig_t* appconfig);
+static int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config, const appconfig_t* appconfig);
 static openssl_t* __module_loader_tls_load(const json_token_t* token_object);
 static int __module_loader_check_unique_domainport(server_t* first_server);
 static void* __module_loader_storage_fs_load(const json_token_t* token_object, const char* storage_name);
@@ -116,7 +117,7 @@ int module_loader_init(appconfig_t* config) {
      * middlewares, and the names exist only once the application modules have
      * registered them. On a reload this runs against the registry that
      * module_loader_create_config_and_init() has just cleared. */
-    if (!app_modules_load(json_root(document)))
+    if (!app_modules_load(config, json_root(document)))
         goto failed;
 
     if (!__module_loader_init_modules(config, document))
@@ -131,14 +132,27 @@ int module_loader_init(appconfig_t* config) {
     return result;
 }
 
-int module_loader_config_correct(const char* path) {
+static int __module_loader_config_attempt(const char* path, json_doc_t* document) {
     int result = 0;
-    appconfig_t* config = NULL;
-    json_doc_t* document = NULL;
-    if (!module_loader_load_json_config(path, &document))
-        goto failed;
 
-    config = appconfig_create(path);
+    /* A whole throwaway generation: the modules are opened and the handlers are
+     * loaded against them, exactly as the real pass will do it, and the lot is
+     * freed on the way out. Checking the modules here rather than where they are
+     * really loaded is the point -- app_modules_load() runs from
+     * module_loader_init(), long after signal_reload() has closed the listening
+     * sockets under `reload: hard` (docs/hotreload/00-shadow-copy.md §4). */
+    appconfig_t* config = appconfig_create(path);
+    if (config == NULL) return 0;
+
+    /* The validation generation runs its own app_init(), so it needs its own
+     * middleware registry: the running configuration's registrations are set
+     * aside for the duration and put back below. Without this a reload could
+     * never introduce a middleware together with the module that registers it --
+     * the names of a build that is not loaded yet are in no registry. */
+    middleware_registry_snapshot_t* registry = middleware_registry_save();
+
+    if (!app_modules_check(config, json_root(document)))
+        goto failed;
     if (!module_loader_config_load(config, document))
         goto failed;
 
@@ -149,19 +163,39 @@ int module_loader_config_correct(const char* path) {
         goto failed;
 #endif
 
-    /* Last, because it is the only check here that touches the filesystem and
-     * dlopen()s anything -- and here at all, rather than where the modules are
-     * actually loaded, because app_modules_load() runs from
-     * module_loader_init(), long after signal_reload() has closed the listening
-     * sockets under `reload: hard` (docs/hotreload/00-shadow-copy.md §4). */
-    if (!app_modules_check(json_root(document)))
-        goto failed;
-
     result = 1;
 
     failed:
 
+    /* Before the config is freed: freeing it unloads the modules whose functions
+     * the registry is currently pointing at. */
+    middleware_registry_restore(registry);
+
     appconfig_free(config);
+
+    return result;
+}
+
+int module_loader_config_correct(const char* path) {
+    json_doc_t* document = NULL;
+    if (!module_loader_load_json_config(path, &document))
+        return 0;
+
+    int result = __module_loader_config_attempt(path, document);
+
+    /* A configuration that failed only because a copy could not be given a
+     * SONAME of its own is not a broken configuration: this application simply
+     * cannot swap its module without a restart. Renaming is switched off for the
+     * process and the whole pass is repeated, so everything else in the reload
+     * still happens (docs/hotreload/01-soname-per-generation.md §3.3). */
+    if (!result && shadow_retag_refused()) {
+        log_error_stderr("module_loader_config_correct: the application module cannot be "
+                         "reloaded in place -- carrying on without that, and a restart is "
+                         "what picks a rebuilt module up\n");
+        shadow_retag_disable();
+
+        result = __module_loader_config_attempt(path, document);
+    }
 
     json_free(document);
 
@@ -790,6 +824,10 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             goto failed;
         }
 
+        /* Before anything on this vhost is parsed: a request context built for
+         * it reaches the application's ctx->user_data destructor through here. */
+        server->config = config;
+
         if (first_server == NULL)
             first_server = server;
 
@@ -938,7 +976,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
                 log_error("__module_loader_servers_load: can't load routes\n");
                 goto failed;
             }
-            if (!__module_loader_http_routes_load(&first_lib, json_object_get(token_http, "routes"), &server->http.route, server->ratelimits_config, config->env.main.tmp)) {
+            if (!__module_loader_http_routes_load(&first_lib, json_object_get(token_http, "routes"), &server->http.route, server->ratelimits_config, config)) {
                 log_error("__module_loader_servers_load: can't load routes\n");
                 goto failed;
             }
@@ -962,7 +1000,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
                 goto failed;
             }
 
-            if (!__module_loader_websockets_default_load(&server->websockets.default_handler, &first_lib, json_object_get(token_websockets, "default"), server->ratelimits_config, config->env.main.tmp)) {
+            if (!__module_loader_websockets_default_load(&server->websockets.default_handler, &first_lib, json_object_get(token_websockets, "default"), server->ratelimits_config, config)) {
                 log_error("__module_loader_servers_load: can't load default handler\n");
                 goto failed;
             }
@@ -970,7 +1008,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
                 log_error("__module_loader_servers_load: can't load routes\n");
                 goto failed;
             }
-            if (!__module_loader_websockets_routes_load(&first_lib, json_object_get(token_websockets, "routes"), &server->websockets.route, server->ratelimits_config, config->env.main.tmp)) {
+            if (!__module_loader_websockets_routes_load(&first_lib, json_object_get(token_websockets, "routes"), &server->websockets.route, server->ratelimits_config, config)) {
                 log_error("__module_loader_servers_load: can't load routes\n");
                 goto failed;
             }
@@ -1531,7 +1569,7 @@ int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* 
     return 0;
 }
 
-int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config, const char* tmpdir) {
+int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config, const appconfig_t* appconfig) {
     int result = 0;
     route_t* first_route = NULL;
     route_t* last_route = NULL;
@@ -1570,7 +1608,7 @@ int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_t
 
         last_route = rt;
 
-        if (!__module_loader_set_http_route(first_lib, &last_lib, rt, json_it_value(&it), ratelimiter_config, tmpdir)) {
+        if (!__module_loader_set_http_route(first_lib, &last_lib, rt, json_it_value(&it), ratelimiter_config, appconfig)) {
             log_error("__module_loader_http_routes_load: failed to set http route\n");
             goto failed;
         }
@@ -1588,7 +1626,7 @@ int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_t
     return result;
 }
 
-int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config, const char* tmpdir) {
+int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config, const appconfig_t* appconfig) {
     if (token_object == NULL) {
         log_error_stderr("__module_loader_set_http_route: http.route item is empty\n");
         return 0;
@@ -1708,7 +1746,7 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
         const char* lib_file = json_string(token_file);
         const char* lib_handler = json_string(token_function);
         if (!routeloader_has_lib(*first_lib, lib_file)) {
-            routeloader_lib_t* routeloader_lib = routeloader_load_lib(lib_file, tmpdir);
+            routeloader_lib_t* routeloader_lib = routeloader_load_lib(lib_file, appconfig->env.main.tmp, appconfig->sonames);
             if (routeloader_lib == NULL) {
                 log_error("__module_loader_set_http_route: failed to load lib %s\n", lib_file);
                 return 0;
@@ -1857,7 +1895,7 @@ int __module_loader_middlewares_load(const json_token_t* token_array, middleware
     return result;
 }
 
-int __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t** first_lib, const json_token_t* token_object, map_t* ratelimiter_config, const char* tmpdir) {
+int __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t** first_lib, const json_token_t* token_object, map_t* ratelimiter_config, const appconfig_t* appconfig) {
     *fn = (void(*)(void*))websockets_default_handler;
 
     if (!json_is_object(token_object)) {
@@ -1917,7 +1955,7 @@ int __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t
     const char* lib_file = json_string(token_file);
     const char* lib_handler = json_string(token_function);
     if (!routeloader_has_lib(*first_lib, lib_file)) {
-        routeloader_lib_t* routeloader_lib = routeloader_load_lib(lib_file, tmpdir);
+        routeloader_lib_t* routeloader_lib = routeloader_load_lib(lib_file, appconfig->env.main.tmp, appconfig->sonames);
         if (routeloader_lib == NULL) {
             log_error("__module_loader_websockets_default_load: failed to load lib %s\n", lib_file);
             return 0;
@@ -1937,7 +1975,7 @@ int __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t
     return 1;
 }
 
-int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config, const char* tmpdir) {
+int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config, const appconfig_t* appconfig) {
     int result = 0;
     route_t* first_route = NULL;
     route_t* last_route = NULL;
@@ -1971,7 +2009,7 @@ int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const 
 
         last_route = rt;
 
-        if (!__module_loader_set_websockets_route(first_lib, &last_lib, rt, json_it_value(&it), ratelimiter_config, tmpdir)) {
+        if (!__module_loader_set_websockets_route(first_lib, &last_lib, rt, json_it_value(&it), ratelimiter_config, appconfig)) {
             log_error("__module_loader_websockets_routes_load: failed to set websockets route\n");
             goto failed;
         }
@@ -1989,7 +2027,7 @@ int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const 
     return result;
 }
 
-int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config, const char* tmpdir) {
+int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config, const appconfig_t* appconfig) {
     if (token_object == NULL) {
         log_error_stderr("__module_loader_set_websockets_route: websockets.route item is empty\n");
         return 0;
@@ -2063,7 +2101,7 @@ int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloa
         const char* lib_handler = json_string(token_function);
         routeloader_lib_t* routeloader_lib = NULL;
         if (!routeloader_has_lib(*first_lib, lib_file)) {
-            routeloader_lib = routeloader_load_lib(lib_file, tmpdir);
+            routeloader_lib = routeloader_load_lib(lib_file, appconfig->env.main.tmp, appconfig->sonames);
             if (routeloader_lib == NULL) {
                 log_error("__module_loader_set_websockets_route: failed to load lib %s\n", lib_file);
                 return 0;
@@ -2708,7 +2746,7 @@ static int __module_loader_taskmanager_load(appconfig_t* config, taskmanager_t* 
         const char* function_name = json_string(token_function);
 
         if (!routeloader_has_lib(config->taskmanager_loader, lib_file)) {
-            routeloader_lib_t* lib = routeloader_load_lib(lib_file, config->env.main.tmp);
+            routeloader_lib_t* lib = routeloader_load_lib(lib_file, config->env.main.tmp, config->sonames);
             if (lib == NULL) {
                 log_error("__module_loader_taskmanager_load: failed to load library %s\n", lib_file);
                 return 0;

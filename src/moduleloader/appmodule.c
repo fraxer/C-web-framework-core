@@ -3,34 +3,90 @@
 #include <string.h>
 
 #include "log.h"
+#include "shadowload.h"
 #include "appmodule.h"
 
 
-typedef struct app_module {
+struct app_module {
     char* path;
     void* handle;
     struct app_module* next;
-} app_module_t;
+};
 
-/* Loaded once per process and kept for its lifetime. A reload re-runs app_init()
- * against the cleared middleware registry, but does not re-dlopen: old-generation
- * workers may still be executing a middleware from this module, so unmapping it
- * is never safe. Rebuilt application modules therefore need a restart, not a
- * reload -- the same constraint handler .so files carry. */
-static app_module_t* __modules = NULL;
-
-static app_module_t* __app_module_find(const char* path) {
-    for (app_module_t* module = __modules; module != NULL; module = module->next)
+static struct app_module* __app_module_find(const struct app_module* first, const char* path) {
+    for (const struct app_module* module = first; module != NULL; module = module->next)
         if (strcmp(module->path, path) == 0)
-            return module;
+            return (struct app_module*)module;
 
     return NULL;
 }
 
-static void* __app_module_open(const char* path) {
-    app_module_t* module = __app_module_find(path);
+/* main.tmp, straight out of the document.
+ *
+ * The modules are loaded before `servers` is parsed and therefore before
+ * appconfig_set() publishes anything, so env() still describes the *previous*
+ * generation and config->env is empty. The value is only a fallback directory
+ * for a shadow copy, so a missing or malformed key is not worth failing over --
+ * module_loader_config_load validates it properly a moment later. */
+static const char* __app_modules_tmp(const json_token_t* root) {
+    const json_token_t* token_main = json_object_get(root, "main");
+    if (token_main == NULL || !json_is_object(token_main)) return NULL;
+
+    const json_token_t* token_tmp = json_object_get(token_main, "tmp");
+    if (token_tmp == NULL || !json_is_string(token_tmp)) return NULL;
+    if (json_string_size(token_tmp) == 0) return NULL;
+
+    return json_string(token_tmp);
+}
+
+/* Was this module given a SONAME of its own for this generation? */
+static int __app_module_retagged(const appconfig_t* config, const char* path) {
+    char soname[256];
+    if (!shadow_read_soname(path, soname, sizeof soname)) return 0;
+
+    return shadow_sonames_tagged(config->sonames, soname) != NULL;
+}
+
+static void* __app_module_open(appconfig_t* config, const char* path,
+                               const char* tmpdir, const char* who) {
+    struct app_module* module = __app_module_find(config->modules, path);
     if (module != NULL)
         return module->handle;
+
+    /* A rebuilt module with no name of its own must not be loaded as a copy:
+     * the handlers of this generation would still bind the *old* one by SONAME,
+     * and one generation would end up running code from two builds
+     * (docs/hotreload/01-soname-per-generation.md §1). Keeping the running module
+     * is the honest answer -- it is what the server did before any of this
+     * existed -- and the reservation pass has already said why there is no tag. */
+    if (shadow_needs_copy(path) && !__app_module_retagged(config, path)) {
+        void* running = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+        if (running == NULL) {
+            log_error_stderr("%s: can't load module %s: %s\n", who, path, dlerror());
+            return NULL;
+        }
+
+        module = malloc(sizeof * module);
+        if (module == NULL) {
+            log_error_stderr("%s: memory alloc error\n", who);
+            dlclose(running);
+            return NULL;
+        }
+
+        module->path = strdup(path);
+        if (module->path == NULL) {
+            log_error_stderr("%s: memory alloc error\n", who);
+            free(module);
+            dlclose(running);
+            return NULL;
+        }
+
+        module->handle = running;
+        module->next = config->modules;
+        config->modules = module;
+
+        return running;
+    }
 
     /* RTLD_NOW: app_init() is about to be called and the module's unresolved
      * framework symbols must be diagnosed here, with the path in hand, rather
@@ -40,42 +96,39 @@ static void* __app_module_open(const char* path) {
      * the first one win every name they happen to share -- a second module's
      * own user_create() would silently bind to the first module's, with no
      * diagnostic anywhere. Local scope is not a loss, because it is not what
-     * lets handlers reach the module: a handler .so records libapp.so in
+     * lets handlers reach the module: a handler .so records the module in
      * DT_NEEDED, and the loader satisfies that from the already-loaded object by
-     * SONAME regardless of the scope it was opened in. */
-    void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+     * SONAME regardless of the scope it was opened in. Which is exactly why the
+     * SONAME has to differ per generation -- see shadowload.h. */
+    void* handle = shadow_dlopen_ex(path, RTLD_NOW | RTLD_LOCAL, tmpdir, config->sonames);
     if (handle == NULL) {
-        log_error_stderr("app_modules_load: can't load module %s: %s\n", path, dlerror());
+        log_error_stderr("%s: can't load module %s: %s\n", who, path, shadow_dlerror());
         return NULL;
     }
 
     module = malloc(sizeof * module);
     if (module == NULL) {
-        log_error_stderr("app_modules_load: memory alloc error\n");
+        log_error_stderr("%s: memory alloc error\n", who);
         dlclose(handle);
         return NULL;
     }
 
     module->path = strdup(path);
     if (module->path == NULL) {
-        log_error_stderr("app_modules_load: memory alloc error\n");
+        log_error_stderr("%s: memory alloc error\n", who);
         free(module);
         dlclose(handle);
         return NULL;
     }
 
     module->handle = handle;
-    module->next = __modules;
-    __modules = module;
+    module->next = config->modules;
+    config->modules = module;
 
     return handle;
 }
 
-static int __app_module_init(const char* path) {
-    void* handle = __app_module_open(path);
-    if (handle == NULL)
-        return 0;
-
+static int __app_module_init(const char* path, void* handle) {
     int (*app_init)(void);
     *(void**)(&app_init) = dlsym(handle, "app_init");
     if (app_init == NULL) {
@@ -104,10 +157,25 @@ static int __app_module_init(const char* path) {
     return 1;
 }
 
+/* Everything the modules do to the process, done once against a throwaway
+ * generation so that a bad configuration is refused while the running one is
+ * still serving. app_modules_load() itself is far too late for that -- see
+ * docs/hotreload/00-shadow-copy.md §4.
+ *
+ * app_init() IS called here, and that matters: the reload may bring a rebuilt
+ * module registering a middleware the previous build did not have, and a route
+ * naming it has to resolve. The caller has set the middleware registry aside
+ * first, so these registrations -- pointers into modules this pass is about to
+ * unload -- never reach the running configuration. */
+static int __app_module_check(const char* path, void* handle) {
+    return __app_module_init(path, handle);
+}
+
 /* Walk main.modules, handing each path to `apply`. The section is optional and
  * an application with no modules at all is a valid configuration, so an absent
  * one is success; a malformed one is not. */
-static int __app_modules_foreach(const json_token_t* root, const char* who, int (*apply)(const char*)) {
+static int __app_modules_foreach(const json_token_t* root, const char* who,
+                                 int (*apply)(const char* path, void* arg), void* arg) {
     const json_token_t* token_main = json_object_get(root, "main");
     if (token_main == NULL || !json_is_object(token_main))
         return 1;
@@ -138,69 +206,120 @@ static int __app_modules_foreach(const json_token_t* root, const char* who, int 
             return 0;
         }
 
-        if (!apply(json_string(token_path)))
+        if (!apply(json_string(token_path), arg))
             return 0;
     }
 
     return 1;
 }
 
-/* Can this path be loaded at all, and does it export app_init()?
+/* First pass: reserve a SONAME for every module that is about to be replaced
+ * under a live generation.
  *
- * Answered without calling app_init(), and without keeping the module: this
- * runs from module_loader_config_correct(), whose whole job is to reject a bad
- * configuration while the running one is still serving. app_modules_load()
- * itself is far too late for that -- see docs/hotreload/00-shadow-copy.md §4.
+ * "About to be replaced" is exactly shadow_needs_copy(): the file changed and
+ * the old one is still loaded. Anything else -- a first load, an unchanged file,
+ * a module whose generation has already gone -- keeps its own name, because
+ * there is nothing for it to collide with.
  *
- * A module this process has already loaded needs no check: it is running, so it
- * loaded and its app_init() returned success. Everything else -- a new entry in
- * main.modules, and every entry at all if the check is run before anything is
- * loaded -- is opened here and closed again, which means a newly added module
- * has its ELF constructors run once more than it otherwise would. That is the
- * price of finding out before the old generation is gone, and it is only paid
- * for modules that are not loaded yet.
- *
- * What deliberately stays fatal is app_init() returning 0. That is a bug in the
- * application, not a mistake in the configuration, and it shows up on the first
- * start rather than on some later reload. */
-static int __app_module_check(const char* path) {
-    if (__app_module_find(path) != NULL)
-        return 1;
+ * The tags have to exist before any module is loaded, and certainly before the
+ * handlers are: they all carry the same map. */
+static int __app_module_reserve(const char* path, void* arg) {
+    appconfig_t* config = arg;
 
-    void* handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
-    if (handle == NULL) {
-        log_error_stderr("app_modules_check: can't load module %s: %s\n", path, dlerror());
-        return 0;
+    char reason[256];
+    if (!shadow_sonames_reserve(config->sonames, path, reason, sizeof reason))
+        log_error_stderr("app_modules_load: %s was rebuilt but will not be reloaded: %s -- "
+                         "the running module is kept, and a restart is what picks the new "
+                         "one up\n", path, reason);
+
+    /* Never fatal: a module that cannot be renamed is a module that is not
+     * swapped, and the rest of the reload is still worth doing. */
+    return 1;
+}
+
+typedef struct {
+    appconfig_t* config;
+    const char* tmpdir;
+    const char* who;
+} app_module_open_t;
+
+static int __app_module_open_apply(const char* path, void* arg) {
+    const app_module_open_t* state = arg;
+
+    return __app_module_open(state->config, path, state->tmpdir, state->who) != NULL;
+}
+
+/* Reserve the SONAMEs and open every module of `main.modules`, without calling
+ * app_init(). Shared by the validation pass and the real one, because the
+ * handlers loaded afterwards resolve their DT_NEEDED against these very objects
+ * -- a validation that skipped them would be validating a different program. */
+static int __app_modules_open_all(appconfig_t* config, const json_token_t* root, const char* who) {
+    if (config->sonames == NULL) {
+        config->sonames = shadow_sonames_create();
+        if (config->sonames == NULL) {
+            log_error_stderr("%s: memory alloc error\n", who);
+            return 0;
+        }
     }
 
-    const int exports_init = dlsym(handle, "app_init") != NULL;
-    if (!exports_init)
-        log_error_stderr("app_modules_check: module %s exports no app_init()\n", path);
+    if (!__app_modules_foreach(root, who, __app_module_reserve, config))
+        return 0;
 
-    dlclose(handle);
+    app_module_open_t state = { .config = config, .tmpdir = __app_modules_tmp(root), .who = who };
 
-    return exports_init;
+    return __app_modules_foreach(root, who, __app_module_open_apply, &state);
 }
 
-int app_modules_load(const json_token_t* root) {
-    return __app_modules_foreach(root, "app_modules_load", __app_module_init);
+int app_modules_load(appconfig_t* config, const json_token_t* root) {
+    if (!__app_modules_open_all(config, root, "app_modules_load"))
+        return 0;
+
+    /* app_init() registers this generation's context destructors, and it has to
+     * be able to reach the configuration to do it -- which is not yet published
+     * (appconfig.h). Cleared before returning either way. */
+    appconfig_set_loading(config);
+
+    int result = 1;
+    for (const struct app_module* module = config->modules;
+         module != NULL && result; module = module->next)
+        result = __app_module_init(module->path, module->handle);
+
+    appconfig_set_loading(NULL);
+
+    return result;
 }
 
-int app_modules_check(const json_token_t* root) {
-    return __app_modules_foreach(root, "app_modules_check", __app_module_check);
+int app_modules_check(appconfig_t* config, const json_token_t* root) {
+    if (!__app_modules_open_all(config, root, "app_modules_check"))
+        return 0;
+
+    appconfig_set_loading(config);
+
+    int result = 1;
+    for (const struct app_module* module = config->modules;
+         module != NULL && result; module = module->next)
+        result = __app_module_check(module->path, module->handle);
+
+    appconfig_set_loading(NULL);
+
+    return result;
 }
 
-void app_modules_free(void) {
-    app_module_t* module = __modules;
+void app_modules_free(struct app_module* modules) {
+    struct app_module* module = modules;
 
     while (module != NULL) {
-        app_module_t* next = module->next;
+        struct app_module* next = module->next;
+
+        /* Safe now and not a moment earlier: the caller is appconfig_clear(),
+         * reached when the last thread of this generation has gone, so nothing
+         * can be executing the module's middleware and no live configuration
+         * holds a pointer into its text. */
+        dlclose(module->handle);
 
         free(module->path);
         free(module);
 
         module = next;
     }
-
-    __modules = NULL;
 }

@@ -804,7 +804,8 @@ httpresponse_t* __httpclient_self_invoke(httpclient_t* client, server_t* server)
     client->response->connection = connection;
 
     httpctx_t ctx;
-    httpctx_init(&ctx, client->request, client->response);
+    /* NULL: the client never sets ctx->user_data, so there is nothing to free. */
+    httpctx_init(&ctx, client->request, client->response, NULL);
 
     if (run_middlewares(server->http.middleware, &ctx))
         handler(&ctx);

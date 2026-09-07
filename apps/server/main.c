@@ -16,7 +16,6 @@
 
 #include "appconfig.h"
 #include "moduleloader.h"
-#include "appmodule.h"
 #include "shadowload.h"
 #include "log.h"
 #include "signal/signal.h"
@@ -235,13 +234,9 @@ int main(int argc, char* argv[]) {
          * where the global already points at the replacement config -- is not
          * touched at all. The cost is the final log line, which env() now
          * refuses to emit; everything worth saying was said above. */
+        /* The application modules went with it: they belong to the generation
+         * now, and the last thread out closed them in appconfig_clear(). */
         appconfig_set(NULL);
-
-        /* The application modules themselves stay mapped -- nothing may still be
-         * holding a middleware pointer at this point, but dlclose() on the way
-         * out buys nothing and can only run atexit handlers that no longer have
-         * a config to log through. This just releases the list. */
-        app_modules_free();
     }
 
     failed:

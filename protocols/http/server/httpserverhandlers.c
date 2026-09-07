@@ -3,6 +3,7 @@
 #include <string.h>
 #include <sys/socket.h>
 
+#include "appconfig.h"
 #include "httpcontext.h"
 #include "httprequest.h"
 #include "httpresponse.h"
@@ -1037,7 +1038,8 @@ void __queue_request_handler(void* arg) {
 
     /* --- user code: middlewares and the route handler, no lock held --- */
     httpctx_t ctx;
-    httpctx_init(&ctx, data->request, data->response);
+    httpctx_init(&ctx, data->request, data->response,
+                 data->server->config != NULL ? data->server->config->httpctx_user_data_free : NULL);
 
     if (run_middlewares(data->server->http.middleware, &ctx))
         item->handle(&ctx);

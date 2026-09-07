@@ -9,11 +9,13 @@
 
 routeloader_lib_t* __routeloader_init_container(const char*, void*);
 
-routeloader_lib_t* routeloader_load_lib(const char* filepath, const char* tmpdir) {
+routeloader_lib_t* routeloader_load_lib(const char* filepath, const char* tmpdir,
+                                        const shadow_sonames_t* sonames) {
     /* shadow_dlopen rather than dlopen: a handler rebuilt at the same path is
      * otherwise not picked up at all, because dlopen answers from the objects it
-     * already has. A first load goes straight through and copies nothing. */
-    void* shared_lib_p = shadow_dlopen(filepath, RTLD_LAZY, tmpdir);
+     * already has. A first load with no renames goes straight through and copies
+     * nothing. */
+    void* shared_lib_p = shadow_dlopen_ex(filepath, RTLD_LAZY, tmpdir, sonames);
 
     if (shared_lib_p == NULL) {
         /* log_error_stderr, because losing this leaves a server that refuses to
