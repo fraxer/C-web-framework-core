@@ -43,8 +43,6 @@ static void* __async_worker(void* arg) {
     appconfig_t* config = arg;
     taskmanager_t* manager = config->taskmanager;
 
-    appconfg_threads_increment(config);
-
     while (!atomic_load(&config->shutdown)) {
         struct timeval now;
         gettimeofday(&now, NULL);
@@ -123,8 +121,6 @@ static void* __scheduler_worker(void* arg) {
     appconfig_t* config = arg;
     taskmanager_t* manager = config->taskmanager;
 
-    appconfg_threads_increment(config);
-
     while (!atomic_load(&config->shutdown)) {
         sleep(1);
 
@@ -181,15 +177,19 @@ int taskmanager_create_threads(appconfig_t* config) {
 
     taskmanager_t* manager = config->taskmanager;
 
+    appconfg_threads_increment(config);
     if (pthread_create(&manager->async_thread, NULL, __async_worker, config) != 0) {
-        log_error("taskmanager_init: failed to create async worker thread\n");
+        appconfg_threads_decrement(config);
+        log_error_stderr("taskmanager_init: failed to create async worker thread\n");
         return 0;
     }
     pthread_detach(manager->async_thread);
     pthread_setname_np(manager->async_thread, "Server async");
 
+    appconfg_threads_increment(config);
     if (pthread_create(&manager->scheduler_thread, NULL, __scheduler_worker, config) != 0) {
-        log_error("taskmanager_init: failed to create scheduler thread\n");
+        appconfg_threads_decrement(config);
+        log_error_stderr("taskmanager_init: failed to create scheduler thread\n");
         return 0;
     }
     pthread_detach(manager->scheduler_thread);

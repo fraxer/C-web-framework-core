@@ -335,6 +335,7 @@ void testdb_teardown(void) {
     }
 
     if (__appconfig) {
+        appconfig_set(NULL);
         appconfig_free(__appconfig);
         __appconfig = NULL;
     }

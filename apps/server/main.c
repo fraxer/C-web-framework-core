@@ -93,6 +93,7 @@ static int __daemonize(void) {
 
 int main(int argc, char* argv[]) {
     int result = EXIT_FAILURE;
+    int sig = 0;
 
     if (!appconfig_init(argc, argv))
         goto failed;
@@ -114,24 +115,16 @@ int main(int argc, char* argv[]) {
     if (pthread_sigmask(SIG_BLOCK, &mask, NULL) != 0)
         goto failed;
 
-    if (!module_loader_init(appconfig()))
-        goto failed;
+    if (!module_loader_init(appconfig())) {
+        log_error_stderr("startup: configuration or thread initialization failed\n");
+        goto shutdown;
+    }
 
-    /* module_loader_init returns as soon as the workers have been created, and
-     * each worker binds its own listening sockets afterwards -- so this is where
-     * "the server started" actually becomes true or false (appconfig.h).
-     *
-     * _exit rather than the failed label: the other workers are being shut down
-     * by the one that failed, so threads are still live, and exit() would run
-     * OPENSSL_cleanup and every other destructor underneath them -- the hazard
-     * the drain below documents. Nothing is lost by skipping the teardown of a
-     * process that is refusing to start, and the closed readiness descriptor is
-     * what the waiting parent turns into its own non-zero status. */
+    /* Publication owns the config until shutdown unpublishes it, even when
+     * every worker has already failed and released its own reference. */
     if (!appconfig_wait_workers()) {
-        log_error("startup: a worker could not start; the server is not listening\n");
-        shadow_cleanup();
-        fflush(NULL);
-        _exit(EXIT_FAILURE);
+        log_error_stderr("startup: a worker could not start; the server is not listening\n");
+        goto shutdown;
     }
 
     result = EXIT_SUCCESS;
@@ -148,7 +141,6 @@ int main(int argc, char* argv[]) {
         close(ready_fd);
     }
 
-    int sig;
     for (;;) {
         if (sigwait(&mask, &sig) != 0)
             continue;
@@ -160,6 +152,8 @@ int main(int argc, char* argv[]) {
 
         break;
     }
+
+    shutdown:
 
     /* Phase 5 — graceful drain. SIGTERM/SIGINT no longer hard-exit: the app is
      * marked for shutdown, handler threads are released from the queue condvar,
@@ -178,12 +172,12 @@ int main(int argc, char* argv[]) {
          * and a worker that saw `shutdown` without `terminating` would take the
          * reload path and leave its listeners open. */
         appconfig_set_terminating();
-        atomic_store(&cfg->shutdown, 1);
+        if (cfg != NULL)
+            atomic_store(&cfg->shutdown, 1);
         module_loader_wakeup_all_threads();
 
-        /* Poll appconfig_threads_alive(), not cfg->threads_count: the thread that
-         * takes the count to zero frees cfg on its way out, so reading the
-         * in-config counter here is a use-after-free. */
+        /* Include threads from failed/replaced generations too. A failed
+         * initialization may already have unpublished its configuration. */
         for (int ms = 0; ms < grace_ms; ms += 100) {
             if (appconfig_threads_alive() == 0)
                 break;
@@ -222,24 +216,14 @@ int main(int argc, char* argv[]) {
             _exit(result);
         }
 
-        /* Every thread has gone, and the last one out freed the configuration
-         * (appconfg_threads_decrement). The global env() hands out still points
-         * at it, and everything that logs reads env() -- so the teardown below
-         * would log through freed memory. ASan reported exactly that the moment
-         * the drain started completing; while it never did, nothing freed the
-         * config and the bug stayed hidden.
-         *
-         * Cleared here rather than inside appconfig_free: this thread is the
-         * only one left, so there is nobody to race with, and the reload path --
-         * where the global already points at the replacement config -- is not
-         * touched at all. The cost is the final log line, which env() now
-         * refuses to emit; everything worth saying was said above. */
-        /* The application modules went with it: they belong to the generation
-         * now, and the last thread out closed them in appconfig_clear(). */
+        /* Unpublish before the last reference destroys the config and modules.
+         * At this point all worker and logger references have been released. */
         appconfig_set(NULL);
     }
 
     failed:
+
+    appconfig_set(NULL);
 
     /* Every path that returns from main() comes through here, the failed
      * configuration load included -- and a load can have made copies before it

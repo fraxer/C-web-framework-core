@@ -90,6 +90,10 @@ typedef struct appconfig {
      * (docs/hotreload/01-soname-per-generation.md §3.5). */
     void (*httpctx_user_data_free)(void*);
     void (*wsctx_user_data_free)(void*);
+
+    /* Owners are independent of live threads: the creator, publication and
+     * each reserved thread keep the generation alive. */
+    atomic_int references;
 } appconfig_t;
 
 int appconfig_init(int argc, char* argv[]);
@@ -100,6 +104,10 @@ int appconfig_init(int argc, char* argv[]);
 int appconfig_foreground(void);
 appconfig_t* appconfig_create(const char* path);
 appconfig_t* appconfig(void);
+/* Acquire the published configuration safely across replacement. Release with
+ * appconfig_free(). appconfig() itself remains a borrowed pointer. */
+appconfig_t* appconfig_acquire(void);
+void appconfig_retain(appconfig_t* config);
 
 /* The configuration currently being built, for the window in which it is not yet
  * published through appconfig_set().
@@ -118,13 +126,16 @@ env_t* env(void);
 void appconfig_set(appconfig_t* config);
 void appconfig_clear(appconfig_t* config);
 void appconfig_free(appconfig_t* config);
+/* create() returns one owned reference; set() owns an additional reference.
+ * free() releases one reference and destroys only after the last owner leaves.
+ * Reserve each thread below BEFORE pthread_create; roll back on failure. */
 char* appconfig_path(void);
 void appconfg_threads_increment(appconfig_t* config);
 void appconfg_threads_decrement(appconfig_t* config);
 
 /* How many worker/handler/task threads are still running, tracked in a
- * process-lifetime counter rather than in the config — the last thread out frees
- * the config, so config->threads_count cannot be safely polled from outside.
+ * process-lifetime counter rather than in one generation's config. This includes
+ * threads draining after reload or a partially failed initialization.
  * Used by the shutdown drain to tell when the workers have finished. */
 int appconfig_threads_alive(void);
 

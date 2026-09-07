@@ -14,8 +14,6 @@ void* thread_handler(void* arg) {
     signal_block_usr1();
 
     appconfig_t* appconfig = arg;
-    appconfg_threads_increment(appconfig);
-
     while (1) {
         if (atomic_load(&appconfig->shutdown))
             break;
@@ -84,8 +82,10 @@ void* thread_handler(void* arg) {
 int thread_handler_run(appconfig_t* appconfig, int thread_count) {
     for (int i = 0; i < thread_count; i++) {
         pthread_t thread;
+        appconfg_threads_increment(appconfig);
         if (pthread_create(&thread, NULL, thread_handler, appconfig) != 0) {
-            log_error("thread_handler_run: unable to create thread handler\n");
+            appconfg_threads_decrement(appconfig);
+            log_error_stderr("thread_handler_run: unable to create thread handler\n");
             return 0;
         }
 

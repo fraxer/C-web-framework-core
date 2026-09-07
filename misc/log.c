@@ -18,14 +18,11 @@ void log_reinit() {
 }
 
 static void log_message(int priority, const char* format, va_list args) {
-    env_t* environment = env();
-    if (environment == NULL) return;
-
-    if (!environment->main.log.enabled) return;
-
-    if (priority > environment->main.log.level) return;
-
-    vsyslog(priority, format, args);
+    appconfig_t* config = appconfig_acquire();
+    if (config == NULL) return;
+    if (config->env.main.log.enabled && priority <= config->env.main.log.level)
+        vsyslog(priority, format, args);
+    appconfig_free(config);
 }
 
 void log_error_stderr(const char* format, ...) {

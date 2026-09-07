@@ -97,7 +97,7 @@ static const char* __module_loader_storage_field(const char* storage_name, const
 static int __module_loader_thread_taskmanager_load(appconfig_t* config);
 static int __module_loader_thread_workers_load(appconfig_t* config);
 static int __module_loader_thread_handlers_load(appconfig_t* config);
-static void __module_loader_on_shutdown_cb(void);
+static void __module_loader_on_shutdown_cb(appconfig_t* config);
 static map_t* __module_loader_ratelimits_configs_load(const json_token_t* token_object);
 static char* __module_loader_dotenv_path(const appconfig_t* config, const json_token_t* token_main);
 static int __module_loader_dotenv_pair(const char* key, const char* value, int quoted, void* userdata);
@@ -108,6 +108,9 @@ static int __module_loader_websockets_ratelimit_load(const json_token_t* token_s
 
 int module_loader_init(appconfig_t* config) {
     int result = 0;
+    /* The caller may have borrowed the published pointer. Rollback can unpublish
+     * it while workers are already exiting, so own the entire initialization. */
+    appconfig_retain(config);
 
     json_doc_t* document = NULL;
     if (!module_loader_load_json_config(config->path, &document))
@@ -128,6 +131,8 @@ int module_loader_init(appconfig_t* config) {
     failed:
 
     json_free(document);
+
+    appconfig_free(config);
 
     return result;
 }
@@ -243,7 +248,7 @@ int module_loader_load_json_config(const char* path, json_doc_t** document) {
 
 int __module_loader_init_modules(appconfig_t* config, json_doc_t* document) {
     int result = 0;
-    appconfig_t* previous_config = appconfig();
+    appconfig_t* previous_config = appconfig_acquire();
 
     if (!connection_queue_init()) {
         log_error("__module_loader_init_modules: connection_queue_init error\n");
@@ -299,10 +304,12 @@ int __module_loader_init_modules(appconfig_t* config, json_doc_t* document) {
     failed:
 
     if (!result) {
+        atomic_store(&config->shutdown, 1);
+        module_loader_wakeup_all_threads();
         if (appconfig() == config)
             appconfig_set(previous_config == config ? NULL : previous_config);
-        appconfig_free(config);
     }
+    appconfig_free(previous_config);
 
     return result;
 }
@@ -2142,10 +2149,11 @@ void module_loader_create_config_and_init(void) {
 
     middleware_registry_clear();
     module_loader_init(newconfig);
+    appconfig_free(newconfig);
 }
 
-void __module_loader_on_shutdown_cb(void) {
-    atomic_store(&appconfig()->shutdown, 1);
+void __module_loader_on_shutdown_cb(appconfig_t* config) {
+    atomic_store(&config->shutdown, 1);
     module_loader_wakeup_all_threads();
 }
 

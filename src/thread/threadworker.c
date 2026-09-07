@@ -9,17 +9,15 @@
 #include "multiplexingserver.h"
 #include "threadworker.h"
 
-static void(*__thread_worker_threads_shutdown)(void) = NULL;
+static void(*__thread_worker_threads_shutdown)(appconfig_t*) = NULL;
 
 void* thread_worker(void* arg) {
     signal_block_usr1();
 
     appconfig_t* appconfig = arg;
 
-    appconfg_threads_increment(appconfig);
-
     if (!mpxserver_run(appconfig))
-        __thread_worker_threads_shutdown();
+        __thread_worker_threads_shutdown(appconfig);
 
     appconfg_threads_decrement(appconfig);
     json_manager_free();
@@ -30,8 +28,10 @@ void* thread_worker(void* arg) {
 int thread_worker_run(appconfig_t* appconfig, int thread_count) {
     for (int i = 0; i < thread_count; i++) {
         pthread_t thread;
+        appconfg_threads_increment(appconfig);
         if (pthread_create(&thread, NULL, thread_worker, appconfig) != 0) {
-            log_error("thread_worker_run: unable to create thread worker\n");
+            appconfg_threads_decrement(appconfig);
+            log_error_stderr("thread_worker_run: unable to create thread worker\n");
             return 0;
         }
 
@@ -49,7 +49,7 @@ int thread_worker_run(appconfig_t* appconfig, int thread_count) {
     return 1;
 }
 
-void thread_worker_set_threads_shutdown_cb(void (*thread_worker_threads_shutdown)(void)) {
+void thread_worker_set_threads_shutdown_cb(void (*thread_worker_threads_shutdown)(appconfig_t*)) {
     if (__thread_worker_threads_shutdown == NULL)
         __thread_worker_threads_shutdown = thread_worker_threads_shutdown;
 }

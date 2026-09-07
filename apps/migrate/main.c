@@ -468,6 +468,7 @@ int main(int argc, char* argv[]) {
 
     failed:
 
+    appconfig_set(NULL);
     mg_config_free(&config);
     json_free(document);
 

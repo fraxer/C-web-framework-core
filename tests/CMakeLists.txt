@@ -124,6 +124,16 @@ add_dependencies(runner shadow_test_v1 shadow_test_v2 shadow_merged)
 
 add_test(NAME core_tests COMMAND runner)
 
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+    add_library(pthread_create_fail SHARED data/pthread_create_fail.c)
+    target_link_libraries(pthread_create_fail PRIVATE ${CMAKE_DL_LIBS})
+    add_test(NAME startup_lifetime
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/startup_lifetime.py
+                $<TARGET_FILE:cwfr> $<TARGET_FILE:pthread_create_fail> ${CMAKE_BUILD_TYPE})
+    set_tests_properties(startup_lifetime PROPERTIES TIMEOUT 120)
+endif()
+
 # HTTP/2 regressions can run independently of database and HTTP client suites.
 set(H2_UNIT_TEST_FILES ${UNIT_TEST_FILES})
 list(FILTER H2_UNIT_TEST_FILES INCLUDE REGEX "/test_(h2|hpack|httpfields)")

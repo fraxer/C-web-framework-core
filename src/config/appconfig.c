@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <getopt.h>
+#include <pthread.h>
 
 #include "log.h"
 #include "appconfig.h"
@@ -18,13 +19,12 @@ void shadow_sonames_free(shadow_sonames_t* map);
 
 static char* __appconfig_path = NULL;
 static _Atomic(appconfig_t*) __appconfig = NULL;
+static pthread_mutex_t __appconfig_mutex = PTHREAD_MUTEX_INITIALIZER;
 /* See appconfig_loading() in the header for why this needs no synchronisation. */
 static appconfig_t* __appconfig_loading = NULL;
 
-/* Mirror of config->threads_count with process lifetime. The counter inside the
- * config cannot be polled by an observer: the thread that drops it to zero frees
- * the config in the same breath, so the next read of config->threads_count is a
- * use-after-free. The shutdown drain in main() watches this copy instead. */
+/* Live/reserved threads across all generations. Reference owners such as the
+ * main thread and logger are excluded, so shutdown can wait for zero. */
 static atomic_int __appconfig_threads_alive = 0;
 static atomic_int __appconfig_terminating = 0;
 
@@ -50,6 +50,7 @@ int appconfig_init(int argc, char* argv[]) {
     }
 
     appconfig_set(config);
+    appconfig_free(config);
 
     return 1;
 }
@@ -76,6 +77,7 @@ appconfig_t* appconfig_create(const char* path) {
 
     atomic_store(&config->shutdown, 0);
     atomic_store(&config->threads_count, 0);
+    atomic_init(&config->references, 1);
     __appconfig_env_init(&config->env);
     config->mimetype = NULL;
     config->databases = NULL;
@@ -120,7 +122,26 @@ env_t* env(void) {
 }
 
 void appconfig_set(appconfig_t* config) {
-    atomic_store_explicit(&__appconfig, config, memory_order_release);
+    appconfig_retain(config);
+    pthread_mutex_lock(&__appconfig_mutex);
+    appconfig_t* previous = atomic_exchange_explicit(&__appconfig, config, memory_order_acq_rel);
+    pthread_mutex_unlock(&__appconfig_mutex);
+    /* Destructors may log. Publish the replacement before releasing the old
+     * owner, and never run destructors while holding the publication mutex. */
+    appconfig_free(previous);
+}
+
+void appconfig_retain(appconfig_t* config) {
+    if (config != NULL)
+        atomic_fetch_add_explicit(&config->references, 1, memory_order_relaxed);
+}
+
+appconfig_t* appconfig_acquire(void) {
+    pthread_mutex_lock(&__appconfig_mutex);
+    appconfig_t* config = atomic_load_explicit(&__appconfig, memory_order_acquire);
+    appconfig_retain(config);
+    pthread_mutex_unlock(&__appconfig_mutex);
+    return config;
 }
 
 void appconfig_clear(appconfig_t* config) {
@@ -177,6 +198,8 @@ void appconfig_clear(appconfig_t* config) {
 
 void appconfig_free(appconfig_t* config) {
     if (config == NULL) return;
+    if (atomic_fetch_sub_explicit(&config->references, 1, memory_order_acq_rel) != 1)
+        return;
 
     appconfig_clear(config);
 
@@ -190,19 +213,14 @@ char* appconfig_path(void) {
 }
 
 void appconfg_threads_increment(appconfig_t* config) {
+    appconfig_retain(config);
     atomic_fetch_add(&__appconfig_threads_alive, 1);
     atomic_fetch_add(&config->threads_count, 1);
 }
 
 void appconfg_threads_decrement(appconfig_t* config) {
-    /* Decide on the value fetch_sub returned, not on a re-read: two threads
-     * could otherwise both observe zero and free the config twice. The mirror is
-     * lowered after the free so an observer never sees zero while the config is
-     * still being torn down. */
-    const int was = atomic_fetch_sub(&config->threads_count, 1);
-
-    if (was == 1)
-        appconfig_free(config);
+    atomic_fetch_sub(&config->threads_count, 1);
+    appconfig_free(config);
 
     atomic_fetch_sub(&__appconfig_threads_alive, 1);
 }
