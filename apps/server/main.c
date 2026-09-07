@@ -17,6 +17,7 @@
 #include "appconfig.h"
 #include "moduleloader.h"
 #include "appmodule.h"
+#include "shadowload.h"
 #include "log.h"
 #include "signal/signal.h"
 
@@ -129,6 +130,7 @@ int main(int argc, char* argv[]) {
      * what the waiting parent turns into its own non-zero status. */
     if (!appconfig_wait_workers()) {
         log_error("startup: a worker could not start; the server is not listening\n");
+        shadow_cleanup();
         fflush(NULL);
         _exit(EXIT_FAILURE);
     }
@@ -210,6 +212,13 @@ int main(int argc, char* argv[]) {
         if (alive != 0) {
             log_error("shutdown: %d thread(s) still running after the %d ms grace "
                       "window; exiting without running destructors\n", alive, grace_ms);
+
+            /* Unlinking the shadow copies is safe with those threads still
+             * running -- unlink drops the name, never the mapping -- and this
+             * is the path a normal shutdown actually takes today, so leaving
+             * them behind here would mean leaving them behind almost always. */
+            shadow_cleanup();
+
             fflush(NULL);
             _exit(result);
         }
@@ -236,6 +245,12 @@ int main(int argc, char* argv[]) {
     }
 
     failed:
+
+    /* Every path that returns from main() comes through here, the failed
+     * configuration load included -- and a load can have made copies before it
+     * failed. Removing them is the last thing done, so that a core dump taken up
+     * to this point still symbolises the code the copies carried (shadowload.h). */
+    shadow_cleanup();
 
     signal_before_terminate(result);
 

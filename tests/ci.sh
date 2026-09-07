@@ -31,6 +31,10 @@
 #   fuzz     build the fuzz targets         + FUZZ_SECONDS each
 #   reload   hard reload with live QUIC      + old worker retirement
 #   softreload shared UDP handoff             + old CID/config drain
+#   hotreload a handler rebuilt in place is picked up by SIGUSR1, its
+#            $ORIGIN dependency still resolves, the copies are cleaned up,
+#            and a broken main.modules path is refused instead of killing
+#            the server (docs/hotreload/00-shadow-copy.md §6)
 #   qlog     traces written, bounded, off by default       (diagnostics)
 #   h3spec   run a server, run h3spec against it           (RFC conformance)
 #   h2ws     RFC 8441 tunnels driven by python-h2, a client that enforces
@@ -490,6 +494,18 @@ stage_softreload() {
     fi
 }
 
+stage_hotreload() {
+    say "hotreload: a rebuilt handler is picked up, and a bad module is refused"
+
+    if build "$CI_BUILD_DIR/rel" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes &&
+       "$CORE_DIR/tests/hot_reload_shadow.sh" "$CI_BUILD_DIR/rel" \
+             "$CI_BUILD_DIR/hot-reload-shadow"; then
+        record hotreload OK
+    else
+        record hotreload FAIL
+    fi
+}
+
 stage_h3spec() {
     say "h3spec: RFC conformance against a running server"
 
@@ -678,7 +694,7 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit config startup keepalive limits soak affinity earlydata vn version2 ipv6 qlog priority benchmark asan tsan fuzz reload softreload h2ws h3spec)
+ALL_STAGES=(noh3 h3unit config startup keepalive limits soak affinity earlydata vn version2 ipv6 qlog priority benchmark asan tsan fuzz reload softreload hotreload h2ws h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
@@ -711,6 +727,7 @@ for stage in "${STAGES[@]}"; do
     fuzz)   stage_fuzz ;;
     reload) stage_reload ;;
     softreload) stage_softreload ;;
+    hotreload) stage_hotreload ;;
     h2ws)   stage_h2ws ;;
     h3spec) stage_h3spec ;;
     *)      echo "unknown stage: $stage" >&2; exit 2 ;;

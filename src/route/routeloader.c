@@ -4,15 +4,23 @@
 #include <stdlib.h>
 
 #include "log.h"
+#include "shadowload.h"
 #include "routeloader.h"
 
 routeloader_lib_t* __routeloader_init_container(const char*, void*);
 
-routeloader_lib_t* routeloader_load_lib(const char* filepath) {
-    void* shared_lib_p = dlopen(filepath, RTLD_LAZY);
+routeloader_lib_t* routeloader_load_lib(const char* filepath, const char* tmpdir) {
+    /* shadow_dlopen rather than dlopen: a handler rebuilt at the same path is
+     * otherwise not picked up at all, because dlopen answers from the objects it
+     * already has. A first load goes straight through and copies nothing. */
+    void* shared_lib_p = shadow_dlopen(filepath, RTLD_LAZY, tmpdir);
 
     if (shared_lib_p == NULL) {
-        log_error(ROUTELOADER_LIB_NOT_FOUND, filepath);
+        /* log_error_stderr, because losing this leaves a server that refuses to
+         * start or refuses to reload with no explanation anywhere: at startup
+         * this runs before appconfig_set(), where log_error() is dropped
+         * outright (log.h). */
+        log_error_stderr(ROUTELOADER_LIB_NOT_FOUND, filepath, shadow_dlerror());
         return NULL;
     }
 

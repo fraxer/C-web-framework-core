@@ -85,6 +85,23 @@ if(INCLUDE_HTTP3 STREQUAL yes)
     )
 endif()
 
+# Two tiny shared objects the shadow-copy suite rebuilds in place: it publishes
+# one at a working path, loads it, publishes the other over the same path and
+# loads again. Both carry the SONAME libshadow_test_v1.so -- a rebuilt handler
+# keeps its own, and the suite should not accidentally pass because they differ
+# -- which is why the second one is built under the first one's name in a
+# directory of its own.
+add_library(shadow_test_v1 SHARED ${CMAKE_CURRENT_SOURCE_DIR}/data/shadow_module_v1.c)
+add_library(shadow_test_v2 SHARED ${CMAKE_CURRENT_SOURCE_DIR}/data/shadow_module_v2.c)
+set_target_properties(shadow_test_v2 PROPERTIES
+    OUTPUT_NAME shadow_test_v1
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/shadow_v2)
+
+target_compile_definitions(runner PRIVATE
+    TEST_SHADOW_V1="$<TARGET_FILE:shadow_test_v1>"
+    TEST_SHADOW_V2="$<TARGET_FILE:shadow_test_v2>")
+add_dependencies(runner shadow_test_v1 shadow_test_v2)
+
 add_test(NAME core_tests COMMAND runner)
 
 # HTTP/2 regressions can run independently of database and HTTP client suites.

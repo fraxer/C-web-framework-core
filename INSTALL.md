@@ -394,6 +394,41 @@ route-to-handler mappings), database connections, storage backends, and the
 task manager. See the documentation for the full reference:
 [https://cwebframework.tech/en/introduction.html](https://cwebframework.tech/en/introduction.html)
 
+### Deploying a rebuilt handler
+
+A handler `.so` rebuilt at the same path is picked up by `SIGUSR1` — the path in
+`config.json` does not have to change. The loader will not do that on its own, so
+the server loads such a file through a copy it puts next to the original,
+`.cwfr-shadow-<pid>-<seq>-<name>`; that is what keeps `$ORIGIN` in the module's
+RPATH pointing at its own directory, and what keeps ASan reports, gdb and core
+dumps able to name a function, a file and a line.
+
+Two things this asks of a deployment:
+
+* **the directory holding the `.so` should be writable** by the server. Where it
+  is not, the copy falls back to `main.tmp` and `$ORIGIN` no longer resolves to
+  the module's own directory — private libraries next to the handler stop being
+  found. It is logged when it happens.
+* **send `SIGUSR1` after the build has finished**, not during it. A linker writes
+  a `.so` by unlinking and re-creating it, so mid-write the path holds a truncated
+  ELF; a signal arriving then is refused at the validation stage (the server keeps
+  serving the old configuration) and has to be repeated. Building into a temporary
+  directory and publishing with an atomic `rename` avoids the window entirely.
+
+The copies are unlinked when the process exits, and copies left behind by a
+process that was killed are swept by the next start. A copy deliberately outlives
+the library's unload, so a core dump has to be investigated *before* the server is
+restarted.
+
+The application module from `main.modules` is not covered by any of this and still
+needs a restart, for the reason in `docs/hotreload/00-shadow-copy.md`: handlers
+reach it by SONAME, and the loader would answer with the first copy loaded.
+
+**API change**: `routeloader_load_lib()` takes a second argument, the fallback
+directory for the copy. It is called only by the core -- an application has never
+had a reason to -- but it is a public header, so a consumer that did call it needs
+the extra argument.
+
 Applying database migrations:
 
 ```bash
