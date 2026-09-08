@@ -1,6 +1,8 @@
 #ifndef __HTTP1RESPONSE__
 #define __HTTP1RESPONSE__
 
+#include <time.h>
+
 #include "connection_s.h"
 #include "server.h"
 #include "httpcommon.h"
@@ -297,6 +299,22 @@ typedef struct httpresponse {
      * freed. NULL for every other kind of response. */
     void* body_cache;
 
+    /* Access log (server/accesslog.h). `body_bytes_sent` is what the terminal
+     * write stage of the protocol actually put on the wire -- compressed and
+     * ranged bytes, not the size of the resource -- and `access_started` is when
+     * this response was taken for its request, both meaningless unless
+     * `access_log` was set at that moment. */
+    struct timespec access_started;
+    size_t body_bytes_sent;
+
+    /* What the client asked for, kept here when the request can no longer
+     * answer for it at the point the record is written -- a redirect has
+     * replaced `request->uri` with its destination by then. Owned here and
+     * freed with the response; NULL means "ask the request", the ordinary
+     * case. */
+    char* access_uri;
+    size_t access_uri_length;
+
     http_version_e version;
     http_payload_t payload_;
 
@@ -338,6 +356,10 @@ typedef struct httpresponse {
      * length stops reading the tunnel at it. Set for the RFC 8441 WebSocket
      * tunnel (docs/http2/09); zero on every ordinary response. */
     unsigned connect_tunnel : 1;
+    /* This response is to produce an access-log record. Armed once, where the
+     * response is taken for a request and the vhost's configuration is at hand,
+     * and cleared by the record itself so a retried write cannot repeat it. */
+    unsigned access_log : 1;
 } httpresponse_t;
 
 httpresponse_t* httpresponse_create(connection_t* connection);

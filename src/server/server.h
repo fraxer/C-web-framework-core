@@ -20,10 +20,27 @@ typedef struct index {
     int length;
 } index_t;
 
+/* One response header the vhost puts on every answer it gives -- the
+ * `Strict-Transport-Security`, `X-Content-Type-Options`, `Content-Security-Policy`
+ * class, which is decided once per site and belongs on static files and error
+ * pages just as much as on a handler's output (docs/webserver/00 §2).
+ *
+ * Stored with the lengths already measured: the strings cannot change once the
+ * configuration is parsed, and add_headeru takes explicit lengths -- so a
+ * strlen per header per response would buy nothing. */
+typedef struct server_header {
+    char* key;
+    size_t key_length;
+    char* value;
+    size_t value_length;
+    struct server_header* next;
+} server_header_t;
+
 typedef struct server_http {
     route_t* route;
     ratelimiter_t* ratelimiter;
     redirect_t* redirect;
+    server_header_t* header;
     struct middleware_item* middleware;
 } server_http_t;
 
@@ -118,6 +135,9 @@ typedef struct server_chain {
 } server_chain_t;
 
 server_t* server_create();
+/* Build one configured response header; NULL on an allocation failure. */
+server_header_t* server_header_create(const char* key, const char* value);
+void server_headers_free(server_header_t*);
 index_t* server_index_create(const char*);
 void server_index_destroy(index_t*);
 void servers_free(server_t* server);

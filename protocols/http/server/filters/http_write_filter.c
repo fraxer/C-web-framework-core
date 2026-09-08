@@ -275,6 +275,14 @@ int http_write_body(httprequest_t* request, httpresponse_t* response, bufo_t* pa
     bufo_t* buf = module->buf;
     module->base.parent_buf = parent_buf;
 
+    /* Whatever this pass takes out of the chain's buffer is a body byte on the
+     * wire — joined behind the head or written straight — and that is the size
+     * the access log reports (accesslog.h). Counted here, at the terminal stage,
+     * so it is what gzip, chunking and Range actually left, and counted as a
+     * cursor delta so an EAGAIN resume cannot count the same bytes twice. */
+    const size_t consumed_from = parent_buf != NULL ? parent_buf->pos : 0;
+    int result = CWF_DATA_AGAIN;
+
     /* Anything still in the own buffer goes first: the head, and possibly a
      * body chunk joined to it that an earlier EAGAIN left half-written. Order
      * matters — the peer must see the response in the order it was built. */
@@ -282,14 +290,18 @@ int http_write_body(httprequest_t* request, httpresponse_t* response, bufo_t* pa
         __join_first_chunk(buf, parent_buf);
 
         const int r = __wr(response, buf);
-        if (r != CWF_OK) return r;
+        if (r != CWF_OK) result = r;
     }
 
-    const int r = __wr(response, parent_buf);
-    if (r == CWF_OK)
-        return CWF_DATA_AGAIN;
+    if (result == CWF_DATA_AGAIN) {
+        const int r = __wr(response, parent_buf);
+        if (r != CWF_OK) result = r;
+    }
 
-    return r;
+    if (parent_buf != NULL)
+        response->body_bytes_sent += parent_buf->pos - consumed_from;
+
+    return result;
 }
 
 int http_write_flush(httprequest_t* request, httpresponse_t* response) {

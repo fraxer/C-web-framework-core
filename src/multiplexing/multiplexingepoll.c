@@ -54,6 +54,7 @@ void* mpx_epoll_init() {
     api->base.control_mod = __mpx_epoll_control_mod;
     api->base.process_events = __mpx_epoll_process_events;
     api->base.on_tick = NULL;
+    api->base.access_log = NULL;
     api->fd = fd;
     api->timerfd = -1;
 

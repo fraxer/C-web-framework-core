@@ -85,6 +85,7 @@ static int __module_loader_translations_load(appconfig_t* config, json_token_t* 
 static int __module_loader_http_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config, const appconfig_t* appconfig);
 static int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_lib_t** last_lib, route_t* route, const json_token_t* token_object, map_t* ratelimiter_config, const appconfig_t* appconfig);
 static int __module_loader_http_redirects_load(const json_token_t* token_object, redirect_t** redirect);
+static int __module_loader_http_headers_load(const json_token_t* token_object, server_header_t** header);
 static int __module_loader_middlewares_load(const json_token_t* token_object, middleware_item_t** middleware_item);
 static int __module_loader_websockets_default_load(void(**fn)(void*), routeloader_lib_t** first_lib, const json_token_t* token_object, map_t* ratelimiter_config, const appconfig_t* appconfig);
 static int __module_loader_websockets_routes_load(routeloader_lib_t** first_lib, const json_token_t* token_object, route_t** route, map_t* ratelimiter_config, const appconfig_t* appconfig);
@@ -612,6 +613,17 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     else {
         log_error_stderr("module_loader_config_load: log.level must be one of: emerg, alert, crit, err, warning, notice, info, debug\n");
         goto failed;
+    }
+
+    /* Optional, and off unless asked for: an access log nobody switched on must
+     * cost nothing at all, down to the clock read per response. */
+    const json_token_t* token_log_access = json_object_get(token_log, "access");
+    if (token_log_access != NULL) {
+        if (!json_is_bool(token_log_access)) {
+            log_error_stderr("module_loader_config_load: log.access must be boolean\n");
+            goto failed;
+        }
+        env->main.log.access = json_bool(token_log_access);
     }
 
 
@@ -1179,6 +1191,10 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             }
             if (!__module_loader_http_redirects_load(json_object_get(token_http, "redirects"), &server->http.redirect)) {
                 log_error("__module_loader_servers_load: can't load redirects\n");
+                goto failed;
+            }
+            if (!__module_loader_http_headers_load(json_object_get(token_http, "headers"), &server->http.header)) {
+                log_error("__module_loader_servers_load: can't load headers\n");
                 goto failed;
             }
             if (!__module_loader_middlewares_load(json_object_get(token_http, "middlewares"), &server->http.middleware)) {
@@ -2031,6 +2047,75 @@ int __module_loader_http_redirects_load(const json_token_t* token_object, redire
 
     if (result == 0)
         redirect_free(first_redirect);
+
+    return result;
+}
+
+/* http.headers -- response headers this vhost puts on every answer.
+ *
+ * Written like http.redirects, an object of name/value pairs:
+ *
+ *     "headers": {
+ *         "X-Content-Type-Options": "nosniff",
+ *         "Strict-Transport-Security": "max-age=31536000; includeSubDomains"
+ *     }
+ *
+ * Nothing here judges the names: the point of the key is the header class an
+ * operator decides once per site, and a list of blessed ones would be wrong the
+ * day a new one is standardised. An empty value is refused all the same -- it
+ * is a header the operator meant to fill in and did not. */
+int __module_loader_http_headers_load(const json_token_t* token_object, server_header_t** header) {
+    int result = 0;
+    server_header_t* first_header = NULL;
+    server_header_t* last_header = NULL;
+
+    if (token_object == NULL) return 1;
+    if (!json_is_object(token_object)) {
+        log_error_stderr("__module_loader_http_headers_load: http.headers must be object\n");
+        goto failed;
+    }
+    if (json_object_size(token_object) == 0) return 1;
+
+    for (json_it_t it = json_init_it(token_object); !json_end_it(&it); json_next_it(&it)) {
+        const char* key = json_it_key(&it);
+        if (key == NULL || strlen(key) == 0) {
+            log_error_stderr("__module_loader_http_headers_load: http.headers item.key is empty\n");
+            goto failed;
+        }
+
+        json_token_t* token_value = json_it_value(&it);
+        if (token_value == NULL || !json_is_string(token_value)) {
+            log_error_stderr("__module_loader_http_headers_load: http.headers \"%s\" must be string\n", key);
+            goto failed;
+        }
+        if (json_string_size(token_value) == 0) {
+            log_error_stderr("__module_loader_http_headers_load: http.headers \"%s\" is empty\n", key);
+            goto failed;
+        }
+
+        server_header_t* item = server_header_create(key, json_string(token_value));
+        if (item == NULL) {
+            log_error("__module_loader_http_headers_load: failed to create header\n");
+            goto failed;
+        }
+
+        if (first_header == NULL)
+            first_header = item;
+
+        if (last_header != NULL)
+            last_header->next = item;
+
+        last_header = item;
+    }
+
+    result = 1;
+
+    *header = first_header;
+
+    failed:
+
+    if (result == 0)
+        server_headers_free(first_header);
 
     return result;
 }

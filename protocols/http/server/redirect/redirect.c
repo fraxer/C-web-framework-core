@@ -182,3 +182,44 @@ void redirect_free(redirect_t* redirect) {
 char* redirect_get_uri(redirect_t* redirect, const char* string, int* vector) {
     return strtemplate_expand(redirect->destination, string, vector);
 }
+
+const char* redirect_carry_query(const char* target, const char* uri, size_t uri_length, size_t* length) {
+    *length = 0;
+
+    if (target == NULL || uri == NULL) return NULL;
+    if (strchr(target, '?') != NULL) return NULL;
+
+    const char* query = memchr(uri, '?', uri_length);
+    if (query == NULL) return NULL;
+
+    const size_t query_length = uri_length - (size_t)(query - uri);
+    if (query_length < 2) return NULL;
+
+    *length = query_length;
+
+    return query;
+}
+
+char* redirect_uri_with_query(redirect_t* redirect, const char* path, int* vector,
+                              const char* uri, size_t uri_length) {
+    char* target = redirect_get_uri(redirect, path, vector);
+    if (target == NULL) return NULL;
+
+    size_t query_length = 0;
+    /* Points into `uri`, which the reallocation below does not touch. */
+    const char* query = redirect_carry_query(target, uri, uri_length, &query_length);
+    if (query_length == 0) return target;
+
+    /* strtemplate_expand hands back a plain malloc'd string. */
+    const size_t target_length = strlen(target);
+    char* merged = realloc(target, target_length + query_length + 1);
+    if (merged == NULL) {
+        free(target);
+        return NULL;
+    }
+
+    memcpy(merged + target_length, query, query_length);
+    merged[target_length + query_length] = 0;
+
+    return merged;
+}

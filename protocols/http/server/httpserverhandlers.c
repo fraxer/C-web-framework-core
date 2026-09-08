@@ -3,6 +3,7 @@
 #include <string.h>
 #include <sys/socket.h>
 
+#include "accesslog.h"
 #include "appconfig.h"
 #include "httpcontext.h"
 #include "httprequest.h"
@@ -69,31 +70,42 @@ static void __retire_response(void* arg_ctx, void* arg_response) {
  * the same decision as which terminal write stage will run. */
 static httpresponse_t* __create_response(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
+    httpresponse_t* response = NULL;
 
     /* h2 keeps a small pool of finished response objects on the session; a new
      * stream takes one from there when it can (docs/http2/10 §10.2). */
-    if (ctx->is_http2) return h2_server_take_response(connection);
+    if (ctx->is_http2)
+        response = h2_server_take_response(connection);
 #ifdef CWFR_HTTP3
     /* Same pool, on the h3 connection (docs/http2/10 §10.7). */
-    if (__is_http3(connection)) return h3_server_take_response(connection);
+    else if (__is_http3(connection))
+        response = h3_server_take_response(connection);
 #endif
+    else {
+        /* Whichever way the object is obtained, this connection now retires its
+         * responses into the cache. */
+        ctx->response_retire = __retire_response;
 
-    /* Whichever way the object is obtained, this connection now retires its
-     * responses into the cache. */
-    ctx->response_retire = __retire_response;
-
-    httpresponse_t* recycled = ctx->response_cache;
-    if (recycled != NULL) {
-        ctx->response_cache = NULL;
-        /* Everything else was cleared when it was parked; keep-alive is the one
-         * thing that could not be, because it belongs to the request being
-         * answered and that request did not exist yet. */
-        httpresponse_reuse(recycled);
-
-        return recycled;
+        httpresponse_t* recycled = ctx->response_cache;
+        if (recycled != NULL) {
+            ctx->response_cache = NULL;
+            /* Everything else was cleared when it was parked; keep-alive is the
+             * one thing that could not be, because it belongs to the request
+             * being answered and that request did not exist yet. */
+            httpresponse_reuse(recycled);
+            response = recycled;
+        }
+        else
+            response = httpresponse_create(connection);
     }
 
-    return httpresponse_create(connection);
+    /* Every server response is born here, whichever protocol asked for it and
+     * whether it came from a pool or from malloc -- so this is the one place
+     * the access log's clock can start, and the one place the vhost that
+     * decides whether it runs at all is still unambiguous (accesslog.h). */
+    http_access_log_start(response, ctx->server);
+
+    return response;
 }
 
 typedef struct {
@@ -138,7 +150,7 @@ static int __write(connection_t* connection);
 static int __deferred_handler(connection_t* connection, httprequest_t* request, httpresponse_t* response, queue_handler runner, queue_handler handle, queue_data_create data_create, ratelimiter_t* ratelimiter);
 static int __handle(connection_t* connection, httprequest_t* request, deferred_handler handler);
 static int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response);
-static int __get_redirect(connection_t* connection, httprequest_t* request);
+static int __get_redirect(connection_t* connection, httprequest_t* request, httpresponse_t* response);
 static int __apply_redirect(httprequest_t* request, httpresponse_t* response, deferred_handler handler);
 static void __queue_request_handler(void* arg);
 static void __queue_response_handler(void* arg);
@@ -501,6 +513,13 @@ int __write(connection_t* connection) {
     if (r == CWF_ERROR)
         return 0;
 
+    /* The whole response is on the wire: status, byte count and duration are
+     * all final, and this is the HTTP/1.1 half of the completion point the
+     * access log needs (h2_write_finished and h3's __write_stream are the other
+     * two). Not reached when the write failed, which is the intent -- a torn
+     * response was not served. */
+    http_access_log(ctx->request, response);
+
     /* Close on the answered request's terms, not on whatever the parser has
      * read since. With pipelining those differ: a "Connection: close" on the
      * third request had already cleared connection->keepalive by the time the
@@ -843,7 +862,7 @@ int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
 int __apply_redirect(httprequest_t* request, httpresponse_t* response, deferred_handler handler) {
     connection_t* connection = request->connection;
     
-    switch (__get_redirect(connection, request)) {
+    switch (__get_redirect(connection, request, response)) {
     case REDIRECT_OUT_OF_MEMORY:
     {
         httpresponse_default(response, 500);
@@ -878,7 +897,7 @@ int __apply_redirect(httprequest_t* request, httpresponse_t* response, deferred_
     return 0;
 }
 
-int __get_redirect(connection_t* connection, httprequest_t* request) {
+int __get_redirect(connection_t* connection, httprequest_t* request, httpresponse_t* response) {
     int loop_cycle = 1;
     int find_new_location = 0;
 
@@ -903,14 +922,36 @@ int __get_redirect(connection_t* connection, httprequest_t* request) {
 
         find_new_location = 1;
 
-        char* new_uri = redirect_get_uri(redirect, request->path, vector);
+        /* request->uri is still the target this iteration matched -- it is
+         * replaced a few lines below -- and on a second pass it is the previous
+         * destination, query and all, so the parameters keep travelling. */
+        char* new_uri = redirect_uri_with_query(redirect, request->path, vector,
+                                                request->uri, request->uri_length);
         if (new_uri == NULL) return REDIRECT_OUT_OF_MEMORY;
+
+        /* The target the client actually asked for is about to be replaced. An
+         * access record naming the destination instead of the request is no
+         * help in finding out what was asked for, so the response keeps a copy
+         * of it before the string goes -- and nothing is copied when there is
+         * no record to keep it for. */
+        http_access_log_keep_uri(response, request->uri, request->uri_length);
 
         if (request->uri) free((void*)request->uri);
         request->uri = NULL;
 
         if (request->path) free((void*)request->path);
         request->path = NULL;
+
+        /* And the parsed query, which belonged to the target being replaced.
+         * Left in place it is both a leak and wrong: __set_query overwrites
+         * request->query_ with the head of whatever it parses next, orphaning
+         * these -- and a handler behind the redirect would otherwise read the
+         * parameters of a URL that no longer applies. Anything the destination
+         * carries, including the query joined on above, is parsed back in by
+         * httpparser_set_uri below. */
+        queries_free(request->query_);
+        request->query_ = NULL;
+        request->last_query = NULL;
 
         if (httpresponse_redirect_is_external(new_uri)) {
             request->uri = new_uri;
@@ -1086,6 +1127,32 @@ void __queue_response_handler(void* arg) {
     __publish_response(item->connection, data->request, data->response);
 }
 
+/* The vhost's configured response headers (server.h: server_header_t).
+ *
+ * add_headeru rather than add_header, for the reason __apply_route_cache_control
+ * gives: the configured value is the site's default, and a handler that decided
+ * for this particular response outranks it. That is also why this runs here
+ * rather than at dispatch -- by now every producer of the response has had its
+ * say, so "the handler set its own Referrer-Policy" is a question that can be
+ * answered instead of guessed, and a duplicate field is impossible.
+ *
+ * Here rather than in http_server_dispatch() for a second reason: a response
+ * the dispatcher never saw -- the 400 of a malformed request line, the 404 of
+ * an unknown Host -- is still an answer this vhost gave, and the security
+ * headers belong on it too. Every protocol's write path passes through the
+ * filter chain, so one call covers HTTP/1.1, HTTP/2 and HTTP/3. */
+static void __apply_server_headers(httpresponse_t* response) {
+    const connection_t* connection = response->connection;
+    if (connection == NULL) return;
+
+    const connection_server_ctx_t* ctx = connection->ctx;
+    if (ctx == NULL || ctx->server == NULL) return;
+
+    for (const server_header_t* header = ctx->server->http.header; header; header = header->next)
+        response->add_headeru(response, header->key, header->key_length,
+                              header->value, header->value_length);
+}
+
 int __run_header_filters(httprequest_t* request, httpresponse_t* response) {
     if (response == NULL) {
         log_error("__run_header_filters: response is NULL\n");
@@ -1099,6 +1166,10 @@ int __run_header_filters(httprequest_t* request, httpresponse_t* response) {
         log_error("__run_header_filters: response->filter is NULL\n");
         return CWF_ERROR;
     }
+
+    /* Idempotent, which matters: a header pass that stops on EAGAIN comes back
+     * through here, and add_headeru already refuses a field that is present. */
+    __apply_server_headers(response);
 
     response->event_again = 0;
     response->cur_filter = response->filter;
@@ -1372,6 +1443,15 @@ int __sni_callback(SSL* ssl, int* ad, void* arg) {
     return SSL_TLSEXT_ERR_NOACK;
 }
 
+/* An answer produced without dispatching: a request the parser refused, or one
+ * addressed to a host this listener does not serve.
+ *
+ * There is no request object to pass on, and not only because __post_response
+ * would have nothing to do with one: the parser retires the half-read request
+ * as it gives up on it (httprequestparser.c, __clear), so by the time the
+ * status reaches here the target and the method are already gone. The access
+ * record for these carries the peer, the status and the size, and "-" where the
+ * request line would be. */
 int __post_response_default(connection_t* connection, int status_code) {
     httpresponse_t* response = __create_response(connection);
     if (response == NULL) return 0;

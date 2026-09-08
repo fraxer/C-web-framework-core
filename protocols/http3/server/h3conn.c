@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "accesslog.h"
 #include "connection_s.h"
 #include "h3response.h"
 #include "http_filter.h"
@@ -1072,6 +1073,10 @@ static int __write_stream(quicstream_t* qs, h3stream_t* st) {
      * only finishes the stream when it could prove up front that none follows,
      * so close it explicitly when it is still open. */
     if (!qs->send.fin) quicstream_finish(qs);
+
+    /* The response is complete: the HTTP/3 completion point for the access log,
+     * matching __write's for h1.1 and h2_write_finished's for h2. */
+    http_access_log(st->request, response);
 
     st->response_done = 1;
     atomic_store_explicit(&st->response_ready, 0, memory_order_release);

@@ -36,6 +36,12 @@ typedef struct mpxapi {
      * server layer wires the h2 idle/PING/shutdown sweep onto it. */
     void(*on_tick)(struct mpxapi*);
 
+    /* This worker's access-log staging area (accesslog_t*, see
+     * protocols/http/server/accesslog.h). Records are batched here and the tick
+     * drains them. void* for the reason quic_endpoints below is one: the event
+     * loop owns the pointer's slot, the http layer owns what it points at. */
+    void* access_log;
+
 #ifdef CWFR_HTTP3
     /* This worker's QUIC endpoints (quicendpoint_t*), so the tick can reach
      * them. Kept here rather than walked out of `conns` because the send queue

@@ -172,6 +172,12 @@ static httpresponse_t* __httpresponse_create(connection_t* connection, http_chai
     response->vary_encoding = 0;
     response->gzip_precompressed = 0;
     response->connect_tunnel = 0;
+    response->access_log = 0;
+    response->access_started.tv_sec = 0;
+    response->access_started.tv_nsec = 0;
+    response->body_bytes_sent = 0;
+    response->access_uri = NULL;
+    response->access_uri_length = 0;
     response->validator_mtime = 0;
     response->validator_size = 0;
     response->body_cache = NULL;
@@ -235,6 +241,13 @@ void __httpresponse_reset(httpresponse_t* response) {
     response->vary_encoding = 0;
     response->gzip_precompressed = 0;
     response->connect_tunnel = 0;
+    response->access_log = 0;
+    response->access_started.tv_sec = 0;
+    response->access_started.tv_nsec = 0;
+    response->body_bytes_sent = 0;
+    free(response->access_uri);
+    response->access_uri = NULL;
+    response->access_uri_length = 0;
     response->validator_mtime = 0;
     response->validator_size = 0;
 

@@ -1,3 +1,4 @@
+#include "accesslog.h"
 #include "log.h"
 #include "socket.h"
 #include "broadcast.h"
@@ -37,6 +38,16 @@ int mpxserver_run(appconfig_t* appconfig) {
         return result;
     }
     api->owner_config = appconfig;
+
+    /* Owned by this worker for as long as it runs: records are staged here and
+     * delivered in batches (accesslog.h). Created before anything can answer a
+     * request, freed below once nothing can. */
+    api->access_log = http_access_log_create();
+    if (api->access_log == NULL) {
+        appconfig_worker_failed();
+        api->free(api);
+        return result;
+    }
 
     listener_t* listeners = NULL;
 #ifdef CWFR_HTTP3
@@ -113,6 +124,13 @@ int mpxserver_run(appconfig_t* appconfig) {
     result = 1;
 
     failed:
+
+    /* Nothing staged survives this worker, so it goes out before the staging
+     * area does. Anything that still logs afterwards finds a NULL access_log
+     * and is delivered on its own. */
+    http_access_log_flush(api->access_log);
+    http_access_log_free(api->access_log);
+    api->access_log = NULL;
 
     /* result is 0 only on the way out of a startup failure -- the event loop
      * above sets it before it breaks -- so this is the single place every such
@@ -352,6 +370,11 @@ void __set_protocol(connection_t* connection) {
  * lifecycle and may close (and free) the connection, so next is captured first
  * and the connection is not touched after the call. */
 static void __mpx_on_tick(mpxapi_t* api) {
+    /* Access records this worker staged since the last tick. Delivered here so
+     * a batch never waits on a quiet server for longer than one tick, and on
+     * this thread because that is the one that staged them (accesslog.c). */
+    http_access_log_flush(api->access_log);
+
     /* appconfig() points at the newest generation after SIGUSR1. This worker
      * may belong to the previous one, whose shutdown bit is the signal that
      * makes H2/QUIC drain and ultimately releases connection_count. */

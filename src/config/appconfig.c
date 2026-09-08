@@ -289,6 +289,7 @@ void __appconfig_env_init(env_t* env) {
     env->main.tmp = NULL;
     env->main.log.enabled = false;
     env->main.log.level = 0;
+    env->main.log.access = false;
     env->mail.dkim_private = NULL;
     env->mail.dkim_selector = NULL;
     env->mail.host = NULL;
@@ -323,6 +324,7 @@ void __appconfig_env_free(env_t* env) {
 
     env->main.log.enabled = false;
     env->main.log.level = 0;
+    env->main.log.access = false;
 
     if (env->mail.dkim_private != NULL) {
         free(env->mail.dkim_private);

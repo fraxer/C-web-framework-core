@@ -180,6 +180,13 @@ static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* pare
     module->base.parent_buf = parent_buf;
     if (parent_buf == NULL) return CWF_ERROR;
 
+    /* The body bytes this pass took out of the chain, for the access log
+     * (accesslog.h). A cursor delta rather than a running total kept by the
+     * framer: the DATA frame headers h3data adds are framing, not body, and a
+     * pass that stops on a spent window resumes here and must not count the
+     * bytes it already reported. */
+    const size_t consumed_from = parent_buf->pos;
+
     /* The framing and the write-ahead budget live in h3data.c: the Extended
      * CONNECT tunnel of §8 needs the same two, and one copy of that arithmetic
      * is the point (the lesson h2 learned the other way round, docs/http2/09
@@ -187,6 +194,8 @@ static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* pare
     const h3_data_status_e st = h3_data_write(&module->writer, qc, qs, parent_buf,
                                               parent_buf->is_last,
                                               !__has_trailers(response));
+
+    response->body_bytes_sent += parent_buf->pos - consumed_from;
 
     quicconn_want_write(response->connection);
 

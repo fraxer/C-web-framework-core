@@ -23,6 +23,7 @@ server_t* server_create() {
     server->index = NULL;
     server->http.route = NULL;
     server->http.redirect = NULL;
+    server->http.header = NULL;
     server->http.middleware = NULL;
     server->http.ratelimiter = NULL;
     server->websockets.default_handler = NULL;
@@ -68,6 +69,9 @@ void servers_free(server_t* server) {
         if (server->http.redirect) redirect_free(server->http.redirect);
         server->http.redirect = NULL;
 
+        if (server->http.header) server_headers_free(server->http.header);
+        server->http.header = NULL;
+
         if (server->http.middleware) middlewares_free(server->http.middleware);
         server->http.middleware = NULL;
 
@@ -100,6 +104,45 @@ void servers_free(server_t* server) {
         free(server);
 
         server = next;
+    }
+}
+
+server_header_t* server_header_create(const char* key, const char* value) {
+    server_header_t* header = malloc(sizeof * header);
+    if (header == NULL) {
+        log_error("server_header_create: alloc memory for header failed\n");
+        return NULL;
+    }
+
+    header->key = NULL;
+    header->value = NULL;
+    header->key_length = strlen(key);
+    header->value_length = strlen(value);
+    header->next = NULL;
+
+    header->key = malloc(header->key_length + 1);
+    header->value = malloc(header->value_length + 1);
+    if (header->key == NULL || header->value == NULL) {
+        log_error("server_header_create: alloc memory for header value failed\n");
+        server_headers_free(header);
+        return NULL;
+    }
+
+    memcpy(header->key, key, header->key_length + 1);
+    memcpy(header->value, value, header->value_length + 1);
+
+    return header;
+}
+
+void server_headers_free(server_header_t* header) {
+    while (header != NULL) {
+        server_header_t* next = header->next;
+
+        free(header->key);
+        free(header->value);
+        free(header);
+
+        header = next;
     }
 }
 

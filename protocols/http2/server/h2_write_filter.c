@@ -307,11 +307,23 @@ static int __body(httprequest_t* request, httpresponse_t* response, bufo_t* pare
     module->base.parent_buf = parent_buf;
     if (parent_buf == NULL) return CWF_ERROR;
 
+    /* The body bytes this pass took out of the chain, for the access log
+     * (accesslog.h). A cursor delta rather than a running total kept by the
+     * framer: the DATA frame headers h2data adds are framing, not body, and a
+     * pass that stops on a spent window resumes here and must not count the
+     * bytes it already reported. */
+    const size_t consumed_from = parent_buf->pos;
+
     /* The framing itself lives in h2data.c — the WebSocket tunnel of RFC 8441
      * needs the same windows, quantum and frame-boundary rules, and having one
      * copy of that arithmetic is the point (docs/http2/09 §4.3). What stays
      * here is the translation into the filter chain's vocabulary. */
-    switch (h2_data_write(&module->writer, s, stream, parent_buf, !__has_trailers(response))) {
+    const h2_data_status_e status =
+        h2_data_write(&module->writer, s, stream, parent_buf, !__has_trailers(response));
+
+    response->body_bytes_sent += parent_buf->pos - consumed_from;
+
+    switch (status) {
     case H2_DATA_DRAINED:
         /* Nothing was framed, so a HEADERS block held back for a ride has no
          * ride: __has_body said there would be a body and there was none (an

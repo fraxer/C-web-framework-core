@@ -33,6 +33,11 @@ typedef enum {
 typedef struct env_log {
     bool enabled;
     int level;
+    /* The access log (protocols/http/server/accesslog.h): one record per
+     * answered request, in its own syslog facility. Independent of `enabled`
+     * above, which governs the log of server *events* -- wanting request
+     * records without debug chatter is the ordinary case. */
+    bool access;
 } env_log_t;
 
 typedef struct i18n i18n_t;

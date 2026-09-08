@@ -381,3 +381,166 @@ TEST(test_redirect_literal_flag) {
     TEST_ASSERT_EQUAL(0, captures->is_literal, "a location with groups is never literal");
     redirect_free(captures);
 }
+
+// ============================================================================
+// Carrying the request's query string onto the destination
+// (docs/webserver/00-headers-and-access-log.md, R.1).
+//
+// The redirect is matched against the request's `path`, which the parser has
+// already cut at the "?" — so the destination is built without the query, and
+// `/page?utm_source=ya` used to arrive at the target with the label gone.
+// redirect_carry_query answers what, if anything, has to be appended.
+// ============================================================================
+
+/* The whole step the http server takes: match, expand the destination, carry
+ * the query. `uri` is the request target as it arrived; the path it is matched
+ * on is the part before the "?", exactly as the parser splits it. */
+static char* redirect_exec_uri_with_query(redirect_t* redirect, const char* uri) {
+    const char* question = strchr(uri, '?');
+    const size_t path_length = question != NULL ? (size_t)(question - uri) : strlen(uri);
+
+    char path[256];
+    memcpy(path, uri, path_length);
+    path[path_length] = 0;
+
+    int vector[30];
+    memset(vector, -1, sizeof(vector));
+
+    if (pcre_exec_compat(redirect->location, path, vector, 30) < 0) return NULL;
+
+    return redirect_uri_with_query(redirect, path, vector, uri, strlen(uri));
+}
+
+TEST(test_redirect_query_carried) {
+    TEST_SUITE("redirect: query string");
+    TEST_CASE("a target without a query of its own inherits the request's");
+
+    redirect_t* r = redirect_create("^/old$", "/index.html");
+    TEST_REQUIRE_NOT_NULL(r, "redirect_create should succeed");
+
+    char* uri = redirect_exec_uri_with_query(r, "/old?utm_source=ya&a=1");
+    TEST_ASSERT_STR_EQUAL("/index.html?utm_source=ya&a=1", uri,
+                          "the whole query, '?' included, is appended");
+    free(uri);
+    redirect_free(r);
+
+    /* The typical rule of every site that redirects to https: the destination
+     * is external, and the label has to survive the hop. */
+    redirect_t* external = redirect_create("^/$", "https://example.com/");
+    TEST_REQUIRE_NOT_NULL(external, "redirect_create should succeed");
+
+    uri = redirect_exec_uri_with_query(external, "/?utm_source=ya");
+    TEST_ASSERT_STR_EQUAL("https://example.com/?utm_source=ya", uri,
+                          "an external destination carries it too");
+    free(uri);
+    redirect_free(external);
+}
+
+TEST(test_redirect_query_target_wins) {
+    TEST_CASE("a target with its own query is left alone");
+
+    /* Merging two sets of parameters would be a surprise: the operator wrote
+     * these deliberately. */
+    redirect_t* r = redirect_create("^/withq$", "/index.html?b=2");
+    TEST_REQUIRE_NOT_NULL(r, "redirect_create should succeed");
+
+    char* uri = redirect_exec_uri_with_query(r, "/withq?a=1");
+    TEST_ASSERT_STR_EQUAL("/index.html?b=2", uri, "the destination's own query stands");
+
+    free(uri);
+    redirect_free(r);
+
+    size_t length = 123;
+    TEST_ASSERT_NULL((void*)redirect_carry_query("/new?b=2", "/old?a=1", 8, &length),
+                     "nothing is offered to carry");
+    TEST_ASSERT_EQUAL_SIZE(0, length, "and the length is cleared");
+}
+
+TEST(test_redirect_query_absent) {
+    TEST_CASE("a request without a query leaves no dangling '?'");
+
+    redirect_t* r = redirect_create("^/old", "/index.html");
+    TEST_REQUIRE_NOT_NULL(r, "redirect_create should succeed");
+
+    char* uri = redirect_exec_uri_with_query(r, "/old");
+    TEST_ASSERT_STR_EQUAL("/index.html", uri, "nothing is appended");
+    free(uri);
+
+    /* A bare trailing "?" is not a query: it holds no parameters, and carrying
+     * it would put a dangling character on the Location. */
+    uri = redirect_exec_uri_with_query(r, "/old?");
+    TEST_ASSERT_STR_EQUAL("/index.html", uri, "a bare '?' is not carried");
+    free(uri);
+
+    /* A fragment is not a query either — and a client is not supposed to send
+     * one, so this only says the search is for '?' and nothing else. */
+    uri = redirect_exec_uri_with_query(r, "/old#frag");
+    TEST_ASSERT_STR_EQUAL("/index.html", uri, "a fragment is not a query");
+    free(uri);
+
+    redirect_free(r);
+}
+
+TEST(test_redirect_query_length_bounded) {
+    TEST_CASE("the query is taken by length, not by the terminator");
+
+    /* The http server hands over request->uri and request->uri_length, and the
+     * length is authoritative: the string may be shared with more than the
+     * target being redirected. */
+    size_t length = 0;
+    const char* uri = "/old?a=1&b=2";
+    const char* query = redirect_carry_query("/new", uri, 8, &length);
+
+    TEST_REQUIRE_NOT_NULL((void*)query, "a query is found within the given length");
+    TEST_ASSERT_EQUAL_SIZE(4, length, "and stops where the length says");
+    TEST_ASSERT(memcmp(query, "?a=1", 4) == 0, "which is exactly '?a=1'");
+
+    /* The '?' itself lies past the length: there is no query to be seen. */
+    TEST_ASSERT_NULL((void*)redirect_carry_query("/new", uri, 4, &length),
+                     "a '?' past the length is not found");
+}
+
+TEST(test_redirect_query_null_safe) {
+    TEST_CASE("a missing target or request URI is not a crash");
+
+    size_t length = 7;
+    TEST_ASSERT_NULL((void*)redirect_carry_query("/new", NULL, 0, &length),
+                     "no request URI, nothing to carry");
+    TEST_ASSERT_EQUAL_SIZE(0, length, "length cleared");
+
+    length = 7;
+    TEST_ASSERT_NULL((void*)redirect_carry_query(NULL, "/old?a=1", 8, &length),
+                     "no target, nothing to carry");
+    TEST_ASSERT_EQUAL_SIZE(0, length, "length cleared");
+}
+
+TEST(test_redirect_query_carried_through_expansion) {
+    TEST_CASE("a destination built from capture groups carries it too");
+
+    /* The match runs on the path without the query, so `(.*)` never captures
+     * it — the query is appended afterwards, not substituted, which is what the
+     * author of the rule expects. */
+    redirect_t* r = redirect_create("^/user/(\\d+)$", "/profile/{1}");
+    TEST_REQUIRE_NOT_NULL(r, "redirect_create should succeed");
+
+    char* uri = redirect_exec_uri_with_query(r, "/user/42?ref=mail");
+    TEST_ASSERT_STR_EQUAL("/profile/42?ref=mail", uri,
+                          "the group took the path, the query followed it");
+    free(uri);
+
+    redirect_free(r);
+}
+
+TEST(test_redirect_query_greedy_group) {
+    TEST_CASE("a greedy (.*) still does not swallow the query");
+
+    redirect_t* r = redirect_create("^/section/(.*)$", "/one/{1}");
+    TEST_REQUIRE_NOT_NULL(r, "redirect_create should succeed");
+
+    char* uri = redirect_exec_uri_with_query(r, "/section/deep/path?a=1&b=2");
+    TEST_ASSERT_STR_EQUAL("/one/deep/path?a=1&b=2", uri,
+                          "the group stopped at the path, the query was appended once");
+    free(uri);
+
+    redirect_free(r);
+}

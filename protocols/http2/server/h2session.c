@@ -13,6 +13,7 @@
 #include <sys/socket.h>
 #include <time.h>
 
+#include "accesslog.h"
 #include "appconfig.h"
 #include "base64.h"
 #include "connection_queue.h"
@@ -2047,6 +2048,10 @@ typedef enum {
  * response is retired all the same — leaving it staged would make the next
  * write pass re-run the filter chain and send a second HEADERS block. */
 static void h2_write_finished(h2session_t* s, h2stream_t* stream) {
+    /* Before either branch below: both of them let go of the response, and one
+     * of them resets it back into the session's pool. */
+    http_access_log(stream->request, stream->response);
+
     /* A tunnel whose CLOSE frame has left carried END_STREAM out with it, so
      * the stream really is finished — the ordinary teardown applies. */
     if (stream->ws == NULL || stream->end_stream_sent) {
