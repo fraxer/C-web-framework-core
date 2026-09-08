@@ -171,3 +171,167 @@ TEST(test_smtpresponse_null_arg_does_not_crash) {
 
     TEST_ASSERT(1, "reached here without crashing on NULL handles");
 }
+
+/* -------------------------------------------------------------------------- */
+/* EHLO capabilities (smtpresponse_parse_capability)                          */
+/* -------------------------------------------------------------------------- */
+
+/* Feed one EHLO reply line, written the way a server sends it. */
+#define PARSE_LINE(r, literal) smtpresponse_parse_capability((r), (literal), sizeof(literal) - 1)
+
+TEST(test_smtpresponse_capabilities_initially_empty) {
+    TEST_SUITE("SMTP Response - EHLO capabilities");
+    TEST_CASE("a fresh response announces nothing");
+
+    smtpresponse_t* r = smtpresponse_create(NULL);
+    TEST_REQUIRE_NOT_NULL(r, "create should succeed");
+
+    TEST_ASSERT_EQUAL(0, (int)r->extensions, "no extensions");
+    TEST_ASSERT_EQUAL(0, (int)r->auth_mechanisms, "no auth mechanisms");
+    TEST_ASSERT_EQUAL(0, (int)r->size_limit, "no size limit");
+
+    r->base.free(r);
+}
+
+TEST(test_smtpresponse_capabilities_full_ehlo) {
+    TEST_CASE("a complete EHLO reply yields STARTTLS, SIZE with its value, and both AUTH mechanisms");
+
+    smtpresponse_t* r = smtpresponse_create(NULL);
+    TEST_REQUIRE_NOT_NULL(r, "create should succeed");
+
+    PARSE_LINE(r, "250-smtp.mail.ru Hello\r\n");
+    PARSE_LINE(r, "250-SIZE 73400320\r\n");
+    PARSE_LINE(r, "250-STARTTLS\r\n");
+    PARSE_LINE(r, "250-AUTH PLAIN LOGIN\r\n");
+    PARSE_LINE(r, "250 HELP\r\n");
+
+    TEST_ASSERT((r->extensions & SMTPRESPONSE_EXT_STARTTLS) != 0, "STARTTLS announced");
+    TEST_ASSERT((r->extensions & SMTPRESPONSE_EXT_SIZE) != 0, "SIZE announced");
+    TEST_ASSERT((r->extensions & SMTPRESPONSE_EXT_AUTH) != 0, "AUTH announced");
+    TEST_ASSERT_EQUAL(73400320, (int)r->size_limit, "SIZE value parsed");
+    TEST_ASSERT((r->auth_mechanisms & SMTPRESPONSE_AUTH_PLAIN) != 0, "PLAIN offered");
+    TEST_ASSERT((r->auth_mechanisms & SMTPRESPONSE_AUTH_LOGIN) != 0, "LOGIN offered");
+
+    r->base.free(r);
+}
+
+TEST(test_smtpresponse_capabilities_on_final_line) {
+    TEST_CASE("the final line of a reply carries a keyword too");
+
+    smtpresponse_t* r = smtpresponse_create(NULL);
+    TEST_REQUIRE_NOT_NULL(r, "create should succeed");
+
+    PARSE_LINE(r, "250-example.org Hello\r\n");
+    PARSE_LINE(r, "250 AUTH LOGIN\r\n");
+
+    TEST_ASSERT((r->extensions & SMTPRESPONSE_EXT_AUTH) != 0, "AUTH announced on the final line");
+    TEST_ASSERT((r->auth_mechanisms & SMTPRESPONSE_AUTH_LOGIN) != 0, "LOGIN offered");
+    TEST_ASSERT_EQUAL(0, (int)(r->auth_mechanisms & SMTPRESPONSE_AUTH_PLAIN), "PLAIN not offered");
+
+    r->base.free(r);
+}
+
+TEST(test_smtpresponse_capabilities_case_and_equals_form) {
+    TEST_CASE("keywords are case-insensitive and the legacy AUTH=... form is understood");
+
+    smtpresponse_t* r = smtpresponse_create(NULL);
+    TEST_REQUIRE_NOT_NULL(r, "create should succeed");
+
+    PARSE_LINE(r, "250-starttls\r\n");
+    PARSE_LINE(r, "250 AUTH=plain login\r\n");
+
+    TEST_ASSERT((r->extensions & SMTPRESPONSE_EXT_STARTTLS) != 0, "lowercase STARTTLS recognised");
+    TEST_ASSERT((r->auth_mechanisms & SMTPRESPONSE_AUTH_PLAIN) != 0, "PLAIN from the '=' form");
+    TEST_ASSERT((r->auth_mechanisms & SMTPRESPONSE_AUTH_LOGIN) != 0, "LOGIN from the '=' form");
+
+    r->base.free(r);
+}
+
+TEST(test_smtpresponse_capabilities_ignore_non_250) {
+    TEST_CASE("a non-250 reply is free text and is not mined for keywords");
+
+    smtpresponse_t* r = smtpresponse_create(NULL);
+    TEST_REQUIRE_NOT_NULL(r, "create should succeed");
+
+    PARSE_LINE(r, "500-STARTTLS is not available here\r\n");
+    PARSE_LINE(r, "500 AUTH PLAIN is not available either\r\n");
+
+    TEST_ASSERT_EQUAL(0, (int)r->extensions, "nothing taken from a 5xx reply");
+    TEST_ASSERT_EQUAL(0, (int)r->auth_mechanisms, "no mechanisms taken from a 5xx reply");
+
+    r->base.free(r);
+}
+
+TEST(test_smtpresponse_capabilities_word_boundary) {
+    TEST_CASE("a keyword must end at a word boundary");
+
+    smtpresponse_t* r = smtpresponse_create(NULL);
+    TEST_REQUIRE_NOT_NULL(r, "create should succeed");
+
+    PARSE_LINE(r, "250-STARTTLSX\r\n");
+    PARSE_LINE(r, "250-SIZEX 100\r\n");
+    PARSE_LINE(r, "250 AUTHENTICATE PLAIN\r\n");
+
+    TEST_ASSERT_EQUAL(0, (int)r->extensions, "no prefix match on a longer keyword");
+    TEST_ASSERT_EQUAL(0, (int)r->size_limit, "no SIZE value from SIZEX");
+    TEST_ASSERT_EQUAL(0, (int)r->auth_mechanisms, "no mechanisms from AUTHENTICATE");
+
+    r->base.free(r);
+}
+
+TEST(test_smtpresponse_capabilities_size_without_value) {
+    TEST_CASE("SIZE with no argument sets the flag and leaves the limit at 0");
+
+    smtpresponse_t* r = smtpresponse_create(NULL);
+    TEST_REQUIRE_NOT_NULL(r, "create should succeed");
+
+    PARSE_LINE(r, "250 SIZE\r\n");
+
+    TEST_ASSERT((r->extensions & SMTPRESPONSE_EXT_SIZE) != 0, "SIZE announced");
+    TEST_ASSERT_EQUAL(0, (int)r->size_limit, "limit stays 0 when unstated");
+
+    r->base.free(r);
+}
+
+TEST(test_smtpresponse_capabilities_reset) {
+    TEST_CASE("reset_capabilities forgets the previous EHLO (the pre-STARTTLS one)");
+
+    smtpresponse_t* r = smtpresponse_create(NULL);
+    TEST_REQUIRE_NOT_NULL(r, "create should succeed");
+
+    PARSE_LINE(r, "250-STARTTLS\r\n");
+    PARSE_LINE(r, "250 SIZE 100\r\n");
+    TEST_ASSERT(r->extensions != 0, "capabilities recorded");
+
+    smtpresponse_reset_capabilities(r);
+
+    TEST_ASSERT_EQUAL(0, (int)r->extensions, "extensions cleared");
+    TEST_ASSERT_EQUAL(0, (int)r->auth_mechanisms, "mechanisms cleared");
+    TEST_ASSERT_EQUAL(0, (int)r->size_limit, "size limit cleared");
+
+    /* The generic reset() must clear them as well, since it is what the
+     * connection layer calls between uses. */
+    PARSE_LINE(r, "250 STARTTLS\r\n");
+    r->base.reset(r);
+    TEST_ASSERT_EQUAL(0, (int)r->extensions, "base.reset clears capabilities too");
+
+    r->base.free(r);
+}
+
+TEST(test_smtpresponse_capabilities_malformed_lines) {
+    TEST_CASE("truncated or NULL input is ignored without reading past the buffer");
+
+    smtpresponse_t* r = smtpresponse_create(NULL);
+    TEST_REQUIRE_NOT_NULL(r, "create should succeed");
+
+    smtpresponse_parse_capability(NULL, "250 STARTTLS\r\n", 14);
+    smtpresponse_parse_capability(r, NULL, 10);
+    PARSE_LINE(r, "250");
+    PARSE_LINE(r, "");
+    PARSE_LINE(r, "250 ");
+    PARSE_LINE(r, "250X STARTTLS\r\n");
+
+    TEST_ASSERT_EQUAL(0, (int)r->extensions, "nothing recorded from malformed input");
+
+    r->base.free(r);
+}

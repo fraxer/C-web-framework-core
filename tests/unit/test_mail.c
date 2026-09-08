@@ -10,9 +10,12 @@
 #include <openssl/pem.h>
 #include <openssl/buffer.h>
 
+#include <fcntl.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/socket.h>
 #include <time.h>
+#include <unistd.h>
 
 /* The internal helpers are not declared in mail.h; redeclare them here so the
  * pure string/date/content/header builders can be unit-tested in isolation.
@@ -568,4 +571,586 @@ TEST(test_mail_build_content_no_leak) {
     __mail_free(m);
     free(pem);
     EVP_PKEY_free(pkey);
+}
+
+/* -------------------------------------------------------------------------- */
+/* __mail_build_content without DKIM (S.6)                                    */
+/* -------------------------------------------------------------------------- */
+
+TEST(test_mail_build_content_without_dkim_key) {
+    TEST_CASE("an empty DKIM key produces an unsigned message instead of no message");
+
+    /* The regression this covers: dkim_create_sign() returns NULL when the key
+     * is unset, __mail_build_content used to treat that as fatal, and every
+     * send from a configuration without DKIM failed with "Failed to send mail"
+     * — while config.md documented the opposite. */
+    mail_test_env_setup("example.com", "", "");
+
+    mail_t* m = mail_create();
+    TEST_REQUIRE_NOT_NULL(m, "mail_create should succeed");
+
+    m->request_data = smtprequest_data_create(NULL);
+    TEST_REQUIRE_NOT_NULL(m->request_data, "request_data allocated");
+
+    TEST_ASSERT_EQUAL(1, __mail_set_from(m, "alice@example.com", "Alice"), "set_from");
+    TEST_ASSERT_EQUAL(1, __mail_set_to(m, "bob@example.com"), "set_to");
+    TEST_ASSERT_EQUAL(1, __mail_set_subject(m, "Hello"), "set_subject");
+    TEST_ASSERT_EQUAL(1, __mail_set_content(m, "Hello, body!"), "set_content");
+
+    TEST_ASSERT_EQUAL(1, __mail_build_content(m), "build_content succeeds with no DKIM key");
+    TEST_ASSERT_EQUAL(0, m->reseted, "the session is not marked reseted");
+
+    smtprequest_data_t* rd = m->request_data;
+    const char* c = rd->content;
+    const size_t cs = rd->content_size;
+
+    TEST_ASSERT_NOT_NULL(c, "content buffer allocated");
+    TEST_ASSERT_EQUAL(0, mail_test_contains(c, cs, "DKIM-Signature:"), "no DKIM-Signature header");
+
+    /* Everything else is still a complete message. */
+    TEST_ASSERT(mail_test_contains(c, cs, "From:"), "has From header");
+    TEST_ASSERT(mail_test_contains(c, cs, "To:"), "has To header");
+    TEST_ASSERT(mail_test_contains(c, cs, "Subject:"), "has Subject header");
+    TEST_ASSERT(mail_test_contains(c, cs, "Date:"), "has Date header");
+    TEST_ASSERT(mail_test_contains(c, cs, "Message-Id:"), "has Message-Id header");
+    TEST_ASSERT(mail_test_contains(c, cs, "MIME-Version:"), "has MIME-Version header");
+    TEST_ASSERT(mail_test_contains(c, cs, "\r\n.\r\n"), "ends with DATA terminator");
+
+    __mail_free(m);
+}
+
+TEST(test_mail_build_content_without_dkim_selector) {
+    TEST_CASE("a key with no selector also yields an unsigned message");
+
+    EVP_PKEY* pkey = mail_test_generate_keypair();
+    TEST_REQUIRE_NOT_NULL(pkey, "keypair generation should succeed");
+    char* pem = mail_test_private_pem(pkey);
+    TEST_REQUIRE_NOT_NULL(pem, "private PEM extraction should succeed");
+
+    mail_test_env_setup("example.com", "", pem);
+
+    mail_t* m = mail_create();
+    TEST_REQUIRE_NOT_NULL(m, "mail_create should succeed");
+    m->request_data = smtprequest_data_create(NULL);
+    TEST_REQUIRE_NOT_NULL(m->request_data, "request_data allocated");
+
+    __mail_set_from(m, "alice@example.com", "Alice");
+    __mail_set_to(m, "bob@example.com");
+    __mail_set_subject(m, "Hi");
+    __mail_set_content(m, "body");
+
+    TEST_ASSERT_EQUAL(1, __mail_build_content(m), "build_content succeeds");
+    TEST_ASSERT_EQUAL(0, mail_test_contains(m->request_data->content, m->request_data->content_size, "DKIM-Signature:"),
+        "no DKIM-Signature without a selector");
+
+    __mail_free(m);
+    free(pem);
+    EVP_PKEY_free(pkey);
+}
+
+TEST(test_mail_message_id_without_host) {
+    TEST_CASE("an unset mail.host still yields a syntactically valid Message-Id");
+
+    /* Relay mode makes this routine: the sender's own domain is often not
+     * configured at all, and an empty EHLO argument or "<...@>" is a syntax
+     * error rather than a missing nicety. */
+    mail_test_env_setup("", "", "");
+
+    mail_t* m = mail_create();
+    TEST_REQUIRE_NOT_NULL(m, "mail_create should succeed");
+
+    time_t rawtime = 1700000000;
+    TEST_ASSERT_EQUAL(1, __mail_set_message_id(m, &rawtime), "set_message_id returns 1");
+    TEST_ASSERT(strstr(m->message_id.value, "@") != NULL, "has an '@'");
+    TEST_ASSERT(strstr(m->message_id.value, "@>") == NULL, "domain part is not empty");
+
+    __mail_free(m);
+}
+
+/* -------------------------------------------------------------------------- */
+/* send_mail_result: why a send failed (S.7)                                   */
+/* -------------------------------------------------------------------------- */
+
+TEST(test_mail_result_reports_failure_reason) {
+    TEST_CASE("a failed send fills the caller's mail_result_t");
+
+    /* Relay mode against a port nothing listens on: no MX lookup, no DNS, and
+     * connect() is refused immediately — which is also what proves the relay
+     * path skips mail_is_real() entirely (the recipient domain here has no MX
+     * and would have been rejected before a socket was ever opened). */
+    mail_test_env_setup("example.com", "", "");
+
+    env_mail_relay_t saved = env()->mail.relay;
+
+    env()->mail.relay.enabled = true;
+    env()->mail.relay.host = (char*)"127.0.0.1";
+    env()->mail.relay.port = 1;   /* a privileged port nothing binds */
+    env()->mail.relay.security = ENV_MAIL_SECURITY_NONE;
+    env()->mail.relay.user = NULL;
+    env()->mail.relay.password = NULL;
+    env()->mail.relay.auth = ENV_MAIL_AUTH_AUTO;
+    env()->mail.relay.timeout = 1;
+    env()->mail.relay.verify = false;
+
+    mail_payload_t payload = {
+        .from = "alice@example.com",
+        .from_name = "Alice",
+        .to = "bob@invalid.invalid",
+        .subject = "Hello",
+        .body = "body"
+    };
+
+    mail_result_t result;
+    memset(&result, 0xAA, sizeof(result));   /* the callee must fill every field */
+
+    TEST_ASSERT_EQUAL(0, send_mail_result(&payload, &result), "send fails against a closed port");
+
+    /* No reply ever arrived, so the code is 0 (as opposed to a 4xx/5xx the
+     * caller could act on) and the text says which step gave up. */
+    TEST_ASSERT_EQUAL(0, result.status, "no SMTP reply code when the connect fails");
+    TEST_ASSERT_STR_EQUAL("Failed to connect", result.error, "the failing step is named");
+
+    /* Plain send_mail() is the same call with no reporting, and must not fall
+     * over on the NULL result. */
+    TEST_ASSERT_EQUAL(0, send_mail(&payload), "send_mail() behaves identically");
+
+    env()->mail.relay = saved;
+}
+
+TEST(test_mail_result_survives_a_second_send) {
+    TEST_CASE("the answer belongs to the caller: a later send does not overwrite it");
+
+    /* This is what the thread-local version could not do — its values were
+     * valid only until the next send in the same thread. */
+    mail_test_env_setup("example.com", "", "");
+
+    env_mail_relay_t saved = env()->mail.relay;
+
+    env()->mail.relay.enabled = true;
+    env()->mail.relay.host = (char*)"127.0.0.1";
+    env()->mail.relay.port = 1;
+    env()->mail.relay.security = ENV_MAIL_SECURITY_NONE;
+    env()->mail.relay.user = NULL;
+    env()->mail.relay.password = NULL;
+    env()->mail.relay.auth = ENV_MAIL_AUTH_AUTO;
+    env()->mail.relay.timeout = 1;
+    env()->mail.relay.verify = false;
+
+    mail_payload_t payload = {
+        .from = "alice@example.com",
+        .from_name = "Alice",
+        .to = "bob@invalid.invalid",
+        .subject = "Hello",
+        .body = "body"
+    };
+
+    mail_result_t first;
+    TEST_ASSERT_EQUAL(0, send_mail_result(&payload, &first), "first send fails");
+
+    mail_result_t second;
+    TEST_ASSERT_EQUAL(0, send_mail_result(&payload, &second), "second send fails");
+
+    TEST_ASSERT_STR_EQUAL("Failed to connect", first.error, "the first answer is still intact");
+    TEST_ASSERT_EQUAL(0, first.status, "the first status is still intact");
+
+    env()->mail.relay = saved;
+}
+
+TEST(test_mail_result_guards) {
+    TEST_CASE("a rejected argument still leaves a usable result, and NULL is accepted");
+
+    mail_result_t result;
+    memset(&result, 0xAA, sizeof(result));
+
+    TEST_ASSERT_EQUAL(0, send_mail_result(NULL, &result), "NULL payload returns 0");
+    TEST_ASSERT_EQUAL(0, result.status, "status cleared");
+    TEST_ASSERT_EQUAL(0, result.error[0], "error cleared, not left uninitialised");
+
+    TEST_ASSERT_EQUAL(0, send_mail_result(NULL, NULL), "a NULL result is not dereferenced");
+    TEST_ASSERT_EQUAL(0, send_mail(NULL), "send_mail(NULL) returns 0");
+}
+
+TEST(test_mail_set_error_trims_and_clears) {
+    TEST_CASE("mail_set_error stores the reason on the session, trimming the reply CRLF");
+
+    mail_t* m = mail_create();
+    TEST_REQUIRE_NOT_NULL(m, "mail_create should succeed");
+
+    TEST_ASSERT_EQUAL(0, m->last_status, "a new session has no recorded status");
+    TEST_ASSERT_EQUAL(0, m->last_error[0], "a new session has no recorded error");
+
+    mail_set_error(m, 535, "535 5.7.8 Error: authentication failed\r\n");
+    TEST_ASSERT_EQUAL(535, m->last_status, "status stored");
+    TEST_ASSERT_STR_EQUAL("535 5.7.8 Error: authentication failed", m->last_error, "CRLF trimmed");
+
+    mail_set_error(m, 0, NULL);
+    TEST_ASSERT_EQUAL(0, m->last_status, "status cleared");
+    TEST_ASSERT_EQUAL(0, m->last_error[0], "a NULL message clears the text");
+
+    mail_set_error(NULL, 500, "ignored");   /* must not dereference */
+
+    __mail_free(m);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Relay: EHLO capabilities, the STARTTLS gate and AUTH (S.3, S.4)            */
+/* -------------------------------------------------------------------------- */
+
+/* These drive the real client over an AF_UNIX socketpair, the way
+ * test_smtpclienthandlers.c does: the server side of the exchange is staged
+ * into the peer end up front, so the client's blocking read always finds its
+ * reply waiting. No TLS is involved — "security": "none" is a configured mode,
+ * and it is the one that leaves the SMTP dialogue readable.
+ *
+ * SOCK_SEQPACKET rather than SOCK_STREAM, because the client reads one reply
+ * per recv(): over a stream, several staged replies coalesce into a single
+ * recv, the parser completes on the first and the rest of the buffer is
+ * dropped. A real server never gets ahead of the client like that; the packet
+ * boundaries reproduce the one-reply-per-read the client actually sees. */
+
+int __mail_connection_setup(mail_t* instance, const int fd, const unsigned short port);
+int __mail_send_hello(mail_t* instance);
+int __mail_start_tls(mail_t* instance);
+int __mail_auth(mail_t* instance);
+
+typedef struct {
+    mail_t* mail;
+    int peer_fd;
+    env_mail_relay_t saved_relay;
+} mail_relay_harness_t;
+
+static void mail_relay_harness_free(mail_relay_harness_t* h) {
+    if (h->mail != NULL) {
+        h->mail->free(h->mail);   /* closes the client end of the pair */
+        h->mail = NULL;
+    }
+    if (h->peer_fd != -1) {
+        close(h->peer_fd);
+        h->peer_fd = -1;
+    }
+
+    env()->mail.relay = h->saved_relay;
+}
+
+/* A connected mail_t whose socket is one end of a socketpair, plus a relay
+ * configuration with credentials. The caller stages the server's replies with
+ * mail_relay_stage() before each client step. */
+static int mail_relay_harness_init(mail_relay_harness_t* h, env_mail_security_e security, env_mail_auth_e auth) {
+    memset(h, 0, sizeof *h);
+    h->peer_fd = -1;
+    h->saved_relay = env()->mail.relay;
+
+    int fds[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, fds) != 0) return 0;
+
+    /* A read that finds nothing staged must fail rather than hang the suite. */
+    struct timeval timeout = { .tv_sec = 2, .tv_usec = 0 };
+    setsockopt(fds[0], SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(fds[0], SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    h->mail = mail_create();
+    if (h->mail == NULL) {
+        close(fds[0]);
+        close(fds[1]);
+        return 0;
+    }
+
+    if (!__mail_connection_setup(h->mail, fds[0], 587)) {
+        h->mail->free(h->mail);
+        h->mail = NULL;
+        close(fds[1]);
+        return 0;
+    }
+
+    h->peer_fd = fds[1];
+
+    env()->mail.relay.enabled = true;
+    env()->mail.relay.host = (char*)"relay.example.org";
+    env()->mail.relay.port = 587;
+    env()->mail.relay.security = security;
+    env()->mail.relay.auth = auth;
+    env()->mail.relay.user = (char*)"info@example.com";
+    env()->mail.relay.password = (char*)"s3cret";
+    env()->mail.relay.timeout = 2;
+    env()->mail.relay.verify = false;
+
+    return 1;
+}
+
+/* One staged reply — one datagram, hence one recv() on the client side. */
+static void mail_relay_stage(mail_relay_harness_t* h, const char* reply) {
+    const ssize_t n = write(h->peer_fd, reply, strlen(reply));
+    (void)n;
+}
+
+/* Everything the client has written so far, concatenated and NUL-terminated.
+ * Non-blocking, so an empty socket yields "" instead of hanging. */
+static size_t mail_relay_sent(mail_relay_harness_t* h, char* out, size_t size) {
+    const int flags = fcntl(h->peer_fd, F_GETFL, 0);
+    fcntl(h->peer_fd, F_SETFL, flags | O_NONBLOCK);
+
+    size_t total = 0;
+    while (total + 1 < size) {
+        const ssize_t n = read(h->peer_fd, out + total, size - total - 1);
+        if (n <= 0) break;
+        total += (size_t)n;
+    }
+    out[total] = '\0';
+
+    fcntl(h->peer_fd, F_SETFL, flags);
+    return total;
+}
+
+/* The base64 argument of the client's "AUTH PLAIN <arg>" line, decoded. Returns
+ * the decoded length, or -1 when the line is not there. */
+static int mail_relay_decode_auth_plain(const char* sent, char* out, size_t size) {
+    const char* start = strstr(sent, "AUTH PLAIN ");
+    if (start == NULL) return -1;
+    start += strlen("AUTH PLAIN ");
+
+    const char* end = strstr(start, "\r\n");
+    if (end == NULL) return -1;
+
+    char b64[512];
+    const size_t length = (size_t)(end - start);
+    if (length >= sizeof(b64)) return -1;
+    memcpy(b64, start, length);
+    b64[length] = '\0';
+
+    const int decoded = base64_decode(out, b64);
+    if (decoded < 0 || (size_t)decoded >= size) return -1;
+
+    return decoded;
+}
+
+TEST(test_mail_relay_auth_plain) {
+    TEST_SUITE("Mail relay - AUTH");
+    TEST_CASE("AUTH PLAIN sends base64(\\0user\\0password) and accepts 235");
+
+    mail_relay_harness_t h;
+    TEST_REQUIRE(mail_relay_harness_init(&h, ENV_MAIL_SECURITY_NONE, ENV_MAIL_AUTH_AUTO), "harness init");
+
+    mail_relay_stage(&h,
+        "250-relay.example.org Hello\r\n"
+        "250-SIZE 10240000\r\n"
+        "250-AUTH PLAIN LOGIN\r\n"
+        "250 HELP\r\n");
+    mail_relay_stage(&h, "235 2.7.0 Authentication successful\r\n");
+
+    TEST_ASSERT_EQUAL(1, __mail_send_hello(h.mail), "EHLO accepted");
+    TEST_ASSERT_EQUAL(1, __mail_auth(h.mail), "AUTH succeeds");
+
+    char sent[1024];
+    mail_relay_sent(&h, sent, sizeof(sent));
+
+    TEST_ASSERT(strstr(sent, "EHLO ") != NULL, "EHLO was sent");
+    TEST_ASSERT(strstr(sent, "AUTH PLAIN ") != NULL, "PLAIN was chosen over LOGIN");
+    TEST_ASSERT_NULL(strstr(sent, "s3cret"), "the password never appears in the clear");
+
+    /* RFC 4616: an empty authorization identity, the login and the password,
+     * NUL-separated. */
+    char decoded[256];
+    const int decoded_length = mail_relay_decode_auth_plain(sent, decoded, sizeof(decoded));
+    const char expected[] = "\0info@example.com\0s3cret";
+
+    TEST_ASSERT_EQUAL((int)sizeof(expected) - 1, decoded_length, "decoded credential has the expected length");
+    if (decoded_length == (int)sizeof(expected) - 1)
+        TEST_ASSERT_EQUAL(0, memcmp(decoded, expected, sizeof(expected) - 1), "decodes to \\0user\\0password");
+
+    mail_relay_harness_free(&h);
+}
+
+TEST(test_mail_relay_auth_login) {
+    TEST_CASE("AUTH LOGIN answers both 334 challenges with base64 of user and password");
+
+    mail_relay_harness_t h;
+    TEST_REQUIRE(mail_relay_harness_init(&h, ENV_MAIL_SECURITY_NONE, ENV_MAIL_AUTH_AUTO), "harness init");
+
+    /* Only LOGIN is offered, so "auto" has to fall back to it. */
+    mail_relay_stage(&h,
+        "250-relay.example.org Hello\r\n"
+        "250 AUTH LOGIN\r\n");
+    mail_relay_stage(&h, "334 VXNlcm5hbWU6\r\n");
+    mail_relay_stage(&h, "334 UGFzc3dvcmQ6\r\n");
+    mail_relay_stage(&h, "235 2.7.0 Authentication successful\r\n");
+
+    TEST_ASSERT_EQUAL(1, __mail_send_hello(h.mail), "EHLO accepted");
+    TEST_ASSERT_EQUAL(1, __mail_auth(h.mail), "AUTH succeeds");
+
+    char sent[1024];
+    mail_relay_sent(&h, sent, sizeof(sent));
+
+    TEST_ASSERT(strstr(sent, "AUTH LOGIN\r\n") != NULL, "LOGIN was chosen when PLAIN is not offered");
+    TEST_ASSERT_NULL(strstr(sent, "AUTH PLAIN"), "PLAIN was not attempted");
+    TEST_ASSERT_NULL(strstr(sent, "s3cret"), "the password never appears in the clear");
+
+    /* base64("info@example.com") and base64("s3cret"), each on its own line. */
+    TEST_ASSERT(strstr(sent, "aW5mb0BleGFtcGxlLmNvbQ==\r\n") != NULL, "login sent as base64");
+    TEST_ASSERT(strstr(sent, "czNjcmV0\r\n") != NULL, "password sent as base64");
+
+    mail_relay_harness_free(&h);
+}
+
+TEST(test_mail_relay_auth_bad_credentials) {
+    TEST_CASE("a 535 reply fails the send instead of continuing unauthenticated");
+
+    mail_relay_harness_t h;
+    TEST_REQUIRE(mail_relay_harness_init(&h, ENV_MAIL_SECURITY_NONE, ENV_MAIL_AUTH_PLAIN), "harness init");
+
+    mail_relay_stage(&h,
+        "250-relay.example.org Hello\r\n"
+        "250 AUTH PLAIN LOGIN\r\n");
+    mail_relay_stage(&h, "535 5.7.8 Error: authentication failed\r\n");
+
+    TEST_ASSERT_EQUAL(1, __mail_send_hello(h.mail), "EHLO accepted");
+    TEST_ASSERT_EQUAL(0, __mail_auth(h.mail), "AUTH fails on 535");
+    TEST_ASSERT_EQUAL(1, h.mail->reseted, "the session is marked unusable");
+
+    /* A manually driven sequence gets the reason too, without going through
+     * send_mail() -- which is what putting the state on mail_t is for. */
+    TEST_ASSERT_EQUAL(535, h.mail->last_status, "the reply code is on the session");
+    TEST_ASSERT_STR_EQUAL("535 5.7.8 Error: authentication failed", h.mail->last_error,
+        "the server's own words, CRLF trimmed");
+
+    mail_relay_harness_free(&h);
+}
+
+TEST(test_mail_relay_auth_mechanism_not_offered) {
+    TEST_CASE("an explicitly configured mechanism the server does not offer is an error, not a fallback");
+
+    mail_relay_harness_t h;
+    TEST_REQUIRE(mail_relay_harness_init(&h, ENV_MAIL_SECURITY_NONE, ENV_MAIL_AUTH_PLAIN), "harness init");
+
+    mail_relay_stage(&h,
+        "250-relay.example.org Hello\r\n"
+        "250 AUTH LOGIN\r\n");
+
+    TEST_ASSERT_EQUAL(1, __mail_send_hello(h.mail), "EHLO accepted");
+    TEST_ASSERT_EQUAL(0, __mail_auth(h.mail), "auth: plain against a LOGIN-only server fails");
+
+    char sent[1024];
+    mail_relay_sent(&h, sent, sizeof(sent));
+    TEST_ASSERT_NULL(strstr(sent, "AUTH"), "no AUTH command was attempted");
+
+    mail_relay_harness_free(&h);
+}
+
+TEST(test_mail_relay_auth_not_offered_at_all) {
+    TEST_CASE("a server announcing no AUTH is an error rather than a silent skip");
+
+    mail_relay_harness_t h;
+    TEST_REQUIRE(mail_relay_harness_init(&h, ENV_MAIL_SECURITY_NONE, ENV_MAIL_AUTH_AUTO), "harness init");
+
+    mail_relay_stage(&h,
+        "250-relay.example.org Hello\r\n"
+        "250 SIZE 10240000\r\n");
+
+    TEST_ASSERT_EQUAL(1, __mail_send_hello(h.mail), "EHLO accepted");
+    TEST_ASSERT_EQUAL(0, __mail_auth(h.mail), "AUTH refused when unannounced");
+
+    mail_relay_harness_free(&h);
+}
+
+TEST(test_mail_relay_auth_refuses_plaintext) {
+    TEST_CASE("credentials are not sent in the clear unless security is \"none\"");
+
+    /* security: "starttls" with no TLS on the socket is the dangerous case: it
+     * means the upgrade did not happen and the password would go out readable. */
+    mail_relay_harness_t h;
+    TEST_REQUIRE(mail_relay_harness_init(&h, ENV_MAIL_SECURITY_STARTTLS, ENV_MAIL_AUTH_AUTO), "harness init");
+
+    mail_relay_stage(&h,
+        "250-relay.example.org Hello\r\n"
+        "250 AUTH PLAIN LOGIN\r\n");
+
+    TEST_ASSERT_EQUAL(1, __mail_send_hello(h.mail), "EHLO accepted");
+    TEST_ASSERT_EQUAL(0, __mail_auth(h.mail), "AUTH refused over an unencrypted socket");
+
+    char sent[1024];
+    mail_relay_sent(&h, sent, sizeof(sent));
+    TEST_ASSERT_NULL(strstr(sent, "AUTH"), "no credentials left the process");
+
+    mail_relay_harness_free(&h);
+}
+
+TEST(test_mail_relay_auth_skipped_without_credentials) {
+    TEST_CASE("no user configured means no AUTH — an open internal relay is a valid setup");
+
+    mail_relay_harness_t h;
+    TEST_REQUIRE(mail_relay_harness_init(&h, ENV_MAIL_SECURITY_NONE, ENV_MAIL_AUTH_AUTO), "harness init");
+
+    env()->mail.relay.user = NULL;
+    env()->mail.relay.password = NULL;
+
+    mail_relay_stage(&h,
+        "250-relay.example.org Hello\r\n"
+        "250 AUTH PLAIN LOGIN\r\n");
+
+    TEST_ASSERT_EQUAL(1, __mail_send_hello(h.mail), "EHLO accepted");
+    TEST_ASSERT_EQUAL(1, __mail_auth(h.mail), "auth is a no-op without credentials");
+
+    char sent[1024];
+    mail_relay_sent(&h, sent, sizeof(sent));
+    TEST_ASSERT_NULL(strstr(sent, "AUTH"), "no AUTH command sent");
+
+    mail_relay_harness_free(&h);
+}
+
+TEST(test_mail_relay_auth_skipped_in_direct_mode) {
+    TEST_CASE("direct delivery never authenticates, whatever else is configured");
+
+    mail_relay_harness_t h;
+    TEST_REQUIRE(mail_relay_harness_init(&h, ENV_MAIL_SECURITY_NONE, ENV_MAIL_AUTH_AUTO), "harness init");
+
+    env()->mail.relay.enabled = false;
+
+    TEST_ASSERT_EQUAL(1, __mail_auth(h.mail), "auth is a no-op in direct mode");
+
+    char sent[1024];
+    mail_relay_sent(&h, sent, sizeof(sent));
+    TEST_ASSERT_NULL(strstr(sent, "AUTH"), "no AUTH command sent");
+
+    mail_relay_harness_free(&h);
+}
+
+TEST(test_mail_relay_starttls_requires_announcement) {
+    TEST_CASE("STARTTLS is not sent to a server that did not announce it");
+
+    /* Before the EHLO reply was parsed this was decided by the reply code to a
+     * STARTTLS sent blind. */
+    mail_relay_harness_t h;
+    TEST_REQUIRE(mail_relay_harness_init(&h, ENV_MAIL_SECURITY_STARTTLS, ENV_MAIL_AUTH_AUTO), "harness init");
+
+    mail_relay_stage(&h,
+        "250-relay.example.org Hello\r\n"
+        "250 SIZE 10240000\r\n");
+
+    TEST_ASSERT_EQUAL(1, __mail_send_hello(h.mail), "EHLO accepted");
+    TEST_ASSERT_EQUAL(0, __mail_start_tls(h.mail), "start_tls refuses without the announcement");
+
+    char sent[1024];
+    mail_relay_sent(&h, sent, sizeof(sent));
+    TEST_ASSERT_NULL(strstr(sent, "STARTTLS"), "no STARTTLS command was written");
+
+    /* Not described by the latest reply, which is the EHLO's own 250: the step
+     * has to name its own reason. */
+    TEST_ASSERT_EQUAL(0, h.mail->last_status, "no reply code -- nothing was rejected");
+    TEST_ASSERT_STR_EQUAL("Server does not offer STARTTLS", h.mail->last_error, "the step names itself");
+
+    mail_relay_harness_free(&h);
+}
+
+TEST(test_mail_relay_ehlo_rejection_is_an_error) {
+    TEST_CASE("a non-250 EHLO reply fails instead of leaving stale capabilities");
+
+    mail_relay_harness_t h;
+    TEST_REQUIRE(mail_relay_harness_init(&h, ENV_MAIL_SECURITY_NONE, ENV_MAIL_AUTH_AUTO), "harness init");
+
+    mail_relay_stage(&h, "502 5.5.1 Command not implemented\r\n");
+
+    TEST_ASSERT_EQUAL(0, __mail_send_hello(h.mail), "EHLO rejection is reported");
+    TEST_ASSERT_EQUAL(1, h.mail->reseted, "the session is marked unusable");
+    TEST_ASSERT_EQUAL(502, h.mail->last_status, "the rejection code is on the session");
+
+    mail_relay_harness_free(&h);
 }

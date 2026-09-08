@@ -105,6 +105,8 @@ static json_token_t* __module_loader_dotenv_value(const char* value, int quoted)
 static ratelimiter_config_t* __module_loader_ratelimits_config_load(const json_token_t* token_object);
 static int __module_loader_http_ratelimit_load(const json_token_t* token_string, ratelimiter_t** ratelimiter, map_t* ratelimits_config);
 static int __module_loader_websockets_ratelimit_load(const json_token_t* token_string, ratelimiter_t** ratelimiter, map_t* ratelimits_config);
+static int __module_loader_mail_relay_load(env_t* env, const json_token_t* token_relay);
+static char* __module_loader_mail_relay_string(const json_token_t* token_relay, const char* key, int* error);
 
 int module_loader_init(appconfig_t* config) {
     int result = 0;
@@ -793,6 +795,18 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
             }
             strcpy(env->mail.host, json_string(token_host));
         }
+
+        if (!__module_loader_mail_relay_load(env, json_object_get(token_mail, "relay")))
+            goto failed;
+    }
+
+    /* DKIM as a whole is optional -- an unconfigured key means the message goes
+     * out unsigned (protocols/smtp/mail.c) -- but half of it is a typo rather
+     * than a decision: a key with no selector signs nothing, and a selector with
+     * no key used to fail every send with "DKIM error loading rsa key". */
+    if ((env->mail.dkim_private[0] != '\0') != (env->mail.dkim_selector[0] != '\0')) {
+        log_error_stderr("module_loader_config_load: mail.dkim_private and mail.dkim_selector must be set together\n");
+        goto failed;
     }
 
     return 1;
@@ -802,6 +816,182 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     __free_gzip_list(env->main.gzip);
     env->main.gzip = NULL;
     return 0;
+}
+
+/* One optional string field of `mail.relay`. Returns NULL both when the field is
+ * absent (*error stays 0) and when it is malformed (*error set): the caller
+ * decides which of the two is fatal for that particular field. */
+char* __module_loader_mail_relay_string(const json_token_t* token_relay, const char* key, int* error) {
+    *error = 0;
+
+    const json_token_t* token = json_object_get(token_relay, key);
+    if (token == NULL) return NULL;
+
+    if (!json_is_string(token)) {
+        log_error_stderr("module_loader_config_load: mail.relay.%s must be string\n", key);
+        *error = 1;
+        return NULL;
+    }
+    if (json_string_size(token) == 0) {
+        log_error_stderr("module_loader_config_load: mail.relay.%s must be not empty\n", key);
+        *error = 1;
+        return NULL;
+    }
+
+    char* value = malloc(json_string_size(token) + 1);
+    if (value == NULL) {
+        log_error("module_loader_config_load: memory alloc error mail.relay.%s\n", key);
+        *error = 1;
+        return NULL;
+    }
+
+    strcpy(value, json_string(token));
+
+    return value;
+}
+
+/* `mail.relay`, the switch between the two delivery modes. Absent is not an
+ * error -- it is the direct-to-MX mode the framework has always had.
+ *
+ * Whatever this allocates before a failure stays hung on env->mail.relay and is
+ * released by __appconfig_env_free when the half-built configuration is torn
+ * down, the same way the dkim_* fields above are. */
+int __module_loader_mail_relay_load(env_t* env, const json_token_t* token_relay) {
+    if (token_relay == NULL) return 1;
+
+    if (!json_is_object(token_relay)) {
+        log_error_stderr("module_loader_config_load: mail.relay must be object\n");
+        return 0;
+    }
+
+    env_mail_relay_t* relay = &env->mail.relay;
+    int error = 0;
+
+    relay->host = __module_loader_mail_relay_string(token_relay, "host", &error);
+    if (error) return 0;
+    if (relay->host == NULL) {
+        log_error_stderr("module_loader_config_load: mail.relay.host is required\n");
+        return 0;
+    }
+
+    relay->user = __module_loader_mail_relay_string(token_relay, "user", &error);
+    if (error) return 0;
+
+    relay->password = __module_loader_mail_relay_string(token_relay, "password", &error);
+    if (error) return 0;
+
+    const json_token_t* token_security = json_object_get(token_relay, "security");
+    if (token_security != NULL) {
+        if (!json_is_string(token_security)) {
+            log_error_stderr("module_loader_config_load: mail.relay.security must be string\n");
+            return 0;
+        }
+
+        const char* security = json_string(token_security);
+        if (strcmp(security, "starttls") == 0)
+            relay->security = ENV_MAIL_SECURITY_STARTTLS;
+        else if (strcmp(security, "tls") == 0)
+            relay->security = ENV_MAIL_SECURITY_TLS;
+        else if (strcmp(security, "none") == 0)
+            relay->security = ENV_MAIL_SECURITY_NONE;
+        else {
+            log_error_stderr("module_loader_config_load: mail.relay.security must be one of: starttls, tls, none\n");
+            return 0;
+        }
+    }
+
+    const json_token_t* token_auth = json_object_get(token_relay, "auth");
+    if (token_auth != NULL) {
+        if (!json_is_string(token_auth)) {
+            log_error_stderr("module_loader_config_load: mail.relay.auth must be string\n");
+            return 0;
+        }
+
+        const char* auth = json_string(token_auth);
+        if (strcmp(auth, "auto") == 0)
+            relay->auth = ENV_MAIL_AUTH_AUTO;
+        else if (strcmp(auth, "plain") == 0)
+            relay->auth = ENV_MAIL_AUTH_PLAIN;
+        else if (strcmp(auth, "login") == 0)
+            relay->auth = ENV_MAIL_AUTH_LOGIN;
+        else if (strcmp(auth, "none") == 0)
+            relay->auth = ENV_MAIL_AUTH_NONE;
+        else {
+            log_error_stderr("module_loader_config_load: mail.relay.auth must be one of: auto, plain, login, none\n");
+            return 0;
+        }
+    }
+
+    /* The port default follows the security mode, which is why it is read after
+     * it: 587 for submission, 465 for implicit TLS, 25 for a plaintext relay. */
+    const json_token_t* token_port = json_object_get(token_relay, "port");
+    if (token_port == NULL) {
+        switch (relay->security) {
+            case ENV_MAIL_SECURITY_TLS:  relay->port = 465; break;
+            case ENV_MAIL_SECURITY_NONE: relay->port = 25;  break;
+            default:                     relay->port = 587;
+        }
+    }
+    else {
+        if (!json_is_number(token_port)) {
+            log_error_stderr("module_loader_config_load: mail.relay.port must be number\n");
+            return 0;
+        }
+
+        int ok = 0;
+        const int port = json_int(token_port, &ok);
+        if (!ok || port <= 0 || port > 65535) {
+            log_error_stderr("module_loader_config_load: mail.relay.port must be in range 1..65535\n");
+            return 0;
+        }
+
+        relay->port = (unsigned short)port;
+    }
+
+    const json_token_t* token_timeout = json_object_get(token_relay, "timeout");
+    if (token_timeout != NULL) {
+        if (!json_is_number(token_timeout)) {
+            log_error_stderr("module_loader_config_load: mail.relay.timeout must be number\n");
+            return 0;
+        }
+
+        int ok = 0;
+        const int timeout = json_int(token_timeout, &ok);
+        if (!ok || timeout <= 0 || timeout > 3600) {
+            log_error_stderr("module_loader_config_load: mail.relay.timeout must be in range 1..3600\n");
+            return 0;
+        }
+
+        relay->timeout = timeout;
+    }
+
+    const json_token_t* token_verify = json_object_get(token_relay, "verify");
+    if (token_verify != NULL) {
+        if (!json_is_bool(token_verify)) {
+            log_error_stderr("module_loader_config_load: mail.relay.verify must be bool\n");
+            return 0;
+        }
+
+        relay->verify = json_bool(token_verify) ? true : false;
+    }
+
+    /* Credentials come as a pair. Half of one is a broken deployment that would
+     * otherwise silently send unauthenticated and be rejected by the relay. */
+    if (relay->user != NULL && relay->password == NULL) {
+        log_error_stderr("module_loader_config_load: mail.relay.user without mail.relay.password\n");
+        return 0;
+    }
+    if (relay->password != NULL && relay->user == NULL) {
+        log_error_stderr("module_loader_config_load: mail.relay.password without mail.relay.user\n");
+        return 0;
+    }
+
+    if (relay->user != NULL && relay->security == ENV_MAIL_SECURITY_NONE)
+        log_warning("module_loader_config_load: mail.relay.security is \"none\" -- credentials will be sent in the clear\n");
+
+    relay->enabled = true;
+
+    return 1;
 }
 
 int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_servers) {

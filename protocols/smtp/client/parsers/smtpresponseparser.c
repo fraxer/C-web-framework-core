@@ -11,6 +11,7 @@
 
 int __smtpresponseparser_set_status(smtpresponse_t*, smtpresponseparser_t*);
 int __smtpresponseparser_set_message(smtpresponse_t*, smtpresponseparser_t*);
+void __smtpresponseparser_read_capability(smtpresponse_t*, smtpresponseparser_t*);
 void __smtpresponseparser_flush(smtpresponseparser_t*);
 
 
@@ -96,10 +97,16 @@ int smtpresponseparser_run(smtpresponseparser_t* parser) {
             if (ch == '\n') {
                 parser->stage = SMTPRESPONSEPARSER_STATUS;
 
-                /* A continuation line ("NNN-...") has ended. Drop it so the
-                 * next line is parsed from a clean buffer — otherwise every
-                 * continuation line piles into the buffer (leaking into
-                 * response->message and obscuring the next status read). */
+                /* A continuation line ("NNN-...") has ended. Everything the
+                 * client can learn from it has to be taken here: the EHLO
+                 * extension list lives in these lines and nowhere else, and the
+                 * buffer is dropped immediately afterwards. */
+                __smtpresponseparser_read_capability(response, parser);
+
+                /* Drop it so the next line is parsed from a clean buffer —
+                 * otherwise every continuation line piles into the buffer
+                 * (leaking into response->message and obscuring the next
+                 * status read). */
                 bufferdata_reset(&parser->buf);
                 parser->line_size = 0;
                 break;
@@ -123,6 +130,10 @@ int smtpresponseparser_run(smtpresponseparser_t* parser) {
                 bufferdata_complete(&parser->buf);
                 if (!__smtpresponseparser_set_message(response, parser))
                     return SMTPRESPONSEPARSER_ERROR;
+
+                /* The final line carries a keyword too ("250 HELP", or a lone
+                 * "250 AUTH PLAIN" when the server sends no continuations). */
+                __smtpresponseparser_read_capability(response, parser);
 
                 bufferdata_reset(&parser->buf);
 
@@ -173,6 +184,20 @@ int __smtpresponseparser_set_status(smtpresponse_t* response, smtpresponseparser
     response->status = status;
 
     return 1;
+}
+
+/* Hand the line just completed in the buffer to the capability reader. Failure
+ * to read the buffer is not a parse error: an unreadable extension list only
+ * means the client will not use the extension. */
+void __smtpresponseparser_read_capability(smtpresponse_t* response, smtpresponseparser_t* parser) {
+    if (!bufferdata_complete(&parser->buf))
+        return;
+
+    const char* line = bufferdata_get(&parser->buf);
+    if (line == NULL)
+        return;
+
+    smtpresponse_parse_capability(response, line, bufferdata_writed(&parser->buf));
 }
 
 int __smtpresponseparser_set_message(smtpresponse_t* response, smtpresponseparser_t* parser) {

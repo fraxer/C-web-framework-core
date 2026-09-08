@@ -292,6 +292,15 @@ void __appconfig_env_init(env_t* env) {
     env->mail.dkim_private = NULL;
     env->mail.dkim_selector = NULL;
     env->mail.host = NULL;
+    env->mail.relay.enabled = false;
+    env->mail.relay.host = NULL;
+    env->mail.relay.user = NULL;
+    env->mail.relay.password = NULL;
+    env->mail.relay.port = 0;
+    env->mail.relay.security = ENV_MAIL_SECURITY_STARTTLS;
+    env->mail.relay.auth = ENV_MAIL_AUTH_AUTO;
+    env->mail.relay.timeout = 0;
+    env->mail.relay.verify = true;
     env->custom_store = NULL;
 }
 
@@ -329,6 +338,26 @@ void __appconfig_env_free(env_t* env) {
         free(env->mail.host);
         env->mail.host = NULL;
     }
+
+    if (env->mail.relay.host != NULL) {
+        free(env->mail.relay.host);
+        env->mail.relay.host = NULL;
+    }
+
+    if (env->mail.relay.user != NULL) {
+        free(env->mail.relay.user);
+        env->mail.relay.user = NULL;
+    }
+
+    /* The relay password is the one secret this configuration holds; wipe it
+     * before the allocator can hand the pages to anything else. */
+    if (env->mail.relay.password != NULL) {
+        explicit_bzero(env->mail.relay.password, strlen(env->mail.relay.password));
+        free(env->mail.relay.password);
+        env->mail.relay.password = NULL;
+    }
+
+    env->mail.relay.enabled = false;
 
     if (env->custom_store != NULL) {
         json_free(env->custom_store);

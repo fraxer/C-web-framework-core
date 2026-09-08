@@ -47,10 +47,45 @@ typedef struct env_main {
     env_log_t log;
 } env_main_t;
 
+/* How the transport to the relay is established.
+ *
+ * STARTTLS upgrades a plaintext session (submission, 587); TLS wraps the
+ * socket before the banner (implicit TLS, 465); NONE stays in the clear and
+ * is only meaningful for an internal relay. */
+typedef enum env_mail_security {
+    ENV_MAIL_SECURITY_STARTTLS = 0,
+    ENV_MAIL_SECURITY_TLS,
+    ENV_MAIL_SECURITY_NONE
+} env_mail_security_e;
+
+typedef enum env_mail_auth {
+    ENV_MAIL_AUTH_AUTO = 0,   /* PLAIN when offered, else LOGIN */
+    ENV_MAIL_AUTH_PLAIN,
+    ENV_MAIL_AUTH_LOGIN,
+    ENV_MAIL_AUTH_NONE
+} env_mail_auth_e;
+
+/* The second delivery mode: hand the message to an authenticated relay instead
+ * of resolving the recipient's MX. `enabled` is the switch and it is set by the
+ * mere presence of "relay" in the `mail` section -- the application code that
+ * calls send_mail() never learns which mode it got. */
+typedef struct env_mail_relay {
+    bool enabled;
+    char* host;
+    char* user;
+    char* password;
+    unsigned short port;
+    env_mail_security_e security;
+    env_mail_auth_e auth;
+    int timeout;   /* socket send/receive timeout, seconds */
+    bool verify;   /* verify the relay certificate and hostname */
+} env_mail_relay_t;
+
 typedef struct env_mail {
     char* dkim_private;
     char* dkim_selector;
     char* host;
+    env_mail_relay_t relay;
 } env_mail_t;
 
 typedef struct env {

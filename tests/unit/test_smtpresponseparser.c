@@ -430,3 +430,78 @@ TEST(test_smtpresponseparser_null_connection_returns_error) {
     /* Stack-allocated parser: init owns no heap, so do not smtpresponseparser_free
      * (it would free() the stack address). */
 }
+
+/* -------------------------------------------------------------------------- */
+/* EHLO extension list                                                        */
+/* -------------------------------------------------------------------------- */
+
+/* The extension list lives only in the continuation lines, which the parser
+ * drops as soon as each one ends — so if it is not taken there it is gone. */
+
+TEST(test_smtpresponseparser_ehlo_capabilities) {
+    TEST_SUITE("SMTP Response Parser - EHLO capabilities");
+    TEST_CASE("a multi-line EHLO reply is mined for STARTTLS, SIZE and AUTH");
+
+    smtp_harness_t h;
+    TEST_REQUIRE(harness_init(&h), "harness init");
+
+    const int result = FEED(&h,
+        "250-smtp.example.org Hello\r\n"
+        "250-SIZE 73400320\r\n"
+        "250-8BITMIME\r\n"
+        "250-STARTTLS\r\n"
+        "250-AUTH PLAIN LOGIN\r\n"
+        "250 HELP\r\n");
+
+    TEST_ASSERT_EQUAL(SMTPRESPONSEPARSER_COMPLETE, result, "reply completes");
+    TEST_ASSERT_EQUAL(250, h.response->status, "status is 250");
+
+    TEST_ASSERT((h.response->extensions & SMTPRESPONSE_EXT_STARTTLS) != 0, "STARTTLS taken from a continuation line");
+    TEST_ASSERT((h.response->extensions & SMTPRESPONSE_EXT_SIZE) != 0, "SIZE taken from a continuation line");
+    TEST_ASSERT((h.response->extensions & SMTPRESPONSE_EXT_AUTH) != 0, "AUTH taken from a continuation line");
+    TEST_ASSERT_EQUAL(73400320, (int)h.response->size_limit, "SIZE value parsed");
+    TEST_ASSERT((h.response->auth_mechanisms & SMTPRESPONSE_AUTH_PLAIN) != 0, "PLAIN offered");
+    TEST_ASSERT((h.response->auth_mechanisms & SMTPRESPONSE_AUTH_LOGIN) != 0, "LOGIN offered");
+
+    /* The message is still just the final line: the continuation lines must not
+     * leak into it. */
+    TEST_ASSERT_STR_EQUAL("250 HELP\r\n", h.response->message, "message is the final line only");
+
+    harness_free(&h);
+}
+
+TEST(test_smtpresponseparser_ehlo_capabilities_split_reads) {
+    TEST_CASE("capabilities survive a reply arriving in several read() chunks");
+
+    smtp_harness_t h;
+    TEST_REQUIRE(harness_init(&h), "harness init");
+
+    TEST_ASSERT_EQUAL(SMTPRESPONSEPARSER_CONTINUE, FEED(&h, "250-smtp.example.org Hel"), "first chunk continues");
+    TEST_ASSERT_EQUAL(SMTPRESPONSEPARSER_CONTINUE, FEED(&h, "lo\r\n250-STARTT"), "second chunk continues");
+    TEST_ASSERT_EQUAL(SMTPRESPONSEPARSER_CONTINUE, FEED(&h, "LS\r\n250-AUTH PLA"), "third chunk continues");
+    TEST_ASSERT_EQUAL(SMTPRESPONSEPARSER_COMPLETE, FEED(&h, "IN\r\n250 HELP\r\n"), "final chunk completes");
+
+    TEST_ASSERT((h.response->extensions & SMTPRESPONSE_EXT_STARTTLS) != 0, "STARTTLS split across reads");
+    TEST_ASSERT((h.response->auth_mechanisms & SMTPRESPONSE_AUTH_PLAIN) != 0, "PLAIN split across reads");
+    TEST_ASSERT_EQUAL(0, (int)(h.response->auth_mechanisms & SMTPRESPONSE_AUTH_LOGIN), "LOGIN not offered");
+
+    harness_free(&h);
+}
+
+TEST(test_smtpresponseparser_ehlo_without_starttls) {
+    TEST_CASE("a server that offers no STARTTLS leaves the flag clear");
+
+    smtp_harness_t h;
+    TEST_REQUIRE(harness_init(&h), "harness init");
+
+    TEST_ASSERT_EQUAL(SMTPRESPONSEPARSER_COMPLETE, FEED(&h,
+        "250-smtp.example.org Hello\r\n"
+        "250-PIPELINING\r\n"
+        "250 SIZE 10240000\r\n"), "reply completes");
+
+    TEST_ASSERT_EQUAL(0, (int)(h.response->extensions & SMTPRESPONSE_EXT_STARTTLS), "STARTTLS not announced");
+    TEST_ASSERT((h.response->extensions & SMTPRESPONSE_EXT_PIPELINING) != 0, "PIPELINING announced");
+    TEST_ASSERT_EQUAL(10240000, (int)h.response->size_limit, "SIZE from the final line");
+
+    harness_free(&h);
+}
