@@ -22,6 +22,8 @@ static int __file_content_put(void* storage, const file_content_t* file_content,
 static int __file_data_put(void* storage, const char* data, const size_t data_size, const char* path);
 static int __file_remove(void* storage, const char* path);
 static int __file_exist(void* storage, const char* path);
+static storage_entry_e __entry_type(void* storage, const char* path);
+static int __prefix_has_objects(storages3_t* storage, const char* prefix);
 static array_t* __file_list(void* storage, const char* path);
 static char* __create_uri(storages3_t* storage, const char* path_format, ...);
 static char* __create_url(storages3_t* storage, const char* uri);
@@ -69,6 +71,7 @@ storages3_t* storage_create_s3(const char* storage_name, const char* access_id, 
     storage->base.file_data_put = __file_data_put;
     storage->base.file_remove = __file_remove;
     storage->base.file_exist = __file_exist;
+    storage->base.entry_type = __entry_type;
     storage->base.file_list = __file_list;
 
     return storage;
@@ -98,7 +101,7 @@ file_t __file_get(void* storage, const char* path) {
     char* authorization = NULL;
     httpclient_t* client = NULL;
 
-    uri = __create_uri(s, path);
+    uri = __create_uri(s, "%s", path);
     if (uri == NULL) goto failed;
 
     url = __create_url(s, uri);
@@ -174,7 +177,7 @@ int __file_content_put(void* storage, const file_content_t* file_content, const 
     char* authorization = NULL;
     httpclient_t* client =  NULL;
 
-    uri = __create_uri(s, path);
+    uri = __create_uri(s, "%s", path);
     if (uri == NULL) goto failed;
 
     url = __create_url(s, uri);
@@ -249,7 +252,7 @@ int __file_data_put(void* storage, const char* data, const size_t data_size, con
     char* authorization = NULL;
     httpclient_t* client =  NULL;
 
-    uri = __create_uri(s, path);
+    uri = __create_uri(s, "%s", path);
     if (uri == NULL) goto failed;
 
     url = __create_url(s, uri);
@@ -318,7 +321,7 @@ int __file_remove(void* storage, const char* path) {
     char* authorization = NULL;
     httpclient_t* client =  NULL;
 
-    uri = __create_uri(s, path);
+    uri = __create_uri(s, "%s", path);
     if (uri == NULL) goto failed;
 
     url = __create_url(s, uri);
@@ -368,7 +371,7 @@ int __file_exist(void* storage, const char* path) {
     char* authorization = NULL;
     httpclient_t* client = NULL;
 
-    uri = __create_uri(s, path);
+    uri = __create_uri(s, "%s", path);
     if (uri == NULL) goto failed;
 
     url = __create_url(s, uri);
@@ -404,6 +407,86 @@ int __file_exist(void* storage, const char* path) {
     if (url != NULL) free(url);
     if (authorization != NULL) free(authorization);
     if (client != NULL) client->free(client);
+
+    return result;
+}
+
+storage_entry_e __entry_type(void* storage, const char* path) {
+    storages3_t* s = storage;
+    if (s == NULL || path == NULL || path[0] == 0)
+        return STORAGE_ENTRY_NONE;
+
+    if (__file_exist(s, path))
+        return STORAGE_ENTRY_FILE;
+
+    // Каталогов в S3 нет: "dir" считается каталогом, если есть хотя бы один
+    // ключ, начинающийся с "dir/" (включая маркер "dir/", который создают консоли)
+    char prefix[PATH_MAX];
+    size_t length = strlen(path);
+    while (length > 0 && path[length - 1] == '/') length--;
+    if (length == 0 || length + 1 >= sizeof(prefix))
+        return STORAGE_ENTRY_NONE;
+
+    memcpy(prefix, path, length);
+    prefix[length] = '/';
+    prefix[length + 1] = 0;
+
+    return __prefix_has_objects(s, prefix) ? STORAGE_ENTRY_DIRECTORY : STORAGE_ENTRY_NONE;
+}
+
+// Есть ли в бакете хотя бы один ключ с этим префиксом. Без delimiter,
+// чтобы найти и объекты во вложенных "каталогах"
+int __prefix_has_objects(storages3_t* storage, const char* prefix) {
+    const char* method = "GET";
+    char* uri = NULL;
+    char* url = NULL;
+    char* authorization = NULL;
+    char* payload = NULL;
+    httpclient_t* client = NULL;
+    array_t* list = NULL;
+    int result = 0;
+
+    uri = __create_uri(storage, "?max-keys=1&prefix=%s", prefix);
+    if (uri == NULL) goto failed;
+
+    url = __create_url(storage, uri);
+    if (url == NULL) goto failed;
+
+    const int timeout = 3;
+    client = httpclient_init(ROUTE_GET, url, timeout);
+    if (client == NULL) goto failed;
+
+    httprequest_t* req = client->request;
+
+    char amz_date[64];
+    __create_amz_date(amz_date, sizeof(amz_date));
+    authorization = __create_authtoken(storage, client, method, amz_date, EMPTY_PAYLOAD_HASH);
+    if (authorization == NULL) goto failed;
+
+    req->add_header(req, "Authorization", authorization);
+    req->add_header(req, "x-amz-content-sha256", EMPTY_PAYLOAD_HASH);
+    req->add_header(req, "x-amz-date", amz_date);
+
+    httpresponse_t* res = client->send(client);
+    if (!res)
+        goto failed;
+    if (res->status_code != 200)
+        goto failed;
+
+    payload = res->get_payload(res);
+    if (payload == NULL) goto failed;
+
+    list = __parse_file_list_payload(payload);
+    result = list != NULL && array_size(list) > 0;
+
+    failed:
+
+    if (uri != NULL) free(uri);
+    if (url != NULL) free(url);
+    if (authorization != NULL) free(authorization);
+    if (client != NULL) client->free(client);
+    if (payload != NULL) free(payload);
+    if (list != NULL) array_free(list);
 
     return result;
 }

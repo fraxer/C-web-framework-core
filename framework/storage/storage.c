@@ -80,6 +80,17 @@ int storage_file_exist(const char* storage_name, const char* path_format, ...) {
     return storage->file_exist(storage, path);
 }
 
+storage_entry_e storage_entry_type(const char* storage_name, const char* path_format, ...) {
+    storage_t* storage = __storage_find(storage_name);
+    if (storage == NULL || storage->entry_type == NULL)
+        return STORAGE_ENTRY_NONE;
+
+    char path[PATH_MAX];
+    STORAGE_BUILD_PATH(path);
+
+    return storage->entry_type(storage, path);
+}
+
 int storage_file_duplicate(const char* from_storage_name, const char* to_storage_name, const char* path_format, ...) {
     if (from_storage_name == NULL)
         return 0;

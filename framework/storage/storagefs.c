@@ -15,6 +15,7 @@ static int __file_content_put(void* storage, const file_content_t* file_content,
 static int __file_data_put(void* storage, const char* data, const size_t data_size, const char* path);
 static int __file_remove(void* storage, const char* path);
 static int __file_exist(void* storage, const char* path);
+static storage_entry_e __entry_type(void* storage, const char* path);
 static array_t* __file_list(void* storage, const char* path);
 static int __prepare_fullpath(storagefs_t* storage, const char* relpath, char* fullpath);
 static int __create_fullpath(const char* path);
@@ -39,6 +40,7 @@ storagefs_t* storage_create_fs(const char* storage_name, const char* root) {
     storage->base.file_data_put = __file_data_put;
     storage->base.file_remove = __file_remove;
     storage->base.file_exist = __file_exist;
+    storage->base.entry_type = __entry_type;
     storage->base.file_list = __file_list;
 
     return storage;
@@ -205,6 +207,31 @@ int __file_exist(void* storage, const char* path) {
     struct stat buffer;   
     return stat(fullpath, &buffer) == 0;
 }
+
+storage_entry_e __entry_type(void* storage, const char* path) {
+    if (storage == NULL) return STORAGE_ENTRY_NONE;
+    if (path == NULL) return STORAGE_ENTRY_NONE;
+    if (path[0] == 0) {
+        log_error("Storage fs empty path\n");
+        return STORAGE_ENTRY_NONE;
+    }
+
+    storagefs_t* s = storage;
+    char fullpath[PATH_MAX];
+
+    if (!__prepare_fullpath(s, path, fullpath))
+        return STORAGE_ENTRY_NONE;
+
+    // lstat, а не stat: ссылка может вести за пределы хранилища
+    struct stat st;
+    if (lstat(fullpath, &st) != 0)
+        return STORAGE_ENTRY_NONE;
+
+    if (S_ISREG(st.st_mode)) return STORAGE_ENTRY_FILE;
+    if (S_ISDIR(st.st_mode)) return STORAGE_ENTRY_DIRECTORY;
+
+    return STORAGE_ENTRY_OTHER;
+}
 array_t* __file_list(void* storage, const char* path) {
     if (storage == NULL) return NULL;
     if (path == NULL) return NULL;
@@ -252,6 +279,11 @@ array_t* __file_list(void* storage, const char* path) {
 }
 
 int __prepare_fullpath(storagefs_t* storage, const char* relpath, char* fullpath) {
+    // Путь ровно ".." не содержит ни "/..", ни "../" и иначе вёл бы к родителю root
+    if (strcmp(relpath, "..") == 0) {
+        log_error("Storage %s restrict .. in path %s\n", storage->base.name, relpath);
+        return 0;
+    }
     if (cmpsubstr_lower(relpath, "/../")) {
         log_error("Storage %s restrict /../ in path %s\n", storage->base.name, relpath);
         return 0;
