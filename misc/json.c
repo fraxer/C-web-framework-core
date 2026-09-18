@@ -45,9 +45,6 @@ static const char escape_table[256] = {
     ['\\'] = '\\', ['/'] = '/'
 };
 
-static json_token_t* __parse_value(json_parser_t* parser);
-static json_token_t* __parse_object(json_parser_t* parser);
-static json_token_t* __parse_array(json_parser_t* parser);
 static json_token_t* __parse_string(json_parser_t* parser);
 static json_token_t* __parse_number(json_parser_t* parser);
 static json_token_t* __parse_null(json_parser_t* parser);
@@ -250,151 +247,6 @@ static inline void skip_ws(json_parser_t* parser) {
     }
 }
 
-json_token_t* __parse_value(json_parser_t* parser) {
-    skip_ws(parser);
-
-    // Проверка на конец строки
-    if (parser->ptr >= parser->end) {
-        parser->error = "Unexpected end of input";
-        return NULL;
-    }
-
-    if (*parser->ptr == '\0') {
-        parser->error = "Unexpected end of input";
-        return NULL;
-    }
-
-    switch (*parser->ptr) {
-        case 'n': return __parse_null(parser);
-        case 't': return __parse_true(parser);
-        case 'f': return __parse_false(parser);
-        case '"': return __parse_string(parser);
-        case '[': return __parse_array(parser);
-        case '{': return __parse_object(parser);
-        case '-':
-        case '0': case '1': case '2': case '3': case '4':
-        case '5': case '6': case '7': case '8': case '9':
-            return __parse_number(parser);
-        default:
-            parser->error = "Unexpected character";
-            return NULL;
-    }
-}
-
-json_token_t* __parse_object(json_parser_t* parser) {
-    json_token_t* token = json_token_alloc(JSON_OBJECT);
-    if (token == NULL) {
-        parser->error = "Out of memory";
-        return NULL;
-    }
-
-    if (*parser->ptr != '{') {
-        parser->error = "Expected '{'";
-        return token;
-    }
-
-    parser->ptr++;
-
-    skip_ws(parser);
-
-    if (*parser->ptr == '}') {
-        parser->ptr++;
-        return token;
-    }
-
-    while (1) {
-        skip_ws(parser);
-
-        json_token_t* key = __parse_string(parser);
-        if (parser->error) {
-            json_token_free(key);
-            return token;
-        }
-
-        __set_child_or_sibling(token, key);
-
-        skip_ws(parser);
-
-        if (*parser->ptr != ':') {
-            parser->error = "Expected ':'";
-            return token;
-        }
-
-        parser->ptr++;
-
-        json_token_t* val = __parse_value(parser);
-        if (parser->error) {
-            json_token_free(val);
-            return token;
-        }
-
-        __set_child_or_sibling(key, val);
-
-        skip_ws(parser);
-
-        if (*parser->ptr == ',') {
-            parser->ptr++;
-            continue;
-        }
-        if (*parser->ptr == '}') {
-            parser->ptr++;
-            break;
-        }
-
-        parser->error = "Expected ',' or '}'";
-        return token;
-    }
-
-    return token;
-}
-
-json_token_t* __parse_array(json_parser_t* parser) {
-    json_token_t* token = json_token_alloc(JSON_ARRAY);
-    if (token == NULL) {
-        parser->error = "Out of memory";
-        return NULL;
-    }
-
-    if (*parser->ptr != '[') {
-        parser->error = "Expected '['";
-        return token;
-    }
-    parser->ptr++;
-
-    skip_ws(parser);
-
-    if (*parser->ptr == ']') {
-        parser->ptr++;
-        return token;
-    }
-
-    while (1) {
-        json_token_t* val = __parse_value(parser);
-        if (parser->error) {
-            json_token_free(val);
-            return token;
-        }
-
-        __set_child_or_sibling(token, val);
-
-        skip_ws(parser);
-
-        if (*parser->ptr == ',') {
-            parser->ptr++;
-            continue;
-        }
-        if (*parser->ptr == ']') {
-            parser->ptr++;
-            break;
-        }
-
-        parser->error = "Expected ',' or ']'";
-        return token;
-    }
-
-    return token;
-}
-
 json_token_t* __parse_null(json_parser_t* parser) {
     json_token_t* token = json_token_alloc(JSON_NULL);
     if (token == NULL) return NULL;
@@ -439,7 +291,7 @@ json_token_t* __parse_false(json_parser_t* parser) {
 
     const char* expected = "false";
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         if (parser->ptr[i] == '\0' || parser->ptr[i] != expected[i]) {
             parser->error = "Expected 'false'";
             return token;
@@ -453,16 +305,53 @@ json_token_t* __parse_false(json_parser_t* parser) {
     return token;
 }
 
+// Проверяет, что с позиции p начинается число, записанное по правилам JSON,
+// и возвращает его длину в символах. Если число записано неверно, возвращает 0.
+// Нужна потому, что strtold принимает то, чего в JSON быть не может:
+// 0x10, 01, 1., inf, nan
+static size_t __scan_number(const char* p) {
+    const char* start = p;
+
+    if (*p == '-') p++;
+
+    if (*p == '0') p++;
+    else if (*p >= '1' && *p <= '9') {
+        while (*p >= '0' && *p <= '9') p++;
+    }
+    else return 0;
+
+    if (*p == '.') {
+        p++;
+        if (*p < '0' || *p > '9') return 0;
+        while (*p >= '0' && *p <= '9') p++;
+    }
+
+    if (*p == 'e' || *p == 'E') {
+        p++;
+        if (*p == '+' || *p == '-') p++;
+        if (*p < '0' || *p > '9') return 0;
+        while (*p >= '0' && *p <= '9') p++;
+    }
+
+    return (size_t)(p - start);
+}
+
 json_token_t* __parse_number(json_parser_t* parser) {
     json_token_t* token = json_token_alloc(JSON_NUMBER);
     if (token == NULL) return NULL;
 
     const char* start = parser->ptr;
+    const size_t length = __scan_number(start);
     char* end = NULL;
+
+    if (length == 0) {
+        parser->error = "Invalid number";
+        return token;
+    }
 
     token->value._ldouble = strtold(start, &end);
 
-    if (end == start) {
+    if (end != start + length) {
         parser->error = "Invalid number";
         return token;
     }
@@ -880,6 +769,53 @@ void __init_token(json_token_t* token, memory_block_t* block, json_token_type_t 
 // Функции для работы с json
 // ============================================================================
 
+// Что может стоять в тексте следующим (пробелы не считаются).
+// Всё остальное — синтаксическая ошибка.
+// В примерах | отмечает текущую позицию парсера
+typedef enum {
+    // Любое значение. Так бывает в начале текста, после ':' в объекте
+    // и после ',' в массиве: [1,| или {"a":|
+    JSON_EXPECT_VALUE,
+
+    // Значение или ']'. Только сразу после '[', чтобы разрешить пустой массив [],
+    // но запретить висячую запятую [1,]
+    JSON_EXPECT_VALUE_OR_CLOSE,
+
+    // Ключ-строка. После ',' в объекте: {"a":1,|
+    JSON_EXPECT_KEY,
+
+    // Ключ-строка или '}'. Только сразу после '{', чтобы разрешить {},
+    // но запретить {"a":1,}
+    JSON_EXPECT_KEY_OR_CLOSE,
+
+    // ':' после ключа: {"a"|
+    JSON_EXPECT_COLON,
+
+    // ',' или закрывающая скобка после элемента массива или значения в объекте:
+    // [1| или {"a":1|
+    JSON_EXPECT_COMMA_OR_CLOSE,
+
+    // Корневое значение полностью разобрано, дальше допустимы только пробелы.
+    // Отсекает 1 2 и {}{}
+    JSON_EXPECT_END
+} json_expect_t;
+
+// Возвращает объект или массив, внутри которого лежит token (NULL для корня).
+// Значение внутри объекта хранится как ребёнок своего ключа,
+// поэтому в этом случае нужно подняться на два уровня: значение -> ключ -> объект
+static json_token_t* __enclosing_container(const json_token_t* token) {
+    json_token_t* parent = token->parent;
+    if (parent != NULL && parent->type == JSON_STRING)
+        parent = parent->parent;
+
+    return parent;
+}
+
+// Парсер работает циклом, без рекурсии. Когда контейнер закрывается,
+// следующий открытый контейнер находится по указателю parent. Поэтому
+// сильно вложенный ввод вроде [[[[...]]]] не может переполнить стек.
+// Вложенность глубже JSON_MAX_DEPTH отвергается ради кода, который потом
+// обходит дерево рекурсивно
 json_doc_t* json_parse(const char* json_str) {
     if (json_str == NULL) return NULL;
 
@@ -909,208 +845,161 @@ json_doc_t* json_parse(const char* json_str) {
         .json_size = json_size
     };
 
-    json_token_t* toksuper = NULL;   // Текущий родительский токен
-    json_token_t* last_token = NULL; // Последний добавленный токен
-    size_t pos = 0;
+    json_token_t* container = NULL;  // Самый вложенный незакрытый объект или массив; NULL — на верхнем уровне
+    json_token_t* key = NULL;        // Ключ, к которому будет привязано следующее значение
+    size_t depth = 0;                // Сколько объектов и массивов сейчас открыто
+    json_expect_t expect = JSON_EXPECT_VALUE;
 
-    // Основной цикл парсинга - проходим по каждому символу
-    for (pos = 0; pos < json_size && json_str[pos] != '\0'; pos++) {
-        char c = json_str[pos];
-        parser.ptr = json_str + pos;
+    for (;;) {
+        skip_ws(&parser);
 
-        switch (c) {
-            case '{':
-            case '[': {
-                // Создаем токен для объекта или массива
-                json_token_t* token = json_token_alloc(
-                    c == '{' ? JSON_OBJECT : JSON_ARRAY
-                );
-                if (!token) {
+        const char c = *parser.ptr;
+        if (c == '\0') break;
+
+        // Закрывающая скобка: допустима только там, где контейнер может кончиться (не после ',' и не после ':')
+        if (c == '}' || c == ']') {
+            const json_token_type_t type = c == '}' ? JSON_OBJECT : JSON_ARRAY;
+            const int can_close = expect == JSON_EXPECT_COMMA_OR_CLOSE ||
+                (type == JSON_OBJECT && expect == JSON_EXPECT_KEY_OR_CLOSE) ||
+                (type == JSON_ARRAY && expect == JSON_EXPECT_VALUE_OR_CLOSE);
+
+            if (container != NULL && container->type != type) {
+                parser.error = "Mismatched brackets";
+                goto failed;
+            }
+            if (container == NULL || !can_close) {
+                parser.error = "Unexpected closing bracket";
+                goto failed;
+            }
+
+            parser.ptr++;
+            container = __enclosing_container(container);
+            depth--;
+            expect = container ? JSON_EXPECT_COMMA_OR_CLOSE : JSON_EXPECT_END;
+            continue;
+        }
+
+        switch (expect) {
+            case JSON_EXPECT_COMMA_OR_CLOSE:
+                if (c != ',') {
+                    parser.error = "Expected ',' or closing bracket";
+                    goto failed;
+                }
+                parser.ptr++;
+                expect = container->type == JSON_OBJECT ? JSON_EXPECT_KEY : JSON_EXPECT_VALUE;
+                continue;
+
+            case JSON_EXPECT_COLON:
+                if (c != ':') {
+                    parser.error = "Expected ':'";
+                    goto failed;
+                }
+                parser.ptr++;
+                expect = JSON_EXPECT_VALUE;
+                continue;
+
+            case JSON_EXPECT_KEY:
+            case JSON_EXPECT_KEY_OR_CLOSE: {
+                if (c != '"') {
+                    parser.error = "Expected string key";
+                    goto failed;
+                }
+
+                json_token_t* token = __parse_string(&parser);
+                if (token == NULL) {
                     parser.error = "Out of memory";
                     goto failed;
                 }
-
-                // Добавляем токен к родителю
-                if (toksuper) {
-                    // В строгом режиме объект/массив не может быть ключом
-                    if (toksuper->type == JSON_OBJECT) {
-                        parser.error = "Object/array cannot be a key";
-                        goto failed;
-                    }
-
-                    token->parent = toksuper;
-                    __set_child_or_sibling(toksuper, token);
-                }
-
-                // Если это первый токен - это корень
-                if (doc->root == NULL) {
-                    doc->root = token;
-                }
-
-                // Запоминаем последний токен
-                last_token = token;
-
-                // Этот токен становится новым родителем
-                toksuper = token;
-                break;
-            }
-
-            case '}':
-            case ']': {
-                json_token_type_t expected_type = (c == '}' ? JSON_OBJECT : JSON_ARRAY);
-
-                // Проверяем текущий родитель
-                if (!toksuper) {
-                    parser.error = "Unexpected closing bracket";
-                    goto failed;
-                }
-
-                // Поднимаемся по цепочке родителей, пока не найдём нужный контейнер
-                json_token_t* container = toksuper;
-                while (container && container->type != expected_type) {
-                    // Если в объекте, то toksuper может указывать на ключ
-                    // Нужно подняться к родительскому объекту
-                    if (container->parent && container->parent->type == expected_type) {
-                        container = container->parent;
-                        break;
-                    }
-                    container = container->parent;
-                }
-
-                if (!container || container->type != expected_type) {
-                    parser.error = "Mismatched brackets";
-                    goto failed;
-                }
-
-                // Закрываем найденный контейнер и поднимаемся к его родителю
-                toksuper = container->parent;
-                break;
-            }
-
-            case '"': {
-                // Используем существующую функцию парсинга строк
-                parser.ptr = json_str + pos;
-                json_token_t* token = __parse_string(&parser);
-
                 if (parser.error) {
                     json_token_free(token);
                     goto failed;
                 }
 
-                // Обновляем позицию в цикле
-                pos = parser.ptr - json_str - 1;  // -1 потому что цикл добавит +1
-
-                // Добавляем к родителю
-                if (toksuper) {
-                    token->parent = toksuper;
-                    __set_child_or_sibling(toksuper, token);
-                }
-
-                // Если это первый токен - это корень
-                if (doc->root == NULL) {
-                    doc->root = token;
-                }
-
-                // Запоминаем последний токен
-                last_token = token;
-                break;
+                __set_child_or_sibling(container, token);
+                key = token;
+                expect = JSON_EXPECT_COLON;
+                continue;
             }
 
-            case '\t':
-            case '\r':
-            case '\n':
-            case ' ':
-                // Пропускаем пробельные символы
-                break;
+            case JSON_EXPECT_END:
+                parser.error = "Unexpected data after root value";
+                goto failed;
 
-            case ':':
-                // После двоеточия следует значение для ключа
-                // Последний токен (ключ) становится родителем для значения
-                if (last_token) {
-                    toksuper = last_token;
+            case JSON_EXPECT_VALUE:
+            case JSON_EXPECT_VALUE_OR_CLOSE:
+                break;
+        }
+
+        // Здесь ожидается значение: разбираем его по первому символу
+        json_token_t* token = NULL;
+
+        switch (c) {
+            case '{':
+            case '[':
+                if (depth >= JSON_MAX_DEPTH) {
+                    parser.error = "Maximum nesting depth exceeded";
+                    goto failed;
                 }
+                token = json_token_alloc(c == '{' ? JSON_OBJECT : JSON_ARRAY);
+                if (token != NULL) parser.ptr++;
                 break;
-
-            case ',':
-                // Запятая разделяет элементы
-                // Поднимаемся к родителю, если мы не в массиве/объекте
-                if (toksuper &&
-                    toksuper->type != JSON_ARRAY &&
-                    toksuper->type != JSON_OBJECT) {
-                    toksuper = toksuper->parent;
-                }
+            case '"':
+                token = __parse_string(&parser);
                 break;
-
-            // Примитивы: числа и boolean
+            case 't':
+                token = __parse_true(&parser);
+                break;
+            case 'f':
+                token = __parse_false(&parser);
+                break;
+            case 'n':
+                token = __parse_null(&parser);
+                break;
             case '-':
             case '0': case '1': case '2': case '3': case '4':
             case '5': case '6': case '7': case '8': case '9':
-            case 't':
-            case 'f':
-            case 'n': {
-                // Примитив не может быть ключом объекта
-                if (toksuper && toksuper->type == JSON_OBJECT) {
-                    parser.error = "Primitive cannot be a key";
-                    goto failed;
-                }
-
-                json_token_t* token = NULL;
-                // Парсим примитив
-                parser.ptr = json_str + pos;
-
-                if (c == 't' || c == 'f') {
-                    token = (c == 't') ?
-                        __parse_true(&parser) : __parse_false(&parser);
-
-                    if (parser.error) {
-                        json_token_free(token);
-                        goto failed;
-                    }
-                } else if (c == 'n') {
-                    token = __parse_null(&parser);
-
-                    if (parser.error) {
-                        json_token_free(token);
-                        goto failed;
-                    }
-                } else {
-                    // Число
-                    token = __parse_number(&parser);
-
-                    if (parser.error) {
-                        json_token_free(token);
-                        goto failed;
-                    }
-                }
-
-                // Обновляем позицию в цикле
-                pos = parser.ptr - json_str - 1;  // -1 потому что цикл добавит +1
-
-                // Добавляем к родителю
-                if (toksuper) {
-                    token->parent = toksuper;
-                    __set_child_or_sibling(toksuper, token);
-                }
-
-                // Если это первый токен - это корень
-                if (doc->root == NULL) {
-                    doc->root = token;
-                }
-
-                // Запоминаем последний токен
-                last_token = token;
+                token = __parse_number(&parser);
                 break;
-            }
-
             default:
                 parser.error = "Unexpected character";
                 goto failed;
         }
+
+        if (token == NULL) {
+            parser.error = "Out of memory";
+            goto failed;
+        }
+        if (parser.error) {
+            json_token_free(token);
+            goto failed;
+        }
+
+        // Сразу добавляем токен в дерево: если дальше встретится ошибка,
+        // json_free освободит его вместе со всем документом
+        if (key != NULL)
+            __set_child_or_sibling(key, token);
+        else if (container != NULL)
+            __set_child_or_sibling(container, token);
+        else
+            doc->root = token;
+
+        key = NULL;
+
+        if (token->type == JSON_OBJECT || token->type == JSON_ARRAY) {
+            container = token;
+            depth++;
+            expect = token->type == JSON_OBJECT ? JSON_EXPECT_KEY_OR_CLOSE : JSON_EXPECT_VALUE_OR_CLOSE;
+        }
+        else {
+            expect = container ? JSON_EXPECT_COMMA_OR_CLOSE : JSON_EXPECT_END;
+        }
     }
 
-    // Проверяем, что все контейнеры закрыты
-    if (toksuper != NULL) {
-        parser.error = "Unclosed object or array";
+    // Текст кончился. Если в нём не было ничего, кроме пробелов,
+    // возвращаем документ без корня (как и раньше). Иначе корневое значение
+    // должно быть разобрано полностью: все скобки закрыты, после ':' есть значение
+    if (doc->root != NULL && expect != JSON_EXPECT_END) {
+        parser.error = "Unexpected end of input";
         goto failed;
     }
 
@@ -1228,40 +1117,50 @@ void json_token_free(json_token_t* token) {
     json_manager_destroy_empty_blocks();
 }
 
-// Рекурсивная функция для освобождения дерева токенов
+// Освобождает token, всех его потомков и всех соседей, идущих после него
+// в том же списке (sibling).
+//
+// Работает циклом, без рекурсии. Все токены, которые ещё нужно освободить,
+// выстроены в одну цепочку через sibling. Перед освобождением токена его дети
+// вставляются в начало этой цепочки: [token, B, C] -> [child1, child2, B, C].
+// Так сильно вложенное дерево не может переполнить стек
 static void __free_token_tree(json_token_t* token) {
-    if (token == NULL) return;
+    while (token != NULL) {
+        json_token_t* next = token->sibling;
+        json_token_t* child = token->child;
+        memory_block_t* block = token->block;
 
-    // Сохраняем ссылки на child и sibling перед обнулением
-    json_token_t* child = token->child;
-    json_token_t* sibling = token->sibling;
-    memory_block_t* block = token->block;
+        if (child != NULL) {
+            json_token_t* tail = child;
+            while (tail->sibling != NULL)
+                tail = tail->sibling;
 
-    // Освобождаем значение токена (если это строка)
-    if (token->type == JSON_STRING) {
-        str_clear(&token->value._string);
+            tail->sibling = next;
+            next = child;
+        }
+
+        // Освобождаем значение токена (если это строка)
+        if (token->type == JSON_STRING) {
+            str_clear(&token->value._string);
+        }
+
+        // Обнуляем все поля токена
+        token->block = NULL;
+        token->child = NULL;
+        token->sibling = NULL;
+        token->last_sibling = NULL;
+        token->parent = NULL;
+        token->size = 0;
+        token->value._int = 0;
+        token->type = 0;
+
+        // Помечаем слот как свободный в блоке памяти
+        if (block != NULL) {
+            memory_block_free_slot(block, token);
+        }
+
+        token = next;
     }
-
-    // Обнуляем все поля токена
-    token->block = NULL;
-    token->child = NULL;
-    token->sibling = NULL;
-    token->last_sibling = NULL;
-    token->parent = NULL;
-    token->size = 0;
-    token->value._int = 0;
-    token->type = 0;
-
-    // Помечаем слот как свободный в блоке памяти
-    if (block != NULL) {
-        memory_block_free_slot(block, token);
-    }
-
-    // Рекурсивно освобождаем дочерние токены
-    __free_token_tree(child);
-
-    // Рекурсивно освобождаем сиблингов
-    __free_token_tree(sibling);
 }
 
 void json_clear(json_doc_t* document) {

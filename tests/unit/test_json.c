@@ -2,6 +2,10 @@
 #include "json.h"
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 // ============================================================================
 // Тесты парсинга простых типов
@@ -929,4 +933,295 @@ TEST(test_json_document_lifecycle) {
     json_clear(doc);
     json_free(doc);
     json_manager_free();
+}
+
+// ============================================================================
+// Тесты строгости парсера: некорректный JSON должен отвергаться
+// ============================================================================
+
+typedef struct {
+    const char* input;
+    const char* why;
+} json_bad_case_t;
+
+static const char* json_printable(const char* input, char* out, size_t size) {
+    size_t n = 0;
+    for (const unsigned char* p = (const unsigned char*)input; *p && n + 5 < size; p++) {
+        if (*p < 0x20 || *p >= 0x7F) n += (size_t)snprintf(out + n, size - n, "\\x%02X", *p);
+        else out[n++] = (char)*p;
+    }
+    out[n] = 0;
+    return out;
+}
+
+static void assert_json_rejected(const json_bad_case_t* cases, size_t count) {
+    char message[256], printable[128];
+    for (size_t i = 0; i < count; i++) {
+        json_doc_t* doc = json_parse(cases[i].input);
+        snprintf(message, sizeof message, "Must reject %s: '%s'", cases[i].why,
+                 json_printable(cases[i].input, printable, sizeof printable));
+        // Пустой ввод даёт документ без корня: для вызывающего это тоже отказ
+        TEST_ASSERT(doc == NULL || json_root(doc) == NULL, message);
+        if (doc != NULL) json_free(doc);
+    }
+    json_manager_free();
+}
+
+static void assert_json_accepted(const char* const* inputs, size_t count) {
+    char message[256], printable[128];
+    for (size_t i = 0; i < count; i++) {
+        json_doc_t* doc = json_parse(inputs[i]);
+        snprintf(message, sizeof message, "Must accept '%s'",
+                 json_printable(inputs[i], printable, sizeof printable));
+        TEST_ASSERT(doc != NULL && json_root(doc) != NULL, message);
+        if (doc != NULL) json_free(doc);
+    }
+    json_manager_free();
+}
+
+TEST(test_json_parse_accepts_valid_documents) {
+    TEST_CASE("Valid RFC 8259 documents are accepted");
+
+    static const char* const inputs[] = {
+        "{}", "[]", "\"\"", "0", "-0", "-0.5e+3", "1E-2", "123456789",
+        "true", "false", "null",
+        " \t\r\n{ \"a\" : [ 1 , { \"b\" : null } ] } \t\r\n",
+        "[[[[[[[[[[1]]]]]]]]]]",
+        "{\"a\":{\"b\":{\"c\":[true,false,null,\"x\",1.5]}}}",
+        "\"\\\" \\\\ \\/ \\b \\f \\n \\r \\t \\u0041 \\u00e9\"",
+        "\"привет\"", "\"\xF0\x9F\x98\x80\"",
+    };
+    assert_json_accepted(inputs, sizeof inputs / sizeof inputs[0]);
+}
+
+TEST(test_json_parse_rejects_empty_and_trailing) {
+    TEST_CASE("Empty input and content after the value are rejected");
+
+    static const json_bad_case_t cases[] = {
+        { "",            "empty input" },
+        { "   ",         "whitespace only" },
+        { "{\"a\":1} x", "garbage after value" },
+        { "1 2",         "two top-level values" },
+        { "[1]]",        "extra closing bracket" },
+        { "{}{}",        "two top-level objects" },
+    };
+    assert_json_rejected(cases, sizeof cases / sizeof cases[0]);
+}
+
+TEST(test_json_parse_rejects_bad_structure) {
+    TEST_CASE("Misplaced commas, colons and brackets are rejected");
+
+    static const json_bad_case_t cases[] = {
+        { "[1,]",          "trailing comma in array" },
+        { "{\"a\":1,}",    "trailing comma in object" },
+        { "[,1]",          "leading comma in array" },
+        { "{,}",           "lone comma in object" },
+        { "[1,,2]",        "double comma" },
+        { "[1 2]",         "missing comma in array" },
+        { "[true false]",  "missing comma between literals" },
+        { "{\"a\":1 \"b\":2}", "missing comma in object" },
+        { "{\"a\"}",       "key without value" },
+        { "{\"a\":}",      "colon without value" },
+        { "{\"a\" 1}",     "missing colon" },
+        { "{\"a\",1}",     "comma instead of colon" },
+        { "{\"a\":1:2}",   "double colon" },
+        { "[1:2]",         "colon in array" },
+        { "[\"a\":1]",     "key-value pair in array" },
+        { "{1:2}",         "non-string key" },
+        { "[1",            "unclosed array" },
+        { "{\"a\":1",      "unclosed object" },
+        { "{\"a\":{\"b\":1}", "unclosed outer object" },
+        { "]",             "lone closing bracket" },
+        { "[1}",           "mismatched brackets" },
+        { "[}",            "empty array closed with '}'" },
+        { "{]",            "empty object closed with ']'" },
+        { "{\"a\":1]",     "object closed with ']'" },
+        { "[{]}",          "inner object closed with ']'" },
+        { "{\"a\":[}]",    "inner array closed with '}'" },
+        { "[{]",           "inner object skipped by outer ']'" },
+        { "[[1]}",         "outer array closed with '}'" },
+        { "}",             "lone closing brace" },
+    };
+    assert_json_rejected(cases, sizeof cases / sizeof cases[0]);
+}
+
+TEST(test_json_parse_rejects_bad_literals_and_numbers) {
+    TEST_CASE("Non-JSON literals and number formats are rejected");
+
+    static const json_bad_case_t cases[] = {
+        { "tru",      "truncated literal" },
+        { "truex",    "literal with suffix" },
+        { "nul",      "truncated null" },
+        { "fals",     "truncated false" },
+        { "[falsa]",  "misspelled false" },
+        { "True",     "capitalized literal" },
+        { "NaN",      "NaN" },
+        { "Infinity", "Infinity" },
+        { "-",        "lone minus" },
+        { "+1",       "leading plus" },
+        { "01",       "leading zero" },
+        { "-01",      "negative leading zero" },
+        { ".5",       "missing integer part" },
+        { "1.",       "missing fraction digits" },
+        { "1e",       "missing exponent digits" },
+        { "1e+",      "missing signed exponent digits" },
+        { "0x10",     "hex number" },
+        { "'a'",      "single-quoted string" },
+        { "// c\n1",  "comment" },
+    };
+    assert_json_rejected(cases, sizeof cases / sizeof cases[0]);
+}
+
+TEST(test_json_parse_rejects_bad_strings) {
+    TEST_CASE("Malformed strings, escapes and UTF-8 are rejected");
+
+    static const json_bad_case_t cases[] = {
+        { "\"abc",             "unterminated string" },
+        { "\"a\\x\"",          "unknown escape" },
+        { "\"a\\u12\"",        "short \\u escape" },
+        { "\"a\\u12zz\"",      "non-hex \\u escape" },
+        { "\"a\tb\"",          "raw control character" },
+        { "\"\xC0\x80\"",      "overlong UTF-8" },
+        { "\"\xED\xA0\x80\"",  "UTF-8 encoded surrogate" },
+        { "\"\xF5\x80\x80\x80\"", "UTF-8 beyond U+10FFFF" },
+        { "\"\xFF\"",          "invalid UTF-8 byte" },
+        { "\"\x80\"",          "stray continuation byte" },
+    };
+    assert_json_rejected(cases, sizeof cases / sizeof cases[0]);
+}
+
+// Разбор идёт в дочернем процессе: если лимит глубины сломается, ошибка
+// в коде, обходящем дерево рекурсивно, уронит только его, а не весь runner.
+// Возвращает 1 — ввод принят, 0 — отвергнут, -1 — процесс упал
+static int json_parse_in_child(const char* input) {
+    pid_t child = fork();
+    if (child == -1) return -1;
+    if (child == 0) {
+        json_doc_t* doc = json_parse(input);
+        const int accepted = doc != NULL && json_root(doc) != NULL;
+        if (doc != NULL) json_free(doc);
+        _exit(accepted ? 1 : 0);
+    }
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) return -1;
+    if (!WIFEXITED(status)) return -1;
+    return WEXITSTATUS(status);
+}
+
+TEST(test_json_parse_deep_nesting) {
+    TEST_CASE("Very deep input is rejected without crashing");
+
+    enum { DEPTH = 200000 };
+    char* open_only = malloc(DEPTH + 1);
+    char* balanced = malloc(DEPTH * 2 + 1);
+    TEST_REQUIRE_NOT_NULL_GOTO(open_only, "Buffer allocated", done);
+    TEST_REQUIRE_NOT_NULL_GOTO(balanced, "Buffer allocated", done);
+
+    memset(open_only, '[', DEPTH);
+    open_only[DEPTH] = 0;
+    memset(balanced, '[', DEPTH);
+    memset(balanced + DEPTH, ']', DEPTH);
+    balanced[DEPTH * 2] = 0;
+
+    TEST_ASSERT_EQUAL(0, json_parse_in_child(open_only),
+                      "Unclosed 200000-deep array must be rejected, not crash");
+    TEST_ASSERT_EQUAL(0, json_parse_in_child(balanced),
+                      "Balanced 200000-deep array must be rejected, not crash");
+
+done:
+    free(open_only);
+    free(balanced);
+}
+
+// Строит документ из depth вложенных контейнеров, самый внутренний пустой.
+// kind: 'a' — только массивы [[[]]], 'o' — только объекты {"k":{"k":{}}},
+// 'm' — чередование [{"k":[{}]}]
+static char* json_nested(size_t depth, char kind) {
+    char* out = malloc(depth * 6 + 1);  // "{\"k\":" + "}" — самый длинный уровень
+    if (out == NULL) return NULL;
+
+    size_t n = 0;
+    for (size_t i = 0; i < depth; i++) {
+        const int object = kind == 'o' || (kind == 'm' && i % 2 == 1);
+        const int innermost = i + 1 == depth;
+        if (!object) out[n++] = '[';
+        else if (innermost) out[n++] = '{';
+        else { memcpy(out + n, "{\"k\":", 5); n += 5; }
+    }
+    for (size_t i = depth; i-- > 0;) {
+        const int object = kind == 'o' || (kind == 'm' && i % 2 == 1);
+        out[n++] = object ? '}' : ']';
+    }
+    out[n] = 0;
+
+    return out;
+}
+
+static int json_accepts(const char* input) {
+    json_doc_t* doc = json_parse(input);
+    const int accepted = doc != NULL && json_root(doc) != NULL;
+    if (doc != NULL) json_free(doc);
+    json_manager_free();
+    return accepted;
+}
+
+TEST(test_json_parse_depth_limit) {
+    TEST_CASE("Nesting up to JSON_MAX_DEPTH is accepted, one level more is rejected");
+
+    static const struct { char kind; const char* name; } kinds[] = {
+        { 'a', "arrays" }, { 'o', "objects" }, { 'm', "mixed" },
+    };
+    char message[128];
+
+    for (size_t i = 0; i < sizeof kinds / sizeof kinds[0]; i++) {
+        char* at_limit = json_nested(JSON_MAX_DEPTH, kinds[i].kind);
+        char* over_limit = json_nested(JSON_MAX_DEPTH + 1, kinds[i].kind);
+
+        if (at_limit != NULL && over_limit != NULL) {
+            snprintf(message, sizeof message, "%s: depth %d must be accepted",
+                     kinds[i].name, JSON_MAX_DEPTH);
+            TEST_ASSERT(json_accepts(at_limit), message);
+
+            snprintf(message, sizeof message, "%s: depth %d must be rejected",
+                     kinds[i].name, JSON_MAX_DEPTH + 1);
+            TEST_ASSERT(!json_accepts(over_limit), message);
+        }
+        else {
+            TEST_FAIL("Buffer allocated");
+        }
+
+        free(at_limit);
+        free(over_limit);
+    }
+}
+
+TEST(test_json_parse_depth_counts_open_containers) {
+    TEST_CASE("Closed containers do not count towards the depth limit");
+
+    // Два соседних поддерева, каждое ровно на лимите: [ <limit-1>, <limit-1> ].
+    // Если бы закрытие контейнера не уменьшало глубину, второе поддерево
+    // вышло бы за лимит
+    char* subtree = json_nested(JSON_MAX_DEPTH - 1, 'm');
+    TEST_REQUIRE_NOT_NULL(subtree, "Buffer allocated");
+
+    const size_t length = strlen(subtree);
+    char* siblings = malloc(length * 2 + 4);
+    TEST_REQUIRE_NOT_NULL_GOTO(siblings, "Buffer allocated", done);
+
+    siblings[0] = '[';
+    memcpy(siblings + 1, subtree, length);
+    siblings[1 + length] = ',';
+    memcpy(siblings + 2 + length, subtree, length);
+    siblings[2 + length * 2] = ']';
+    siblings[3 + length * 2] = 0;
+
+    TEST_ASSERT(json_accepts(siblings), "Two sibling subtrees at the limit must be accepted");
+
+    // Много пустых контейнеров на одном уровне — глубина 2, а не их количество
+    TEST_ASSERT(json_accepts("[[],[],[],{},{},[[]],{\"a\":[]},{\"b\":{}}]"),
+                "Many sibling containers must be accepted");
+
+done:
+    free(subtree);
+    free(siblings);
 }

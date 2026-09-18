@@ -9,6 +9,12 @@
 // Количество токенов в одном блоке памяти
 #define TOKENS_PER_BLOCK 4096
 
+// Максимальная вложенность объектов и массивов, которую принимает json_parse.
+// RFC 8259 §9 разрешает парсерам ограничивать вложенность
+#ifndef JSON_MAX_DEPTH
+#define JSON_MAX_DEPTH 512
+#endif
+
 typedef struct memory_block {
     void* memory;                    // Указатель на память
     void* free_list;                 // Односвязный список свободных слотов
