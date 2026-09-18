@@ -11,7 +11,6 @@
 #include "log.h"
 #include "helpers.h"
 
-static int __hex_char_to_int(char c);
 static char __byte_to_hex(unsigned char);
 
 int helpers_mkdir(const char* path) {
@@ -153,7 +152,7 @@ int timezone_offset() {
     return local_tm.tm_hour - gm_tm.tm_hour;
 }
 
-int __hex_char_to_int(char c) {
+int hex_char_to_int(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
@@ -175,8 +174,8 @@ int hex_to_bytes(const char* hex, unsigned char* raw, size_t raw_size) {
     }
 
     for (size_t i = 0; i < len; i += 2) {
-        int high = __hex_char_to_int(hex[i]);
-        int low = __hex_char_to_int(hex[i + 1]);
+        int high = hex_char_to_int(hex[i]);
+        int low = hex_char_to_int(hex[i + 1]);
 
         if (high == -1 || low == -1) {
             log_error("Error: Invalid hex character\n");
@@ -247,8 +246,8 @@ char* urldecodel(const char* string, size_t length, size_t* output_length) {
         char ch = string[i];
         if (ch == '%') {
             if (i + 2 < length) {
-                int hi = __hex_char_to_int(string[i + 1]);
-                int lo = __hex_char_to_int(string[i + 2]);
+                int hi = hex_char_to_int(string[i + 1]);
+                int lo = hex_char_to_int(string[i + 2]);
                 if (hi >= 0 && lo >= 0) {
                     *pbuffer++ = (char)((hi << 4) | lo);
                     i += 2;
