@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 
 #include "mailheader.h"
+#include "mailmessage.h"
 #include "openssl.h"
 #include "smtprequest.h"
 #include "smtpresponse.h"
@@ -33,11 +34,6 @@ typedef struct mail_payload {
     const char* body;
 } mail_payload_t;
 
-typedef struct mail_string {
-    char* value;
-    size_t length;
-} mail_string_t;
-
 typedef struct mail_result {
     int status;
     char error[SMTPRESPONSE_MESSAGE_SIZE];
@@ -47,12 +43,6 @@ typedef struct mail {
     int reseted;
     int last_status;
     char last_error[SMTPRESPONSE_MESSAGE_SIZE];
-    mail_string_t from_with_name;
-    mail_string_t from;
-    mail_string_t to;
-    mail_string_t subject;
-    mail_string_t date;
-    mail_string_t message_id;
 
     connection_t* connection;
     smtprequest_t* request;
@@ -62,12 +52,7 @@ typedef struct mail {
     char* buffer;
     size_t buffer_size;
 
-    char* data;
-    size_t data_size;
-
     SSL_CTX* ssl_ctx;
-    mail_header_t* _header;
-    mail_header_t* _last_header;
 
     int(*connected)(struct mail* instance);
     int(*connect)(struct mail* instance, const char* email);
@@ -79,12 +64,8 @@ typedef struct mail {
      * whenever no credentials are configured, so the caller can invoke it
      * unconditionally. */
     int(*auth)(struct mail* instance);
-    int(*set_from)(struct mail* instance, const char* email, const char* sender_name);
-    int(*set_to)(struct mail* instance, const char* email);
-    int(*set_subject)(struct mail* instance, const char* subject);
-    int(*set_body)(struct mail* instance, const char* body);
 
-    int(*send_mail)(struct mail* instance);
+    int(*send_mail)(struct mail* instance, mail_message_t* message);
     int(*send_reset)(struct mail* instance);
     int(*send_quit)(struct mail* instance);
 

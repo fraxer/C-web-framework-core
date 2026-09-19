@@ -48,6 +48,7 @@ add_executable(
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/dkim.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/mailheader.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/mailattachment.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/mailmessage.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/dkimcanonparser.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/dkimheaderparser.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/mail.c

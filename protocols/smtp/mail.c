@@ -17,8 +17,6 @@
 #include "mail.h"
 #include "taskmanager.h"
 
-void __mail_string_reset(mail_string_t* string);
-void __mail_string_free(mail_string_t* string);
 int __mail_connected(mail_t* instance);
 int __mail_connect(mail_t* instance, const char* email);
 connection_t* __mail_connection_create(const int fd, const unsigned short port);
@@ -33,15 +31,9 @@ int __mail_send_hello(mail_t* instance);
 int __mail_start_tls(mail_t* instance);
 int __mail_auth(mail_t* instance);
 int __mail_send_quit(mail_t* instance);
-int __mail_set_from(mail_t* instance, const char* email, const char* sender_name);
-int __mail_set_to(mail_t* instance, const char* email);
-int __mail_set_subject(mail_t* instance, const char* subject);
-int __mail_set_date(mail_t* instance, time_t* rawtime);
-int __mail_set_message_id(mail_t* instance, time_t* rawtime);
-int __mail_set_content(mail_t* instance, const char* body);
-int __mail_send_mail(mail_t* instance);
-int __mail_send_from(mail_t* instance);
-int __mail_send_to(mail_t* instance);
+int __mail_send_mail(mail_t* instance, mail_message_t* message);
+int __mail_send_from(mail_t* instance, mail_message_t* message);
+int __mail_send_to(mail_t* instance, mail_message_t* message);
 int __mail_send_data(mail_t* instance);
 int __mail_send_content(mail_t* instance);
 int __mail_send_reset(mail_t* instance);
@@ -55,11 +47,6 @@ int __mail_send_command(mail_t* instance, const char* format, ...);
 int __mail_init_tls(mail_t* instance);
 int __mail_alloc_ssl(connection_t* connection, const char* hostname, const int verify);
 int __mail_handshake(connection_t* connection, const int verify);
-int __mail_set_dkim_headers(dkim_t* dkim, mail_t* instance);
-int __mail_build_content(mail_t* instance);
-int __mail_header_add(mail_t* instance, const char* key, const char* value);
-size_t __mail_calc_content_length(mail_t* instance);
-int __mail_data_append(char* data, size_t* pos, const char* string, const size_t length);
 
 /* ---------------------------------------------------------------------------
  * Why a session stopped (mail_result_t in mail.h). The reason is recorded on
@@ -162,13 +149,6 @@ mail_t* mail_create() {
     instance->last_status = 0;
     instance->last_error[0] = '\0';
 
-    __mail_string_reset(&instance->from_with_name);
-    __mail_string_reset(&instance->from);
-    __mail_string_reset(&instance->to);
-    __mail_string_reset(&instance->subject);
-    __mail_string_reset(&instance->date);
-    __mail_string_reset(&instance->message_id);
-
     instance->ssl_ctx = NULL;
     instance->connection = NULL;
     instance->request = NULL;
@@ -181,20 +161,12 @@ mail_t* mail_create() {
         return NULL;
     }
 
-    instance->data_size = 0;
-    instance->data = NULL;
-    instance->_header = NULL;
-    instance->_last_header = NULL;
     instance->connected = __mail_connected;
     instance->connect = __mail_connect;
     instance->read_banner = __mail_read_banner;
     instance->send_hello = __mail_send_hello;
     instance->start_tls = __mail_start_tls;
     instance->auth = __mail_auth;
-    instance->set_from = __mail_set_from;
-    instance->set_to = __mail_set_to;
-    instance->set_subject = __mail_set_subject;
-    instance->set_body = __mail_set_content;
     instance->send_mail = __mail_send_mail;
     instance->send_reset = __mail_send_reset;
     instance->send_quit = __mail_send_quit;
@@ -257,6 +229,7 @@ int send_mail_result(mail_payload_t* payload, mail_result_t* result) {
 
     int sent = 0;  // Assume failure
     const char* reason = "Unknown error";
+    mail_message_t* message = NULL;
 
     // Check connection
     if (!mail->connected(mail)) {
@@ -292,35 +265,15 @@ int send_mail_result(mail_payload_t* payload, mail_result_t* result) {
         }
     }
 
-    // Set sender
-    if (!mail->set_from(mail, payload->from, payload->from_name)) {
-        reason = "Failed to set FROM";
-        goto cleanup;
-    }
+    message = mail_message_create();
+    if (message == NULL) { reason = "Failed to create message"; goto cleanup; }
 
-    // Set recipient
-    if (!mail->set_to(mail, payload->to)) {
-        reason = "Failed to set TO";
-        goto cleanup;
-    }
+    if (!mail_message_set_from(message, payload->from, payload->from_name)) { reason = "Failed to set FROM"; goto cleanup; }
+    if (!mail_message_set_to(message, payload->to)) { reason = "Failed to set TO"; goto cleanup; }
+    if (!mail_message_set_subject(message, payload->subject)) { reason = "Failed to set subject"; goto cleanup; }
+    mail_message_set_body(message, payload->body);
 
-    // Set subject
-    if (!mail->set_subject(mail, payload->subject)) {
-        reason = "Failed to set subject";
-        goto cleanup;
-    }
-
-    // Set body
-    if (!mail->set_body(mail, payload->body)) {
-        reason = "Failed to set body";
-        goto cleanup;
-    }
-
-    // Send mail (MAIL FROM, RCPT TO, DATA, content)
-    if (!mail->send_mail(mail)) {
-        reason = "Failed to send mail";
-        goto cleanup;
-    }
+    if (!mail->send_mail(mail, message)) { reason = "Failed to send mail"; goto cleanup; }
 
     // Send RSET to reset connection
     if (!mail->send_reset(mail)) {
@@ -345,6 +298,8 @@ cleanup:
     }
 
     __mail_result_fill(result, mail, 0, NULL);
+
+    if (message != NULL) mail_message_free(message);
 
     mail->free(mail);
     return sent;
@@ -395,20 +350,6 @@ void send_mail_async(mail_payload_t* payload) {
         log_error("[send_mail_async] Failed to queue async task\n");
         __mail_payload_free(copy);
     }
-}
-
-void __mail_string_reset(mail_string_t* item) {
-    if (item == NULL) return;
-
-    item->value = NULL;
-    item->length = 0;
-}
-
-void __mail_string_free(mail_string_t* string) {
-    if (string->value != NULL)
-        free(string->value);
-
-    __mail_string_reset(string);
 }
 
 int __mail_connected(mail_t* instance) {
@@ -936,167 +877,34 @@ int __mail_send_quit(mail_t* instance) {
     return 1;
 }
 
-int __mail_set_from(mail_t* instance, const char* email, const char* sender_name) {
+int __mail_send_mail(mail_t* instance, mail_message_t* message) {
     if (instance == NULL) return 0;
-    if (email == NULL) return 0;
-    if (sender_name == NULL) return 0;
 
-    size_t sender_name_length = strlen(sender_name);
-    char encoded_sender_name[base64_encode_len(sender_name_length)];
-    size_t encoded_sender_name_length = base64_encode(encoded_sender_name, sender_name, sender_name_length);
-
-    const size_t email_length = strlen(email);
-    const char* template = "=?UTF-8?B?%s?= <%s>";
-    instance->from_with_name.length = strlen(template) - 4 + encoded_sender_name_length + email_length;
-    instance->from_with_name.value = malloc(instance->from_with_name.length + 1);
-    if (instance->from_with_name.value == NULL)
+    if (!__mail_send_from(instance, message))
         return 0;
-
-    instance->from_with_name.length = snprintf(instance->from_with_name.value, instance->from_with_name.length + 1, template, encoded_sender_name, email);
-    if (instance->from_with_name.length <= 0) return 0;
-
-    template = "<%s>";
-    instance->from.length = strlen(template) - 2 + email_length;
-    instance->from.value = malloc(instance->from.length + 1);
-    if (instance->from.value == NULL)
-        return 0;
-
-    instance->from.length = snprintf(instance->from.value, instance->from.length + 1, template, email);
-    if (instance->from.length <= 0) return 0;
-
-    return 1;
-}
-
-int __mail_set_to(mail_t* instance, const char* email) {
-    if (instance == NULL) return 0;
-    if (email == NULL) return 0;
-
-    const size_t email_length = strlen(email);
-    const char* template = "<%s>";
-
-    instance->to.length = strlen(template) - 2 + email_length;
-    instance->to.value = malloc(instance->to.length + 1);
-    if (instance->to.value == NULL)
-        return 0;
-
-    instance->to.length = snprintf(instance->to.value, instance->to.length + 1, template, email);
-    if (instance->to.length <= 0) return 0;
-
-    return 1;
-}
-
-int __mail_set_subject(mail_t* instance, const char* subject) {
-    if (instance == NULL) return 0;
-    if (subject == NULL) return 0;
-
-    size_t subject_length = strlen(subject);
-    char encoded_subject[base64_encode_len(subject_length)];
-    const size_t encoded_subject_length = base64_encode(encoded_subject, subject, subject_length);
-
-    const char* template = "=?UTF-8?B?%s?=";
-    instance->subject.length = strlen(template) - 2 + encoded_subject_length;
-    instance->subject.value = malloc(instance->subject.length + 1);
-    if (instance->subject.value == NULL)
-        return 0;
-
-    instance->subject.length = snprintf(instance->subject.value, instance->subject.length + 1, template, encoded_subject);
-    if (instance->subject.length <= 0) return 0;
-
-    return 1;
-}
-
-int __mail_set_date(mail_t* instance, time_t* rawtime) {
-    if (instance == NULL) return 0;
-    if (rawtime == NULL) return 0;
-
-    char timezone[7];
-    {
-        /* timezone_offset() returns a signed hour difference (e.g. -5 for EST).
-         * The numeric part must use the absolute value so the sign is emitted
-         * only once; otherwise -5 would render as "-0-500" instead of "-0500". */
-        const int tz = timezone_offset();
-        const int tz_abs = tz < 0 ? -tz : tz;
-        const char* sign = tz < 0 ? "-" : "+";
-        const char* zero = tz_abs < 10 ? "0" : "";
-        const int r = snprintf(timezone, sizeof(timezone), "%s%s%d00", sign, zero, tz_abs);
-        if (r <= 0) return 0;
-    }
-
-    char template[80];
-    const int r = snprintf(template, sizeof(template), "%%a, %%d %%b %%Y %%T %s", timezone);
-    if (r <= 0) return 0;
-
-    struct tm* timeinfo = localtime(rawtime);
-    if (timeinfo == NULL) return 0;
-
-    instance->date.value = malloc(80);
-    if (instance->date.value == NULL)
-        return 0;
-
-    instance->date.length = strftime(instance->date.value, 80, template, timeinfo);
-    if (instance->date.length <= 0) return 0;
-
-    return 1;
-}
-
-int __mail_set_message_id(mail_t* instance, time_t* rawtime) {
-    if (instance == NULL) return 0;
-    if (rawtime == NULL) return 0;
-
-    char template[80];
-    const int r = snprintf(template, sizeof(template), "<%%Y%%m%%d%%H%%M%%S@%s>", __mail_ehlo_host());
-    if (r <= 0) return 0;
-
-    struct tm* timeinfo = localtime(rawtime);
-    if (timeinfo == NULL) return 0;
-
-    instance->message_id.value = malloc(80);
-    if (instance->message_id.value == NULL)
-        return 0;
-
-    instance->message_id.length = strftime(instance->message_id.value, 80, template, timeinfo);
-    if (instance->message_id.length <= 0) return 0;
-
-    return 1;
-}
-
-int __mail_set_content(mail_t* instance, const char* body) {
-    if (instance == NULL) return 0;
-    if (body == NULL) return 0;
-    if (instance->data != NULL)
-        free(instance->data);
-
-    const int wrap = 76;
-    size_t body_length = strlen(body);
-    instance->data = malloc(base64_encode_nl_len(body_length, wrap));
-    if (instance->data == NULL) return 0;
-
-    instance->data_size = base64_encode_nl(instance->data, body, body_length, wrap);
-
-    return 1;
-}
-
-int __mail_send_mail(mail_t* instance) {
-    if (instance == NULL) return 0;
-    
-    if (!__mail_send_from(instance))
-        return 0;
-    if (!__mail_send_to(instance))
+    if (!__mail_send_to(instance, message))
         return 0;
     if (!__mail_send_data(instance))
         return 0;
-    if (!__mail_build_content(instance))
+    if (!mail_message_build(message, time(0))) {
+        mail_set_error(instance, 0, "Failed to build message"); /* спека §8 */
         return 0;
+    }
+    instance->request_data->content = message->data;
+    instance->request_data->content_size = message->data_size;
+    /* владение буфером переходит request_data, как раньше с malloc внутри build_content */
+    message->data = NULL;
+    message->data_size = 0;
     if (!__mail_send_content(instance))
         return 0;
 
     return 1;
 }
 
-int __mail_send_from(mail_t* instance) {
+int __mail_send_from(mail_t* instance, mail_message_t* message) {
     if (!__mail_can_interact(instance)) return 0;
-    if (instance->from.length == 0) return 0;
-    if (!__mail_send_command(instance, "MAIL FROM: %s\r\n", instance->from.value)) return 0;
+    if (message->from.length == 0) return 0;
+    if (!__mail_send_command(instance, "MAIL FROM: %s\r\n", message->from.value)) return 0;
 
     connection_client_ctx_t* ctx = instance->connection->ctx;
     smtpresponse_t* response = ctx->response;
@@ -1110,10 +918,10 @@ int __mail_send_from(mail_t* instance) {
     return 1;
 }
 
-int __mail_send_to(mail_t* instance) {
+int __mail_send_to(mail_t* instance, mail_message_t* message) {
     if (!__mail_can_interact(instance)) return 0;
-    if (instance->to.length == 0) return 0;
-    if (!__mail_send_command(instance, "RCPT TO: %s\r\n", instance->to.value)) return 0;
+    if (message->to.length == 0) return 0;
+    if (!__mail_send_command(instance, "RCPT TO: %s\r\n", message->to.value)) return 0;
 
     connection_client_ctx_t* ctx = instance->connection->ctx;
     smtpresponse_t* response = ctx->response;
@@ -1148,7 +956,7 @@ int __mail_send_data(mail_t* instance) {
 
 int __mail_send_content(mail_t* instance) {
     if (!__mail_can_interact(instance)) return 0;
-    if (instance->data_size == 0) return 0;
+    if (instance->request_data->content_size == 0) return 0;
 
     // Check write return value
     int write_result = instance->connection->write(instance->connection);
@@ -1193,13 +1001,6 @@ int __mail_send_reset(mail_t* instance) {
 void __mail_free(mail_t* instance) {
     if (instance == NULL) return;
 
-    __mail_string_free(&instance->from_with_name);
-    __mail_string_free(&instance->from);
-    __mail_string_free(&instance->to);
-    __mail_string_free(&instance->subject);
-    __mail_string_free(&instance->date);
-    __mail_string_free(&instance->message_id);
-    
     if (instance->ssl_ctx != NULL) {
         SSL_CTX_free(instance->ssl_ctx);
         instance->ssl_ctx = NULL;
@@ -1224,20 +1025,8 @@ void __mail_free(mail_t* instance) {
         free(instance->buffer);
         instance->buffer = NULL;
     }
-    if (instance->data != NULL) {
-        free(instance->data);
-        instance->data = NULL;
-    }
 
     instance->buffer_size = 0;
-    instance->data_size = 0;
-
-    mail_header_t* header = instance->_header;
-    while (header) {
-        mail_header_t* next = header->next;
-        mail_header_free(header);
-        header = next;
-    }
 
     free(instance);
 }
@@ -1566,155 +1355,3 @@ int __mail_handshake(connection_t* connection, const int verify) {
     return 1;
 }
 
-int __mail_set_dkim_headers(dkim_t* dkim, mail_t* instance) {
-    if (!dkim_header_add(dkim, "From", 4, instance->from_with_name.value, instance->from_with_name.length)) return 0;
-    if (!dkim_header_add(dkim, "To", 2, instance->to.value, instance->to.length)) return 0;
-    if (!dkim_header_add(dkim, "Subject", 7, instance->subject.value, instance->subject.length)) return 0;
-    if (!dkim_header_add(dkim, "Date", 4, instance->date.value, instance->date.length)) return 0;
-    if (!dkim_header_add(dkim, "Message-Id", 10, instance->message_id.value, instance->message_id.length)) return 0;
-
-    return 1;
-}
-
-int __mail_build_content(mail_t* instance) {
-    if (instance == NULL) return 0;
-
-    int result = 0;
-    time_t rawtime = time(0);
-    dkim_t* dkim = NULL;
-    char* dkim_sign = NULL;
-
-    if (!__mail_set_date(instance, &rawtime))
-        goto failed;
-    if (!__mail_set_message_id(instance, &rawtime))
-        goto failed;
-
-    /* DKIM is optional, which is what config.md has always claimed and what the
-     * code did not do: dkim_create_sign() returns NULL on an unset key, and the
-     * message was then never sent at all. A configuration with no key now
-     * produces an unsigned message and the send goes ahead.
-     *
-     * A relay makes this the ordinary case rather than the exception -- it
-     * signs with its own key and its own domain, and a second signature from
-     * the sender is not wanted. The half-configured case (a key without a
-     * selector, or the reverse) is rejected at configuration load, so seeing
-     * one of them here means both are set. */
-    const char* dkim_private = env()->mail.dkim_private;
-    const char* dkim_selector = env()->mail.dkim_selector;
-
-    if (dkim_private != NULL && dkim_private[0] != '\0' &&
-        dkim_selector != NULL && dkim_selector[0] != '\0') {
-        dkim = dkim_create();
-        if (dkim == NULL)
-            goto failed;
-
-        dkim_set_private_key(dkim, dkim_private);
-        dkim_set_domain(dkim, env()->mail.host);
-        dkim_set_selector(dkim, dkim_selector);
-        dkim_set_timestamp(dkim, rawtime);
-
-        if (!__mail_set_dkim_headers(dkim, instance))
-            goto failed;
-
-        dkim_sign = dkim_create_sign(dkim, instance->data);
-        if (dkim_sign == NULL)
-            goto failed;
-    }
-
-    if (!__mail_header_add(instance, "From", instance->from_with_name.value)) goto failed;
-    if (!__mail_header_add(instance, "To", instance->to.value)) goto failed;
-    if (!__mail_header_add(instance, "Subject", instance->subject.value)) goto failed;
-    if (!__mail_header_add(instance, "Date", instance->date.value)) goto failed;
-    if (!__mail_header_add(instance, "Message-Id", instance->message_id.value)) goto failed;
-    if (dkim_sign != NULL && !__mail_header_add(instance, "DKIM-Signature", dkim_sign)) goto failed;
-    if (!__mail_header_add(instance, "MIME-Version", "1.0")) goto failed;
-    if (!__mail_header_add(instance, "Content-Transfer-Encoding", "base64")) goto failed;
-    if (!__mail_header_add(instance, "Content-Type", "text/html; charset=utf-8")) goto failed;
-
-    instance->request_data->content_size = __mail_calc_content_length(instance);
-    instance->request_data->content = malloc(sizeof(char) * instance->request_data->content_size);
-    if (instance->request_data->content == NULL)
-        goto failed;
-
-    size_t pos = 0;
-    mail_header_t* header = instance->_header;
-    while (header) {
-        if (!__mail_data_append(instance->request_data->content, &pos, header->key, header->key_length)) goto failed;
-        if (!__mail_data_append(instance->request_data->content, &pos, ": ", 2)) goto failed;
-        if (!__mail_data_append(instance->request_data->content, &pos, header->value, header->value_length)) goto failed;
-        if (!__mail_data_append(instance->request_data->content, &pos, "\r\n", 2)) goto failed;
-
-        header = header->next;
-    }
-
-    if (!__mail_data_append(instance->request_data->content, &pos, "\r\n", 2)) goto failed;
-    if (!__mail_data_append(instance->request_data->content, &pos, instance->data, instance->data_size)) goto failed;
-    if (!__mail_data_append(instance->request_data->content, &pos, "\r\n.\r\n", 5)) goto failed;
-
-    result = 1;
-
-    failed:
-
-    if (result == 0) {
-        instance->reseted = 1;
-    }
-
-    if (dkim != NULL) dkim_free(dkim);
-    if (dkim_sign != NULL) free(dkim_sign);
-
-    return result;
-}
-
-int __mail_header_add(mail_t* instance, const char* key, const char* value) {
-    if (instance == NULL) return 0;
-    if (key == NULL) return 0;
-    if (value == NULL) return 0;
-    if (key[0] == 0) return 0;
-    if (value[0] == 0) return 0;
-
-    const size_t key_length = strlen(key);
-    const size_t value_length = strlen(value);
-    mail_header_t* header = mail_header_create(key, key_length, value, value_length);
-    if (header == NULL) return 0;
-    if (header->key == NULL || header->value == NULL) {
-        mail_header_free(header);
-        return 0;
-    }
-
-    if (instance->_header == NULL)
-        instance->_header = header;
-
-    if (instance->_last_header != NULL)
-        instance->_last_header->next = header;
-
-    instance->_last_header = header;
-
-    return 1;
-}
-
-size_t __mail_calc_content_length(mail_t* instance) {
-    mail_header_t* header = instance->_header;
-    size_t size = 0;
-
-    while (header) {
-        size += header->key_length;
-        size += 2; // ": "
-        size += header->value_length;
-        size += 2; // "\r\n"
-
-        header = header->next;
-    }
-
-    size += 2; // "\r\n"
-    size += instance->data_size;
-    size += 5; // "\r\n.\r\n"
-
-    return size;
-}
-
-int __mail_data_append(char* data, size_t* pos, const char* string, const size_t length) {
-    memcpy(&data[*pos], string, length);
-    *pos += length;
-
-    return 1;
-}
