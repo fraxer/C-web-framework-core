@@ -2,12 +2,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
-#include <sys/time.h>
 
 #include "appconfig.h"
 #include "base64.h"
 #include "dkim.h"
 #include "helpers.h"
+#include "mailattachment.h"
 #include "mailheader.h"
 #include "uuid.h"
 
@@ -20,6 +20,7 @@ static int __mailmessage_header_add(mail_message_t* message, const char* key, co
 static size_t __mailmessage_content_length(const mail_message_t* message);
 static int __mailmessage_data_append(char* data, size_t* pos, const char* string, const size_t length);
 static int __mailmessage_set_dkim_headers(dkim_t* dkim, const mail_message_t* message);
+static int __mailmessage_boundary_generate(mail_message_t* message);
 static int __mailmessage_build_body(mail_message_t* message);
 static int __mailmessage_dkim_sign(mail_message_t* message, time_t rawtime, char** sign_out);
 static const char* __mailmessage_host(void);
@@ -135,9 +136,31 @@ void mail_message_set_attachments(mail_message_t* message, const mail_attachment
 int mail_message_build(mail_message_t* message, time_t rawtime) {
     if (message == NULL || message->body == NULL || message->body[0] == '\0') return 0;
 
+    /* Некорректное вложение отвергается до сборки: частично собранного
+     * письма не существует */
+    for (size_t i = 0; i < message->attachments_count; i++) {
+        const mail_attachment_t* a = &message->attachments[i];
+        if (a->filename == NULL || a->filename[0] == '\0' ||
+            a->data == NULL || a->size == 0)
+            return 0;
+    }
+
     /* повторная сборка того же сообщения не течёт (наследие test_mail_set_content_replaces_previous) */
     if (message->data != NULL) { free(message->data); message->data = NULL; message->data_size = 0; }
     if (message->body_data != NULL) { free(message->body_data); message->body_data = NULL; message->body_size = 0; }
+
+    /* заголовки прошлой сборки тоже не живут: иначе повторная сборка
+     * дублирует их, а неудачная оставляет цепочку частично заполненной */
+    {
+        mail_header_t* header = message->header;
+        while (header != NULL) {
+            mail_header_t* next = header->next;
+            mail_header_free(header);
+            header = next;
+        }
+        message->header = NULL;
+        message->last_header = NULL;
+    }
 
     int result = 0;
     char* dkim_sign = NULL;
@@ -155,8 +178,16 @@ int mail_message_build(mail_message_t* message, time_t rawtime) {
     if (!__mailmessage_header_add(message, "Message-Id", message->message_id.value)) goto failed;
     if (dkim_sign != NULL && !__mailmessage_header_add(message, "DKIM-Signature", dkim_sign)) goto failed;
     if (!__mailmessage_header_add(message, "MIME-Version", "1.0")) goto failed;
-    if (!__mailmessage_header_add(message, "Content-Transfer-Encoding", "base64")) goto failed;
-    if (!__mailmessage_header_add(message, "Content-Type", "text/html; charset=utf-8")) goto failed;
+    if (message->attachments_count > 0) {
+        char content_type[128];
+        snprintf(content_type, sizeof(content_type),
+                 "multipart/mixed; boundary=\"%s\"", message->boundary);
+        if (!__mailmessage_header_add(message, "Content-Type", content_type)) goto failed;
+    }
+    else {
+        if (!__mailmessage_header_add(message, "Content-Transfer-Encoding", "base64")) goto failed;
+        if (!__mailmessage_header_add(message, "Content-Type", "text/html; charset=utf-8")) goto failed;
+    }
 
     message->data_size = __mailmessage_content_length(message);
     message->data = malloc(message->data_size);
@@ -258,13 +289,97 @@ static int __mailmessage_set_message_id(mail_message_t* message, time_t* rawtime
     return 1;
 }
 
-static int __mailmessage_build_body(mail_message_t* message) {
-    /* Ровно сегодняшнее __mail_set_content: base64 тела с переносом 76 */
-    const size_t length = strlen(message->body);
-    message->body_data = malloc(base64_encode_nl_len((int)length, 76));
-    if (message->body_data == NULL) return 0;
+static int __mailmessage_boundary_generate(mail_message_t* message) {
+    char uuid[UUID4_SIZE];
+    if (uuid4_generate(uuid) != 1) return 0;
 
-    message->body_size = base64_encode_nl(message->body_data, message->body, (int)length, 76);
+    snprintf(message->boundary, sizeof(message->boundary), "=_%.36s", uuid);
+    return 1;
+}
+
+static int __mailmessage_build_body(mail_message_t* message) {
+    /* base64 текстовой части — как раньше (перенос 76) */
+    const size_t body_length = strlen(message->body);
+    char* encoded = malloc((size_t)base64_encode_nl_len((int)body_length, 76) + 1);
+    if (encoded == NULL) return 0;
+
+    const size_t encoded_size = base64_encode_nl(encoded, message->body, (int)body_length, 76);
+
+    if (message->attachments_count == 0) {
+        /* Односоставное письмо — байты как раньше */
+        message->body_data = encoded;
+        message->body_size = encoded_size;
+        return 1;
+    }
+
+    if (!__mailmessage_boundary_generate(message)) {
+        free(encoded);
+        return 0;
+    }
+
+    /* Текстовая часть: те же заголовки, что были верхними у односоставного
+     * письма, теперь внутри части (спека §4) */
+    char text_prefix[512];
+    const int text_prefix_length = snprintf(text_prefix, sizeof(text_prefix),
+        "--%s\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Transfer-Encoding: base64\r\n"
+        "\r\n",
+        message->boundary);
+
+    char closing[96];
+    const int closing_length = snprintf(closing, sizeof(closing), "--%s--\r\n", message->boundary);
+
+    if (text_prefix_length <= 0 || closing_length <= 0) {
+        free(encoded);
+        return 0;
+    }
+
+    /* Части вложений собираются заранее: любая неудача освобождает все
+     * предыдущие, и тело не собирается вовсе */
+    mail_attachment_part_t* parts = calloc(message->attachments_count, sizeof(mail_attachment_part_t));
+    if (parts == NULL) {
+        free(encoded);
+        return 0;
+    }
+
+    size_t total = (size_t)text_prefix_length + encoded_size + 2 + (size_t)closing_length;
+
+    for (size_t i = 0; i < message->attachments_count; i++) {
+        parts[i] = mailattachment_part_build(&message->attachments[i], message->boundary);
+        if (parts[i].data == NULL) {
+            for (size_t j = 0; j < i; j++) mail_attachment_part_free(&parts[j]);
+            free(parts);
+            free(encoded);
+            return 0;
+        }
+        total += parts[i].size;
+    }
+
+    char* body = malloc(total + 1);
+    if (body == NULL) {
+        for (size_t i = 0; i < message->attachments_count; i++) mail_attachment_part_free(&parts[i]);
+        free(parts);
+        free(encoded);
+        return 0;
+    }
+
+    size_t pos = 0;
+    memcpy(body + pos, text_prefix, (size_t)text_prefix_length); pos += (size_t)text_prefix_length;
+    memcpy(body + pos, encoded, encoded_size); pos += encoded_size;
+    memcpy(body + pos, "\r\n", 2); pos += 2;
+    for (size_t i = 0; i < message->attachments_count; i++) {
+        memcpy(body + pos, parts[i].data, parts[i].size); pos += parts[i].size;
+        mail_attachment_part_free(&parts[i]);
+    }
+    memcpy(body + pos, closing, (size_t)closing_length); pos += (size_t)closing_length;
+    body[pos] = '\0';
+
+    free(parts);
+    free(encoded);
+
+    message->body_data = body;
+    message->body_size = pos;
     return 1;
 }
 

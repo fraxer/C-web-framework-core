@@ -1,5 +1,6 @@
 #include "framework.h"
 #include "mail.h"
+#include "mailattachment.h"
 #include "mailheader.h"
 #include "smtprequest.h"
 #include "base64.h"
@@ -8,6 +9,7 @@
 #include <fcntl.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -19,6 +21,11 @@
  *  send_mail_async — are not covered here; they need a live server.) */
 void __mail_free(mail_t* instance);
 const char* __mail_domain_from_email(const char* email);
+
+/* Внутренние функции асинхронного пути: становятся нестатическими (тот же
+ * паттерн переобъявления внутренних хелперов). */
+mail_payload_t* __mail_payload_copy(mail_payload_t* payload);
+void __mail_payload_free(void* data);
 
 /* -------------------------------------------------------------------------- */
 /* Test helpers                                                               */
@@ -543,4 +550,46 @@ TEST(test_mail_relay_ehlo_rejection_is_an_error) {
     TEST_ASSERT_EQUAL(502, h.mail->last_status, "the rejection code is on the session");
 
     mail_relay_harness_free(&h);
+}
+
+/* -------------------------------------------------------------------------- */
+/* __mail_payload_copy — вложения                                             */
+/* -------------------------------------------------------------------------- */
+
+TEST(test_mail_payload_copy_attachments) {
+    TEST_SUITE("mail payload");
+    TEST_CASE("вложения копируются глубоко: бинарные данные и строки");
+
+    static const uint8_t bytes[] = { 0x00, 0x01, 0xFF, 'a', 'b', 'c' };
+    const mail_attachment_t attachments[] = {
+        { .filename = "отчёт.pdf", .content_type = NULL, .data = bytes, .size = sizeof(bytes) },
+        { .filename = "n.txt", .content_type = "text/plain", .data = "hi", .size = 2 },
+    };
+
+    mail_payload_t payload = {
+        .from = "a@b.c", .from_name = "A", .to = "d@e.f",
+        .subject = "S", .body = "B",
+        .attachments = attachments, .attachments_count = 2,
+    };
+
+    mail_payload_t* copy = __mail_payload_copy(&payload);
+    TEST_REQUIRE_NOT_NULL(copy, "копия создаётся");
+    TEST_REQUIRE_NOT_NULL(copy->attachments, "массив вложений скопирован");
+    TEST_ASSERT_EQUAL(2, copy->attachments_count, "количество");
+
+    const mail_attachment_t* a0 = &copy->attachments[0];
+    TEST_ASSERT_STR_EQUAL("отчёт.pdf", a0->filename, "имя скопировано");
+    TEST_ASSERT_NULL(a0->content_type, "NULL content_type остаётся NULL");
+    TEST_ASSERT(a0->data != bytes, "данные — другая память");
+    TEST_ASSERT_EQUAL(sizeof(bytes), a0->size, "размер");
+    TEST_ASSERT_EQUAL(0, memcmp(a0->data, bytes, sizeof(bytes)), "байты совпадают");
+
+    const mail_attachment_t* a1 = &copy->attachments[1];
+    TEST_ASSERT_STR_EQUAL("text/plain", a1->content_type, "content_type скопирован");
+    TEST_ASSERT_EQUAL(0, memcmp(a1->data, "hi", 2), "второе вложение");
+
+    /* копия не ссылается на оригинал */
+    TEST_ASSERT(copy->attachments != attachments, "массив — другая память");
+
+    __mail_payload_free(copy);
 }

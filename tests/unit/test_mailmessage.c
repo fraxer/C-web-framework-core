@@ -11,6 +11,7 @@
 #include "framework.h"
 #include "appconfig.h"
 #include "base64.h"
+#include "mailattachment.h"
 #include "mailmessage.h"
 
 /* env() runner'а — calloc'd appconfig; выставляем только то, что читает сборка */
@@ -149,6 +150,28 @@ static int mail_test_contains(const char* hay, size_t hay_len, const char* needl
     for (size_t i = 0; i + nl <= hay_len; i++)
         if (memcmp(hay + i, needle, nl) == 0) return 1;
     return 0;
+}
+
+/* Копирует значение boundary (с "=_") из верхнего Content-Type в out. Буфер
+ * m->data не NUL-терминирован, поэтому поиск по явной длине, а значение — до
+ * закрывающей кавычки. NULL, если boundary не найден. */
+static const char* mailmessage_test_boundary(char* out, size_t out_size, const mail_message_t* m) {
+    const char* marker = "boundary=\"";
+    const size_t marker_length = strlen(marker);
+
+    const char* at = (m != NULL && m->data != NULL && m->data_size > marker_length)
+        ? memmem(m->data, m->data_size, marker, marker_length) : NULL;
+    if (at == NULL || out == NULL || out_size == 0) return NULL;
+
+    const size_t offset = (size_t)(at - m->data) + marker_length;
+    size_t n = 0;
+    while (offset + n < m->data_size && m->data[offset + n] != '"' && n + 1 < out_size) {
+        out[n] = m->data[offset + n];
+        n++;
+    }
+    out[n] = '\0';
+
+    return out;
 }
 
 /* Decode the RFC 2047 "=?UTF-8?B?...?= " payload inside `encoded` back to the
@@ -583,4 +606,84 @@ TEST(test_mailmessage_build_without_dkim_selector) {
     mail_message_free(m);
     free(pem);
     EVP_PKEY_free(pkey);
+}
+
+/* -------------------------------------------------------------------------- */
+/* multipart/mixed с вложениями                                               */
+/* -------------------------------------------------------------------------- */
+
+TEST(test_mailmessage_build_multipart_structure) {
+    TEST_SUITE("mailmessage");
+    TEST_CASE("multipart: boundary в Content-Type, текстовая часть, часть вложения, закрытие");
+
+    mailmessage_test_fixed_clock();
+    mailmessage_test_env("example.com");
+
+    const char file_data[] = "PDFDATA";
+    const mail_attachment_t attachments[] = {
+        { .filename = "отчёт.pdf", .content_type = NULL, .data = file_data, .size = sizeof(file_data) - 1 },
+        { .filename = "notes.txt", .content_type = "text/plain", .data = "hello", .size = 5 },
+    };
+
+    mail_message_t* m = mail_message_create();
+    TEST_REQUIRE_NOT_NULL(m, "создание");
+    TEST_REQUIRE(mail_message_set_from(m, "alice@example.com", "Alice"), "from");
+    TEST_REQUIRE(mail_message_set_to(m, "bob@example.org"), "to");
+    TEST_REQUIRE(mail_message_set_subject(m, "Subject"), "subject");
+    mail_message_set_body(m, "<html>body</html>");
+    mail_message_set_attachments(m, attachments, 2);
+
+    TEST_REQUIRE(mail_message_build(m, (time_t)1760000000), "сборка");
+
+    char boundary[64];
+    TEST_REQUIRE(mailmessage_test_boundary(boundary, sizeof(boundary), m) != NULL, "boundary найден");
+    TEST_ASSERT(boundary[0] == '=' && boundary[1] == '_', "boundary вида =_<uuid>");
+
+    char marker[192];
+
+    snprintf(marker, sizeof(marker), "Content-Type: multipart/mixed; boundary=\"%s\"", boundary);
+    TEST_ASSERT(mail_test_contains(m->data, m->data_size, marker), "Content-Type с boundary");
+
+    /* верхнего CTE нет: он живёт внутри частей */
+    snprintf(marker, sizeof(marker), "--%s\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\nPGh0bWw+Ym9keTwvaHRtbD4=", boundary);
+    TEST_ASSERT(mail_test_contains(m->data, m->data_size, marker), "текстовая часть внутри multipart");
+
+    snprintf(marker, sizeof(marker), "--%s\r\nContent-Type: application/pdf", boundary);
+    TEST_ASSERT(mail_test_contains(m->data, m->data_size, marker), "часть pdf с MIME по расширению");
+
+    snprintf(marker, sizeof(marker), "--%s\r\nContent-Type: text/plain", boundary);
+    TEST_ASSERT(mail_test_contains(m->data, m->data_size, marker), "явный content_type переопределяет расширение");
+
+    snprintf(marker, sizeof(marker), "--%s--\r\n", boundary);
+    TEST_ASSERT(mail_test_contains(m->data, m->data_size, marker), "закрывающий разделитель");
+
+    /* порядок: текстовая часть раньше вложений */
+    const char* text_part = memmem(m->data, m->data_size, "Content-Type: text/html", strlen("Content-Type: text/html"));
+    const char* pdf_part = memmem(m->data, m->data_size, "application/pdf", strlen("application/pdf"));
+    TEST_ASSERT(text_part != NULL && pdf_part != NULL && text_part < pdf_part, "текст раньше вложений");
+
+    mail_message_free(m);
+}
+
+TEST(test_mailmessage_build_multipart_rejects_empty_attachment) {
+    TEST_SUITE("mailmessage");
+    TEST_CASE("пустое вложение отклоняется на входе — письма не существует");
+
+    mailmessage_test_fixed_clock();
+    mailmessage_test_env("example.com");
+
+    const mail_attachment_t bad[] = { { .filename = "", .data = "x", .size = 1 } };
+
+    mail_message_t* m = mail_message_create();
+    TEST_REQUIRE_NOT_NULL(m, "создание");
+    TEST_REQUIRE(mail_message_set_from(m, "a@b.c", "A"), "from");
+    TEST_REQUIRE(mail_message_set_to(m, "d@e.f"), "to");
+    TEST_REQUIRE(mail_message_set_subject(m, "S"), "subject");
+    mail_message_set_body(m, "body");
+    mail_message_set_attachments(m, bad, 1);
+
+    TEST_ASSERT_EQUAL(0, mail_message_build(m, (time_t)1760000000), "сборка отклонена");
+    TEST_ASSERT_NULL(m->data, "буфера нет");
+
+    mail_message_free(m);
 }

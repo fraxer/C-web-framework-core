@@ -39,6 +39,8 @@ int __mail_send_content(mail_t* instance);
 int __mail_send_reset(mail_t* instance);
 void __mail_free(mail_t* instance);
 const char* __mail_domain_from_email(const char* email);
+mail_payload_t* __mail_payload_copy(mail_payload_t* payload);
+void __mail_payload_free(void* data);
 int __mail_set_conn_timeout(const int fd, const int seconds);
 int __mail_get_mx_servers(const char* host, mail_mx_record_t* mx_records);
 int __mail_parse_mx_record(unsigned char* buffer, size_t r, ns_sect s, int idx, ns_msg* message, mail_mx_record_t* mx_record);
@@ -272,6 +274,7 @@ int send_mail_result(mail_payload_t* payload, mail_result_t* result) {
     if (!mail_message_set_to(message, payload->to)) { reason = "Failed to set TO"; goto cleanup; }
     if (!mail_message_set_subject(message, payload->subject)) { reason = "Failed to set subject"; goto cleanup; }
     mail_message_set_body(message, payload->body);
+    mail_message_set_attachments(message, payload->attachments, payload->attachments_count);
 
     if (!mail->send_mail(mail, message)) { reason = "Failed to send mail"; goto cleanup; }
 
@@ -305,7 +308,7 @@ cleanup:
     return sent;
 }
 
-static mail_payload_t* __mail_payload_copy(mail_payload_t* payload) {
+mail_payload_t* __mail_payload_copy(mail_payload_t* payload) {
     if (payload == NULL) return NULL;
 
     mail_payload_t* copy = malloc(sizeof * copy);
@@ -316,11 +319,50 @@ static mail_payload_t* __mail_payload_copy(mail_payload_t* payload) {
     copy->to = payload->to ? strdup(payload->to) : NULL;
     copy->subject = payload->subject ? strdup(payload->subject) : NULL;
     copy->body = payload->body ? strdup(payload->body) : NULL;
+    copy->attachments = NULL;
+    copy->attachments_count = 0;
+
+    /* Вложения переживают возврат из маршрута только своей копией: данные
+     * вызывающего к моменту отправки уже освобождены */
+    if (payload->attachments != NULL && payload->attachments_count > 0) {
+        copy->attachments = malloc(payload->attachments_count * sizeof(mail_attachment_t));
+        if (copy->attachments == NULL) {
+            __mail_payload_free(copy);
+            return NULL;
+        }
+
+        /* счётчик растёт по мере копирования: освобождение по ошибке должно
+         * видеть ровно то, что уже заполнено */
+        for (size_t i = 0; i < payload->attachments_count; i++) {
+            const mail_attachment_t* src = &payload->attachments[i];
+            mail_attachment_t* dst = &((mail_attachment_t*)copy->attachments)[i];
+
+            dst->filename = src->filename ? strdup(src->filename) : NULL;
+            dst->content_type = src->content_type ? strdup(src->content_type) : NULL;
+            dst->size = src->size;
+            dst->data = NULL;
+
+            copy->attachments_count = i + 1;
+
+            if (src->data != NULL && src->size > 0) {
+                dst->data = malloc(src->size);
+                if (dst->data != NULL)
+                    memcpy((void*)dst->data, src->data, src->size);
+            }
+
+            if ((src->filename != NULL && dst->filename == NULL) ||
+                (src->content_type != NULL && dst->content_type == NULL) ||
+                (src->data != NULL && src->size > 0 && dst->data == NULL)) {
+                __mail_payload_free(copy);
+                return NULL;
+            }
+        }
+    }
 
     return copy;
 }
 
-static void __mail_payload_free(void* data) {
+void __mail_payload_free(void* data) {
     if (data == NULL) return;
 
     mail_payload_t* payload = data;
@@ -330,6 +372,17 @@ static void __mail_payload_free(void* data) {
     free((void*)payload->to);
     free((void*)payload->subject);
     free((void*)payload->body);
+
+    if (payload->attachments != NULL) {
+        for (size_t i = 0; i < payload->attachments_count; i++) {
+            mail_attachment_t* a = &((mail_attachment_t*)payload->attachments)[i];
+            free((void*)a->filename);
+            free((void*)a->content_type);
+            free((void*)a->data);
+        }
+        free((void*)payload->attachments);
+    }
+
     free(payload);
 }
 

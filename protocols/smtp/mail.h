@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 
+#include "mailattachment.h"
 #include "mailheader.h"
 #include "mailmessage.h"
 #include "openssl.h"
@@ -32,6 +33,9 @@ typedef struct mail_payload {
     const char* to;
     const char* subject;
     const char* body;
+    /* NULL или count == 0 — письмо собирается как раньше, односоставным */
+    const mail_attachment_t* attachments;
+    size_t attachments_count;
 } mail_payload_t;
 
 typedef struct mail_result {
