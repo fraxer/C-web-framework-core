@@ -72,21 +72,12 @@ size_t utf8_strlen(const char *str) {
     if (str == NULL) return 0;
 
     size_t count = 0;
-    const uint8_t *p = (const uint8_t *)str;
 
-    while (*p) {
-        if (*p < 0x80) {
-            p++;
-        } else if ((*p & 0xE0) == 0xC0) {
-            p += 2;
-        } else if ((*p & 0xF0) == 0xE0) {
-            p += 3;
-        } else if ((*p & 0xF8) == 0xF0) {
-            p += 4;
-        } else {
-            p++;
-        }
-        count++;
+    for (const unsigned char *p = (const unsigned char *)str; *p; count++) {
+        uint32_t codepoint;
+        const size_t size = utf8_decode(p, &codepoint);
+
+        p += size > 0 ? size : 1;
     }
 
     return count;

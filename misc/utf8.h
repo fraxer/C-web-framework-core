@@ -44,6 +44,12 @@ size_t utf8_decode(const unsigned char *value, uint32_t *codepoint);
 /**
  * Count Unicode characters (codepoints) in a UTF-8 string.
  * Returns 0 if str is NULL.
+ *
+ * The count is strict: it goes through utf8_decode(), so a truncated
+ * sequence, an overlong form, a surrogate or a codepoint above U+10FFFF
+ * counts as one character per byte, and the walk never steps over the
+ * terminator. That is what makes this function usable for the length limit
+ * of a form field, where the input is whatever the sender typed.
  */
 size_t utf8_strlen(const char *str);
 

@@ -38,6 +38,29 @@ TEST(test_utf8_strlen_emoji) {
     TEST_ASSERT_EQUAL_SIZE(1, len, "Single emoji should be 1 character");
 }
 
+TEST(test_utf8_strlen_truncated_lead_byte) {
+    TEST_CASE("A truncated lead byte at the end counts as one character");
+
+    /* The old implementation trusted the lead byte and jumped p += 4, stepping
+     * over the terminator and reading past the buffer. */
+    size_t len = utf8_strlen("ab\xF0");
+    TEST_ASSERT_EQUAL_SIZE(3, len, "Two letters plus the broken byte");
+}
+
+TEST(test_utf8_strlen_overlong_form) {
+    TEST_CASE("An overlong form counts as separate broken bytes");
+
+    size_t len = utf8_strlen("\xC0\xAF");
+    TEST_ASSERT_EQUAL_SIZE(2, len, "Neither byte forms a character");
+}
+
+TEST(test_utf8_strlen_surrogate) {
+    TEST_CASE("A surrogate counts as broken bytes");
+
+    size_t len = utf8_strlen("\xED\xA0\x80");
+    TEST_ASSERT_EQUAL_SIZE(3, len, "A surrogate is not a character");
+}
+
 TEST(test_utf8_strlen_empty) {
     TEST_CASE("Empty string");
 
