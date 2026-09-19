@@ -9,6 +9,7 @@
 
 #include "jwt.h"
 #include "base64.h"
+#include "helpers.h"
 
 // ============================================================================
 // Algorithm name mapping
@@ -698,14 +699,10 @@ static int verify_hmac(const jwt_key_t* key, const char* data, size_t data_len,
         return 0;
     }
 
-    // Constant-time comparison
-    volatile unsigned char diff = 0;
-    for (size_t i = 0; i < sig_len; i++) {
-        diff |= expected_sig[i] ^ sig[i];
-    }
+    const int equal = secure_compare_bytes(expected_sig, sig, sig_len);
 
     free(expected_sig);
-    return diff == 0;
+    return equal;
 }
 
 static int verify_rsa(const jwt_key_t* key, const char* data, size_t data_len,

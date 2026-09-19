@@ -1213,3 +1213,31 @@ TEST(test_file_extension_only_filename) {
     TEST_ASSERT_NOT_NULL(ext, "Should find extension");
     TEST_ASSERT_STR_EQUAL("xz", ext, "Should get last extension");
 }
+
+/* ── secure_compare ──────────────────────────────────────────────────── */
+
+TEST(test_secure_compare_strings) {
+    TEST_CASE("Secure compare agrees with strcmp on the result");
+
+    TEST_ASSERT(secure_compare("abc123", "abc123"), "Equal strings match");
+    TEST_ASSERT(!secure_compare("abc123", "abc124"), "A difference at the end fails");
+    TEST_ASSERT(!secure_compare("abc123", "xbc123"), "A difference at the start fails");
+    TEST_ASSERT(!secure_compare("abc", "abc123"), "Different lengths fail");
+    TEST_ASSERT(!secure_compare(NULL, "abc"), "NULL fails");
+    TEST_ASSERT(!secure_compare("abc", NULL), "NULL fails");
+    TEST_ASSERT(secure_compare("", ""), "Two empty strings match");
+}
+
+TEST(test_secure_compare_bytes_buffers) {
+    TEST_CASE("The byte comparison covers buffers with embedded zeros");
+
+    const unsigned char a[] = { 0x00, 0xFF, 0x00, 0x42 };
+    const unsigned char b[] = { 0x00, 0xFF, 0x00, 0x42 };
+    const unsigned char c[] = { 0x00, 0xFF, 0x00, 0x43 };
+
+    TEST_ASSERT(secure_compare_bytes(a, b, sizeof a), "Identical buffers match");
+    TEST_ASSERT(!secure_compare_bytes(a, c, sizeof a), "A difference in the last byte fails");
+    TEST_ASSERT(secure_compare_bytes(a, c, 3), "The first three bytes are equal");
+    TEST_ASSERT(secure_compare_bytes(a, b, 0), "Zero length is a match");
+    TEST_ASSERT(!secure_compare_bytes(NULL, b, sizeof a), "NULL fails");
+}

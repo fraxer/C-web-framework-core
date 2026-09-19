@@ -1,6 +1,7 @@
 #ifndef __HELPERS__
 #define __HELPERS__
 
+#include <stddef.h>
 #include <time.h>
 
 int helpers_mkdir(const char* path);
@@ -14,6 +15,20 @@ int timezone_offset();
 int hex_char_to_int(char c);
 int hex_to_bytes(const char* hex, unsigned char* raw, size_t raw_size);
 void bytes_to_hex(const unsigned char* raw, size_t raw_length, char* hex);
+
+/* Comparison whose running time does not depend on where the two sides
+ * differ. An ordinary memcmp() or strcmp() returns at the first difference,
+ * and the response time then gives a secret away one character at a time.
+ *
+ * The contents are hidden, the length is not: secure_compare() calls strlen()
+ * on both sides anyway. For a fixed-length token -- a CSRF value, a webhook
+ * signature, an admin key, all of which arrive as a hex or base64 string --
+ * that is enough, and comparing secrets of different lengths is meaningless.
+ *
+ * secure_compare_bytes() is the one to use for a buffer of known length that
+ * may contain zero bytes, such as a signature. */
+int secure_compare_bytes(const void* a, const void* b, size_t size);
+int secure_compare(const char* a, const char* b);
 char* urlencode(const char* string, size_t length);
 char* urlencodel(const char* string, size_t length, size_t* output_length);
 char* urldecode(const char* string, size_t length);

@@ -346,3 +346,25 @@ size_t http_format_date(time_t time, char* buf, size_t buf_size) {
 
     return strftime(buf, buf_size, "%a, %d %b %Y %H:%M:%S GMT", tm);
 }
+
+int secure_compare_bytes(const void* a, const void* b, size_t size) {
+    if (a == NULL || b == NULL) return 0;
+
+    const unsigned char* left = a;
+    const unsigned char* right = b;
+    volatile unsigned char diff = 0;
+
+    for (size_t i = 0; i < size; i++)
+        diff |= left[i] ^ right[i];
+
+    return diff == 0;
+}
+
+int secure_compare(const char* a, const char* b) {
+    if (a == NULL || b == NULL) return 0;
+
+    const size_t a_length = strlen(a);
+    if (a_length != strlen(b)) return 0;
+
+    return secure_compare_bytes(a, b, a_length);
+}
