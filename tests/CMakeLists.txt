@@ -5,6 +5,7 @@ cmake_minimum_required(VERSION 3.12.4)
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/../src
     ${CMAKE_CURRENT_SOURCE_DIR}/../misc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../misc/validation
     ${CMAKE_CURRENT_SOURCE_DIR}/../framework
     ${CMAKE_CURRENT_SOURCE_DIR}/../framework/session
     ${CMAKE_CURRENT_SOURCE_DIR}/../protocols

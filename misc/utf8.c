@@ -36,6 +36,38 @@ int utf8_is_punct(uint32_t codepoint) {
 
 /* --- String operations --- */
 
+size_t utf8_decode(const unsigned char *value, uint32_t *codepoint) {
+    const unsigned char first = value[0];
+
+    if (first < 0x80) {
+        *codepoint = first;
+        return 1;
+    }
+
+    size_t size;
+    uint32_t result;
+
+    if ((first & 0xE0) == 0xC0) { size = 2; result = first & 0x1Fu; }
+    else if ((first & 0xF0) == 0xE0) { size = 3; result = first & 0x0Fu; }
+    else if ((first & 0xF8) == 0xF0) { size = 4; result = first & 0x07u; }
+    else return 0; /* a continuation byte where a lead byte belongs, or 0xF8..0xFF */
+
+    for (size_t i = 1; i < size; i++) {
+        if ((value[i] & 0xC0) != 0x80) return 0;
+        result = (result << 6) | (uint32_t)(value[i] & 0x3Fu);
+    }
+
+    if (size == 2 && result < 0x80) return 0;
+    if (size == 3 && result < 0x800) return 0;
+    if (size == 4 && result < 0x10000) return 0;
+    if (result > 0x10FFFF) return 0;
+    if (result >= 0xD800 && result <= 0xDFFF) return 0;
+
+    *codepoint = result;
+
+    return size;
+}
+
 size_t utf8_strlen(const char *str) {
     if (str == NULL) return 0;
 

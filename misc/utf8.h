@@ -30,6 +30,18 @@ int utf8_is_punct(uint32_t codepoint);
 /* --- String operations --- */
 
 /**
+ * Decode one UTF-8 character and return its length in bytes, or 0 when the
+ * sequence is broken: truncated, overlong, a surrogate or above U+10FFFF.
+ * A caller advances by one byte on 0, which is what makes a broken sequence
+ * count as a single character.
+ *
+ * Unlike the iterator below, this is the strict decoder: it is what the
+ * cleaning and validation functions in cstr.h and validation.h are written
+ * against, and it never reads past the terminator.
+ */
+size_t utf8_decode(const unsigned char *value, uint32_t *codepoint);
+
+/**
  * Count Unicode characters (codepoints) in a UTF-8 string.
  * Returns 0 if str is NULL.
  */
