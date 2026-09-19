@@ -304,10 +304,13 @@ typedef struct {
     };
 } form_field_spec_t;
 
-/* clean() edits a text buffer in place and returns a pointer into it.
- * length() is required if a text field has a length rule. validate() runs after
- * field checks and may add field or non-field errors. The schema, validator
- * arrays, defaults and their contexts must outlive the form. */
+/* clean() edits a text buffer in place and returns a pointer into it, and
+ * length() counts characters. Both are optional: NULL means the core's own
+ * cstr_clean() from cstr.h and utf8_strlen() from utf8.h, which is what gives
+ * clean_flags their CSTR_CLEAN_* meaning. Set them only for different
+ * semantics. validate() runs after field checks and may add field or non-field
+ * errors. The schema, validator arrays, defaults and their contexts must
+ * outlive the form. */
 typedef struct {
     const form_field_spec_t* fields;
     size_t fields_count;

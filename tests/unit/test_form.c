@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "framework.h"
+#include "cstr.h"
 #include "form/form.h"
 #include <float.h>
 #include <math.h>
@@ -734,7 +735,6 @@ TEST(test_form_invalid_schemas_consume_inputs) {
         { .kind = FORM_FIELD_TEXT }, /* Missing name. */
         { .kind = FORM_FIELD_TEXT, .text = { .common = { .name = "x", .validators_count = 1 } } },
         { .kind = FORM_FIELD_TEXT, .text = { .common = { .name = "x", .validators = &no_check, .validators_count = 1 } } },
-        { .kind = FORM_FIELD_TEXT, .text = { .common = { .name = "x" }, .min_length = 1 } }, /* No length hook. */
         { .kind = FORM_FIELD_DECIMAL, .decimal = { .common = { .name = "x" }, .has_min_value = 1, .min_value = 2, .has_max_value = 1, .max_value = 1 } },
         { .kind = FORM_FIELD_DECIMAL, .decimal = { .common = { .name = "x" }, .has_default = 1, .default_value = NAN } },
         { .kind = FORM_FIELD_DECIMAL, .decimal = { .common = { .name = "x" }, .has_min_value = 1, .min_value = -INFINITY } },
@@ -982,5 +982,39 @@ TEST(test_form_invalid_utf8_regex) {
     TEST_REQUIRE_NOT_NULL(form, "Regex form should build");
     TEST_ASSERT(!form_is_valid(form), "Invalid UTF-8 must fail");
     TEST_ASSERT_EQUAL(FORM_INVALID, form_error_code(form, 0), "Encoding error differs from no match");
+    form_free(form);
+}
+
+/* ── Default hooks ───────────────────────────────────────────────────── */
+
+TEST(test_form_default_clean_and_length_hooks) {
+    TEST_CASE("A schema without hooks gets the core implementation");
+
+    form_field_spec_t field = {
+        .kind = FORM_FIELD_TEXT,
+        .text = { .common = { .name = "name", .required = 1 },
+                  .clean_flags = CSTR_CLEAN_TEXT,
+                  .min_length = 2,
+                  .max_length = 9 }
+    };
+    /* Neither .clean nor .length is set. */
+    const form_schema_t schema = { .fields = &field, .fields_count = 1 };
+
+    /* The form owns text buffers and frees them, so the input is heap memory. */
+    const form_input_t inputs[] = {
+        { .kind = FORM_INPUT_TEXT, .data.text = strdup("  Александр  ") }
+    };
+
+    form_t* form = form_create(&schema, inputs);
+    TEST_ASSERT_NOT_NULL(form, "A length rule without a hook is now a valid schema");
+    if (form == NULL) return; /* TEST_ASSERT does not stop the case */
+
+    TEST_ASSERT(form_is_valid(form), "Nine characters fit the limit of nine after trimming");
+
+    const form_value_t* value = form_cleaned_data(form, 0);
+    TEST_ASSERT_NOT_NULL(value, "Cleaned data should exist");
+    TEST_ASSERT_STR_EQUAL("Александр", value->data.text,
+                          "The default clean hook trims the field");
+
     form_free(form);
 }

@@ -10,10 +10,12 @@
 #include <pcre2.h>
 
 #include "form.h"
+#include "cstr.h"
 #include "file.h"
 #include "helpers.h"
 #include "json.h"
 #include "storage.h"
+#include "utf8.h"
 
 typedef struct {
     form_input_t input;
@@ -443,10 +445,8 @@ static int spec_valid(const form_schema_t* schema, const form_field_spec_t* spec
 
     switch (spec->kind) {
     case FORM_FIELD_TEXT:
-        return ((spec->text.min_length == 0 &&
-                 spec->text.max_length == 0) || schema->length != NULL) &&
-               (spec->text.max_length == 0 ||
-                spec->text.min_length <= spec->text.max_length);
+        return spec->text.max_length == 0 ||
+               spec->text.min_length <= spec->text.max_length;
     case FORM_FIELD_INTEGER:
         return !spec->integer.has_min_value ||
                !spec->integer.has_max_value ||
@@ -582,6 +582,17 @@ static int input_empty(const form_input_t* input) {
     return input->kind == FORM_INPUT_OBJECT && input->data.object == NULL;
 }
 
+/* A schema that sets neither hook gets the core implementation: cstr_clean
+ * gives clean_flags their meaning, and utf8_strlen counts the characters a
+ * length rule is written in. A schema may still override either one. */
+static char* schema_clean(const form_schema_t* schema, char* text, int flags) {
+    return (schema->clean != NULL ? schema->clean : cstr_clean)(text, flags);
+}
+
+static size_t schema_length(const form_schema_t* schema, const char* text) {
+    return (schema->length != NULL ? schema->length : utf8_strlen)(text);
+}
+
 static form_error_t value_error(const form_schema_t* schema, const form_field_spec_t* spec, const form_value_t* value, const form_field_t* field) {
     const form_field_common_t* common = field_common(spec);
 
@@ -591,7 +602,7 @@ static form_error_t value_error(const form_schema_t* schema, const form_field_sp
             return FORM_INVALID;
 
         if (spec->text.min_length > 0 || spec->text.max_length > 0) {
-            size_t length = schema->length(value->data.text);
+            size_t length = schema_length(schema, value->data.text);
             if (spec->text.min_length > 0 && length < spec->text.min_length)
                 return FORM_MIN_LENGTH;
             if (spec->text.max_length > 0 && length > spec->text.max_length)
@@ -719,12 +730,12 @@ static void field_validate(form_t* form, size_t index) {
         return;
     }
 
-    if (cleaned.kind == FORM_INPUT_TEXT && form->schema->clean != NULL)
-        cleaned.data.text = form->schema->clean(cleaned.data.text, field_clean_flags(spec));
+    if (cleaned.kind == FORM_INPUT_TEXT)
+        cleaned.data.text = schema_clean(form->schema, cleaned.data.text, field_clean_flags(spec));
 
     /* clean() may return a pointer past the start of the buffer, while input
      * must keep the original pointers for free(): clean into a separate array. */
-    if (cleaned.kind == FORM_INPUT_TEXT_LIST && form->schema->clean != NULL &&
+    if (cleaned.kind == FORM_INPUT_TEXT_LIST &&
         cleaned.data.text_list.count > 0 && cleaned.data.text_list.items != NULL) {
         size_t count = cleaned.data.text_list.count;
         char** items = realloc(field->cleaned_items, count * sizeof *items);
@@ -736,7 +747,7 @@ static void field_validate(form_t* form, size_t index) {
         int flags = field_clean_flags(spec);
         for (size_t i = 0; i < count; i++) {
             char* item = cleaned.data.text_list.items[i];
-            items[i] = item != NULL ? form->schema->clean(item, flags) : NULL;
+            items[i] = item != NULL ? schema_clean(form->schema, item, flags) : NULL;
         }
         cleaned.data.text_list.items = items;
     }
