@@ -3,10 +3,17 @@
 
 #include <stddef.h>
 
+/* Максимум значения Content-ID без угловых скобок. */
+#define MAILATTACHMENT_CID_MAX 255
+
 /* Вложение письма. Данные принадлежат вызывающему до возврата send_mail*. */
 typedef struct mail_attachment {
     const char* filename;      /* имя для Content-Disposition, UTF-8 */
     const char* content_type;  /* NULL или "" => вывести из расширения */
+    const char* cid;           /* NULL или "" — обычное вложение; иначе часть
+                                * встраивается в тело: Content-Disposition:
+                                * inline и Content-ID: <cid>, а HTML ссылается
+                                * на неё как src="cid:<cid>" (RFC 2392) */
     const void* data;          /* бинарные данные, НЕ NUL-терминированы */
     size_t size;
 } mail_attachment_t;
@@ -31,8 +38,14 @@ typedef struct mail_attachment_part {
  * верхним регистром, побайтово (UTF-8 проходит как есть). */
 void mailattachment_percent_encode(const char* value, char* out, size_t out_size);
 
+/* Значение Content-ID пригодно для заголовка и для cid:-ссылки: непустое, не
+ * длиннее MAILATTACHMENT_CID_MAX, только видимые ASCII без пробелов и без
+ * '<', '>', '"'. Угловые скобки добавляет сам заголовок. */
+int mailattachment_cid_valid(const char* cid);
+
 /* boundary — значение ЦЕЛИКОМ, с "=_"-префиксом (как в Content-Type);
- * разделитель части — строка "--" + boundary. */
+ * разделитель части — строка "--" + boundary. Вложение с некорректным cid
+ * отклоняется так же, как вложение без имени или без данных. */
 mail_attachment_part_t mailattachment_part_build(const mail_attachment_t* attachment, const char* boundary);
 
 void mail_attachment_part_free(mail_attachment_part_t* part);

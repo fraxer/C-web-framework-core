@@ -21,6 +21,7 @@ static size_t __mailmessage_content_length(const mail_message_t* message);
 static int __mailmessage_data_append(char* data, size_t* pos, const char* string, const size_t length);
 static int __mailmessage_set_dkim_headers(dkim_t* dkim, const mail_message_t* message);
 static int __mailmessage_boundary_generate(mail_message_t* message);
+static int __mailmessage_attachments_all_inline(const mail_message_t* message);
 static int __mailmessage_build_body(mail_message_t* message);
 static int __mailmessage_dkim_sign(mail_message_t* message, time_t rawtime, char** sign_out);
 static const char* __mailmessage_host(void);
@@ -181,7 +182,10 @@ int mail_message_build(mail_message_t* message, time_t rawtime) {
     if (message->attachments_count > 0) {
         char content_type[128];
         snprintf(content_type, sizeof(content_type),
-                 "multipart/mixed; boundary=\"%s\"", message->boundary);
+                 __mailmessage_attachments_all_inline(message)
+                     ? "multipart/related; type=\"text/html\"; boundary=\"%s\""
+                     : "multipart/mixed; boundary=\"%s\"",
+                 message->boundary);
         if (!__mailmessage_header_add(message, "Content-Type", content_type)) goto failed;
     }
     else {
@@ -285,6 +289,19 @@ static int __mailmessage_set_message_id(mail_message_t* message, time_t* rawtime
 
     message->message_id.length = strftime(message->message_id.value, 80, template, timeinfo);
     if (message->message_id.length <= 0) return 0;
+
+    return 1;
+}
+
+/* Картинки тела письма — multipart/related (RFC 2387): части с Content-ID
+ * относятся к HTML, а не приложены к нему. Стоит подмешаться обычному
+ * вложению — корень остаётся multipart/mixed: вложенный related ради такой
+ * смеси не собирается, а cid-ссылки клиенты разбирают и в mixed. */
+int __mailmessage_attachments_all_inline(const mail_message_t* message) {
+    for (size_t i = 0; i < message->attachments_count; i++) {
+        const char* cid = message->attachments[i].cid;
+        if (cid == NULL || cid[0] == '\0') return 0;
+    }
 
     return 1;
 }

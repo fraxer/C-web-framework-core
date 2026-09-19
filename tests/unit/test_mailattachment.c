@@ -128,6 +128,89 @@ TEST(test_mailattachment_part_build_structure) {
     TEST_ASSERT_NULL(part.data, "free обнуляет");
 }
 
+TEST(test_mailattachment_part_build_inline_cid) {
+    TEST_SUITE("mailattachment");
+    TEST_CASE("cid делает часть inline: Content-Disposition: inline и Content-ID");
+
+    mail_test_mimetype_setup();
+
+    const char data[] = "PNGDATA";
+    const mail_attachment_t attachment = {
+        .filename = "logo-blue.png",
+        .content_type = NULL,
+        .cid = "logo@synecta.tech",
+        .data = data,
+        .size = sizeof(data) - 1
+    };
+
+    mail_attachment_part_t part = mailattachment_part_build(&attachment, "=_b1");
+    TEST_REQUIRE_NOT_NULL(part.data, "часть собирается");
+
+    TEST_ASSERT(mail_test_part_contains(part, "Content-Type: image/png; name=\"logo-blue.png\"\r\n"), "тип по расширению");
+    TEST_ASSERT(mail_test_part_contains(part, "Content-Disposition: inline; filename=\"logo-blue.png\";\r\n"), "disposition inline");
+    /* угловые скобки живут в заголовке, в cid:-ссылке их нет */
+    TEST_ASSERT(mail_test_part_contains(part, "Content-ID: <logo@synecta.tech>\r\n"), "Content-ID в скобках");
+    TEST_ASSERT(mail_test_part_contains(part, "Content-Transfer-Encoding: base64\r\n\r\n"), "CTE части");
+
+    mail_attachment_part_free(&part);
+}
+
+TEST(test_mailattachment_part_build_without_cid_stays_attachment) {
+    TEST_SUITE("mailattachment");
+    TEST_CASE("пустой cid не меняет обычное вложение");
+
+    mail_test_mimetype_setup();
+
+    const mail_attachment_t attachment = {
+        .filename = "a.pdf", .cid = "", .data = "x", .size = 1
+    };
+
+    mail_attachment_part_t part = mailattachment_part_build(&attachment, "=_b1");
+    TEST_REQUIRE_NOT_NULL(part.data, "часть собирается");
+
+    TEST_ASSERT(mail_test_part_contains(part, "Content-Disposition: attachment;"), "disposition attachment");
+    TEST_ASSERT(!mail_test_part_contains(part, "Content-ID:"), "Content-ID не выводится");
+
+    mail_attachment_part_free(&part);
+}
+
+TEST(test_mailattachment_cid_valid) {
+    TEST_SUITE("mailattachment");
+    TEST_CASE("cid: непустой видимый ASCII без пробелов, скобок и кавычек");
+
+    TEST_ASSERT(mailattachment_cid_valid("logo@synecta.tech"), "обычный addr-spec");
+    TEST_ASSERT(mailattachment_cid_valid("logo"), "без домена — тоже значение");
+    TEST_ASSERT(!mailattachment_cid_valid(NULL), "NULL");
+    TEST_ASSERT(!mailattachment_cid_valid(""), "пустой");
+    TEST_ASSERT(!mailattachment_cid_valid("logo @synecta.tech"), "пробел");
+    TEST_ASSERT(!mailattachment_cid_valid("<logo@synecta.tech>"), "угловые скобки");
+    TEST_ASSERT(!mailattachment_cid_valid("logo\"@synecta.tech"), "кавычка");
+    TEST_ASSERT(!mailattachment_cid_valid("логотип@synecta.tech"), "не-ASCII");
+    TEST_ASSERT(!mailattachment_cid_valid("logo\n@synecta.tech"), "перевод строки");
+
+    char long_cid[MAILATTACHMENT_CID_MAX + 2];
+    memset(long_cid, 'a', sizeof(long_cid) - 1);
+    long_cid[sizeof(long_cid) - 1] = 0;
+    TEST_ASSERT(!mailattachment_cid_valid(long_cid), "длиннее MAILATTACHMENT_CID_MAX");
+
+    long_cid[MAILATTACHMENT_CID_MAX] = 0;
+    TEST_ASSERT(mailattachment_cid_valid(long_cid), "ровно MAILATTACHMENT_CID_MAX");
+}
+
+TEST(test_mailattachment_part_build_rejects_bad_cid) {
+    TEST_SUITE("mailattachment");
+    TEST_CASE("некорректный cid отклоняет часть целиком");
+
+    mail_test_mimetype_setup();
+
+    const mail_attachment_t attachment = {
+        .filename = "logo.png", .cid = "logo @synecta.tech", .data = "x", .size = 1
+    };
+
+    mail_attachment_part_t part = mailattachment_part_build(&attachment, "=_b1");
+    TEST_ASSERT_NULL(part.data, "часть не собрана");
+}
+
 TEST(test_mailattachment_part_build_guards) {
     TEST_SUITE("mailattachment");
     TEST_CASE("пустое вложение и NULL отклоняются на входе");

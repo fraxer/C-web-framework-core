@@ -665,6 +665,74 @@ TEST(test_mailmessage_build_multipart_structure) {
     mail_message_free(m);
 }
 
+TEST(test_mailmessage_build_related_when_all_inline) {
+    TEST_SUITE("mailmessage");
+    TEST_CASE("все вложения с cid — корень multipart/related, части inline");
+
+    mailmessage_test_fixed_clock();
+    mailmessage_test_env("example.com");
+
+    const mail_attachment_t attachments[] = {
+        { .filename = "logo.png", .content_type = "image/png",
+          .cid = "logo@example.com", .data = "PNG", .size = 3 },
+    };
+
+    mail_message_t* m = mail_message_create();
+    TEST_REQUIRE_NOT_NULL(m, "создание");
+    TEST_REQUIRE(mail_message_set_from(m, "alice@example.com", "Alice"), "from");
+    TEST_REQUIRE(mail_message_set_to(m, "bob@example.org"), "to");
+    TEST_REQUIRE(mail_message_set_subject(m, "Subject"), "subject");
+    mail_message_set_body(m, "<img src=\"cid:logo@example.com\">");
+    mail_message_set_attachments(m, attachments, 1);
+
+    TEST_REQUIRE(mail_message_build(m, (time_t)1760000000), "сборка");
+
+    char boundary[64];
+    TEST_REQUIRE(mailmessage_test_boundary(boundary, sizeof(boundary), m) != NULL, "boundary найден");
+
+    char marker[192];
+    snprintf(marker, sizeof(marker), "Content-Type: multipart/related; type=\"text/html\"; boundary=\"%s\"", boundary);
+    TEST_ASSERT(mail_test_contains(m->data, m->data_size, marker), "корневой тип related");
+    TEST_ASSERT(mail_test_contains(m->data, m->data_size, "Content-ID: <logo@example.com>"), "Content-ID части");
+
+    mail_message_free(m);
+}
+
+TEST(test_mailmessage_build_mixed_when_any_attachment_plain) {
+    TEST_SUITE("mailmessage");
+    TEST_CASE("обычное вложение рядом с inline — корень остаётся multipart/mixed");
+
+    mailmessage_test_fixed_clock();
+    mailmessage_test_env("example.com");
+
+    const mail_attachment_t attachments[] = {
+        { .filename = "logo.png", .content_type = "image/png",
+          .cid = "logo@example.com", .data = "PNG", .size = 3 },
+        { .filename = "notes.txt", .content_type = "text/plain", .data = "hello", .size = 5 },
+    };
+
+    mail_message_t* m = mail_message_create();
+    TEST_REQUIRE_NOT_NULL(m, "создание");
+    TEST_REQUIRE(mail_message_set_from(m, "alice@example.com", "Alice"), "from");
+    TEST_REQUIRE(mail_message_set_to(m, "bob@example.org"), "to");
+    TEST_REQUIRE(mail_message_set_subject(m, "Subject"), "subject");
+    mail_message_set_body(m, "<html>body</html>");
+    mail_message_set_attachments(m, attachments, 2);
+
+    TEST_REQUIRE(mail_message_build(m, (time_t)1760000000), "сборка");
+
+    char boundary[64];
+    TEST_REQUIRE(mailmessage_test_boundary(boundary, sizeof(boundary), m) != NULL, "boundary найден");
+
+    char marker[192];
+    snprintf(marker, sizeof(marker), "Content-Type: multipart/mixed; boundary=\"%s\"", boundary);
+    TEST_ASSERT(mail_test_contains(m->data, m->data_size, marker), "корневой тип mixed");
+    TEST_ASSERT(mail_test_contains(m->data, m->data_size, "Content-Disposition: inline; filename=\"logo.png\""), "картинка всё равно inline");
+    TEST_ASSERT(mail_test_contains(m->data, m->data_size, "Content-Disposition: attachment; filename=\"notes.txt\""), "файл — вложение");
+
+    mail_message_free(m);
+}
+
 TEST(test_mailmessage_build_multipart_rejects_empty_attachment) {
     TEST_SUITE("mailmessage");
     TEST_CASE("пустое вложение отклоняется на входе — письма не существует");

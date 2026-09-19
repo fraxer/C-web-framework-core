@@ -92,12 +92,34 @@ void mailattachment_percent_encode(const char* value, char* out, size_t out_size
     out[n] = '\0';
 }
 
+int mailattachment_cid_valid(const char* cid) {
+    if (cid == NULL || cid[0] == '\0') return 0;
+
+    size_t n = 0;
+    for (const unsigned char* p = (const unsigned char*)cid; *p != '\0'; p++, n++) {
+        if (n >= MAILATTACHMENT_CID_MAX) return 0;
+
+        /* Только видимые ASCII: пробел и управляющие сломали бы заголовок,
+         * '<' и '>' его обрамляют, '"' встречается рядом в параметрах. */
+        if (*p <= 0x20 || *p >= 0x7F) return 0;
+        if (*p == '<' || *p == '>' || *p == '"') return 0;
+    }
+
+    return 1;
+}
+
 mail_attachment_part_t mailattachment_part_build(const mail_attachment_t* attachment, const char* boundary) {
     mail_attachment_part_t part = { NULL, 0 };
 
     if (attachment == NULL || attachment->filename == NULL || attachment->filename[0] == '\0' ||
         attachment->data == NULL || attachment->size == 0)
         return part;
+
+    /* cid задан — часть встраивается в тело письма и адресуется как cid:<...>;
+     * непригодное значение отклоняет часть, чтобы битая ссылка не уехала
+     * получателю вместе с письмом. */
+    const int is_inline = attachment->cid != NULL && attachment->cid[0] != '\0';
+    if (is_inline && !mailattachment_cid_valid(attachment->cid)) return part;
 
     const char* type = (attachment->content_type != NULL && attachment->content_type[0] != '\0')
         ? attachment->content_type
@@ -109,16 +131,24 @@ mail_attachment_part_t mailattachment_part_build(const mail_attachment_t* attach
     char percent[NAME_MAX * 3];
     mailattachment_percent_encode(attachment->filename, percent, sizeof(percent));
 
-    /* NAME_MAX*3 (percent) + NAME_MAX (ascii ×2) + тип + константы — хватает с запасом */
-    char headers[NAME_MAX * 6];
+    /* Content-ID печатается отдельной строкой только у inline-части */
+    char cid_header[MAILATTACHMENT_CID_MAX + 16];
+    cid_header[0] = '\0';
+    if (is_inline)
+        snprintf(cid_header, sizeof(cid_header), "Content-ID: <%s>\r\n", attachment->cid);
+
+    /* NAME_MAX*3 (percent) + NAME_MAX (ascii ×2) + тип + cid + константы —
+     * хватает с запасом */
+    char headers[NAME_MAX * 6 + sizeof(cid_header)];
     const int headers_length = snprintf(headers, sizeof(headers),
         "--%s\r\n"
         "Content-Type: %s; name=\"%s\"\r\n"
-        "Content-Disposition: attachment; filename=\"%s\";\r\n"
+        "Content-Disposition: %s; filename=\"%s\";\r\n"
         " filename*=UTF-8''%s\r\n"
+        "%s"
         "Content-Transfer-Encoding: base64\r\n"
         "\r\n",
-        boundary, type, ascii, ascii, percent);
+        boundary, type, ascii, is_inline ? "inline" : "attachment", ascii, percent, cid_header);
     if (headers_length <= 0 || (size_t)headers_length >= sizeof(headers)) return part;
 
     /* ёмкость: base64_encode_nl_len включает терминатор NUL, поэтому берётся

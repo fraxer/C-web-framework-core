@@ -563,7 +563,7 @@ TEST(test_mail_payload_copy_attachments) {
     static const uint8_t bytes[] = { 0x00, 0x01, 0xFF, 'a', 'b', 'c' };
     const mail_attachment_t attachments[] = {
         { .filename = "отчёт.pdf", .content_type = NULL, .data = bytes, .size = sizeof(bytes) },
-        { .filename = "n.txt", .content_type = "text/plain", .data = "hi", .size = 2 },
+        { .filename = "n.txt", .content_type = "text/plain", .cid = "logo@b.c", .data = "hi", .size = 2 },
     };
 
     mail_payload_t payload = {
@@ -584,8 +584,12 @@ TEST(test_mail_payload_copy_attachments) {
     TEST_ASSERT_EQUAL(sizeof(bytes), a0->size, "размер");
     TEST_ASSERT_EQUAL(0, memcmp(a0->data, bytes, sizeof(bytes)), "байты совпадают");
 
+    TEST_ASSERT_NULL(a0->cid, "NULL cid остаётся NULL");
+
     const mail_attachment_t* a1 = &copy->attachments[1];
     TEST_ASSERT_STR_EQUAL("text/plain", a1->content_type, "content_type скопирован");
+    TEST_ASSERT_STR_EQUAL("logo@b.c", a1->cid, "cid скопирован");
+    TEST_ASSERT(a1->cid != attachments[1].cid, "cid — другая память");
     TEST_ASSERT_EQUAL(0, memcmp(a1->data, "hi", 2), "второе вложение");
 
     /* копия не ссылается на оригинал */

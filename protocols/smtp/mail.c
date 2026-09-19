@@ -339,6 +339,7 @@ mail_payload_t* __mail_payload_copy(mail_payload_t* payload) {
 
             dst->filename = src->filename ? strdup(src->filename) : NULL;
             dst->content_type = src->content_type ? strdup(src->content_type) : NULL;
+            dst->cid = src->cid ? strdup(src->cid) : NULL;
             dst->size = src->size;
             dst->data = NULL;
 
@@ -352,6 +353,7 @@ mail_payload_t* __mail_payload_copy(mail_payload_t* payload) {
 
             if ((src->filename != NULL && dst->filename == NULL) ||
                 (src->content_type != NULL && dst->content_type == NULL) ||
+                (src->cid != NULL && dst->cid == NULL) ||
                 (src->data != NULL && src->size > 0 && dst->data == NULL)) {
                 __mail_payload_free(copy);
                 return NULL;
@@ -378,6 +380,7 @@ void __mail_payload_free(void* data) {
             mail_attachment_t* a = &((mail_attachment_t*)payload->attachments)[i];
             free((void*)a->filename);
             free((void*)a->content_type);
+            free((void*)a->cid);
             free((void*)a->data);
         }
         free((void*)payload->attachments);
