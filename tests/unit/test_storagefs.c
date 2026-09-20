@@ -127,3 +127,122 @@ TEST(test_storagefs_entry_type_rejects_escape) {
 
     storagefs_fixture_teardown(&fx);
 }
+
+TEST(test_storage_resolve_path_normal) {
+    TEST_SUITE("storage: path resolution");
+    TEST_CASE("a path inside the storage becomes a full path on disk");
+
+    storagefs_fixture_t fx;
+    TEST_REQUIRE(storagefs_fixture_setup(&fx), "the storage fixture should be created");
+
+    char out[PATH_MAX] = {0};
+    char expected[PATH_MAX];
+    snprintf(expected, sizeof expected, "%s/file.txt", fx.root);
+
+    TEST_ASSERT_EQUAL(1, storage_resolve_path(STORAGEFS_TEST_NAME, "file.txt", out, sizeof out),
+                      "a plain relative path resolves");
+    TEST_ASSERT_STR_EQUAL(expected, out, "the resolved path is root + path");
+
+    snprintf(expected, sizeof expected, "%s/dir/inner.txt", fx.root);
+    TEST_ASSERT_EQUAL(1, storage_resolve_path(STORAGEFS_TEST_NAME, "dir/inner.txt", out, sizeof out),
+                      "a nested path resolves");
+    TEST_ASSERT_STR_EQUAL(expected, out, "the nested path keeps its subdirectory");
+
+    /* Resolution answers about the path, not about what is at it: opening is
+     * the caller's step, and that is where a missing file becomes a 404. */
+    TEST_ASSERT_EQUAL(1, storage_resolve_path(STORAGEFS_TEST_NAME, "missing.txt", out, sizeof out),
+                      "a path to a missing file still resolves");
+
+    storagefs_fixture_teardown(&fx);
+}
+
+TEST(test_storage_resolve_path_rejects_escape) {
+    TEST_CASE("paths leaving the storage root are refused");
+
+    storagefs_fixture_t fx;
+    TEST_REQUIRE(storagefs_fixture_setup(&fx), "the storage fixture should be created");
+
+    char out[PATH_MAX] = {0};
+
+    TEST_ASSERT_EQUAL(0, storage_resolve_path(STORAGEFS_TEST_NAME, "..", out, sizeof out),
+                      "'..' alone is refused");
+    TEST_ASSERT_EQUAL(0, storage_resolve_path(STORAGEFS_TEST_NAME, "../etc/passwd", out, sizeof out),
+                      "a leading '../' is refused");
+    TEST_ASSERT_EQUAL(0, storage_resolve_path(STORAGEFS_TEST_NAME, "dir/../../etc/passwd", out, sizeof out),
+                      "'/../' in the middle is refused");
+    TEST_ASSERT_EQUAL(0, storage_resolve_path(STORAGEFS_TEST_NAME, "dir/..", out, sizeof out),
+                      "a trailing '/..' is refused");
+
+    storagefs_fixture_teardown(&fx);
+}
+
+/* The path of a storage route is expanded from the request path, so a pattern
+ * in it is a client asking for "whichever file the shell picks first" rather
+ * than for a file. __file_get answers that with glob(..., GLOB_TILDE, ...);
+ * resolution answers with a refusal. */
+TEST(test_storage_resolve_path_rejects_glob) {
+    TEST_CASE("glob metacharacters are refused, not expanded");
+
+    storagefs_fixture_t fx;
+    TEST_REQUIRE(storagefs_fixture_setup(&fx), "the storage fixture should be created");
+
+    char out[PATH_MAX] = {0};
+
+    TEST_ASSERT_EQUAL(0, storage_resolve_path(STORAGEFS_TEST_NAME, "*", out, sizeof out),
+                      "a bare star is refused");
+    TEST_ASSERT_EQUAL(0, storage_resolve_path(STORAGEFS_TEST_NAME, "dir/*.txt", out, sizeof out),
+                      "a star inside a path is refused");
+    TEST_ASSERT_EQUAL(0, storage_resolve_path(STORAGEFS_TEST_NAME, "file.tx?", out, sizeof out),
+                      "a question mark is refused");
+    TEST_ASSERT_EQUAL(0, storage_resolve_path(STORAGEFS_TEST_NAME, "[abc].txt", out, sizeof out),
+                      "a bracket is refused");
+    TEST_ASSERT_EQUAL(0, storage_resolve_path(STORAGEFS_TEST_NAME, "~/file.txt", out, sizeof out),
+                      "a tilde is refused");
+
+    storagefs_fixture_teardown(&fx);
+}
+
+TEST(test_storage_resolve_path_bad_arguments) {
+    TEST_CASE("an unknown storage, an empty path and a short buffer all fail");
+
+    storagefs_fixture_t fx;
+    TEST_REQUIRE(storagefs_fixture_setup(&fx), "the storage fixture should be created");
+
+    char out[PATH_MAX] = {0};
+    char small[4] = {0};
+
+    TEST_ASSERT_EQUAL(0, storage_resolve_path("no_such_storage", "file.txt", out, sizeof out),
+                      "an unknown storage fails");
+    TEST_ASSERT_EQUAL(0, storage_resolve_path(STORAGEFS_TEST_NAME, "", out, sizeof out),
+                      "an empty path fails");
+    TEST_ASSERT_EQUAL(0, storage_resolve_path(NULL, "file.txt", out, sizeof out),
+                      "a NULL storage name fails");
+    TEST_ASSERT_EQUAL(0, storage_resolve_path(STORAGEFS_TEST_NAME, "file.txt", small, sizeof small),
+                      "a buffer too short for the result fails");
+
+    storagefs_fixture_teardown(&fx);
+}
+
+/* The validator of the config checks the configuration being loaded, while
+ * storage_* answer about the active one -- at reload those are two different
+ * lists, and asking the wrong one passes a name that is already gone. */
+TEST(test_storage_type_in_list) {
+    TEST_CASE("storage_type_in answers from the list it is given");
+
+    storagefs_fixture_t fx;
+    TEST_REQUIRE(storagefs_fixture_setup(&fx), "the storage fixture should be created");
+
+    storage_type_e type = STORAGE_TYPE_S3;
+
+    TEST_ASSERT_EQUAL(1, storage_type_in((storage_t*)fx.storage, STORAGEFS_TEST_NAME, &type),
+                      "a storage in the list is found");
+    TEST_ASSERT_EQUAL(STORAGE_TYPE_FS, type, "its type is filesystem");
+    TEST_ASSERT_EQUAL(0, storage_type_in((storage_t*)fx.storage, "no_such_storage", &type),
+                      "a storage outside the list is not found");
+    TEST_ASSERT_EQUAL(0, storage_type_in(NULL, STORAGEFS_TEST_NAME, &type),
+                      "an empty list finds nothing");
+    TEST_ASSERT_EQUAL(0, storage_type_in((storage_t*)fx.storage, NULL, &type),
+                      "a NULL name finds nothing");
+
+    storagefs_fixture_teardown(&fx);
+}
