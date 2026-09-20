@@ -34,6 +34,14 @@ static void __create_short_date(char* short_date, size_t short_date_size);
 static int __file_sha256(const int fd, unsigned char* hash);
 static int __data_sha256(const char* data, const size_t data_size, unsigned char* hash);
 static array_t* __parse_file_list_payload(const char* payload);
+/* Живёт в storage.c и объявлена только там: storage.h раздаёт обёртки по
+ * имени, а сюда нужен сам storage_t, чтобы проверить тип до запроса. */
+storage_t* __storage_find(const char* storage_name);
+static httpresponse_t* __request_object(storages3_t* s, const char* method_name, route_methods_e method,
+                                        const char* path, const char* range, const char* if_none_match,
+                                        const char* if_modified_since, httpclient_t** client_out);
+static char* __header_copy(httpresponse_t* res, const char* key);
+static char* __payload_take(httpresponse_t* res, size_t* size);
 
 storages3_t* storage_create_s3(const char* storage_name, const char* access_id, const char* access_secret, const char* protocol, const char* host, const char* port, const char* bucket, const char* region) {
     storages3_t* storage = calloc(1, sizeof * storage);
@@ -882,4 +890,291 @@ array_t* __parse_file_list_payload(const char* payload) {
     xmlFreeDoc(doc);
 
     return list;
+}
+
+int storages3_range_format(char* out, size_t out_size, size_t start, size_t end) {
+    if (out == NULL) return 0;
+    if (end < start) return 0;
+
+    const int written = snprintf(out, out_size, "bytes=%zu-%zu", start, end);
+
+    return written > 0 && (size_t)written < out_size;
+}
+
+int storages3_content_range_parse(const char* value, size_t* start, size_t* end, size_t* total) {
+    if (value == NULL || start == NULL || end == NULL || total == NULL) return 0;
+
+    unsigned long long s = 0, e = 0, t = 0;
+    if (sscanf(value, "bytes %llu-%llu/%llu", &s, &e, &t) != 3) return 0;
+    if (e < s) return 0;
+
+    *start = (size_t)s;
+    *end = (size_t)e;
+    *total = (size_t)t;
+
+    return 1;
+}
+
+int storages3_http_status(int s3_status) {
+    switch (s3_status) {
+    case 200:
+    case 206:
+    case 304:
+    case 404:
+    case 416:
+        return s3_status;
+    case 403:
+        // Креды сервера, а не права клиента на объект: клиенту тут нечего чинить
+        return 502;
+    case 0:
+        // Таймаут или соединение не состоялось — параллель с FILE_UNAVAILABLE
+        return 503;
+    default:
+        return 502;
+    }
+}
+
+size_t storages3_chunk_size(size_t client_max_body_size) {
+    if (client_max_body_size == 0) return STORAGES3_CHUNK_LIMIT;
+    if (client_max_body_size < STORAGES3_CHUNK_LIMIT) return client_max_body_size;
+
+    return STORAGES3_CHUNK_LIMIT;
+}
+
+/* Один подписанный запрос к объекту. `range` и условные заголовки идут
+ * неподписанными, и SigV4 это разрешает: SignedHeaders у нас фиксирован
+ * (host;x-amz-content-sha256;x-amz-date), а подписать заголовок, не объявив
+ * его там, было бы как раз ошибкой.
+ *
+ * Возвращает ответ; владение клиентом переходит вызывающему через
+ * *client_out, потому что тело ответа живёт в клиенте. NULL — запрос не
+ * состоялся, клиент уже освобождён. */
+httpresponse_t* __request_object(storages3_t* s, const char* method_name, route_methods_e method,
+                                 const char* path, const char* range, const char* if_none_match,
+                                 const char* if_modified_since, httpclient_t** client_out) {
+    char* uri = NULL;
+    char* url = NULL;
+    char* authorization = NULL;
+    httpclient_t* client = NULL;
+    httpresponse_t* res = NULL;
+
+    *client_out = NULL;
+
+    uri = __create_uri(s, "%s", path);
+    if (uri == NULL) goto done;
+
+    url = __create_url(s, uri);
+    if (url == NULL) goto done;
+
+    client = httpclient_init(method, url, STORAGES3_TIMEOUT);
+    if (client == NULL) goto done;
+
+    httprequest_t* req = client->request;
+
+    char amz_date[64];
+    __create_amz_date(amz_date, sizeof(amz_date));
+    authorization = __create_authtoken(s, client, method_name, amz_date, EMPTY_PAYLOAD_HASH);
+    if (authorization == NULL) goto done;
+
+    req->add_header(req, "Authorization", authorization);
+    req->add_header(req, "x-amz-content-sha256", EMPTY_PAYLOAD_HASH);
+    req->add_header(req, "x-amz-date", amz_date);
+
+    if (range != NULL) req->add_header(req, "Range", range);
+    if (if_none_match != NULL) req->add_header(req, "If-None-Match", if_none_match);
+    if (if_modified_since != NULL) req->add_header(req, "If-Modified-Since", if_modified_since);
+
+    res = client->send(client);
+
+    done:
+
+    if (uri != NULL) free(uri);
+    if (url != NULL) free(url);
+    if (authorization != NULL) free(authorization);
+
+    if (res == NULL) {
+        if (client != NULL) client->free(client);
+        return NULL;
+    }
+
+    *client_out = client;
+
+    return res;
+}
+
+char* __header_copy(httpresponse_t* res, const char* key) {
+    http_header_t* header = res->get_header(res, key);
+    if (header == NULL || header->value == NULL) return NULL;
+
+    return strdup(header->value);
+}
+
+/* Тело ответа вместе с его длиной. get_payload сам знает, лежит оно в памяти
+ * или в файле, а вот размер в этих двух случаях берётся из разных мест —
+ * спрашивать strlen у бинарных данных нельзя. */
+char* __payload_take(httpresponse_t* res, size_t* size) {
+    file_content_t content = res->get_payload_file(res);
+    const size_t length = content.ok ? content.size : res->body.size;
+
+    char* data = res->get_payload(res);
+    if (data == NULL) {
+        *size = 0;
+        return NULL;
+    }
+
+    *size = length;
+
+    return data;
+}
+
+int storages3_head(const char* storage_name, const char* path,
+                   const char* if_none_match, const char* if_modified_since,
+                   s3fetch_t* out) {
+    if (out == NULL) return 0;
+
+    memset(out, 0, sizeof *out);
+    out->file = file_alloc();
+
+    storage_t* base = __storage_find(storage_name);
+    if (base == NULL || base->type != STORAGE_TYPE_S3) return 0;
+
+    httpclient_t* client = NULL;
+    httpresponse_t* res = __request_object((storages3_t*)base, "HEAD", ROUTE_HEAD, path,
+                                           NULL, if_none_match, if_modified_since, &client);
+    if (res == NULL) {
+        out->status = 0;
+        return 0;
+    }
+
+    out->status = res->status_code;
+    out->etag = __header_copy(res, "ETag");
+    out->last_modified = __header_copy(res, "Last-Modified");
+    out->content_type = __header_copy(res, "Content-Type");
+
+    http_header_t* length = res->get_header(res, "Content-Length");
+    if (length != NULL && length->value != NULL)
+        out->total_size = strtoull(length->value, NULL, 10);
+
+    client->free(client);
+
+    return out->status == 200 || out->status == 304;
+}
+
+int storages3_fetch(const char* storage_name, const char* path,
+                    size_t start, size_t end, int whole, s3fetch_t* out) {
+    if (out == NULL) return 0;
+
+    memset(out, 0, sizeof *out);
+    out->file = file_alloc();
+
+    storage_t* base = __storage_find(storage_name);
+    if (base == NULL || base->type != STORAGE_TYPE_S3) return 0;
+
+    storages3_t* s = (storages3_t*)base;
+
+    const size_t chunk = storages3_chunk_size(env()->main.client_max_body_size);
+    size_t cursor = whole ? 0 : start;
+    size_t last = whole ? cursor + chunk - 1 : end;   /* при whole уточняется из Content-Range */
+    int first = 1;
+
+    while (1) {
+        size_t chunk_end = cursor + chunk - 1;
+        if (chunk_end > last) chunk_end = last;
+
+        char range[64];
+        if (!storages3_range_format(range, sizeof(range), cursor, chunk_end))
+            goto failed;
+
+        httpclient_t* client = NULL;
+        httpresponse_t* res = __request_object(s, "GET", ROUTE_GET, path, range, NULL, NULL, &client);
+        if (res == NULL) {
+            out->status = 0;
+            goto failed;
+        }
+
+        out->status = res->status_code;
+        if (res->status_code != 206 && res->status_code != 200) {
+            client->free(client);
+            goto failed;
+        }
+
+        if (first) {
+            out->etag = __header_copy(res, "ETag");
+            out->last_modified = __header_copy(res, "Last-Modified");
+            out->content_type = __header_copy(res, "Content-Type");
+
+            http_header_t* content_range = res->get_header(res, "Content-Range");
+            size_t range_start = 0, range_end = 0, total = 0;
+            if (content_range != NULL && content_range->value != NULL &&
+                storages3_content_range_parse(content_range->value, &range_start, &range_end, &total)) {
+                out->total_size = total;
+                if (whole)
+                    last = total > 0 ? total - 1 : 0;
+            }
+            else {
+                /* S3 проигнорировал Range и отдал объект целиком: докачивать
+                 * нечего, и второй запрос принёс бы те же байты снова. */
+                last = chunk_end;
+            }
+        }
+
+        size_t size = 0;
+        char* data = __payload_take(res, &size);
+        if (data == NULL) {
+            client->free(client);
+            goto failed;
+        }
+
+        const int single = first && chunk_end >= last;
+        if (single) {
+            /* Всё поместилось в одну порцию — тело остаётся в памяти, tmpfile
+             * не нужен. */
+            out->body = data;
+            out->size = size;
+            client->free(client);
+            break;
+        }
+
+        if (first) {
+            out->file = file_create_tmp("s3object", env()->main.tmp);
+            if (!out->file.ok) {
+                free(data);
+                client->free(client);
+                goto failed;
+            }
+        }
+
+        const int appended = out->file.append_content(&out->file, data, size);
+        free(data);
+        client->free(client);
+
+        if (!appended) goto failed;
+
+        out->size += size;
+        cursor = chunk_end + 1;
+        first = 0;
+
+        if (cursor > last) break;
+    }
+
+    return 1;
+
+    failed:
+
+    return 0;
+}
+
+void storages3_fetch_free(s3fetch_t* fetch) {
+    if (fetch == NULL) return;
+
+    if (fetch->etag != NULL) free(fetch->etag);
+    if (fetch->last_modified != NULL) free(fetch->last_modified);
+    if (fetch->content_type != NULL) free(fetch->content_type);
+    if (fetch->body != NULL) free(fetch->body);
+
+    if (fetch->file.ok)
+        fetch->file.close(&fetch->file);
+
+    memset(fetch, 0, sizeof *fetch);
+    fetch->file = file_alloc();
 }
