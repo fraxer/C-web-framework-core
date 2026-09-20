@@ -22,6 +22,8 @@ static int __create_fullpath(const char* path);
 static int __dir_empty(const char* path);
 static int __remove_empty_dirs(const char* basepath, const char* path);
 static int __pattern_in(const char* path);
+static int __path_resolve(void* storage, const char* path, char* out, size_t out_size);
+static int __glob_pattern_in(const char* path);
 
 storagefs_t* storage_create_fs(const char* storage_name, const char* root) {
     storagefs_t* storage = malloc(sizeof * storage);
@@ -42,6 +44,7 @@ storagefs_t* storage_create_fs(const char* storage_name, const char* root) {
     storage->base.file_exist = __file_exist;
     storage->base.entry_type = __entry_type;
     storage->base.file_list = __file_list;
+    storage->base.path_resolve = __path_resolve;
 
     return storage;
 }
@@ -276,6 +279,37 @@ array_t* __file_list(void* storage, const char* path) {
     closedir(dir);
 
     return list;
+}
+
+int __path_resolve(void* storage, const char* path, char* out, size_t out_size) {
+    if (storage == NULL || path == NULL || out == NULL) return 0;
+    if (path[0] == 0) return 0;
+
+    storagefs_t* s = storage;
+
+    // Путь приходит из пути HTTP-запроса. Шаблон в нём — это просьба отдать
+    // первый попавшийся файл каталога: __file_get отвечает на неё
+    // glob(..., GLOB_TILDE, ...). Здесь — отказ, а не раскрытие.
+    if (__glob_pattern_in(path)) {
+        log_error("Storage %s restrict glob pattern in path %s\n", s->base.name, path);
+        return 0;
+    }
+
+    char fullpath[PATH_MAX];
+    if (!__prepare_fullpath(s, path, fullpath))
+        return 0;
+
+    const size_t length = strlen(fullpath);
+    if (length + 1 > out_size)
+        return 0;
+
+    memcpy(out, fullpath, length + 1);
+
+    return 1;
+}
+
+int __glob_pattern_in(const char* path) {
+    return strpbrk(path, "*?[~") != NULL;
 }
 
 int __prepare_fullpath(storagefs_t* storage, const char* relpath, char* fullpath) {

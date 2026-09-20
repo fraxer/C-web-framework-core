@@ -39,6 +39,9 @@ typedef struct storage {
     int(*file_exist)(void* storage, const char* path);
     storage_entry_e(*entry_type)(void* storage, const char* path);
     array_t*(*file_list)(void* storage, const char* path);
+    /* Полный путь объекта на файловой системе. NULL у хранилищ, у которых
+     * путей на ФС нет (S3): вызывающий обязан проверять указатель. */
+    int(*path_resolve)(void* storage, const char* path, char* out, size_t out_size);
 
     struct storage* next;
 } storage_t;
@@ -53,6 +56,15 @@ int storage_file_exist(const char* storage_name, const char* path_format, ...);
 storage_entry_e storage_entry_type(const char* storage_name, const char* path_format, ...);
 int storage_file_duplicate(const char* from_storage_name, const char* to_storage_name, const char* path_format, ...);
 array_t* storage_file_list(const char* storage_name, const char* path_format, ...);
+/* Тип хранилища из ЗАДАННОГО списка. Нужен валидатору конфига: он проверяет
+ * загружаемую конфигурацию, а storage_* работают с активной (appconfig()), и
+ * при reload это разные списки. 1 — имя найдено. */
+int storage_type_in(storage_t* list, const char* name, storage_type_e* out);
+// Полный путь объекта внутри файлового хранилища. 1 — путь построен;
+// 0 — хранилища нет, оно не файловое, или путь недопустим.
+// Резолв отдельно от открытия: file_t хранит от пути один basename, а
+// gzip_static ищет ".gz"-двойника по полному пути.
+int storage_resolve_path(const char* storage_name, const char* path, char* out, size_t out_size);
 void storages_free(storage_t* storage);
 void storage_merge_slash(char* path);
 
