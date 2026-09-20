@@ -10,6 +10,7 @@
 #include "httpresponse.h"
 #include "httprequestparser.h"
 #include "storage.h"
+#include "httpstorage.h"
 #include "log.h"
 #include "connection_queue.h"
 #include "openssl.h"
@@ -115,6 +116,11 @@ typedef struct {
     httpresponse_t* response;
     connection_t* connection;
     ratelimiter_t* ratelimiter;
+    /* Storage branch only: the expanded path and the storage name have to
+     * outlive dispatch, because the dispatcher expands them and the worker is
+     * what goes to the storage. NULL for every other runner. */
+    char* storage_name;
+    char* storage_path;
     /* The virtual host this request resolved to, captured at dispatch time.
      *
      * ctx->server is per-connection but rewritten per request by
@@ -149,6 +155,12 @@ static int __read(connection_t* connection);
 static void __send_continue(connection_t* connection);
 static int __write(connection_t* connection);
 static int __deferred_handler(connection_t* connection, httprequest_t* request, httpresponse_t* response, queue_handler runner, queue_handler handle, queue_data_create data_create, ratelimiter_t* ratelimiter);
+static int __deferred_enqueue(connection_t* connection, connection_queue_item_t* item);
+static int __deferred_storage_handler(connection_t* connection, httprequest_t* request, httpresponse_t* response,
+                                      const char* storage_name, const char* path, ratelimiter_t* ratelimiter);
+static void __queue_storage_handler(void* arg);
+static void* __queue_data_storage_create(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter);
+static void __queue_data_storage_free(void* arg);
 static int __handle(connection_t* connection, httprequest_t* request, deferred_handler handler);
 static int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response);
 static int __get_redirect(connection_t* connection, httprequest_t* request, httpresponse_t* response);
@@ -547,6 +559,13 @@ int __deferred_handler(connection_t* connection, httprequest_t* request, httpres
         return 0;
     }
 
+    return __deferred_enqueue(connection, item);
+}
+
+/* Parking the connection and handing the item to the workers: the part both
+ * the ordinary deferred answer and the storage branch need, the latter having
+ * to write the storage name and path onto the item first. */
+int __deferred_enqueue(connection_t* connection, connection_queue_item_t* item) {
     connection_server_ctx_t* ctx = connection->ctx;
 
     /* h2 hands every item to its own worker; h1.1 keeps one request in flight
@@ -765,8 +784,20 @@ static route_dispatch_e __route_dispatch(connection_t* connection, httprequest_t
                 response->send_default(response, 503);
                 prepared = 1;
             }
-            else
+            else if (type == STORAGE_TYPE_FS)
                 prepared = __prepare_storage_fs_response(response, storage_name, path);
+            else {
+                /* S3: the answer has to be fetched, which cannot happen on the
+                 * event loop. The queue takes it from here, and the path is
+                 * freed on this way out -- the branch leaves before the common
+                 * free below. */
+                __apply_route_cache_control(response, route, method);
+                *queued = __deferred_storage_handler(connection, request, response,
+                                                     storage_name, path, ratelimiter);
+                free(path);
+
+                return ROUTE_DISPATCH_DONE;
+            }
         }
         else
             prepared = __prepare_static_file_response(ctx, response, path);
@@ -1007,6 +1038,9 @@ void* __queue_data_request_create(connection_t* connection, httprequest_t* reque
     data->ratelimiter = ratelimiter;
     data->server = ((connection_server_ctx_t*)connection->ctx)->server;
 
+    data->storage_name = NULL;
+    data->storage_path = NULL;
+
     return data;
 }
 
@@ -1021,7 +1055,68 @@ void* __queue_data_response_create(connection_t* connection, httprequest_t* requ
     data->ratelimiter = ratelimiter;
     data->server = ((connection_server_ctx_t*)connection->ctx)->server;
 
+    data->storage_name = NULL;
+    data->storage_path = NULL;
+
     return data;
+}
+
+void* __queue_data_storage_create(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter) {
+    connection_queue_http_data_t* data = malloc(sizeof * data);
+    if (data == NULL) return NULL;
+
+    data->base.free = __queue_data_storage_free;
+    data->request = request;
+    data->connection = connection;
+    data->response = response;
+    data->ratelimiter = ratelimiter;
+    data->server = ((connection_server_ctx_t*)connection->ctx)->server;
+    data->storage_name = NULL;
+    data->storage_path = NULL;
+
+    return data;
+}
+
+void __queue_data_storage_free(void* arg) {
+    if (arg == NULL) return;
+
+    connection_queue_http_data_t* data = arg;
+
+    free(data->storage_name);
+    free(data->storage_path);
+    free(data);
+}
+
+/* Like __deferred_handler, but with the storage name and the expanded path on
+ * the item. A function of its own rather than two more parameters on the
+ * common one: the other three callers know nothing about storages. The copies
+ * are made before the item is enqueued -- afterwards it belongs to the queue
+ * and a worker may already be running it. */
+int __deferred_storage_handler(connection_t* connection, httprequest_t* request, httpresponse_t* response,
+                               const char* storage_name, const char* path, ratelimiter_t* ratelimiter) {
+    connection_queue_item_t* item = connection_queue_item_create();
+    if (item == NULL) return 0;
+
+    item->run = __queue_storage_handler;
+    item->handle = NULL;
+    item->connection = connection;
+    item->data = __queue_data_storage_create(connection, request, response, ratelimiter);
+
+    if (item->data == NULL) {
+        item->free(item);
+        return 0;
+    }
+
+    connection_queue_http_data_t* data = (connection_queue_http_data_t*)item->data;
+    data->storage_name = strdup(storage_name);
+    data->storage_path = strdup(path);
+
+    if (data->storage_name == NULL || data->storage_path == NULL) {
+        item->free(item);
+        return 0;
+    }
+
+    return __deferred_enqueue(connection, item);
 }
 
 void __queue_data_request_free(void* arg) {
@@ -1107,6 +1202,61 @@ void __queue_request_handler(void* arg) {
     /* Publishing: h2 pushes to the session queue and re-arms under its own
      * acquisition; h1.1 needs connection_s_lock for the re-arm. __publish_response
      * owns that difference (docs/concurrency/01 §4.1, phase B). */
+    __publish_response(item->connection, data->request, data->response);
+}
+
+/* The storage branch. Unlike __queue_response_handler the answer is not built
+ * yet -- it has to be fetched, and that is what belongs in a worker. Unlike
+ * __queue_request_handler there is no handler to call: the core takes its
+ * place. Ratelimit and middlewares do run: a route into S3 costs egress, and a
+ * private file behind authorization is the reason to bind a route to a storage
+ * in the first place. */
+void __queue_storage_handler(void* arg) {
+    if (arg == NULL) {
+        log_error("__queue_storage_handler: arg is NULL\n");
+        return;
+    }
+
+    connection_queue_item_t* item = arg;
+    if (item->data == NULL || item->connection == NULL) {
+        log_error("__queue_storage_handler: item->data or item->connection is NULL\n");
+        return;
+    }
+
+    connection_queue_http_data_t* data = (connection_queue_http_data_t*)item->data;
+    connection_server_ctx_t* conn_ctx = item->connection->ctx;
+    if (conn_ctx == NULL) {
+        log_error("__queue_storage_handler: conn_ctx is NULL\n");
+        return;
+    }
+
+    if (!__is_multiplexed(item->connection)) {
+        connection_s_lock(item->connection, LOCK_SITE_HTTP_DISPATCH);
+        conn_ctx->request = data->request;
+        conn_ctx->response = data->response;
+        connection_s_unlock(item->connection);
+    }
+
+    if (!ratelimiter_allow(data->ratelimiter, &item->connection->remote_ip, 1)) {
+        if (data->response != NULL) {
+            httpresponse_default(data->response, 429);
+            data->response->add_header(data->response, "Retry-After", "1");
+        }
+
+        __publish_response(item->connection, data->request, data->response);
+        return;
+    }
+
+    /* --- user code: middlewares, no lock held --- */
+    httpctx_t ctx;
+    httpctx_init(&ctx, data->request, data->response,
+                 data->server->config != NULL ? data->server->config->httpctx_user_data_free : NULL);
+
+    if (run_middlewares(data->server->http.middleware, &ctx))
+        http_storage_respond(data->request, data->response, data->storage_name, data->storage_path);
+
+    httpctx_clear(&ctx);
+
     __publish_response(item->connection, data->request, data->response);
 }
 
