@@ -312,17 +312,17 @@ TEST(test_route_set_http_static) {
     route_t* r = route_create("/index.html");
     TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
 
-    TEST_ASSERT_EQUAL(0, route_set_http_static(r, "BOGUS", "/var/www/a.html", NULL), "Unknown method should be rejected");
+    TEST_ASSERT_EQUAL(0, route_set_http_static(r, "BOGUS", "/var/www/a.html", NULL, NULL), "Unknown method should be rejected");
 
     char source[] = "/var/www/a.html";
-    TEST_ASSERT_EQUAL(1, route_set_http_static(r, "GET", source, NULL), "GET static file should be accepted");
+    TEST_ASSERT_EQUAL(1, route_set_http_static(r, "GET", source, NULL, NULL), "GET static file should be accepted");
 
     char* stored = route_test_static_path(r, ROUTE_GET);
     TEST_ASSERT_STR_EQUAL("/var/www/a.html", stored, "Static file path should be stored");
     TEST_ASSERT((void*)stored != (void*)source, "Static file path should be copied, not aliased");
     free(stored);
 
-    TEST_ASSERT_EQUAL(1, route_set_http_static(r, "GET", "/var/www/b.html", NULL), "Duplicate GET should report success");
+    TEST_ASSERT_EQUAL(1, route_set_http_static(r, "GET", "/var/www/b.html", NULL, NULL), "Duplicate GET should report success");
     stored = route_test_static_path(r, ROUTE_GET);
     TEST_ASSERT_STR_EQUAL("/var/www/a.html", stored, "Duplicate GET should not overwrite static file");
     free(stored);
@@ -335,7 +335,7 @@ TEST(test_route_static_file_template) {
 
     route_t* r = route_create("/assets/(.*)");
     TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
-    TEST_ASSERT_EQUAL(1, route_set_http_static(r, "GET", "/assets/{1}", NULL), "Template should be accepted");
+    TEST_ASSERT_EQUAL(1, route_set_http_static(r, "GET", "/assets/{1}", NULL, NULL), "Template should be accepted");
 
     const char* path = "/assets/app/style.css";
     int vector[30];
@@ -422,7 +422,7 @@ TEST(test_route_multiple_routes_free) {
     TEST_REQUIRE_NOT_NULL_GOTO(b, "route_create /b should succeed", cleanup);
 
     a->next = b;
-    route_set_http_static(b, "GET", "/var/www/b.html", NULL);
+    route_set_http_static(b, "GET", "/var/www/b.html", NULL, NULL);
     route_set_http_handler(a, "GET", route_test_handler_a, NULL);
 
     routes_free(a); // LSan verifies both routes and their internals are freed
@@ -565,6 +565,53 @@ TEST(test_route_dot_with_named_param_is_still_allowed) {
     TEST_ASSERT_EQUAL(0, r->is_primitive, "a param makes it non-primitive anyway");
     TEST_ASSERT_EQUAL(1, r->params_count, "the param is still parsed");
     TEST_ASSERT(route_pattern_matches(r, "/files/report.json"), "and the route matches");
+
+    routes_free(r);
+}
+
+TEST(test_route_set_http_static_storage) {
+    TEST_CASE("route_set_http_static keeps a copy of the storage name");
+
+    route_t* r = route_create("/videos/(.*)");
+    TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
+
+    char source[] = "media";
+    TEST_ASSERT_EQUAL(1, route_set_http_static(r, "GET", "{1}", source, NULL),
+                      "GET static file with a storage should be accepted");
+    TEST_REQUIRE_NOT_NULL(r->storage_name[ROUTE_GET], "Storage name should be stored");
+    TEST_ASSERT_STR_EQUAL("media", r->storage_name[ROUTE_GET], "Storage name should be stored");
+    TEST_ASSERT((void*)r->storage_name[ROUTE_GET] != (void*)source,
+                "Storage name should be copied, not aliased");
+    TEST_ASSERT_NULL(r->storage_name[ROUTE_POST], "Other methods should stay empty");
+
+    routes_free(r); // LSan verifies the copy is freed
+}
+
+TEST(test_route_set_http_static_without_storage) {
+    TEST_CASE("a static route without a storage stays on server.root");
+
+    route_t* r = route_create("/index.html");
+    TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
+
+    TEST_ASSERT_EQUAL(1, route_set_http_static(r, "GET", "/index.html", NULL, NULL),
+                      "GET static file without a storage should be accepted");
+    TEST_ASSERT_NULL(r->storage_name[ROUTE_GET], "Storage name should stay NULL");
+
+    routes_free(r);
+}
+
+TEST(test_route_set_http_static_storage_duplicate) {
+    TEST_CASE("a duplicate method does not replace the storage of the first one");
+
+    route_t* r = route_create("/videos/(.*)");
+    TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
+
+    TEST_ASSERT_EQUAL(1, route_set_http_static(r, "GET", "{1}", "media", NULL),
+                      "The first GET should be accepted");
+    TEST_ASSERT_EQUAL(1, route_set_http_static(r, "GET", "{1}", "other", NULL),
+                      "A duplicate GET should report success");
+    TEST_ASSERT_STR_EQUAL("media", r->storage_name[ROUTE_GET],
+                          "The duplicate should not overwrite the storage name");
 
     routes_free(r);
 }

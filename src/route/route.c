@@ -118,6 +118,7 @@ route_t* route_init_route() {
     for (int i = 0; i < 7; i++) {
         route->static_file[i] = NULL;
         route->cache_control[i] = NULL;
+        route->storage_name[i] = NULL;
     }
 
     route->location_erroffset = 0;
@@ -507,7 +508,7 @@ int route_set_http_handler(route_t* route, const char* method, void(*function)(v
     return 1;
 }
 
-int route_set_http_static(route_t* route, const char* method, const char* static_file, ratelimiter_t* ratelimiter) {
+int route_set_http_static(route_t* route, const char* method, const char* static_file, const char* storage_name, ratelimiter_t* ratelimiter) {
     const int m = route_method_index(method);
     if (m == ROUTE_NONE) {
         route_drop_ratelimiter(route, ratelimiter);
@@ -525,6 +526,16 @@ int route_set_http_static(route_t* route, const char* method, const char* static
         route_drop_ratelimiter(route, ratelimiter);
         return 0;
     }
+
+    if (storage_name != NULL) {
+        route->storage_name[m] = strdup(storage_name);
+        if (route->storage_name[m] == NULL) {
+            log_error(ROUTE_OUT_OF_MEMORY);
+            route_drop_ratelimiter(route, ratelimiter);
+            return 0;
+        }
+    }
+
     route_own_ratelimiter(route, ratelimiter);
 
     return 1;
@@ -586,6 +597,7 @@ void routes_free(route_t* route) {
         for (int i = 0; i < 7; i++) {
             strtemplate_free(route->static_file[i]);
             free(route->cache_control[i]);
+            free(route->storage_name[i]);
         }
 
         free(route->path);

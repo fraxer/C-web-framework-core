@@ -46,12 +46,17 @@ typedef struct route {
      * applies it only when nothing else set one, so a handler still decides for
      * itself and this is the default for the route. */
     char* cache_control[7];
+    /* Хранилище, из которого отдаётся static_file этого метода, или NULL —
+     * тогда путь резолвится относительно server.root, как раньше. Имя, а не
+     * указатель на storage_t: резолв по имени смотрит в активную конфигурацию
+     * в момент запроса и потому переживает reload. */
+    char* storage_name[7];
     ratelimiter_t* ratelimiter;
 } route_t;
 
 route_t* route_create(const char*);
 int route_set_http_handler(route_t*, const char*, void(*)(void*), ratelimiter_t* ratelimiter);
-int route_set_http_static(route_t*, const char* method, const char* static_file, ratelimiter_t* ratelimiter);
+int route_set_http_static(route_t*, const char* method, const char* static_file, const char* storage_name, ratelimiter_t* ratelimiter);
 int route_set_http_cache_control(route_t*, const char* method, const char* cache_control);
 int route_set_websockets_handler(route_t*, const char*, void(*)(void*), ratelimiter_t* ratelimiter);
 void routes_free(route_t* route);

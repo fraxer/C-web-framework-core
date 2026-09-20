@@ -1929,7 +1929,7 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
                 return 0;
             }
             const char* static_file = json_string(token_static_file);
-            if (!route_set_http_static(route, method, static_file, ratelimiter)) {
+            if (!route_set_http_static(route, method, static_file, NULL, ratelimiter)) {
                 log_error("__module_loader_set_http_route: failed to set static file %s\n", static_file);
                 return 0;
             }
