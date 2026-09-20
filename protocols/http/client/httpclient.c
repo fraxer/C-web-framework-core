@@ -650,6 +650,15 @@ int __httpclient_free_connection(httpclient_t* client) {
     }
 
     client->connection = NULL;
+    /* The request and the response point at the connection this client has
+     * just let go of: released to the pool it may already belong to somebody
+     * else, discarded it is freed outright. The response outlives it either
+     * way -- the caller reads its payload after send() returns -- and
+     * __httpresponse_reset() reads connection->keepalive on the way out, which
+     * is a use-after-free on the discard path. Same clearing as
+     * __httpclient_self_invoke does. */
+    client->request->connection = NULL;
+    client->response->connection = NULL;
 
     return 1;
 }
