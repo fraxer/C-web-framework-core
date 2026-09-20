@@ -9,6 +9,7 @@
 #include "httprequest.h"
 #include "httpresponse.h"
 #include "httprequestparser.h"
+#include "storage.h"
 #include "log.h"
 #include "connection_queue.h"
 #include "openssl.h"
@@ -166,6 +167,7 @@ static int __post_response(httprequest_t* request, httpresponse_t* response);
 static int __post_deffered_response(httprequest_t* request, httpresponse_t* response);
 static ratelimiter_t* __ratelimiter_find(server_http_t* http_config, route_t* route);
 static int __prepare_static_file_response(connection_server_ctx_t* ctx, httpresponse_t* response, const char* static_file_path);
+static int __prepare_storage_fs_response(httpresponse_t* response, const char* storage_name, const char* path);
 
 /* What a matched route did with the request: nothing it could serve for this
  * method (keep looking), queued, or failed outright. */
@@ -753,7 +755,22 @@ static route_dispatch_e __route_dispatch(connection_t* connection, httprequest_t
         char* path = strtemplate_expand(route->static_file[method], request->path, vector);
         if (path == NULL) return ROUTE_DISPATCH_ERROR;
 
-        const int prepared = __prepare_static_file_response(ctx, response, path);
+        int prepared = 0;
+        const char* storage_name = route->storage_name[method];
+        if (storage_name != NULL) {
+            storage_type_e type = STORAGE_TYPE_FS;
+            if (!storage_type_in(appconfig()->storages, storage_name, &type)) {
+                /* The config was validated at load, so the name can only be
+                 * missing if the storage went away between generations. */
+                response->send_default(response, 503);
+                prepared = 1;
+            }
+            else
+                prepared = __prepare_storage_fs_response(response, storage_name, path);
+        }
+        else
+            prepared = __prepare_static_file_response(ctx, response, path);
+
         free(path);
 
         if (!prepared) return ROUTE_DISPATCH_ERROR;
@@ -1536,6 +1553,24 @@ void __apply_route_cache_control(httpresponse_t* response, route_t* route, int m
     if (value == NULL) return;
 
     response->add_headeru(response, "Cache-Control", 13, value, strlen(value));
+}
+
+/* A filesystem storage: resolve the full path, then answer with the very
+ * function static files from server.root are answered with. Resolving apart
+ * from opening is what keeps that possible -- storage_file_get() hands back a
+ * file_t whose name is a basename, and gzip_static looks for the ".gz" twin by
+ * path. */
+int __prepare_storage_fs_response(httpresponse_t* response, const char* storage_name, const char* path) {
+    char file_full_path[PATH_MAX];
+
+    if (!storage_resolve_path(storage_name, path, file_full_path, sizeof(file_full_path))) {
+        response->send_default(response, 404);
+        return 1;
+    }
+
+    http_response_file(response, file_full_path);
+
+    return 1;
 }
 
 int __prepare_static_file_response(connection_server_ctx_t* ctx, httpresponse_t* response, const char* static_file_path) {
