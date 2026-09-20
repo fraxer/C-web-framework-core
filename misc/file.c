@@ -223,12 +223,19 @@ int __file_close(file_t* file) {
     snprintf(path, sizeof(path), "/proc/self/fd/%d", file->fd);
 
     if (file->tmp) {
+        /* readlink() does not terminate what it writes, so unlink() used to be
+         * handed the path plus whatever was on the stack after it: the
+         * temporary file stayed on disk (84 of them had piled up in /tmp), and
+         * the name actually passed to unlink() was nobody's. One byte is
+         * reserved for the terminator and written explicitly. */
         char filePath[PATH_MAX];
-        const int rlresult = readlink(path, filePath, PATH_MAX);
+        const ssize_t rlresult = readlink(path, filePath, sizeof(filePath) - 1);
         if (rlresult == -1)
-            log_error("File: readlink error");
-        if (rlresult >= 0)
+            log_error("File: readlink error\n");
+        else {
+            filePath[rlresult] = 0;
             unlink(filePath);
+        }
     }
 
     const int status = close(file->fd);

@@ -1062,3 +1062,28 @@ TEST(test_file_name_survives_a_shorter_replacement) {
     TEST_ASSERT_EQUAL(1, file.set_name(&file, "/tmp/s.txt"), "short name set");
     TEST_ASSERT_STR_EQUAL("s.txt", file.name, "with no tail of the previous one");
 }
+
+/* REGRESSION: __file_close() read the path out of readlink() without
+ * terminating it and unlinked that, so temporary files were never removed --
+ * /tmp filled up with them one request at a time. */
+TEST(test_file_create_tmp_is_unlinked_on_close) {
+    TEST_CASE("file_create_tmp removes its file from disk on close");
+
+    file_t file = file_create_tmp("probe", "/tmp");
+    TEST_REQUIRE(file.ok, "a temporary file should be created");
+    TEST_REQUIRE(file.fd > -1, "it should be open");
+
+    TEST_ASSERT(file.append_content(&file, "payload", 7), "content should be written");
+
+    char link[PATH_MAX];
+    char on_disk[PATH_MAX];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", file.fd);
+    const ssize_t length = readlink(link, on_disk, sizeof(on_disk) - 1);
+    TEST_REQUIRE(length > 0, "the path of the temporary file should be readable");
+    on_disk[length] = 0;
+
+    TEST_ASSERT_EQUAL(0, access(on_disk, F_OK), "the file should exist while open");
+
+    TEST_ASSERT(file.close(&file), "close should succeed");
+    TEST_ASSERT_EQUAL(-1, access(on_disk, F_OK), "the file should be gone after close");
+}
