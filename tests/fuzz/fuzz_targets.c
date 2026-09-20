@@ -13710,7 +13710,7 @@ static void __rt_route(rt_in_t* in) {
     const int k = __rt_u8(in) % (r->captures + 3);
     char tpl[32];
     snprintf(tpl, sizeof tpl, "/f/{%d}", k);
-    const int set = route_set_http_static(r, "GET", tpl, NULL);
+    const int set = route_set_http_static(r, "GET", tpl, NULL, NULL);
     if (set != (k <= r->captures)) __builtin_trap();
     if (set && got == 1) {
         char* file = strtemplate_expand(r->static_file[ROUTE_GET], path.b, r->is_primitive ? NULL : vector);
