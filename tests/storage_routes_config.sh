@@ -43,7 +43,7 @@ write_config() {
     },
     "servers": {
         "s1": {
-            "domains": ["localhost"], "ip": "127.0.0.1", "port": $PORT,
+            "domains": ["localhost", "127.0.0.1"], "ip": "127.0.0.1", "port": $PORT,
             "root": "$WORK_DIR/www", "index": "index.html",
             "http": { "routes": $routes }
         }
