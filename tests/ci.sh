@@ -15,6 +15,10 @@
 #   h3unit   QUIC / HTTP/3 / QPACK unit runner only
 #   config   invalid HTTP/3 types/ranges reject startup
 #   startup  a server that did not start exits non-zero, in both start modes
+#   storage  routes bound to storages: a bad binding refuses to start, the
+#            filesystem branch in full, and the S3 branch against MinIO
+#            (skipped when MinIO is unreachable; REQUIRE_S3=1 makes that a
+#            failure)
 #   keepalive a quiet connection outlives the idle timeout, and does not
 #            without http3_keepalive_sec (both arms, ~90 s)
 #   limits   process connection/memory exhaustion and drain
@@ -59,6 +63,7 @@
 #   H3SPEC         path to the h3spec binary (default: found on PATH)
 #   H2WS_PYTHONPATH  where python-h2 lives, when it is not installed system-wide
 #   REQUIRE_H3SPEC fail instead of skip when h3spec is unavailable (default 0)
+#   REQUIRE_S3     fail instead of skip when MinIO is unreachable (default 0)
 #   SOAK_REQUESTS requests in the soak stage (default 1000; release 10000)
 #   SOAK_RSS_GROWTH_KB allowed post-warmup RSS growth (default 16384)
 #   BENCH_BASELINE benchmark JSON produced with BENCH_RECORD
@@ -192,6 +197,20 @@ stage_startup() {
         record startup OK
     else
         record startup FAIL
+    fi
+}
+
+stage_storage() {
+    say "storage: routes bound to storages"
+    if build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes -DSANITIZE=none &&
+       STORAGE_CONFIG_PORT=18510 "$CORE_DIR/tests/storage_routes_config.sh" \
+             "$CI_BUILD_DIR/limits" "$CI_BUILD_DIR/storage-routes-config" &&
+       STORAGE_ROUTES_PORT=18511 "$CORE_DIR/tests/storage_routes.sh" \
+             "$CI_BUILD_DIR/limits" "$CI_BUILD_DIR/storage-routes"; then
+        record storage OK
+    else
+        record storage FAIL
     fi
 }
 
@@ -696,7 +715,7 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit config startup keepalive limits soak affinity earlydata vn version2 ipv6 qlog priority benchmark asan tsan fuzz reload softreload hotreload h2ws h3spec)
+ALL_STAGES=(noh3 h3unit config startup storage keepalive limits soak affinity earlydata vn version2 ipv6 qlog priority benchmark asan tsan fuzz reload softreload hotreload h2ws h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
@@ -715,6 +734,7 @@ for stage in "${STAGES[@]}"; do
     h3unit) stage_h3unit ;;
     config) stage_config ;;
     startup) stage_startup ;;
+    storage) stage_storage ;;
     keepalive) stage_keepalive ;;
     limits) stage_limits ;;
     soak)    stage_soak ;;
