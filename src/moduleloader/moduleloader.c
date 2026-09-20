@@ -76,6 +76,7 @@ static int __module_loader_servers_load(appconfig_t* config, const json_token_t*
 static domain_t* __module_loader_domains_load(const json_token_t* token_array);
 static int __module_loader_databases_load(appconfig_t* config, const json_token_t* databases);
 static int __module_loader_storages_load(appconfig_t* config, const json_token_t* storages);
+static int __module_loader_validate_storage_routes(appconfig_t* config);
 static int __module_loader_mimetype_load(appconfig_t* config, const json_token_t* mimetypes);
 static int __module_loader_viewstore_load(appconfig_t* config);
 static int __module_loader_sessionconfig_load(appconfig_t* config, const json_token_t* sessionconfig);
@@ -681,6 +682,8 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     if (!__module_loader_databases_load(config, json_object_get(root, "databases")))
         goto failed;
     if (!__module_loader_storages_load(config, json_object_get(root, "storages")))
+        goto failed;
+    if (!__module_loader_validate_storage_routes(config))
         goto failed;
     if (!__module_loader_mimetype_load(config, json_object_get(root, "mimetypes")))
         goto failed;
@@ -1488,6 +1491,31 @@ int __module_loader_databases_load(appconfig_t* config, const json_token_t* toke
     return result;
 }
 
+/* Маршруты разбираются раньше, чем грузятся хранилища, и storage_* отвечают
+ * про АКТИВНУЮ конфигурацию -- при reload это предыдущее поколение, где имя
+ * может ещё существовать. Поэтому имя проверяется здесь: по списку
+ * загружаемой конфигурации и после того, как он построен. */
+int __module_loader_validate_storage_routes(appconfig_t* config) {
+    if (config->server_chain == NULL) return 1;
+
+    for (server_t* server = config->server_chain->server; server != NULL; server = server->next) {
+        for (route_t* route = server->http.route; route != NULL; route = route->next) {
+            for (int method = 0; method < 7; method++) {
+                if (route->storage_name[method] == NULL) continue;
+
+                storage_type_e type = STORAGE_TYPE_FS;
+                if (!storage_type_in(config->storages, route->storage_name[method], &type)) {
+                    log_error_stderr("__module_loader_validate_storage_routes: storage %s not found for route %s\n",
+                                     route->storage_name[method], route->path);
+                    return 0;
+                }
+            }
+        }
+    }
+
+    return 1;
+}
+
 int __module_loader_storages_load(appconfig_t* config, const json_token_t* token_storages) {
     if (token_storages == NULL) return 1;
     if (!json_is_object(token_storages)) {
@@ -1918,18 +1946,51 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
             }
         }
 
+        /* Хранилище, из которого отдаётся static_file. Само имя проверяется
+         * позже -- __module_loader_validate_storage_routes: storages грузятся
+         * после servers, так что здесь их ещё нет. */
+        const json_token_t* token_storage = json_object_get(token_item, "storage");
+        const char* storage_name = NULL;
+        if (token_storage != NULL) {
+            if (!json_is_string(token_storage)) {
+                log_error_stderr("__module_loader_set_http_route: http.route item.value.storage must be string\n");
+                ratelimiter_free(ratelimiter);
+                return 0;
+            }
+            if (json_string_size(token_storage) == 0) {
+                log_error_stderr("__module_loader_set_http_route: http.route item.value.storage must be not empty string\n");
+                ratelimiter_free(ratelimiter);
+                return 0;
+            }
+            if (json_object_get(token_item, "file") != NULL || json_object_get(token_item, "function") != NULL) {
+                log_error_stderr("__module_loader_set_http_route: http.route item.value.storage can not be used with a handler\n");
+                ratelimiter_free(ratelimiter);
+                return 0;
+            }
+
+            storage_name = json_string(token_storage);
+        }
+
         const json_token_t* token_static_file = json_object_get(token_item, "static_file");
+        if (token_static_file == NULL && storage_name != NULL) {
+            log_error_stderr("__module_loader_set_http_route: http.route item.value.storage requires static_file\n");
+            ratelimiter_free(ratelimiter);
+            return 0;
+        }
+
         if (token_static_file != NULL) {
             if (!json_is_string(token_static_file)) {
                 log_error_stderr("__module_loader_set_http_route: http.route item.value.static_file must be string\n");
+                ratelimiter_free(ratelimiter);
                 return 0;
             }
             if (json_string_size(token_static_file) == 0) {
                 log_error_stderr("__module_loader_set_http_route: http.route item.value.static_file must be not empty string\n");
+                ratelimiter_free(ratelimiter);
                 return 0;
             }
             const char* static_file = json_string(token_static_file);
-            if (!route_set_http_static(route, method, static_file, NULL, ratelimiter)) {
+            if (!route_set_http_static(route, method, static_file, storage_name, ratelimiter)) {
                 log_error("__module_loader_set_http_route: failed to set static file %s\n", static_file);
                 return 0;
             }
