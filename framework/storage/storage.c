@@ -122,6 +122,34 @@ array_t* storage_file_list(const char* storage_name, const char* path_format, ..
     return storage->file_list(storage, path);
 }
 
+int storage_resolve_path(const char* storage_name, const char* path, char* out, size_t out_size) {
+    if (storage_name == NULL || path == NULL || out == NULL) return 0;
+
+    storage_t* storage = __storage_find(storage_name);
+    if (storage == NULL)
+        return 0;
+
+    if (storage->path_resolve == NULL)
+        return 0;
+
+    return storage->path_resolve(storage, path, out, out_size);
+}
+
+int storage_type_in(storage_t* list, const char* name, storage_type_e* out) {
+    if (name == NULL) return 0;
+
+    for (storage_t* item = list; item != NULL; item = item->next) {
+        if (strcmp(item->name, name) != 0) continue;
+
+        if (out != NULL)
+            *out = item->type;
+
+        return 1;
+    }
+
+    return 0;
+}
+
 void storages_free(storage_t* storage) {
     while (storage != NULL) {
         storage_t* next = storage->next;
