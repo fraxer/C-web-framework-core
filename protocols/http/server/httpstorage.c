@@ -59,17 +59,30 @@ void http_storage_respond(httprequest_t* request, httpresponse_t* response,
         return;
     }
 
-    /* Один диапазон обслуживаем; несколько — игнорируем Range целиком и отдаём
-     * объект (RFC 9110 §14.2 это разрешает): multipart/byteranges для S3-ветки
-     * вне объёма. If-Range сверяется локально с ETag из HEAD — второго запроса
-     * для этого не нужно (RFC 9110 §13.1.5). */
+    /* Один диапазон вырезает сам S3 — так с объекта в сотни мегабайт качается
+     * только запрошенное. Несколько диапазонов тянут объект целиком, и дальше
+     * его режет обычный range-фильтр: получается настоящий
+     * multipart/byteranges, не хуже, чем у статики от server.root. Случай
+     * редкий, а стоит он одного полного скачивания.
+     *
+     * If-Range сверяется локально с ETag из HEAD — второго запроса в S3 для
+     * этого не нужно. */
+    if (request->ranges != NULL && !__if_range_matches(request, &meta)) {
+        /* RFC 9110 §13.1.5: a validator that no longer matches means the Range
+         * is ignored and the whole representation goes out. Dropping the parsed
+         * ranges is what stops the range filter from slicing the answer anyway
+         * once it sees them on a 200. */
+        http_ranges_free(request->ranges);
+        request->ranges = NULL;
+    }
+
     const int single_range = request->ranges != NULL && request->ranges->next == NULL;
 
     size_t start = 0;
     size_t end = 0;
     int ranged = 0;
 
-    if (single_range && __if_range_matches(request, &meta)) {
+    if (single_range) {
         const size_t chunk = storages3_chunk_size(env()->main.client_max_body_size);
         if (!__range_bounds(request, meta.total_size, chunk, &start, &end)) {
             char content_range[64];
