@@ -1583,3 +1583,93 @@ TEST(test_range_reset_reuse_after_416) {
     cleanup:
     fixture_teardown(&fx);
 }
+
+// ============================================================================
+// range_passthrough: a body its source already sliced
+// ============================================================================
+
+/* REGRESSION GUARD: a body the source had already cut to the requested range
+ * (the S3 storage branch lets S3 do the slicing) was cut a second time here,
+ * from the slice's own zero, and its Content-Range overwritten. */
+TEST(test_range_header_passthrough) {
+    TEST_SUITE("http_range_filter: range passthrough");
+    TEST_CASE("range_passthrough leaves the header stage untouched");
+
+    range_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx, 64), "fixture should be created");
+
+    fx.request->method = ROUTE_GET;
+    TEST_REQUIRE_NOT_NULL(add_range(fx.request, 2, 6), "range should be set");
+    fx.response->status_code = 206;
+    fx.response->range_passthrough = 1;
+    fx.response->add_header(fx.response, "Content-Range", "bytes 2-6/10");
+
+    const int r = run_header(&fx);
+    TEST_ASSERT_EQUAL(CWF_OK, r, "header chain should finish with CWF_OK");
+    TEST_ASSERT_EQUAL(206, fx.response->status_code, "status should stay as the source set it");
+    TEST_ASSERT_EQUAL_UINT(0, fx.response->range, "the filter should not claim the range");
+    TEST_ASSERT_EQUAL(1, header_count(fx.response, "Content-Range"),
+                      "the source's Content-Range should be the only one");
+
+    fixture_teardown(&fx);
+}
+
+TEST(test_range_body_passthrough) {
+    TEST_SUITE("http_range_filter: range passthrough");
+    TEST_CASE("range_passthrough forwards the body verbatim");
+
+    range_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx, 64), "fixture should be created");
+
+    fx.request->method = ROUTE_GET;
+    TEST_REQUIRE_NOT_NULL(add_range(fx.request, 2, 6), "range should be set");
+    fx.response->status_code = 206;
+    fx.response->range_passthrough = 1;
+
+    TEST_REQUIRE(run_header(&fx) == CWF_OK, "header stage should pass through");
+
+    /* The payload is already bytes 2..6 of "0123456789": slicing it again
+     * would answer with "23456"[2..6] -- three bytes of the wrong part. The
+     * filter is inactive here, so it forwards the parent buffer and hands back
+     * whatever the sink said, exactly as it does with no Range at all. */
+    char sliced[] = "23456";
+    bufo_t parent;
+    parent.data = sliced;
+    parent.capacity = sizeof(sliced);
+    parent.size = sizeof(sliced) - 1;
+    parent.pos = 0;
+    parent.is_proxy = 1;
+    parent.is_last = 1;
+
+    fx.response->cur_filter = fx.range;
+    const int r = fx.range->handler_body(fx.request, fx.response, &parent);
+    TEST_ASSERT_EQUAL(CWF_DATA_AGAIN, r, "the sink's result should be forwarded");
+    TEST_ASSERT_EQUAL(1, fx.sink.body_calls, "downstream body should be called once");
+    TEST_ASSERT(sink_equals(&fx, "23456", 5), "the body should reach the sink unsliced");
+
+    fixture_teardown(&fx);
+}
+
+TEST(test_range_passthrough_off_still_slices) {
+    TEST_SUITE("http_range_filter: range passthrough");
+    TEST_CASE("without the flag the filter slices as before");
+
+    range_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx, 64), "fixture should be created");
+
+    fx.request->method = ROUTE_GET;
+    TEST_REQUIRE_NOT_NULL(add_range(fx.request, 2, 6), "range should be set");
+
+    char whole[] = "0123456789";
+    body_set(&fx, whole, sizeof(whole) - 1);
+
+    TEST_REQUIRE(run_header(&fx) == CWF_OK, "header stage should frame the range");
+    TEST_ASSERT_EQUAL(206, fx.response->status_code, "status should become 206");
+    TEST_ASSERT_EQUAL_UINT(1, fx.response->range, "the filter should claim the range");
+
+    const int r = run_body_to_done(&fx);
+    TEST_ASSERT_EQUAL(CWF_OK, r, "body chain should finish with CWF_OK");
+    TEST_ASSERT(sink_equals(&fx, "23456", 5), "the filter should cut the slice itself");
+
+    fixture_teardown(&fx);
+}

@@ -167,6 +167,7 @@ static httpresponse_t* __httpresponse_create(connection_t* connection, http_chai
      * is the safe half of the choice. */
     response->keepalive = connection != NULL && connection->keepalive ? 1 : 0;
     response->range = 0;
+    response->range_passthrough = 0;
     response->last_modified = 0;
     response->client_gzip = 0;
     response->vary_encoding = 0;
@@ -236,6 +237,7 @@ void __httpresponse_reset(httpresponse_t* response) {
     const connection_t* conn = response->connection;
     response->keepalive = conn != NULL && conn->keepalive ? 1 : 0;
     response->range = 0;
+    response->range_passthrough = 0;
     response->last_modified = 0;
     response->client_gzip = 0;
     response->vary_encoding = 0;
@@ -607,6 +609,25 @@ void http_response_file_opened(httpresponse_t* response, file_t* file, const cha
 
     if (!__httpresponse_prepare_body(response, response->file_.size))
         response->send_default(response, 500);
+}
+
+int http_response_body_file(httpresponse_t* response, file_t* file) {
+    if (response == NULL || file == NULL) return 0;
+    if (!file->ok) return 0;
+
+    response->file_ = *file;
+    *file = file_alloc();
+
+    return __httpresponse_prepare_body(response, response->file_.size);
+}
+
+int http_response_body_data(httpresponse_t* response, const char* data, size_t size) {
+    if (response == NULL || data == NULL) return 0;
+
+    if (!__httpresponse_alloc_body(response, data, size))
+        return 0;
+
+    return __httpresponse_prepare_body(response, size);
 }
 
 void __httpresponse_filef(httpresponse_t* response, const char* storage_name, const char* path_format, ...) {

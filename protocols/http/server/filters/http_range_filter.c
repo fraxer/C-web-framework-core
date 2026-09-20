@@ -474,6 +474,11 @@ int range_handler_header(httprequest_t* request, httpresponse_t* response) {
     if (request == NULL || request->ranges == NULL)
         return filter_next_handler_header(request, response);
 
+    /* The source already sent exactly the bytes asked for and framed them
+     * itself: cutting again would be cutting a range out of a range. */
+    if (response->range_passthrough)
+        return filter_next_handler_header(request, response);
+
     /* Range requests only apply to successful responses (2xx).
      * Redirects (3xx), client errors (4xx) and server errors (5xx) go out
      * unmodified. */
@@ -583,7 +588,11 @@ int range_handler_body(httprequest_t* request, httpresponse_t* response, bufo_t*
     http_module_range_t* module = cur_filter->module;
     module->base.parent_buf = parent_buf;
 
-    if (request == NULL || !response->range)
+    /* range_passthrough never reaches `range`: the header stage returns before
+     * setting it. It is named here anyway, because "the source sliced this
+     * body" is the reason this filter keeps its hands off, and reading it out
+     * of a flag that happens to stay zero is not that reason. */
+    if (request == NULL || !response->range || response->range_passthrough)
         return filter_next_handler_body(request, response, parent_buf);
 
     if (response->last_modified)

@@ -333,6 +333,12 @@ typedef struct httpresponse {
      * the first response and swallowed the other two. */
     unsigned keepalive : 1;
     unsigned range : 1;
+    /* The body of this response is a slice its source already cut, and the
+     * status, Content-Range and Content-Length are the source's too (the S3
+     * storage branch: S3 does the slicing). The range filter switches on the
+     * presence of request->ranges alone, so without this it would cut the
+     * slice a second time, from the slice's own zero. */
+    unsigned range_passthrough : 1;
     unsigned last_modified : 1;
     /* What the request's Accept-Encoding allows. Zero for a response built
      * without a request behind it -- an early error, say -- which is the safe
@@ -400,6 +406,13 @@ int http_gzip_static_enabled(void);
 file_status_e http_open_file(server_t* server, char* file_full_path, size_t file_full_path_size, const char* path, size_t length, file_t* out);
 void http_response_file(httpresponse_t* response, const char* file_full_path);
 void http_response_file_opened(httpresponse_t* response, file_t* file, const char* file_full_path);
+/* Attach an already-open file as the body, touching neither the validators nor
+ * gzip nor Content-Type -- all of those stay with the caller, which is what a
+ * body whose identity comes from somewhere else (an S3 object's ETag) needs.
+ * Ownership of the descriptor moves to the response; *file is emptied. */
+int http_response_body_file(httpresponse_t* response, file_t* file);
+/* The same for a body in memory: the data is copied. */
+int http_response_body_data(httpresponse_t* response, const char* data, size_t size);
 size_t httpresponse_status_length(int status_code);
 
 void httpresponse_default(httpresponse_t* response, int status_code);
