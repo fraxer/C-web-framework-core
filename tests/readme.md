@@ -409,13 +409,40 @@ cmake --build build-fuzz
 ```
 
 Targets: `quic_packet`, `quic_frame`, `quic_tp`, `h3_frame`, `qpack_decode`,
-`qpack_streams`, `huffman`, `h3_priority`, each with a seed corpus under
-`fuzz/corpus/`. `-DBUILD_FUZZERS=yes` requires `-DINCLUDE_HTTP3=yes`.
+`qpack_streams`, `huffman`, `h3_priority`, `hpack`, each with a seed corpus
+under `fuzz/corpus/`. `-DBUILD_FUZZERS=yes` requires `-DINCLUDE_HTTP3=yes`
+even for `hpack`, which is HTTP/2 and needs none of it — the flag gates the
+whole block rather than a target at a time.
 
-clang is not optional in practice: it builds the targets against libFuzzer
-(`-fsanitize=fuzzer,address`), while the gcc branch compiles its own driver,
-`fuzz/fuzz_main.c`, which calls `__sanitizer_set_death_callback` without
-linking a sanitizer runtime — that configuration currently fails at link time.
+clang builds the targets against libFuzzer (`-fsanitize=fuzzer,address`) and
+is the better choice where it is available. gcc works too, and the link error
+this note used to describe is not a property of the gcc branch but of building
+it without a sanitizer: `fuzz_main.c` calls `__sanitizer_set_death_callback`,
+so the runtime that defines it has to be on the line. Put it there and the
+same targets build and run:
+
+```bash
+cmake -S backend -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+      -DBUILD_TESTS=yes -DBUILD_FUZZERS=yes -DINCLUDE_HTTP3=yes \
+      -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+      -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+      -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
+cmake --build build-fuzz --target fuzz_hpack
+./build-fuzz/exec/fuzz_hpack -seconds=120 backend/core/tests/fuzz/corpus/hpack
+```
+
+The driver takes `-seconds=`, `-runs=`, `-seed=` and `-artifacts=<dir>`, and
+writes the crashing input to the artifacts directory; a reproducer belongs in
+the seed corpus once the bug behind it is fixed.
+
+`corpus/hpack/regression_dynamic_index_oob.bin` is there for a different
+reason, and stands for no bug this code ever had: the bounds check in
+`hpack_resolve_index` was loosened by one on purpose, to establish that the
+target reaches the dynamic table at all rather than exercising the static one
+and reporting nothing. The fuzzer answered in under two minutes with these
+three bytes — `82 be 45`, an indexed field naming dynamic entry 1 of an empty
+table — and they are kept as a seed because that boundary is worth landing on
+from the first run.
 
 ---
 

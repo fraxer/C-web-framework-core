@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "h3frame.h"
+#include "hpack.h"
 #include "h3priority.h"
 #include "huffman.h"
 #include "qpack.h"
@@ -233,6 +234,52 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     uint8_t enc[8192];
     const ssize_t n = huffman_encode(enc, sizeof enc, data, size > 2048 ? 2048 : size);
     if (n > 0) (void)huffman_decode(out, sizeof out, enc, (size_t)n);
+
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_HPACK
+
+/* HTTP/2's field section: the half of the pair that the QPACK target next door
+ * does not reach. HPACK differs in the way that matters here -- it carries its
+ * dynamic table updates inside the block itself (RFC 7541 §6.3), so the peer
+ * rewrites the decoder's state with the same bytes that state is used to
+ * decode.
+ *
+ * Decoded twice on one decoder on purpose. A block is not self-contained: an
+ * indexed field may name an entry a previous block inserted, and an eviction
+ * during a size update moves the index space under the reader. Only the second
+ * pass sees a table that is not empty, and that is the state a connection
+ * actually spends its life in.
+ *
+ * Then again on a decoder with no room at all. Every insert there must be
+ * refused rather than evict its way down to a table that still cannot hold the
+ * entry that caused the eviction -- the case where an off-by-one leaves the
+ * table describing entries it no longer owns. */
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    hpack_header_t* headers = NULL;
+    size_t count = 0;
+
+    hpack_decoder_t* d = hpack_decoder_create(4096);
+    if (d == NULL) return 0;
+
+    for (int pass = 0; pass < 2; pass++) {
+        if (hpack_decoder_decode(d, data, size, 1048576, &headers, &count) == HPACK_OK)
+            hpack_headers_free(headers, count);
+
+        headers = NULL;
+        count = 0;
+    }
+
+    hpack_decoder_free(d);
+
+    d = hpack_decoder_create(0);
+    if (d == NULL) return 0;
+
+    if (hpack_decoder_decode(d, data, size, 1048576, &headers, &count) == HPACK_OK)
+        hpack_headers_free(headers, count);
+
+    hpack_decoder_free(d);
 
     return 0;
 }

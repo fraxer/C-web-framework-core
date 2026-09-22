@@ -219,7 +219,7 @@ endif()
 if(BUILD_FUZZERS STREQUAL "yes" AND INCLUDE_HTTP3 STREQUAL yes)
     set(FUZZ_TARGET_NAMES
         quic_packet quic_frame quic_tp h3_frame qpack_decode qpack_streams huffman
-        h3_priority)
+        h3_priority hpack)
 
     set(FUZZ_ID_quic_packet    1)
     set(FUZZ_ID_quic_frame     2)
@@ -229,6 +229,7 @@ if(BUILD_FUZZERS STREQUAL "yes" AND INCLUDE_HTTP3 STREQUAL yes)
     set(FUZZ_ID_qpack_streams  6)
     set(FUZZ_ID_huffman        7)
     set(FUZZ_ID_h3_priority    8)
+    set(FUZZ_ID_hpack          9)
 
     foreach(name ${FUZZ_TARGET_NAMES})
         set(exe fuzz_${name})
@@ -252,6 +253,7 @@ if(BUILD_FUZZERS STREQUAL "yes" AND INCLUDE_HTTP3 STREQUAL yes)
             FUZZ_QPACK_STREAMS=6
             FUZZ_HUFFMAN=7
             FUZZ_H3_PRIORITY=8
+            FUZZ_HPACK=9
             FUZZ_TARGET=${FUZZ_ID_${name}}
         )
 
@@ -259,6 +261,7 @@ if(BUILD_FUZZERS STREQUAL "yes" AND INCLUDE_HTTP3 STREQUAL yes)
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/quic/common
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http3/frame
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http3/qpack
+            ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http2/hpack
         )
 
         target_link_libraries(${exe} PRIVATE
