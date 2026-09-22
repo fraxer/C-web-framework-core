@@ -1597,7 +1597,15 @@ static h2_frame_result_e h2_on_headers(h2session_t* s, const h2_frame_t* frame) 
         uint8_t* buf = realloc(s->cont, block_len ? block_len : 1);
         if (buf == NULL) return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
 
-        memcpy(buf, block, block_len);
+        /* block is NULL when the frame carried no payload at all: the parser
+         * returns a zero-length frame without ever allocating one, and a
+         * HEADERS of length 0 without END_HEADERS is a thing a peer can send
+         * as its very first frame. memcpy requires valid pointers even for a
+         * zero count (C11 7.24.1p2), and a compiler entitled to read the call
+         * as proof that block is non-NULL may drop a later check on it. The
+         * realloc above already allows for block_len == 0; this is the same
+         * case one line down. */
+        if (block_len > 0) memcpy(buf, block, block_len);
         s->cont = buf;
         s->cont_len = block_len;
         s->cont_stream_id = frame->stream_id;
