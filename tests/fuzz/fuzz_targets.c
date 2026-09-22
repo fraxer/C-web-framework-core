@@ -16,12 +16,21 @@
  * instead; when clang is installed, the same objects link against
  * -fsanitize=fuzzer with nothing changed here. */
 
+#define _GNU_SOURCE
+
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "h3frame.h"
+#include "cookieparser.h"
 #include "hpack.h"
+#include "httpcommon.h"
+#include "multipartparser.h"
+#include "urlencodedparser.h"
 #include "h3priority.h"
 #include "huffman.h"
 #include "qpack.h"
@@ -31,6 +40,27 @@
 #include "varint.h"
 
 int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size);
+
+#if FUZZ_TARGET == FUZZ_URLENCODED || FUZZ_TARGET == FUZZ_MULTIPART
+
+/* Both body parsers scan a buffer but read the field values back out of a file
+ * descriptor with pread, so the target needs a real, seekable one. memfd is
+ * what tests/unit/test_multipartparser.c uses for the same reason, and at
+ * fuzzing rates it matters that nothing touches a filesystem. */
+static int __fuzz_payload_fd(const uint8_t* data, size_t size) {
+    const int fd = memfd_create("fuzz_payload", 0);
+    if (fd < 0) return -1;
+
+    if (size > 0 && write(fd, data, size) != (ssize_t)size) {
+        close(fd);
+        return -1;
+    }
+
+    lseek(fd, 0, SEEK_SET);
+    return fd;
+}
+
+#endif
 
 #if FUZZ_TARGET == FUZZ_QUIC_PACKET
 
@@ -333,6 +363,127 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
         if (field.urgency > H3_PRIORITY_URGENCY_MAX) __builtin_trap();
     }
+
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_COOKIE
+
+/* The Cookie header as the peer wrote it. It arrives on requests that have
+ * proved nothing, the header buffer is its only size limit, and the parser
+ * walks it with index arithmetic of its own over ';' and '=' -- including the
+ * branch that trims leading spaces off a key, which moves one index while
+ * another stands still. */
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    cookieparser_t parser;
+    cookieparser_init(&parser);
+
+    (void)cookieparser_parse(&parser, (const char*)data, size);
+
+    /* Freed whether the parse succeeded or not: a failure partway leaves the
+     * pairs it had already built on the list. */
+    http_cookie_free(parser.cookie);
+
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_URLENCODED
+
+/* application/x-www-form-urlencoded, which is how the feedback form of the
+ * site this framework runs arrives. The scan walks the buffer recording where
+ * each field begins and ends, while the values are pulled out of the payload
+ * fd afterwards with pread at those offsets -- so the interesting failures are
+ * the ones where the two stop agreeing about the end of a field. */
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    const int fd = __fuzz_payload_fd(data, size);
+    if (fd < 0) return 0;
+
+    /* parse() takes a non-const buffer. Whether it writes to it or not, the
+     * fuzzer's own memory is not ours to hand over. */
+    char* buffer = malloc(size > 0 ? size : 1);
+    if (buffer == NULL) {
+        close(fd);
+        return 0;
+    }
+    memcpy(buffer, data, size);
+
+    urlencodedparser_t parser;
+    urlencodedparser_init(&parser, fd, size);
+
+    (void)urlencodedparser_parse(&parser, buffer, size);
+
+    urlencodedparser_clear(&parser);
+    free(buffer);
+    close(fd);
+
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_MULTIPART
+
+/* multipart/form-data, where two separate things the peer controls meet: the
+ * body, and the boundary that delimits it. The boundary comes from
+ * Content-Type and init() only ever measures it with strlen(), deriving two
+ * separator lengths by adding 4 and 6 to it -- so an empty boundary is part of
+ * the input space rather than an impossible case, and it is worth reaching.
+ *
+ * The first byte picks the boundary length and the bytes after it are the
+ * boundary, so the fuzzer can move that split around instead of being handed a
+ * constant one. */
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    size_t blen = 0;
+
+    if (size > 0) {
+        blen = data[0] % 64;
+        if (blen > size - 1) blen = size - 1;
+    }
+
+    /* On the heap, sized to the boundary and its terminator and nothing more.
+     * A fixed array would be the obvious thing and the wrong one: the parser
+     * indexes the boundary with arithmetic derived from its length, and a read
+     * past the end lands inside a roomy array without a word from the
+     * sanitizer. Here the allocation ends where the string does, which is also
+     * how the real thing looks -- the boundary points into the Content-Type
+     * header, not into a buffer with room to spare. */
+    char* boundary = malloc(blen + 1);
+    if (boundary == NULL) return 0;
+
+    for (size_t i = 0; i < blen; i++) {
+        const char ch = (char)data[1 + i];
+        /* strlen() has to see the whole boundary, so an embedded NUL would
+           silently shorten it instead of testing the length chosen here. */
+        boundary[i] = ch == '\0' ? '.' : ch;
+    }
+    boundary[blen] = '\0';
+
+    if (size > 0) {
+        data += 1 + blen;
+        size -= 1 + blen;
+    }
+
+    const int fd = __fuzz_payload_fd(data, size);
+    if (fd < 0) {
+        free(boundary);
+        return 0;
+    }
+
+    char* buffer = malloc(size > 0 ? size : 1);
+    if (buffer == NULL) {
+        free(boundary);
+        close(fd);
+        return 0;
+    }
+    memcpy(buffer, data, size);
+
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+
+    (void)multipartparser_parse(&parser, buffer, size);
+
+    multipartparser_clear(&parser);
+    free(buffer);
+    free(boundary);
+    close(fd);
 
     return 0;
 }

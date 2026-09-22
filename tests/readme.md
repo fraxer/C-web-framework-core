@@ -408,10 +408,21 @@ cmake --build build-fuzz
 ./build-fuzz/exec/fuzz_quic_packet backend/core/tests/fuzz/corpus/quic_packet
 ```
 
-Targets: `quic_packet`, `quic_frame`, `quic_tp`, `h3_frame`, `qpack_decode`,
-`qpack_streams`, `huffman`, `h3_priority`, `hpack`, each with a seed corpus
-under `fuzz/corpus/`. `-DBUILD_FUZZERS=yes` requires `-DINCLUDE_HTTP3=yes`
-even for `hpack`, which is HTTP/2 and needs none of it — the flag gates the
+Targets, each with a seed corpus under `fuzz/corpus/`:
+
+| Target | Reached by |
+|---|---|
+| `quic_packet`, `quic_frame`, `quic_tp` | a datagram, before decryption or a finished handshake |
+| `h3_frame`, `h3_priority`, `qpack_decode`, `qpack_streams` | any stream the peer opens |
+| `huffman` | QPACK and HPACK both, on names and values |
+| `hpack` | an HTTP/2 field section |
+| `cookie`, `urlencoded`, `multipart` | every HTTP/1.1 request that carries the header or the body |
+
+The last four are newer than the rest and cover what the HTTP/1.1 and HTTP/2
+side reaches before a handler sees anything. `httprequestparser` itself is
+still uncovered: it wants a `connection_t`, so a target for it needs a stub
+the others do not. `-DBUILD_FUZZERS=yes` requires `-DINCLUDE_HTTP3=yes`
+even for `hpack` and the HTTP/1.1 targets, which need none of it — the flag gates the
 whole block rather than a target at a time.
 
 clang builds the targets against libFuzzer (`-fsanitize=fuzzer,address`) and
