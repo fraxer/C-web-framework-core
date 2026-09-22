@@ -26,9 +26,15 @@
 #include <unistd.h>
 
 #include "h3frame.h"
+#include "appconfig.h"
+#include "connection_s.h"
 #include "cookieparser.h"
+#include "cqueue.h"
+#include "domain.h"
 #include "hpack.h"
 #include "httpcommon.h"
+#include "httprequest.h"
+#include "httprequestparser.h"
 #include "multipartparser.h"
 #include "urlencodedparser.h"
 #include "h3priority.h"
@@ -484,6 +490,137 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     free(buffer);
     free(boundary);
     close(fd);
+
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_REQUEST
+
+/* The HTTP/1.1 request as it comes off the socket: request line, headers, and
+ * whatever the Content-Length or Transfer-Encoding claims about the body. It is
+ * the first code in the process to look at a connection's bytes, it runs before
+ * a route is chosen or a handler exists, and every request to an h1.1 server
+ * goes through it. Of the parsers here it is the one with the largest state
+ * machine and the only one that needs a connection to talk to at all.
+ *
+ * The mock objects below follow tests/unit/test_httprequestparser_dumb_fuzzing.c,
+ * which already had to build them. That test walks 100 buffers of bytes from a
+ * seeded PRNG; this target is the same setup with coverage feedback behind it,
+ * so a header the random one would need a lucky draw to spell gets assembled
+ * from the branches it already reached.
+ *
+ * Two departures from that test. The domain is literal rather than left half
+ * built: the pcre branch of domain_matches() would be handed a NULL pattern,
+ * and the empty server list the test uses to avoid that also skips the
+ * matching entirely, leaving the branch that adopts a vhost unreached. And the
+ * context is per-iteration rather than file-static, because the parser caches a
+ * recycled request on it -- shared between runs that is a leak, and a fuzzer
+ * that reports one on every input reports nothing. */
+
+/* The parser asks the running configuration what the largest acceptable body
+ * is, and there is no configuration here. Overridden the way
+ * tests/unit/test_httprequestparser.c overrides it -- a weak definition in the
+ * executable, which the framework's own call resolves to.
+ *
+ * Without it the target reports a crash on its very first well-formed
+ * Content-Length, in env() rather than in anything the parser does, and the
+ * first thing this target found was exactly that: its own missing setup. A
+ * fuzz target that crashes on valid input tests nothing beyond the fixture. */
+static appconfig_t* __fuzz_appconfig = NULL;
+
+static void __fuzz_appconfig_init(void) {
+    if (__fuzz_appconfig != NULL) return;
+
+    __fuzz_appconfig = calloc(1, sizeof *__fuzz_appconfig);
+    if (__fuzz_appconfig == NULL) return;
+
+    __fuzz_appconfig->env.main.client_max_body_size = 10485760;
+    __fuzz_appconfig->env.main.tmp = "/tmp";
+    __fuzz_appconfig->env.main.log.enabled = false;
+    __fuzz_appconfig->env.main.workers = 1;
+    __fuzz_appconfig->env.main.threads = 1;
+}
+
+__attribute__((weak)) appconfig_t* appconfig(void) {
+    __fuzz_appconfig_init();
+    return __fuzz_appconfig;
+}
+
+__attribute__((weak)) env_t* env(void) {
+    __fuzz_appconfig_init();
+    return __fuzz_appconfig != NULL ? &__fuzz_appconfig->env : NULL;
+}
+
+__attribute__((weak)) void appconfig_set(appconfig_t* config) {
+    (void)config;
+}
+
+static char __fuzz_domain_template[] = "localhost";
+
+static domain_t __fuzz_domain = {
+    .is_literal = 1,
+    .template = __fuzz_domain_template,
+    .ascii_template = __fuzz_domain_template,
+    .ascii_length = sizeof __fuzz_domain_template - 1,
+    .next = NULL
+};
+
+static server_t __fuzz_server = {
+    .ip = { .family = AF_INET, .u = { .v4 = { .s_addr = 0x0100007F } } },  /* 127.0.0.1 */
+    .port = 8080,
+    .domain = &__fuzz_domain,
+    .next = NULL
+};
+
+static cqueue_item_t __fuzz_queue_item = { .data = &__fuzz_server, .next = NULL };
+
+static listener_t __fuzz_listener = {
+    .servers = { .item = &__fuzz_queue_item, .last_item = &__fuzz_queue_item, .size = 1, .locked = 0 },
+    .connection = NULL,
+    .api = NULL,
+    .next = NULL
+};
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    connection_server_ctx_t ctx;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.listener = &__fuzz_listener;
+
+    connection_t* conn = calloc(1, sizeof *conn);
+    if (conn == NULL) return 0;
+
+    /* The parser reads from connection->buffer and writes back into it, so it
+     * gets a copy sized to the input: a buffer with room to spare would hide
+     * exactly the overruns this is here to find. */
+    conn->buffer = malloc(size + 1);
+    if (conn->buffer == NULL) {
+        free(conn);
+        return 0;
+    }
+    memcpy(conn->buffer, data, size);
+    conn->buffer[size] = '\0';
+    conn->buffer_size = size;
+
+    conn->ip = ipaddr_from_v4(0x0100007F);
+    conn->port = 8080;
+    conn->ssl = NULL;
+    conn->keepalive = 0;
+    conn->ctx = (connection_ctx_t*)&ctx;
+
+    httprequestparser_t* parser = httpparser_create(conn);
+    if (parser != NULL) {
+        httpparser_set_bytes_readed(parser, size);
+        (void)httpparser_run(parser);
+        httpparser_free(parser);
+    }
+
+    /* Whatever the parser left on the context is ours now: the connection it
+     * belonged to is going away with this iteration. */
+    if (ctx.request_cache != NULL)
+        httprequest_free(ctx.request_cache);
+
+    free(conn->buffer);
+    free(conn);
 
     return 0;
 }

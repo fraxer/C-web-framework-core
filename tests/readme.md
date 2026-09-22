@@ -417,11 +417,29 @@ Targets, each with a seed corpus under `fuzz/corpus/`:
 | `huffman` | QPACK and HPACK both, on names and values |
 | `hpack` | an HTTP/2 field section |
 | `cookie`, `urlencoded`, `multipart` | every HTTP/1.1 request that carries the header or the body |
+| `request` | every HTTP/1.1 request, before a route is chosen |
 
-The last four are newer than the rest and cover what the HTTP/1.1 and HTTP/2
-side reaches before a handler sees anything. `httprequestparser` itself is
-still uncovered: it wants a `connection_t`, so a target for it needs a stub
-the others do not. `-DBUILD_FUZZERS=yes` requires `-DINCLUDE_HTTP3=yes`
+The last five are newer than the rest and cover what the HTTP/1.1 and HTTP/2
+side reaches before a handler sees anything.
+
+`request` is the one with a fixture rather than a bare call: `httpparser_run`
+wants a connection, a server context and a configuration to ask about
+`client_max_body_size`. The mocks follow
+`tests/unit/test_httprequestparser_dumb_fuzzing.c`, which had to build the same
+ones; the differences are that the domain is literal (so `domain_matches` does
+not reach a NULL pcre pattern, and the branch that adopts a vhost is reachable
+at all), that the context is per-iteration rather than file-static (the parser
+caches a recycled request on it, and a cache shared between runs is a leak
+reported on every input), and that `env()` is overridden the way
+`test_httprequestparser.c` overrides it. That last one is not optional: without
+it the target crashes on the first well-formed `Content-Length` it sees, inside
+`env()`, and a target that crashes on valid input tests nothing but its own
+fixture.
+
+Those two tests remain worth keeping and are not what this replaces: they walk
+100 buffers from a seeded PRNG, which is a different question from what
+coverage feedback answers. A header spelled correctly enough to reach
+`__validate_content_length` is not something a random draw produces. `-DBUILD_FUZZERS=yes` requires `-DINCLUDE_HTTP3=yes`
 even for `hpack` and the HTTP/1.1 targets, which need none of it — the flag gates the
 whole block rather than a target at a time.
 

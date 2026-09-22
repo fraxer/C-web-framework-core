@@ -219,7 +219,7 @@ endif()
 if(BUILD_FUZZERS STREQUAL "yes" AND INCLUDE_HTTP3 STREQUAL yes)
     set(FUZZ_TARGET_NAMES
         quic_packet quic_frame quic_tp h3_frame qpack_decode qpack_streams huffman
-        h3_priority hpack cookie urlencoded multipart)
+        h3_priority hpack cookie urlencoded multipart request)
 
     set(FUZZ_ID_quic_packet    1)
     set(FUZZ_ID_quic_frame     2)
@@ -233,6 +233,7 @@ if(BUILD_FUZZERS STREQUAL "yes" AND INCLUDE_HTTP3 STREQUAL yes)
     set(FUZZ_ID_cookie         10)
     set(FUZZ_ID_urlencoded     11)
     set(FUZZ_ID_multipart      12)
+    set(FUZZ_ID_request        13)
 
     foreach(name ${FUZZ_TARGET_NAMES})
         set(exe fuzz_${name})
@@ -260,6 +261,7 @@ if(BUILD_FUZZERS STREQUAL "yes" AND INCLUDE_HTTP3 STREQUAL yes)
             FUZZ_COOKIE=10
             FUZZ_URLENCODED=11
             FUZZ_MULTIPART=12
+            FUZZ_REQUEST=13
             FUZZ_TARGET=${FUZZ_ID_${name}}
         )
 
@@ -270,6 +272,10 @@ if(BUILD_FUZZERS STREQUAL "yes" AND INCLUDE_HTTP3 STREQUAL yes)
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http2/hpack
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http/server/parsers
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src/connection
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src/domain
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src/server
+            ${CMAKE_CURRENT_SOURCE_DIR}/../misc
         )
 
         target_link_libraries(${exe} PRIVATE
