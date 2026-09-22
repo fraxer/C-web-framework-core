@@ -418,9 +418,28 @@ Targets, each with a seed corpus under `fuzz/corpus/`:
 | `hpack` | an HTTP/2 field section |
 | `cookie`, `urlencoded`, `multipart` | every HTTP/1.1 request that carries the header or the body |
 | `request` | every HTTP/1.1 request, before a route is chosen |
+| `h2_frame` | every HTTP/2 connection, one frame at a time |
+| `h2_session` | every HTTP/2 connection, as a stream of frames with state between them |
+| `json` | a request body a handler asks for as JSON, and the document it builds in reply |
+| `websocket` | a websocket frame, where a route accepts them |
+| `ws_deflate` | permessage-deflate: the negotiated header and the inflate behind it |
 
-The last five are newer than the rest and cover what the HTTP/1.1 and HTTP/2
-side reaches before a handler sees anything.
+Everything below `huffman` in that table is newer than the QUIC targets above
+it and covers what the HTTP/1.1 and HTTP/2 sides reach before a handler sees
+anything.
+
+`h2_session` is the only stateful one. The frame target reads a frame and
+forgets it; the session target feeds a stream of bytes in chunks the input
+sizes, and what it tests is what the previous frame left behind -- the stream
+table, flow control, the token buckets. The named HTTP/2 denial-of-service
+families live at that level and none of them is a malformed frame: Rapid Reset
+and a CONTINUATION flood are both sequences of correct ones, which a target
+that validates frames in isolation cannot reach. It runs with
+`detect_leaks=0`, and the comment on the target says why at length: a
+dispatched response is owned in turn by the stream, the publish queue, the
+worker's write pass and the response pool, and a fixture without an event loop
+cannot follow it all the way. ASan and UBSan stay on, and they are what turned
+up the null `memcpy` in `h2_on_headers` on this target's first run.
 
 `request` is the one with a fixture rather than a bare call: `httpparser_run`
 wants a connection, a server context and a configuration to ask about
@@ -459,6 +478,57 @@ cmake -S backend -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=Debug \
 cmake --build build-fuzz --target fuzz_hpack
 ./build-fuzz/exec/fuzz_hpack -seconds=120 backend/core/tests/fuzz/corpus/hpack
 ```
+
+### Dictionaries
+
+`-dict=<file>` gives the mutator a list of tokens to splice in whole. It earns
+its place where the grammar has long literals: `Transfer-Encoding` is
+seventeen bytes that have to land in order before the branch behind it means
+anything, and random edits get there slowly. Measured over a minute at a fixed
+seed, on `request`, the edge count went from 135 to 184, and taken branches in
+`httprequestparser.c` from 71.8% to 75.6%.
+
+Dictionaries live in `fuzz/dict/<target>.dict` and are picked up automatically
+by the repository's own audit script. The format is libFuzzer's, and libFuzzer
+is the stricter parser of the two: it knows `\xNN`, `\\` and `\"` and rejects
+the whole file on the first line it cannot read. `\r\n` is not among them, so
+the files use `\x0d\x0a`.
+
+The driver prints `dict N` in its summary when it loaded one, because a run
+given a dictionary it could not read otherwise looks exactly like a run given
+none.
+
+### Coverage
+
+The targets say how many edges they reached, which is a number without a scale.
+For one with a scale, build with `--coverage` and read it with gcov:
+
+```bash
+cmake -S backend -B build-cov -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+      -DBUILD_TESTS=yes -DBUILD_FUZZERS=yes -DINCLUDE_HTTP3=yes \
+      -DCMAKE_C_FLAGS="--coverage -fsanitize=address -O0 -g" \
+      -DCMAKE_EXE_LINKER_FLAGS="--coverage -fsanitize=address" \
+      -DCMAKE_SHARED_LINKER_FLAGS="--coverage -fsanitize=address"
+cmake --build build-cov --target fuzz_request
+find build-cov -name '*.gcda' -delete
+./build-cov/exec/fuzz_request -seconds=60 backend/core/tests/fuzz/corpus/request
+gcov -b -o build-cov/core/protocols/http/server/parsers/CMakeFiles/*.dir \
+     httprequestparser.c.o
+```
+
+Delete the `.gcda` files before each run or the counters accumulate across
+targets, and a number measured that way says nothing about any one of them.
+
+At a minute a target with dictionaries, the parsers sit at 80–91% of lines.
+Worth reading per function rather than per file: `hpack` looked like 60% until
+the encoder half was accounted for, and the encoder was not 60% covered — it
+was not entered at all. Adding the round trip to the target took the file to
+91%, which is the number the decoder alone had deserved all along.
+
+### Continuous fuzzing
+
+`fuzz/oss-fuzz/` holds a tested OSS-Fuzz / ClusterFuzzLite integration — build
+script, Dockerfile and `project.yaml` — with its own readme.
 
 The driver takes `-seconds=`, `-runs=`, `-seed=` and `-artifacts=<dir>`, and
 writes the crashing input to the artifacts directory; a reproducer belongs in

@@ -1,0 +1,11 @@
+# Префиксы представлений полей (RFC 7541, раздел 6) и типовые индексы.
+indexed="\x82"
+indexed_path="\x84"
+indexed_scheme="\x86"
+dynamic_first="\xbe"
+literal_incremental="\x40"
+literal_no_index="\x00"
+literal_never="\x10"
+size_update="\x20"
+size_update_max="\x3f\xe1\x1f"
+huffman_len="\x8c"

@@ -1,0 +1,11 @@
+# Разделители и процентные последовательности.
+amp="&"
+eq="="
+pct="%"
+pct_plus="%2B"
+pct_at="%40"
+pct_space="%20"
+pct_nul="%00"
+plus="+"
+field_name="name="
+field_email="email="

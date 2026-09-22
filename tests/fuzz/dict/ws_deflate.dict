@@ -1,0 +1,10 @@
+# Параметры permessage-deflate (RFC 7692) и хвост пустого блока.
+ext="permessage-deflate"
+cmwb="; client_max_window_bits"
+smwb="; server_max_window_bits"
+cnct="; client_no_context_takeover"
+snct="; server_no_context_takeover"
+eq_8="=8"
+eq_15="=15"
+semi=";"
+tail="\x00\x00\xff\xff"

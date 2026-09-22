@@ -216,10 +216,21 @@ endif()
 # own (`-fsanitize=fuzzer`); with gcc, which has no libFuzzer, the driver in
 # fuzz_main.c supplies the loop and gcc's `-fsanitize-coverage=trace-pc` supplies
 # the feedback. The target files do not know the difference.
-if(BUILD_FUZZERS STREQUAL "yes" AND INCLUDE_HTTP3 STREQUAL yes)
+if(BUILD_FUZZERS STREQUAL "yes")
+    # Two groups. The HTTP/1.1 parsers, HPACK and Huffman need nothing beyond
+    # the framework, and gating them on INCLUDE_HTTP3 -- as this block used to
+    # -- kept them out of any build without the HTTP/3 stack, including the
+    # stock OSS-Fuzz base image, whose OpenSSL is older than the 3.5 that
+    # INCLUDE_HTTP3 requires.
     set(FUZZ_TARGET_NAMES
-        quic_packet quic_frame quic_tp h3_frame qpack_decode qpack_streams huffman
-        h3_priority hpack cookie urlencoded multipart request)
+        huffman hpack h2_frame json cookie urlencoded multipart request
+        websocket ws_deflate h2_session)
+
+    if(INCLUDE_HTTP3 STREQUAL yes)
+        list(APPEND FUZZ_TARGET_NAMES
+            quic_packet quic_frame quic_tp h3_frame qpack_decode qpack_streams
+            h3_priority)
+    endif()
 
     set(FUZZ_ID_quic_packet    1)
     set(FUZZ_ID_quic_frame     2)
@@ -234,11 +245,22 @@ if(BUILD_FUZZERS STREQUAL "yes" AND INCLUDE_HTTP3 STREQUAL yes)
     set(FUZZ_ID_urlencoded     11)
     set(FUZZ_ID_multipart      12)
     set(FUZZ_ID_request        13)
+    set(FUZZ_ID_h2_frame       14)
+    set(FUZZ_ID_json           15)
+    set(FUZZ_ID_websocket      16)
+    set(FUZZ_ID_ws_deflate     17)
+    set(FUZZ_ID_h2_session     18)
 
     foreach(name ${FUZZ_TARGET_NAMES})
         set(exe fuzz_${name})
 
-        if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+        if(DEFINED ENV{LIB_FUZZING_ENGINE})
+            # OSS-Fuzz and ClusterFuzzLite: the sanitizer arrives in CFLAGS and
+            # the engine is named by the environment. Adding our own would
+            # break the coverage and MSan builds, which use neither.
+            add_executable(${exe} fuzz/fuzz_targets.c)
+            target_link_options(${exe} PRIVATE $ENV{LIB_FUZZING_ENGINE})
+        elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
             add_executable(${exe} fuzz/fuzz_targets.c)
             target_compile_options(${exe} PRIVATE -fsanitize=fuzzer,address)
             target_link_options(${exe} PRIVATE -fsanitize=fuzzer,address)
@@ -262,6 +284,11 @@ if(BUILD_FUZZERS STREQUAL "yes" AND INCLUDE_HTTP3 STREQUAL yes)
             FUZZ_URLENCODED=11
             FUZZ_MULTIPART=12
             FUZZ_REQUEST=13
+            FUZZ_H2_FRAME=14
+            FUZZ_JSON=15
+            FUZZ_WEBSOCKET=16
+            FUZZ_WS_DEFLATE=17
+            FUZZ_H2_SESSION=18
             FUZZ_TARGET=${FUZZ_ID_${name}}
         )
 
@@ -270,6 +297,10 @@ if(BUILD_FUZZERS STREQUAL "yes" AND INCLUDE_HTTP3 STREQUAL yes)
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http3/frame
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http3/qpack
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http2/hpack
+            ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http2/frame
+            ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/websocket
+            ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/websocket/server/parsers
+            ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http2/server
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http/server/parsers
             ${CMAKE_CURRENT_SOURCE_DIR}/../src/connection

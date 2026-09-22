@@ -129,10 +129,113 @@ static size_t __rnd_below(size_t n) {
     return n == 0 ? 0 : (size_t)(__rnd() % n);
 }
 
+/* ---- Dictionary ----
+ *
+ * Mutating bytes at random gets to a malformed header quickly and to a
+ * well-spelled one slowly: "Transfer-Encoding" is seventeen bytes that have to
+ * land in order before the branch behind it is worth anything. A dictionary is
+ * the standard answer, and the format is libFuzzer's so that the same file
+ * works when the targets are built with clang. Note that libFuzzer's own
+ * parser is the stricter of the two -- it knows \\xNN, \\\\ and \\" and nothing
+ * else, and rejects the whole file on the first line it cannot read -- so a
+ * dictionary meant for both stays inside that subset, however much \\r\\n
+ * would read better:
+ *
+ *     # comment
+ *     name="token"
+ *     "\r\n"
+ *     "\x82"
+ *
+ * The name before '=' is documentation; only the quoted token is used. */
+
+#define DICT_MAX 256
+
+static input_t __dict[DICT_MAX];
+static size_t  __dict_count;
+
+static int __dict_hex(int c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* One line to one token. Returns the token length, or 0 for a line that holds
+ * none -- a comment, a blank, or something malformed, all of which are skipped
+ * rather than treated as an error: a dictionary is an optimisation, and a
+ * typo in it must not stop a run. */
+static size_t __dict_parse_line(const char* line, uint8_t* out, size_t cap) {
+    const char* p = strchr(line, '"');
+    if (p == NULL) return 0;
+    p++;
+
+    size_t n = 0;
+    while (*p != '\0' && *p != '"' && n < cap) {
+        if (*p != '\\') {
+            out[n++] = (uint8_t)*p++;
+            continue;
+        }
+
+        p++;
+        switch (*p) {
+        case 'n':  out[n++] = '\n'; p++; break;
+        case 'r':  out[n++] = '\r'; p++; break;
+        case 't':  out[n++] = '\t'; p++; break;
+        case '\\': out[n++] = '\\'; p++; break;
+        case '"':  out[n++] = '"';  p++; break;
+        case 'x': {
+            const int hi = __dict_hex(p[1]);
+            const int lo = hi < 0 ? -1 : __dict_hex(p[2]);
+            if (lo < 0) return 0;
+            out[n++] = (uint8_t)((hi << 4) | lo);
+            p += 3;
+            break;
+        }
+        default: return 0;
+        }
+    }
+
+    return n;
+}
+
+static void __dict_load(const char* path) {
+    FILE* f = fopen(path, "r");
+    if (f == NULL) {
+        fprintf(stderr, "[fuzz] dictionary %s not readable, continuing without it\n", path);
+        return;
+    }
+
+    char line[1024];
+    uint8_t token[256];
+
+    while (fgets(line, sizeof line, f) != NULL && __dict_count < DICT_MAX) {
+        const char* trimmed = line;
+        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+        if (*trimmed == '#' || *trimmed == '\n' || *trimmed == '\0') continue;
+
+        const size_t n = __dict_parse_line(trimmed, token, sizeof token);
+        if (n == 0) continue;
+
+        uint8_t* copy = malloc(n);
+        if (copy == NULL) break;
+
+        memcpy(copy, token, n);
+        __dict[__dict_count].data = copy;
+        __dict[__dict_count].len = n;
+        __dict_count++;
+    }
+
+    fclose(f);
+}
+
 /* ---- Mutation ---- */
 
 static size_t __mutate(uint8_t* buf, size_t len, size_t cap) {
-    switch (__rnd() % 6) {
+    /* The dictionary strategy only exists when there is a dictionary, so that
+     * a run without one keeps exactly the distribution it had before. */
+    const uint64_t strategies = __dict_count > 0 ? 7 : 6;
+
+    switch (__rnd() % strategies) {
     case 0:   /* flip a bit */
         if (len > 0) buf[__rnd_below(len)] ^= (uint8_t)(1u << (__rnd() % 8));
         break;
@@ -170,6 +273,26 @@ static size_t __mutate(uint8_t* buf, size_t len, size_t cap) {
             }
         }
         break;
+
+    case 6: {  /* write a dictionary token in, or splice one over what is there */
+        const input_t* tok = &__dict[__rnd_below(__dict_count)];
+        if (tok->len == 0 || tok->len > cap) break;
+
+        const size_t at = __rnd_below(len + 1 > cap - tok->len + 1 ? cap - tok->len + 1 : len + 1);
+
+        if ((__rnd() % 2) && len + tok->len <= cap) {
+            /* Insert: the bytes after the point move along, which is what
+               grows a request one header at a time. */
+            memmove(buf + at + tok->len, buf + at, len - at);
+            memcpy(buf + at, tok->data, tok->len);
+            len += tok->len;
+        }
+        else if (at + tok->len <= cap) {
+            memcpy(buf + at, tok->data, tok->len);
+            if (at + tok->len > len) len = at + tok->len;
+        }
+        break;
+    }
 
     default:  /* duplicate a run in place -- what makes a length field lie */
         if (len > 1 && len < cap) {
@@ -273,6 +396,7 @@ int main(int argc, char* argv[]) {
         else if (strncmp(argv[i], "-runs=", 6) == 0) runs = strtoull(argv[i] + 6, NULL, 10);
         else if (strncmp(argv[i], "-seed=", 6) == 0) __rng_state = strtoull(argv[i] + 6, NULL, 10) | 1;
         else if (strncmp(argv[i], "-artifacts=", 11) == 0) __artifact_dir = argv[i] + 11;
+        else if (strncmp(argv[i], "-dict=", 6) == 0) __dict_load(argv[i] + 6);
         else corpus_dir = argv[i];
     }
 
@@ -326,11 +450,20 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    printf("%-22s %8llu runs, corpus %zu (+%zu from %zu seeds), "
-           "%zu edges, %llu hits\n",
-           argv[0], (unsigned long long)executed, __corpus_count, found, seeded,
-           base_cov, (unsigned long long)__cov_hits);
+    /* The dictionary is reported whether one was asked for or not: a run that
+     * silently loaded nothing and a run that was never given a file look the
+     * same from the outside otherwise, and the difference is the whole point
+     * of passing one. */
+    char dict_note[32] = "";
+    if (__dict_count > 0)
+        snprintf(dict_note, sizeof dict_note, ", dict %zu", __dict_count);
 
+    printf("%-22s %8llu runs, corpus %zu (+%zu from %zu seeds), "
+           "%zu edges, %llu hits%s\n",
+           argv[0], (unsigned long long)executed, __corpus_count, found, seeded,
+           base_cov, (unsigned long long)__cov_hits, dict_note);
+
+    for (size_t i = 0; i < __dict_count; i++) free(__dict[i].data);
     for (size_t i = 0; i < __corpus_count; i++) free(__corpus[i].data);
 
     return 0;

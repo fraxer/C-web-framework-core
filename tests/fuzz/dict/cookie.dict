@@ -1,0 +1,8 @@
+# Разделители и формы, вокруг которых крутится разбор Cookie.
+sep="; "
+semi=";"
+eq="="
+space=" "
+pair="a=1"
+empty_key="=v"
+empty_val="k="

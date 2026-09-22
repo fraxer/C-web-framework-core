@@ -1,0 +1,9 @@
+# Разделители частей и заголовки тела.
+dashes="--"
+crlf="\x0d\x0a"
+sep="\x0d\x0a--"
+close="--\x0d\x0a"
+cd="Content-Disposition: form-data; name=\""
+filename="; filename=\""
+ct="Content-Type: "
+quote="\""

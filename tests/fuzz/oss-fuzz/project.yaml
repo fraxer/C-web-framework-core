@@ -1,0 +1,18 @@
+homepage: "https://github.com/fraxer/C-web-framework-core"
+main_repo: "https://github.com/fraxer/C-web-framework-core"
+language: c
+file_github_issue: true
+
+# Fill this in before submitting: OSS-Fuzz requires a contact it can send
+# reports to, and it must be an address with commit access to the project.
+primary_contact: "<email>"
+
+sanitizers:
+  - address
+  - undefined
+
+architectures:
+  - x86_64
+
+fuzzing_engines:
+  - libfuzzer
