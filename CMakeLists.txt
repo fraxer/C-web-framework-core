@@ -3,6 +3,17 @@ cmake_minimum_required(VERSION 3.12.4)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/cwfr.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/app.cmake)
 
+if(BUILD_FUZZERS STREQUAL "yes")
+    if(NOT BUILD_TESTS STREQUAL "yes")
+        message(FATAL_ERROR "BUILD_FUZZERS=yes requires BUILD_TESTS=yes")
+    endif()
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/fuzz.cmake)
+    set(CWFR_FUZZ_DRIVER "${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz/fuzz_main.c"
+        CACHE INTERNAL "GCC fuzz driver" FORCE)
+    file(WRITE "${CMAKE_BINARY_DIR}/fuzz-targets.txt" "")
+    cwfr_fuzz_instrument()
+endif()
+
 # Framework version. It is the SONAME of libcwfr_framework.so and the version a
 # standalone application checks with find_package(cwfr 1.0 REQUIRED), so bump the
 # major whenever a handler built against the previous release would break.

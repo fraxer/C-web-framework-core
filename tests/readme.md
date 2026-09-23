@@ -15,7 +15,7 @@ literally, so `ON`, `1` and `true` all leave the suite out.
 | `h3_runner` | the QUIC / HTTP/3 / QPACK subset | `-DINCLUDE_HTTP3=yes` |
 | `db_runner` | `db/test_db_*.c` — real SQL against a real server | a reachable database |
 | `quicclient` | a QUIC/HTTP3 client tool, for the shell suites below | `-DINCLUDE_HTTP3=yes` |
-| `fuzz_*` | the QUIC/H3/QPACK parsers under a fuzzer | `-DBUILD_FUZZERS=yes`, clang |
+| `fuzz_*` | the protocol parsers under a fuzzer; run by `fuzz/run.sh` | `-DBUILD_FUZZERS=yes` (clang or gcc) |
 
 `h2_runner` and `h3_runner` are narrower builds of files `runner` already
 contains. They exist so a protocol regression stays visible when an unrelated
@@ -402,11 +402,53 @@ Overridden via command-line arguments:
 ## Fuzzing
 
 ```bash
-cmake -S backend -B build-fuzz -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=yes \
-      -DINCLUDE_HTTP3=yes -DBUILD_FUZZERS=yes -DCMAKE_C_COMPILER=clang
+cmake -S backend -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=yes \
+      -DINCLUDE_HTTP3=yes -DBUILD_FUZZERS=yes
 cmake --build build-fuzz
+backend/core/tests/fuzz/run.sh build-fuzz              # every target, 10 s each
 ./build-fuzz/exec/fuzz_quic_packet backend/core/tests/fuzz/corpus/quic_packet
 ```
+
+`-DBUILD_FUZZERS=yes` needs `-DBUILD_TESTS=yes` and nothing else: the targets
+that touch QUIC are added when `INCLUDE_HTTP3=yes`, the rest build either way.
+The flag instruments the whole tree, not just the target binaries
+(`cmake/fuzz.cmake`, `cwfr_fuzz_instrument()`): the framework and an
+application built alongside it get ASan, UBSan with `-fno-sanitize-recover`
+and coverage feedback, so a bug in the code under test is caught where it
+happens and a new edge in it counts as progress. Under OSS-Fuzz, where
+`LIB_FUZZING_ENGINE` is set, the flags come from the environment instead.
+
+### Running them: `tests/fuzz/run.sh`
+
+`run.sh BUILD_DIR [OUTPUT_DIR]` runs exactly what the build registered.
+`cwfr_add_fuzzer()` writes each target to `BUILD_DIR/fuzz-targets.txt` with its
+seed corpus, dictionary, engine and leak policy, and `run.sh` reads that
+manifest -- so an application's own targets run alongside the framework's
+without a list to keep in step. It is what `tests/ci.sh fuzz` calls, for a
+build with HTTP/3 and one without.
+
+The one list it does keep is the independent half: the framework's targets for
+the build at hand. A target missing from the manifest, registered but not
+built, or without seeds fails the run; `FUZZ_EXPECT_EXTRA=fuzz_feedback` adds
+an application's to what must be there.
+
+| Profile (`FUZZ_PROFILE`) | Time per target | Largest input | Seed | For |
+|---|---|---|---|---|
+| `smoke` (default) | 10 s | 8 KiB | 1 | every change |
+| `long` | 24 h | 256 KiB | fresh | a schedule |
+| `large` | 120 s | 1 MiB | fresh | inputs that cross buffer sizes |
+
+`FUZZ_SECONDS`, `FUZZ_MAX_LEN`, `FUZZ_TIMEOUT` (seconds one input may take,
+default 5), `FUZZ_SEED` and `FUZZ_JOBS` (parallel targets, default `nproc`)
+override the profile; `FUZZ_ONLY` narrows the run to the targets it names.
+
+Nothing is written next to the seeds. `OUTPUT_DIR` keeps, per target, the
+corpus the runs grew (reused by the next run), `artifacts/` with failing
+inputs, `run.log`, the exact `command.txt`, and a `summary.txt` for the run.
+When a run fails, `run.sh` replays the saved input on its own and says whether
+it reproduces -- a failure that a stored input does not reproduce is one nobody
+can fix. Replaying by hand is the same call: the target with a file instead of
+a directory.
 
 Targets, each with a seed corpus under `fuzz/corpus/`:
 
@@ -423,6 +465,44 @@ Targets, each with a seed corpus under `fuzz/corpus/`:
 | `json` | a request body a handler asks for as JSON, and the document it builds in reply |
 | `websocket` | a websocket frame, where a route accepts them |
 | `ws_deflate` | permessage-deflate: the negotiated header and the inflate behind it |
+| `request_sequence` | one keep-alive HTTP/1.1 connection: pipelined requests, delivered in reads of any size |
+| `websocket_sequence` | websocket frames across reads, control frames between fragments |
+| `qpack_dynamic` | the QPACK encoder stream changing a live dynamic table under a field section |
+
+An application registers its own with the same function, and `run.sh` picks
+them up from the manifest; the site's `fuzz_feedback` (in `backend/tests/`) is
+one.
+
+### What the targets check
+
+A target that only feeds bytes finds crashes and sanitizer reports. Several
+also hold the code to a property, and trap when it breaks, so the input that
+broke it is saved like any crash:
+
+- **Round trips.** `huffman`: decode(encode(x)) is x. `hpack`: a decoded
+  field section, re-encoded by one encoder and decoded by one decoder that
+  both keep their tables across the plain and Huffman passes, comes back the
+  same. `ws_deflate`: two messages through one context, with and without
+  context takeover, inflate to what was deflated. `json`: a parsed document
+  serializes to JSON that parses again and serializes to the same bytes.
+- **Delivery does not matter.** `request_sequence` parses the same stream in
+  one read, one byte per read, and in reads of 1..256 bytes, and compares the
+  requests that came out: method, version, target, fields, trailers, body and
+  the keep-alive decision. Each completed request must also have at most one
+  Host and Content-Length, no Transfer-Encoding (the parser refuses it) and a
+  body exactly as long as Content-Length said -- a byte of one request in the
+  next breaks one of these. `multipart` does the same with whole, byte and
+  random-sized reads, each in its own buffer freed after the call, as
+  `httprequest.c` reuses one.
+- **Tables stay within bounds.** `qpack_dynamic`: bytes never exceed the
+  capacity, capacity never exceeds what was advertised, and a section that
+  decoded before the encoder stream cannot block after it.
+
+The first runs of these found two bugs, both kept as seeds and unit tests:
+an Insert With Name Reference to the entry its own insertion evicts read the
+name after `free` (`qpack.c`), and a number whose exponent overflows `long
+double` was accepted and serialized as `inf` (`json.c`).
+
 
 Everything below `huffman` in that table is newer than the QUIC targets above
 it and covers what the HTTP/1.1 and HTTP/2 sides reach before a handler sees
@@ -458,26 +538,16 @@ fixture.
 Those two tests remain worth keeping and are not what this replaces: they walk
 100 buffers from a seeded PRNG, which is a different question from what
 coverage feedback answers. A header spelled correctly enough to reach
-`__validate_content_length` is not something a random draw produces. `-DBUILD_FUZZERS=yes` requires `-DINCLUDE_HTTP3=yes`
-even for `hpack` and the HTTP/1.1 targets, which need none of it — the flag gates the
-whole block rather than a target at a time.
+`__validate_content_length` is not something a random draw produces.
 
-clang builds the targets against libFuzzer (`-fsanitize=fuzzer,address`) and
-is the better choice where it is available. gcc works too, and the link error
-this note used to describe is not a property of the gcc branch but of building
-it without a sanitizer: `fuzz_main.c` calls `__sanitizer_set_death_callback`,
-so the runtime that defines it has to be on the line. Put it there and the
-same targets build and run:
-
-```bash
-cmake -S backend -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-      -DBUILD_TESTS=yes -DBUILD_FUZZERS=yes -DINCLUDE_HTTP3=yes \
-      -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
-      -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
-      -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined"
-cmake --build build-fuzz --target fuzz_hpack
-./build-fuzz/exec/fuzz_hpack -seconds=120 backend/core/tests/fuzz/corpus/hpack
-```
+clang builds the targets against libFuzzer and is the better engine where it
+is available. With gcc, which has none, `fuzz_main.c` supplies the loop and
+`-fsanitize-coverage=trace-pc` the feedback; `cwfr_fuzz_instrument()` sets
+both up, so the build line above is the same for either compiler. The driver
+takes `-seconds=`, `-runs=`, `-seed=`, `-artifacts=<dir>`, `-dict=<file>`,
+`-timeout=<s>` and `-max_len=<bytes>` (at most 1 MiB), and a file instead of
+a directory to replay one input. A trap, an abort, a UBSan report or an input
+running past `-timeout` all save the input first.
 
 ### Dictionaries
 
@@ -488,8 +558,8 @@ anything, and random edits get there slowly. Measured over a minute at a fixed
 seed, on `request`, the edge count went from 135 to 184, and taken branches in
 `httprequestparser.c` from 71.8% to 75.6%.
 
-Dictionaries live in `fuzz/dict/<target>.dict` and are picked up automatically
-by the repository's own audit script. The format is libFuzzer's, and libFuzzer
+Dictionaries live in `fuzz/dict/<target>.dict`; `cwfr_add_fuzzer()` records
+the path in the manifest and `run.sh` passes it when the file exists. The format is libFuzzer's, and libFuzzer
 is the stricter parser of the two: it knows `\xNN`, `\\` and `\"` and rejects
 the whole file on the first line it cannot read. `\r\n` is not among them, so
 the files use `\x0d\x0a`.
@@ -530,9 +600,11 @@ was not entered at all. Adding the round trip to the target took the file to
 `fuzz/oss-fuzz/` holds a tested OSS-Fuzz / ClusterFuzzLite integration — build
 script, Dockerfile and `project.yaml` — with its own readme.
 
-The driver takes `-seconds=`, `-runs=`, `-seed=` and `-artifacts=<dir>`, and
-writes the crashing input to the artifacts directory; a reproducer belongs in
-the seed corpus once the bug behind it is fixed.
+`tests/ci.sh fuzz` is the gate; `FUZZ_PROFILE=long tests/ci.sh fuzz` is the
+scheduled run. A reproducer belongs in the seed corpus once the bug behind it
+is fixed, next to a unit test that pins the fix. Targets registered with
+`NO_LEAK_CHECK` (`h2_session`) run with `detect_leaks=0` both here and under
+OSS-Fuzz, where `build.sh` writes the matching `.options` file.
 
 `corpus/hpack/regression_dynamic_index_oob.bin` is there for a different
 reason, and stands for no bug this code ever had: the bounds check in

@@ -1,0 +1,11 @@
+VB--VB
+Content-Disposition: form-data; name="a"
+
+--VB is not a delimiter
+-VB
+--V
+--VB
+Content-Disposition: form-data; name="b"
+
+
+--VB--

@@ -78,4 +78,10 @@ for exe in "$SRC"/build/exec/fuzz_*; do
     if [ -f "$SRC/cwfr/tests/fuzz/dict/$target.dict" ]; then
         cp "$SRC/cwfr/tests/fuzz/dict/$target.dict" "$OUT/$name.dict"
     fi
+
+    # A target registered with NO_LEAK_CHECK (cmake/fuzz.cmake) runs without
+    # LeakSanitizer here too, the way tests/fuzz/run.sh runs it locally.
+    if grep -q "^$name|.*|0\$" "$SRC/build/fuzz-targets.txt"; then
+        printf '[asan]\ndetect_leaks=0\n' > "$OUT/$name.options"
+    fi
 done

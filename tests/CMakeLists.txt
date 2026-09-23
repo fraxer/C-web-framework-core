@@ -223,13 +223,13 @@ if(BUILD_FUZZERS STREQUAL "yes")
     # stock OSS-Fuzz base image, whose OpenSSL is older than the 3.5 that
     # INCLUDE_HTTP3 requires.
     set(FUZZ_TARGET_NAMES
-        huffman hpack h2_frame json cookie urlencoded multipart request
-        websocket ws_deflate h2_session)
+        huffman hpack h2_frame json cookie urlencoded multipart request request_sequence
+        websocket websocket_sequence ws_deflate h2_session)
 
     if(INCLUDE_HTTP3 STREQUAL yes)
         list(APPEND FUZZ_TARGET_NAMES
             quic_packet quic_frame quic_tp h3_frame qpack_decode qpack_streams
-            h3_priority)
+            h3_priority qpack_dynamic)
     endif()
 
     set(FUZZ_ID_quic_packet    1)
@@ -250,24 +250,24 @@ if(BUILD_FUZZERS STREQUAL "yes")
     set(FUZZ_ID_websocket      16)
     set(FUZZ_ID_ws_deflate     17)
     set(FUZZ_ID_h2_session     18)
+    set(FUZZ_ID_request_sequence 19)
+    set(FUZZ_ID_qpack_dynamic 20)
+    set(FUZZ_ID_websocket_sequence 21)
 
     foreach(name ${FUZZ_TARGET_NAMES})
         set(exe fuzz_${name})
 
-        if(DEFINED ENV{LIB_FUZZING_ENGINE})
-            # OSS-Fuzz and ClusterFuzzLite: the sanitizer arrives in CFLAGS and
-            # the engine is named by the environment. Adding our own would
-            # break the coverage and MSan builds, which use neither.
-            add_executable(${exe} fuzz/fuzz_targets.c)
-            target_link_options(${exe} PRIVATE $ENV{LIB_FUZZING_ENGINE})
-        elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
-            add_executable(${exe} fuzz/fuzz_targets.c)
-            target_compile_options(${exe} PRIVATE -fsanitize=fuzzer,address)
-            target_link_options(${exe} PRIVATE -fsanitize=fuzzer,address)
-        else()
-            add_executable(${exe} fuzz/fuzz_targets.c fuzz/fuzz_main.c)
-            target_compile_options(${exe} PRIVATE -fsanitize-coverage=trace-pc)
+        # h2_session: see the comment above its target in fuzz_targets.c.
+        set(fuzz_leak_option)
+        if(name STREQUAL h2_session)
+            set(fuzz_leak_option NO_LEAK_CHECK)
         endif()
+
+        cwfr_add_fuzzer(${exe} ${fuzz_leak_option}
+            SOURCES fuzz/fuzz_targets.c
+            CORPUS "${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus/${name}"
+            DICTIONARY "${CMAKE_CURRENT_SOURCE_DIR}/fuzz/dict/${name}.dict"
+            LIBRARIES cwfr_framework ${OPENSSL_LIBRARIES} Threads::Threads ${CMAKE_DL_LIBS})
 
         string(TOUPPER ${name} upper)
         target_compile_definitions(${exe} PRIVATE
@@ -289,6 +289,9 @@ if(BUILD_FUZZERS STREQUAL "yes")
             FUZZ_WEBSOCKET=16
             FUZZ_WS_DEFLATE=17
             FUZZ_H2_SESSION=18
+            FUZZ_REQUEST_SEQUENCE=19
+            FUZZ_QPACK_DYNAMIC=20
+            FUZZ_WEBSOCKET_SEQUENCE=21
             FUZZ_TARGET=${FUZZ_ID_${name}}
         )
 

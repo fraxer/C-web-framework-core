@@ -747,6 +747,15 @@ TEST(test_json_stringify_primitives) {
     const char* str4 = json_stringify(doc4);
     TEST_ASSERT_STR_EQUAL("\"hello\"", str4, "Stringified string should match");
     json_free(doc4);
+
+    // Найдено fuzz_json: бесконечность уходила в вывод как "inf" — не JSON
+    json_doc_t* doc5 = json_root_create_array();
+    json_array_append(json_root(doc5), json_create_number(INFINITY));
+    json_array_append(json_root(doc5), json_create_number(-INFINITY));
+    json_array_append(json_root(doc5), json_create_number(NAN));
+    const char* str5 = json_stringify(doc5);
+    TEST_ASSERT_STR_EQUAL("[null,null,null]", str5, "Non-finite numbers become null");
+    json_free(doc5);
     json_manager_free();
 }
 
@@ -1066,6 +1075,8 @@ TEST(test_json_parse_rejects_bad_literals_and_numbers) {
         { "1e",       "missing exponent digits" },
         { "1e+",      "missing signed exponent digits" },
         { "0x10",     "hex number" },
+        { "1e99999",  "number overflowing to infinity" },
+        { "[-1e99999]", "negative number overflowing to infinity" },
         { "'a'",      "single-quoted string" },
         { "// c\n1",  "comment" },
     };

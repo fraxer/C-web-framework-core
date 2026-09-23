@@ -28,7 +28,8 @@
 #   priority urgency and incremental scheduling, and what an unsignalled
 #            small response still pays for being asked for second (RFC 9218)
 #   benchmark median req/s and throughput against a runner-local baseline
-#   fuzz     build the fuzz targets         + FUZZ_SECONDS each
+#   fuzz     build the fuzz targets, with and without HTTP/3, and run every
+#            one the build registered (tests/fuzz/run.sh)
 #   reload   hard reload with live QUIC      + old worker retirement
 #   softreload shared UDP handoff             + old CID/config drain
 #   hotreload a handler rebuilt in place is picked up by SIGUSR1, its
@@ -51,11 +52,16 @@
 #   tests/ci.sh asan tsan        # a subset, in the order given
 #   tests/ci.sh startup          # a failed start must exit non-zero
 #   FUZZ_SECONDS=600 tests/ci.sh fuzz
+#   FUZZ_PROFILE=long tests/ci.sh fuzz    # the scheduled run
 #   CI_BUILD_DIR=/var/tmp/ci tests/ci.sh
 #
 # Environment:
 #   CI_BUILD_DIR   where build trees go (default: a temp dir, kept between runs)
-#   FUZZ_SECONDS   per fuzz target (default 60; §5 asks for 24h on a schedule)
+#   FUZZ_PROFILE   smoke (10 s, 8 KiB), long (24 h, 256 KiB) or large (120 s, 1 MiB)
+#   FUZZ_SECONDS   override time per target
+#   FUZZ_HTTP3     builds to fuzz: "yes no" (default), "yes" or "no"
+#   FUZZ_MAX_LEN   override input size; FUZZ_TIMEOUT: seconds per input (default 5)
+#   FUZZ_JOBS, FUZZ_SEED, FUZZ_EXPECT_EXTRA: see tests/fuzz/run.sh
 #   H3SPEC         path to the h3spec binary (default: found on PATH)
 #   H2WS_PYTHONPATH  where python-h2 lives, when it is not installed system-wide
 #   REQUIRE_H3SPEC fail instead of skip when h3spec is unavailable (default 0)
@@ -77,7 +83,6 @@ CI_BUILD_DIR=${CI_BUILD_DIR:-/tmp/cwfr-ci}
 # build tree must not silently disarm the regression check. Under $HOME so it
 # survives a reboot, which /tmp does not.
 DEFAULT_BENCH_BASELINE=${DEFAULT_BENCH_BASELINE:-${XDG_STATE_HOME:-${HOME:-$CI_BUILD_DIR}/.local/state}/cwfr/h3-baseline.json}
-FUZZ_SECONDS=${FUZZ_SECONDS:-10}
 JOBS=${JOBS:-$(nproc)}
 H3SPEC=${H3SPEC:-$(command -v h3spec || true)}
 REQUIRE_H3SPEC=${REQUIRE_H3SPEC:-0}
@@ -413,58 +418,24 @@ stage_config() {
 }
 
 stage_fuzz() {
-    say "fuzz: $FUZZ_SECONDS s per target (§5 asks 24h per target on a schedule)"
+    # Both builds by default: the HTTP/3 one has every target, and the one
+    # without it is what OSS-Fuzz builds (fuzz/oss-fuzz/build.sh) -- a target
+    # that only compiles, or only passes, with HTTP/3 on shows up here first.
+    # tests/fuzz/run.sh knows which targets each build must have and fails on
+    # a missing one; the application's own go in FUZZ_EXPECT_EXTRA.
+    local variant ok=1
+    for variant in ${FUZZ_HTTP3:-yes no}; do
+        local tree="$CI_BUILD_DIR/fuzz"
+        [ "$variant" = yes ] || tree="$CI_BUILD_DIR/fuzz-noh3"
 
-    if ! build "$CI_BUILD_DIR/fuzz" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=yes \
-               -DINCLUDE_HTTP3=yes -DBUILD_FUZZERS=yes; then
-        record fuzz FAIL
-        return
-    fi
-
-    local crashes="$CI_BUILD_DIR/crashes"
-    mkdir -p "$crashes"
-
-    local ok=1
-    local fuzz_names=(
-        quic_packet quic_frame quic_tp h3_frame
-        qpack_decode qpack_streams huffman h3_priority
-    )
-    local fuzz_name target
-    for fuzz_name in "${fuzz_names[@]}"; do
-        target="$CI_BUILD_DIR/fuzz/exec/fuzz_$fuzz_name"
-        if [ ! -x "$target" ]; then
-            note "fuzz_$fuzz_name is missing or not executable"
+        say "fuzz: ${FUZZ_PROFILE:-smoke} profile, HTTP/3=$variant"
+        if ! build "$tree" -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTS=yes \
+                   -DINCLUDE_HTTP3="$variant" -DBUILD_FUZZERS=yes; then
             ok=0
             continue
         fi
-
-        local name=$(basename "$target")
-        local corpus="$CORE_DIR/tests/fuzz/corpus/${name#fuzz_}"
-
-        # The corpus in the tree is the seed set; found inputs go to the build
-        # dir, so a gate run never writes to the working copy.
-        local work="$CI_BUILD_DIR/corpus/${name#fuzz_}"
-        mkdir -p "$work"
-        [ -d "$corpus" ] && cp -n "$corpus"/* "$work"/ 2>/dev/null
-
-        local log="$CI_BUILD_DIR/$name.log"
-        if "$target" -seconds="$FUZZ_SECONDS" -artifacts="$crashes" "$work" \
-                > "$log" 2>&1; then
-            note "$(tail -1 "$CI_BUILD_DIR/$name.log")"
-        elif grep -Eq 'LeakSanitizer.*(does not work|not supported)|LSan.*(does not work|not supported)' "$log"; then
-            note "$name: LeakSanitizer unavailable; retrying with leak detection disabled"
-            if ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_leaks=0" \
-                    "$target" -seconds="$FUZZ_SECONDS" -artifacts="$crashes" "$work" \
-                    >> "$log" 2>&1; then
-                note "$(tail -1 "$log")"
-            else
-                note "$name CRASHED after the LSan fallback -- input in $crashes, log in $log"
-                ok=0
-            fi
-        else
-            note "$name CRASHED -- input in $crashes, log in $CI_BUILD_DIR/$name.log"
-            ok=0
-        fi
+        bash "$CORE_DIR/tests/fuzz/run.sh" "$tree" "$tree-results" 2>&1 | sed 's/^/   /'
+        [ "${PIPESTATUS[0]}" -eq 0 ] || ok=0
     done
 
     [ "$ok" = 1 ] && record fuzz OK || record fuzz FAIL

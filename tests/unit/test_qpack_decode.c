@@ -404,6 +404,32 @@ TEST(test_qpack_dynamic_table_instructions) {
                     == QPACK_ERR_ENCODER_STREAM, "peer cannot exceed advertised maximum");
 
     qpack_decoder_free(d);
+
+    TEST_CASE("a name reference to the entry its own insertion evicts");
+    /* Found by fuzz_qpack_dynamic: the name was copied out of the entry after
+     * eviction had freed it. Room for exactly one 38-byte entry. */
+    d = qpack_decoder_create(40, 4);
+    static const uint8_t self_evict[] = {
+        0x3f, 0x09,                         /* capacity 40 */
+        0x43, 'f', 'o', 'o', 0x03, 'b', 'a', 'r',
+        0x80, 0x03, 'b', 'a', 'z',          /* name of relative 0, value baz */
+        0x00                                /* duplicate it, evicting it again */
+    };
+    TEST_ASSERT(qpack_decoder_read_encoder(d, self_evict, sizeof self_evict, &consumed)
+                    == QPACK_OK, "self-evicting references accepted");
+    TEST_ASSERT(consumed == sizeof self_evict, "all instructions consumed");
+    TEST_ASSERT(qpack_decoder_insert_count(d) == 3 && qpack_decoder_bytes(d) == 38,
+                "one entry remains after two evictions");
+
+    /* RIC 3 encodes as 3 mod (2 * MaxEntries 1) + 1 = 2; base 3; relative 0. */
+    static const uint8_t field[] = { 0x02, 0x00, 0x80 };
+    qpack_header_t* h = NULL;
+    size_t count = 0;
+    TEST_ASSERT(qpack_decode_block(d, field, sizeof field, 1024, &h, &count) == QPACK_OK &&
+                count == 1 && field_eq(&h[0], "foo", "baz", 0),
+                "surviving entry carries the referenced name");
+    qpack_headers_free(h, count);
+    qpack_decoder_free(d);
 }
 
 TEST(test_qpack_dynamic_field_references) {

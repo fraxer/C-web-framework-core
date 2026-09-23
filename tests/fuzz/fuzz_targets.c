@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -58,7 +59,7 @@
 #if FUZZ_TARGET == FUZZ_QUIC_PACKET || FUZZ_TARGET == FUZZ_QUIC_FRAME || \
     FUZZ_TARGET == FUZZ_QUIC_TP     || FUZZ_TARGET == FUZZ_H3_FRAME   || \
     FUZZ_TARGET == FUZZ_QPACK_DECODE || FUZZ_TARGET == FUZZ_QPACK_STREAMS || \
-    FUZZ_TARGET == FUZZ_H3_PRIORITY
+    FUZZ_TARGET == FUZZ_H3_PRIORITY || FUZZ_TARGET == FUZZ_QPACK_DYNAMIC
 #include "h3frame.h"
 #include "h3priority.h"
 #include "qpack.h"
@@ -70,7 +71,8 @@
 
 int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size);
 
-#if FUZZ_TARGET == FUZZ_REQUEST || FUZZ_TARGET == FUZZ_WEBSOCKET || \
+#if FUZZ_TARGET == FUZZ_REQUEST || FUZZ_TARGET == FUZZ_REQUEST_SEQUENCE || \
+    FUZZ_TARGET == FUZZ_WEBSOCKET || FUZZ_TARGET == FUZZ_WEBSOCKET_SEQUENCE || \
     FUZZ_TARGET == FUZZ_H2_SESSION
 
 /* The parser asks the running configuration what the largest acceptable body
@@ -186,6 +188,31 @@ static int __fuzz_payload_fd(const uint8_t* data, size_t size) {
 
     lseek(fd, 0, SEEK_SET);
     return fd;
+}
+
+#endif
+
+#if FUZZ_TARGET == FUZZ_MULTIPART || FUZZ_TARGET == FUZZ_REQUEST_SEQUENCE
+
+/* FNV-1a over what a parse produced, so that deliveries of the same bytes in
+ * different reads can be compared without keeping every result around. */
+static uint64_t __fuzz_fnv(uint64_t h, const void* data, size_t len) {
+    const unsigned char* p = data;
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t __fuzz_fnv_headers(uint64_t h, const http_header_t* header) {
+    for (; header != NULL; header = header->next) {
+        h = __fuzz_fnv(h, header->key, header->key_length);
+        h = __fuzz_fnv(h, "\0", 1);
+        h = __fuzz_fnv(h, header->value, header->value_length);
+        h = __fuzz_fnv(h, "\n", 1);
+    }
+    return h;
 }
 
 #endif
@@ -333,6 +360,61 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     return 0;
 }
 
+#elif FUZZ_TARGET == FUZZ_QPACK_DYNAMIC
+
+/* Two coupled QPACK streams: an encoder instruction stream changes a real
+ * dynamic table while a field section may be blocked on its insert count. */
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 3) return 0;
+    const size_t instruction_len = (size_t)data[0] % (size - 1);
+    const size_t step = (size_t)data[1] + 1;
+    const uint8_t* instructions = data + 2;
+    const uint8_t* block = instructions + instruction_len;
+    const size_t block_len = size - 2 - instruction_len;
+
+    qpack_decoder_t* d = qpack_decoder_create(256, 8);
+    if (d == NULL) return 0;
+
+    qpack_header_t* fields = NULL;
+    size_t count = 0;
+    const qpack_status_e before = qpack_decode_block(
+        d, block, block_len, 1048576, &fields, &count);
+    if (before == QPACK_OK) qpack_headers_free(fields, count);
+
+    size_t consumed_total = 0;
+    size_t offered = 0;
+    while (consumed_total < instruction_len) {
+        const size_t remaining = instruction_len - offered;
+        offered += remaining < step ? remaining : step;
+        size_t consumed = 0;
+        const qpack_status_e status = qpack_decoder_read_encoder(
+            d, instructions + consumed_total, offered - consumed_total, &consumed);
+        if (status != QPACK_OK) break;
+        if (consumed > offered - consumed_total) __builtin_trap();
+        consumed_total += consumed;
+        if (offered == instruction_len && consumed == 0) break;
+    }
+
+    if (qpack_decoder_bytes(d) > qpack_decoder_capacity(d) ||
+        qpack_decoder_capacity(d) > 256) __builtin_trap();
+
+    fields = NULL;
+    count = 0;
+    const qpack_status_e after = qpack_decode_block(
+        d, block, block_len, 1048576, &fields, &count);
+    if (after == QPACK_OK) qpack_headers_free(fields, count);
+    if (before == QPACK_OK && after == QPACK_BLOCKED) __builtin_trap();
+
+    const uint8_t* pending = NULL;
+    const size_t pending_len = qpack_decoder_pending(d, &pending);
+    if (pending_len > 0) {
+        qpack_decoder_consume(d, pending_len / 2);
+        qpack_decoder_consume(d, qpack_decoder_pending(d, &pending));
+    }
+    qpack_decoder_free(d);
+    return 0;
+}
+
 #elif FUZZ_TARGET == FUZZ_QPACK_STREAMS
 
 /* Both QPACK service streams, which are resumable parsers -- so they are fed in
@@ -389,9 +471,14 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     /* And the round trip, which asserts nothing but walks the encoder with
      * arbitrary bytes -- the encoder is reached with header values the peer
      * chose too. */
+    const size_t source_len = size > 2048 ? 2048 : size;
     uint8_t enc[8192];
-    const ssize_t n = huffman_encode(enc, sizeof enc, data, size > 2048 ? 2048 : size);
-    if (n > 0) (void)huffman_decode(out, sizeof out, enc, (size_t)n);
+    const ssize_t n = huffman_encode(enc, sizeof enc, data, source_len);
+    if (n >= 0) {
+        const ssize_t decoded = huffman_decode(out, sizeof out, enc, (size_t)n);
+        if (decoded != (ssize_t)source_len || memcmp(out, data, source_len) != 0)
+            __builtin_trap();
+    }
 
     return 0;
 }
@@ -458,8 +545,9 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     if (hpack_decoder_decode(d, data, size, 1048576, &headers, &count) == HPACK_OK) {
         hpack_encoder_t* e = hpack_encoder_create(4096);
+        hpack_decoder_t* back = hpack_decoder_create(4096);
 
-        if (e != NULL) {
+        if (e != NULL && back != NULL) {
             for (int huffman = 0; huffman < 2; huffman++) {
                 uint8_t* encoded = NULL;
                 size_t encoded_len = 0;
@@ -467,23 +555,28 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
                 if (hpack_encoder_encode(e, headers, count, huffman, &encoded, &encoded_len) != HPACK_OK)
                     continue;
 
-                hpack_decoder_t* back = hpack_decoder_create(4096);
-                if (back != NULL) {
-                    hpack_header_t* again = NULL;
-                    size_t again_count = 0;
-
-                    if (hpack_decoder_decode(back, encoded, encoded_len, 1048576,
-                                             &again, &again_count) == HPACK_OK)
-                        hpack_headers_free(again, again_count);
-
-                    hpack_decoder_free(back);
+                hpack_header_t* again = NULL;
+                size_t again_count = 0;
+                if (hpack_decoder_decode(back, encoded, encoded_len, 1048576,
+                                         &again, &again_count) != HPACK_OK)
+                    __builtin_trap();
+                if (again_count != count) __builtin_trap();
+                for (size_t i = 0; i < count; i++) {
+                    if (headers[i].name_len != again[i].name_len ||
+                        headers[i].value_len != again[i].value_len ||
+                        memcmp(headers[i].name, again[i].name, headers[i].name_len) != 0 ||
+                        memcmp(headers[i].value, again[i].value, headers[i].value_len) != 0)
+                        __builtin_trap();
                 }
+                hpack_headers_free(again, again_count);
 
                 free(encoded);
             }
 
-            hpack_encoder_free(e);
         }
+
+        hpack_encoder_free(e);
+        hpack_decoder_free(back);
 
         hpack_headers_free(headers, count);
     }
@@ -621,8 +714,15 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     __fuzz_json_walk(json_root(doc), 0);
 
-    (void)json_stringify(doc);
+    const char* serialized = json_stringify(doc);
     (void)json_stringify_size(doc);
+    if (serialized != NULL) {
+        json_doc_t* parsed = json_parse(serialized);
+        if (parsed == NULL) __builtin_trap();
+        const char* again = json_stringify(parsed);
+        if (again == NULL || strcmp(serialized, again) != 0) __builtin_trap();
+        json_free(parsed);
+    }
 
     /* Copying, and then building a document out of what was parsed.
      *
@@ -654,6 +754,69 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     json_free(doc);
 
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_WEBSOCKET_SEQUENCE
+
+/* WebSocket control/data frames can cross reads and share message state. */
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 2) return 0;
+    const size_t chunk = (size_t)data[0] + 1;
+    char* buffer = malloc(chunk + 1);
+    if (buffer == NULL) return 0;
+
+    connection_t connection;
+    connection_server_ctx_t ctx;
+    memset(&connection, 0, sizeof connection);
+    memset(&ctx, 0, sizeof ctx);
+    connection.buffer = buffer;
+    connection.buffer_size = chunk;
+    connection.fd = -1;
+    connection.ctx = (connection_ctx_t*)&ctx;
+
+    websocketsparser_t* parser =
+        websocketsparser_create(&connection, websockets_protocol_default_create);
+    if (parser == NULL) { free(buffer); return 0; }
+
+    for (size_t off = 1; off < size;) {
+        const size_t n = size - off < chunk ? size - off : chunk;
+        memcpy(buffer, data + off, n);
+        buffer[n] = 0;
+        websocketsparser_set_bytes_readed(parser, n);
+        parser->pos = parser->pos_start = 0;
+
+        for (size_t frames = 0; frames <= n; frames++) {
+            const int status = websocketsparser_run(parser);
+            if (status == WSPARSER_HANDLE_AND_CONTINUE) {
+                if (parser->pos > n) __builtin_trap();
+                if (parser->request != NULL && !parser->message_fragmented &&
+                    parser->frame.opcode < WSOPCODE_CLOSE) {
+                    websocketsrequest_free(parser->request);
+                    parser->request = NULL;
+                }
+                websocketsparser_prepare_remains(parser);
+                if (parser->pos_start >= n) break;
+                continue;
+            }
+            if (status == WSPARSER_COMPLETE) {
+                if (parser->request != NULL) {
+                    websocketsrequest_free(parser->request);
+                    parser->request = NULL;
+                }
+                websocketsparser_reset(parser);
+            }
+            if (status != WSPARSER_CONTINUE && status != WSPARSER_COMPLETE &&
+                status != WSPARSER_HANDLE_AND_CONTINUE) {
+                off = size;
+            }
+            break;
+        }
+        off += n;
+    }
+
+    websocketsparser_free(parser);
+    free(buffer);
     return 0;
 }
 
@@ -732,7 +895,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
      * what the connection would then run with, so both go on to inflate. */
     (void)ws_deflate_parse_header(header, &d.config);
 
-    if (ws_deflate_start(&d) != 0) {
+    if (!ws_deflate_start(&d)) {
         ws_deflate_free(&d);
         return 0;
     }
@@ -763,6 +926,38 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
                               comp, sizeof comp, 1);
 
     ws_deflate_free(&d);
+
+    /* A fresh paired context checks two successive messages, once with and
+     * once without context takeover. The random inflate above cannot be used
+     * as the oracle: malformed compressed input may have poisoned its state. */
+    for (int no_takeover = 0; no_takeover < 2; no_takeover++) {
+        ws_deflate_t pair;
+        ws_deflate_init(&pair);
+        pair.config.server_no_context_takeover = no_takeover;
+        pair.config.client_no_context_takeover = no_takeover;
+        if (!ws_deflate_start(&pair)) { ws_deflate_free(&pair); continue; }
+
+        const size_t bounded = body_len > 4096 ? 4096 : body_len;
+        for (int message = 0; message < 2; message++) {
+            const size_t start = message == 0 ? 0 : bounded / 2;
+            const size_t length = message == 0 ? bounded / 2 : bounded - start;
+            char packed[8192];
+            char unpacked[4096];
+            const ssize_t packed_len = ws_deflate_compress(
+                &pair, (const char*)body + start, length, packed, sizeof packed - 4, 1);
+            if (packed_len < 0 || pair.deflate_stream.avail_in != 0)
+                __builtin_trap();
+            memcpy(packed + packed_len, "\x00\x00\xff\xff", 4);
+            const ssize_t plain_len = ws_deflate_decompress(
+                &pair, packed, (size_t)packed_len + 4, unpacked, sizeof unpacked);
+            if (plain_len != (ssize_t)length ||
+                memcmp(unpacked, body + start, length) != 0)
+                __builtin_trap();
+            ws_deflate_reset_deflate(&pair);
+            ws_deflate_reset_inflate(&pair);
+        }
+        ws_deflate_free(&pair);
+    }
 
     return 0;
 }
@@ -1029,6 +1224,48 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
 #elif FUZZ_TARGET == FUZZ_MULTIPART
 
+/* Parses `data` delivered in reads of `fixed` bytes, or -- with fixed 0 and a
+ * seed -- of sizes 1..64 from a small PRNG, or whole with both 0. Returns a
+ * digest of the result and of every part the parser produced. */
+static uint64_t __fuzz_multipart_run(int fd, const char* boundary,
+                                     const uint8_t* data, size_t size,
+                                     size_t fixed, uint64_t seed) {
+    multipartparser_t parser;
+    multipartparser_init(&parser, fd, boundary);
+
+    multipart_res_e result = MP_RES_PARTIAL;
+    uint64_t rng = seed * 0x9E3779B97F4A7C15ULL + 1;
+    for (size_t off = 0; off < size && result == MP_RES_PARTIAL;) {
+        size_t n = size - off;
+        if (fixed != 0) n = fixed;
+        else if (seed != 0) {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            n = 1 + (size_t)(rng % 64);
+        }
+        if (n > size - off) n = size - off;
+
+        char* chunk = malloc(n);
+        if (chunk == NULL) { multipartparser_clear(&parser); return 0; }
+        memcpy(chunk, data + off, n);
+        result = multipartparser_parse(&parser, chunk, n);
+        free(chunk);
+        off += n;
+    }
+
+    uint64_t h = __fuzz_fnv(1469598103934665603ULL, &result, sizeof result);
+    for (const http_payloadpart_t* part = multipartparser_part(&parser);
+         part != NULL; part = part->next) {
+        h = __fuzz_fnv(h, &part->offset, sizeof part->offset);
+        h = __fuzz_fnv(h, &part->size, sizeof part->size);
+        h = __fuzz_fnv_headers(h, part->field);
+        h = __fuzz_fnv_headers(h, part->header);
+        if (part->offset > size || part->size > size - part->offset) __builtin_trap();
+    }
+
+    multipartparser_clear(&parser);
+    return h;
+}
+
 /* multipart/form-data, where two separate things the peer controls meet: the
  * body, and the boundary that delimits it. The boundary comes from
  * Content-Type and init() only ever measures it with strlen(), deriving two
@@ -1042,7 +1279,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     size_t blen = 0;
 
     if (size > 0) {
-        blen = data[0] % 64;
+        blen = data[0];
         if (blen > size - 1) blen = size - 1;
     }
 
@@ -1075,24 +1312,192 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         return 0;
     }
 
-    char* buffer = malloc(size > 0 ? size : 1);
-    if (buffer == NULL) {
-        free(boundary);
-        close(fd);
-        return 0;
-    }
-    memcpy(buffer, data, size);
+    /* Three deliveries of the same body -- whole, byte by byte, and in steps
+     * the input chooses -- must produce the same result and the same parts.
+     * Each read gets its own exact-size buffer that is freed after the call,
+     * the way httprequest.c reuses one: a part that kept a pointer into an
+     * earlier read shows up as a use-after-free, not as a quiet mismatch. */
+    const uint64_t whole = __fuzz_multipart_run(fd, boundary, data, size, 0, 0);
+    const uint64_t bytes = __fuzz_multipart_run(fd, boundary, data, size, 1, 0);
+    const uint64_t steps = __fuzz_multipart_run(fd, boundary, data, size, 0, blen + 1);
+    if (whole != bytes || whole != steps) __builtin_trap();
 
-    multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
-
-    (void)multipartparser_parse(&parser, buffer, size);
-
-    multipartparser_clear(&parser);
-    free(buffer);
     free(boundary);
     close(fd);
 
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_REQUEST_SEQUENCE
+
+/* One keep-alive connection, a byte stream of pipelined requests, and the
+ * same stream delivered three ways: in a single read, one byte per read, and
+ * in reads of 1..256 bytes the input chooses. A network picks the boundaries,
+ * not the client, so every observable result must be the same for all three:
+ * how many requests completed, what each one was -- method, version, target,
+ * header and trailer fields, the body bytes, the keep-alive decision -- and the
+ * status the stream ended on.
+ *
+ * Each completed request is also held to what the parser promises on its own:
+ * at most one Host and one Content-Length, no Transfer-Encoding (requests with
+ * it are refused, RFC 9112 §6.3 leaves that choice to the server), and a body
+ * exactly as long as Content-Length said. A body byte or a field that leaked
+ * from one request into the next breaks one of these, or the comparison. */
+typedef struct {
+    uint64_t digest;
+    size_t completed;
+    int final_status;
+} fuzz_request_result_t;
+
+static size_t __fuzz_count_field(const http_header_t* header, const char* name) {
+    size_t count = 0;
+    const size_t len = strlen(name);
+    for (; header != NULL; header = header->next)
+        if (header->key_length == len && strncasecmp(header->key, name, len) == 0)
+            count++;
+    return count;
+}
+
+static uint64_t __fuzz_request_digest(uint64_t h, httprequest_t* request,
+                                      const connection_t* connection) {
+    const http_header_t* cl = request->get_header(request, "Content-Length");
+    if (__fuzz_count_field(request->header_, "Content-Length") > 1 ||
+        __fuzz_count_field(request->header_, "Transfer-Encoding") != 0 ||
+        __fuzz_count_field(request->header_, "Host") > 1)
+        __builtin_trap();
+    if (request->version == HTTP1_VER_1_1 &&
+        __fuzz_count_field(request->header_, "Host") != 1)
+        __builtin_trap();
+
+    size_t expected = 0;
+    if (cl != NULL)
+        for (size_t i = 0; i < cl->value_length; i++) {
+            if (cl->value[i] < '0' || cl->value[i] > '9') __builtin_trap();
+            if (expected > (SIZE_MAX - 9) / 10) __builtin_trap();
+            expected = expected * 10 + (size_t)(cl->value[i] - '0');
+        }
+
+    const file_t* body = &request->payload_.file;
+    const size_t body_size = body->fd >= 0 ? body->size : 0;
+    if (body_size != expected) __builtin_trap();
+
+    h = __fuzz_fnv(h, &request->method, sizeof request->method);
+    h = __fuzz_fnv(h, &request->version, sizeof request->version);
+    const unsigned char keepalive = connection->keepalive;
+    h = __fuzz_fnv(h, &keepalive, 1);
+    if (request->uri != NULL) h = __fuzz_fnv(h, request->uri, request->uri_length);
+    h = __fuzz_fnv(h, "\0", 1);
+    if (request->path != NULL) h = __fuzz_fnv(h, request->path, request->path_length);
+    h = __fuzz_fnv(h, "\0", 1);
+    h = __fuzz_fnv_headers(h, request->header_);
+    h = __fuzz_fnv_headers(h, request->trailer_);
+
+    char chunk[4096];
+    for (size_t off = 0; off < body_size;) {
+        const size_t want = body_size - off < sizeof chunk ? body_size - off : sizeof chunk;
+        const ssize_t n = pread(body->fd, chunk, want, (off_t)off);
+        if (n <= 0) __builtin_trap();
+        h = __fuzz_fnv(h, chunk, (size_t)n);
+        off += (size_t)n;
+    }
+    return __fuzz_fnv(h, "\xff", 1);
+}
+
+/* chunk 0: one read of the whole input; seed 0: reads of `chunk` bytes;
+ * otherwise reads of 1..256 bytes drawn from a PRNG seeded with `seed`. */
+static fuzz_request_result_t __fuzz_request_sequence_run(
+    const uint8_t* data, size_t size, size_t chunk, uint64_t seed) {
+    fuzz_request_result_t result = { .digest = 1469598103934665603ULL,
+                                     .completed = 0,
+                                     .final_status = HTTP1PARSER_CONTINUE };
+    const size_t cap = chunk == 0 ? size : seed != 0 ? 256 : chunk;
+    char* buffer = malloc(cap + 1);
+    if (buffer == NULL) return result;
+
+    connection_server_ctx_t ctx;
+    connection_t connection;
+    memset(&ctx, 0, sizeof ctx);
+    memset(&connection, 0, sizeof connection);
+    ctx.listener = &__fuzz_listener;
+    connection.buffer = buffer;
+    connection.buffer_size = cap;
+    connection.ip = ipaddr_from_v4(0x0100007F);
+    connection.port = 8080;
+    connection.fd = -1;
+    connection.keepalive = 1;
+    connection.ctx = (connection_ctx_t*)&ctx;
+
+    httprequestparser_t* parser = httpparser_create(&connection);
+    if (parser == NULL) { free(buffer); return result; }
+
+    uint64_t rng = seed * 0x9E3779B97F4A7C15ULL + 1;
+    for (size_t off = 0; off < size;) {
+        size_t n = cap;
+        if (chunk != 0 && seed != 0) {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            n = 1 + (size_t)(rng % 256);
+        }
+        if (n > size - off) n = size - off;
+        memcpy(buffer, data + off, n);
+        buffer[n] = 0;
+        httpparser_set_bytes_readed(parser, n);
+        parser->pos_start = 0;
+        parser->pos = 0;
+
+        /* A read can contain several requests. Bound the number of completions
+         * to its byte count so even a parser regression cannot spin forever. */
+        for (size_t complete = 0; complete <= n; complete++) {
+            const int status = httpparser_run(parser);
+            result.final_status = status;
+            if (status == HTTP1PARSER_HANDLE_AND_CONTINUE ||
+                status == HTTP1PARSER_COMPLETE) {
+                if (parser->pos > n || parser->request == NULL) __builtin_trap();
+                result.digest = __fuzz_request_digest(result.digest, parser->request,
+                                                      &connection);
+                result.completed++;
+                if (ctx.request_retire != NULL)
+                    ctx.request_retire(&ctx, parser->request);
+                else
+                    httprequest_free(parser->request);
+
+                if (status == HTTP1PARSER_HANDLE_AND_CONTINUE) {
+                    httpparser_prepare_continue(parser);
+                    if (parser->pos_start >= n) __builtin_trap();
+                    continue;
+                }
+
+                parser->request = NULL;
+                httpparser_reset(parser);
+            }
+            break;
+        }
+        if (result.final_status != HTTP1PARSER_CONTINUE &&
+            result.final_status != HTTP1PARSER_COMPLETE &&
+            result.final_status != HTTP1PARSER_HANDLE_AND_CONTINUE)
+            break;
+        off += n;
+    }
+
+    httpparser_free(parser);
+    if (ctx.request_cache != NULL) httprequest_free(ctx.request_cache);
+    free(buffer);
+    return result;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 2) return 0;
+    const size_t input_len = size - 1 > 65536 ? 65536 : size - 1;
+    const fuzz_request_result_t whole =
+        __fuzz_request_sequence_run(data + 1, input_len, 0, 0);
+    const fuzz_request_result_t bytes =
+        __fuzz_request_sequence_run(data + 1, input_len, 1, 0);
+    const fuzz_request_result_t split =
+        __fuzz_request_sequence_run(data + 1, input_len, 1, (uint64_t)data[0] + 1);
+    if (whole.completed != bytes.completed || whole.completed != split.completed ||
+        whole.digest != bytes.digest || whole.digest != split.digest ||
+        whole.final_status != bytes.final_status ||
+        whole.final_status != split.final_status)
+        __builtin_trap();
     return 0;
 }
 

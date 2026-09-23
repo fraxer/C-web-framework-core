@@ -17,6 +17,8 @@
 
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <signal.h>
 #include <stdio.h>
@@ -65,7 +67,8 @@ static size_t __cov_count(void) {
 /* ---- Corpus ---- */
 
 #define CORPUS_MAX      4096
-#define INPUT_MAX       8192
+#define INPUT_LIMIT     (1024u * 1024u)
+static size_t __input_max = 8192;
 
 typedef struct {
     uint8_t* data;
@@ -76,7 +79,7 @@ static input_t __corpus[CORPUS_MAX];
 static size_t  __corpus_count;
 
 static void __corpus_add(const uint8_t* data, size_t len) {
-    if (__corpus_count >= CORPUS_MAX || len > INPUT_MAX) return;
+    if (__corpus_count >= CORPUS_MAX || len > __input_max) return;
 
     uint8_t* copy = malloc(len > 0 ? len : 1);
     if (copy == NULL) return;
@@ -88,6 +91,23 @@ static void __corpus_add(const uint8_t* data, size_t len) {
 }
 
 static void __corpus_load(const char* dir) {
+    struct stat st;
+    if (stat(dir, &st) == 0 && S_ISREG(st.st_mode)) {
+        /* A single file is an input to replay, and it is replayed whole: one
+         * saved by a run with a larger -max_len must not be cut to this one's. */
+        if ((size_t)st.st_size > __input_max && (size_t)st.st_size <= INPUT_LIMIT)
+            __input_max = (size_t)st.st_size;
+        FILE* f = fopen(dir, "rb");
+        if (f == NULL) return;
+        uint8_t* buf = malloc(__input_max);
+        if (buf != NULL) {
+            const size_t n = fread(buf, 1, __input_max, f);
+            __corpus_add(buf, n);
+            free(buf);
+        }
+        fclose(f);
+        return;
+    }
     DIR* d = opendir(dir);
     if (d == NULL) return;
 
@@ -101,11 +121,13 @@ static void __corpus_load(const char* dir) {
         FILE* f = fopen(path, "rb");
         if (f == NULL) continue;
 
-        uint8_t buf[INPUT_MAX];
-        const size_t n = fread(buf, 1, sizeof buf, f);
+        uint8_t* buf = malloc(__input_max);
+        if (buf == NULL) { fclose(f); break; }
+        const size_t n = fread(buf, 1, __input_max, f);
         fclose(f);
 
         __corpus_add(buf, n);
+        free(buf);
     }
 
     closedir(d);
@@ -318,6 +340,8 @@ static const uint8_t* __current;
 static size_t __current_len;
 static const char* __artifact_dir = ".";
 static const char* __corpus_dir;
+static unsigned __input_timeout = 5;
+static char __crash_path[4096];
 
 /* Keep what found new coverage, so the next run starts where this one stopped.
  * Without it every run re-derives the same inputs from the seeds, and §5's
@@ -345,20 +369,30 @@ static void __corpus_save(const uint8_t* data, size_t len) {
 
 void __sanitizer_set_death_callback(void (*callback)(void));
 
+/* UBSan does not run the death callback above: with -fno-sanitize-recover it
+ * reports and exits, and the input that caused it was lost -- a failed run
+ * with nothing to replay. Asking it to abort instead routes it through
+ * __on_signal, which saves the input. UBSAN_OPTIONS still overrides this. */
+const char* __ubsan_default_options(void);
+const char* __ubsan_default_options(void) {
+    return "halt_on_error=1:abort_on_error=1:print_stacktrace=1";
+}
+
 static void __on_death(void) {
-    if (__current == NULL) return;
+    if (__current == NULL || __crash_path[0] == '\0') return;
 
-    char path[4096];
-    snprintf(path, sizeof path, "%s/crash-%u.bin", __artifact_dir, (unsigned)getpid());
-
-    FILE* f = fopen(path, "wb");
-    if (f != NULL) {
-        fwrite(__current, 1, __current_len, f);
-        fclose(f);
+    const int fd = open(__crash_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        size_t off = 0;
+        while (off < __current_len) {
+            const ssize_t n = write(fd, __current + off, __current_len - off);
+            if (n <= 0) break;
+            off += (size_t)n;
+        }
+        close(fd);
     }
-
-    fprintf(stderr, "\n[fuzz] crashing input (%zu bytes) written to %s\n",
-            __current_len, path);
+    static const char msg[] = "\n[fuzz] failing input saved to artifact directory\n";
+    (void)write(STDERR_FILENO, msg, sizeof msg - 1);
 }
 
 /* A target may also fail an invariant of its own, by trapping or aborting.
@@ -371,18 +405,20 @@ static void __on_death(void) {
  * SIGILL and SIGABRT only. SIGSEGV and friends belong to the sanitizer, and
  * taking them from it would replace its report with this one. */
 static void __on_signal(int sig) {
+    if (sig == SIGALRM) {
+        static const char msg[] = "\n[fuzz] input exceeded -timeout\n";
+        (void)write(STDERR_FILENO, msg, sizeof msg - 1);
+    }
     __on_death();
-
-    signal(sig, SIG_DFL);
-    raise(sig);
+    _exit(128 + sig);
 }
 
 static void __run(const uint8_t* data, size_t len) {
     __current = data;
     __current_len = len;
-
+    alarm(__input_timeout);
     LLVMFuzzerTestOneInput(data, len);
-
+    alarm(0);
     __current = NULL;
 }
 
@@ -390,6 +426,7 @@ int main(int argc, char* argv[]) {
     unsigned seconds = 60;
     uint64_t runs = 0;   /* 0 = unlimited, bounded by time */
     const char* corpus_dir = NULL;
+    int replay_only = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strncmp(argv[i], "-seconds=", 9) == 0) seconds = (unsigned)atoi(argv[i] + 9);
@@ -397,14 +434,32 @@ int main(int argc, char* argv[]) {
         else if (strncmp(argv[i], "-seed=", 6) == 0) __rng_state = strtoull(argv[i] + 6, NULL, 10) | 1;
         else if (strncmp(argv[i], "-artifacts=", 11) == 0) __artifact_dir = argv[i] + 11;
         else if (strncmp(argv[i], "-dict=", 6) == 0) __dict_load(argv[i] + 6);
+        else if (strncmp(argv[i], "-timeout=", 9) == 0) __input_timeout = (unsigned)strtoul(argv[i] + 9, NULL, 10);
+        else if (strncmp(argv[i], "-max_len=", 9) == 0) __input_max = (size_t)strtoull(argv[i] + 9, NULL, 10);
         else corpus_dir = argv[i];
     }
+
+    if (__input_timeout == 0 || __input_max == 0 || __input_max > INPUT_LIMIT) {
+        fprintf(stderr, "[fuzz] timeout and max_len must be positive; max_len <= %u\n", INPUT_LIMIT);
+        return 2;
+    }
+    if (corpus_dir != NULL) {
+        struct stat st;
+        replay_only = stat(corpus_dir, &st) == 0 && S_ISREG(st.st_mode);
+    }
+
+    /* Replaying a saved input must not save it again: the verdict is the exit
+     * status, and a copy in the working directory is litter. */
+    if (!replay_only)
+        snprintf(__crash_path, sizeof __crash_path, "%s/crash-%u.bin",
+                 __artifact_dir, (unsigned)getpid());
 
     __sanitizer_set_death_callback(__on_death);
     signal(SIGILL, __on_signal);
     signal(SIGABRT, __on_signal);
+    signal(SIGALRM, __on_signal);
 
-    __corpus_dir = corpus_dir;
+    __corpus_dir = replay_only ? NULL : corpus_dir;
     if (corpus_dir != NULL) __corpus_load(corpus_dir);
 
     /* An empty corpus is not fatal, it is just a slower start: the mutator
@@ -421,9 +476,17 @@ int main(int argc, char* argv[]) {
     for (size_t i = 0; i < __corpus_count; i++)
         __run(__corpus[i].data, __corpus[i].len);
 
+    if (replay_only) {
+        printf("replayed %s (%zu bytes)\n", corpus_dir, __corpus[0].len);
+        for (size_t i = 0; i < __corpus_count; i++) free(__corpus[i].data);
+        for (size_t i = 0; i < __dict_count; i++) free(__dict[i].data);
+        return 0;
+    }
+
     size_t base_cov = __cov_count();
 
-    uint8_t buf[INPUT_MAX];
+    uint8_t* buf = malloc(__input_max);
+    if (buf == NULL) return 2;
     uint64_t executed = 0;
     size_t found = 0;
 
@@ -432,11 +495,11 @@ int main(int argc, char* argv[]) {
     while ((runs == 0 || executed < runs) && time(NULL) < deadline) {
         const input_t* pick = &__corpus[__rnd_below(__corpus_count)];
 
-        size_t len = pick->len < sizeof buf ? pick->len : sizeof buf;
+        size_t len = pick->len < __input_max ? pick->len : __input_max;
         memcpy(buf, pick->data, len);
 
         const size_t rounds = 1 + __rnd_below(4);
-        for (size_t i = 0; i < rounds; i++) len = __mutate(buf, len, sizeof buf);
+        for (size_t i = 0; i < rounds; i++) len = __mutate(buf, len, __input_max);
 
         __run(buf, len);
         executed++;
@@ -465,6 +528,7 @@ int main(int argc, char* argv[]) {
 
     for (size_t i = 0; i < __dict_count; i++) free(__dict[i].data);
     for (size_t i = 0; i < __corpus_count; i++) free(__corpus[i].data);
+    free(buf);
 
     return 0;
 }
