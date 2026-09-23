@@ -351,7 +351,10 @@ json_token_t* __parse_number(json_parser_t* parser) {
 
     token->value._ldouble = strtold(start, &end);
 
-    if (end != start + length) {
+    // Переполнение strtold превращает число в бесконечность, которую JSON
+    // записать не может: сериализатор выдал бы "inf". RFC 8259 §6 разрешает
+    // ограничивать диапазон чисел — такое число отвергается при разборе.
+    if (end != start + length || isinf(token->value._ldouble)) {
         parser->error = "Invalid number";
         return token;
     }
@@ -2393,7 +2396,11 @@ static int __json_stringify_token(json_doc_t* document) {
 
                         // Проверка возвращаемого значения snprintf (int → size_t)
                         int written;
-                        if (is_integer) {
+                        if (isinf(value) || isnan(value)) {
+                            // В JSON нет inf и nan; значение из API пишется
+                            // как null, так же поступает JSON.stringify
+                            written = snprintf(buffer, sizeof(buffer), "null");
+                        } else if (is_integer) {
                             // Целое число
                             written = snprintf(buffer, sizeof(buffer), "%.0Lf", value);
                         } else {

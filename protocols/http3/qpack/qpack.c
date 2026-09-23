@@ -150,17 +150,9 @@ static int __dynamic_insert(qpack_decoder_t* d, const char* name, size_t name_le
 
     /* §3.2.2: an entry larger than the current capacity cannot be inserted. */
     if (size > d->capacity) return 0;
-    while (d->bytes > d->capacity - size) __dynamic_drop_oldest(d);
 
-    if (d->entry_count == d->entry_cap) {
-        const size_t ncap = d->entry_cap ? d->entry_cap * 2 : 8;
-        if (ncap < d->entry_cap) return 0;
-        qpack_dynamic_entry_t* grown = realloc(d->entries, ncap * sizeof *grown);
-        if (grown == NULL) return 0;
-        d->entries = grown;
-        d->entry_cap = ncap;
-    }
-
+    /* Copy before evicting: `name` may point into the very entry the eviction
+     * below frees (Insert With Name Reference to the oldest entry, §3.2.2). */
     char* ncopy = malloc(name_len + 1);
     char* vcopy = malloc(value_len + 1);
     if (ncopy == NULL || vcopy == NULL) {
@@ -168,6 +160,17 @@ static int __dynamic_insert(qpack_decoder_t* d, const char* name, size_t name_le
     }
     memcpy(ncopy, name, name_len); ncopy[name_len] = '\0';
     memcpy(vcopy, value, value_len); vcopy[value_len] = '\0';
+
+    if (d->entry_count == d->entry_cap) {
+        const size_t ncap = d->entry_cap ? d->entry_cap * 2 : 8;
+        qpack_dynamic_entry_t* grown = ncap < d->entry_cap
+            ? NULL : realloc(d->entries, ncap * sizeof *grown);
+        if (grown == NULL) { free(ncopy); free(vcopy); return 0; }
+        d->entries = grown;
+        d->entry_cap = ncap;
+    }
+
+    while (d->bytes > d->capacity - size) __dynamic_drop_oldest(d);
 
     qpack_dynamic_entry_t* e = &d->entries[d->entry_count++];
     e->name = ncopy; e->name_len = name_len;
@@ -279,18 +282,9 @@ qpack_status_e qpack_decoder_read_encoder(qpack_decoder_t* d, const uint8_t* dat
         if (n == 0) break;
         const qpack_dynamic_entry_t* ref = __dynamic_relative(d, idx);
         if (ref == NULL) return QPACK_ERR_ENCODER_STREAM;
-        /* Insertion may realloc/memmove, so copy the referenced bytes first. */
-        char* name = malloc(ref->name_len + 1);
-        char* value = malloc(ref->value_len + 1);
-        if (name == NULL || value == NULL) {
-            free(name); free(value); return QPACK_ERR_MEMORY;
-        }
-        memcpy(name, ref->name, ref->name_len + 1);
-        memcpy(value, ref->value, ref->value_len + 1);
-        const size_t name_len = ref->name_len, value_len = ref->value_len;
-        const int ok = __dynamic_insert(d, name, name_len, value, value_len);
-        free(name); free(value);
-        if (!ok) return QPACK_ERR_ENCODER_STREAM;
+        /* __dynamic_insert copies before it evicts or reallocates. */
+        if (!__dynamic_insert(d, ref->name, ref->name_len, ref->value, ref->value_len))
+            return QPACK_ERR_ENCODER_STREAM;
         if (!__decoder_pending_int(d, 1, 6, 0x00)) return QPACK_ERR_MEMORY;
         p += n;
     }
