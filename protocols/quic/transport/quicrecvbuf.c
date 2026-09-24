@@ -202,10 +202,15 @@ size_t quicrecvbuf_read(quicrecvbuf_t* buf, uint8_t* dst, size_t len) {
         memcpy(dst + taken, seg->data + within, available);
         taken += available;
         buf->read_off += available;
+        /* `buffered` is what the cap measures, and the cap is the flow-control
+         * window, which is granted on bytes read: count them off as they are
+         * read, not when their segment is freed, or the read head of a
+         * part-read segment eats into a window the peer was given. The memory
+         * budget below stays per segment -- that is what is actually held. */
+        buf->buffered -= available;
 
         if (buf->read_off >= seg->offset + seg->len) {
             buf->head = seg->next;
-            buf->buffered -= seg->len;
             quicmemory_release(sizeof *seg + seg->len);
             free(seg->data);
             free(seg);

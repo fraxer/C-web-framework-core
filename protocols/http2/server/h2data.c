@@ -87,6 +87,49 @@ static h2_data_status_e __drain(connection_t* connection, const uint8_t* buf,
     return H2_DATA_DRAINED;
 }
 
+size_t h2_data_writer_owed(const h2_data_writer_t* w, const bufo_t* src, uint8_t* dst,
+                           size_t* payload) {
+    if (payload != NULL) *payload = 0;
+    if (w == NULL) return 0;
+
+    /* A joined buffer is one write: prefix, frame header and payload together.
+     * Its payload is charged to the windows only once the whole buffer has
+     * left, so all of it is still uncharged. */
+    if (w->join_len > 0) {
+        if (w->join_pos == 0) return 0;
+        const size_t n = w->join_len - w->join_pos;
+        if (dst != NULL) memcpy(dst, w->join + w->join_pos, n);
+        if (payload != NULL) *payload = w->join_payload;
+        return n;
+    }
+
+    /* A header block started on its own is finished on its own: the DATA frame
+     * behind it has not begun, since the prefix always drains first. */
+    if (w->prefix != NULL && w->prefix_pos > 0 && w->prefix_pos < w->prefix_len) {
+        const size_t n = w->prefix_len - w->prefix_pos;
+        if (dst != NULL) memcpy(dst, w->prefix + w->prefix_pos, n);
+        return n;
+    }
+
+    if (w->fh_len == 0 || w->fh_pos == 0) return 0;
+
+    size_t n = w->fh_len - w->fh_pos;
+    if (dst != NULL) memcpy(dst, w->fh + w->fh_pos, n);
+
+    /* The payload still owed is at the front of the source, which only ever
+     * advances by what the socket took. Should it be short, the peer gets
+     * zeros: DATA on a stream it will no longer hear about is discarded, and
+     * only its length matters to the framing (RFC 9113 §6.4). */
+    const size_t have = src != NULL ? bufo_chunk_size((bufo_t*)src, w->frame_remaining) : 0;
+    if (dst != NULL) {
+        if (have > 0) memcpy(dst + n, bufo_data((bufo_t*)src), have);
+        memset(dst + n + have, 0, w->frame_remaining - have);
+    }
+    /* The part already written was charged as it went; the rest was not. */
+    if (payload != NULL) *payload = w->frame_remaining;
+    return n + w->frame_remaining;
+}
+
 h2_data_status_e h2_data_flush_prefix(h2_data_writer_t* w, h2session_t* s) {
     if (w == NULL || s == NULL) return H2_DATA_ERROR;
     if (w->prefix == NULL || w->prefix_len <= w->prefix_pos) return H2_DATA_DRAINED;

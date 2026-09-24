@@ -151,6 +151,10 @@ typedef struct h2session {
      * (out of window, or out of write quantum) does NOT get pinned here, because
      * letting somebody else write is exactly the point. See h2_write(). */
     h2stream_t* writing;
+    /* A stream went away mid-frame and the bytes to finish its frame could not
+     * be queued: nothing written after that would parse, so the connection
+     * closes (h2_flush_out). */
+    int framing_broken;
 
     /* Pending outbound frames that did not fit the socket (control frames, the
      * trailing empty DATA). All frame writing happens on the worker's write

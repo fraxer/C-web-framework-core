@@ -30,6 +30,11 @@ struct h2session;
  * a second resumable-write path. Returns 1 on success. */
 int h2_write_filter_trailers(struct h2session* s, h2stream_t* stream, httpresponse_t* response);
 
+/* What the response's writer owes the wire to finish the frame it is in the
+ * middle of (see h2_data_writer_owed): a header block drained on its own, or
+ * the DATA writer's state. 0 on a frame boundary; `dst` NULL only counts. */
+size_t h2_write_filter_owed(httpresponse_t* response, uint8_t* dst, size_t* payload);
+
 /* Encode one informational response (103 Early Hints) into a HEADERS block and
  * queue it — docs/http2/08, phase E.2. No END_STREAM: a 1xx is not the final
  * response, and the stream carries on. `fields` is borrowed, not consumed. */

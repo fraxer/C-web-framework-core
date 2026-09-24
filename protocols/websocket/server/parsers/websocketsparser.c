@@ -509,6 +509,12 @@ int websocketsparser_parse_payload(websocketsparser_t* parser) {
         return WSPARSER_COMPLETE;
     }
 
+    /* The read ended exactly with this fragment. The caller answers
+     * HANDLE_AND_CONTINUE with prepare_remains and runs the parser again over
+     * the same read, starting at pos: leave pos past the payload, or the
+     * second run parses the (already unmasked) payload as the next frame. */
+    parser->pos += size;
+
     return WSPARSER_HANDLE_AND_CONTINUE;
 }
 

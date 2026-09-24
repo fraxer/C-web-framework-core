@@ -285,8 +285,18 @@ int __httpresponseparser_parse_payload(httpresponseparser_t* parser) {
             return HTTP1PARSER_ERROR;
     }
 
-    const size_t string_len = parser->pos - parser->pos_start;
+    size_t string_len = parser->pos - parser->pos_start;
     const size_t client_max_body_size = env()->main.client_max_body_size;
+
+    /* A Content-Length body ends at its length, wherever the read ends: what
+     * follows in the same read -- a stray CRLF, the start of another response,
+     * junk -- is not body (RFC 9112 §6.3). Counted in wire bytes, so for gzip
+     * this bounds the compressed input, as content_saved_length does below. */
+    if (response->transfer_encoding != TE_CHUNKED) {
+        const size_t owed = parser->content_length > parser->content_saved_length
+            ? parser->content_length - parser->content_saved_length : 0;
+        if (string_len > owed) string_len = owed;
+    }
 
     /*
      * Лимит размера тела считаем по фактически записанным в файл байтам

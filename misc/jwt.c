@@ -93,6 +93,32 @@ static char* base64url_to_base64(const char* str) {
     return result;
 }
 
+// A signature in its one canonical base64url spelling (RFC 7515 §2): only the
+// URL-safe alphabet, no padding, no length the encoding cannot produce, and the
+// unused low bits of the last character zero. The decoder below reads the
+// standard alphabet too and stops at the first character outside it, so
+// without this "SIG==", "SIG=anything", '+' for '-' and a last character with
+// a stray bit all verified as the same token -- not a forgery, but a token that
+// can be spelled many ways gets past any check that compares tokens as strings
+// (a revocation list, a replay cache). Found by fuzz_jwt.
+static int base64url_value(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '-') return 62;
+    if (c == '_') return 63;
+    return -1;
+}
+
+static int base64url_canonical(const char* s, size_t len) {
+    if (len % 4 == 1) return 0;
+    for (size_t i = 0; i < len; i++)
+        if (base64url_value(s[i]) < 0) return 0;
+    if (len % 4 == 2) return (base64url_value(s[len - 1]) & 0x0f) == 0;
+    if (len % 4 == 3) return (base64url_value(s[len - 1]) & 0x03) == 0;
+    return 1;
+}
+
 // ============================================================================
 // Internal: Get EVP_MD for algorithm
 // ============================================================================
@@ -999,6 +1025,11 @@ jwt_t jwt_decode(const char* token, const jwt_key_t* key) {
     size_t payload_b64_len = second_dot - first_dot - 1;
     size_t signature_b64_len = strlen(second_dot + 1);
 
+    if (!base64url_canonical(second_dot + 1, signature_b64_len)) {
+        result.error = JWT_ERROR_INVALID_SIGNATURE;
+        return result;
+    }
+
     // Decode header first to check algorithm
     char* header_b64 = malloc(header_b64_len + 1);
     if (!header_b64) {
@@ -1191,6 +1222,9 @@ jwt_result_t jwt_verify(const char* token, const jwt_key_t* key) {
     size_t header_b64_len = first_dot - token;
     size_t payload_b64_len = second_dot - first_dot - 1;
     size_t signature_b64_len = strlen(second_dot + 1);
+
+    if (!base64url_canonical(second_dot + 1, signature_b64_len))
+        return JWT_ERROR_INVALID_SIGNATURE;
 
     // Decode header to check algorithm
     char* header_b64 = malloc(header_b64_len + 1);

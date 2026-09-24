@@ -334,6 +334,16 @@ int h2_session_queue_frame(h2session_t* s, uint8_t type, uint8_t flags,
 static int h2_flush_out(h2session_t* s) {
     connection_t* conn = s->connection;
 
+    /* A stream stopped mid-frame owns the socket (see h2_write): the peer has
+     * a frame header promising N bytes of one stream's payload, and a control
+     * frame written now lands inside them -- found by fuzz_h2_connection as a
+     * PING ACK spliced into a DATA frame the socket had taken half of. The
+     * queued frames go out once h2_write has finished that frame. Reported as
+     * "blocked", which every caller already answers with an EPOLLOUT turn. */
+    if (s->framing_broken) return 0;
+    if (s->writing != NULL)
+        return s->out_pos < s->out_len ? -1 : 1;
+
     /* Whatever window credit is queued is on its way to the peer now — see
      * h2_recv_settle. Done here rather than in the callers because this is the
      * one place every path goes through on its way to the socket. */
@@ -684,10 +694,55 @@ static h2_frame_result_e h2_ctrl_flood(h2session_t* s, const char* what) {
 
 /* Retire a stream, keeping the session's write cursor consistent. h2stream_close
  * keeps the stream alive when a handler still holds its request/response. */
+/* A stream going away while it owns the socket mid-frame leaves the peer
+ * waiting for the rest of that frame -- a DATA frame header promising 16384
+ * bytes and 8174 of them sent, as fuzz_h2_connection found for a client that
+ * reset a download the socket was backed up on. Whatever is written next would
+ * be read as the missing payload. So the missing bytes are taken from the
+ * stream's writer now, while its buffers still exist, and put at the front of
+ * the queue h2_flush_out drains: the frame is finished before anything else. */
+static int h2_session_settle_frame(h2session_t* s, h2stream_t* stream) {
+    size_t payload = 0;
+    const size_t owed = stream->ws != NULL && stream->response == NULL
+        ? h2_ws_tunnel_owed(stream, NULL, &payload)
+        : h2_write_filter_owed(stream->response, NULL, &payload);
+    if (owed == 0) return 1;
+
+    const size_t pending = s->out_len - s->out_pos;
+    if (s->out_cap < pending + owed) {
+        size_t cap = s->out_cap ? s->out_cap : 256;
+        while (cap < pending + owed) cap *= 2;
+        uint8_t* buf = realloc(s->out, cap);
+        if (buf == NULL) return 0;
+        s->out = buf;
+        s->out_cap = cap;
+    }
+    if (pending > 0) memmove(s->out + owed, s->out + s->out_pos, pending);
+
+    if (stream->ws != NULL && stream->response == NULL)
+        (void)h2_ws_tunnel_owed(stream, s->out, NULL);
+    else
+        (void)h2_write_filter_owed(stream->response, s->out, NULL);
+    s->out_pos = 0;
+    s->out_len = owed + pending;
+
+    /* The payload finished here counts against the connection window like
+     * any other DATA (RFC 9113 §6.9.1) -- found by fuzz_h2_connection when the
+     * uncharged remainder let the next stream overrun the client's window.
+     * The stream's own window goes with the stream. */
+    s->send_window -= (int64_t)payload;
+    return 1;
+}
+
 static void h2_session_drop_stream(h2session_t* s, h2stream_t* stream) {
     if (stream == NULL) return;
 
-    if (s->writing == stream) s->writing = NULL;
+    if (s->writing == stream) {
+        /* Out of memory for a few KiB leaves no way to keep the framing
+         * intact: the connection has to go (h2_flush_out reports it). */
+        if (!h2_session_settle_frame(s, stream)) s->framing_broken = 1;
+        s->writing = NULL;
+    }
 
     h2stream_close(s, stream);
 }
@@ -2204,9 +2259,13 @@ static int h2_write(connection_t* connection) {
      * the drain sets. (docs/concurrency/01 §4.1, phase B) */
     h2_publish_drain(s);
 
-    const int flushed = h2_flush_out(s);
-    if (flushed == 0) return 0;
-    if (flushed < 0) return rearm(connection, MPXOUT | MPXRDHUP);
+    /* Queued control frames first -- unless a stream is mid-frame, in which
+     * case h2_flush_out holds them back and the frame is finished below. */
+    if (s->writing == NULL) {
+        const int flushed = h2_flush_out(s);
+        if (flushed == 0) return 0;
+        if (flushed < 0) return rearm(connection, MPXOUT | MPXRDHUP);
+    }
 
     int socket_full = 0;
     int window_stalled = 0;
@@ -2246,8 +2305,8 @@ static int h2_write(connection_t* connection) {
             s->writing = NULL;
             return h2_fail(s, H2_ERR_INTERNAL_ERROR);
         case H2_WRITE_SOCKET:
-            /* Still mid-frame: nobody else may touch the socket. */
-            if (h2_flush_out(s) == 0) return 0;
+            /* Still mid-frame: nobody else may touch the socket, the queued
+             * control frames included. */
             atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
             return rearm(connection, MPXOUT | MPXRDHUP);
         case H2_WRITE_WINDOW:
@@ -2261,6 +2320,16 @@ static int h2_write(connection_t* connection) {
             s->writing = NULL;
             h2_write_finished(s, stream);
             break;
+        }
+
+        /* The frame is finished: what was held back goes now, and before any
+         * other stream -- a control frame the socket took only part of is a
+         * frame in progress too. */
+        const int flushed = h2_flush_out(s);
+        if (flushed == 0) return 0;
+        if (flushed < 0) {
+            atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
+            return rearm(connection, MPXOUT | MPXRDHUP);
         }
     }
 

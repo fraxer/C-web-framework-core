@@ -204,6 +204,12 @@ static int openssl_context_init(openssl_t* openssl) {
     SSL_CTX_set_options(openssl->ctx, SSL_OP_ALL | SSL_OP_NO_SSLv2 | SSL_OP_NO_SSLv3 | SSL_OP_NO_RENEGOTIATION);
     SSL_CTX_set_quiet_shutdown(openssl->ctx, 1);
 
+    /* A write refused with WANT_WRITE is retried with the same bytes, but not
+     * always from the same address: the h2 session compacts and grows its
+     * output buffer, and moves the unsent rest of a frame there when its stream
+     * is dropped. By default OpenSSL fails such a retry as "bad write retry". */
+    SSL_CTX_set_mode(openssl->ctx, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+
     if (SSL_CTX_set_min_proto_version(openssl->ctx, TLS1_2_VERSION) != 1) {
         log_error(OPENSSL_ERROR_MIN_PROTO);
         goto failed;

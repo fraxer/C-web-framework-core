@@ -43,14 +43,15 @@ int quicrange_add(quicrange_t* r, uint64_t start, uint64_t end) {
 
     /* Find the first interval that could touch this one. Adjacency counts:
      * [1,3] and [4,6] must become [1,6], since the ACK encoding cannot express
-     * a gap of zero. The guard on start avoids underflow at 0. */
+     * a gap of zero. Written as `x < y - 1` with y > 0 rather than
+     * `x + 1 < y`: the latter wraps for a span ending at UINT64_MAX, which then
+     * looked as if it lay before every interval added after it. */
     size_t i = 0;
-    while (i < r->count && r->spans[i].end + 1 < start &&
-           !(start == 0 && r->spans[i].end + 1 == 0))
+    while (i < r->count && start > 0 && r->spans[i].end < start - 1)
         i++;
 
     /* No overlap and no adjacency: a plain insert at i. */
-    if (i == r->count || (end + 1 < r->spans[i].start && end != UINT64_MAX)) {
+    if (i == r->count || (r->spans[i].start > 0 && end < r->spans[i].start - 1)) {
         if (!__grow(r)) return 0;
 
         memmove(&r->spans[i + 1], &r->spans[i],

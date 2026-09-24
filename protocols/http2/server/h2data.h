@@ -88,6 +88,19 @@ void h2_data_writer_prefix(h2_data_writer_t* w, const uint8_t* data, size_t len)
  * h2_data_write. */
 h2_data_status_e h2_data_flush_prefix(h2_data_writer_t* w, struct h2session* s);
 
+/* The bytes that finish what this writer has already started on the wire: the
+ * rest of a HEADERS prefix, of a joined buffer, or of a DATA frame header and
+ * its payload (taken from `src`, which is the buffer the frame was cut from).
+ * 0 when the writer stands on a frame boundary. With `dst` NULL only counts.
+ * `payload`, when not NULL, receives how many of those bytes are DATA payload
+ * that no send window has been charged for yet.
+ *
+ * For a stream that goes away mid-frame (h2_session_drop_stream): the peer has
+ * been promised those bytes, and anything else written first would be read as
+ * part of them. */
+size_t h2_data_writer_owed(const h2_data_writer_t* w, const bufo_t* src, uint8_t* dst,
+                           size_t* payload);
+
 void h2_data_writer_reset(h2_data_writer_t* w);
 
 /* Push as much of `src` as the windows, the quantum and the socket allow.

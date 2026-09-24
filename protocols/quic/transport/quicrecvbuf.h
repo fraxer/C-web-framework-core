@@ -37,7 +37,7 @@ typedef struct quicrecvbuf {
     uint64_t contig_end;      /* end of the readable prefix */
     uint64_t max_offset;      /* highest offset+len ever seen (for final size) */
 
-    size_t   buffered;        /* bytes held in segments */
+    size_t   buffered;        /* bytes held and not yet read */
     size_t   limit;           /* cap on `buffered`; 0 = unlimited */
 
     int      fin;             /* final size is known */

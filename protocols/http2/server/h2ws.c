@@ -162,6 +162,21 @@ static int h2_ws_wake(connection_t* connection, void* owner, int handler_done) {
     return connection_after_read(connection);
 }
 
+size_t h2_ws_tunnel_owed(h2stream_t* stream, uint8_t* dst, size_t* payload) {
+    if (payload != NULL) *payload = 0;
+    h2_ws_tunnel_t* tunnel = stream != NULL ? stream->ws : NULL;
+    if (tunnel == NULL || tunnel->writing == NULL) return 0;
+
+    const websocketsresponse_t* response = tunnel->writing;
+    bufo_t view = {0};
+    view.data = response->body.data;
+    view.size = response->body.size;
+    view.pos = response->body.pos;
+    view.capacity = response->body.size;
+
+    return h2_data_writer_owed(&tunnel->writer, &view, dst, payload);
+}
+
 h2_data_status_e h2_ws_tunnel_write(h2session_t* s, h2stream_t* stream) {
     h2_ws_tunnel_t* tunnel = stream->ws;
 

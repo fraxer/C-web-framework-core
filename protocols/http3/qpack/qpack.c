@@ -567,26 +567,47 @@ static int __encoder_pending_bytes(qpack_encoder_t* e, const void* data, size_t 
     return 1;
 }
 
+/* §2.1.1: an entry becomes evictable only once its insertion has been
+ * acknowledged and no unacknowledged section references it. The first half is
+ * not a formality: it is what keeps the encoder at most MaxEntries insertions
+ * ahead of the decoder, and a Required Insert Count further ahead than that is
+ * one the decoder cannot reconstruct from its modular encoding (§4.5.1.1). */
 static int __encoder_entry_protected(const qpack_encoder_t* e, uint64_t absolute) {
+    if (absolute >= e->known_received_count) return 1;
     for (size_t i = 0; i < e->section_count; i++)
         if (e->sections[i].required_insert_count > absolute) return 1;
     return 0;
 }
 
-static int __encoder_make_room(qpack_encoder_t* e, size_t size) {
-    if (size > e->capacity) return 0;
-    while (e->bytes > e->capacity - size) {
-        if (e->entry_count == 0 || __encoder_entry_protected(e, e->entries[0].absolute))
+/* Evict the oldest entries until the table holds at most `limit` bytes -- or
+ * evict nothing and return 0, when one of them is not evictable. Checked for
+ * every entry first: an eviction the encoder makes on its own copy reaches the
+ * decoder only with the instruction that caused it, so a refused instruction
+ * must leave the table exactly as it was, or the two copies part ways. */
+static int __encoder_evict_to(qpack_encoder_t* e, size_t limit) {
+    size_t bytes = e->bytes, evict = 0;
+    while (bytes > limit) {
+        if (evict == e->entry_count ||
+            __encoder_entry_protected(e, e->entries[evict].absolute))
             return 0;
-        qpack_dynamic_entry_t* oldest = &e->entries[0];
-        e->bytes -= oldest->size;
-        e->evictions++;
-        free(oldest->name); free(oldest->value);
-        e->entry_count--;
-        if (e->entry_count != 0)
-            memmove(e->entries, e->entries + 1, e->entry_count * sizeof *e->entries);
+        bytes -= e->entries[evict++].size;
+    }
+    for (size_t i = 0; i < evict; i++) {
+        free(e->entries[i].name);
+        free(e->entries[i].value);
+    }
+    if (evict != 0) {
+        memmove(e->entries, e->entries + evict, (e->entry_count - evict) * sizeof *e->entries);
+        e->entry_count -= evict;
+        e->evictions += evict;
+        e->bytes = bytes;
     }
     return 1;
+}
+
+static int __encoder_make_room(qpack_encoder_t* e, size_t size) {
+    if (size > e->capacity) return 0;
+    return __encoder_evict_to(e, e->capacity - size);
 }
 
 qpack_status_e qpack_encoder_insert_literal(qpack_encoder_t* e,
@@ -842,7 +863,18 @@ static int __encoder_pending_int(qpack_encoder_t* e, uint64_t value,
 
 qpack_status_e qpack_encoder_set_capacity(qpack_encoder_t* e, size_t capacity) {
     if (e == NULL || capacity > e->max_capacity) return QPACK_ERR_ENCODER_STREAM;
+
+    /* The decoder evicts down to the new capacity when this instruction
+     * arrives (§3.2.2), so the encoder's copy has to evict the same entries
+     * now, or it goes on referencing ones the peer no longer has. And §4.3.1:
+     * not below what is still not evictable. The instruction is queued first
+     * and withdrawn if the eviction is refused, so a refusal changes nothing. */
+    const size_t old_pending = e->pending_len;
     if (!__encoder_pending_int(e, capacity, 5, 0x20)) return QPACK_ERR_MEMORY;
+    if (!__encoder_evict_to(e, capacity)) {
+        e->pending_len = old_pending;
+        return QPACK_ERR_ENCODER_STREAM;
+    }
     e->capacity = capacity;
     return QPACK_OK;
 }

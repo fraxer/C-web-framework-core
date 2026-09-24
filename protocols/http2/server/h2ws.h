@@ -99,4 +99,8 @@ int h2_ws_tunnel_has_output(const h2_ws_tunnel_t* tunnel);
  * SOCKET, rotate on WINDOW/YIELD — apply unchanged. */
 h2_data_status_e h2_ws_tunnel_write(struct h2session* s, h2stream_t* stream);
 
+/* What the tunnel's writer owes the wire to finish its current DATA frame;
+ * see h2_data_writer_owed. */
+size_t h2_ws_tunnel_owed(h2stream_t* stream, uint8_t* dst, size_t* payload);
+
 #endif

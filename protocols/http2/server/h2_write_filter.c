@@ -492,6 +492,30 @@ int h2_write_filter_trailers(h2session_t* s, h2stream_t* stream, httpresponse_t*
     return ok;
 }
 
+size_t h2_write_filter_owed(httpresponse_t* response, uint8_t* dst, size_t* payload) {
+    if (payload != NULL) *payload = 0;
+    if (response == NULL) return 0;
+
+    for (http_filter_t* f = response->filter; f != NULL; f = f->next) {
+        if (f->handler_body != __body) continue;
+
+        h2_module_write_t* module = f->module;
+        bufo_t* block = module->buf;
+
+        /* The HEADERS block went out through __write_bufo, not as a prefix,
+         * and the socket took part of it. */
+        if (module->writer.prefix == NULL && block->pos > 0 && block->pos < block->size) {
+            const size_t n = block->size - block->pos;
+            if (dst != NULL) memcpy(dst, bufo_data(block), n);
+            return n;
+        }
+
+        return h2_data_writer_owed(&module->writer, module->base.parent_buf, dst, payload);
+    }
+
+    return 0;
+}
+
 http_filter_t* h2_write_filter_create(void) {
     http_filter_t* filter = malloc(sizeof * filter);
     if (filter == NULL) return NULL;
