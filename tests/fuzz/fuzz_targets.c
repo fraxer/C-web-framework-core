@@ -59,10 +59,13 @@
 #if FUZZ_TARGET == FUZZ_QUIC_PACKET || FUZZ_TARGET == FUZZ_QUIC_FRAME || \
     FUZZ_TARGET == FUZZ_QUIC_TP     || FUZZ_TARGET == FUZZ_H3_FRAME   || \
     FUZZ_TARGET == FUZZ_QPACK_DECODE || FUZZ_TARGET == FUZZ_QPACK_STREAMS || \
-    FUZZ_TARGET == FUZZ_H3_PRIORITY || FUZZ_TARGET == FUZZ_QPACK_DYNAMIC
+    FUZZ_TARGET == FUZZ_H3_PRIORITY || FUZZ_TARGET == FUZZ_QPACK_DYNAMIC || \
+    FUZZ_TARGET == FUZZ_QPACK_SESSION || FUZZ_TARGET == FUZZ_QUIC_STREAM || \
+    FUZZ_TARGET == FUZZ_H3_REQUEST
 #include "h3frame.h"
 #include "h3priority.h"
 #include "qpack.h"
+#include "qpack_statictable.h"
 #include "quicframe.h"
 #include "quicpacket.h"
 #include "quictp.h"
@@ -73,7 +76,9 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size);
 
 #if FUZZ_TARGET == FUZZ_REQUEST || FUZZ_TARGET == FUZZ_REQUEST_SEQUENCE || \
     FUZZ_TARGET == FUZZ_WEBSOCKET || FUZZ_TARGET == FUZZ_WEBSOCKET_SEQUENCE || \
-    FUZZ_TARGET == FUZZ_H2_SESSION
+    FUZZ_TARGET == FUZZ_H2_SESSION || FUZZ_TARGET == FUZZ_H2_CONNECTION || \
+    FUZZ_TARGET == FUZZ_H3_REQUEST || FUZZ_TARGET == FUZZ_HTTP_RESPONSE || \
+    FUZZ_TARGET == FUZZ_SMTP_RESPONSE
 
 /* The parser asks the running configuration what the largest acceptable body
  * is, and there is no configuration here. Overridden the way
@@ -192,7 +197,9 @@ static int __fuzz_payload_fd(const uint8_t* data, size_t size) {
 
 #endif
 
-#if FUZZ_TARGET == FUZZ_MULTIPART || FUZZ_TARGET == FUZZ_REQUEST_SEQUENCE
+#if FUZZ_TARGET == FUZZ_MULTIPART || FUZZ_TARGET == FUZZ_REQUEST_SEQUENCE || \
+    FUZZ_TARGET == FUZZ_WEBSOCKET_SEQUENCE || FUZZ_TARGET == FUZZ_H3_REQUEST || \
+    FUZZ_TARGET == FUZZ_HTTP_RESPONSE
 
 /* FNV-1a over what a parse produced, so that deliveries of the same bytes in
  * different reads can be compared without keeping every result around. */
@@ -412,6 +419,732 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         qpack_decoder_consume(d, qpack_decoder_pending(d, &pending));
     }
     qpack_decoder_free(d);
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_QPACK_SESSION
+
+/* Our QPACK encoder talking to our QPACK decoder, both service streams in
+ * between, driven by a script the input writes. qpack_dynamic feeds the
+ * decoder bytes a peer chose; this one asks whether the two halves agree when
+ * everything on the wire is correct -- which is what a real connection needs,
+ * and what a table that drifts apart on one side breaks without either parser
+ * ever seeing a malformed byte.
+ *
+ * Each script byte is an operation, followed by its arguments:
+ *
+ *   0 capacity   Set Dynamic Table Capacity
+ *   1-4 insert   literal name, static name, dynamic name, duplicate
+ *   5 section    prepare + encode a field section on a stream, blocking or
+ *                confirmed-only, and keep it for later decoding
+ *   6 encoder    deliver some encoder-stream bytes to the decoder
+ *   7 decode     try the oldest section of a stream: BLOCKED, or decode it,
+ *                compare every field and acknowledge it if it used the table
+ *   8 decoder    deliver some decoder-stream bytes to the encoder
+ *   9 cancel     the decoder cancels a stream and forgets its sections
+ *
+ * An encoder call may refuse (a table pinned by outstanding sections, an
+ * entry larger than the capacity); that is policy. What may not happen:
+ * either stream reader rejecting what the other side wrote, a section that
+ * decodes to other fields than it was encoded from, more streams able to
+ * block than SETTINGS allowed, or -- once everything has been delivered,
+ * decoded and acknowledged -- two tables that do not agree. */
+
+#define QS_STREAMS 8
+#define QS_SECTIONS 64
+#define QS_FIELDS 4
+
+typedef struct {
+    int stream;
+    uint8_t* block;
+    size_t len;
+    qpack_header_t fields[QS_FIELDS];
+    size_t count;
+    uint64_t ric;
+} qs_section_t;
+
+typedef struct {
+    qpack_encoder_t* e;
+    qpack_decoder_t* d;
+    qs_section_t sections[QS_SECTIONS];   /* in encode order */
+    size_t section_count;
+    uint8_t enc_wire[65536];              /* delivered, not yet consumed */
+    size_t enc_wire_len;
+    uint8_t dec_wire[65536];
+    size_t dec_wire_len;
+    /* A cancelled stream is gone for good: its id is never used again, so a
+     * slot moves on to a fresh id. Reusing one would let the cancellation,
+     * still in flight, release a section encoded after it -- a case a real
+     * connection cannot produce. */
+    uint64_t generation[QS_STREAMS];
+    const uint8_t* p;
+    const uint8_t* end;
+} qs_t;
+
+static const char* const qs_names[] = {
+    "x-a", "x-b", "content-type", "cookie", ":path", "user-agent", "accept"
+};
+
+static uint8_t qs_byte(qs_t* q) { return q->p < q->end ? *q->p++ : 0; }
+
+static uint64_t qs_stream_id(const qs_t* q, int slot) {
+    return ((uint64_t)slot + QS_STREAMS * q->generation[slot]) * 4;
+}
+
+/* A value of 0..15 bytes from the script. */
+static size_t qs_value(qs_t* q, const char** out) {
+    size_t n = qs_byte(q) % 16;
+    if (n > (size_t)(q->end - q->p)) n = (size_t)(q->end - q->p);
+    *out = (const char*)q->p;
+    q->p += n;
+    return n;
+}
+
+static void qs_section_free(qs_section_t* s) {
+    free(s->block);
+    for (size_t i = 0; i < s->count; i++) {
+        free(s->fields[i].name);
+        free(s->fields[i].value);
+    }
+    memset(s, 0, sizeof *s);
+}
+
+static void qs_section_drop(qs_t* q, size_t i) {
+    qs_section_free(&q->sections[i]);
+    memmove(q->sections + i, q->sections + i + 1,
+            (q->section_count - i - 1) * sizeof *q->sections);
+    q->section_count--;
+    memset(&q->sections[q->section_count], 0, sizeof q->sections[0]);
+}
+
+static void qs_deliver_encoder(qs_t* q, size_t want) {
+    const uint8_t* pending = NULL;
+    size_t n = qpack_encoder_pending(q->e, &pending);
+    if (n > want) n = want;
+    if (n > sizeof q->enc_wire - q->enc_wire_len) n = sizeof q->enc_wire - q->enc_wire_len;
+    if (n != 0) memcpy(q->enc_wire + q->enc_wire_len, pending, n);
+    q->enc_wire_len += n;
+    qpack_encoder_consume(q->e, n);
+
+    size_t consumed = 0;
+    if (qpack_decoder_read_encoder(q->d, q->enc_wire, q->enc_wire_len, &consumed) != QPACK_OK)
+        __builtin_trap();                 /* our decoder refused our encoder */
+    if (consumed > q->enc_wire_len) __builtin_trap();
+    memmove(q->enc_wire, q->enc_wire + consumed, q->enc_wire_len - consumed);
+    q->enc_wire_len -= consumed;
+}
+
+static void qs_deliver_decoder(qs_t* q, size_t want) {
+    const uint8_t* pending = NULL;
+    size_t n = qpack_decoder_pending(q->d, &pending);
+    if (n > want) n = want;
+    if (n > sizeof q->dec_wire - q->dec_wire_len) n = sizeof q->dec_wire - q->dec_wire_len;
+    if (n != 0) memcpy(q->dec_wire + q->dec_wire_len, pending, n);
+    q->dec_wire_len += n;
+    qpack_decoder_consume(q->d, n);
+
+    size_t consumed = 0;
+    if (qpack_encoder_read_decoder_state(q->e, q->dec_wire, q->dec_wire_len, &consumed) != QPACK_OK)
+        __builtin_trap();                 /* our encoder refused our decoder */
+    if (consumed > q->dec_wire_len) __builtin_trap();
+    memmove(q->dec_wire, q->dec_wire + consumed, q->dec_wire_len - consumed);
+    q->dec_wire_len -= consumed;
+    if (q->e->known_received_count > q->e->insert_count) __builtin_trap();
+}
+
+/* The oldest undecoded section of a stream: sections of one stream are
+ * decoded in order, as a request's headers come before its trailers. */
+static int qs_oldest(const qs_t* q, int stream) {
+    for (size_t i = 0; i < q->section_count; i++)
+        if (q->sections[i].stream == stream) return (int)i;
+    return -1;
+}
+
+/* Returns 1 when the section was decoded, 0 when it is still blocked. */
+static int qs_decode(qs_t* q, size_t i) {
+    qs_section_t* s = &q->sections[i];
+    qpack_header_t* out = NULL;
+    size_t count = 0;
+    const qpack_status_e st = qpack_decode_block(q->d, s->block, s->len, 1 << 20, &out, &count);
+    if (getenv("FUZZ_TRACE") != NULL)
+        fprintf(stderr, "decode stream %d ric %llu: status %d, count %zu/%zu, "
+                "decoder inserts %llu bytes %zu cap %zu, encoder inserts %llu bytes %zu cap %zu\n",
+                s->stream, (unsigned long long)s->ric, st, count, s->count,
+                (unsigned long long)qpack_decoder_insert_count(q->d), qpack_decoder_bytes(q->d),
+                qpack_decoder_capacity(q->d), (unsigned long long)q->e->insert_count,
+                q->e->bytes, q->e->capacity);
+    if (st == QPACK_BLOCKED) {
+        if (s->ric <= qpack_decoder_insert_count(q->d)) __builtin_trap();
+        return 0;
+    }
+    if (st != QPACK_OK || count != s->count) __builtin_trap();
+    for (size_t k = 0; k < count; k++)
+        if (out[k].name_len != s->fields[k].name_len ||
+            out[k].value_len != s->fields[k].value_len ||
+            memcmp(out[k].name, s->fields[k].name, out[k].name_len) != 0 ||
+            memcmp(out[k].value, s->fields[k].value, out[k].value_len) != 0 ||
+            out[k].never_indexed != s->fields[k].never_indexed)
+            __builtin_trap();
+    qpack_headers_free(out, count);
+
+    /* §4.4.1: acknowledged only when the section referenced the table. */
+    if (s->ric != 0 && qpack_decoder_ack_section(q->d, qs_stream_id(q, s->stream)) != QPACK_OK)
+        __builtin_trap();
+    qs_section_drop(q, i);
+    return 1;
+}
+
+static void qs_encode(qs_t* q) {
+    const uint8_t how = qs_byte(q);
+    const int stream = how % QS_STREAMS;
+    const int confirmed = (how & 0x80) != 0;
+    if (q->section_count == QS_SECTIONS) return;
+
+    qs_section_t* s = &q->sections[q->section_count];
+    memset(s, 0, sizeof *s);
+    s->count = (size_t)(how >> 3 & 3) + 1;
+    for (size_t k = 0; k < s->count; k++) {
+        const uint8_t pick = qs_byte(q);
+        const char* name = qs_names[pick % (sizeof qs_names / sizeof qs_names[0])];
+        const char* value;
+        const size_t value_len = qs_value(q, &value);
+        s->fields[k].name = strdup(name);
+        s->fields[k].name_len = strlen(name);
+        s->fields[k].value = malloc(value_len + 1);
+        if (s->fields[k].name == NULL || s->fields[k].value == NULL) { qs_section_free(s); return; }
+        memcpy(s->fields[k].value, value, value_len);
+        s->fields[k].value[value_len] = '\0';
+        s->fields[k].value_len = value_len;
+        s->fields[k].never_indexed = (pick & 0x80) != 0;
+    }
+
+    if (qpack_encoder_prepare_fields(q->e, s->fields, s->count) == QPACK_ERR_MEMORY) {
+        qs_section_free(s);
+        return;
+    }
+    uint8_t block[4096];
+    const size_t n = confirmed
+        ? qpack_encode_block_for_stream_confirmed(q->e, qs_stream_id(q, stream), s->fields,
+                                                  s->count, block, sizeof block)
+        : qpack_encode_block_for_stream(q->e, qs_stream_id(q, stream), s->fields, s->count,
+                                        block, sizeof block);
+    if (n == 0) { qs_section_free(s); return; }
+    s->block = malloc(n);
+    if (s->block == NULL) { qs_section_free(s); return; }
+    memcpy(s->block, block, n);
+    s->len = n;
+    s->stream = stream;
+    const qpack_status_e ric_status = qpack_required_insert_count(q->d, block, n, &s->ric);
+    if (ric_status != QPACK_OK && ric_status != QPACK_BLOCKED) __builtin_trap();
+    if (s->ric > q->e->insert_count) __builtin_trap();
+    if (confirmed && s->ric > q->e->known_received_count) __builtin_trap();
+    q->section_count++;
+
+    /* §2.1.2: no more streams able to block than SETTINGS allowed. */
+    size_t blocking = 0;
+    for (int st = 0; st < QS_STREAMS; st++)
+        for (size_t i = 0; i < q->section_count; i++)
+            if (q->sections[i].stream == st &&
+                q->sections[i].ric > q->e->known_received_count) { blocking++; break; }
+    if (blocking > q->e->max_blocked) __builtin_trap();
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 2) return 0;
+    const size_t max_capacity = (size_t)data[0] * 16;       /* 0..4080 */
+    const size_t max_blocked = data[1] % 5;
+
+    qs_t* q = calloc(1, sizeof *q);
+    if (q == NULL) return 0;
+    q->e = qpack_encoder_create(max_capacity, max_blocked);
+    q->d = qpack_decoder_create(max_capacity, max_blocked);
+    q->p = data + 2;
+    q->end = data + size;
+    if (q->e == NULL || q->d == NULL) goto out;
+
+    for (size_t steps = 0; q->p < q->end && steps < 4096; steps++) {
+        const uint8_t op = qs_byte(q);
+        const char* value;
+        if (getenv("FUZZ_TRACE") != NULL)
+            fprintf(stderr, "op %d: encoder inserts %llu bytes %zu cap %zu krc %llu sections %zu\n",
+                    op % 10, (unsigned long long)q->e->insert_count, q->e->bytes, q->e->capacity,
+                    (unsigned long long)q->e->known_received_count, q->e->section_count);
+        switch (op % 10) {
+        case 0:
+            (void)qpack_encoder_set_capacity(q->e, (size_t)qs_byte(q) * 16);
+            break;
+        case 1: {
+            const char* name = qs_names[qs_byte(q) % (sizeof qs_names / sizeof qs_names[0])];
+            const size_t n = qs_value(q, &value);
+            (void)qpack_encoder_insert_literal(q->e, name, strlen(name), value, n, NULL);
+            break;
+        }
+        case 2: {
+            const uint8_t idx = qs_byte(q);
+            const size_t n = qs_value(q, &value);
+            (void)qpack_encoder_insert_static_name(q->e, idx % QPACK_STATIC_TABLE_SIZE, value, n, NULL);
+            break;
+        }
+        case 3: {
+            const uint8_t rel = qs_byte(q);
+            const size_t n = qs_value(q, &value);
+            (void)qpack_encoder_insert_dynamic_name(q->e, rel % 8, value, n, NULL);
+            break;
+        }
+        case 4:
+            (void)qpack_encoder_duplicate(q->e, qs_byte(q) % 8, NULL);
+            break;
+        case 5:
+            qs_encode(q);
+            break;
+        case 6:
+            qs_deliver_encoder(q, (size_t)qs_byte(q) + 1);
+            break;
+        case 7: {
+            const int i = qs_oldest(q, qs_byte(q) % QS_STREAMS);
+            if (i >= 0) (void)qs_decode(q, (size_t)i);
+            break;
+        }
+        case 8:
+            qs_deliver_decoder(q, (size_t)qs_byte(q) + 1);
+            break;
+        case 9: {
+            const int stream = qs_byte(q) % QS_STREAMS;
+            if (qpack_decoder_cancel_stream(q->d, qs_stream_id(q, stream)) != QPACK_OK)
+                __builtin_trap();
+            for (int i; (i = qs_oldest(q, stream)) >= 0;) qs_section_drop(q, (size_t)i);
+            q->generation[stream]++;
+            break;
+        }
+        }
+    }
+
+    /* Everything delivered, decoded, acknowledged: the halves must agree. */
+    qs_deliver_encoder(q, SIZE_MAX);
+    if (q->enc_wire_len != 0) __builtin_trap();     /* a truncated instruction */
+    while (q->section_count > 0)
+        if (!qs_decode(q, 0)) __builtin_trap();      /* all inserts have arrived */
+    qs_deliver_decoder(q, SIZE_MAX);
+    if (q->dec_wire_len != 0) __builtin_trap();
+    if (q->e->insert_count != qpack_decoder_insert_count(q->d) ||
+        q->e->capacity != qpack_decoder_capacity(q->d) ||
+        q->e->bytes != qpack_decoder_bytes(q->d) ||
+        q->e->entry_count != q->d->entry_count ||
+        q->e->section_count != 0)
+        __builtin_trap();
+
+out:
+    for (size_t i = 0; i < q->section_count; i++) qs_section_free(&q->sections[i]);
+    qpack_encoder_free(q->e);
+    qpack_decoder_free(q->d);
+    free(q);
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_QUIC_STREAM
+
+#include "quicmemory.h"
+#include "quicrange.h"
+#include "quicrecvbuf.h"
+
+/* The two pieces of QUIC transport state a peer shapes most directly, each
+ * against a model small enough to be obviously right.
+ *
+ * quicrecvbuf -- a stream's bytes arrive as STREAM frames in any order, with
+ * retransmissions that overlap, duplicate or contradict what came before, a FIN
+ * and a RESET_STREAM that fix the final size. The model is a byte array with a
+ * "have" bit per offset and the first arrival kept, which is what the buffer
+ * promises ("only the parts not already held are copied"). After every
+ * operation: the same status (FINAL_SIZE_ERROR per RFC 9000 §4.5, the buffered
+ * cap as FLOW_CONTROL_ERROR), the same readable prefix, the same buffered
+ * count, reads that return exactly the model's bytes, completion when and only
+ * when the final size has been read -- and, freed, every byte of the global
+ * QUIC memory budget handed back.
+ *
+ * quicrange -- the sets behind ACK ranges and duplicate detection, against a
+ * bitset over a window that may sit at 0, in the middle of the range, or at
+ * UINT64_MAX, where the adjacency arithmetic can wrap. Spans stay sorted,
+ * disjoint and merged when adjacent, within max_spans, and every value above
+ * what eviction has forgotten is a member exactly when the model says so.
+ *
+ * First byte: which structure, and its parameters. */
+
+#define QS_U 2048   /* offsets modelled */
+
+typedef struct {
+    uint8_t byte[QS_U];
+    uint8_t have[QS_U];
+    uint64_t read_off, max_offset, final_size;
+    int fin;
+} qsm_t;
+
+static size_t qsm_readable(const qsm_t* m) {
+    size_t n = 0;
+    while (m->read_off + n < QS_U && m->have[m->read_off + n]) n++;
+    return n;
+}
+
+static size_t qsm_buffered(const qsm_t* m) {
+    size_t n = 0;
+    for (uint64_t i = m->read_off; i < QS_U; i++) n += m->have[i];
+    return n;
+}
+
+static void __quic_recvbuf(const uint8_t* data, size_t size) {
+    const size_t limit = (size_t)data[0] * 8;         /* 0 = no cap */
+    const size_t baseline = quicmemory_current();
+    qsm_t* m = calloc(1, sizeof *m);
+    if (m == NULL) return;
+    quicrecvbuf_t buf;
+    quicrecvbuf_init(&buf, limit);
+
+    size_t p = 1;
+    while (p + 4 <= size) {
+        const uint8_t op = data[p++];
+        const uint64_t offset = (uint64_t)(data[p] | data[p + 1] << 8) % QS_U;
+        const size_t len = data[p + 2] % 128;
+        p += 3;
+
+        if (op % 4 <= 1) {                           /* STREAM, with FIN if op is 1 */
+            const int fin = op % 4 == 1;
+            size_t n = len;
+            if (offset + n > QS_U) n = (size_t)(QS_U - offset);
+            if (n > size - p) n = size - p;
+            const uint8_t* bytes = data + p;
+            p += n;
+            const uint64_t end = offset + n;
+
+            quicrecvbuf_status_e want = QUICRECVBUF_OK;
+            size_t fresh = 0;
+            for (uint64_t i = offset; i < end; i++)
+                if (i >= m->read_off && !m->have[i]) fresh++;
+            if ((m->fin && end > m->final_size) || (fin && m->fin && end != m->final_size) ||
+                (fin && end < m->max_offset))
+                want = QUICRECVBUF_FINAL_SIZE;
+            else if (limit != 0 && fresh > 0 && qsm_buffered(m) + fresh > limit)
+                want = QUICRECVBUF_TOO_MUCH;
+
+            const quicrecvbuf_status_e got = quicrecvbuf_insert(&buf, offset, bytes, n, fin);
+            if (got != want) __builtin_trap();
+            if (got != QUICRECVBUF_OK) break;        /* the connection closes here */
+
+            if (fin) { m->fin = 1; m->final_size = end; }
+            if (end > m->max_offset) m->max_offset = end;
+            for (uint64_t i = offset; i < end; i++)
+                if (i >= m->read_off && !m->have[i]) {
+                    m->have[i] = 1;
+                    m->byte[i] = bytes[i - offset];
+                }
+        } else if (op % 4 == 2) {                    /* the application reads */
+            uint8_t out[128];
+            const size_t n = quicrecvbuf_read(&buf, out, len);
+            const size_t ready = qsm_readable(m);
+            if (n != (len < ready ? len : ready)) __builtin_trap();
+            for (size_t i = 0; i < n; i++)
+                if (out[i] != m->byte[m->read_off + i]) __builtin_trap();
+            for (size_t i = 0; i < n; i++) m->have[m->read_off + i] = 0;
+            m->read_off += n;
+        } else {                                      /* RESET_STREAM */
+            const uint64_t final_size = offset;
+            const quicrecvbuf_status_e want =
+                (m->fin && m->final_size != final_size) || final_size < m->max_offset
+                ? QUICRECVBUF_FINAL_SIZE : QUICRECVBUF_OK;
+            if (quicrecvbuf_set_final_size(&buf, final_size) != want) __builtin_trap();
+            if (want != QUICRECVBUF_OK) break;
+            m->fin = 1;
+            m->final_size = final_size;
+            if (final_size > m->max_offset) m->max_offset = final_size;
+        }
+
+        if (quicrecvbuf_readable(&buf) != qsm_readable(m) ||
+            buf.buffered != qsm_buffered(m) || buf.max_offset != m->max_offset ||
+            buf.read_off != m->read_off ||
+            quicrecvbuf_complete(&buf) != (m->fin && m->read_off >= m->final_size))
+            __builtin_trap();
+    }
+
+    quicrecvbuf_free(&buf);
+    if (quicmemory_current() != baseline) __builtin_trap();    /* budget leaked */
+    free(m);
+}
+
+static void __quic_range(const uint8_t* data, size_t size) {
+    static const uint64_t bases[] = { 0, UINT64_C(1) << 62, UINT64_MAX - (QS_U - 1) };
+    const uint64_t base = bases[(data[0] >> 1) % 3];
+    const size_t max_spans = (size_t)(data[0] >> 3) % 9;       /* 0 = unbounded */
+
+    uint8_t* model = calloc(QS_U, 1);
+    if (model == NULL) return;
+    quicrange_t r;
+    quicrange_init(&r, max_spans);
+
+    for (size_t p = 1; p + 5 <= size; p += 5) {
+        const uint8_t op = data[p];
+        const uint64_t a = (uint64_t)(data[p + 1] | data[p + 2] << 8) % QS_U;
+        const uint64_t b = (uint64_t)(data[p + 3] | data[p + 4] << 8) % QS_U;
+        const uint64_t lo = a < b ? a : b, hi = a < b ? b : a;
+
+        switch (op % 3) {
+        case 0:
+            if (!quicrange_add(&r, base + lo, base + hi)) goto out;
+            memset(model + lo, 1, hi - lo + 1);
+            break;
+        case 1:
+            if (!quicrange_remove(&r, base + lo, base + hi)) goto out;
+            memset(model + lo, 0, hi - lo + 1);
+            break;
+        case 2:
+            quicrange_trim_below(&r, base + lo);     /* at or below, per quicrange.h */
+            memset(model, 0, lo + 1);
+            break;
+        }
+
+        /* The cap is enforced by add, the only operation the capped set (the
+         * ACK ranges in quicack.c) is given; remove may split past it. */
+        if (op % 3 == 0 && max_spans != 0 && r.count > max_spans) __builtin_trap();
+        for (size_t i = 0; i < r.count; i++) {
+            if (r.spans[i].start > r.spans[i].end) __builtin_trap();
+            /* Disjoint and not adjacent, without the `end + 1` that wraps. */
+            if (i > 0 && (r.spans[i].start == 0 || r.spans[i - 1].end >= r.spans[i].start - 1))
+                __builtin_trap();
+        }
+        for (uint64_t v = 0; v < QS_U; v++) {
+            /* Eviction forgets on purpose; what it forgot counts as seen. */
+            if (r.has_evicted && base + v <= r.evicted_upto) {
+                model[v] = (uint8_t)quicrange_contains(&r, base + v);
+                continue;
+            }
+            if (quicrange_contains(&r, base + v) != model[v]) __builtin_trap();
+        }
+        if (!quicrange_empty(&r) &&
+            (quicrange_min(&r) != r.spans[0].start || quicrange_max(&r) != r.spans[r.count - 1].end))
+            __builtin_trap();
+    }
+
+out:
+    quicrange_free(&r);
+    free(model);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 2) return 0;
+    if (data[0] & 1) __quic_range(data, size);
+    else __quic_recvbuf(data, size);
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_H3_REQUEST
+
+#include "h3stream.h"
+
+/* An HTTP/3 request stream: the per-stream state machine of RFC 9114 §4.1 --
+ * HEADERS, then DATA, then optionally trailers, with unknown frame types
+ * ignored anywhere and everything else refused -- fed the way h3conn feeds it,
+ * one QUIC read at a time, with FIN on the last.
+ *
+ * Raw mode: the stream as the input spells it, delivered in one read, one byte
+ * per read and in reads of 1..256 bytes. The three must agree on every event
+ * and on the request that came out: method, target, fields, trailers, body.
+ *
+ * Generated mode: a well-formed request -- a static-table-only field section,
+ * a body cut into DATA frames, trailers, grease frames between them -- and at
+ * most one deliberate violation, each with the answer §4.1 requires:
+ *
+ *   none                         DONE, body byte for byte, one REQUEST_READY
+ *   DATA before HEADERS          H3_FRAME_UNEXPECTED
+ *   HEADERS after trailers       H3_FRAME_UNEXPECTED
+ *   SETTINGS on a request stream H3_FRAME_UNEXPECTED
+ *   an HTTP/2 codepoint (0x06)   H3_FRAME_UNEXPECTED (§11.2.1)
+ *   the last frame cut short     H3_FRAME_ERROR (§7.1)
+ *   content-length != body       H3_MESSAGE_ERROR (§4.1.2)
+ *   FIN before any HEADERS       H3_REQUEST_INCOMPLETE
+ *
+ * in all three deliveries. */
+
+typedef struct {
+    uint64_t digest;
+    int ready;          /* REQUEST_READY events */
+    int status;         /* the terminal one, or NEED_MORE */
+} h3r_result_t;
+
+static int __h3r_terminal(h3stream_status_e st) {
+    return st != H3STREAM_NEED_MORE && st != H3STREAM_BODY_CHUNK &&
+           st != H3STREAM_REQUEST_READY && st != H3STREAM_QPACK_BLOCKED;
+}
+
+static uint64_t __h3r_request_digest(uint64_t h, httprequest_t* r) {
+    h = __fuzz_fnv(h, &r->method, sizeof r->method);
+    if (r->path != NULL) h = __fuzz_fnv(h, r->path, r->path_length);
+    h = __fuzz_fnv_headers(h, r->header_);
+    h = __fuzz_fnv_headers(h, r->trailer_);
+    const file_t* body = &r->payload_.file;
+    if (body->fd >= 0) {
+        char chunk[4096];
+        for (off_t off = 0;;) {
+            const ssize_t n = pread(body->fd, chunk, sizeof chunk, off);
+            if (n <= 0) break;
+            h = __fuzz_fnv(h, chunk, (size_t)n);
+            off += n;
+        }
+    }
+    return h;
+}
+
+/* chunk 0: one read; seed 0: reads of `chunk`; else reads of 1..256 bytes. */
+static h3r_result_t __h3r_run(const uint8_t* data, size_t size, size_t chunk, uint64_t seed) {
+    h3r_result_t r = { .digest = 1469598103934665603ULL, .ready = 0, .status = H3STREAM_NEED_MORE };
+    h3stream_t* st = h3stream_create(NULL, 0);
+    qpack_decoder_t* qdec = qpack_decoder_create(0, 0);
+    if (st == NULL || qdec == NULL) { h3stream_free(st); qpack_decoder_free(qdec); return r; }
+
+    uint64_t rng = seed * 0x9E3779B97F4A7C15ULL + 1;
+    size_t off = 0;
+    do {
+        size_t n = chunk == 0 ? size : chunk;
+        if (chunk != 0 && seed != 0) {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            n = 1 + (size_t)(rng % 256);
+        }
+        if (n > size - off) n = size - off;
+        const int fin = off + n == size;
+        const uint8_t* p = data + off;
+        const uint8_t* end = p + n;
+        off += n;
+
+        for (int passes = 0; passes <= (int)n + 1; passes++) {
+            const h3stream_status_e ev = h3stream_feed(st, qdec, &p, end, fin);
+            if (ev == H3STREAM_REQUEST_READY) {
+                r.ready++;
+                if (p < end || fin) continue;
+                break;
+            }
+            if (__h3r_terminal(ev)) r.status = ev;
+            break;
+        }
+        if (__h3r_terminal(r.status)) break;
+    } while (off < size);
+
+    if (st->request != NULL && r.status == H3STREAM_DONE)
+        r.digest = __h3r_request_digest(r.digest, st->request);
+    h3stream_free(st);
+    qpack_decoder_free(qdec);
+    return r;
+}
+
+static int __h3r_frame(uint8_t* out, size_t cap, size_t* len, uint64_t type,
+                       const uint8_t* payload, size_t plen) {
+    const size_t a = varint_write(out + *len, cap - *len, type);
+    if (a == 0) return 0;
+    const size_t b = varint_write(out + *len + a, cap - *len - a, plen);
+    if (b == 0 || plen > cap - *len - a - b) return 0;
+    if (plen != 0) memcpy(out + *len + a + b, payload, plen);
+    *len += a + b + plen;
+    return 1;
+}
+
+enum { H3R_NONE, H3R_DATA_FIRST, H3R_HEADERS_AFTER_TRAILERS, H3R_SETTINGS,
+       H3R_H2_CODEPOINT, H3R_TRUNCATED, H3R_LENGTH_MISMATCH, H3R_NO_HEADERS, H3R_VIOLATIONS };
+
+static const h3stream_status_e __h3r_expected[H3R_VIOLATIONS] = {
+    H3STREAM_DONE, H3STREAM_ERR_FRAME_UNEXPECTED, H3STREAM_ERR_FRAME_UNEXPECTED,
+    H3STREAM_ERR_FRAME_UNEXPECTED, H3STREAM_ERR_FRAME_UNEXPECTED, H3STREAM_ERR_FRAME,
+    H3STREAM_ERR_MESSAGE, H3STREAM_ERR_REQUEST_INCOMPLETE,
+};
+
+/* Layout: [mode][violation][body pieces][grease] then the body bytes. */
+static size_t __h3r_generate(const uint8_t* data, size_t size, uint8_t* out, size_t cap,
+                             int* violation) {
+    *violation = data[1] % H3R_VIOLATIONS;
+    const size_t pieces = (size_t)(data[2] % 4);
+    /* No trailers after a truncated frame: DATA behind trailers is already a
+     * different error (H3_FRAME_UNEXPECTED), and one violation at a time. */
+    const int grease = data[3] & 1;
+    const int trailers = (data[3] & 2) != 0 && *violation != H3R_TRUNCATED;
+    const uint8_t* body = data + 4;
+    const size_t body_len = size - 4 > 2000 ? 2000 : size - 4;
+
+    char cl[24];
+    snprintf(cl, sizeof cl, "%zu", *violation == H3R_LENGTH_MISMATCH ? body_len + 1 : body_len);
+    const qpack_header_t fields[] = {
+        { ":method", 7, "POST", 4, 0 }, { ":scheme", 7, "https", 5, 0 },
+        { ":authority", 10, "localhost", 9, 0 }, { ":path", 5, "/upload", 7, 0 },
+        { "content-length", 14, cl, strlen(cl), 0 },
+    };
+    uint8_t block[256];
+    qpack_encoder_t* e = qpack_encoder_create(0, 0);
+    const size_t blen = e != NULL ? qpack_encode_block(e, fields, 5, block, sizeof block) : 0;
+    qpack_encoder_free(e);
+    if (blen == 0) return 0;
+
+    static const qpack_header_t trailer_fields[] = { { "x-checksum", 10, "abc", 3, 0 } };
+    uint8_t tblock[64];
+    qpack_encoder_t* te = qpack_encoder_create(0, 0);
+    const size_t tlen = te != NULL ? qpack_encode_block(te, trailer_fields, 1, tblock, sizeof tblock) : 0;
+    qpack_encoder_free(te);
+
+    static const uint8_t greasy[] = { 'g', 'r', 'e', 'a', 's', 'e' };
+    size_t len = 0;
+    int ok = 1;
+    if (grease) ok = ok && __h3r_frame(out, cap, &len, 0x21 + 0x1f * 3, greasy, sizeof greasy);
+    if (*violation == H3R_DATA_FIRST) ok = ok && __h3r_frame(out, cap, &len, 0x00, body, 1);
+    if (*violation == H3R_NO_HEADERS) return ok ? len : 0;
+    ok = ok && __h3r_frame(out, cap, &len, 0x01, block, blen);
+    if (*violation == H3R_SETTINGS) ok = ok && __h3r_frame(out, cap, &len, 0x04, NULL, 0);
+    if (*violation == H3R_H2_CODEPOINT) ok = ok && __h3r_frame(out, cap, &len, 0x06, greasy, 4);
+
+    const size_t n = pieces + 1;
+    for (size_t i = 0; i < n && ok; i++) {
+        const size_t from = body_len * i / n, to = body_len * (i + 1) / n;
+        ok = __h3r_frame(out, cap, &len, 0x00, body + from, to - from);
+        if (grease && ok) ok = __h3r_frame(out, cap, &len, 0x21, NULL, 0);
+    }
+    if ((trailers || *violation == H3R_HEADERS_AFTER_TRAILERS) && tlen > 0) {
+        ok = ok && __h3r_frame(out, cap, &len, 0x01, tblock, tlen);
+        if (*violation == H3R_HEADERS_AFTER_TRAILERS)
+            ok = ok && __h3r_frame(out, cap, &len, 0x01, tblock, tlen);
+    }
+    /* A DATA frame announcing six bytes, of which the stream carries four. */
+    if (*violation == H3R_TRUNCATED && ok &&
+        __h3r_frame(out, cap, &len, 0x00, greasy, sizeof greasy))
+        len -= 2;
+    return ok ? len : 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 4) return 0;
+
+    if (!(data[0] & 1)) {
+        const uint64_t seed = (uint64_t)data[0] + 1;
+        const h3r_result_t whole = __h3r_run(data + 1, size - 1, 0, 0);
+        const h3r_result_t bytes = __h3r_run(data + 1, size - 1, 1, 0);
+        const h3r_result_t split = __h3r_run(data + 1, size - 1, 1, seed);
+        if (whole.status != bytes.status || whole.status != split.status ||
+            whole.ready != bytes.ready || whole.ready != split.ready ||
+            whole.digest != bytes.digest || whole.digest != split.digest)
+            __builtin_trap();
+        return 0;
+    }
+
+    static uint8_t wire[8192];
+    int violation = H3R_NONE;
+    const size_t len = __h3r_generate(data, size, wire, sizeof wire, &violation);
+    if (len == 0 && violation != H3R_NO_HEADERS) return 0;
+
+    const h3r_result_t runs[3] = {
+        __h3r_run(wire, len, 0, 0), __h3r_run(wire, len, 1, 0),
+        __h3r_run(wire, len, 1, (uint64_t)data[0] + 1),
+    };
+    if (getenv("FUZZ_TRACE") != NULL)
+        fprintf(stderr, "violation %d: %zu bytes, status %d/%d/%d (want %d), ready %d\n",
+                violation, len, runs[0].status, runs[1].status, runs[2].status,
+                (int)__h3r_expected[violation], runs[0].ready);
+    for (int i = 0; i < 3; i++) {
+        if (runs[i].status != (int)__h3r_expected[violation]) __builtin_trap();
+        if (violation == H3R_NONE && runs[i].ready != 1) __builtin_trap();
+    }
+    if (violation == H3R_NONE &&
+        (runs[0].digest != runs[1].digest || runs[0].digest != runs[2].digest))
+        __builtin_trap();
     return 0;
 }
 
@@ -759,57 +1492,167 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
 #elif FUZZ_TARGET == FUZZ_WEBSOCKET_SEQUENCE
 
-/* WebSocket control/data frames can cross reads and share message state. */
-int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-    if (size < 2) return 0;
-    const size_t chunk = (size_t)data[0] + 1;
-    char* buffer = malloc(chunk + 1);
-    if (buffer == NULL) return 0;
+#include <zlib.h>
+
+/* One WebSocket connection: a stream of frames, fed to the parser the way
+ * websocketsserverhandlers.c feeds it -- HANDLE_AND_CONTINUE handles the frame
+ * and calls prepare_remains, COMPLETE handles it and resets, CONTINUE waits for
+ * the next read -- in a single read, one byte per read, and in reads of
+ * 1..256 bytes. Every completed message and every control frame is an event;
+ * the three event sequences must agree.
+ *
+ * Two modes, by the top bit of the first byte.
+ *
+ * Raw: the rest is the byte stream as it is. With permessage-deflate on,
+ * garbage inflates to errors at points that depend on how much input a read
+ * delivered, so the sequences are compared only when all three runs end
+ * without an error.
+ *
+ * Generated: the rest describes messages -- text or binary, compressed or not,
+ * split into 1..4 fragments, a ping, pong or close between fragments -- and
+ * the frames are built here: masked, with minimal length encoding, compressed
+ * by a zlib stream that keeps or drops its window between messages as
+ * client_no_context_takeover says. Then what must come out is known, not just
+ * that the runs agree: every message byte for byte, in order, with the control
+ * frames where they were sent. A text message that is not UTF-8, or a message
+ * over client_max_body_size (which the input picks), must not be delivered,
+ * and nothing after it may be; the runs may differ only in where inside that
+ * message they stopped, and then only in control frames. */
+
+#define WS_SEQ_MAX_EVENTS 64
+
+typedef struct {
+    uint64_t digest;                    /* every event, in order */
+    uint64_t data[WS_SEQ_MAX_EVENTS];   /* data messages alone */
+    size_t data_count;
+    size_t events;
+    int status;                         /* the last parser status */
+    int failed;
+} ws_seq_result_t;
+
+static int __ws_seq_failed(int status) {
+    return status != WSPARSER_CONTINUE && status != WSPARSER_COMPLETE &&
+           status != WSPARSER_HANDLE_AND_CONTINUE;
+}
+
+static uint64_t __ws_seq_event(uint64_t h, unsigned char type,
+                               const void* payload, size_t len) {
+    h = __fuzz_fnv(h, &type, 1);
+    h = __fuzz_fnv(h, &len, sizeof len);
+    return __fuzz_fnv(h, payload, len);
+}
+
+static void __ws_seq_record(ws_seq_result_t* r, unsigned char type,
+                            const void* payload, size_t len, int is_data) {
+    const uint64_t e = __ws_seq_event(1469598103934665603ULL, type, payload, len);
+    r->digest = __fuzz_fnv(r->digest, &e, sizeof e);
+    r->events++;
+    if (is_data && r->data_count < WS_SEQ_MAX_EVENTS) r->data[r->data_count] = e;
+    if (is_data) r->data_count++;
+}
+
+/* What __handle() does, minus the dispatch: a control frame is answered (here:
+ * recorded), a final data frame hands its message over (here: recorded and
+ * freed, which is what ownership passing to the queue amounts to). */
+static void __ws_seq_handle(websocketsparser_t* parser, ws_seq_result_t* r) {
+    switch (parser->frame.opcode) {
+    case WSOPCODE_CLOSE:
+    case WSOPCODE_PING:
+    case WSOPCODE_PONG:
+        __ws_seq_record(r, (unsigned char)(0x80 | parser->frame.opcode),
+                        bufferdata_get(&parser->buf), bufferdata_writed(&parser->buf), 0);
+        return;
+    }
+    if (!parser->frame.fin) return;
+
+    websocketsrequest_t* request = parser->request;
+    if (request == NULL) __builtin_trap();
+
+    uint64_t h = 1469598103934665603ULL;
+    size_t len = 0;
+    const int fd = request->protocol->payload.fd;
+    char chunk[4096];
+    for (;;) {
+        const ssize_t n = fd >= 0 ? pread(fd, chunk, sizeof chunk, (off_t)len) : 0;
+        if (n < 0) __builtin_trap();
+        if (n == 0) break;
+        h = __fuzz_fnv(h, chunk, (size_t)n);
+        len += (size_t)n;
+    }
+    /* The payload is hashed in pieces, so the event is built from the hash and
+     * the length rather than from the bytes; __ws_seq_expect does the same. */
+    const unsigned char type = (unsigned char)request->type;
+    uint64_t e = __fuzz_fnv(1469598103934665603ULL, &type, 1);
+    e = __fuzz_fnv(e, &len, sizeof len);
+    e = __fuzz_fnv(e, &h, sizeof h);
+    r->digest = __fuzz_fnv(r->digest, &e, sizeof e);
+    r->events++;
+    if (r->data_count < WS_SEQ_MAX_EVENTS) r->data[r->data_count] = e;
+    r->data_count++;
+
+    websocketsrequest_free(request);
+    parser->request = NULL;
+}
+
+/* chunk 0: one read of everything; seed 0: reads of `chunk` bytes; otherwise
+ * reads of 1..256 bytes from a PRNG. */
+static ws_seq_result_t __ws_seq_run(const uint8_t* data, size_t size, int compress_on,
+                                    int no_takeover, size_t chunk, uint64_t seed) {
+    ws_seq_result_t r = { .digest = 1469598103934665603ULL, .status = WSPARSER_CONTINUE };
+    const size_t cap = chunk == 0 ? (size ? size : 1) : seed != 0 ? 256 : chunk;
+    char* buffer = malloc(cap + 1);
+    if (buffer == NULL) return r;
 
     connection_t connection;
     connection_server_ctx_t ctx;
     memset(&connection, 0, sizeof connection);
     memset(&ctx, 0, sizeof ctx);
     connection.buffer = buffer;
-    connection.buffer_size = chunk;
+    connection.buffer_size = cap;
     connection.fd = -1;
     connection.ctx = (connection_ctx_t*)&ctx;
 
     websocketsparser_t* parser =
         websocketsparser_create(&connection, websockets_protocol_default_create);
-    if (parser == NULL) { free(buffer); return 0; }
+    if (parser == NULL) { free(buffer); return r; }
+    if (compress_on) {
+        parser->ws_deflate.config.client_no_context_takeover = no_takeover;
+        if (!ws_deflate_start(&parser->ws_deflate)) {
+            websocketsparser_free(parser);
+            free(buffer);
+            return r;
+        }
+        parser->ws_deflate_enabled = 1;
+    }
 
-    for (size_t off = 1; off < size;) {
-        const size_t n = size - off < chunk ? size - off : chunk;
+    uint64_t rng = seed * 0x9E3779B97F4A7C15ULL + 1;
+    for (size_t off = 0; off < size && !r.failed;) {
+        size_t n = cap;
+        if (chunk != 0 && seed != 0) {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            n = 1 + (size_t)(rng % 256);
+        }
+        if (n > size - off) n = size - off;
         memcpy(buffer, data + off, n);
         buffer[n] = 0;
         websocketsparser_set_bytes_readed(parser, n);
-        parser->pos = parser->pos_start = 0;
+        parser->pos_start = 0;
+        parser->pos = 0;
 
-        for (size_t frames = 0; frames <= n; frames++) {
-            const int status = websocketsparser_run(parser);
-            if (status == WSPARSER_HANDLE_AND_CONTINUE) {
+        for (size_t frames = 0; frames <= n + 1; frames++) {
+            r.status = websocketsparser_run(parser);
+            if (r.status == WSPARSER_HANDLE_AND_CONTINUE) {
                 if (parser->pos > n) __builtin_trap();
-                if (parser->request != NULL && !parser->message_fragmented &&
-                    parser->frame.opcode < WSOPCODE_CLOSE) {
-                    websocketsrequest_free(parser->request);
-                    parser->request = NULL;
-                }
+                __ws_seq_handle(parser, &r);
                 websocketsparser_prepare_remains(parser);
-                if (parser->pos_start >= n) break;
+                if (parser->pos_start > n) __builtin_trap();
                 continue;
             }
-            if (status == WSPARSER_COMPLETE) {
-                if (parser->request != NULL) {
-                    websocketsrequest_free(parser->request);
-                    parser->request = NULL;
-                }
+            if (r.status == WSPARSER_COMPLETE) {
+                __ws_seq_handle(parser, &r);
                 websocketsparser_reset(parser);
             }
-            if (status != WSPARSER_CONTINUE && status != WSPARSER_COMPLETE &&
-                status != WSPARSER_HANDLE_AND_CONTINUE) {
-                off = size;
-            }
+            if (__ws_seq_failed(r.status)) r.failed = 1;
             break;
         }
         off += n;
@@ -817,6 +1660,268 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     websocketsparser_free(parser);
     free(buffer);
+    return r;
+}
+
+/* ---- The generator ---- */
+
+typedef struct {
+    uint8_t* data;
+    size_t len;
+    size_t cap;
+} ws_seq_buf_t;
+
+static int __ws_seq_put(ws_seq_buf_t* b, const void* data, size_t len) {
+    if (len == 0) return 1;
+    if (b->len + len > b->cap) {
+        size_t cap = b->cap ? b->cap : 1024;
+        while (cap < b->len + len) cap *= 2;
+        uint8_t* grown = realloc(b->data, cap);
+        if (grown == NULL) return 0;
+        b->data = grown;
+        b->cap = cap;
+    }
+    memcpy(b->data + b->len, data, len);
+    b->len += len;
+    return 1;
+}
+
+static int __ws_seq_frame(ws_seq_buf_t* b, uint8_t first, const uint8_t* payload,
+                          size_t len, uint64_t* rng) {
+    uint8_t head[14];
+    size_t hl = 0;
+    head[hl++] = first;
+    if (len < 126) {
+        head[hl++] = (uint8_t)(0x80 | len);
+    } else if (len <= 0xffff) {
+        head[hl++] = 0x80 | 126;
+        head[hl++] = (uint8_t)(len >> 8);
+        head[hl++] = (uint8_t)len;
+    } else {
+        head[hl++] = 0x80 | 127;
+        for (int i = 7; i >= 0; i--) head[hl++] = (uint8_t)((uint64_t)len >> (8 * i));
+    }
+    *rng ^= *rng << 13; *rng ^= *rng >> 7; *rng ^= *rng << 17;
+    uint8_t mask[4];
+    memcpy(mask, rng, 4);
+    memcpy(head + hl, mask, 4);
+    hl += 4;
+    if (!__ws_seq_put(b, head, hl)) return 0;
+
+    for (size_t i = 0; i < len; i++) {
+        const uint8_t c = payload[i] ^ mask[i % 4];
+        if (!__ws_seq_put(b, &c, 1)) return 0;
+    }
+    return 1;
+}
+
+/* RFC 3629, by length: a NUL is a character like any other. */
+static int __ws_seq_utf8(const uint8_t* s, size_t len) {
+    for (size_t i = 0; i < len;) {
+        const uint8_t c = s[i];
+        if (c < 0x80) { i++; continue; }
+        size_t n;
+        uint32_t cp;
+        if ((c & 0xe0) == 0xc0) { n = 1; cp = c & 0x1f; }
+        else if ((c & 0xf0) == 0xe0) { n = 2; cp = c & 0x0f; }
+        else if ((c & 0xf8) == 0xf0) { n = 3; cp = c & 0x07; }
+        else return 0;
+        if (i + n >= len) return 0;
+        for (size_t k = 1; k <= n; k++) {
+            if ((s[i + k] & 0xc0) != 0x80) return 0;
+            cp = (cp << 6) | (s[i + k] & 0x3f);
+        }
+        if ((n == 1 && cp < 0x80) || (n == 2 && cp < 0x800) || (n == 3 && cp < 0x10000))
+            return 0;
+        if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return 0;
+        i += n + 1;
+    }
+    return 1;
+}
+
+typedef struct {
+    ws_seq_result_t result;     /* the events that must come out */
+    int fails;                  /* a message that must not be delivered */
+} ws_seq_expect_t;
+
+/* Builds the frame stream into `wire` and the expected events into `ex`.
+ * Layout after the mode byte: [limit][mask seed] then per message
+ * [header][length][extra length if header bit 6][payload...]. */
+static int __ws_seq_generate(const uint8_t* data, size_t size, int compress_on,
+                             int no_takeover, size_t limit,
+                             ws_seq_buf_t* wire, ws_seq_expect_t* ex) {
+    uint64_t rng = (size > 1 ? data[1] : 0) * 0x2545F4914F6CDD1DULL + 7;
+    z_stream z;
+    memset(&z, 0, sizeof z);
+    if (compress_on && deflateInit2(&z, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8,
+                                Z_DEFAULT_STRATEGY) != Z_OK)
+        return 0;
+
+    int ok = 1;
+    size_t p = 2;
+    uint8_t* packed = NULL;
+    for (int m = 0; m < 16 && p < size && ok; m++) {
+        const uint8_t h = data[p++];
+        size_t len = p < size ? data[p++] : 0;
+        if ((h & 0x40) && p < size) len += (size_t)data[p++] * 256;
+        if (len > size - p) len = size - p;
+        const uint8_t* payload = data + p;
+        p += len;
+
+        const int text = !(h & 1);
+        const int compressed = compress_on && (h & 2);
+        const size_t fragments = ((h >> 2) & 3) + 1;
+        const int control = (h >> 4) & 3;
+
+        /* What goes on the wire: the payload, or its deflate stream without
+         * the 00 00 ff ff tail (RFC 7692 §7.2.1). */
+        const uint8_t* body = payload;
+        size_t body_len = len;
+        if (compressed) {
+            if (no_takeover) deflateReset(&z);
+            const size_t bound = deflateBound(&z, len) + 16;
+            free(packed);
+            packed = malloc(bound);
+            if (packed == NULL) { ok = 0; break; }
+            z.next_in = (Bytef*)payload;
+            z.avail_in = (uInt)len;
+            z.next_out = packed;
+            z.avail_out = (uInt)bound;
+            if (deflate(&z, Z_SYNC_FLUSH) != Z_OK || z.avail_in != 0) { ok = 0; break; }
+            body_len = bound - z.avail_out;
+            if (body_len < 4 || memcmp(packed + body_len - 4, "\x00\x00\xff\xff", 4) != 0) {
+                ok = 0;
+                break;
+            }
+            body_len -= 4;
+            body = packed;
+        }
+
+        /* Fragment sizes: as even as the division allows. */
+        size_t largest = 0;
+        for (size_t f = 0; f < fragments; f++) {
+            const size_t from = body_len * f / fragments;
+            const size_t to = body_len * (f + 1) / fragments;
+            if (to - from > largest) largest = to - from;
+        }
+        const int bad = (text && !__ws_seq_utf8(payload, len)) || len > limit || largest > limit;
+
+        for (size_t f = 0; f < fragments && ok; f++) {
+            const size_t from = body_len * f / fragments;
+            const size_t to = body_len * (f + 1) / fragments;
+            uint8_t first = f == 0 ? (text ? 0x01 : 0x02) : 0x00;
+            if (f == fragments - 1) first |= 0x80;
+            if (f == 0 && compressed) first |= 0x40;
+            ok = __ws_seq_frame(wire, first, body + from, to - from, &rng);
+
+            /* A control frame between the first two fragments (RFC 6455
+             * §5.4 allows them inside a fragmented message). */
+            if (ok && control != 0 && (f == 0 ? fragments > 1 : 0)) {
+                static const uint8_t opcodes[] = { 0, 0x9, 0xA, 0x8 };
+                const uint8_t cp[2] = { 0x03, 0xe8 };  /* also a close code: 1000 */
+                ok = __ws_seq_frame(wire, (uint8_t)(0x80 | opcodes[control]), cp, 2, &rng);
+                if (ok && !ex->fails)
+                    __ws_seq_record(&ex->result, (uint8_t)(0x80 | opcodes[control]), cp, 2, 0);
+            }
+        }
+        if (!ok || ex->fails) continue;
+        if (bad) { ex->fails = 1; continue; }
+
+        uint64_t hash = __fuzz_fnv(1469598103934665603ULL, payload, len);
+        const unsigned char type = text ? WEBSOCKETS_TEXT : WEBSOCKETS_BINARY;
+        uint64_t e = __fuzz_fnv(1469598103934665603ULL, &type, 1);
+        e = __fuzz_fnv(e, &len, sizeof len);
+        e = __fuzz_fnv(e, &hash, sizeof hash);
+        ex->result.digest = __fuzz_fnv(ex->result.digest, &e, sizeof e);
+        ex->result.events++;
+        if (ex->result.data_count < WS_SEQ_MAX_EVENTS) ex->result.data[ex->result.data_count] = e;
+        ex->result.data_count++;
+    }
+
+    free(packed);
+    if (compress_on) deflateEnd(&z);
+    return ok;
+}
+
+static int __ws_seq_same(const ws_seq_result_t* a, const ws_seq_result_t* b) {
+    return a->digest == b->digest && a->events == b->events &&
+           a->data_count == b->data_count && a->status == b->status;
+}
+
+/* A run that had to stop: the messages before the bad one, exactly, and no
+ * message after it. Control frames sent inside the bad message may or may not
+ * have been handled, depending on where the run noticed. */
+static void __ws_seq_check_prefix(const ws_seq_result_t* run, const ws_seq_expect_t* ex) {
+    if (!run->failed || run->data_count != ex->result.data_count) __builtin_trap();
+    const size_t n = run->data_count < WS_SEQ_MAX_EVENTS ? run->data_count : WS_SEQ_MAX_EVENTS;
+    for (size_t i = 0; i < n; i++)
+        if (run->data[i] != ex->result.data[i]) __builtin_trap();
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 2) return 0;
+    const int generated = (data[0] & 0x80) != 0;
+    const int compress_on = data[0] & 1;
+    const int no_takeover = (data[0] & 2) != 0;
+    const uint64_t seed = (uint64_t)(data[0] >> 2) + 1;
+
+    if (!generated) {
+        const ws_seq_result_t whole = __ws_seq_run(data + 1, size - 1, compress_on, no_takeover, 0, 0);
+        const ws_seq_result_t bytes = __ws_seq_run(data + 1, size - 1, compress_on, no_takeover, 1, 0);
+        const ws_seq_result_t split = __ws_seq_run(data + 1, size - 1, compress_on, no_takeover, 1, seed);
+        /* Without compression an error is a property of the bytes, not of
+         * the reads: it must happen at the same place in every run. */
+        const int comparable = !compress_on || (!whole.failed && !bytes.failed && !split.failed);
+        if (getenv("FUZZ_TRACE") != NULL) {
+            const ws_seq_result_t* runs[3] = { &whole, &bytes, &split };
+            for (int i = 0; i < 3; i++)
+                fprintf(stderr, "run %d: events=%zu data=%zu status=%d failed=%d\n", i,
+                        runs[i]->events, runs[i]->data_count, runs[i]->status, runs[i]->failed);
+        }
+        if (comparable && (!__ws_seq_same(&whole, &bytes) || !__ws_seq_same(&whole, &split)))
+            __builtin_trap();
+        return 0;
+    }
+
+    /* The limit is per message: 16..4080 bytes, or the configured 10 MiB. */
+    env_t* e = env();
+    const size_t saved_limit = e->main.client_max_body_size;
+    const size_t limit = data[1] != 0 ? (size_t)data[1] * 16 : saved_limit;
+    e->main.client_max_body_size = limit;
+
+    ws_seq_buf_t wire = { 0 };
+    ws_seq_expect_t ex;
+    memset(&ex, 0, sizeof ex);
+    ex.result.digest = 1469598103934665603ULL;
+
+    if (__ws_seq_generate(data, size, compress_on, no_takeover, limit, &wire, &ex) && wire.len > 0) {
+        const ws_seq_result_t runs[3] = {
+            __ws_seq_run(wire.data, wire.len, compress_on, no_takeover, 0, 0),
+            __ws_seq_run(wire.data, wire.len, compress_on, no_takeover, 1, 0),
+            __ws_seq_run(wire.data, wire.len, compress_on, no_takeover, 1, seed),
+        };
+        /* FUZZ_TRACE=1 when replaying one input: what each run produced. */
+        if (getenv("FUZZ_TRACE") != NULL) {
+            fprintf(stderr, "expected: events=%zu data=%zu fails=%d wire=%zu\n",
+                    ex.result.events, ex.result.data_count, ex.fails, wire.len);
+            for (int i = 0; i < 3; i++)
+                fprintf(stderr, "run %d: events=%zu data=%zu status=%d failed=%d same=%d\n",
+                        i, runs[i].events, runs[i].data_count, runs[i].status,
+                        runs[i].failed, runs[i].digest == ex.result.digest);
+        }
+        for (int i = 0; i < 3; i++) {
+            if (ex.fails) {
+                __ws_seq_check_prefix(&runs[i], &ex);
+            } else {
+                if (runs[i].failed || runs[i].status != WSPARSER_COMPLETE) __builtin_trap();
+                if (runs[i].digest != ex.result.digest || runs[i].events != ex.result.events)
+                    __builtin_trap();
+            }
+        }
+    }
+
+    free(wire.data);
+    e->main.client_max_body_size = saved_limit;
     return 0;
 }
 
@@ -959,6 +2064,451 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         ws_deflate_free(&pair);
     }
 
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_H2_CONNECTION
+
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+
+/* A whole HTTP/2 connection through the entry points the event loop uses:
+ * h2_server_set_http2() builds the session and writes the server preface,
+ * h2_server_guard_read() takes what the client sent off a socket,
+ * h2_server_guard_write() pushes out what is queued. The socket is one end of
+ * a socketpair with a small send buffer, so writes are short and EAGAIN is
+ * ordinary; the other end is the client, which sends the input and reads the
+ * server's bytes in amounts a PRNG picks. Reads, writes and the client's own
+ * reads interleave in an order the first input byte decides.
+ *
+ * h2_session feeds the frame layer directly and cannot see the write path at
+ * all -- its fd is -1. This target is about that path, so it checks what the
+ * server actually put on the wire, the way a strict client would:
+ *
+ *   - it is a sequence of frames, SETTINGS first, none longer than the
+ *     largest SETTINGS_MAX_FRAME_SIZE the client allowed;
+ *   - every header block decodes with one HPACK decoder kept for the whole
+ *     connection, and pseudo-fields come first;
+ *   - HEADERS and DATA only on streams the client opened, DATA after HEADERS,
+ *     nothing after END_STREAM or RST_STREAM on that stream;
+ *   - DATA never exceeds what the client let the server send: 65535 plus the
+ *     client's WINDOW_UPDATEs for the connection, and the largest initial
+ *     window the client advertised plus its updates for the stream -- an
+ *     upper bound, so a window the client shrank later cannot raise a false
+ *     alarm;
+ *   - a PING ACK echoes a PING the client sent, SETTINGS ACKs do not outnumber
+ *     the client's SETTINGS, GOAWAY's last stream id never grows.
+ *
+ * Requests are answered from a directory with a small file and one larger
+ * than the default 64 KiB window, so a response has to wait for credit. */
+
+#define H2C_STREAMS 256
+
+typedef struct {
+    uint32_t id;
+    int64_t credit;         /* what the client allowed on this stream, at most */
+    int64_t sent;
+    int opened, headers, ended;
+} h2c_stream_t;
+
+typedef struct {
+    /* What the client said, taken from the bytes it actually got onto the socket. */
+    uint8_t cbuf[1 << 16];
+    size_t clen;
+    int cpreface;           /* 0 unseen, 1 seen, -1 not a preface: stop tracking */
+    int64_t max_initial;
+    uint32_t max_frame;
+    int64_t conn_credit;
+    size_t settings_sent;
+    uint8_t pings[64][8];
+    size_t ping_count;
+
+    /* What the server wrote. */
+    uint8_t sbuf[1 << 17];
+    size_t slen;
+    int first_frame;
+    int64_t conn_sent;
+    size_t frames[10];      /* by type, for FUZZ_TRACE */
+    size_t settings_acks;
+    uint32_t goaway_last;
+    int goaway_seen;
+    uint8_t* block;         /* header block being assembled */
+    size_t block_len;
+    uint32_t block_stream;
+    int block_active;
+    hpack_decoder_t* hpack;
+
+    h2c_stream_t streams[H2C_STREAMS];
+} h2c_t;
+
+static h2c_stream_t* __h2c_stream(h2c_t* c, uint32_t id, int create) {
+    for (size_t i = 0; i < H2C_STREAMS; i++) {
+        h2c_stream_t* st = &c->streams[(id + i) % H2C_STREAMS];
+        if (st->id == id) return st;
+        if (st->id == 0) {
+            if (!create) return NULL;
+            st->id = id;
+            st->credit = c->max_initial;
+            return st;
+        }
+    }
+    return NULL;
+}
+
+static uint32_t __h2c_u32(const uint8_t* p) {
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+/* The client side: frames the client managed to send. Only what loosens the
+ * server's limits is tracked, so a malformed client frame costs precision,
+ * never a false report. */
+static void __h2c_client_sent(h2c_t* c, const uint8_t* data, size_t len) {
+    if (c->cpreface < 0) return;
+    if (len > sizeof c->cbuf - c->clen) { c->cpreface = -1; return; }
+    memcpy(c->cbuf + c->clen, data, len);
+    c->clen += len;
+
+    size_t p = 0;
+    if (c->cpreface == 0) {
+        if (c->clen < 24) return;
+        if (memcmp(c->cbuf, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", 24) != 0) { c->cpreface = -1; return; }
+        c->cpreface = 1;
+        p = 24;
+    }
+    while (c->clen - p >= 9) {
+        const uint8_t* f = c->cbuf + p;
+        const size_t flen = (size_t)f[0] << 16 | (size_t)f[1] << 8 | f[2];
+        if (c->clen - p - 9 < flen) break;
+        const uint8_t type = f[3], flags = f[4];
+        const uint32_t sid = __h2c_u32(f + 5) & 0x7fffffff;
+        const uint8_t* pl = f + 9;
+
+        if (type == 0x4 && !(flags & 1) && sid == 0 && flen % 6 == 0) {       /* SETTINGS */
+            c->settings_sent++;
+            for (size_t i = 0; i < flen; i += 6) {
+                const uint16_t id = (uint16_t)(pl[i] << 8 | pl[i + 1]);
+                const uint32_t v = __h2c_u32(pl + i + 2);
+                if (id == 4 && v <= 0x7fffffff && (int64_t)v > c->max_initial) {
+                    /* Every stream may now be credited up to the new value. */
+                    for (size_t k = 0; k < H2C_STREAMS; k++)
+                        if (c->streams[k].id != 0)
+                            c->streams[k].credit += (int64_t)v - c->max_initial;
+                    c->max_initial = v;
+                }
+                if (id == 5 && v > c->max_frame && v <= 0xffffff) c->max_frame = v;
+            }
+        } else if (type == 0x8 && flen == 4) {                                   /* WINDOW_UPDATE */
+            const int64_t inc = __h2c_u32(pl) & 0x7fffffff;
+            if (sid == 0) c->conn_credit += inc;
+            else {
+                h2c_stream_t* st = __h2c_stream(c, sid, 1);
+                if (st != NULL) st->credit += inc;
+            }
+        } else if (type == 0x1 && sid != 0) {                                    /* HEADERS */
+            h2c_stream_t* st = __h2c_stream(c, sid, 1);
+            if (st != NULL) st->opened = 1;
+        } else if (type == 0x6 && !(flags & 1) && flen == 8 && c->ping_count < 64) {
+            memcpy(c->pings[c->ping_count++], pl, 8);                            /* PING */
+        }
+        p += 9 + flen;
+    }
+    memmove(c->cbuf, c->cbuf + p, c->clen - p);
+    c->clen -= p;
+}
+
+static int __h2c_block_append(h2c_t* c, const uint8_t* data, size_t len) {
+    uint8_t* grown = realloc(c->block, c->block_len + len + 1);
+    if (grown == NULL) return 0;
+    c->block = grown;
+    if (len != 0) memcpy(c->block + c->block_len, data, len);
+    c->block_len += len;
+    return 1;
+}
+
+static void __h2c_header_block(h2c_t* c) {
+    hpack_header_t* headers = NULL;
+    size_t count = 0;
+    if (hpack_decoder_decode(c->hpack, c->block, c->block_len, 1 << 20, &headers, &count)
+            != HPACK_OK)
+        __builtin_trap();                     /* our encoder wrote what no decoder reads */
+    int regular = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (headers[i].name_len > 0 && headers[i].name[0] == ':') {
+            if (regular) __builtin_trap();    /* pseudo-field after a regular one */
+        } else {
+            regular = 1;
+        }
+    }
+    hpack_headers_free(headers, count);
+    c->block_len = 0;
+    c->block_active = 0;
+}
+
+/* The server side: every byte the client read, checked as it arrives. */
+static void __h2c_server_sent(h2c_t* c, const uint8_t* data, size_t len) {
+    if (len > sizeof c->sbuf - c->slen) __builtin_trap();
+    memcpy(c->sbuf + c->slen, data, len);
+    c->slen += len;
+
+    size_t p = 0;
+    while (c->slen - p >= 9) {
+        const uint8_t* f = c->sbuf + p;
+        const size_t flen = (size_t)f[0] << 16 | (size_t)f[1] << 8 | f[2];
+        if (getenv("FUZZ_TRACE") != NULL && c->slen - p - 9 >= flen)
+            fprintf(stderr, "server frame type %u flags 0x%02x stream %u len %zu\n",
+                    f[3], f[4], __h2c_u32(f + 5) & 0x7fffffff, flen);
+        if (flen > c->max_frame) __builtin_trap();
+        if (c->slen - p - 9 < flen) break;
+        const uint8_t type = f[3], flags = f[4];
+        const uint32_t sid = __h2c_u32(f + 5) & 0x7fffffff;
+        const uint8_t* pl = f + 9;
+
+        if (c->first_frame) {
+            if (type != 0x4 || (flags & 1)) __builtin_trap();   /* §3.4: SETTINGS first */
+            c->first_frame = 0;
+        }
+        if (c->block_active && (type != 0x9 || sid != c->block_stream))
+            __builtin_trap();                 /* §6.10: CONTINUATION must follow */
+
+        h2c_stream_t* st = sid != 0 ? __h2c_stream(c, sid, 0) : NULL;
+        if (type < 10) c->frames[type]++;
+        switch (type) {
+        case 0x0:                                                        /* DATA */
+        case 0x1: {                                                      /* HEADERS */
+            if (sid == 0 || st == NULL || !st->opened || st->ended) __builtin_trap();
+            size_t body = flen, off = 0;
+            if (flags & 0x8) {                                           /* PADDED */
+                if (flen == 0 || (size_t)pl[0] + 1 > flen) __builtin_trap();
+                body -= (size_t)pl[0] + 1;
+                off = 1;
+            }
+            if (type == 0x0) {
+                if (!st->headers) __builtin_trap();
+                st->sent += (int64_t)flen;
+                c->conn_sent += (int64_t)flen;
+                if (st->sent > st->credit || c->conn_sent > c->conn_credit) __builtin_trap();
+            } else {
+                if (flags & 0x20) {                                      /* PRIORITY */
+                    if (body < 5) __builtin_trap();
+                    body -= 5;
+                    off += 5;
+                }
+                st->headers = 1;
+                if (!__h2c_block_append(c, pl + off, body)) break;
+                c->block_stream = sid;
+                if (flags & 0x4) __h2c_header_block(c);
+                else c->block_active = 1;
+            }
+            if (flags & 0x1) st->ended = 1;
+            break;
+        }
+        case 0x9:                                                        /* CONTINUATION */
+            if (!c->block_active || sid != c->block_stream) __builtin_trap();
+            if (!__h2c_block_append(c, pl, flen)) break;
+            if (flags & 0x4) __h2c_header_block(c);
+            break;
+        case 0x3:                                                        /* RST_STREAM */
+            if (sid == 0 || flen != 4) __builtin_trap();
+            if (st != NULL) st->ended = 1;
+            break;
+        case 0x4:                                                        /* SETTINGS */
+            if (sid != 0 || flen % 6 != 0) __builtin_trap();
+            if (flags & 1) {
+                if (flen != 0 || ++c->settings_acks > c->settings_sent) __builtin_trap();
+            }
+            break;
+        case 0x6:                                                        /* PING */
+            if (sid != 0 || flen != 8) __builtin_trap();
+            if (flags & 1) {
+                size_t i = 0;
+                while (i < c->ping_count && memcmp(c->pings[i], pl, 8) != 0) i++;
+                if (i == c->ping_count && c->ping_count < 64) __builtin_trap();
+            }
+            break;
+        case 0x7: {                                                      /* GOAWAY */
+            if (sid != 0 || flen < 8) __builtin_trap();
+            const uint32_t last = __h2c_u32(pl) & 0x7fffffff;
+            if (c->goaway_seen && last > c->goaway_last) __builtin_trap();
+            c->goaway_seen = 1;
+            c->goaway_last = last;
+            break;
+        }
+        case 0x8:                                                        /* WINDOW_UPDATE */
+            if (flen != 4 || (__h2c_u32(pl) & 0x7fffffff) == 0) __builtin_trap();
+            break;
+        case 0x2:                                                        /* PRIORITY */
+            if (flen != 5) __builtin_trap();
+            break;
+        case 0x5:                                                        /* PUSH_PROMISE */
+            __builtin_trap();                 /* never offered, never sent */
+        default:
+            break;
+        }
+        p += 9 + flen;
+    }
+    memmove(c->sbuf, c->sbuf + p, c->slen - p);
+    c->slen -= p;
+}
+
+static char __h2c_root[64];
+
+static void __h2c_root_remove(void) {
+    char path[128];
+    snprintf(path, sizeof path, "%s/index.html", __h2c_root);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/big.bin", __h2c_root);
+    unlink(path);
+    rmdir(__h2c_root);
+}
+
+/* Once per process: a document root with one small and one large file,
+ * removed again when the process exits normally. */
+static void __h2c_root_init(void) {
+    if (__h2c_root[0] != '\0') return;
+    snprintf(__h2c_root, sizeof __h2c_root, "/tmp/cwfr-fuzz-h2c-%d", (int)getpid());
+    if (mkdir(__h2c_root, 0700) != 0) return;
+    atexit(__h2c_root_remove);
+    char path[128];
+    static char big[100000];
+    memset(big, 'x', sizeof big);
+    snprintf(path, sizeof path, "%s/index.html", __h2c_root);
+    FILE* f = fopen(path, "wb");
+    if (f != NULL) { fputs("<html>small</html>", f); fclose(f); }
+    snprintf(path, sizeof path, "%s/big.bin", __h2c_root);
+    f = fopen(path, "wb");
+    if (f != NULL) { fwrite(big, 1, sizeof big, f); fclose(f); }
+    __fuzz_server.root = __h2c_root;
+    __fuzz_server.root_length = strlen(__h2c_root);
+}
+
+static int __h2c_pump(h2c_t* c, int fd, size_t want) {
+    uint8_t buf[4096];
+    int got = 0;
+    while (want > 0) {
+        const ssize_t n = recv(fd, buf, want < sizeof buf ? want : sizeof buf, 0);
+        if (n <= 0) break;
+        /* FUZZ_H2C_DUMP=<file>: the raw server byte stream, for a replay. */
+        const char* dump = getenv("FUZZ_H2C_DUMP");
+        if (dump != NULL) {
+            FILE* f = fopen(dump, "ab");
+            if (f != NULL) { fwrite(buf, 1, (size_t)n, f); fclose(f); }
+        }
+        __h2c_server_sent(c, buf, (size_t)n);
+        want -= (size_t)n;
+        got = 1;
+    }
+    return got;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 2) return 0;
+    __h2c_root_init();
+
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) != 0) return 0;
+    const int small = 4096;
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+    setsockopt(sv[1], SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+
+    h2c_t* c = calloc(1, sizeof *c);
+    char* buffer = malloc(16384);
+    if (c == NULL || buffer == NULL) { free(c); free(buffer); close(sv[0]); close(sv[1]); return 0; }
+    c->max_initial = 65535;
+    c->max_frame = 16384;
+    c->conn_credit = 65535;
+    c->first_frame = 1;
+    c->hpack = hpack_decoder_create(1 << 16);
+
+    /* The server's own constructor, so the context has its queues and reset
+     * hook: the write path ends in connection_after_write(), which uses both. */
+    const ipaddr_t loopback = ipaddr_from_v4(0x0100007F);
+    connection_t* connection = connection_s_alloc(&__fuzz_listener, sv[0], &loopback, 8080,
+                                                  &loopback, 40000, buffer, 16384);
+    if (connection == NULL) {
+        hpack_decoder_free(c->hpack); free(c); free(buffer); close(sv[0]); close(sv[1]);
+        return 0;
+    }
+    connection_server_ctx_t* ctx = connection->ctx;
+    ctx->server = &__fuzz_server;
+
+    int alive = h2_server_set_http2(connection) && c->hpack != NULL;
+
+    uint64_t rng = (uint64_t)data[0] * 0x9E3779B97F4A7C15ULL + 1;
+    const uint8_t* p = data + 1;
+    const uint8_t* end = data + size;
+    for (size_t steps = 0; alive && steps < 100000; steps++) {
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        const unsigned op = (unsigned)(rng % 4);
+        const size_t amount = 1 + (size_t)((rng >> 8) % 512);
+        if (p == end && op == 0) break;
+        switch (op) {
+        case 0: {                                     /* the client sends */
+            size_t n = (size_t)(end - p) < amount ? (size_t)(end - p) : amount;
+            /* Half the time exactly up to the end of its next frame: a client
+             * writes frames, and a RST_STREAM or PING that arrives on its own,
+             * while the server is part-way through a frame of its own, is the
+             * interleaving that matters. Random cuts rarely produce it. */
+            if ((rng >> 20) & 1) {
+                size_t at = (size_t)(p - (data + 1));
+                size_t boundary = at < 24 ? 24 : 24;
+                while (boundary <= at && boundary + 9 <= size - 1) {
+                    const uint8_t* f = data + 1 + boundary;
+                    boundary += 9 + ((size_t)f[0] << 16 | (size_t)f[1] << 8 | f[2]);
+                }
+                if (boundary > at && boundary - at < n) n = boundary - at;
+            }
+            const ssize_t w = send(sv[1], p, n, MSG_NOSIGNAL);
+            if (w > 0) { __h2c_client_sent(c, p, (size_t)w); p += w; }
+            break;
+        }
+        case 1: alive = h2_server_guard_read(connection); break;
+        case 2: alive = h2_server_guard_write(connection); break;
+        case 3: (void)__h2c_pump(c, sv[1], amount * 8); break;
+        }
+    }
+
+    /* Drain: whatever the server still has to say, until it stops. */
+    for (int idle = 0; idle < 3;) {
+        if (alive) alive = h2_server_guard_read(connection);
+        if (alive) alive = h2_server_guard_write(connection);
+        idle = __h2c_pump(c, sv[1], SIZE_MAX) ? 0 : idle + 1;
+    }
+
+    /* Quiet and still alive, the server must have stopped on a frame
+     * boundary. A DATA frame is only started with window for all of it, so a
+     * frame left half-written -- a stream dropped mid-frame, say -- is one the
+     * client will wait on forever. */
+    if (alive && c->slen != 0) __builtin_trap();
+
+    /* Teardown as in h2_session: the loop that would retire responses and
+     * clear handler flags is not here. */
+    if (getenv("FUZZ_TRACE") != NULL) {
+        size_t ended = 0;
+        for (size_t i = 0; i < H2C_STREAMS; i++) ended += c->streams[i].ended;
+        fprintf(stderr, "server frames: DATA %zu HEADERS %zu RST %zu SETTINGS %zu PING %zu "
+                "GOAWAY %zu WINDOW_UPDATE %zu CONTINUATION %zu; DATA bytes %lld; "
+                "streams ended %zu; client credit %lld\n",
+                c->frames[0], c->frames[1], c->frames[3], c->frames[4], c->frames[6],
+                c->frames[7], c->frames[8], c->frames[9], (long long)c->conn_sent, ended,
+                (long long)c->conn_credit);
+    }
+
+    /* The response pool goes with the session. (h2_server_take_response is no
+     * way to empty it: on an empty pool it makes a new response.) */
+    h2session_t* s = ctx->parser;
+    if (s != NULL) {
+        for (h2stream_t* st = s->streams; st != NULL; st = st->next)
+            atomic_store_explicit(&st->handler_pending, 0, memory_order_release);
+    }
+    connection_s_free_local(connection);   /* frees the session with the context */
+
+    hpack_decoder_free(c->hpack);
+    free(c->block);
+    free(c);
+    free(buffer);
+    close(sv[0]);
+    close(sv[1]);
     return 0;
 }
 
@@ -1498,6 +3048,558 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         whole.final_status != bytes.final_status ||
         whole.final_status != split.final_status)
         __builtin_trap();
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_HTTP_RESPONSE
+
+#include <zlib.h>
+#include "connection_c.h"
+#include "httpresponseparser.h"
+
+/* The HTTP/1.1 client reading a server's response (httpclienthandlers.c
+ * __read): status line, fields, and a body framed by Content-Length or by
+ * chunked transfer coding, possibly gzip-encoded -- the path every outgoing
+ * HTTP request of the framework takes, fed by a server we do not control.
+ *
+ * Raw mode: the response as the input spells it, delivered in one read, one
+ * byte per read and in reads of 1..256 bytes. Same final status, status code,
+ * fields and body bytes in all three.
+ *
+ * Generated mode: a well-formed response -- Content-Length or chunked with
+ * chunk sizes, extensions and trailers the input picks, identity or gzip, to a
+ * GET or a HEAD -- after which the server may keep talking (a stray CRLF, the
+ * start of another response). Expected: COMPLETE, and a body that is exactly
+ * the bytes that were framed -- no more, no less, none for HEAD. */
+
+static connection_client_ctx_t __resp_ctx;
+
+typedef struct {
+    int status;
+    int code;
+    uint64_t digest;
+    size_t body_len;
+} resp_result_t;
+
+static resp_result_t __resp_run(const uint8_t* data, size_t size, int head,
+                                size_t chunk, uint64_t seed, uint8_t* body_out, size_t body_cap) {
+    resp_result_t r = { .status = HTTP1PARSER_CONTINUE, .digest = 1469598103934665603ULL };
+    const size_t cap = chunk == 0 ? (size ? size : 1) : seed != 0 ? 256 : chunk;
+    char* buffer = malloc(cap + 1);
+    connection_t* conn = calloc(1, sizeof *conn);
+    if (buffer == NULL || conn == NULL) { free(buffer); free(conn); return r; }
+    conn->buffer = buffer;
+    conn->buffer_size = cap;
+    conn->ctx = (connection_ctx_t*)&__resp_ctx;
+
+    httpresponse_t* response = httpresponse_create(conn);
+    httprequest_t* request = httprequest_create(conn);
+    if (response == NULL || request == NULL) {
+        if (response) httpresponse_free(response);
+        if (request) httprequest_free(request);
+        free(buffer); free(conn);
+        return r;
+    }
+    request->method = head ? ROUTE_HEAD : ROUTE_GET;
+    __resp_ctx.response = response;
+    __resp_ctx.request = request;
+    httpresponseparser_t* parser = response->parser;
+    httpresponseparser_set_connection(parser, conn);
+    httpresponseparser_set_buffer(parser, conn->buffer);
+
+    uint64_t rng = seed * 0x9E3779B97F4A7C15ULL + 1;
+    for (size_t off = 0; off < size;) {
+        size_t n = cap;
+        if (chunk != 0 && seed != 0) {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            n = 1 + (size_t)(rng % 256);
+        }
+        if (n > size - off) n = size - off;
+        memcpy(buffer, data + off, n);
+        buffer[n] = 0;
+        off += n;
+        httpresponseparser_set_bytes_readed(parser, (ssize_t)n);
+        r.status = httpresponseparser_run(parser);
+        if (r.status != HTTP1PARSER_CONTINUE) break;
+    }
+
+    r.code = response->status_code;
+    r.digest = __fuzz_fnv_headers(r.digest, response->header_);
+    const file_t* body = &response->payload_.file;
+    if (body->fd >= 0) {
+        uint8_t tmp[4096];
+        for (off_t o = 0;;) {
+            const ssize_t n = pread(body->fd, tmp, sizeof tmp, o);
+            if (n <= 0) break;
+            r.digest = __fuzz_fnv(r.digest, tmp, (size_t)n);
+            if (body_out != NULL && r.body_len + (size_t)n <= body_cap)
+                memcpy(body_out + r.body_len, tmp, (size_t)n);
+            r.body_len += (size_t)n;
+            o += n;
+        }
+    }
+
+    __resp_ctx.response = NULL;
+    __resp_ctx.request = NULL;
+    httprequest_free(request);
+    httpresponse_free(response);
+    free(conn);
+    free(buffer);
+    return r;
+}
+
+static int __resp_put(uint8_t* out, size_t cap, size_t* len, const void* p, size_t n) {
+    if (n > cap - *len) return 0;
+    memcpy(out + *len, p, n);
+    *len += n;
+    return 1;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 4) return 0;
+    const int head = (data[0] & 2) != 0;
+
+    if (!(data[0] & 1)) {
+        const uint64_t seed = (uint64_t)(data[0] >> 2) + 1;
+        const resp_result_t whole = __resp_run(data + 1, size - 1, head, 0, 0, NULL, 0);
+        const resp_result_t bytes = __resp_run(data + 1, size - 1, head, 1, 0, NULL, 0);
+        const resp_result_t split = __resp_run(data + 1, size - 1, head, 1, seed, NULL, 0);
+        if (whole.status != bytes.status || whole.status != split.status ||
+            whole.code != bytes.code || whole.code != split.code ||
+            whole.digest != bytes.digest || whole.digest != split.digest ||
+            whole.body_len != bytes.body_len || whole.body_len != split.body_len)
+            __builtin_trap();
+        return 0;
+    }
+
+    /* Generated: [mode][framing][chunk seed][tail] then the body. */
+    const int chunked = data[1] & 1, gzipped = (data[1] & 2) != 0;
+    const int extensions = (data[1] & 4) != 0, trailers = (data[1] & 8) != 0;
+    const int tail = data[3] % 3;
+    const uint8_t* body = data + 4;
+    const size_t body_len = size - 4 > 3000 ? 3000 : size - 4;
+
+    /* What goes on the wire as the representation: the body, or its gzip. */
+    static uint8_t packed[8192];
+    const uint8_t* rep = body;
+    size_t rep_len = body_len;
+    if (gzipped) {
+        z_stream z;
+        memset(&z, 0, sizeof z);
+        if (deflateInit2(&z, Z_DEFAULT_COMPRESSION, Z_DEFLATED, MAX_WBITS + 16, 8,
+                         Z_DEFAULT_STRATEGY) != Z_OK) return 0;
+        z.next_in = (Bytef*)body;
+        z.avail_in = (uInt)body_len;
+        z.next_out = packed;
+        z.avail_out = sizeof packed;
+        const int st = deflate(&z, Z_FINISH);
+        rep_len = sizeof packed - z.avail_out;
+        deflateEnd(&z);
+        if (st != Z_STREAM_END) return 0;
+        rep = packed;
+    }
+
+    static uint8_t wire[16384];
+    size_t len = 0;
+    char line[128];
+    int ok = __resp_put(wire, sizeof wire, &len, "HTTP/1.1 200 OK\r\nServer: fuzz\r\n", 31);
+    if (gzipped) ok = ok && __resp_put(wire, sizeof wire, &len, "Content-Encoding: gzip\r\n", 24);
+    if (chunked) {
+        ok = ok && __resp_put(wire, sizeof wire, &len, "Transfer-Encoding: chunked\r\n\r\n", 30);
+        if (!head) {
+            uint64_t rng = (uint64_t)data[2] * 0x9E3779B97F4A7C15ULL + 1;
+            for (size_t off = 0; off < rep_len && ok;) {
+                rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                size_t n = 1 + (size_t)(rng % 300);
+                if (n > rep_len - off) n = rep_len - off;
+                const int w = snprintf(line, sizeof line, "%zx%s\r\n", n, extensions ? ";ext=1" : "");
+                ok = __resp_put(wire, sizeof wire, &len, line, (size_t)w) &&
+                     __resp_put(wire, sizeof wire, &len, rep + off, n) &&
+                     __resp_put(wire, sizeof wire, &len, "\r\n", 2);
+                off += n;
+            }
+            ok = ok && __resp_put(wire, sizeof wire, &len, "0\r\n", 3);
+            if (trailers) ok = ok && __resp_put(wire, sizeof wire, &len, "X-Trailer: t\r\n", 14);
+            ok = ok && __resp_put(wire, sizeof wire, &len, "\r\n", 2);
+        }
+    } else {
+        const int w = snprintf(line, sizeof line, "Content-Length: %zu\r\n\r\n", rep_len);
+        ok = ok && __resp_put(wire, sizeof wire, &len, line, (size_t)w);
+        if (!head) ok = ok && __resp_put(wire, sizeof wire, &len, rep, rep_len);
+    }
+    /* What a server may put after a complete response on a keep-alive
+     * connection: nothing, a stray CRLF, or the start of another response. */
+    if (tail == 1) ok = ok && __resp_put(wire, sizeof wire, &len, "\r\n", 2);
+    if (tail == 2) ok = ok && __resp_put(wire, sizeof wire, &len, "HTTP/1.1 204 No", 15);
+    if (!ok) return 0;
+
+    static uint8_t got[4096];
+    const resp_result_t runs[3] = {
+        __resp_run(wire, len, head, 0, 0, got, sizeof got),
+        __resp_run(wire, len, head, 1, 0, NULL, 0),
+        __resp_run(wire, len, head, 1, (uint64_t)data[2] + 1, NULL, 0),
+    };
+    if (getenv("FUZZ_TRACE") != NULL)
+        fprintf(stderr, "chunked %d gzip %d head %d tail %d: status %d/%d/%d body %zu/%zu/%zu want %zu\n",
+                chunked, gzipped, head, tail, runs[0].status, runs[1].status, runs[2].status,
+                runs[0].body_len, runs[1].body_len, runs[2].body_len, head ? 0 : body_len);
+    for (int i = 0; i < 3; i++) {
+        if (runs[i].status != HTTP1RESPONSEPARSER_COMPLETE || runs[i].code != 200) __builtin_trap();
+        if (runs[i].body_len != (head ? 0 : body_len)) __builtin_trap();
+    }
+    if (!head && memcmp(got, body, body_len) != 0) __builtin_trap();
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_SMTP_RESPONSE
+
+#include <ctype.h>
+#include "connection_c.h"
+#include "smtpresponse.h"
+#include "smtpresponseparser.h"
+
+/* The SMTP client reading a server reply (smtpclienthandlers.c), and what it
+ * learns from an EHLO reply: whether the server offers STARTTLS -- which
+ * decides whether the password goes out encrypted -- which AUTH mechanisms,
+ * and the SIZE limit.
+ *
+ * Raw mode: the reply as the input spells it, in one read, one byte per read
+ * and in reads of 1..64 bytes; the same status, message, extensions, AUTH
+ * mechanisms and size in all three.
+ *
+ * Generated mode: a reply of 1..8 lines, all with one code, each carrying a
+ * keyword from a list that includes the look-alikes -- "STARTTLSX",
+ * "X-STARTTLS", "sTaRtTlS", "SIZE=10", "AUTH=PLAIN", "AUTH PLAINX" -- and the
+ * capabilities are checked against a model of RFC 5321 §4.1.1.1, RFC 3207,
+ * RFC 4954 and RFC 1870: a keyword counts, case-insensitively, when it is the
+ * whole first word of a line of a 250 reply; nothing else counts. */
+
+static connection_client_ctx_t __smtp_ctx;
+
+typedef struct {
+    int status, parser_status;
+    unsigned ext, auth;
+    size_t size;
+    char message[SMTPRESPONSE_MESSAGE_SIZE];
+} smtp_result_t;
+
+static smtp_result_t __smtp_run(const uint8_t* data, size_t size, size_t chunk, uint64_t seed) {
+    smtp_result_t r;
+    memset(&r, 0, sizeof r);
+    r.parser_status = SMTPRESPONSEPARSER_CONTINUE;
+    connection_t* conn = calloc(1, sizeof *conn);
+    if (conn == NULL) return r;
+    smtpresponse_t* response = smtpresponse_create(conn);
+    if (response == NULL) { free(conn); return r; }
+    __smtp_ctx.response = response;
+    conn->ctx = (connection_ctx_t*)&__smtp_ctx;
+    smtpresponseparser_t* parser = response->parser;
+    smtpresponseparser_set_connection(parser, conn);
+
+    uint64_t rng = seed * 0x9E3779B97F4A7C15ULL + 1;
+    for (size_t off = 0; off < size;) {
+        size_t n = chunk == 0 ? size : chunk;
+        if (chunk != 0 && seed != 0) {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            n = 1 + (size_t)(rng % 64);
+        }
+        if (n > size - off) n = size - off;
+        char* buffer = malloc(n);               /* exact size: ASan sees any overread */
+        if (buffer == NULL) break;
+        memcpy(buffer, data + off, n);
+        off += n;
+        smtpresponseparser_set_buffer(parser, buffer);
+        smtpresponseparser_set_bytes_readed(parser, (int)n);
+        r.parser_status = smtpresponseparser_run(parser);
+        free(buffer);
+        if (r.parser_status != SMTPRESPONSEPARSER_CONTINUE) break;
+    }
+    r.status = response->status;
+    r.ext = response->extensions;
+    r.auth = response->auth_mechanisms;
+    r.size = response->size_limit;
+    memcpy(r.message, response->message, sizeof r.message);
+
+    __smtp_ctx.response = NULL;
+    response->base.free(response);
+    free(conn);
+    return r;
+}
+
+static int __smtp_same(const smtp_result_t* a, const smtp_result_t* b) {
+    return a->status == b->status && a->parser_status == b->parser_status &&
+           a->ext == b->ext && a->auth == b->auth && a->size == b->size &&
+           memcmp(a->message, b->message, sizeof a->message) == 0;
+}
+
+/* The model: the first word of the line, compared case-insensitively. */
+static int __smtp_word_is(const char* text, const char* keyword) {
+    const size_t n = strlen(keyword);
+    for (size_t i = 0; i < n; i++)
+        if (toupper((unsigned char)text[i]) != keyword[i]) return 0;
+    return text[n] == '\0' || text[n] == ' ' || text[n] == '=';
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 2) return 0;
+
+    if (!(data[0] & 1)) {
+        const uint64_t seed = (uint64_t)(data[0] >> 1) + 1;
+        const smtp_result_t whole = __smtp_run(data + 1, size - 1, 0, 0);
+        const smtp_result_t bytes = __smtp_run(data + 1, size - 1, 1, 0);
+        const smtp_result_t split = __smtp_run(data + 1, size - 1, 1, seed);
+        if (!__smtp_same(&whole, &bytes) || !__smtp_same(&whole, &split)) __builtin_trap();
+        return 0;
+    }
+
+    static const char* const words[] = {
+        "STARTTLS", "starttls", "StartTLS", "STARTTLSX", "X-STARTTLS", "PIPELINING",
+        "PIPELININGX", "SIZE 35882577", "SIZE", "SIZE=10", "SIZE  42", "SIZEX 5",
+        "AUTH PLAIN LOGIN", "AUTH=PLAIN", "AUTH LOGIN", "AUTH PLAINX", "AUTH CRAM-MD5",
+        "auth plain", "8BITMIME", "HELP", "mx.example.com greets you", "ENHANCEDSTATUSCODES",
+    };
+    const size_t nwords = sizeof words / sizeof words[0];
+    static const int codes[] = { 250, 250, 250, 220, 550, 421 };
+    const int code = codes[(data[0] >> 1) % 6];
+    const size_t lines = (size_t)(data[1] % 8) + 1;
+
+    char wire[1024];
+    size_t len = 0;
+    unsigned ext = 0, auth = 0;
+    size_t size_limit = 0;
+    for (size_t i = 0; i < lines; i++) {
+        const char* w = words[(2 + i < size ? data[2 + i] : i) % nwords];
+        const int n = snprintf(wire + len, sizeof wire - len, "%03d%c%s\r\n", code,
+                               i + 1 == lines ? ' ' : '-', w);
+        if (n < 0 || (size_t)n >= sizeof wire - len) return 0;
+        len += (size_t)n;
+
+        if (code != 250) continue;
+        if (__smtp_word_is(w, "STARTTLS")) ext |= SMTPRESPONSE_EXT_STARTTLS;
+        if (__smtp_word_is(w, "PIPELINING")) ext |= SMTPRESPONSE_EXT_PIPELINING;
+        if (__smtp_word_is(w, "SIZE")) {
+            ext |= SMTPRESPONSE_EXT_SIZE;
+            const char* p = w + 4;
+            while (*p == ' ') p++;
+            if (isdigit((unsigned char)*p)) size_limit = (size_t)strtoull(p, NULL, 10);
+        }
+        if (__smtp_word_is(w, "AUTH")) {
+            ext |= SMTPRESPONSE_EXT_AUTH;
+            char args[64];
+            snprintf(args, sizeof args, "%s", w + 4);
+            for (char* tok = strtok(args, " ="); tok != NULL; tok = strtok(NULL, " =")) {
+                if (__smtp_word_is(tok, "PLAIN")) auth |= SMTPRESPONSE_AUTH_PLAIN;
+                if (__smtp_word_is(tok, "LOGIN")) auth |= SMTPRESPONSE_AUTH_LOGIN;
+            }
+        }
+    }
+
+    const smtp_result_t runs[3] = {
+        __smtp_run((const uint8_t*)wire, len, 0, 0), __smtp_run((const uint8_t*)wire, len, 1, 0),
+        __smtp_run((const uint8_t*)wire, len, 1, (uint64_t)data[1] + 1),
+    };
+    for (int i = 0; i < 3; i++) {
+        if (runs[i].parser_status != SMTPRESPONSEPARSER_COMPLETE || runs[i].status != code)
+            __builtin_trap();
+        if (runs[i].ext != ext || runs[i].auth != auth || runs[i].size != size_limit)
+            __builtin_trap();
+    }
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_JWT
+
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include "jwt.h"
+
+/* JSON Web Tokens as the framework verifies them, with an HS256 key. The
+ * property that matters above all others: a token is accepted only with the
+ * right signature. It is checked here without the library -- HMAC-SHA256 of
+ * the signing input computed with OpenSSL, the signature decoded by a strict
+ * base64url decoder of our own -- for every token jwt_decode accepts (an
+ * expired one included: its signature was checked before its expiry).
+ *
+ * Raw mode: the input is the token. Almost none will be valid, and any that
+ * is accepted without a matching HMAC is a forgery.
+ *
+ * Generated mode: a payload built from the input is encoded and must decode
+ * to the same claims; then the token is attacked the ways tokens are
+ * attacked -- one character of the header or payload changed, one character
+ * of the signature changed, the algorithm renamed to "none" or to HS512 with a
+ * genuine HS512 signature, the expiry moved into the past -- and each must be
+ * refused, the last one as EXPIRED. */
+
+static const char __jwt_secret[] = "fuzz-secret-0123456789abcdef-0123";
+
+static int __jwt_b64val(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '-') return 62;
+    if (c == '_') return 63;
+    return -1;
+}
+
+/* Strict base64url without padding; returns decoded length or -1. */
+static int __jwt_b64url_decode(const char* s, size_t len, uint8_t* out, size_t cap) {
+    if (len % 4 == 1) return -1;
+    size_t o = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (size_t i = 0; i < len; i++) {
+        const int v = __jwt_b64val(s[i]);
+        if (v < 0) return -1;
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            if (o == cap) return -1;
+            out[o++] = (uint8_t)(acc >> bits);
+        }
+    }
+    return (int)o;
+}
+
+static void __jwt_b64url_encode(const uint8_t* in, size_t len, char* out) {
+    static const char a[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    size_t o = 0;
+    for (size_t i = 0; i < len; i += 3) {
+        const uint32_t v = (uint32_t)in[i] << 16 | (i + 1 < len ? (uint32_t)in[i + 1] << 8 : 0) |
+                           (i + 2 < len ? in[i + 2] : 0);
+        out[o++] = a[v >> 18 & 63];
+        out[o++] = a[v >> 12 & 63];
+        if (i + 1 < len) out[o++] = a[v >> 6 & 63];
+        if (i + 2 < len) out[o++] = a[v & 63];
+    }
+    out[o] = '\0';
+}
+
+/* The independent check: is `token` signed with our secret, and does its
+ * header name HS256? */
+static int __jwt_genuinely_signed(const char* token) {
+    const char* d1 = strchr(token, '.');
+    const char* d2 = d1 != NULL ? strchr(d1 + 1, '.') : NULL;
+    if (d2 == NULL) return 0;
+    uint8_t want[EVP_MAX_MD_SIZE];
+    unsigned int want_len = 0;
+    if (HMAC(EVP_sha256(), __jwt_secret, (int)strlen(__jwt_secret),
+             (const unsigned char*)token, (size_t)(d2 - token), want, &want_len) == NULL)
+        return 0;
+    uint8_t got[128];
+    const int got_len = __jwt_b64url_decode(d2 + 1, strlen(d2 + 1), got, sizeof got);
+    if (got_len != (int)want_len || memcmp(got, want, want_len) != 0) return 0;
+    /* And spelled the one canonical way: re-encoding gives the segment back. */
+    char again[256];
+    __jwt_b64url_encode(got, (size_t)got_len, again);
+    return strcmp(again, d2 + 1) == 0;
+}
+
+static void __jwt_check_decode(const char* token, const jwt_key_t* key) {
+    jwt_t r = jwt_decode(token, key);
+    if ((r.error == JWT_OK || r.error == JWT_ERROR_EXPIRED) && !__jwt_genuinely_signed(token))
+        __builtin_trap();                     /* accepted without our signature */
+    if (r.error == JWT_OK && jwt_verify(token, key) != JWT_OK) __builtin_trap();
+    jwt_free(&r);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 2) return 0;
+    jwt_key_t* key = jwt_key_hs256(__jwt_secret, strlen(__jwt_secret));
+    if (key == NULL) return 0;
+
+    if (!(data[0] & 1)) {
+        char* token = malloc(size);
+        if (token != NULL) {
+            for (size_t i = 1; i < size; i++) token[i - 1] = data[i] ? (char)data[i] : '.';
+            token[size - 1] = '\0';
+            __jwt_check_decode(token, key);
+            free(token);
+        }
+        jwt_key_free(key);
+        return 0;
+    }
+
+    /* Claims: a subject and a number from the input, and an expiry either in
+     * the future or in the past. */
+    const int expired = (data[0] & 2) != 0;
+    json_doc_t* payload = json_root_create_object();
+    char sub[64];
+    const size_t sub_len = size - 2 < sizeof sub - 1 ? size - 2 : sizeof sub - 1;
+    for (size_t i = 0; i < sub_len; i++) sub[i] = (char)(data[2 + i] % 94 + 33);
+    sub[sub_len] = '\0';
+    json_object_set(json_root(payload), "sub", json_create_string(sub));
+    json_object_set(json_root(payload), "n", json_create_number(data[1]));
+    json_object_set(json_root(payload), "exp",
+                    json_create_number((long double)(time(NULL) + (expired ? -100 : 3600))));
+    char* token = jwt_encode(payload, key);
+    json_free(payload);
+    if (token == NULL) { jwt_key_free(key); return 0; }
+
+    /* The genuine token. */
+    jwt_t r = jwt_decode(token, key);
+    if (r.error != (expired ? JWT_ERROR_EXPIRED : JWT_OK)) __builtin_trap();
+    if (!expired) {
+        const json_token_t* got = json_object_get(json_root(r.payload), "sub");
+        if (got == NULL || !json_is_string(got) || strcmp(json_string(got), sub) != 0)
+            __builtin_trap();
+    }
+    jwt_free(&r);
+    __jwt_check_decode(token, key);
+
+    const size_t len = strlen(token);
+    const char* d1 = strchr(token, '.');
+    const char* d2 = strchr(d1 + 1, '.');
+
+    /* One character changed. In the signing input any change must fail; in the
+     * signature, all but the last character (whose low bits base64url does not
+     * use, so a change there may decode to the same bytes). */
+    static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    const size_t at = data[1] * 131u % len;
+    if (token[at] != '.' && at != len - 1) {
+        char* bad = strdup(token);
+        if (bad != NULL) {
+            const char* was = strchr(alphabet, bad[at]);
+            const size_t idx = was != NULL ? (size_t)(was - alphabet) : 0;
+            bad[at] = alphabet[(idx + 1 + data[1] % 62) % 64];
+            jwt_t t = jwt_decode(bad, key);
+            if (t.error == JWT_OK || t.error == JWT_ERROR_EXPIRED) __builtin_trap();
+            jwt_free(&t);
+            __jwt_check_decode(bad, key);
+            free(bad);
+        }
+    }
+
+    /* The algorithm changed: to "none" with no signature, and to HS512 with a
+     * correct HS512 signature under the same secret (RFC 8725 §2.1, §3.1). */
+    const char* payload_b64 = d1 + 1;
+    const size_t payload_b64_len = (size_t)(d2 - payload_b64);
+    for (int variant = 0; variant < 2; variant++) {
+        const char* header = variant == 0 ? "{\"alg\":\"none\",\"typ\":\"JWT\"}"
+                                          : "{\"alg\":\"HS512\",\"typ\":\"JWT\"}";
+        char forged[2048];
+        __jwt_b64url_encode((const uint8_t*)header, strlen(header), forged);
+        size_t n = strlen(forged);
+        forged[n++] = '.';
+        if (n + payload_b64_len + 200 > sizeof forged) break;
+        memcpy(forged + n, payload_b64, payload_b64_len);
+        n += payload_b64_len;
+        forged[n++] = '.';
+        forged[n] = '\0';
+        if (variant == 1) {
+            uint8_t mac[EVP_MAX_MD_SIZE];
+            unsigned int mac_len = 0;
+            HMAC(EVP_sha512(), __jwt_secret, (int)strlen(__jwt_secret),
+                 (const unsigned char*)forged, n - 1, mac, &mac_len);
+            __jwt_b64url_encode(mac, mac_len, forged + n);
+        }
+        jwt_t t = jwt_decode(forged, key);
+        if (t.error == JWT_OK || t.error == JWT_ERROR_EXPIRED) __builtin_trap();
+        jwt_free(&t);
+    }
+
+    free(token);
+    jwt_key_free(key);
     return 0;
 }
 

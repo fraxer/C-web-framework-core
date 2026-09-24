@@ -154,6 +154,36 @@ TEST(test_httpresponseparser_simple_200) {
     harness_free(&h);
 }
 
+TEST(test_httpresponseparser_content_length_stops_at_length) {
+    TEST_SUITE("HTTP Response Parser - Status Line");
+    TEST_CASE("bytes past Content-Length in the same read are not body");
+
+    /* Found by fuzz_http_response. Whatever followed the declared length in
+     * the read that completed it was appended to the body: a stray CRLF, the
+     * start of a pipelined response or plain junk became part of what the
+     * caller received -- and only when it happened to share a read, so the
+     * same response parsed differently depending on how TCP split it. */
+    response_harness_t h;
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
+
+    const char* resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloEXTRA";
+    TEST_ASSERT_EQUAL(HTTP1RESPONSEPARSER_COMPLETE, harness_feed(&h, resp, strlen(resp)),
+                      "Parser should complete");
+    TEST_ASSERT_EQUAL_SIZE((size_t)5, h.response->payload_.file.size, "exactly five bytes of body");
+    char* body = harness_read_body(&h);
+    TEST_ASSERT_STR_EQUAL("hello", body, "and they are the declared ones");
+    free(body);
+    harness_free(&h);
+
+    TEST_CASE("the same holds when the body arrives over several reads");
+    TEST_REQUIRE(harness_init(&h, ROUTE_GET), "Harness should initialize");
+    const char* head = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel";
+    TEST_ASSERT_EQUAL(HTTP1PARSER_CONTINUE, harness_feed(&h, head, strlen(head)), "first part");
+    TEST_ASSERT_EQUAL(HTTP1RESPONSEPARSER_COMPLETE, harness_feed(&h, "loEXTRA", 7), "rest");
+    TEST_ASSERT_EQUAL_SIZE((size_t)5, h.response->payload_.file.size, "still five bytes");
+    harness_free(&h);
+}
+
 TEST(test_httpresponseparser_http10) {
     TEST_CASE("Accept HTTP/1.0 response");
 

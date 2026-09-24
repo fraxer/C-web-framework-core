@@ -474,6 +474,72 @@ TEST(test_openssl_handshake_read_write) {
     openssl_free(openssl);
 }
 
+TEST(test_openssl_write_retry_from_moved_buffer) {
+    TEST_SUITE("openssl: io");
+    TEST_CASE("a write refused with WANT_WRITE may be retried from another address");
+
+    /* OpenSSL keeps the refused write's records and by default demands the
+     * retry pass the very same pointer, or it fails the connection with "bad
+     * write retry". The h2 session does not keep that pointer: compacting or
+     * growing s->out (h2_session_queue_frame) and settling a stream dropped
+     * mid-frame (h2_session_settle_frame) retry the same bytes from wherever
+     * they now live. SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER is what makes that a
+     * legal retry. */
+    TEST_REQUIRE(ensure_certs(), "test certificates should be written");
+
+    openssl_t* openssl = make_openssl(cert_path, key_path, TEST_CIPHERS_VALID);
+    unsigned char* sent = malloc(65536);
+    unsigned char* moved = malloc(65536);
+    unsigned char* received = malloc(65536);
+
+    TEST_REQUIRE_NOT_NULL(openssl, "make_openssl should not return NULL");
+    TEST_REQUIRE(sent != NULL && moved != NULL && received != NULL, "buffers");
+    TEST_REQUIRE(openssl_init(openssl) == 1, "server context should initialize");
+
+    tls_pair_t pair;
+    TEST_REQUIRE_GOTO(tls_pair_setup(&pair, openssl->ctx), "tls pair should be created", done);
+    TEST_REQUIRE_GOTO(do_handshake(pair.client, pair.server), "handshake should complete", done);
+
+    for (size_t i = 0; i < 65536; i++) sent[i] = (unsigned char)(i * 131 + 7);
+
+    /* The BIO pair holds about 17 KB, so 64 KiB cannot go in one call. */
+    int result = openssl_write(pair.server, sent, 65536);
+    TEST_REQUIRE_GOTO(result <= 0 && openssl_io_status(pair.server, result) == OPENSSL_IO_WANT_WRITE,
+                      "the first write should be refused with WANT_WRITE", done);
+
+    memcpy(moved, sent, 65536);
+    memset(sent, 0, 65536);   /* the old address holds nothing useful any more */
+
+    size_t got = 0;
+    int written = 0;
+    for (int round = 0; round < 64 && (written == 0 || got < 65536); round++) {
+        for (;;) {
+            const int n = openssl_read(pair.client, received + got, 65536 - got);
+            if (n <= 0) break;
+            got += (size_t)n;
+        }
+        if (written) continue;
+
+        result = openssl_write(pair.server, moved, 65536);
+        if (result == 65536) { written = 1; continue; }
+
+        TEST_REQUIRE_GOTO(openssl_io_status(pair.server, result) == OPENSSL_IO_WANT_WRITE,
+                          "a retry from the moved buffer must not fail the connection", done);
+    }
+
+    TEST_ASSERT(written, "the retry should complete");
+    TEST_ASSERT_EQUAL(65536, (int)got, "the client should receive every byte once");
+    TEST_ASSERT(memcmp(received, moved, 65536) == 0, "and in order");
+
+    done:
+
+    tls_pair_free(&pair);
+    openssl_free(openssl);
+    free(sent);
+    free(moved);
+    free(received);
+}
+
 TEST(test_openssl_init_sets_min_tls_1_2) {
     TEST_SUITE("openssl: init");
     TEST_CASE("openssl_init sets TLS 1.2 as minimum protocol version");

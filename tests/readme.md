@@ -466,8 +466,15 @@ Targets, each with a seed corpus under `fuzz/corpus/`:
 | `websocket` | a websocket frame, where a route accepts them |
 | `ws_deflate` | permessage-deflate: the negotiated header and the inflate behind it |
 | `request_sequence` | one keep-alive HTTP/1.1 connection: pipelined requests, delivered in reads of any size |
-| `websocket_sequence` | websocket frames across reads, control frames between fragments |
+| `websocket_sequence` | one WebSocket connection: fragmented, compressed and control frames across reads |
 | `qpack_dynamic` | the QPACK encoder stream changing a live dynamic table under a field section |
+| `qpack_session` | our QPACK encoder and decoder joined by both service streams |
+| `h2_connection` | a whole HTTP/2 connection through the event-loop entry points, over a socket that takes writes in part |
+| `quic_stream` | QUIC stream reassembly (`quicrecvbuf`) and range sets (`quicrange`) against models |
+| `h3_request` | an HTTP/3 request stream: frame order, FIN, the body |
+| `http_response` | the HTTP/1.1 client reading a server's response: Content-Length, chunked, gzip |
+| `smtp_response` | the SMTP client reading replies, and the EHLO capabilities it trusts |
+| `jwt` | HS256 tokens: acceptance, tampering, algorithm substitution, expiry |
 
 An application registers its own with the same function, and `run.sh` picks
 them up from the manifest; the site's `fuzz_feedback` (in `backend/tests/`) is
@@ -497,12 +504,68 @@ broke it is saved like any crash:
 - **Tables stay within bounds.** `qpack_dynamic`: bytes never exceed the
   capacity, capacity never exceeds what was advertised, and a section that
   decoded before the encoder stream cannot block after it.
+- **Generated traffic with a known answer.** Several targets build correct
+  traffic from the input instead of mutating bytes, so what must come out is
+  known, and one deliberate violation at a time is checked for the error the
+  RFC prescribes. `websocket_sequence`: messages in 1..4 fragments, compressed
+  with and without context takeover, pings and closes between fragments, text
+  that is not UTF-8, messages over the size limit. `qpack_session`: a script of
+  capacity changes, the four insert instructions, sections on eight streams,
+  partial delivery of both streams, decoding out of order, acknowledgments and
+  cancellations -- the fields must round-trip, neither side may reject the
+  other, and in the end both tables agree. `h3_request`: HEADERS, DATA,
+  trailers and grease, or DATA first, HEADERS after trailers, SETTINGS or an
+  HTTP/2 codepoint on the stream, a truncated frame, a content-length mismatch,
+  FIN before HEADERS. `http_response`, `smtp_response` and `jwt` likewise.
+- **Models.** `quic_stream` runs `quicrecvbuf` against a byte array that
+  keeps the first arrival (overlaps, conflicting retransmissions, FIN and
+  RESET_STREAM final sizes, the buffered cap) and `quicrange` against a bitset,
+  near 0 and near `UINT64_MAX`; freeing must hand the QUIC memory budget back.
+- **What reaches the wire.** `h2_connection` checks the server's bytes the way
+  a strict client would: SETTINGS first, every header block decodes with one
+  HPACK decoder, no frame on a stream after END_STREAM, DATA never beyond the
+  windows the client granted, PING and SETTINGS ACKs answer something, and a
+  quiet server stops on a frame boundary. `jwt` checks every token it sees
+  accepted against an HMAC computed with OpenSSL and a strict base64url decoder.
 
-The first runs of these found two bugs, both kept as seeds and unit tests:
-an Insert With Name Reference to the entry its own insertion evicts read the
-name after `free` (`qpack.c`), and a number whose exponent overflows `long
-double` was accepted and serialized as `inf` (`json.c`).
+What these found, each fixed and kept as a seed and a unit test (or, for the
+HTTP/2 write path, as a seed that replays it):
 
+- `qpack.c`: an Insert With Name Reference to the entry its own insertion
+  evicts read the name after `free`.
+- `json.c`: a number whose exponent overflows `long double` was accepted and
+  serialized as `inf`.
+- `websocketsparser.c`: a non-final fragment that ended a read left `pos` at
+  its payload, and the server loop parsed the unmasked payload as the next
+  frame -- every fragmented message sent in separate segments was closed with
+  1002, on HTTP/1.1 and in RFC 8441 tunnels alike.
+- `qpack.c` (encoder): Set Dynamic Table Capacity evicted on the decoder but
+  not in the encoder's copy; the encoder evicted insertions the peer had not
+  acknowledged (RFC 9204 §2.1.1), which let it run more than MaxEntries ahead
+  and produce a Required Insert Count the decoder cannot reconstruct; and a
+  refused insertion could leave the copy with entries evicted that the peer
+  was never told about.
+- `h2session.c`: control frames queued by the read path were written into the
+  middle of a DATA frame the socket had taken part of, and a stream reset while
+  it owned the socket mid-frame left that frame unfinished. Once the frame was
+  finished, its remaining payload was not charged to the connection window, so
+  the next stream sent DATA past what the client had granted.
+- `quicrecvbuf.c`: the read head of a part-read segment still counted against
+  the buffer cap, which is the flow-control window -- a peer filling the window
+  it had just been granted got FLOW_CONTROL_ERROR.
+- `quicrange.c`: a span ending at `UINT64_MAX` wrapped `end + 1` to 0 and
+  unsorted the set.
+- `httpresponseparser.c`: bytes after a Content-Length body in the same read
+  were appended to the body.
+- `jwt.c`: the signature was accepted with padding, a tail after '=', the
+  standard alphabet or stray unused bits -- one token, many spellings.
+
+One more came out of checking the HTTP/2 fix against a live server rather than
+out of a target: finishing a frame from the session's output buffer, like
+compacting or growing that buffer, retries a write from a different address.
+Over TLS OpenSSL refuses that by default ("bad write retry") and fails the
+connection, so the server context now sets `SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER`
+(`test_openssl_write_retry_from_moved_buffer`).
 
 Everything below `huffman` in that table is newer than the QUIC targets above
 it and covers what the HTTP/1.1 and HTTP/2 sides reach before a handler sees

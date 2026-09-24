@@ -60,10 +60,12 @@ manifest="$build_dir/fuzz-targets.txt"
 # The core's own targets, kept in step with tests/CMakeLists.txt on purpose.
 expected=(fuzz_huffman fuzz_hpack fuzz_h2_frame fuzz_json fuzz_cookie
           fuzz_urlencoded fuzz_multipart fuzz_request fuzz_request_sequence
-          fuzz_websocket fuzz_websocket_sequence fuzz_ws_deflate fuzz_h2_session)
+          fuzz_websocket fuzz_websocket_sequence fuzz_ws_deflate fuzz_h2_session
+          fuzz_h2_connection fuzz_http_response fuzz_smtp_response fuzz_jwt)
 if grep -Eq '^INCLUDE_HTTP3:[A-Z]+=yes$' "$build_dir/CMakeCache.txt" 2>/dev/null; then
     expected+=(fuzz_quic_packet fuzz_quic_frame fuzz_quic_tp fuzz_h3_frame
-               fuzz_qpack_decode fuzz_qpack_streams fuzz_h3_priority fuzz_qpack_dynamic)
+               fuzz_qpack_decode fuzz_qpack_streams fuzz_h3_priority fuzz_qpack_dynamic
+               fuzz_qpack_session fuzz_quic_stream fuzz_h3_request)
 fi
 read -r -a extra <<< "${FUZZ_EXPECT_EXTRA:-}"
 expected+=("${extra[@]}")

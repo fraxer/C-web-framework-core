@@ -125,6 +125,26 @@ TEST(test_quic_range) {
     TEST_ASSERT(quicrange_count(&keeps) == 20, "all of them held");
     TEST_ASSERT(!quicrange_evicted(&keeps, 0), "nothing evicted");
     quicrange_free(&keeps);
+
+    TEST_CASE("an interval ending at UINT64_MAX still orders what follows");
+    /* Found by fuzz_quic_stream. `end + 1` of a span ending at UINT64_MAX is 0,
+     * which made every later interval look as if it lay beyond that span: it
+     * was appended after it instead of merged into it, the set stopped being
+     * sorted, and the binary search in quicrange_contains stopped finding
+     * members. */
+    quicrange_t top;
+    quicrange_init(&top, 0);
+    quicrange_add(&top, UINT64_MAX - 10, UINT64_MAX);
+    quicrange_add(&top, UINT64_MAX - 5, UINT64_MAX - 4);
+    TEST_ASSERT(quicrange_count(&top) == 1, "a contained interval merges");
+    quicrange_add(&top, UINT64_MAX - 20, UINT64_MAX - 11);
+    TEST_ASSERT(quicrange_count(&top) == 1 && quicrange_min(&top) == UINT64_MAX - 20 &&
+                quicrange_max(&top) == UINT64_MAX, "an adjacent one below merges too");
+    quicrange_add(&top, 5, 7);
+    TEST_ASSERT(quicrange_count(&top) == 2 && quicrange_contains(&top, 6) &&
+                quicrange_contains(&top, UINT64_MAX - 15) && !quicrange_contains(&top, 8),
+                "a distant one goes in front, and lookups find both");
+    quicrange_free(&top);
 }
 
 TEST(test_quic_recvbuf) {
@@ -222,6 +242,26 @@ TEST(test_quic_recvbuf) {
     memset(big, 'x', sizeof big);
     TEST_ASSERT(quicrecvbuf_insert(&buf, 1000, big, sizeof big, 0)
                 == QUICRECVBUF_TOO_MUCH, "past the cap");
+    quicrecvbuf_free(&buf);
+
+    TEST_CASE("bytes already read do not count against the cap");
+    /* Found by fuzz_quic_stream. The cap is the stream's flow-control window,
+     * and the window is granted as consumed + window (quicflow_should_update):
+     * a peer may hold exactly `cap` unread bytes here. A segment was taken off
+     * the count only once read to its end, so the read head of a part-read
+     * segment still counted, and a peer filling the window it had just been
+     * given got FLOW_CONTROL_ERROR -- an ordinary upload, whenever the reader
+     * stopped mid-segment. */
+    quicrecvbuf_init(&buf, 10);
+    TEST_ASSERT(quicrecvbuf_insert(&buf, 0, (const uint8_t*)"0123456789", 10, 0)
+                == QUICRECVBUF_OK, "the window, filled");
+    TEST_ASSERT(quicrecvbuf_read(&buf, out, 4) == 4, "four read, mid-segment");
+    TEST_ASSERT(quicrecvbuf_insert(&buf, 10, (const uint8_t*)"abcd", 4, 0)
+                == QUICRECVBUF_OK, "four more: ten unread, exactly the cap");
+    TEST_ASSERT(quicrecvbuf_insert(&buf, 14, (const uint8_t*)"e", 1, 0)
+                == QUICRECVBUF_TOO_MUCH, "one past the cap is still refused");
+    TEST_ASSERT(quicrecvbuf_read(&buf, out, 10) == 10 &&
+                memcmp(out, "456789abcd", 10) == 0, "and the bytes are intact");
     quicrecvbuf_free(&buf);
 
     TEST_CASE("final size");

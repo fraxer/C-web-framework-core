@@ -224,12 +224,13 @@ if(BUILD_FUZZERS STREQUAL "yes")
     # INCLUDE_HTTP3 requires.
     set(FUZZ_TARGET_NAMES
         huffman hpack h2_frame json cookie urlencoded multipart request request_sequence
-        websocket websocket_sequence ws_deflate h2_session)
+        websocket websocket_sequence ws_deflate h2_session h2_connection http_response
+        smtp_response jwt)
 
     if(INCLUDE_HTTP3 STREQUAL yes)
         list(APPEND FUZZ_TARGET_NAMES
             quic_packet quic_frame quic_tp h3_frame qpack_decode qpack_streams
-            h3_priority qpack_dynamic)
+            h3_priority qpack_dynamic qpack_session quic_stream h3_request)
     endif()
 
     set(FUZZ_ID_quic_packet    1)
@@ -253,6 +254,13 @@ if(BUILD_FUZZERS STREQUAL "yes")
     set(FUZZ_ID_request_sequence 19)
     set(FUZZ_ID_qpack_dynamic 20)
     set(FUZZ_ID_websocket_sequence 21)
+    set(FUZZ_ID_qpack_session 22)
+    set(FUZZ_ID_h2_connection 23)
+    set(FUZZ_ID_quic_stream 24)
+    set(FUZZ_ID_h3_request 25)
+    set(FUZZ_ID_http_response 26)
+    set(FUZZ_ID_smtp_response 27)
+    set(FUZZ_ID_jwt 28)
 
     foreach(name ${FUZZ_TARGET_NAMES})
         set(exe fuzz_${name})
@@ -267,7 +275,7 @@ if(BUILD_FUZZERS STREQUAL "yes")
             SOURCES fuzz/fuzz_targets.c
             CORPUS "${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus/${name}"
             DICTIONARY "${CMAKE_CURRENT_SOURCE_DIR}/fuzz/dict/${name}.dict"
-            LIBRARIES cwfr_framework ${OPENSSL_LIBRARIES} Threads::Threads ${CMAKE_DL_LIBS})
+            LIBRARIES cwfr_framework ${OPENSSL_LIBRARIES} ${ZLIB_LIBRARIES} Threads::Threads ${CMAKE_DL_LIBS})
 
         string(TOUPPER ${name} upper)
         target_compile_definitions(${exe} PRIVATE
@@ -292,13 +300,22 @@ if(BUILD_FUZZERS STREQUAL "yes")
             FUZZ_REQUEST_SEQUENCE=19
             FUZZ_QPACK_DYNAMIC=20
             FUZZ_WEBSOCKET_SEQUENCE=21
+            FUZZ_QPACK_SESSION=22
+            FUZZ_H2_CONNECTION=23
+            FUZZ_QUIC_STREAM=24
+            FUZZ_H3_REQUEST=25
+            FUZZ_HTTP_RESPONSE=26
+            FUZZ_SMTP_RESPONSE=27
+            FUZZ_JWT=28
             FUZZ_TARGET=${FUZZ_ID_${name}}
         )
 
         target_include_directories(${exe} PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/quic/common
+            ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/quic/transport
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http3/frame
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http3/qpack
+            ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http3/server
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http2/hpack
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http2/frame
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/websocket
@@ -306,6 +323,9 @@ if(BUILD_FUZZERS STREQUAL "yes")
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http2/server
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http
             ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http/server/parsers
+            ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/http/client/parsers
+            ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../protocols/smtp/client/parsers
             ${CMAKE_CURRENT_SOURCE_DIR}/../src/connection
             ${CMAKE_CURRENT_SOURCE_DIR}/../src/domain
             ${CMAKE_CURRENT_SOURCE_DIR}/../src/server

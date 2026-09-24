@@ -181,10 +181,17 @@ TEST(test_qpack_encoder_literal_insert) {
     static const uint8_t expected[] = { 0x43, 'f','o','o', 0x03, 'b','a','r' };
     TEST_ASSERT(n == sizeof expected && memcmp(pending, expected, n) == 0,
                 "Insert With Literal Name wire form");
-    TEST_ASSERT(qpack_encoder_insert_literal(e, "large", 5,
-                                              "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz", 78,
-                                              NULL) == QPACK_OK,
-                "unreferenced oldest entry may be evicted");
+    static const char large[] =
+        "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz";
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "large", 5, large, 78, NULL)
+                    == QPACK_ERR_ENCODER_STREAM,
+                "an insertion the peer has not acknowledged is not evictable (§2.1.1)");
+    size_t consumed = 0;
+    static const uint8_t increment[] = { 0x01 };   /* Insert Count Increment 1 */
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, increment, sizeof increment, &consumed)
+                    == QPACK_OK, "peer acknowledged the insertion");
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "large", 5, large, 78, NULL) == QPACK_OK,
+                "acknowledged, unreferenced oldest entry may be evicted");
     qpack_encoder_free(e);
 }
 
@@ -473,6 +480,10 @@ TEST(test_qpack_encoder_source_survives_eviction_operation) {
     TEST_ASSERT(qpack_encoder_insert_literal(e, "b", 1, "two", 3, NULL) == QPACK_OK,
                 "newest source");
     qpack_encoder_consume(e, 99);
+    size_t consumed = 0;
+    static const uint8_t increment[] = { 0x02 };   /* both insertions acknowledged */
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, increment, sizeof increment, &consumed)
+                    == QPACK_OK, "peer acknowledged both insertions");
     uint64_t absolute = 99;
     TEST_ASSERT(qpack_encoder_duplicate(e, 1, &absolute) == QPACK_OK,
                 "oldest copied before insertion evicts it");
@@ -481,5 +492,146 @@ TEST(test_qpack_encoder_source_survives_eviction_operation) {
     const uint8_t* pending = NULL;
     TEST_ASSERT(qpack_encoder_pending(e, &pending) == 1 && pending[0] == 0x01,
                 "wire index still names pre-insertion relative source one");
+    qpack_encoder_free(e);
+}
+
+/* Found by fuzz_qpack_session. Set Dynamic Table Capacity makes the decoder
+ * evict down to the new capacity (§3.2.2), but the encoder only recorded the
+ * number: it kept every entry, went on referencing ones the peer had dropped,
+ * and the next section failed to decode. */
+TEST(test_qpack_encoder_capacity_reduction_evicts_like_decoder) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(128, 4);
+    qpack_decoder_t* d = qpack_decoder_create(128, 4);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 128) == QPACK_OK, "capacity");
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "a", 1, "one", 3, NULL) == QPACK_OK &&
+                qpack_encoder_insert_literal(e, "b", 1, "two", 3, NULL) == QPACK_OK &&
+                qpack_encoder_insert_literal(e, "c", 1, "tri", 3, NULL) == QPACK_OK,
+                "three 36-byte entries");
+
+    /* Deliver the insertions and bring back the decoder's increments: an
+     * insertion is evictable only once acknowledged (§2.1.1). */
+    const uint8_t* wire = NULL;
+    size_t consumed = 0;
+    size_t wlen = qpack_encoder_pending(e, &wire);
+    TEST_ASSERT(qpack_decoder_read_encoder(d, wire, wlen, &consumed) == QPACK_OK &&
+                consumed == wlen, "decoder received the insertions");
+    qpack_encoder_consume(e, wlen);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 40) == QPACK_ERR_ENCODER_STREAM,
+                "unacknowledged insertions keep the capacity");
+    const uint8_t* back = NULL;
+    const size_t blen = qpack_decoder_pending(d, &back);
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, back, blen, &consumed) == QPACK_OK &&
+                e->known_received_count == 3, "encoder learned all three arrived");
+    qpack_decoder_consume(d, blen);
+
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 40) == QPACK_OK, "capacity reduced");
+    TEST_ASSERT(e->entry_count == 1 && e->bytes == 36 && e->capacity == 40,
+                "encoder evicted the two oldest, as the decoder will");
+
+    wlen = qpack_encoder_pending(e, &wire);
+    TEST_ASSERT(qpack_decoder_read_encoder(d, wire, wlen, &consumed) == QPACK_OK &&
+                consumed == wlen, "decoder applied the encoder stream");
+    TEST_ASSERT(qpack_decoder_bytes(d) == e->bytes &&
+                qpack_decoder_capacity(d) == e->capacity, "both tables agree");
+
+    qpack_header_t fields[] = { { "c", 1, "tri", 3, 0 }, { "a", 1, "one", 3, 0 } };
+    uint8_t block[64];
+    const size_t n = qpack_encode_block_for_stream(e, 0, fields, 2, block, sizeof block);
+    qpack_header_t* out = NULL;
+    size_t count = 0;
+    TEST_ASSERT(n > 0 && qpack_decode_block(d, block, n, 0, &out, &count) == QPACK_OK &&
+                count == 2 && memcmp(out[0].value, "tri", 3) == 0 &&
+                memcmp(out[1].value, "one", 3) == 0,
+                "a section after the reduction decodes: the evicted entry went literal");
+    qpack_headers_free(out, count);
+    qpack_encoder_free(e);
+    qpack_decoder_free(d);
+}
+
+/* §4.3.1: the encoder must not reduce the capacity below what entries still
+ * referenced by unacknowledged sections occupy. */
+TEST(test_qpack_encoder_capacity_reduction_keeps_referenced_entries) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(128, 4);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 128) == QPACK_OK, "capacity");
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "a", 1, "one", 3, NULL) == QPACK_OK &&
+                qpack_encoder_insert_literal(e, "b", 1, "two", 3, NULL) == QPACK_OK,
+                "two entries");
+    size_t consumed = 0;
+    static const uint8_t increment[] = { 0x02 };
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, increment, sizeof increment, &consumed)
+                    == QPACK_OK, "both insertions acknowledged");
+    TEST_ASSERT(qpack_encoder_section_open(e, 4, 1) == QPACK_OK, "oldest entry referenced");
+    const size_t pending_before = qpack_encoder_pending(e, NULL);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 40) == QPACK_ERR_ENCODER_STREAM,
+                "reduction that would evict a referenced entry is refused");
+    TEST_ASSERT(e->capacity == 128 && e->entry_count == 2 &&
+                qpack_encoder_pending(e, NULL) == pending_before,
+                "refused reduction changes nothing and sends nothing");
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 72) == QPACK_OK && e->entry_count == 2,
+                "a reduction that evicts nothing is still allowed");
+    qpack_encoder_free(e);
+}
+
+/* Found by fuzz_qpack_session. The encoder evicted insertions the decoder had
+ * not acknowledged, contrary to §2.1.1, and so could run more than MaxEntries
+ * insertions ahead of the peer. A section referencing its newest entry then
+ * carried a Required Insert Count the decoder cannot reconstruct: capacity 64
+ * is MaxEntries 2, and with four insertions in flight RIC 4 encodes as 1,
+ * which a decoder that has seen none of them reads as 0 -- an error. */
+TEST(test_qpack_encoder_stays_within_max_entries_of_peer) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(64, 4);
+    qpack_decoder_t* d = qpack_decoder_create(64, 4);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 64) == QPACK_OK, "capacity");
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "a", 1, "1", 1, NULL) == QPACK_OK,
+                "first insertion fits");
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "b", 1, "2", 1, NULL) == QPACK_ERR_ENCODER_STREAM,
+                "second would evict the unacknowledged first: refused");
+
+    qpack_header_t field = { "a", 1, "1", 1, 0 };
+    uint8_t block[32];
+    const size_t n = qpack_encode_block_for_stream(e, 0, &field, 1, block, sizeof block);
+    uint64_t ric = 0;
+    TEST_ASSERT(n > 0 && qpack_required_insert_count(d, block, n, &ric) == QPACK_BLOCKED &&
+                ric == 1, "a blocked section's Required Insert Count decodes exactly");
+
+    const uint8_t* wire = NULL;
+    size_t consumed = 0;
+    const size_t wlen = qpack_encoder_pending(e, &wire);
+    TEST_ASSERT(qpack_decoder_read_encoder(d, wire, wlen, &consumed) == QPACK_OK, "delivered");
+    qpack_header_t* out = NULL;
+    size_t count = 0;
+    TEST_ASSERT(qpack_decode_block(d, block, n, 0, &out, &count) == QPACK_OK && count == 1,
+                "and the section decodes once the insertion arrives");
+    qpack_headers_free(out, count);
+    qpack_encoder_free(e);
+    qpack_decoder_free(d);
+}
+
+/* Found by fuzz_qpack_session once unacknowledged insertions became
+ * unevictable: the oldest entry is acknowledged and the next one is not, an
+ * insertion needs both gone, and the encoder used to evict the first, stop at
+ * the second and refuse -- with the first already dropped from its copy and
+ * no instruction telling the decoder so. */
+TEST(test_qpack_encoder_refused_insert_evicts_nothing) {
+    TEST_SUITE("qpack dynamic encoder");
+    qpack_encoder_t* e = qpack_encoder_create(80, 4);
+    TEST_ASSERT(qpack_encoder_set_capacity(e, 80) == QPACK_OK, "capacity");
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "a", 1, "one", 3, NULL) == QPACK_OK &&
+                qpack_encoder_insert_literal(e, "b", 1, "two", 3, NULL) == QPACK_OK,
+                "two 36-byte entries");
+    size_t consumed = 0;
+    static const uint8_t increment[] = { 0x01 };   /* only the first acknowledged */
+    TEST_ASSERT(qpack_encoder_read_decoder_state(e, increment, sizeof increment, &consumed)
+                    == QPACK_OK, "first insertion acknowledged");
+    const size_t pending = qpack_encoder_pending(e, NULL);
+    TEST_ASSERT(qpack_encoder_insert_literal(e, "c", 1, "0123456789012345678901234", 25, NULL)
+                    == QPACK_ERR_ENCODER_STREAM,
+                "a 58-byte entry would need the unacknowledged one gone too");
+    TEST_ASSERT(e->entry_count == 2 && e->bytes == 72 &&
+                qpack_encoder_pending(e, NULL) == pending,
+                "refused insertion evicted nothing and sent nothing");
     qpack_encoder_free(e);
 }

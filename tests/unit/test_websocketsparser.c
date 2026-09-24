@@ -554,6 +554,43 @@ TEST(test_wsp_fragmented_text_reassembles) {
     harness_free(&h);
 }
 
+TEST(test_wsp_fragment_ending_a_read_is_not_reparsed) {
+    TEST_SUITE("websocketsparser: fragmentation");
+    TEST_CASE("a non-final fragment that ends its read leaves nothing to reparse");
+
+    /* Found by fuzz_websocket_sequence. The server loop (websocketsserverhandlers.c
+     * __read) does not start a new read after HANDLE_AND_CONTINUE: it calls
+     * prepare_remains and runs the parser again over the SAME read. When the
+     * fragment's payload was the last thing in that read, pos had been left at
+     * the start of the payload, so the second run parsed the already-unmasked
+     * payload as a frame header: "Hello, " starts with 0x48, a non-final close,
+     * and the connection was closed with 1002. Every fragmented message whose
+     * fragments arrived in separate segments. */
+    harness_t h;
+    harness_init(&h);
+
+    const unsigned char part1[] = "Hello, ";
+    const unsigned char part2[] = "world!";
+    unsigned char f1[32], f2[32];
+    size_t f1_size = build_frame(f1, WSOPCODE_TEXT, 0, part1, 7);
+    size_t f2_size = build_frame(f2, WSOPCODE_CONTINUE, 1, part2, 6);
+
+    TEST_ASSERT_EQUAL(WSPARSER_HANDLE_AND_CONTINUE, harness_feed(&h, f1, f1_size), "first fragment handled");
+    websocketsparser_prepare_remains(h.parser);
+    TEST_ASSERT_EQUAL(WSPARSER_CONTINUE, websocketsparser_run(h.parser),
+                      "the rest of the same read is empty: wait for the next one");
+
+    TEST_ASSERT_EQUAL(WSPARSER_COMPLETE, harness_feed(&h, f2, f2_size), "final fragment completes");
+    TEST_ASSERT_NOT_NULL(h.parser->request, "the message survived both reads");
+    if (h.parser->request != NULL) {
+        char* out = harness_payload(&h);
+        TEST_ASSERT_STR_EQUAL("Hello, world!", out, "fragments reassembled in order");
+        free(out);
+    }
+
+    harness_free(&h);
+}
+
 TEST(test_wsp_orphan_continuation_rejected) {
     TEST_SUITE("websocketsparser: fragmentation");
     TEST_CASE("CONTINUE without an open fragmented message is BAD_REQUEST");
