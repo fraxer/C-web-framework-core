@@ -84,6 +84,7 @@ if(INCLUDE_HTTP3 STREQUAL yes)
     # connection the way quicendpoint.c does, so it needs to see both sides.
     target_include_directories(runner PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/quicclient
+        ${CMAKE_CURRENT_SOURCE_DIR}/quic
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/udp
     )
 endif()
@@ -162,6 +163,7 @@ if(INCLUDE_HTTP3 STREQUAL yes)
     )
     target_include_directories(h3_runner PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/quicclient
+        ${CMAKE_CURRENT_SOURCE_DIR}/quic
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/udp
     )
     target_compile_definitions(h3_runner PRIVATE
@@ -225,12 +227,12 @@ if(BUILD_FUZZERS STREQUAL "yes")
     set(FUZZ_TARGET_NAMES
         huffman hpack h2_frame json cookie urlencoded multipart request request_sequence
         websocket websocket_sequence ws_deflate h2_session h2_connection http_response
-        smtp_response jwt)
+        smtp_response jwt h1_connection text mail_message)
 
     if(INCLUDE_HTTP3 STREQUAL yes)
         list(APPEND FUZZ_TARGET_NAMES
             quic_packet quic_frame quic_tp h3_frame qpack_decode qpack_streams
-            h3_priority qpack_dynamic qpack_session quic_stream h3_request)
+            h3_priority qpack_dynamic qpack_session quic_stream h3_request quic_conn)
     endif()
 
     set(FUZZ_ID_quic_packet    1)
@@ -261,6 +263,10 @@ if(BUILD_FUZZERS STREQUAL "yes")
     set(FUZZ_ID_http_response 26)
     set(FUZZ_ID_smtp_response 27)
     set(FUZZ_ID_jwt 28)
+    set(FUZZ_ID_h1_connection 29)
+    set(FUZZ_ID_text 30)
+    set(FUZZ_ID_mail_message 31)
+    set(FUZZ_ID_quic_conn 32)
 
     foreach(name ${FUZZ_TARGET_NAMES})
         set(exe fuzz_${name})
@@ -307,6 +313,10 @@ if(BUILD_FUZZERS STREQUAL "yes")
             FUZZ_HTTP_RESPONSE=26
             FUZZ_SMTP_RESPONSE=27
             FUZZ_JWT=28
+            FUZZ_H1_CONNECTION=29
+            FUZZ_TEXT=30
+            FUZZ_MAIL_MESSAGE=31
+            FUZZ_QUIC_CONN=32
             FUZZ_TARGET=${FUZZ_ID_${name}}
         )
 
@@ -330,6 +340,7 @@ if(BUILD_FUZZERS STREQUAL "yes")
             ${CMAKE_CURRENT_SOURCE_DIR}/../src/domain
             ${CMAKE_CURRENT_SOURCE_DIR}/../src/server
             ${CMAKE_CURRENT_SOURCE_DIR}/../misc
+            ${CMAKE_CURRENT_SOURCE_DIR}/../misc/validation
         )
 
         target_link_libraries(${exe} PRIVATE
@@ -338,6 +349,23 @@ if(BUILD_FUZZERS STREQUAL "yes")
             Threads::Threads
             ${CMAKE_DL_LIBS}
         )
+
+        # quic_conn drives the in-process stand of test_quic_conn.c
+        # (tests/quic/quic_stand.h), which talks to the test client and loads
+        # the test certificate -- what h3_runner is given, given here too.
+        if(name STREQUAL quic_conn)
+            target_sources(${exe} PRIVATE ${QUIC_CLIENT_SOURCES})
+            target_include_directories(${exe} PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/quicclient
+                ${CMAKE_CURRENT_SOURCE_DIR}/quic
+                ${CMAKE_CURRENT_SOURCE_DIR}/../src/udp
+            )
+            target_compile_definitions(${exe} PRIVATE
+                TEST_QUIC_CERT="${CMAKE_CURRENT_SOURCE_DIR}/data/quic_test_cert.pem"
+                TEST_QUIC_KEY="${CMAKE_CURRENT_SOURCE_DIR}/data/quic_test_key.pem"
+            )
+            target_link_libraries(${exe} PRIVATE idn2 resolv)
+        endif()
     endforeach()
 endif()
 

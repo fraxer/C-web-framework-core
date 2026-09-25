@@ -15,7 +15,7 @@
  *     formats (http_format_date IMF-fixdate and W/"mtime-size", plus a
  *     -gzip suffix and Vary: Accept-Encoding when the response will be
  *     compressed);
- *   - __check_not_modified: method gate (GET/HEAD only), If-None-Match exact /
+ *   - __check_not_modified: method gate (GET/HEAD only), If-None-Match weak /
  *     "*" / comma list / whitespace, If-None-Match precedence over
  *     If-Modified-Since, If-Modified-Since equal / older / newer, invalid date;
  *   - the 304 path suppresses the body-related state (status 304,
@@ -511,15 +511,15 @@ TEST(test_nm_inm_no_match_200) {
     fixture_teardown(&fx);
 }
 
-TEST(test_nm_inm_weak_vs_strong_no_match) {
+TEST(test_nm_inm_weak_comparison_304) {
     TEST_SUITE("http_not_modified_filter: If-None-Match");
-    TEST_CASE("current behavior: byte-exact compare, strong form does not match a weak ETag");
+    TEST_CASE("If-None-Match uses weak comparison: \"x\" matches the ETag W/\"x\"");
 
-    /* RFC 7232 §3.2 says If-None-Match uses the weak comparison function, so
-     * "x" and W/"x" are equivalent. __etag_matches compares byte-for-byte, so
-     * a client that strips the W/ prefix does not get a 304. This case pins
-     * the current (non-compliant) behavior so any future fix is a deliberate
-     * change visible here. */
+    /* RFC 9110 §13.1.2: a recipient MUST use the weak comparison function for
+     * If-None-Match, under which "x" and W/"x" are the same tag. The byte-exact
+     * compare this replaced sent a client (or a cache) that keeps the tag
+     * without W/ the whole file every time. Found by fuzz_h1_connection; this
+     * case used to pin the byte-exact behavior. */
     nm_fixture_t fx;
     TEST_REQUIRE(fixture_setup(&fx), "fixture should be created");
 
@@ -528,10 +528,34 @@ TEST(test_nm_inm_weak_vs_strong_no_match) {
     arm_file(&fx, TEST_MTIME, TEST_SIZE);
 
     TEST_ASSERT_EQUAL(CWF_OK, run_header(&fx), "header chain should finish with CWF_OK");
-    TEST_ASSERT_EQUAL(200, fx.response->status_code,
-                      "byte-exact compare: strong form does not match weak ETag");
+    TEST_ASSERT_EQUAL(304, fx.response->status_code, "the strong form matches the weak ETag");
 
     fixture_teardown(&fx);
+}
+
+TEST(test_nm_inm_weak_comparison_keeps_tags_apart) {
+    TEST_SUITE("http_not_modified_filter: If-None-Match");
+    TEST_CASE("weak comparison still tells different opaque tags apart");
+
+    /* Dropping the W/ must not turn into a prefix match: the identity tag is a
+     * prefix of the gzip one up to the closing quote, and "W/" alone, or a tag
+     * with a different body, is no match either. */
+    static const char* const others[] = {
+        "W/\"6553f100-4d2-gzip\"", "\"6553f100-4d\"", "W/", "W/\"\"", "\"6553f100-4d2",
+    };
+    for (size_t i = 0; i < sizeof others / sizeof others[0]; i++) {
+        nm_fixture_t fx;
+        TEST_REQUIRE(fixture_setup(&fx), "fixture should be created");
+
+        fx.request->method = ROUTE_GET;
+        REQ_ADD(fx.request, "If-None-Match", others[i]);
+        arm_file(&fx, TEST_MTIME, TEST_SIZE);
+
+        TEST_ASSERT_EQUAL(CWF_OK, run_header(&fx), "header chain should finish with CWF_OK");
+        TEST_ASSERT_EQUAL(200, fx.response->status_code, others[i]);
+
+        fixture_teardown(&fx);
+    }
 }
 
 TEST(test_nm_inm_takes_precedence_over_ims) {

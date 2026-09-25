@@ -61,6 +61,31 @@ TEST(test_log_escape_keeps_cyrillic) {
     free(escaped);
 }
 
+TEST(test_log_escape_hides_c1_controls) {
+    TEST_CASE("C1 control characters are escaped too, in UTF-8 and as stray bytes");
+
+    /* U+009B is CSI: a terminal showing the journal starts an escape
+     * sequence on it, whether it arrives as the two bytes C2 9B or as a lone
+     * 9B that is not part of any UTF-8 sequence. Found by fuzz_text. */
+    char* escaped = log_escape("a\xC2\x9B" "31m b\x9B" "31m c\xC2\x85" "d");
+
+    TEST_ASSERT_STR_EQUAL("a\\xc2\\x9b31m b\\x9b31m c\\xc2\\x85d", escaped,
+                          "C1 controls and stray bytes become hex escapes");
+    free(escaped);
+}
+
+TEST(test_log_escape_escapes_invalid_utf8) {
+    TEST_CASE("Bytes that are not valid UTF-8 are escaped, valid sequences are kept");
+
+    /* A truncated sequence, an overlong form and a surrogate, between two
+     * letters that must survive as they are. */
+    char* escaped = log_escape("Я\xD0" "x\xC0\xAF" "y\xED\xA0\x80" "z€");
+
+    TEST_ASSERT_STR_EQUAL("Я\\xd0x\\xc0\\xafy\\xed\\xa0\\x80z€", escaped,
+                          "Only whole, valid sequences pass through");
+    free(escaped);
+}
+
 TEST(test_escape_null) {
     TEST_CASE("NULL in, NULL out for escaping");
 

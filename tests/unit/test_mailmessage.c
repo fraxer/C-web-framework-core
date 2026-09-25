@@ -249,6 +249,75 @@ TEST(test_mailmessage_set_from_rejects_null) {
     mail_message_free(m);
 }
 
+TEST(test_mailmessage_set_address_rejects_unsafe) {
+    TEST_CASE("an address that cannot stand between < > is refused by both setters");
+
+    /* The address is printed into the From/To field between < >, and mail.c
+     * prints the same string into MAIL FROM and RCPT TO. A CR or LF in it
+     * started a new header -- or a new SMTP command: an application that mails
+     * an address a user typed (a password reset, "send me a copy") relayed to
+     * whoever the user added. Found by fuzz_mail_message. */
+    static const char* const bad[] = {
+        "victim@x.ru>\r\nRCPT TO:<spam@y.ru", "a@b.ru\r\nBcc: c@d.ru", "a@b.ru\n",
+        "a b@c.ru", "a\t@b.ru", "<a@b.ru>", "a@b.ru>", "a@b\x7f.ru", "no-at-sign", "",
+    };
+
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        mail_message_t* m = mail_message_create();
+        TEST_REQUIRE_NOT_NULL(m, "mail_message_create should succeed");
+
+        TEST_ASSERT_EQUAL(0, mail_message_set_to(m, bad[i]), "set_to refuses it");
+        TEST_ASSERT_EQUAL(0, mail_message_set_from(m, bad[i], "Name"), "set_from refuses it");
+        TEST_ASSERT_NULL(m->to.value, "nothing kept for To");
+        TEST_ASSERT_NULL(m->from.value, "nothing kept for From");
+
+        mail_message_free(m);
+    }
+}
+
+TEST(test_mailmessage_set_address_keeps_ordinary) {
+    TEST_CASE("ordinary addresses, UTF-8 ones included, are accepted as they are");
+
+    static const char* const good[] = {
+        "user+tag@sub.example.com", "o'brien@example.ie", "иван@почта.рф",
+    };
+
+    for (size_t i = 0; i < sizeof good / sizeof good[0]; i++) {
+        mail_message_t* m = mail_message_create();
+        TEST_REQUIRE_NOT_NULL(m, "mail_message_create should succeed");
+
+        TEST_ASSERT_EQUAL(1, mail_message_set_to(m, good[i]), good[i]);
+        TEST_ASSERT_EQUAL(1, mail_message_set_from(m, good[i], "Name"), good[i]);
+
+        mail_message_free(m);
+    }
+}
+
+TEST(test_mailmessage_set_subject_large_value) {
+    TEST_CASE("a subject of many megabytes is encoded on the heap, not the stack");
+
+    /* The base64 copy of the subject and of the sender name was a VLA sized by
+     * the value: 12 MB of subject asked for 16 MB of stack, past the default
+     * 8 MB, and the process died. The request body limit is 10 MB, so a value
+     * taken from a form reaches that. */
+    const size_t size = 12u * 1024 * 1024;
+    char* big = malloc(size + 1);
+    TEST_REQUIRE_NOT_NULL(big, "buffer");
+    memset(big, 'A', size);
+    big[size] = '\0';
+
+    mail_message_t* m = mail_message_create();
+    TEST_REQUIRE_NOT_NULL(m, "mail_message_create should succeed");
+
+    TEST_ASSERT_EQUAL(1, mail_message_set_subject(m, big), "set_subject survives");
+    TEST_ASSERT_EQUAL(1, mail_message_set_from(m, "a@b.ru", big), "set_from survives");
+    TEST_ASSERT(m->subject.value != NULL && strncmp(m->subject.value, "=?UTF-8?B?QUFB", 14) == 0,
+                "the subject is encoded");
+
+    mail_message_free(m);
+    free(big);
+}
+
 TEST(test_mailmessage_set_to_structure) {
     TEST_CASE("To frames the address");
 

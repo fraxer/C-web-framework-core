@@ -78,7 +78,8 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size);
     FUZZ_TARGET == FUZZ_WEBSOCKET || FUZZ_TARGET == FUZZ_WEBSOCKET_SEQUENCE || \
     FUZZ_TARGET == FUZZ_H2_SESSION || FUZZ_TARGET == FUZZ_H2_CONNECTION || \
     FUZZ_TARGET == FUZZ_H3_REQUEST || FUZZ_TARGET == FUZZ_HTTP_RESPONSE || \
-    FUZZ_TARGET == FUZZ_SMTP_RESPONSE
+    FUZZ_TARGET == FUZZ_SMTP_RESPONSE || FUZZ_TARGET == FUZZ_H1_CONNECTION || \
+    FUZZ_TARGET == FUZZ_MAIL_MESSAGE
 
 /* The parser asks the running configuration what the largest acceptable body
  * is, and there is no configuration here. Overridden the way
@@ -173,6 +174,42 @@ static listener_t __fuzz_listener = {
     .api = &__fuzz_mpxapi,
     .next = NULL
 };
+
+#endif
+
+#if FUZZ_TARGET == FUZZ_H1_CONNECTION || FUZZ_TARGET == FUZZ_H2_CONNECTION
+
+#include "connection_queue.h"
+
+/* The worker threads' side of a connection target. Handlers -- a pipelined
+ * HTTP/1.1 request, a WebSocket message on an RFC 8441 tunnel -- are run
+ * through the connection queue: the connection is parked and queued, and a
+ * worker picks it up. There are no threads here, so this is one iteration of
+ * thread_handler's loop, run when the schedule says so. The pop is the
+ * non-blocking one: connection_queue_guard_pop would sleep a second on an
+ * empty queue. 1 when there was something to run. */
+connection_t* __connection_queue_pop(void);
+
+static int __fuzz_worker(void) {
+    connection_t* connection = __connection_queue_pop();
+    if (connection == NULL) return 0;
+
+    connection_server_ctx_t* ctx = connection->ctx;
+    cqueue_lock(ctx->queue);
+    connection_queue_item_t* item = cqueue_pop(ctx->queue);
+    cqueue_unlock(ctx->queue);
+    if (item == NULL) {
+        cqueue_lock(ctx->broadcast_queue);
+        item = cqueue_pop(ctx->broadcast_queue);
+        cqueue_unlock(ctx->broadcast_queue);
+    }
+    if (item != NULL) {
+        item->run(item);
+        item->free(item);
+    }
+    connection_s_dec(connection);
+    return 1;
+}
 
 #endif
 
@@ -2069,6 +2106,8 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
 #elif FUZZ_TARGET == FUZZ_H2_CONNECTION
 
+#include "wscontext.h"
+
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -2362,10 +2401,21 @@ static void __h2c_root_remove(void) {
     rmdir(__h2c_root);
 }
 
+/* The vhost serves WebSocket, so an RFC 8441 extended CONNECT opens a tunnel
+ * rather than getting 501. Every message is answered, so the tunnel's write
+ * path -- WebSocket frames inside DATA frames -- runs too. */
+static void __h2c_ws_answer(void* arg) {
+    wsctx_t* ctx = arg;
+    ctx->response->send_text(ctx->response, "ok");
+}
+
 /* Once per process: a document root with one small and one large file,
  * removed again when the process exits normally. */
 static void __h2c_root_init(void) {
     if (__h2c_root[0] != '\0') return;
+    __fuzz_server.websockets.configured = 1;
+    __fuzz_server.websockets.default_handler = __h2c_ws_answer;
+    if (!connection_queue_init()) abort();
     snprintf(__h2c_root, sizeof __h2c_root, "/tmp/cwfr-fuzz-h2c-%d", (int)getpid());
     if (mkdir(__h2c_root, 0700) != 0) return;
     atexit(__h2c_root_remove);
@@ -2463,7 +2513,11 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             break;
         }
         case 1: alive = h2_server_guard_read(connection); break;
-        case 2: alive = h2_server_guard_write(connection); break;
+        case 2:
+            /* Handlers queued since the last write have run by now. */
+            while (__fuzz_worker()) {}
+            alive = h2_server_guard_write(connection);
+            break;
         case 3: (void)__h2c_pump(c, sv[1], amount * 8); break;
         }
     }
@@ -2471,6 +2525,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     /* Drain: whatever the server still has to say, until it stops. */
     for (int idle = 0; idle < 3;) {
         if (alive) alive = h2_server_guard_read(connection);
+        while (__fuzz_worker()) {}
         if (alive) alive = h2_server_guard_write(connection);
         idle = __h2c_pump(c, sv[1], SIZE_MAX) ? 0 : idle + 1;
     }
@@ -2496,6 +2551,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     /* The response pool goes with the session. (h2_server_take_response is no
      * way to empty it: on an empty pool it makes a new response.) */
+    while (__fuzz_worker()) {}
     h2session_t* s = ctx->parser;
     if (s != NULL) {
         for (h2stream_t* st = s->streams; st != NULL; st = st->next)
@@ -2509,6 +2565,1938 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     free(buffer);
     close(sv[0]);
     close(sv[1]);
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_H1_CONNECTION
+
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <zlib.h>
+
+#include <openssl/evp.h>
+
+#include "helpers.h"
+#include "httpgzipcache.h"
+#include "httpserverhandlers.h"
+#include "route.h"
+#include "websocketsswitch.h"
+
+/* A whole HTTP/1.1 connection serving static files, through the entry points
+ * the event loop uses: set_http(), http_server_guard_read() and
+ * http_server_guard_write() on one end of a socketpair with small buffers, so
+ * writes are short and EAGAIN is ordinary. The other end is a strict client.
+ *
+ * request_sequence stops at the parser; this is everything after it -- the
+ * dispatcher, the file lookup and the filter chain (not_modified, range, data,
+ * gzip, chunked, write) -- which no other target reaches.
+ *
+ * The client builds its requests from the input, so what each answer must be
+ * is known: a file of known bytes, a Range header in a form whose outcome RFC
+ * 9110 §14 fixes or in a mangled one, If-None-Match and If-Modified-Since
+ * (§13.1), Accept-Encoding (§12.5.3), Connection: close, one request at a time
+ * or pipelined. The server's gzip is set up three ways by the input: compressed
+ * as it goes, from the in-memory cache, or from a ".gz" next to the file.
+ *
+ * Every response is checked the way a strict client would read it:
+ *   - framing: one status line, well-formed fields, Content-Length or chunked
+ *     (never both), no body for HEAD and 304, nothing after a close;
+ *   - 200: the file, or its gzip that inflates to the file, and gzip only when
+ *     the request allowed it; a satisfiable Range in an unambiguous form must
+ *     not be ignored;
+ *   - 206: each part is the matching slice of the representation, and lies
+ *     inside what was asked for -- exactly what was asked for, where the form
+ *     leaves no choice;
+ *   - 416: Content-Range "bytes *" + the length, and only when nothing asked
+ *     for was satisfiable;
+ *   - 304 exactly when a validator matched, never otherwise;
+ *   - Last-Modified is the file's, and the ETag carries "-gzip" exactly when a
+ *     200 is compressed, and stays the same for the same representation.
+ *
+ * FUZZ_TRACE=1 prints each request and the status it got. */
+
+#define H1C_T0 ((time_t)1700000000)
+#define H1C_FILES 4
+#define H1C_REQUESTS 12
+
+typedef struct {
+    const char* name;
+    size_t size;
+    uint8_t* data;
+} h1c_file_t;
+
+static h1c_file_t __h1c_files[H1C_FILES] = {
+    { "empty.txt", 0, NULL },
+    { "small.txt", 700, NULL },       /* below the gzip threshold */
+    { "page.txt", 50000, NULL },      /* compressible, with a ".gz" beside it */
+    { "noise.txt", 20000, NULL },     /* compressible type, incompressible bytes */
+};
+static uint8_t* __h1c_gz;             /* page.txt.gz as written */
+static size_t __h1c_gz_len;
+static char __h1c_root[64];
+static char __h1c_date[64];           /* the Last-Modified of every file */
+
+/* The event loop's side of the socket: what the server last asked epoll to
+ * wait for. The HTTP/1.1 handlers are only ever called for an event they armed
+ * -- __write without a response to write is an error, and rightly -- so the
+ * shared stub that says yes to everything and remembers nothing will not do.
+ * A one-shot arming is used up by the event it delivers. */
+static int __h1c_armed;
+
+static int __h1c_mpx_arm(connection_t* connection, int flags) {
+    (void)connection;
+    __h1c_armed = flags;
+    return 1;
+}
+
+static int __h1c_mpx_del(connection_t* connection) {
+    (void)connection;
+    __h1c_armed = 0;
+    return 1;
+}
+
+static mpxapi_t __h1c_mpxapi = {
+    .control_add = __h1c_mpx_arm,
+    .control_mod = __h1c_mpx_arm,
+    .control_del = __h1c_mpx_del,
+};
+
+static int __h1c_event(connection_t* connection, int event) {
+    if (!(__h1c_armed & event)) return 1;                 /* epoll would not call */
+    /* multiplexingepoll.c: a connection marked destroyed -- the write path's
+     * way of saying "close after this response" -- is closed on its next
+     * event, whatever the event is. */
+    const connection_server_ctx_t* ctx = connection->ctx;
+    if (atomic_load(&ctx->destroyed)) return 0;
+    if (__h1c_armed & MPXONESHOT) __h1c_armed = 0;
+    const int alive = event == MPXIN ? http_server_guard_read(connection)
+                                     : http_server_guard_write(connection);
+    if (getenv("FUZZ_TRACE") != NULL)
+        fprintf(stderr, "server %s -> %d, armed 0x%x\n",
+                event == MPXIN ? "read" : "write", alive, __h1c_armed);
+    return alive;
+}
+
+/* What an application does to accept WebSocket on a route: its handler calls
+ * switch_to_websockets(). The target serves it on /ws. */
+static void __h1c_ws_handler(void* arg) {
+    switch_to_websockets(arg);
+}
+
+/* The two switches http_policy_init() reads, set per input. */
+static int __h1c_static, __h1c_cache;
+
+long long env_get_llong(const char* key, long long default_value) {
+    if (key != NULL && strcmp(key, "gzip_cache_size") == 0)
+        return __h1c_cache ? 1 << 20 : 0;
+    return default_value;
+}
+
+int env_get_bool(const char* key, int default_value) {
+    if (key != NULL && strcmp(key, "gzip_static") == 0) return __h1c_static;
+    return default_value;
+}
+
+static size_t __h1c_gzip(const uint8_t* in, size_t len, uint8_t** out) {
+    z_stream z;
+    memset(&z, 0, sizeof z);
+    if (deflateInit2(&z, 6, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) return 0;
+    const size_t cap = deflateBound(&z, len) + 64;
+    *out = malloc(cap);
+    if (*out == NULL) { deflateEnd(&z); return 0; }
+    z.next_in = (Bytef*)in;
+    z.avail_in = (uInt)len;
+    z.next_out = *out;
+    z.avail_out = (uInt)cap;
+    const int r = deflate(&z, Z_FINISH);
+    deflateEnd(&z);
+    if (r != Z_STREAM_END) { free(*out); *out = NULL; return 0; }
+    return cap - z.avail_out;
+}
+
+/* 1 when `in` is exactly one gzip member that inflates to `want`. */
+static int __h1c_gunzip_equals(const uint8_t* in, size_t len, const uint8_t* want, size_t want_len) {
+    z_stream z;
+    memset(&z, 0, sizeof z);
+    if (inflateInit2(&z, 15 + 16) != Z_OK) return 0;
+    uint8_t* out = malloc(want_len + 1);
+    if (out == NULL) { inflateEnd(&z); return 0; }
+    z.next_in = (Bytef*)in;
+    z.avail_in = (uInt)len;
+    z.next_out = out;
+    z.avail_out = (uInt)(want_len + 1);
+    const int r = inflate(&z, Z_FINISH);
+    const int ok = r == Z_STREAM_END && z.avail_in == 0 && z.total_out == want_len &&
+                   (want_len == 0 || memcmp(out, want, want_len) == 0);
+    inflateEnd(&z);
+    free(out);
+    return ok;
+}
+
+static void __h1c_root_remove(void) {
+    char path[160];
+    for (size_t i = 0; i < H1C_FILES; i++) {
+        snprintf(path, sizeof path, "%s/%s", __h1c_root, __h1c_files[i].name);
+        unlink(path);
+    }
+    snprintf(path, sizeof path, "%s/page.txt.gz", __h1c_root);
+    unlink(path);
+    rmdir(__h1c_root);
+}
+
+static int __h1c_write_file(const char* name, const uint8_t* data, size_t len, time_t mtime) {
+    char path[160];
+    snprintf(path, sizeof path, "%s/%s", __h1c_root, name);
+    FILE* f = fopen(path, "wb");
+    if (f == NULL) return 0;
+    const int ok = len == 0 || fwrite(data, 1, len, f) == len;
+    fclose(f);
+    const struct timeval times[2] = { { mtime, 0 }, { mtime, 0 } };
+    return ok && utimes(path, times) == 0;
+}
+
+/* Once per process: the document root, removed again at a normal exit. */
+static void __h1c_root_init(void) {
+    if (__h1c_root[0] != '\0') return;
+    snprintf(__h1c_root, sizeof __h1c_root, "/tmp/cwfr-fuzz-h1c-%d", (int)getpid());
+    if (mkdir(__h1c_root, 0700) != 0) abort();
+    atexit(__h1c_root_remove);
+
+    uint64_t x = 0x9E3779B97F4A7C15ULL;
+    for (size_t i = 0; i < H1C_FILES; i++) {
+        h1c_file_t* f = &__h1c_files[i];
+        f->data = malloc(f->size + 1);
+        if (f->data == NULL) abort();
+        if (i == 3) {
+            for (size_t k = 0; k < f->size; k++) {
+                x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                f->data[k] = (uint8_t)x;
+            }
+        } else {
+            for (size_t k = 0; k < f->size; k++)
+                f->data[k] = (uint8_t)("line of the page, number "[k % 25] + (k / 997) % 3);
+        }
+        if (!__h1c_write_file(f->name, f->data, f->size, H1C_T0)) abort();
+    }
+
+    /* Newer than its source, or __try_gzip_static rightly refuses it. */
+    __h1c_gz_len = __h1c_gzip(__h1c_files[2].data, __h1c_files[2].size, &__h1c_gz);
+    if (__h1c_gz_len == 0 || !__h1c_write_file("page.txt.gz", __h1c_gz, __h1c_gz_len, H1C_T0 + 10))
+        abort();
+
+    if (http_format_date(H1C_T0, __h1c_date, sizeof __h1c_date) == 0) abort();
+
+    __fuzz_server.root = __h1c_root;
+    __fuzz_server.root_length = strlen(__h1c_root);
+    __fuzz_listener.api = &__h1c_mpxapi;
+    if (!connection_queue_init()) abort();
+
+    route_t* ws = route_create("/ws");
+    if (ws == NULL || !route_set_http_handler(ws, "GET", __h1c_ws_handler, NULL)) abort();
+    __fuzz_server.http.route = ws;
+
+    /* No mime table here, so every file is text/plain -- which main.gzip lists. */
+    static char type[] = "text/plain";
+    static env_gzip_str_t gzip_type = { .mimetype = type, .next = NULL };
+    env()->main.gzip = &gzip_type;
+}
+
+/* A byte range as the client asked for it: a == -1 is the suffix form "-b",
+ * b == -1 the open form "a-". */
+typedef struct {
+    long long a, b;
+} h1c_spec_t;
+
+typedef struct {
+    int upgrade;             /* a WebSocket handshake to /ws (RFC 6455 §4.1) */
+    int ws_status;           /* ... the status it must get: 101, 400 or 426 */
+    int ws_offered_ext;      /* ... it offered Sec-WebSocket-Extensions */
+    char ws_accept[32];      /* ... and the accept value a 101 must carry */
+    int file, head, post, close;
+    int expect;              /* Expect: 100-continue, on a POST with a body */
+    int continued;           /* ... and the 100 has been seen */
+    int ae_gzip;             /* the Accept-Encoding sent allows gzip */
+    int ranged;              /* a Range field was sent */
+    int exact;               /* ... one range, outcome fixed by the RFC */
+    int clean;               /* ... ascending, disjoint: honoured as sent */
+    size_t nspecs;           /* 0 for a mangled one */
+    h1c_spec_t specs[4];
+    int inm;
+    char inm_value[256];
+    int ims, ims_valid;
+    time_t ims_time;
+} h1c_req_t;
+
+typedef struct {
+    int status;
+    int has_clen, chunked, gzip, conn_close;
+    int upgrade_ws, conn_upgrade, has_ws_ext;
+    char ws_accept[200], ws_version[200];
+    unsigned long long clen;
+    char crange[200], ctype[200], etag[200], lastmod[200];
+    int has_crange, has_etag, has_lastmod;
+    uint8_t* body;
+    size_t body_len;
+} h1c_resp_t;
+
+typedef struct {
+    int raw;
+    size_t depth;                    /* requests in flight at most */
+
+    uint8_t* out;                    /* what the client still has to send */
+    size_t out_len, out_pos, out_cap;
+
+    h1c_req_t reqs[H1C_REQUESTS];
+    size_t queued, answered;
+    int close_sent;                  /* a request with Connection: close went out */
+    int closing;                     /* the server said or was asked to close */
+    int eof;
+    int switched;                    /* a 101 came: the rest is WebSocket */
+
+    uint8_t* in;                     /* what the server sent, not yet parsed */
+    size_t in_len, in_cap;
+
+    char etag[H1C_FILES][2][200];    /* seen ETags: [file][gzip] */
+    uint8_t* repr[H1C_FILES];        /* a gzip representation seen in a 200 */
+    size_t repr_len[H1C_FILES];
+} h1c_t;
+
+static void __h1c_append(uint8_t** buf, size_t* len, size_t* cap, const void* data, size_t n) {
+    if (*len + n > *cap) {
+        size_t c = *cap ? *cap : 4096;
+        while (c < *len + n) c *= 2;
+        uint8_t* grown = realloc(*buf, c);
+        if (grown == NULL) abort();
+        *buf = grown;
+        *cap = c;
+    }
+    memcpy(*buf + *len, data, n);
+    *len += n;
+}
+
+static uint8_t __h1c_byte(const uint8_t** p, const uint8_t* end) {
+    return *p < end ? *(*p)++ : 0;
+}
+
+/* Offsets that matter for a file of `size` bytes, and one past the parser's
+ * ten-digit limit's edge. */
+static long long __h1c_offset(uint8_t b, size_t size) {
+    switch (b % 10) {
+    case 0: return 0;
+    case 1: return 1;
+    case 2: return (long long)size / 2;
+    case 3: return size > 0 ? (long long)size - 1 : 0;
+    case 4: return (long long)size;
+    case 5: return (long long)size + 1;
+    case 6: return (long long)size + 1000;
+    case 7: return 9999999999LL;
+    default: return (long long)((b * 2654435761u) % (size + 2));
+    }
+}
+
+static int __h1c_spec_text(char* dst, size_t cap, const h1c_spec_t* s) {
+    if (s->a < 0) return snprintf(dst, cap, "-%lld", s->b);
+    if (s->b < 0) return snprintf(dst, cap, "%lld-", s->a);
+    return snprintf(dst, cap, "%lld-%lld", s->a, s->b);
+}
+
+/* RFC 9110 §14.1.2 against a representation of `len` bytes: 1 and the
+ * inclusive [first, last] when satisfiable. */
+static int __h1c_resolve(const h1c_spec_t* s, unsigned long long len,
+                         unsigned long long* first, unsigned long long* last) {
+    if (s->a < 0) {
+        if (s->b <= 0 || len == 0) return 0;
+        const unsigned long long n = (unsigned long long)s->b < len ? (unsigned long long)s->b : len;
+        *first = len - n;
+        *last = len - 1;
+        return 1;
+    }
+    if ((unsigned long long)s->a >= len) return 0;
+    *first = (unsigned long long)s->a;
+    *last = s->b < 0 || (unsigned long long)s->b >= len ? len - 1 : (unsigned long long)s->b;
+    return 1;
+}
+
+/* RFC 6455 §4.2.2 item 5.4: base64(SHA-1(key + GUID)), computed here with
+ * OpenSSL rather than with the code under test. */
+static void __h1c_ws_accept(const char* key, size_t key_len, char* out) {
+    static const char guid[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    uint8_t buf[256 + sizeof guid];
+    memcpy(buf, key, key_len);
+    memcpy(buf + key_len, guid, sizeof guid - 1);
+    unsigned char digest[EVP_MAX_MD_SIZE];
+    unsigned int dlen = 0;
+    EVP_Digest(buf, key_len + sizeof guid - 1, digest, &dlen, EVP_sha1(), NULL);
+    EVP_EncodeBlock((unsigned char*)out, digest, (int)dlen);
+}
+
+/* A handshake with each of its parts right or wrong, and the answer that
+ * RFC 6455 §4.2.1-4.2.2 fixes for it. */
+static int __h1c_generate_upgrade(h1c_t* c, h1c_req_t* r, const uint8_t** p, const uint8_t* end) {
+    r->upgrade = 1;
+    const uint8_t b = __h1c_byte(p, end);
+
+    static const struct { const char* value; int ok; } upgrades[] = {
+        { "websocket", 1 }, { "WebSocket", 1 }, { "h2c", 0 }, { NULL, 0 },
+    };
+    static const struct { const char* value; int ok; } connections[] = {
+        { "Upgrade", 1 }, { "keep-alive, Upgrade", 1 }, { "keep-alive", 0 }, { NULL, 0 },
+    };
+    static const char* const versions[] = { "13", "13", "8", NULL };
+    const int up = b % 4, co = (b >> 2) % 4, ve = (b >> 4) % 4;
+
+    /* The key: 16 bytes from the input, base64 -- or one of the wrong shapes. */
+    char key[260];
+    int key_ok = 0;
+    const uint8_t kb = __h1c_byte(p, end);
+    switch (kb % 6) {
+    case 0: case 1: case 2: {
+        uint8_t raw[16];
+        for (size_t i = 0; i < sizeof raw; i++) raw[i] = __h1c_byte(p, end);
+        EVP_EncodeBlock((unsigned char*)key, raw, sizeof raw);
+        key_ok = 1;
+        break;
+    }
+    case 3: {                                      /* long: the old stack overflow */
+        const size_t len = 92 + __h1c_byte(p, end) % 160;          /* < sizeof key */
+        memset(key, 'A', len);
+        key[len] = '\0';
+        break;
+    }
+    case 4: snprintf(key, sizeof key, "c2hvcnQ="); break;          /* 5 bytes */
+    default: key[0] = '\0'; break;                                  /* none */
+    }
+
+    const int valid = upgrades[up].ok && connections[co].ok && key_ok;
+    r->ws_status = !valid ? 400 : (ve < 2 ? 101 : 426);
+    if (r->ws_status == 101) __h1c_ws_accept(key, strlen(key), r->ws_accept);
+
+    char req[768];
+    int n = snprintf(req, sizeof req, "GET /ws HTTP/1.1\r\nHost: localhost\r\n");
+    if (upgrades[up].value != NULL)
+        n += snprintf(req + n, sizeof req - (size_t)n, "Upgrade: %s\r\n", upgrades[up].value);
+    if (connections[co].value != NULL)
+        n += snprintf(req + n, sizeof req - (size_t)n, "Connection: %s\r\n", connections[co].value);
+    if (versions[ve] != NULL)
+        n += snprintf(req + n, sizeof req - (size_t)n, "Sec-WebSocket-Version: %s\r\n", versions[ve]);
+    if (key[0] != '\0')
+        n += snprintf(req + n, sizeof req - (size_t)n, "Sec-WebSocket-Key: %s\r\n", key);
+    if (b & 0x80) {
+        static const char* const offers[] = {
+            "permessage-deflate", "permessage-deflate; client_max_window_bits",
+            "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
+            "permessage-deflate; server_max_window_bits=9", "x-unknown",
+        };
+        r->ws_offered_ext = 1;
+        n += snprintf(req + n, sizeof req - (size_t)n, "Sec-WebSocket-Extensions: %s\r\n",
+                      offers[__h1c_byte(p, end) % 5]);
+    }
+    n += snprintf(req + n, sizeof req - (size_t)n, "\r\n");
+
+    if (getenv("FUZZ_TRACE") != NULL)
+        fprintf(stderr, "request %zu:\n%.*s", c->queued, n, req);
+
+    __h1c_append(&c->out, &c->out_len, &c->out_cap, req, (size_t)n);
+    c->queued++;
+    return 1;
+}
+
+/* One request from the input onto the client's output. 0 when the input has
+ * run out. */
+static int __h1c_generate(h1c_t* c, const uint8_t** p, const uint8_t* end) {
+    if (*p >= end || c->queued == H1C_REQUESTS || c->close_sent || c->closing || c->switched)
+        return 0;
+    /* After a handshake that may switch, nothing is HTTP until its answer is in. */
+    if (c->queued > 0 && c->reqs[c->queued - 1].upgrade && c->answered < c->queued) return 0;
+
+    h1c_req_t* r = &c->reqs[c->queued];
+    memset(r, 0, sizeof *r);
+    const uint8_t b0 = __h1c_byte(p, end);
+
+    if (b0 >= 0xE0) return __h1c_generate_upgrade(c, r, p, end);
+    r->file = b0 % H1C_FILES;
+    r->head = (b0 >> 2) % 5 == 0;
+    r->post = (b0 >> 2) % 5 == 1;
+    const size_t size = __h1c_files[r->file].size;
+
+    char req[1024];
+    int n = snprintf(req, sizeof req, "%s /%s HTTP/1.1\r\nHost: localhost\r\n",
+                     r->head ? "HEAD" : r->post ? "POST" : "GET", __h1c_files[r->file].name);
+
+    /* A POST carries a body the server has to step over to find the next
+     * request; with Expect it may first say 100 Continue (RFC 9110 §10.1.1). */
+    uint8_t body[64];
+    size_t body_len = 0;
+    if (r->post) {
+        const uint8_t b = __h1c_byte(p, end);
+        body_len = b % sizeof body;
+        r->expect = (b & 0x40) != 0;
+        for (size_t i = 0; i < body_len; i++) body[i] = __h1c_byte(p, end);
+        n += snprintf(req + n, sizeof req - (size_t)n, "Content-Length: %zu\r\n%s", body_len,
+                      r->expect ? "Expect: 100-continue\r\n" : "");
+    }
+
+    /* Range. */
+    char range[256] = "";
+    const uint8_t kind = __h1c_byte(p, end) % 8;
+    if (kind >= 3 && kind <= 5) {
+        h1c_spec_t* s = &r->specs[0];
+        s->a = kind == 5 ? -1 : __h1c_offset(__h1c_byte(p, end), size);
+        s->b = kind == 4 ? -1 : __h1c_offset(__h1c_byte(p, end), size);
+        if (kind == 3 && s->a > s->b) { const long long t = s->a; s->a = s->b; s->b = t; }
+        r->nspecs = 1;
+        r->exact = 1;
+    } else if (kind == 6) {
+        r->nspecs = 2 + __h1c_byte(p, end) % 3;
+        r->clean = 1;
+        for (size_t i = 0; i < r->nspecs; i++) {
+            h1c_spec_t* s = &r->specs[i];
+            const uint8_t form = __h1c_byte(p, end) % 3;
+            s->a = form == 2 ? -1 : __h1c_offset(__h1c_byte(p, end), size);
+            s->b = form == 1 ? -1 : __h1c_offset(__h1c_byte(p, end), size);
+            if (form == 0 && s->a > s->b) { const long long t = s->a; s->a = s->b; s->b = t; }
+            /* Clean: explicit, ascending, disjoint ranges, where only the last
+             * may be open or a suffix -- the only lists the RFC leaves the
+             * server no latitude on besides serving them as they are. */
+            if (i + 1 < r->nspecs && form != 0) r->clean = 0;
+            if (i > 0) {
+                const h1c_spec_t* prev = &r->specs[i - 1];
+                if (s->a >= 0 && s->a <= prev->b) r->clean = 0;
+            }
+        }
+    }
+    if (r->nspecs > 0) {
+        size_t at = (size_t)snprintf(range, sizeof range, "bytes=");
+        for (size_t i = 0; i < r->nspecs; i++) {
+            if (i > 0) at += (size_t)snprintf(range + at, sizeof range - at,
+                                               __h1c_byte(p, end) & 1 ? ", " : ",");
+            at += (size_t)__h1c_spec_text(range + at, sizeof range - at, &r->specs[i]);
+        }
+    } else if (kind == 7) {
+        /* Mangled: anything the parser may accept or ignore. */
+        static const char alphabet[] = "0123456789-, =b";
+        size_t at = (size_t)snprintf(range, sizeof range, "%s",
+                                     __h1c_byte(p, end) & 1 ? "bytes=" : "bytes=0");
+        const size_t len = __h1c_byte(p, end) % 16;
+        for (size_t i = 0; i < len; i++)
+            range[at++] = alphabet[__h1c_byte(p, end) % (sizeof alphabet - 1)];
+        range[at] = '\0';
+    }
+    if (range[0] != '\0') {
+        r->ranged = 1;
+        n += snprintf(req + n, sizeof req - (size_t)n, "Range: %s\r\n", range);
+    }
+
+    /* Validators. The ETags offered are the ones this connection has seen. */
+    const uint8_t cond = __h1c_byte(p, end) % 6;
+    if (cond == 2 || cond == 4 || cond == 5) {
+        r->inm = 1;
+        const uint8_t pick = __h1c_byte(p, end);
+        const char* seen = c->etag[r->file][pick & 1];
+        if (cond == 5) snprintf(r->inm_value, sizeof r->inm_value, "*");
+        else if (seen[0] == '\0' || (pick >> 1) % 4 == 0)
+            snprintf(r->inm_value, sizeof r->inm_value, "\"nope\"");
+        else if ((pick >> 1) % 4 == 1)
+            snprintf(r->inm_value, sizeof r->inm_value, "\"x\", %s", seen);
+        else if ((pick >> 1) % 4 == 2 && strncmp(seen, "W/", 2) == 0)
+            snprintf(r->inm_value, sizeof r->inm_value, "%s", seen + 2);   /* weak compare */
+        else
+            snprintf(r->inm_value, sizeof r->inm_value, "%s", seen);
+        n += snprintf(req + n, sizeof req - (size_t)n, "If-None-Match: %s\r\n", r->inm_value);
+    }
+    if (cond == 3 || cond == 4) {
+        r->ims = 1;
+        const uint8_t pick = __h1c_byte(p, end) % 4;
+        char date[64] = "yesterday";
+        if (pick < 3) {
+            r->ims_valid = 1;
+            r->ims_time = H1C_T0 + (pick == 0 ? -1000 : pick == 1 ? 0 : 1000);
+            http_format_date(r->ims_time, date, sizeof date);
+        }
+        n += snprintf(req + n, sizeof req - (size_t)n, "If-Modified-Since: %s\r\n", date);
+    }
+
+    /* Accept-Encoding, and whether RFC 9110 §12.5.3 lets it take gzip. */
+    static const struct { const char* value; int gzip; } encodings[] = {
+        { NULL, 0 }, { "gzip", 1 }, { "gzip;q=0", 0 }, { "deflate, gzip;q=0.5", 1 },
+        { "identity", 0 }, { "*", 1 }, { "*;q=0", 0 }, { "GZIP", 1 },
+    };
+    const uint8_t ae = __h1c_byte(p, end) % 8;
+    r->ae_gzip = encodings[ae].gzip;
+    if (encodings[ae].value != NULL)
+        n += snprintf(req + n, sizeof req - (size_t)n, "Accept-Encoding: %s\r\n", encodings[ae].value);
+
+    if (__h1c_byte(p, end) % 8 == 0 || *p >= end) {
+        r->close = 1;
+        n += snprintf(req + n, sizeof req - (size_t)n, "Connection: close\r\n");
+    }
+    n += snprintf(req + n, sizeof req - (size_t)n, "\r\n");
+
+    if (getenv("FUZZ_TRACE") != NULL)
+        fprintf(stderr, "request %zu:\n%.*s", c->queued, n, req);
+
+    __h1c_append(&c->out, &c->out_len, &c->out_cap, req, (size_t)n);
+    if (body_len > 0) __h1c_append(&c->out, &c->out_len, &c->out_cap, body, body_len);
+    c->queued++;
+    if (r->close) c->close_sent = 1;
+    return 1;
+}
+
+/* RFC 9110 §13.1.2: weak comparison, a list, or "*". */
+static int __h1c_inm_matches(const char* list, const char* etag) {
+    const char* e = strncmp(etag, "W/", 2) == 0 ? etag + 2 : etag;
+    const size_t elen = strlen(e);
+    const char* s = list;
+    while (*s != '\0') {
+        while (*s == ' ' || *s == ',') s++;
+        const char* t = s;
+        while (*t != '\0' && *t != ',') t++;
+        const char* te = t;
+        while (te > s && te[-1] == ' ') te--;
+        if (te - s == 1 && *s == '*') return 1;
+        const char* v = strncmp(s, "W/", 2) == 0 ? s + 2 : s;
+        if ((size_t)(te - v) == elen && memcmp(v, e, elen) == 0) return 1;
+        s = t;
+    }
+    return 0;
+}
+
+static int __h1c_parse_crange(const char* v, unsigned long long* a, unsigned long long* b,
+                              unsigned long long* total, int* star) {
+    char back[96];
+    *star = 0;
+    if (sscanf(v, "bytes */%llu", total) == 1) {
+        snprintf(back, sizeof back, "bytes */%llu", *total);
+        *star = 1;
+        return strcmp(back, v) == 0;
+    }
+    if (sscanf(v, "bytes %llu-%llu/%llu", a, b, total) != 3) return 0;
+    snprintf(back, sizeof back, "bytes %llu-%llu/%llu", *a, *b, *total);
+    return strcmp(back, v) == 0 && *a <= *b && *b < *total;
+}
+
+typedef struct {
+    unsigned long long a, b, total;
+    const uint8_t* data;
+} h1c_part_t;
+
+/* multipart/byteranges (RFC 9110 §14.6), read strictly: every part's length
+ * comes from its own Content-Range, so bytes that look like the boundary inside
+ * a part are just bytes. Returns the part count, 0 when malformed. */
+static size_t __h1c_multipart(const h1c_resp_t* rs, h1c_part_t* parts, size_t max) {
+    const char* bp = strstr(rs->ctype, "boundary=");
+    if (bp == NULL) return 0;
+    const char* boundary = bp + 9;
+    const size_t blen = strlen(boundary);
+    const uint8_t* s = rs->body;
+    const uint8_t* e = rs->body + rs->body_len;
+    size_t count = 0;
+
+    if (e - s >= 2 && s[0] == '\r' && s[1] == '\n') s += 2;
+    for (;;) {
+        if ((size_t)(e - s) < 2 + blen || s[0] != '-' || s[1] != '-' ||
+            memcmp(s + 2, boundary, blen) != 0) return 0;
+        s += 2 + blen;
+        if (e - s >= 2 && s[0] == '-' && s[1] == '-') {
+            s += 2;
+            if (e - s >= 2 && s[0] == '\r' && s[1] == '\n') s += 2;
+            return s == e && count > 0 ? count : 0;
+        }
+        if (e - s < 2 || s[0] != '\r' || s[1] != '\n' || count == max) return 0;
+        s += 2;
+
+        int have_range = 0;
+        h1c_part_t* part = &parts[count];
+        for (;;) {
+            const uint8_t* eol = memchr(s, '\n', (size_t)(e - s));
+            if (eol == NULL || eol == s || eol[-1] != '\r') return 0;
+            const size_t len = (size_t)(eol - 1 - s);
+            if (len == 0) { s = eol + 1; break; }
+            char line[160];
+            if (len >= sizeof line) return 0;
+            memcpy(line, s, len);
+            line[len] = '\0';
+            if (strncasecmp(line, "Content-Range: ", 15) == 0) {
+                int star = 0;
+                if (!__h1c_parse_crange(line + 15, &part->a, &part->b, &part->total, &star) || star)
+                    return 0;
+                have_range = 1;
+            }
+            s = eol + 1;
+        }
+        if (!have_range) return 0;
+        const unsigned long long n = part->b - part->a + 1;
+        if ((unsigned long long)(e - s) < n + 2) return 0;
+        part->data = s;
+        s += n;
+        if (s[0] != '\r' || s[1] != '\n') return 0;
+        s += 2;
+        count++;
+    }
+}
+
+/* Every byte of [a, b] lies inside some range the request asked for. */
+static int __h1c_covered(const h1c_req_t* r, unsigned long long len,
+                         unsigned long long a, unsigned long long b) {
+    unsigned long long pos = a;
+    while (pos <= b) {
+        int moved = 0;
+        for (size_t i = 0; i < r->nspecs; i++) {
+            unsigned long long f, l;
+            if (__h1c_resolve(&r->specs[i], len, &f, &l) && f <= pos && pos <= l) {
+                if (l >= b) return 1;
+                pos = l + 1;
+                moved = 1;
+            }
+        }
+        if (!moved) return 0;
+    }
+    return 1;
+}
+
+static void __h1c_check(h1c_t* c, const h1c_req_t* r, const h1c_resp_t* rs) {
+    const h1c_file_t* f = &__h1c_files[r->file];
+
+    if (r->upgrade) {
+        if (getenv("FUZZ_TRACE") != NULL)
+            fprintf(stderr, "  -> %d (handshake, expected %d)\n", rs->status, r->ws_status);
+        if (rs->status != r->ws_status) __builtin_trap();
+        if (rs->status == 101) {
+            if (!rs->upgrade_ws || !rs->conn_upgrade) __builtin_trap();
+            if (strcmp(rs->ws_accept, r->ws_accept) != 0) __builtin_trap();
+            if (rs->has_ws_ext && !r->ws_offered_ext) __builtin_trap();   /* §9.1 */
+            c->switched = 1;
+            return;
+        }
+        if (rs->upgrade_ws) __builtin_trap();                           /* no switch */
+        if (rs->status == 426 && strcmp(rs->ws_version, "13") != 0) __builtin_trap();
+        return;
+    }
+
+    if (getenv("FUZZ_TRACE") != NULL)
+        fprintf(stderr, "  -> %d, %zu body bytes%s%s%s\n", rs->status, rs->body_len,
+                rs->gzip ? ", gzip" : "", rs->has_crange ? ", " : "", rs->has_crange ? rs->crange : "");
+
+    if (rs->status != 200 && rs->status != 206 && rs->status != 304 && rs->status != 416 &&
+        !(rs->status == 412 && r->post))
+        __builtin_trap();
+    if (rs->gzip && !r->ae_gzip) __builtin_trap();                  /* §12.5.3 */
+    if (rs->has_clen && rs->chunked) __builtin_trap();              /* RFC 9112 §6.1 */
+    if (!rs->has_lastmod || strcmp(rs->lastmod, __h1c_date) != 0) __builtin_trap();
+    if (!rs->has_etag) __builtin_trap();
+
+    /* One ETag per representation, the gzip one marked. */
+    const size_t etlen = strlen(rs->etag);
+    const int gz_tag = etlen >= 6 && strcmp(rs->etag + etlen - 6, "-gzip\"") == 0;
+    char* seen = c->etag[r->file][gz_tag];
+    if (seen[0] == '\0') snprintf(seen, sizeof c->etag[0][0], "%s", rs->etag);
+    else if (strcmp(seen, rs->etag) != 0) __builtin_trap();
+    if (strcmp(c->etag[r->file][0], c->etag[r->file][1]) == 0) __builtin_trap();
+
+    /* §13.1.2 and §13.1.3: If-None-Match wins; If-Modified-Since only without
+     * it, and only for GET and HEAD. A matching If-None-Match on any other
+     * method is 412, not 304. */
+    const int inm_match = r->inm && __h1c_inm_matches(r->inm_value, rs->etag);
+    const int ims_match = !r->post && !r->inm && r->ims && r->ims_valid && r->ims_time >= H1C_T0;
+    if (r->post) {
+        if (rs->status == 304) __builtin_trap();
+        if (rs->status == 412 && !inm_match) __builtin_trap();
+        if (rs->status == 412) return;
+    } else if ((rs->status == 304) != (inm_match || ims_match)) {
+        __builtin_trap();
+    }
+    if (rs->status == 304) {
+        if (rs->body_len != 0) __builtin_trap();
+        return;
+    }
+
+    if (rs->status == 200) {
+        /* A Range in a form the server must understand was ignored. */
+        if (!r->post && (r->exact || r->clean)) __builtin_trap();
+        if (gz_tag != rs->gzip) __builtin_trap();
+        if (r->head) {
+            if (rs->body_len != 0) __builtin_trap();
+            if (!rs->gzip && rs->has_clen && rs->clen != f->size) __builtin_trap();
+            return;
+        }
+        if (rs->gzip) {
+            if (!__h1c_gunzip_equals(rs->body, rs->body_len, f->data, f->size)) __builtin_trap();
+            if (c->repr[r->file] == NULL && rs->body_len > 0) {
+                c->repr[r->file] = malloc(rs->body_len);
+                if (c->repr[r->file] != NULL) {
+                    memcpy(c->repr[r->file], rs->body, rs->body_len);
+                    c->repr_len[r->file] = rs->body_len;
+                }
+            }
+        } else if (rs->body_len != f->size ||
+                   (f->size > 0 && memcmp(rs->body, f->data, f->size) != 0)) {
+            __builtin_trap();
+        }
+        return;
+    }
+
+    if (!r->ranged) __builtin_trap();
+    /* §14.2: range handling is defined for GET only, and a server MUST ignore
+     * Range on a method it is not defined for. HEAD mirrors GET (§9.3.2). */
+    if (r->post) __builtin_trap();
+
+    /* The representation the ranges apply to: the file, or -- when the server
+     * swapped in a stored gzip -- that gzip, as far as this client knows it. */
+    const uint8_t* repr = f->data;
+    unsigned long long repr_len = f->size;
+    int repr_known = 1;
+    if (rs->gzip) {
+        repr_known = 0;
+        if (__h1c_static && r->file == 2) {
+            repr = __h1c_gz; repr_len = __h1c_gz_len; repr_known = 1;
+        } else if (c->repr[r->file] != NULL && __h1c_cache) {
+            repr = c->repr[r->file]; repr_len = c->repr_len[r->file]; repr_known = 1;
+        }
+    }
+
+    if (rs->status == 416) {
+        unsigned long long a, b, total;
+        int star = 0;
+        if (!rs->has_crange || !__h1c_parse_crange(rs->crange, &a, &b, &total, &star) || !star)
+            __builtin_trap();
+        if (repr_known && total != repr_len) __builtin_trap();
+        if (rs->body_len != 0) __builtin_trap();
+        for (size_t i = 0; i < r->nspecs; i++) {
+            unsigned long long first, last;
+            if (__h1c_resolve(&r->specs[i], total, &first, &last)) __builtin_trap();
+        }
+        return;
+    }
+
+    /* 206. */
+    h1c_part_t parts[8];
+    size_t count = 0;
+    const int multipart = strncasecmp(rs->ctype, "multipart/byteranges", 20) == 0;
+    if (multipart) {
+        if (r->exact) __builtin_trap();                  /* §14.6: one range, one part */
+        if (r->head) {
+            if (rs->body_len != 0) __builtin_trap();
+            return;
+        }
+        count = __h1c_multipart(rs, parts, 8);
+        if (count == 0) __builtin_trap();
+    } else {
+        int star = 0;
+        if (!rs->has_crange || !__h1c_parse_crange(rs->crange, &parts[0].a, &parts[0].b,
+                                                   &parts[0].total, &star) || star)
+            __builtin_trap();
+        if (rs->has_clen && rs->clen != parts[0].b - parts[0].a + 1) __builtin_trap();
+        if (r->head) {
+            if (rs->body_len != 0) __builtin_trap();
+        } else if (rs->body_len != parts[0].b - parts[0].a + 1) {
+            __builtin_trap();
+        }
+        parts[0].data = r->head ? NULL : rs->body;
+        count = 1;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        const h1c_part_t* part = &parts[i];
+        if (part->total != parts[0].total) __builtin_trap();
+        if (repr_known && part->total != repr_len) __builtin_trap();
+        if (part->data != NULL && repr_known &&
+            memcmp(part->data, repr + part->a, part->b - part->a + 1) != 0) __builtin_trap();
+        if (r->nspecs > 0 && !__h1c_covered(r, part->total, part->a, part->b)) __builtin_trap();
+    }
+
+    /* Where the form leaves no choice, the parts are exactly the satisfiable
+     * ranges in the order asked. */
+    if ((r->exact || r->clean) && !r->head) {
+        size_t k = 0;
+        for (size_t i = 0; i < r->nspecs; i++) {
+            unsigned long long first, last;
+            if (!__h1c_resolve(&r->specs[i], parts[0].total, &first, &last)) continue;
+            if (k == count || parts[k].a != first || parts[k].b != last) __builtin_trap();
+            k++;
+        }
+        if (k != count) __builtin_trap();
+    }
+}
+
+/* Take one response off the front of c->in: 1 when one was consumed. */
+static int __h1c_take(h1c_t* c) {
+    if (c->switched) return 0;
+    uint8_t* s = c->in;
+    uint8_t* e = c->in + c->in_len;
+    const uint8_t* head_end = NULL;
+    for (uint8_t* q = s; q + 4 <= e; q++)
+        if (q[0] == '\r' && q[1] == '\n' && q[2] == '\r' && q[3] == '\n') { head_end = q; break; }
+    if (head_end == NULL) {
+        if (c->in_len > 16384) __builtin_trap();         /* a head nobody can finish */
+        return 0;
+    }
+
+    h1c_resp_t rs;
+    memset(&rs, 0, sizeof rs);
+
+    /* Status line. */
+    const uint8_t* eol = memchr(s, '\n', (size_t)(head_end + 2 - s));
+    if (eol == NULL || eol - s < 13 || eol[-1] != '\r' || memcmp(s, "HTTP/1.1 ", 9) != 0 ||
+        s[12] != ' ' || s[9] < '1' || s[9] > '5' || s[10] < '0' || s[10] > '9' ||
+        s[11] < '0' || s[11] > '9')
+        __builtin_trap();
+    rs.status = (s[9] - '0') * 100 + (s[10] - '0') * 10 + (s[11] - '0');
+    if (rs.status < 200 && rs.status != 101) {
+        /* Interim: only 100, only once, only to the request waiting for it
+         * (RFC 9110 §15.2), and it carries no body. */
+        if (rs.status != 100 || c->answered == c->queued) __builtin_trap();
+        h1c_req_t* waiting = &c->reqs[c->answered];
+        if (!waiting->expect || waiting->continued || c->closing) __builtin_trap();
+        waiting->continued = 1;
+        const size_t used = (size_t)(head_end + 4 - s);
+        memmove(c->in, c->in + used, c->in_len - used);
+        c->in_len -= used;
+        return 1;
+    }
+
+    /* Fields: "name: value", no bare CR or LF, no obs-fold. */
+    const uint8_t* line = eol + 1;
+    while (line < head_end + 2) {
+        const uint8_t* le = memchr(line, '\n', (size_t)(head_end + 4 - line));
+        if (le == NULL || le[-1] != '\r') __builtin_trap();
+        const size_t len = (size_t)(le - 1 - line);
+        if (len == 0) break;
+        const uint8_t* colon = memchr(line, ':', len);
+        if (colon == NULL || colon == line || line[0] == ' ' || line[0] == '\t') __builtin_trap();
+        for (const uint8_t* q = line; q < line + len; q++)
+            if (*q == '\r' || *q == '\n' || *q == '\0') __builtin_trap();
+        for (const uint8_t* q = line; q < colon; q++)
+            if (*q <= ' ' || *q >= 0x7f) __builtin_trap();
+
+        const size_t nlen = (size_t)(colon - line);
+        const uint8_t* v = colon + 1;
+        while (v < line + len && (*v == ' ' || *v == '\t')) v++;
+        const size_t vlen = (size_t)(line + len - v);
+        char value[200];
+        if (vlen >= sizeof value) { line = le + 1; continue; }
+        memcpy(value, v, vlen);
+        value[vlen] = '\0';
+
+#define H1C_IS(name) (nlen == sizeof(name) - 1 && strncasecmp((const char*)line, name, nlen) == 0)
+        if (H1C_IS("Content-Length")) {
+            char* endp = NULL;
+            const unsigned long long n = strtoull(value, &endp, 10);
+            if (vlen == 0 || *endp != '\0' || (rs.has_clen && rs.clen != n)) __builtin_trap();
+            rs.has_clen = 1;
+            rs.clen = n;
+        } else if (H1C_IS("Transfer-Encoding")) {
+            if (strcasecmp(value, "chunked") != 0) __builtin_trap();
+            rs.chunked = 1;
+        } else if (H1C_IS("Content-Encoding")) {
+            if (strcasecmp(value, "gzip") != 0) __builtin_trap();
+            rs.gzip = 1;
+        } else if (H1C_IS("Content-Range")) {
+            snprintf(rs.crange, sizeof rs.crange, "%s", value);
+            rs.has_crange = 1;
+        } else if (H1C_IS("Content-Type")) {
+            snprintf(rs.ctype, sizeof rs.ctype, "%s", value);
+        } else if (H1C_IS("ETag")) {
+            snprintf(rs.etag, sizeof rs.etag, "%s", value);
+            rs.has_etag = 1;
+        } else if (H1C_IS("Last-Modified")) {
+            snprintf(rs.lastmod, sizeof rs.lastmod, "%s", value);
+            rs.has_lastmod = 1;
+        } else if (H1C_IS("Connection")) {
+            if (strcasecmp(value, "close") == 0) rs.conn_close = 1;
+            if (strcasecmp(value, "upgrade") == 0) rs.conn_upgrade = 1;
+        } else if (H1C_IS("Upgrade")) {
+            if (strcasecmp(value, "websocket") == 0) rs.upgrade_ws = 1;
+        } else if (H1C_IS("Sec-WebSocket-Accept")) {
+            snprintf(rs.ws_accept, sizeof rs.ws_accept, "%s", value);
+        } else if (H1C_IS("Sec-WebSocket-Version")) {
+            snprintf(rs.ws_version, sizeof rs.ws_version, "%s", value);
+        } else if (H1C_IS("Sec-WebSocket-Extensions")) {
+            rs.has_ws_ext = 1;
+        }
+#undef H1C_IS
+        line = le + 1;
+    }
+
+    /* Which request this answers decides whether a body follows. */
+    if (c->answered == c->queued) __builtin_trap();       /* an answer to nothing */
+    const h1c_req_t* r = &c->reqs[c->answered];
+    const uint8_t* body = head_end + 4;
+    uint8_t* decoded = NULL;
+    size_t decoded_len = 0, decoded_cap = 0;
+    const uint8_t* next = body;
+
+    if (r->head || rs.status == 304 || rs.status == 204 || rs.status == 101) {
+        next = body;
+    } else if (rs.chunked) {
+        const uint8_t* q = body;
+        for (;;) {
+            const uint8_t* le = memchr(q, '\n', (size_t)(e - q));
+            if (le == NULL) { free(decoded); return 0; }
+            if (le == q || le[-1] != '\r') __builtin_trap();
+            char* endp = NULL;
+            const unsigned long long n = strtoull((const char*)q, &endp, 16);
+            if (endp == (char*)q || (*endp != '\r' && *endp != ';')) __builtin_trap();
+            q = le + 1;
+            if (n == 0) {
+                /* Trailer section, then the empty line. */
+                for (;;) {
+                    const uint8_t* te = memchr(q, '\n', (size_t)(e - q));
+                    if (te == NULL) { free(decoded); return 0; }
+                    if (te == q || te[-1] != '\r') __builtin_trap();
+                    const int empty = te == q + 1;
+                    q = te + 1;
+                    if (empty) break;
+                }
+                break;
+            }
+            if ((unsigned long long)(e - q) < n + 2) { free(decoded); return 0; }
+            __h1c_append(&decoded, &decoded_len, &decoded_cap, q, (size_t)n);
+            q += n;
+            if (q[0] != '\r' || q[1] != '\n') __builtin_trap();
+            q += 2;
+        }
+        next = q;
+    } else if (rs.has_clen) {
+        if ((unsigned long long)(e - body) < rs.clen) return 0;
+        next = body + rs.clen;
+    } else {
+        __builtin_trap();              /* a keep-alive answer with no length */
+    }
+
+    rs.body = decoded != NULL ? decoded : (uint8_t*)body;
+    rs.body_len = decoded != NULL ? decoded_len : (size_t)(next - body);
+    if (rs.chunked && decoded == NULL) rs.body_len = 0;
+
+    if (c->closing) __builtin_trap();                     /* bytes after the last answer */
+    __h1c_check(c, r, &rs);
+    free(decoded);
+
+    c->answered++;
+    if (r->close || rs.conn_close) c->closing = 1;
+
+    const size_t used = (size_t)(next - s);
+    memmove(c->in, c->in + used, c->in_len - used);
+    c->in_len -= used;
+    return 1;
+}
+
+static int __h1c_pump(h1c_t* c, int fd, size_t want) {
+    uint8_t buf[4096];
+    int got = 0;
+    while (want > 0) {
+        const ssize_t n = recv(fd, buf, want < sizeof buf ? want : sizeof buf, 0);
+        if (n == 0) { c->eof = 1; break; }
+        if (n < 0) break;
+        got = 1;
+        want -= (size_t)n;
+        if (c->raw || c->switched) {                      /* nothing to hold it to */
+            if (getenv("FUZZ_TRACE") != NULL)
+                fprintf(stderr, "server sent %zd bytes:\n%.*s\n", n, (int)n, (const char*)buf);
+            continue;
+        }
+        __h1c_append(&c->in, &c->in_len, &c->in_cap, buf, (size_t)n);
+        while (__h1c_take(c)) {}
+    }
+    return got;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 3) return 0;
+    __h1c_root_init();
+
+    const uint8_t flags = data[0];
+    __h1c_static = (flags & 1) != 0;
+    __h1c_cache = (flags & 2) != 0;
+    http_gzip_cache_clear();
+    http_policy_init();
+
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) != 0) return 0;
+    const int small = 4096;
+    setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+    setsockopt(sv[1], SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+
+    h1c_t* c = calloc(1, sizeof *c);
+    char* buffer = malloc(16384);
+    if (c == NULL || buffer == NULL) { free(c); free(buffer); close(sv[0]); close(sv[1]); return 0; }
+    c->raw = (flags >> 2) % 8 == 0;
+    c->depth = 1 + (flags >> 5) % 4;
+
+    const ipaddr_t loopback = ipaddr_from_v4(0x0100007F);
+    connection_t* connection = connection_s_alloc(&__fuzz_listener, sv[0], &loopback, 8080,
+                                                  &loopback, 40000, buffer, 16384);
+    if (connection == NULL) { free(c); free(buffer); close(sv[0]); close(sv[1]); return 0; }
+    connection_server_ctx_t* ctx = connection->ctx;
+    ctx->server = &__fuzz_server;
+    int alive = set_http(connection);
+    __h1c_armed = MPXIN | MPXRDHUP;           /* what accept() arms a connection for */
+
+    const uint8_t* p = data + 2;
+    const uint8_t* end = data + size;
+    if (c->raw) {
+        __h1c_append(&c->out, &c->out_len, &c->out_cap, p, (size_t)(end - p));
+        p = end;
+    }
+
+    uint64_t rng = (uint64_t)data[1] * 0x9E3779B97F4A7C15ULL + 1;
+    for (size_t steps = 0; alive && steps < 20000; steps++) {
+        if (!c->raw)
+            while (c->queued - c->answered < c->depth && __h1c_generate(c, &p, end)) {}
+        if (c->out_pos == c->out_len && c->answered == c->queued &&
+            (p >= end || c->closing || c->switched)) break;
+        if (c->eof) break;
+
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        const size_t amount = 1 + (size_t)((rng >> 8) % 700);
+        switch (rng % 5) {
+        case 0: {
+            const size_t left = c->out_len - c->out_pos;
+            const size_t n = left < amount ? left : amount;
+            if (n == 0) break;
+            const ssize_t w = send(sv[1], c->out + c->out_pos, n, MSG_NOSIGNAL);
+            if (w > 0) c->out_pos += (size_t)w;
+            break;
+        }
+        case 1: alive = __h1c_event(connection, MPXIN); break;
+        case 2: alive = __h1c_event(connection, MPXOUT); break;
+        case 3: (void)__h1c_pump(c, sv[1], amount * 8); break;
+        case 4: (void)__fuzz_worker(); break;
+        }
+    }
+
+    /* Drain: the rest of the requests in, everything the server has out. */
+    for (int idle = 0; idle < 4 && !c->eof;) {
+        int moved = 0;
+        if (c->out_pos < c->out_len) {
+            const ssize_t w = send(sv[1], c->out + c->out_pos, c->out_len - c->out_pos, MSG_NOSIGNAL);
+            if (w > 0) { c->out_pos += (size_t)w; moved = 1; }
+        }
+        if (alive) alive = __h1c_event(connection, MPXIN);
+        while (__fuzz_worker()) moved = 1;
+        if (alive) alive = __h1c_event(connection, MPXOUT);
+        if (__h1c_pump(c, sv[1], SIZE_MAX)) moved = 1;
+        if (!c->raw && alive && c->answered < c->queued && !c->closing)
+            while (c->queued - c->answered < c->depth && __h1c_generate(c, &p, end)) moved = 1;
+        idle = moved ? 0 : idle + 1;
+    }
+
+    if (!c->raw) {
+        /* The server stopped: every request it was sent must have been
+         * answered, unless someone asked to close. A half-sent answer is one
+         * the client waits on for ever. */
+        const int complete = c->out_pos == c->out_len;
+        if (complete && !c->closing && c->answered < c->queued) __builtin_trap();
+        if (alive && c->in_len != 0) __builtin_trap();
+        if (!alive && !c->closing && c->answered < c->queued && complete) __builtin_trap();
+    }
+
+    /* Nothing may still hold the connection when it goes. */
+    while (__fuzz_worker()) {}
+    connection_s_free_local(connection);
+    for (size_t i = 0; i < H1C_FILES; i++) free(c->repr[i]);
+    free(c->out);
+    free(c->in);
+    free(c);
+    free(buffer);
+    close(sv[0]);
+    close(sv[1]);
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_TEXT
+
+#include "cstr.h"
+#include "escape.h"
+#include "strtemplate.h"
+#include "validation.h"
+
+/* The helpers that stand between what a form sent and where it ends up: HTML
+ * and log escaping, form cleaning, the validators, and the {N} templates of
+ * redirects and static routes. Each has a property that holds for every input,
+ * and the checks here are written against the documentation in the headers,
+ * not the code:
+ *
+ *   html_escape      -- no raw < > " ' left, every & starts one of the five
+ *                       entities, and unescaping gives the input back (line
+ *                       breaks as <br>\n for the multi-line form, CRLF as one);
+ *   log_escape       -- what reaches the journal is valid UTF-8 with no C0,
+ *                       DEL or C1 control character in it;
+ *   cstr_clean       -- never longer, idempotent, and each flag's promise
+ *                       kept (valid UTF-8, no controls, no line breaks, one
+ *                       space per run, lower case, no whitespace at the ends);
+ *   validators       -- UTF-8 and phone numbers against a reference, and an
+ *                       accepted address or link carries nothing that could
+ *                       break the header or the attribute it is put into;
+ *   strtemplate      -- the expansion equals a reference expansion.
+ *
+ * The first byte picks the helper, the rest is the value. */
+
+/* Strict UTF-8 (RFC 3629): no overlongs, no surrogates, nothing past U+10FFFF.
+ * Decodes one code point at s[i..n); 0 when there is none. */
+static size_t __text_utf8_next(const uint8_t* s, size_t n, size_t i, uint32_t* cp) {
+    const uint8_t c = s[i];
+    if (c < 0x80) { *cp = c; return 1; }
+    size_t len;
+    uint32_t v;
+    if (c >= 0xC2 && c <= 0xDF) { len = 2; v = c & 0x1F; }
+    else if (c >= 0xE0 && c <= 0xEF) { len = 3; v = c & 0x0F; }
+    else if (c >= 0xF0 && c <= 0xF4) { len = 4; v = c & 0x07; }
+    else return 0;
+    if (i + len > n) return 0;
+    for (size_t k = 1; k < len; k++) {
+        if ((s[i + k] & 0xC0) != 0x80) return 0;
+        v = v << 6 | (s[i + k] & 0x3F);
+    }
+    if (len == 3 && (v < 0x800 || (v >= 0xD800 && v <= 0xDFFF))) return 0;
+    if (len == 4 && (v < 0x10000 || v > 0x10FFFF)) return 0;
+    *cp = v;
+    return len;
+}
+
+static int __text_utf8_valid(const char* str) {
+    const uint8_t* s = (const uint8_t*)str;
+    const size_t n = strlen(str);
+    uint32_t cp;
+    for (size_t i = 0; i < n;) {
+        const size_t len = __text_utf8_next(s, n, i, &cp);
+        if (len == 0) return 0;
+        i += len;
+    }
+    return 1;
+}
+
+/* cstr.c's set, spelled out there for the same reason it is here. */
+static int __text_space(uint32_t cp) {
+    return cp == 0x20 || (cp >= 0x09 && cp <= 0x0D) || (cp >= 0x2000 && cp <= 0x200A) ||
+           cp == 0x85 || cp == 0xA0 || cp == 0x1680 || cp == 0x2028 || cp == 0x2029 ||
+           cp == 0x202F || cp == 0x205F || cp == 0x3000;
+}
+
+static void __text_html(const char* in) {
+    for (int multiline = 0; multiline <= 1; multiline++) {
+        char* out = multiline ? html_escape_multiline(in) : html_escape(in);
+        if (out == NULL) return;
+
+        /* Unescape while checking that nothing raw is left. */
+        const size_t n = strlen(in);
+        char* back = malloc(n + 1);
+        if (back == NULL) { free(out); return; }
+        size_t k = 0;
+        for (const char* p = out; *p;) {
+            static const struct { const char* entity; char c; } entities[] = {
+                { "&amp;", '&' }, { "&lt;", '<' }, { "&gt;", '>' }, { "&quot;", '"' }, { "&#39;", '\'' },
+            };
+            if (*p == '<' && multiline && strncmp(p, "<br>\n", 5) == 0) {
+                if (k == n + 1) __builtin_trap();
+                back[k++] = '\n';
+                p += 5;
+                continue;
+            }
+            if (*p == '<' || *p == '>' || *p == '"' || *p == '\'') __builtin_trap();
+            if (multiline && (*p == '\r' || *p == '\n')) __builtin_trap();
+            if (*p == '&') {
+                size_t e = 0;
+                while (e < 5 && strncmp(p, entities[e].entity, strlen(entities[e].entity)) != 0) e++;
+                if (e == 5) __builtin_trap();                  /* a bare & */
+                if (k == n + 1) __builtin_trap();
+                back[k++] = entities[e].c;
+                p += strlen(entities[e].entity);
+                continue;
+            }
+            if (k == n + 1) __builtin_trap();
+            back[k++] = *p++;
+        }
+        back[k] = '\0';
+
+        /* What the input becomes once its breaks are normalised. */
+        char* want = malloc(n + 1);
+        if (want == NULL) { free(out); free(back); return; }
+        size_t w = 0;
+        for (size_t i = 0; i < n; i++) {
+            if (multiline && (in[i] == '\r' || in[i] == '\n')) {
+                if (in[i] == '\r' && in[i + 1] == '\n') i++;
+                want[w++] = '\n';
+            } else {
+                want[w++] = in[i];
+            }
+        }
+        want[w] = '\0';
+        if (strcmp(back, want) != 0) __builtin_trap();
+
+        free(want);
+        free(back);
+        free(out);
+    }
+}
+
+static void __text_log(const char* in) {
+    char* out = log_escape(in);
+    if (out == NULL) return;
+
+    /* RFC 3629 validity, and no C0, DEL or C1: a lone 0x9B, or U+009B in two
+     * bytes, is CSI to a terminal reading the journal. */
+    const uint8_t* s = (const uint8_t*)out;
+    const size_t n = strlen(out);
+    uint32_t cp;
+    for (size_t i = 0; i < n;) {
+        const size_t len = __text_utf8_next(s, n, i, &cp);
+        if (len == 0) __builtin_trap();
+        if (cp < 0x20 || (cp >= 0x7F && cp <= 0x9F)) __builtin_trap();
+        i += len;
+    }
+    free(out);
+}
+
+static void __text_clean(const char* in, int flags) {
+    char* once = cstr_clean_copy(in, flags);
+    if (once == NULL) return;
+    char* twice = cstr_clean_copy(once, flags);
+    if (twice == NULL) { free(once); return; }
+
+    if (strlen(once) > strlen(in)) __builtin_trap();
+    if (strcmp(once, twice) != 0) __builtin_trap();              /* idempotent */
+
+    if ((flags & CSTR_CLEAN_UTF8) && !__text_utf8_valid(once)) __builtin_trap();
+    for (const char* p = once; *p; p++) {
+        const unsigned char c = (unsigned char)*p;
+        if ((flags & CSTR_CLEAN_CONTROL) && ((c < 0x20 && c != '\t' && c != '\r' && c != '\n') || c == 0x7F))
+            __builtin_trap();
+        if ((flags & CSTR_CLEAN_NEWLINES) && (c == '\r' || c == '\n')) __builtin_trap();
+        if ((flags & CSTR_CLEAN_LOWER) && c >= 'A' && c <= 'Z') __builtin_trap();
+    }
+
+    /* The whitespace promises are about code points, so only where the
+     * string can be read as such. */
+    if (__text_utf8_valid(once)) {
+        const uint8_t* s = (const uint8_t*)once;
+        const size_t n = strlen(once);
+        uint32_t cp = 0, prev = 0;
+        int first = 1, prev_space = 0;
+        for (size_t i = 0; i < n;) {
+            const size_t len = __text_utf8_next(s, n, i, &cp);
+            const int space = __text_space(cp);
+            if ((flags & CSTR_CLEAN_TRIM) && first && space) __builtin_trap();
+            if ((flags & CSTR_CLEAN_COLLAPSE) && space && (cp != 0x20 || prev_space)) __builtin_trap();
+            first = 0;
+            prev_space = space;
+            prev = cp;
+            i += len;
+        }
+        if ((flags & CSTR_CLEAN_TRIM) && n > 0 && __text_space(prev)) __builtin_trap();
+    }
+
+    free(twice);
+    free(once);
+}
+
+static void __text_validators(const char* in) {
+    if (validate_utf8(in) != __text_utf8_valid(in)) __builtin_trap();
+
+    /* Phone: the rule as validation.h states it. */
+    const char* p = in;
+    if (*p == '+') p++;
+    size_t digits = 0;
+    int ok = *in != '\0';
+    for (; *p; p++) {
+        if (*p >= '0' && *p <= '9') digits++;
+        else if (strchr(" ()-.", *p) == NULL) ok = 0;
+    }
+    ok = ok && digits >= 7 && digits <= 15;
+    if (validate_phone(in) != ok) __builtin_trap();
+
+    /* Length in characters, for strings that have characters. */
+    if (__text_utf8_valid(in)) {
+        size_t chars = 0;
+        for (const unsigned char* q = (const unsigned char*)in; *q; q++)
+            if ((*q & 0xC0) != 0x80) chars++;
+        if (validate_length(in, 2, 10) != (chars >= 2 && chars <= 10)) __builtin_trap();
+    }
+
+    /* An accepted address goes between < > in a header: nothing in it may end
+     * the field or the brackets -- no controls, spaces, brackets, quotes,
+     * commas or a second @ (RFC 5322 atext, dots and one @). */
+    if (validate_email(in)) {
+        size_t at = 0;
+        for (const unsigned char* q = (const unsigned char*)in; *q; q++) {
+            if (*q == '@') { at++; continue; }
+            if (*q <= 0x20 || *q >= 0x7F || strchr("<>\"(),:;[\\]", *q) != NULL) __builtin_trap();
+        }
+        if (at != 1 || strlen(in) > 254) __builtin_trap();
+    }
+
+    /* An accepted link is http(s), printable ASCII, with no user info. */
+    if (validate_url(in)) {
+        if (strncmp(in, "http://", 7) != 0 && strncmp(in, "https://", 8) != 0) __builtin_trap();
+        for (const unsigned char* q = (const unsigned char*)in; *q; q++)
+            if (*q <= 0x20 || *q >= 0x7F) __builtin_trap();
+    }
+
+    if (validate_no_control(in)) {
+        for (const unsigned char* q = (const unsigned char*)in; *q; q++)
+            if ((*q < 0x20 && *q != '\t' && *q != '\r' && *q != '\n') || *q == 0x7F) __builtin_trap();
+    }
+}
+
+/* strtemplate.h: {N} with one or two digits is group N; "{}" and braces around
+ * anything else are text; three digits or more fail the whole template. */
+static void __text_template(const char* source, const char* subject, const uint8_t* groups, size_t ng) {
+    strtemplate_t* tpl = strtemplate_create(source);
+
+    /* The reference parse, and the reference expansion. */
+    int vector[200];
+    const size_t slen = strlen(subject);
+    for (int g = 0; g < 100; g++) {
+        const uint8_t a = (size_t)g * 2 + 1 < ng ? groups[g * 2] : 0xff;
+        const uint8_t b = (size_t)g * 2 + 1 < ng ? groups[g * 2 + 1] : 0xff;
+        if (a == 0xff || slen == 0) { vector[g * 2] = vector[g * 2 + 1] = -1; continue; }
+        size_t x = a % (slen + 1), y = b % (slen + 1);
+        if (x > y) { const size_t t = x; x = y; y = t; }
+        vector[g * 2] = (int)x;
+        vector[g * 2 + 1] = (int)y;
+    }
+
+    size_t cap = strlen(source) * 1 + 1;
+    for (const char* q = source; *q; q++) if (*q == '{') cap += slen;
+    char* want = malloc(cap + 1);
+    if (want == NULL) { strtemplate_free(tpl); return; }
+    size_t w = 0;
+    int valid = source[0] != '\0';
+    for (size_t i = 0; source[i];) {
+        if (source[i] == '{') {
+            size_t j = i + 1;
+            while (source[j] >= '0' && source[j] <= '9') j++;
+            if (source[j] == '}' && j > i + 1) {
+                if (j - i - 1 > 2) { valid = 0; break; }
+                const int g = (source[i + 1] - '0') * (j - i - 1 == 2 ? 10 : 1) +
+                              (j - i - 1 == 2 ? source[i + 2] - '0' : 0);
+                if (vector[g * 2] >= 0) {
+                    memcpy(want + w, subject + vector[g * 2], (size_t)(vector[g * 2 + 1] - vector[g * 2]));
+                    w += (size_t)(vector[g * 2 + 1] - vector[g * 2]);
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        want[w++] = source[i++];
+    }
+    want[w] = '\0';
+
+    if ((tpl != NULL) != valid) __builtin_trap();
+    if (tpl != NULL) {
+        char* got = strtemplate_expand(tpl, subject, vector);
+        if (got != NULL && strcmp(got, want) != 0) __builtin_trap();
+        free(got);
+    }
+    free(want);
+    strtemplate_free(tpl);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 2) return 0;
+
+    /* The value as the helpers see it: a C string, cut at the first NUL. */
+    char* value = malloc(size);
+    if (value == NULL) return 0;
+    memcpy(value, data + 2, size - 2);
+    value[size - 2] = '\0';
+
+    switch (data[0] % 5) {
+    case 0: __text_html(value); break;
+    case 1: __text_log(value); break;
+    case 2: __text_clean(value, data[1] & 0x3F); break;
+    case 3: __text_validators(value); break;
+    case 4: {
+        /* Template, subject and group offsets, split where the input says. */
+        const size_t vlen = strlen(value);
+        const size_t cut = vlen > 0 ? data[1] % (vlen + 1) : 0;
+        char* source = strndup(value, cut);
+        const char* rest = value + cut;
+        const size_t half = strlen(rest) / 2;
+        char* subject = strndup(rest, half);
+        if (source != NULL && subject != NULL)
+            __text_template(source, subject, (const uint8_t*)rest + half, strlen(rest) - half);
+        free(source);
+        free(subject);
+        break;
+    }
+    }
+
+    free(value);
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_MAIL_MESSAGE
+
+#include <openssl/evp.h>
+
+#include "mailattachment.h"
+#include "mailmessage.h"
+
+/* A letter as mail_message_build() writes it, read back the way a mail server
+ * and a mail client would. The input supplies every value an application may
+ * pass in -- sender address and name, recipient, subject, HTML body, up to two
+ * attachments with name, type, Content-ID and bytes -- and the letter must:
+ *
+ *   - carry exactly the header fields the builder writes, each once: a value
+ *     that smuggles a CR or LF shows up as a field nobody wrote (or, in the
+ *     addresses, as an SMTP command -- mail.c prints them into MAIL FROM and
+ *     RCPT TO), so an address the builder cannot put safely between < > must
+ *     be refused by the setter;
+ *   - give back, decoded, the sender name, the subject, the body and every
+ *     attachment byte for byte;
+ *   - keep every line within RFC 5322's 998 characters;
+ *   - end in exactly one "\r\n.\r\n", with no line consisting of a lone dot
+ *     anywhere before it (RFC 5321 §4.5.2). */
+
+typedef struct {
+    const uint8_t* p;
+    const uint8_t* end;
+} mm_in_t;
+
+/* A length-prefixed field: one byte of length, then that many bytes. */
+static char* __mm_field(mm_in_t* in, size_t max) {
+    size_t len = in->p < in->end ? *in->p++ : 0;
+    if (len > max) len = max;
+    if (len > (size_t)(in->end - in->p)) len = (size_t)(in->end - in->p);
+    char* s = malloc(len + 1);
+    if (s == NULL) abort();
+    memcpy(s, in->p, len);
+    s[len] = '\0';
+    in->p += len;
+    return s;
+}
+
+/* What can stand between < > in a header and after MAIL FROM: in SMTP. */
+static int __mm_addr_safe(const char* a) {
+    if (*a == '\0' || strchr(a, '@') == NULL) return 0;
+    for (const unsigned char* q = (const unsigned char*)a; *q; q++)
+        if (*q <= 0x20 || *q == 0x7F || *q == '<' || *q == '>') return 0;
+    return 1;
+}
+
+static char* __mm_b64(const char* s) {
+    const size_t n = strlen(s);
+    char* out = malloc(4 * ((n + 2) / 3) + 1);
+    if (out == NULL) abort();
+    EVP_EncodeBlock((unsigned char*)out, (const unsigned char*)s, (int)n);
+    return out;
+}
+
+/* Base64 lines, CRLF between them, back into bytes. -1 when malformed. */
+static long __mm_unb64(const char* text, size_t len, uint8_t** out) {
+    char* joined = malloc(len + 1);
+    if (joined == NULL) abort();
+    size_t j = 0;
+    for (size_t i = 0; i < len; i++)
+        if (text[i] != '\r' && text[i] != '\n') joined[j++] = text[i];
+    joined[j] = '\0';
+    if (j % 4 != 0) { free(joined); return -1; }
+    *out = malloc(j / 4 * 3 + 1);
+    if (*out == NULL) abort();
+    const int n = EVP_DecodeBlock(*out, (const unsigned char*)joined, (int)j);
+    long pad = 0;
+    if (j > 0 && joined[j - 1] == '=') pad++;
+    if (j > 1 && joined[j - 2] == '=') pad++;
+    free(joined);
+    return n < 0 ? -1 : n - pad;
+}
+
+/* Header fields of a block ending at the empty line; folded lines belong to
+ * the field above. Each name must be in `allowed`, at most once. Returns a
+ * pointer past the empty line, NULL (trap) otherwise. `values` receives the
+ * unfolded value per allowed name. */
+static const char* __mm_fields(const char* s, const char* end, const char* const* allowed,
+                               size_t n_allowed, char** values) {
+    for (size_t i = 0; i < n_allowed; i++) values[i] = NULL;
+    size_t current = n_allowed;
+    for (;;) {
+        const char* eol = s;
+        while (eol + 1 < end && !(eol[0] == '\r' && eol[1] == '\n')) {
+            if (*eol == '\r' || *eol == '\n') __builtin_trap();       /* bare CR/LF */
+            eol++;
+        }
+        if (eol + 1 >= end) __builtin_trap();
+        if (eol == s) return eol + 2;                                   /* empty line */
+        if (*s == ' ' || *s == '\t') {                                  /* folded */
+            if (current == n_allowed) __builtin_trap();
+            const size_t old = strlen(values[current]);
+            char* grown = realloc(values[current], old + (size_t)(eol - s) + 1);
+            if (grown == NULL) abort();
+            memcpy(grown + old, s, (size_t)(eol - s));
+            grown[old + (size_t)(eol - s)] = '\0';
+            values[current] = grown;
+        } else {
+            const char* colon = memchr(s, ':', (size_t)(eol - s));
+            if (colon == NULL || colon + 1 >= eol || colon[1] != ' ') __builtin_trap();
+            current = n_allowed;
+            for (size_t i = 0; i < n_allowed; i++)
+                if (strlen(allowed[i]) == (size_t)(colon - s) &&
+                    strncasecmp(allowed[i], s, (size_t)(colon - s)) == 0) current = i;
+            if (current == n_allowed) __builtin_trap();                 /* a field nobody wrote */
+            if (values[current] != NULL) __builtin_trap();              /* twice */
+            values[current] = strndup(colon + 2, (size_t)(eol - colon - 2));
+            if (values[current] == NULL) abort();
+        }
+        s = eol + 2;
+    }
+}
+
+static void __mm_free_values(char** values, size_t n) {
+    for (size_t i = 0; i < n; i++) free(values[i]);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 2) return 0;
+    mm_in_t in = { data, data + size };
+
+    char* from = __mm_field(&in, 80);
+    char* from_name = __mm_field(&in, 255);
+    char* to = __mm_field(&in, 80);
+    char* subject = __mm_field(&in, 255);
+    char* body = __mm_field(&in, 255);
+
+    mail_attachment_t att[2];
+    char *names[2] = { NULL, NULL }, *types[2] = { NULL, NULL }, *cids[2] = { NULL, NULL };
+    uint8_t* bytes[2] = { NULL, NULL };
+    size_t count = in.p < in.end ? *in.p++ % 3 : 0;
+    for (size_t i = 0; i < count; i++) {
+        const uint8_t shape = in.p < in.end ? *in.p++ : 0;
+        names[i] = __mm_field(&in, 120);
+        types[i] = shape & 1 ? __mm_field(&in, 60) : NULL;
+        cids[i] = shape & 2 ? __mm_field(&in, 40) : NULL;
+        char* raw = __mm_field(&in, 255);
+        const size_t n = strlen(raw);
+        bytes[i] = (uint8_t*)raw;
+        att[i] = (mail_attachment_t){ names[i], types[i], cids[i], bytes[i], n };
+    }
+
+    mail_message_t* m = mail_message_create();
+    if (m == NULL) abort();
+
+    const int from_ok = mail_message_set_from(m, from, from_name);
+    const int to_ok = mail_message_set_to(m, to);
+    /* An address the header or the SMTP command cannot hold is refused here. */
+    if (from_ok && !__mm_addr_safe(from)) __builtin_trap();
+    if (to_ok && !__mm_addr_safe(to)) __builtin_trap();
+
+    if (from_ok && to_ok && mail_message_set_subject(m, subject)) {
+        mail_message_set_body(m, body);
+        mail_message_set_attachments(m, count > 0 ? att : NULL, count);
+
+        if (mail_message_build(m, (time_t)1700000000)) {
+            const char* d = m->data;
+            const size_t len = m->data_size;
+
+            /* The terminator, once, and every line within 998. */
+            if (len < 5 || memcmp(d + len - 5, "\r\n.\r\n", 5) != 0) __builtin_trap();
+            for (size_t i = 0, line = 0; i + 1 < len; i++) {
+                if (d[i] == '\r' && d[i + 1] == '\n') {
+                    if (line == 1 && d[i - 1] == '.' && i + 2 < len) __builtin_trap();
+                    line = 0;
+                    i++;
+                    continue;
+                }
+                if (++line > 998) __builtin_trap();
+            }
+
+            static const char* const top[] = {
+                "From", "To", "Subject", "Date", "Message-Id", "MIME-Version",
+                "Content-Type", "Content-Transfer-Encoding",
+            };
+            char* v[8];
+            const char* bodypart = __mm_fields(d, d + len, top, 8, v);
+            for (size_t i = 0; i < 7; i++) if (v[i] == NULL) __builtin_trap();
+
+            char* nb = __mm_b64(from_name);
+            char* sb = __mm_b64(subject);
+            char want[1024];
+            snprintf(want, sizeof want, "=?UTF-8?B?%s?= <%s>", nb, from);
+            if (strcmp(v[0], want) != 0) __builtin_trap();
+            snprintf(want, sizeof want, "<%s>", to);
+            if (strcmp(v[1], want) != 0) __builtin_trap();
+            snprintf(want, sizeof want, "=?UTF-8?B?%s?=", sb);
+            if (strcmp(v[2], want) != 0) __builtin_trap();
+            free(nb);
+            free(sb);
+
+            const char* body_end = d + len - 5;
+            if (count == 0) {
+                uint8_t* dec = NULL;
+                const long n = __mm_unb64(bodypart, (size_t)(body_end - bodypart), &dec);
+                if (n != (long)strlen(body) || memcmp(dec, body, (size_t)n) != 0) __builtin_trap();
+                free(dec);
+            } else {
+                const char* b = strstr(v[6], "boundary=\"");
+                if (b == NULL) __builtin_trap();
+                b += 10;
+                const char* be = strchr(b, '"');
+                if (be == NULL) __builtin_trap();
+                char delim[96];
+                snprintf(delim, sizeof delim, "\r\n--%.*s", (int)(be - b), b);
+
+                /* The first part: the HTML body. Then one per attachment. */
+                const char* s = bodypart;
+                if (strncmp(s, delim + 2, strlen(delim) - 2) != 0) __builtin_trap();
+                s += strlen(delim) - 2;
+                for (size_t part = 0; part <= count; part++) {
+                    if (s[0] != '\r' || s[1] != '\n') __builtin_trap();
+                    static const char* const fields[] = {
+                        "Content-Type", "Content-Transfer-Encoding", "Content-Disposition", "Content-ID",
+                    };
+                    char* pv[4];
+                    const char* content = __mm_fields(s + 2, body_end, fields, 4, pv);
+                    const char* next = strstr(content, delim);
+                    if (next == NULL || next > body_end) __builtin_trap();
+                    uint8_t* dec = NULL;
+                    const long n = __mm_unb64(content, (size_t)(next - content), &dec);
+                    const uint8_t* want_bytes = part == 0 ? (const uint8_t*)body : bytes[part - 1];
+                    const size_t want_len = part == 0 ? strlen(body) : att[part - 1].size;
+                    if (n != (long)want_len || memcmp(dec, want_bytes, want_len) != 0) __builtin_trap();
+                    free(dec);
+                    __mm_free_values(pv, 4);
+                    s = next + strlen(delim);
+                }
+                if (strncmp(s, "--\r\n", 4) != 0) __builtin_trap();
+            }
+            __mm_free_values(v, 8);
+        }
+    }
+
+    mail_message_free(m);
+    for (size_t i = 0; i < 2; i++) { free(names[i]); free(types[i]); free(cids[i]); free(bytes[i]); }
+    free(from); free(from_name); free(to); free(subject); free(body);
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_QUIC_CONN
+
+#include "quic_stand.h"
+#include "quicmemory.h"
+
+/* A whole QUIC connection -- the server's quicconn_t with its real TLS 1.3
+ * handshake, loss recovery, congestion control, streams and connection ids --
+ * against the test client, over the emulated path of tests/quic/quic_stand.h.
+ * The unit tests script that stand one scenario at a time; here the input is
+ * the script: the path's delay, loss in each direction, duplication,
+ * reordering and bottleneck, then a sequence of events -- time passing, the
+ * client opening, writing, resetting and stopping streams, pinging, changing
+ * address, updating keys, challenging the path, closing; the server answering;
+ * bursts of loss and blackouts.
+ *
+ * Every byte either side reads is checked against the pattern the other side
+ * wrote, and a finished stream must have delivered exactly what was sent. The
+ * stand must never spin without its clock moving. At the end the path goes
+ * dark, and a connection that is still there after its idle timeout is one
+ * that will never go; once everything is freed the QUIC memory budget must be
+ * back where it started. */
+
+#define QC_STREAMS 8
+
+static uint8_t __qc_client_byte(size_t k, uint64_t i) { return (uint8_t)(i * 7 + k * 13 + 1); }
+static uint8_t __qc_server_byte(size_t k, uint64_t i) { return (uint8_t)(i * 31 + (i >> 8) + k); }
+
+typedef struct {
+    int opened, fin_sent, reset;
+    uint64_t sent;                  /* client -> server */
+    uint64_t server_got;            /* read by the server, checked */
+    int responded;
+    uint64_t response_len;          /* server -> client, when responded */
+    uint64_t client_got;            /* read by the client, checked */
+} qc_stream_t;
+
+/* The stand's own guard, but as a finding: events that keep coming while the
+ * clock stands still are a spin in the code under test. */
+static void __qc_run(stand_t* s, uint64_t horizon_us) {
+    const uint64_t limit = __now_us + horizon_us;
+    uint64_t last = __now_us;
+    unsigned still = 0;
+    for (;;) {
+        if (s->client_failed) return;
+        if (!__step(s, limit)) return;
+        if (__now_us == last) {
+            if (++still > 200000) __builtin_trap();
+        } else {
+            last = __now_us;
+            still = 0;
+        }
+    }
+}
+
+static void __qc_client_read(stand_t* s, qc_stream_t* st) {
+    for (size_t k = 0; k < QC_STREAMS; k++) {
+        if (!st[k].opened) continue;
+        uint8_t buf[4096];
+        for (;;) {
+            const size_t ready = quicclient_stream_readable(&s->client, 4 * k);
+            if (ready == 0) break;
+            const size_t n = quicclient_stream_read(&s->client, 4 * k, buf,
+                                                    ready < sizeof buf ? ready : sizeof buf);
+            if (n == 0) break;
+            for (size_t i = 0; i < n; i++)
+                if (buf[i] != __qc_server_byte(k, st[k].client_got + i)) __builtin_trap();
+            st[k].client_got += n;
+            if (st[k].responded && st[k].client_got > st[k].response_len) __builtin_trap();
+        }
+        /* The FIN means everything that was written has arrived. */
+        if (quicclient_stream_fin(&s->client, 4 * k) && st[k].responded &&
+            st[k].client_got != st[k].response_len) __builtin_trap();
+    }
+    (void)quicclient_flush(&s->client);
+}
+
+static void __qc_serve(stand_t* s, qc_stream_t* st, size_t k, uint64_t len, int fin) {
+    if (s->conn == NULL || !st[k].opened) return;
+    quicstream_t* qs = quicconn_stream_find(s->conn, 4 * k);
+    if (qs == NULL) return;
+
+    connection_s_lock(&s->conn->conn, LOCK_SITE_QUIC_SEND);
+    uint8_t buf[512];
+    size_t taken = 0;
+    for (;;) {
+        const size_t n = quicstream_read(qs, buf, sizeof buf);
+        if (n == 0) break;
+        for (size_t i = 0; i < n; i++)
+            if (buf[i] != __qc_client_byte(k, st[k].server_got + i)) __builtin_trap();
+        st[k].server_got += n;
+        taken += n;
+    }
+    if (st[k].server_got > st[k].sent) __builtin_trap();
+    if (taken > 0) quicconn_consumed(s->conn, taken);
+
+    int wrote = 0;
+    if (!st[k].responded && quicstream_can_send(4 * k) &&
+        qs->send_state == QUIC_SEND_READY) {
+        uint8_t* body = malloc(len + 1);
+        if (body != NULL) {
+            for (uint64_t i = 0; i < len; i++) body[i] = __qc_server_byte(k, i);
+            if (quicstream_write(qs, body, len)) {
+                if (fin) {
+                    quicstream_finish(qs);
+                    st[k].responded = 1;
+                    st[k].response_len = len;
+                }
+                wrote = 1;
+            }
+            free(body);
+        }
+    }
+    connection_s_unlock(&s->conn->conn);
+    if (wrote) quicconn_want_write(&s->conn->conn);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 8) return 0;
+
+    const size_t budget_before = quicmemory_current();
+
+    stand_t* s = __stand_create_version(data[0] | 1, data[1] & 1 ? QUIC_VERSION_2 : QUIC_VERSION_1);
+    if (s == NULL) return 0;
+
+    s->trace = getenv("FUZZ_TRACE") != NULL;
+    s->delay_us = 1000 + (uint64_t)(data[2] % 50) * 1000;
+    s->loss_to_server_pct = data[3] % 4 == 0 ? data[3] % 30 : 0;
+    s->loss_to_client_pct = data[4] % 4 == 0 ? data[4] % 30 : 0;
+    s->dup_pct = data[5] % 8 == 0 ? data[5] % 20 : 0;
+    s->reorder_pct = data[6] % 8 == 0 ? data[6] % 30 : 0;
+    if (data[7] % 8 == 0) {
+        s->bandwidth_bps = 1000000 * (1 + data[7] % 20);
+        s->queue_pkts = 5 + data[7] % 30;
+    }
+
+    qc_stream_t st[QC_STREAMS];
+    memset(st, 0, sizeof st);
+
+    if (!__start(s)) { __stand_free(s); return 0; }
+
+    const uint8_t* p = data + 8;
+    const uint8_t* end = data + size;
+    int closed = 0;
+    while (p < end && !s->client_failed && !closed) {
+        const uint8_t op = *p++;
+        const uint8_t arg = p < end ? *p++ : 0;
+        const size_t k = arg % QC_STREAMS;
+
+        switch (op % 13) {
+        case 0:
+            __qc_run(s, 1000 + (uint64_t)arg * 2000);
+            break;
+        case 1: {                                   /* the client writes */
+            if (!s->client.handshake_complete || st[k].fin_sent || st[k].reset) break;
+            const size_t n = (size_t)arg * 37 % 4000;
+            uint8_t* buf = malloc(n + 1);
+            if (buf == NULL) break;
+            for (size_t i = 0; i < n; i++) buf[i] = __qc_client_byte(k, st[k].sent + i);
+            const int fin = (arg & 0x80) != 0;
+            if (quicclient_stream_write(&s->client, 4 * k, buf, n, fin)) {
+                st[k].opened = 1;
+                st[k].sent += n;
+                if (fin) st[k].fin_sent = 1;
+            }
+            free(buf);
+            (void)quicclient_flush(&s->client);
+            break;
+        }
+        case 2:                                     /* the server answers */
+            __qc_serve(s, st, k, (uint64_t)arg * 131 % 70000, (arg & 1) == 0);
+            break;
+        case 3:
+            __qc_client_read(s, st);
+            break;
+        case 4:
+            if (st[k].opened && !st[k].reset && quicclient_reset_stream(&s->client, 4 * k, arg)) {
+                st[k].reset = 1;
+                st[k].responded = 0;        /* whatever was answered may not all arrive */
+            }
+            break;
+        case 5:
+            if (st[k].opened && quicclient_stop_sending(&s->client, 4 * k, arg))
+                st[k].responded = 0;        /* the server stops; the FIN may never come */
+            break;
+        case 6: (void)quicclient_ping(&s->client); break;
+        case 7:
+            if (s->client.handshake_complete && quicclient_rebind(&s->client)) {
+                /* The stand moves the client's address the way a NAT would. */
+                struct sockaddr_in* in = (struct sockaddr_in*)&s->client_path.remote;
+                in->sin_port = htons((uint16_t)(ntohs(in->sin_port) + 1));
+            }
+            break;
+        case 8: if (s->client.handshake_complete) (void)quicclient_key_update(&s->client); break;
+        case 9: if (s->client.handshake_complete) (void)quicclient_path_challenge(&s->client); break;
+        case 10:
+            if (arg & 1) s->drop_next_to_server = arg % 5;
+            else s->drop_next_to_client = arg % 5;
+            break;
+        case 11:
+            s->blackhole_to_server = (arg & 1) != 0;
+            s->blackhole_to_client = (arg & 2) != 0;
+            __qc_run(s, 1000 + (uint64_t)(arg >> 2) * 5000);
+            s->blackhole_to_server = s->blackhole_to_client = 0;
+            break;
+        case 12:
+            if (arg % 4 == 0) {
+                (void)quicclient_close(&s->client, arg, arg & 1);
+                closed = 1;
+            }
+            break;
+        }
+        (void)quicclient_flush(&s->client);
+        __qc_run(s, 2000);
+    }
+
+    /* Quiet path, then everything readable is read and checked. */
+    __qc_run(s, 3000000);
+    __qc_client_read(s, st);
+
+    /* Then the path goes dark: past the idle timeout nothing may be left. */
+    s->blackhole_to_server = s->blackhole_to_client = 1;
+    __qc_run(s, 400000000);
+    if (s->conn != NULL) __builtin_trap();
+
+    __stand_free(s);
+
+    if (quicmemory_current() != budget_before) __builtin_trap();
     return 0;
 }
 

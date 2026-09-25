@@ -652,6 +652,17 @@ gcov -b -o build-cov/core/protocols/http/server/parsers/CMakeFiles/*.dir \
 Delete the `.gcda` files before each run or the counters accumulate across
 targets, and a number measured that way says nothing about any one of them.
 
+For the whole core at once, build every target in that tree and run
+`tests/fuzz/coverage.sh build-cov [OUTPUT_DIR]`: it resets the counters, runs
+the targets through `run.sh` (30 s each by default, `FUZZ_SECONDS` to change
+it; a corpus left in `OUTPUT_DIR` by an earlier run is replayed first) and
+writes line coverage per file and per directory, largest gap first. That table
+is what says which code no target reaches — the question a per-target edge
+count cannot answer. The first such measurement, with the corpora of a
+ten-minute run: 23,8% of the core's 42 010 lines, with `quicconn.c`, the
+HTTP/3 session, the QUIC loss and congestion code, mail building and the
+WebSocket server handlers at or near zero.
+
 At a minute a target with dictionaries, the parsers sit at 80–91% of lines.
 Worth reading per function rather than per file: `hpack` looked like 60% until
 the encoder half was accounted for, and the encoder was not 60% covered — it

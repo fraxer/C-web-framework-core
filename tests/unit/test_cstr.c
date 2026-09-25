@@ -62,6 +62,27 @@ TEST(test_cstr_strip_control_removes_rlo) {
     free(buffer);
 }
 
+TEST(test_cstr_strip_control_leaves_no_glued_controls) {
+    TEST_CASE("Stripping cannot glue broken bytes into a new control character");
+
+    /* C2 [04 08] 80: with the controls between them gone, the stray C2 and 80
+     * would meet as U+0080 -- a C1 control in a string just cleaned of them,
+     * which a second pass then removes. E2 [01] 80 [02] 8B does the same with
+     * a zero-width space. Found by fuzz_text; the bytes that belong to no
+     * sequence go with the controls, since what they would form cannot be
+     * known until their neighbours are gone. */
+    char* buffer = dup_str("a\xC2\x04\x08\x80z b\xE2\x01\x80\x02\x8Bz");
+    char* stripped = cstr_strip_control(buffer);
+
+    TEST_ASSERT_STR_EQUAL("az bz", stripped, "no C1 or invisible character is formed");
+    free(buffer);
+
+    buffer = dup_str("Иван\x9BПетров");
+    stripped = cstr_strip_control(buffer);
+    TEST_ASSERT_STR_EQUAL("ИванПетров", stripped, "a lone byte goes, whole letters stay");
+    free(buffer);
+}
+
 TEST(test_cstr_strip_newlines_blocks_header_injection) {
     TEST_CASE("A CRLF run becomes a single space");
 

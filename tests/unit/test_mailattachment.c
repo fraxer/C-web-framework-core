@@ -211,6 +211,35 @@ TEST(test_mailattachment_part_build_rejects_bad_cid) {
     TEST_ASSERT_NULL(part.data, "часть не собрана");
 }
 
+TEST(test_mailattachment_part_build_rejects_bad_content_type) {
+    TEST_SUITE("mailattachment");
+    TEST_CASE("content_type с управляющими символами отклоняет часть");
+
+    /* Тип печатается в заголовок части как есть: CR/LF в нём начинал новый
+     * заголовок. Найдено fuzz_mail_message. Параметры через ";" остаются
+     * законными. */
+    mail_test_mimetype_setup();
+
+    const mail_attachment_t injected = {
+        .filename = "a.txt", .content_type = "text/plain\r\nX-Evil: 1", .data = "x", .size = 1
+    };
+    mail_attachment_part_t part = mailattachment_part_build(&injected, "=_b1");
+    TEST_ASSERT_NULL(part.data, "CRLF в типе отклонён");
+
+    const mail_attachment_t tab = {
+        .filename = "a.txt", .content_type = "text/plain\t", .data = "x", .size = 1
+    };
+    part = mailattachment_part_build(&tab, "=_b1");
+    TEST_ASSERT_NULL(part.data, "управляющий символ в типе отклонён");
+
+    const mail_attachment_t params = {
+        .filename = "a.txt", .content_type = "text/plain; charset=utf-8", .data = "x", .size = 1
+    };
+    part = mailattachment_part_build(&params, "=_b1");
+    TEST_ASSERT_NOT_NULL(part.data, "тип с параметром собран");
+    mail_attachment_part_free(&part);
+}
+
 TEST(test_mailattachment_part_build_guards) {
     TEST_SUITE("mailattachment");
     TEST_CASE("пустое вложение и NULL отклоняются на входе");

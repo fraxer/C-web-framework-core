@@ -362,6 +362,33 @@ TEST(test_range_header_non_2xx_passthrough) {
     fixture_teardown(&fx);
 }
 
+TEST(test_range_header_non_get_method_passthrough) {
+    TEST_SUITE("http_range_filter: header passthrough");
+    TEST_CASE("Range is ignored on a method range handling is not defined for");
+
+    /* RFC 9110 §14.2: GET is the only method range handling is defined for,
+     * and a server MUST ignore Range on any other. HEAD stays with GET, whose
+     * header fields it mirrors (§9.3.2). Found by fuzz_h1_connection: a POST
+     * to a static file with "Range: bytes=0-" came back 416. */
+    static const int methods[] = { ROUTE_POST, ROUTE_PUT, ROUTE_PATCH, ROUTE_DELETE, ROUTE_OPTIONS };
+    for (size_t i = 0; i < sizeof methods / sizeof methods[0]; i++) {
+        range_fixture_t fx;
+        TEST_REQUIRE(fixture_setup(&fx, 64), "fixture should be created");
+
+        fx.request->method = methods[i];
+        TEST_REQUIRE_NOT_NULL(add_range(fx.request, 0, 9), "range should be set");
+
+        const int r = run_header(&fx);
+        TEST_ASSERT_EQUAL(CWF_OK, r, "header chain should finish with CWF_OK");
+        TEST_ASSERT_EQUAL(200, fx.response->status_code, "status should stay 200");
+        TEST_ASSERT_EQUAL_UINT(0, fx.response->range, "range flag should stay 0");
+        TEST_ASSERT_NULL(fx.response->get_header(fx.response, "Content-Range"),
+                         "no Content-Range outside GET and HEAD");
+
+        fixture_teardown(&fx);
+    }
+}
+
 TEST(test_range_header_last_modified_passthrough) {
     TEST_SUITE("http_range_filter: header passthrough");
     TEST_CASE("a 304 (last_modified) response skips range framing");
