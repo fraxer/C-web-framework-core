@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <time.h>
 
@@ -67,28 +68,57 @@ static int __mailmessage_address_safe(const char* email) {
     return 1;
 }
 
+/* RFC 2047: each encoded-word is self-contained and at most 75 characters.
+ * 39 source bytes leave room for "Subject: " on the first line. Keep valid
+ * UTF-8 characters together; arbitrary invalid byte strings still make
+ * progress and retain their bytes. All storage is on the heap. */
+static char* __mailmessage_encoded_words(const char* text) {
+    const size_t len = strlen(text);
+    if (len > (SIZE_MAX - 16) / 3) return NULL;
+    char* out = malloc(len * 3 + 16);
+    if (out == NULL) return NULL;
+
+    size_t pos = 0, off = 0;
+    do {
+        size_t n = len - off < 39 ? len - off : 39;
+        if (off + n < len) {
+            const size_t original = n;
+            while (n > original - 3 && ((unsigned char)text[off + n] & 0xC0) == 0x80) n--;
+            if (((unsigned char)text[off + n] & 0xC0) == 0x80) n = original;
+        }
+        if (off != 0) { memcpy(out + pos, "\r\n ", 3); pos += 3; }
+        memcpy(out + pos, "=?UTF-8?B?", 10); pos += 10;
+        pos += (size_t)base64_encode(out + pos, text + off, (int)n);
+        memcpy(out + pos, "?=", 2); pos += 2;
+        off += n;
+    } while (off < len);
+    out[pos] = '\0';
+    return out;
+}
+
 int mail_message_set_from(mail_message_t* message, const char* email, const char* sender_name) {
     if (message == NULL) return 0;
     if (!__mailmessage_address_safe(email)) return 0;
     if (sender_name == NULL) return 0;
 
-    /* On the heap: the name is the caller's and may be megabytes long, and a
-     * VLA of its base64 took the stack with it. */
-    size_t sender_name_length = strlen(sender_name);
-    char* encoded_sender_name = malloc(base64_encode_len(sender_name_length));
+    char* encoded_sender_name = __mailmessage_encoded_words(sender_name);
     if (encoded_sender_name == NULL) return 0;
-    size_t encoded_sender_name_length = base64_encode(encoded_sender_name, sender_name, sender_name_length);
+    const size_t encoded_sender_name_length = strlen(encoded_sender_name);
 
     const size_t email_length = strlen(email);
-    const char* template = "=?UTF-8?B?%s?= <%s>";
-    message->from_with_name.length = strlen(template) - 4 + encoded_sender_name_length + email_length;
+    const char* last = strrchr(encoded_sender_name, '\n');
+    const size_t last_line = last != NULL ? strlen(last + 1) : 6 + encoded_sender_name_length;
+    const char* separator = last_line + email_length + 3 > 76 ? "\r\n " : " ";
+    const char* template = "%s%s<%s>";
+    message->from_with_name.length = encoded_sender_name_length + strlen(separator) + email_length + 2;
     message->from_with_name.value = malloc(message->from_with_name.length + 1);
     if (message->from_with_name.value == NULL) {
         free(encoded_sender_name);
         return 0;
     }
 
-    message->from_with_name.length = snprintf(message->from_with_name.value, message->from_with_name.length + 1, template, encoded_sender_name, email);
+    message->from_with_name.length = snprintf(message->from_with_name.value, message->from_with_name.length + 1,
+                                            template, encoded_sender_name, separator, email);
     free(encoded_sender_name);
     if (message->from_with_name.length <= 0) return 0;
 
@@ -126,24 +156,10 @@ int mail_message_set_subject(mail_message_t* message, const char* subject) {
     if (message == NULL) return 0;
     if (subject == NULL) return 0;
 
-    /* On the heap, as in set_from: a subject taken from a form may be as long
-     * as the request body limit allows. */
-    size_t subject_length = strlen(subject);
-    char* encoded_subject = malloc(base64_encode_len(subject_length));
+    char* encoded_subject = __mailmessage_encoded_words(subject);
     if (encoded_subject == NULL) return 0;
-    const size_t encoded_subject_length = base64_encode(encoded_subject, subject, subject_length);
-
-    const char* template = "=?UTF-8?B?%s?=";
-    message->subject.length = strlen(template) - 2 + encoded_subject_length;
-    message->subject.value = malloc(message->subject.length + 1);
-    if (message->subject.value == NULL) {
-        free(encoded_subject);
-        return 0;
-    }
-
-    message->subject.length = snprintf(message->subject.value, message->subject.length + 1, template, encoded_subject);
-    free(encoded_subject);
-    if (message->subject.length <= 0) return 0;
+    message->subject.value = encoded_subject;
+    message->subject.length = strlen(encoded_subject);
 
     return 1;
 }

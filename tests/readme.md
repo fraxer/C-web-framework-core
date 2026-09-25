@@ -475,10 +475,21 @@ Targets, each with a seed corpus under `fuzz/corpus/`:
 | `http_response` | the HTTP/1.1 client reading a server's response: Content-Length, chunked, gzip |
 | `smtp_response` | the SMTP client reading replies, and the EHLO capabilities it trusts |
 | `jwt` | HS256 tokens: acceptance, tampering, algorithm substitution, expiry |
+| `mail_message` | MIME headers, folded encoded words, body and binary attachments, decoded back to their input |
 
 An application registers its own with the same function, and `run.sh` picks
 them up from the manifest; the site's `fuzz_feedback` (in `backend/tests/`) is
 one.
+
+`mail_message` keeps its original format: five length-prefixed fields (sender
+address, sender name, recipient, subject, body), then an attachment count modulo
+3. Each attachment has a shape byte (bit 0: content type, bit 1: Content-ID),
+filename, optional type and ID, and binary data. Lengths are one byte. A leading
+`0xff` selects three-byte little-endian lengths for every field; name, subject,
+body and attachment data can then use the full input budget. Attachments use
+their explicit byte length, including NUL. Text fields use C-string semantics.
+Addresses remain capped at 80 bytes and attachment metadata at 120/60/40 bytes.
+The corpus includes both formats, large fields and binary data with NUL bytes.
 
 ### What the targets check
 
@@ -611,6 +622,14 @@ takes `-seconds=`, `-runs=`, `-seed=`, `-artifacts=<dir>`, `-dict=<file>`,
 `-timeout=<s>` and `-max_len=<bytes>` (at most 1 MiB), and a file instead of
 a directory to replay one input. A trap, an abort, a UBSan report or an input
 running past `-timeout` all save the input first.
+
+GCC builds also provide `fuzz_driver_tests`, registered with CTest. It checks
+that duplication preserves the input suffix, initializes every added byte and
+respects the buffer capacity, regardless of the previous buffer contents:
+
+```bash
+ctest --test-dir build-fuzz -R '^fuzz_driver_tests$' --output-on-failure
+```
 
 ### Dictionaries
 

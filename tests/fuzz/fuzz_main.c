@@ -321,7 +321,7 @@ static size_t __mutate(uint8_t* buf, size_t len, size_t cap) {
             const size_t n = 1 + __rnd_below(len / 2);
             const size_t at = __rnd_below(len - n);
             const size_t room = cap - len < n ? cap - len : n;
-            memmove(buf + at + room, buf + at, len - at - room);
+            memmove(buf + at + room, buf + at, len - at);
             len += room;
         }
         break;

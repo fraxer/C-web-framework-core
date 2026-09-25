@@ -219,6 +219,11 @@ endif()
 # fuzz_main.c supplies the loop and gcc's `-fsanitize-coverage=trace-pc` supplies
 # the feedback. The target files do not know the difference.
 if(BUILD_FUZZERS STREQUAL "yes")
+    if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND NOT DEFINED ENV{LIB_FUZZING_ENGINE})
+        add_executable(fuzz_driver_tests fuzz/test_driver.c)
+        target_compile_options(fuzz_driver_tests PRIVATE -fno-sanitize-coverage=trace-pc)
+        add_test(NAME fuzz_driver_tests COMMAND fuzz_driver_tests)
+    endif()
     # Two groups. The HTTP/1.1 parsers, HPACK and Huffman need nothing beyond
     # the framework, and gating them on INCLUDE_HTTP3 -- as this block used to
     # -- kept them out of any build without the HTTP/3 stack, including the

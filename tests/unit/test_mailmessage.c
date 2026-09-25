@@ -13,6 +13,7 @@
 #include "base64.h"
 #include "mailattachment.h"
 #include "mailmessage.h"
+#include "validation.h"
 
 /* env() runner'а — calloc'd appconfig; выставляем только то, что читает сборка */
 static void mailmessage_test_env(const char* host) {
@@ -25,6 +26,64 @@ static void mailmessage_test_fixed_clock(void) {
     setenv("TZ", "UTC", 1);
     tzset();
     setlocale(LC_ALL, "C");
+}
+
+/* Independent decoder: every folded word must contain complete UTF-8
+ * characters, and concatenating their decoded bytes must preserve the value. */
+static int mail_test_words_equal(const char* words, const char* expected) {
+    size_t left = strlen(expected);
+    do {
+        if (strncmp(words, "=?UTF-8?B?", 10) != 0) return 0;
+        const char* end = strstr(words + 10, "?=");
+        if (end == NULL || end + 2 - words > 75) return 0;
+        const size_t len = (size_t)(end - words - 10);
+        if (len % 4 != 0) return 0;
+        unsigned char decoded[64];
+        int n = EVP_DecodeBlock(decoded, (const unsigned char*)words + 10, (int)len);
+        if (n < 0) return 0;
+        if (len > 0 && end[-1] == '=') n--;
+        if (len > 1 && end[-2] == '=') n--;
+        if (n < 0 || (size_t)n > left || memcmp(decoded, expected, (size_t)n) != 0) return 0;
+        decoded[n] = 0;
+        if (!validate_utf8((const char*)decoded)) return 0;
+        left -= (size_t)n;
+        expected += n;
+        words = end + 2;
+        if (strncmp(words, "\r\n ", 3) == 0) words += 3;
+    } while (strncmp(words, "=?UTF-8?B?", 10) == 0);
+    return left == 0;
+}
+
+TEST(test_mailmessage_folded_utf8_headers) {
+    TEST_SUITE("mailmessage");
+    TEST_CASE("large names and subjects preserve UTF-8 across folded encoded words");
+    mailmessage_test_env("example.com");
+    const char sample[] = "абв😀";
+    char text[(sizeof sample - 1) * 512 + 1];
+    for (size_t i = 0; i < 512; i++)
+        memcpy(text + i * (sizeof sample - 1), sample, sizeof sample - 1);
+    text[sizeof text - 1] = '\0';
+
+    mail_message_t* m = mail_message_create();
+    TEST_REQUIRE_NOT_NULL(m, "message");
+    TEST_REQUIRE(mail_message_set_from(m, "alice@example.com", text), "large name");
+    TEST_REQUIRE(mail_message_set_to(m, "bob@example.org"), "recipient");
+    TEST_REQUIRE(mail_message_set_subject(m, text), "large subject");
+    TEST_ASSERT(mail_test_words_equal(m->from_with_name.value, text), "complete UTF-8 words in name");
+    TEST_ASSERT(mail_test_words_equal(m->subject.value, text), "complete UTF-8 words in subject");
+    mail_message_set_body(m, "body");
+    TEST_REQUIRE(mail_message_build(m, (time_t)1700000000), "large headers build");
+    size_t line = 0;
+    for (size_t i = 0; i + 1 < m->data_size; i++) {
+        if (m->data[i] == '\r' && m->data[i + 1] == '\n') {
+            TEST_ASSERT(line <= 76, "folded header and body lines fit 76 columns");
+            line = 0;
+            i++;
+        } else {
+            line++;
+        }
+    }
+    mail_message_free(m);
 }
 
 TEST(test_mailmessage_build_golden_no_attachments) {

@@ -1197,29 +1197,31 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     qpack_decoder_t* d = qpack_decoder_create(0, 0);
     if (d == NULL) return 0;
 
-    size_t pos = 1;
-    while (pos < size) {
-        const size_t chunk = size - pos < step ? size - pos : step;
+    size_t pos = 1, offered = 1;
+    while (offered < size) {
+        offered += size - offered < step ? size - offered : step;
         size_t consumed = 0;
 
-        if (qpack_decoder_read_encoder(d, data + pos, chunk, &consumed) != QPACK_OK)
+        if (qpack_decoder_read_encoder(d, data + pos, offered - pos, &consumed) != QPACK_OK)
             break;
 
-        if (consumed == 0) break;   /* needs more bytes than this chunk holds */
+        /* The reader retains no partial instruction. Offer its unread tail
+         * again together with the next chunk, just as h3session does. */
+        if (consumed > offered - pos) __builtin_trap();
         pos += consumed;
     }
 
     qpack_decoder_free(d);
 
-    pos = 1;
-    while (pos < size) {
-        const size_t chunk = size - pos < step ? size - pos : step;
+    pos = offered = 1;
+    while (offered < size) {
+        offered += size - offered < step ? size - offered : step;
         size_t consumed = 0;
 
-        if (qpack_encoder_read_decoder(data + pos, chunk, &consumed) != QPACK_OK)
+        if (qpack_encoder_read_decoder(data + pos, offered - pos, &consumed) != QPACK_OK)
             break;
 
-        if (consumed == 0) break;
+        if (consumed > offered - pos) __builtin_trap();
         pos += consumed;
     }
 
@@ -4053,11 +4055,16 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 typedef struct {
     const uint8_t* p;
     const uint8_t* end;
+    int wide;
 } mm_in_t;
 
-/* A length-prefixed field: one byte of length, then that many bytes. */
-static char* __mm_field(mm_in_t* in, size_t max) {
-    size_t len = in->p < in->end ? *in->p++ : 0;
+/* Legacy inputs use one byte of length. A leading 0xff selects three-byte
+ * little-endian lengths, so large-profile inputs can reach large fields.
+ * Binary fields retain their length even when they contain NUL bytes. */
+static char* __mm_field(mm_in_t* in, size_t max, size_t* length) {
+    size_t len = 0;
+    for (unsigned i = 0; i < (in->wide ? 3u : 1u) && in->p < in->end; i++)
+        len |= (size_t)*in->p++ << (8 * i);
     if (len > max) len = max;
     if (len > (size_t)(in->end - in->p)) len = (size_t)(in->end - in->p);
     char* s = malloc(len + 1);
@@ -4065,6 +4072,7 @@ static char* __mm_field(mm_in_t* in, size_t max) {
     memcpy(s, in->p, len);
     s[len] = '\0';
     in->p += len;
+    if (length != NULL) *length = len;
     return s;
 }
 
@@ -4074,14 +4082,6 @@ static int __mm_addr_safe(const char* a) {
     for (const unsigned char* q = (const unsigned char*)a; *q; q++)
         if (*q <= 0x20 || *q == 0x7F || *q == '<' || *q == '>') return 0;
     return 1;
-}
-
-static char* __mm_b64(const char* s) {
-    const size_t n = strlen(s);
-    char* out = malloc(4 * ((n + 2) / 3) + 1);
-    if (out == NULL) abort();
-    EVP_EncodeBlock((unsigned char*)out, (const unsigned char*)s, (int)n);
-    return out;
 }
 
 /* Base64 lines, CRLF between them, back into bytes. -1 when malformed. */
@@ -4103,12 +4103,44 @@ static long __mm_unb64(const char* text, size_t len, uint8_t** out) {
     return n < 0 ? -1 : n - pad;
 }
 
+/* Decode adjacent RFC 2047 words independently of the builder's choice of
+ * folding positions. Whitespace between words is not part of the value.
+ * Return the suffix (the framed address for From, nothing for Subject). */
+static const char* __mm_words(const char* s, const char* want) {
+    size_t left = strlen(want);
+    for (;;) {
+        if (strncmp(s, "=?UTF-8?B?", 10) != 0) __builtin_trap();
+        const char* end = strstr(s + 10, "?=");
+        if (end == NULL || end + 2 - s > 75) __builtin_trap();
+        const size_t len = (size_t)(end - s - 10);
+        if (len % 4 != 0) __builtin_trap();
+        unsigned char decoded[64];
+        int n = EVP_DecodeBlock(decoded, (const unsigned char*)s + 10, (int)len);
+        if (n < 0) __builtin_trap();
+        if (len > 0 && end[-1] == '=') n--;
+        if (len > 1 && end[-2] == '=') n--;
+        if (n < 0 || (size_t)n > left || memcmp(decoded, want, (size_t)n) != 0) __builtin_trap();
+        want += n;
+        left -= (size_t)n;
+        const char* next = end + 2;
+        while (*next == ' ' || *next == '\t') next++;
+        if (next != end + 2 && strncmp(next, "=?UTF-8?B?", 10) == 0) {
+            s = next;
+            continue;
+        }
+        if (left != 0) __builtin_trap();
+        return end + 2;
+    }
+}
+
 /* Header fields of a block ending at the empty line; folded lines belong to
  * the field above. Each name must be in `allowed`, at most once. Returns a
  * pointer past the empty line, NULL (trap) otherwise. `values` receives the
  * unfolded value per allowed name. */
 static const char* __mm_fields(const char* s, const char* end, const char* const* allowed,
                                size_t n_allowed, char** values) {
+    size_t lengths[8] = { 0 }, capacities[8] = { 0 };
+    if (n_allowed > 8) __builtin_trap();
     for (size_t i = 0; i < n_allowed; i++) values[i] = NULL;
     size_t current = n_allowed;
     for (;;) {
@@ -4121,12 +4153,19 @@ static const char* __mm_fields(const char* s, const char* end, const char* const
         if (eol == s) return eol + 2;                                   /* empty line */
         if (*s == ' ' || *s == '\t') {                                  /* folded */
             if (current == n_allowed) __builtin_trap();
-            const size_t old = strlen(values[current]);
-            char* grown = realloc(values[current], old + (size_t)(eol - s) + 1);
-            if (grown == NULL) abort();
-            memcpy(grown + old, s, (size_t)(eol - s));
-            grown[old + (size_t)(eol - s)] = '\0';
-            values[current] = grown;
+            const size_t old = lengths[current];
+            const size_t len = old + (size_t)(eol - s);
+            if (len + 1 > capacities[current]) {
+                size_t cap = capacities[current];
+                while (cap < len + 1) cap *= 2;
+                char* grown = realloc(values[current], cap);
+                if (grown == NULL) abort();
+                values[current] = grown;
+                capacities[current] = cap;
+            }
+            memcpy(values[current] + old, s, (size_t)(eol - s));
+            values[current][len] = '\0';
+            lengths[current] = len;
         } else {
             const char* colon = memchr(s, ':', (size_t)(eol - s));
             if (colon == NULL || colon + 1 >= eol || colon[1] != ' ') __builtin_trap();
@@ -4138,6 +4177,8 @@ static const char* __mm_fields(const char* s, const char* end, const char* const
             if (values[current] != NULL) __builtin_trap();              /* twice */
             values[current] = strndup(colon + 2, (size_t)(eol - colon - 2));
             if (values[current] == NULL) abort();
+            lengths[current] = (size_t)(eol - colon - 2);
+            capacities[current] = lengths[current] + 1;
         }
         s = eol + 2;
     }
@@ -4149,13 +4190,14 @@ static void __mm_free_values(char** values, size_t n) {
 
 int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     if (size < 2) return 0;
-    mm_in_t in = { data, data + size };
+    mm_in_t in = { .p = data, .end = data + size, .wide = data[0] == 0xff };
+    if (in.wide) in.p++;
 
-    char* from = __mm_field(&in, 80);
-    char* from_name = __mm_field(&in, 255);
-    char* to = __mm_field(&in, 80);
-    char* subject = __mm_field(&in, 255);
-    char* body = __mm_field(&in, 255);
+    char* from = __mm_field(&in, 80, NULL);
+    char* from_name = __mm_field(&in, SIZE_MAX, NULL);
+    char* to = __mm_field(&in, 80, NULL);
+    char* subject = __mm_field(&in, SIZE_MAX, NULL);
+    char* body = __mm_field(&in, SIZE_MAX, NULL);
 
     mail_attachment_t att[2];
     char *names[2] = { NULL, NULL }, *types[2] = { NULL, NULL }, *cids[2] = { NULL, NULL };
@@ -4163,11 +4205,11 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     size_t count = in.p < in.end ? *in.p++ % 3 : 0;
     for (size_t i = 0; i < count; i++) {
         const uint8_t shape = in.p < in.end ? *in.p++ : 0;
-        names[i] = __mm_field(&in, 120);
-        types[i] = shape & 1 ? __mm_field(&in, 60) : NULL;
-        cids[i] = shape & 2 ? __mm_field(&in, 40) : NULL;
-        char* raw = __mm_field(&in, 255);
-        const size_t n = strlen(raw);
+        names[i] = __mm_field(&in, 120, NULL);
+        types[i] = shape & 1 ? __mm_field(&in, 60, NULL) : NULL;
+        cids[i] = shape & 2 ? __mm_field(&in, 40, NULL) : NULL;
+        size_t n = 0;
+        char* raw = __mm_field(&in, SIZE_MAX, &n);
         bytes[i] = (uint8_t*)raw;
         att[i] = (mail_attachment_t){ names[i], types[i], cids[i], bytes[i], n };
     }
@@ -4209,17 +4251,12 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             const char* bodypart = __mm_fields(d, d + len, top, 8, v);
             for (size_t i = 0; i < 7; i++) if (v[i] == NULL) __builtin_trap();
 
-            char* nb = __mm_b64(from_name);
-            char* sb = __mm_b64(subject);
-            char want[1024];
-            snprintf(want, sizeof want, "=?UTF-8?B?%s?= <%s>", nb, from);
-            if (strcmp(v[0], want) != 0) __builtin_trap();
+            char want[128];
+            snprintf(want, sizeof want, " <%s>", from);
+            if (strcmp(__mm_words(v[0], from_name), want) != 0) __builtin_trap();
             snprintf(want, sizeof want, "<%s>", to);
             if (strcmp(v[1], want) != 0) __builtin_trap();
-            snprintf(want, sizeof want, "=?UTF-8?B?%s?=", sb);
-            if (strcmp(v[2], want) != 0) __builtin_trap();
-            free(nb);
-            free(sb);
+            if (*__mm_words(v[2], subject) != '\0') __builtin_trap();
 
             const char* body_end = d + len - 5;
             if (count == 0) {
@@ -4339,8 +4376,9 @@ static void __qc_client_read(stand_t* s, qc_stream_t* st) {
             st[k].client_got += n;
             if (st[k].responded && st[k].client_got > st[k].response_len) __builtin_trap();
         }
-        /* The FIN means everything that was written has arrived. */
-        if (quicclient_stream_fin(&s->client, 4 * k) && st[k].responded &&
+        /* FIN can precede missing data after loss or reordering. Compare the
+         * final length only once every byte before FIN has been read. */
+        if (quicclient_stream_complete(&s->client, 4 * k) && st[k].responded &&
             st[k].client_got != st[k].response_len) __builtin_trap();
     }
     (void)quicclient_flush(&s->client);
@@ -5234,6 +5272,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     for (int i = 0; i < 3; i++) {
         if (runs[i].status != HTTP1RESPONSEPARSER_COMPLETE || runs[i].code != 200) __builtin_trap();
         if (runs[i].body_len != (head ? 0 : body_len)) __builtin_trap();
+        if (runs[i].digest != runs[0].digest) __builtin_trap();
     }
     if (!head && memcmp(got, body, body_len) != 0) __builtin_trap();
     return 0;
