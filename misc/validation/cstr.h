@@ -77,7 +77,9 @@ char* cstr_collapse_spaces(char* value);
 /* Drops control characters (C0 except \t \n \r, DEL, C1) and invisible ones:
  * BOM, zero-width, the bidirectional marks. The last are worth removing for
  * more than tidiness -- an RLO reverses how a line is shown and passes one
- * string off as another in a letter a human reads. */
+ * string off as another in a letter a human reads. Bytes that belong to no
+ * valid UTF-8 sequence are dropped as well: kept, they could join the bytes
+ * on the far side of a removed control into a new control character. */
 char* cstr_strip_control(char* value);
 
 /* Replaces every run of CR/LF with a single space. Needed for anything that

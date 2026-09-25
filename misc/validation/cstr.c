@@ -179,13 +179,21 @@ char* cstr_strip_control(char* value) {
         uint32_t codepoint;
         const size_t size = utf8_decode(in, &codepoint);
 
-        if (size > 0 && cstr_is_control_codepoint(codepoint)) {
+        /* A byte that belongs to no valid sequence goes too. Kept, it would
+         * meet whatever follows the controls removed next to it: C2 [04] 80
+         * came out as U+0080, a C1 control in a string just cleaned of them
+         * (found by fuzz_text). */
+        if (size == 0) {
+            in++;
+            continue;
+        }
+
+        if (cstr_is_control_codepoint(codepoint)) {
             in += size;
             continue;
         }
 
-        const size_t step = size > 0 ? size : 1;
-        for (size_t i = 0; i < step; i++) *out++ = (char)*in++;
+        for (size_t i = 0; i < size; i++) *out++ = (char)*in++;
     }
 
     *out = 0;

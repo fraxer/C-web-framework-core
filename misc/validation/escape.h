@@ -35,8 +35,10 @@ char* html_escape(const char* value);
  * form never reach the recipient. CRLF counts as one break. */
 char* html_escape_multiline(const char* value);
 
-/* Escaping for a log entry: control characters and DEL turn into \xNN, and
- * everything else is left as it is (Cyrillic stays readable in the log).
+/* Escaping for a log entry: control characters (C0, DEL and C1) and every
+ * byte that is not part of a valid UTF-8 sequence turn into \xNN, and
+ * everything else is left as it is (Cyrillic stays readable in the log). C1
+ * matters as much as C0: U+009B is CSI to a terminal showing the journal.
  * Without it a line break inside a value forges a journal line -- the user
  * writes into the log whatever they like. Better to limit the length first
  * with cstr_truncate(): the journal does not need the whole field.

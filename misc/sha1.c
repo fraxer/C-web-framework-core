@@ -12,8 +12,11 @@ void __sha1_final(SHA1_CTX* ctx, BYTE hash[]);
 void __sha1_transform(SHA1_CTX* ctx, const BYTE data[]) {
 	WORD a, b, c, d, e, i, j, t, m[80];
 
+	/* Widened before the shift: a byte promotes to int, and a byte of 0x80 or
+	 * more shifted by 24 does not fit one -- undefined behaviour, which UBSan
+	 * reported on every WebSocket handshake (the padding byte opens a word). */
 	for (i = 0, j = 0; i < 16; ++i, j += 4)
-		m[i] = (data[j] << 24) + (data[j + 1] << 16) + (data[j + 2] << 8) + (data[j + 3]);
+		m[i] = ((WORD)data[j] << 24) + ((WORD)data[j + 1] << 16) + ((WORD)data[j + 2] << 8) + (WORD)data[j + 3];
 
 	for (; i < 80; ++i) {
 		m[i] = (m[i - 3] ^ m[i - 8] ^ m[i - 14] ^ m[i - 16]);

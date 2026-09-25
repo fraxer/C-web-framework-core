@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "escape.h"
+#include "utf8.h"
 
 static char* html_escape_impl(const char* value, int multiline);
 
@@ -68,19 +69,35 @@ char* log_escape(const char* value) {
     if (result == NULL) return NULL;
 
     char* out = result;
-    for (const unsigned char* p = (const unsigned char*)value; *p; p++) {
-        /* Bytes with the high bit set pass through unchanged: they are parts
-         * of UTF-8 sequences, and breaking them into \xNN would make Cyrillic
-         * unreadable in the journal. */
-        if (*p >= 0x20 && *p != 0x7F) {
-            *out++ = (char)*p;
+    for (const unsigned char* p = (const unsigned char*)value; *p;) {
+        /* Printable ASCII as it is. */
+        if (*p >= 0x20 && *p < 0x7F) {
+            *out++ = (char)*p++;
             continue;
         }
 
-        *out++ = '\\';
-        *out++ = 'x';
-        *out++ = hex[*p >> 4];
-        *out++ = hex[*p & 0x0F];
+        /* A whole, valid UTF-8 sequence passes through too -- Cyrillic has to
+         * stay readable in the journal -- unless it is a C1 control. U+009B is
+         * CSI, and a terminal showing the journal would start an escape
+         * sequence on it; found by fuzz_text. A byte that is not part of a
+         * valid sequence is escaped on its own: a lone 0x9B is the same CSI to
+         * an 8-bit terminal. */
+        uint32_t codepoint = 0;
+        const size_t length = *p >= 0x80 ? utf8_decode(p, &codepoint) : 0;
+        if (length > 0 && codepoint > 0x9F) {
+            memcpy(out, p, length);
+            out += length;
+            p += length;
+            continue;
+        }
+
+        const size_t escaped = length > 0 ? length : 1;
+        for (size_t i = 0; i < escaped; i++, p++) {
+            *out++ = '\\';
+            *out++ = 'x';
+            *out++ = hex[*p >> 4];
+            *out++ = hex[*p & 0x0F];
+        }
     }
     *out = 0;
 

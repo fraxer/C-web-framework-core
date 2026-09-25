@@ -205,6 +205,13 @@ int __etag_matches(const char* if_none_match, size_t if_none_match_len,
     if (if_none_match_len == 1 && if_none_match[0] == '*')
         return 1;
 
+    // RFC 9110 §13.1.2: If-None-Match uses the weak comparison function --
+    // the opaque tags are compared and a W/ on either side does not count.
+    if (etag_len >= 2 && etag[0] == 'W' && etag[1] == '/') {
+        etag += 2;
+        etag_len -= 2;
+    }
+
     // Parse comma-separated ETags in If-None-Match
     const char* pos = if_none_match;
     const char* end = if_none_match + if_none_match_len;
@@ -230,6 +237,11 @@ int __etag_matches(const char* if_none_match, size_t if_none_match_len,
                (etag_start[current_etag_len - 1] == ' ' ||
                 etag_start[current_etag_len - 1] == '\t'))
             current_etag_len--;
+
+        if (current_etag_len >= 2 && etag_start[0] == 'W' && etag_start[1] == '/') {
+            etag_start += 2;
+            current_etag_len -= 2;
+        }
 
         // Compare with response ETag
         if (current_etag_len == etag_len &&

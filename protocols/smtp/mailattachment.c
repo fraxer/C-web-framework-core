@@ -125,6 +125,11 @@ mail_attachment_part_t mailattachment_part_build(const mail_attachment_t* attach
         ? attachment->content_type
         : mailattachment_content_type(attachment->filename);
 
+    /* Тип печатается в заголовок части как есть: управляющий символ в нём,
+     * CR/LF прежде всего, начинал бы новый заголовок (fuzz_mail_message). */
+    for (const unsigned char* p = (const unsigned char*)type; *p; p++)
+        if (*p < 0x20 || *p == 0x7F) return part;
+
     char ascii[NAME_MAX];
     mailattachment_ascii_filename(attachment->filename, ascii, sizeof(ascii));
 

@@ -52,23 +52,44 @@ void mail_message_free(mail_message_t* message) {
     free(message);
 }
 
+/* What may stand between < > in From/To -- and after MAIL FROM: and RCPT TO:
+ * in mail.c, which prints the same string. A CR or LF there starts a new
+ * header or a new SMTP command, so an application mailing an address a user
+ * typed relayed to whoever the user appended (found by fuzz_mail_message).
+ * Only what breaks the framing is refused: the syntax proper is the caller's
+ * business (validate_email), and UTF-8 addresses (RFC 6531) pass. */
+static int __mailmessage_address_safe(const char* email) {
+    if (email == NULL || email[0] == '\0' || strchr(email, '@') == NULL) return 0;
+
+    for (const unsigned char* p = (const unsigned char*)email; *p; p++)
+        if (*p <= 0x20 || *p == 0x7F || *p == '<' || *p == '>') return 0;
+
+    return 1;
+}
+
 int mail_message_set_from(mail_message_t* message, const char* email, const char* sender_name) {
     if (message == NULL) return 0;
-    if (email == NULL) return 0;
+    if (!__mailmessage_address_safe(email)) return 0;
     if (sender_name == NULL) return 0;
 
+    /* On the heap: the name is the caller's and may be megabytes long, and a
+     * VLA of its base64 took the stack with it. */
     size_t sender_name_length = strlen(sender_name);
-    char encoded_sender_name[base64_encode_len(sender_name_length)];
+    char* encoded_sender_name = malloc(base64_encode_len(sender_name_length));
+    if (encoded_sender_name == NULL) return 0;
     size_t encoded_sender_name_length = base64_encode(encoded_sender_name, sender_name, sender_name_length);
 
     const size_t email_length = strlen(email);
     const char* template = "=?UTF-8?B?%s?= <%s>";
     message->from_with_name.length = strlen(template) - 4 + encoded_sender_name_length + email_length;
     message->from_with_name.value = malloc(message->from_with_name.length + 1);
-    if (message->from_with_name.value == NULL)
+    if (message->from_with_name.value == NULL) {
+        free(encoded_sender_name);
         return 0;
+    }
 
     message->from_with_name.length = snprintf(message->from_with_name.value, message->from_with_name.length + 1, template, encoded_sender_name, email);
+    free(encoded_sender_name);
     if (message->from_with_name.length <= 0) return 0;
 
     template = "<%s>";
@@ -85,7 +106,7 @@ int mail_message_set_from(mail_message_t* message, const char* email, const char
 
 int mail_message_set_to(mail_message_t* message, const char* email) {
     if (message == NULL) return 0;
-    if (email == NULL) return 0;
+    if (!__mailmessage_address_safe(email)) return 0;
 
     const size_t email_length = strlen(email);
     const char* template = "<%s>";
@@ -105,17 +126,23 @@ int mail_message_set_subject(mail_message_t* message, const char* subject) {
     if (message == NULL) return 0;
     if (subject == NULL) return 0;
 
+    /* On the heap, as in set_from: a subject taken from a form may be as long
+     * as the request body limit allows. */
     size_t subject_length = strlen(subject);
-    char encoded_subject[base64_encode_len(subject_length)];
+    char* encoded_subject = malloc(base64_encode_len(subject_length));
+    if (encoded_subject == NULL) return 0;
     const size_t encoded_subject_length = base64_encode(encoded_subject, subject, subject_length);
 
     const char* template = "=?UTF-8?B?%s?=";
     message->subject.length = strlen(template) - 2 + encoded_subject_length;
     message->subject.value = malloc(message->subject.length + 1);
-    if (message->subject.value == NULL)
+    if (message->subject.value == NULL) {
+        free(encoded_subject);
         return 0;
+    }
 
     message->subject.length = snprintf(message->subject.value, message->subject.length + 1, template, encoded_subject);
+    free(encoded_subject);
     if (message->subject.length <= 0) return 0;
 
     return 1;

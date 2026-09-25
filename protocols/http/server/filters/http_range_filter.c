@@ -474,6 +474,12 @@ int range_handler_header(httprequest_t* request, httpresponse_t* response) {
     if (request == NULL || request->ranges == NULL)
         return filter_next_handler_header(request, response);
 
+    /* RFC 9110 §14.2: range handling is defined for GET only, and Range on any
+     * other method MUST be ignored. HEAD answers with GET's header fields
+     * (§9.3.2), so it keeps the 206 framing without the body. */
+    if (request->method != ROUTE_GET && request->method != ROUTE_HEAD)
+        return filter_next_handler_header(request, response);
+
     /* Range requests only apply to successful responses (2xx).
      * Redirects (3xx), client errors (4xx) and server errors (5xx) go out
      * unmodified. */

@@ -28,6 +28,12 @@ typedef struct {
      * after an EAGAIN would corrupt the HPACK encoder's dynamic table. */
     bufo_t* buf;
 
+    /* The block goes out on its own through buf->pos (__write_bufo), rather
+     * than as the DATA writer's prefix -- which drains its own cursor and
+     * leaves buf->pos where it was. What is still owed on a dropped stream is
+     * read from whichever cursor is the real one. */
+    int direct;
+
     /* DATA frame currently in flight (h2data.c owns the state machine). */
     h2_data_writer_t writer;
 } h2_module_write_t;
@@ -289,6 +295,7 @@ static int __header(httprequest_t* request, httpresponse_t* response) {
         return CWF_OK;
     }
 
+    module->direct = 1;
     return __write_bufo(response, module->buf);
 }
 
@@ -375,6 +382,7 @@ static void __reset(void* arg) {
     h2_data_writer_reset(&module->writer);
 
     bufo_clear(module->buf);
+    module->direct = 0;
 }
 
 /* Trailing fields as their own HPACK block. Shares the encoder with the header
@@ -502,9 +510,10 @@ size_t h2_write_filter_owed(httpresponse_t* response, uint8_t* dst, size_t* payl
         h2_module_write_t* module = f->module;
         bufo_t* block = module->buf;
 
-        /* The HEADERS block went out through __write_bufo, not as a prefix,
-         * and the socket took part of it. */
-        if (module->writer.prefix == NULL && block->pos > 0 && block->pos < block->size) {
+        /* The HEADERS block goes out through __write_bufo, not as a prefix,
+         * and the socket has not taken all of it -- or none: once encoded it
+         * is owed whole, HPACK state and all (RFC 9113 §4.3). */
+        if (module->direct && block->pos < block->size) {
             const size_t n = block->size - block->pos;
             if (dst != NULL) memcpy(dst, bufo_data(block), n);
             return n;
@@ -533,6 +542,7 @@ http_filter_t* h2_write_filter_create(void) {
     module->base.reset = __reset;
     h2_data_writer_reset(&module->writer);
     module->buf = bufo_create();
+    module->direct = 0;
 
     if (module->buf == NULL) {
         free(module);

@@ -96,16 +96,25 @@ size_t h2_data_writer_owed(const h2_data_writer_t* w, const bufo_t* src, uint8_t
      * Its payload is charged to the windows only once the whole buffer has
      * left, so all of it is still uncharged. */
     if (w->join_len > 0) {
-        if (w->join_pos == 0) return 0;
+        /* Nothing of it has left. The DATA frame has not begun and may go, but
+         * a header block riding in front of it was encoded: it has changed the
+         * HPACK context the peer decodes with, so it must still arrive, whole
+         * and in order (RFC 9113 §4.3) -- found by fuzz_h2_connection as the
+         * next header block failing to decode. */
+        if (w->join_pos == 0) {
+            if (dst != NULL && w->join_prefix > 0) memcpy(dst, w->join, w->join_prefix);
+            return w->join_prefix;
+        }
         const size_t n = w->join_len - w->join_pos;
         if (dst != NULL) memcpy(dst, w->join + w->join_pos, n);
         if (payload != NULL) *payload = w->join_payload;
         return n;
     }
 
-    /* A header block started on its own is finished on its own: the DATA frame
-     * behind it has not begun, since the prefix always drains first. */
-    if (w->prefix != NULL && w->prefix_pos > 0 && w->prefix_pos < w->prefix_len) {
+    /* A header block is finished on its own, or sent whole when none of it has
+     * left yet (above): the DATA frame behind it has not begun, since the
+     * prefix always drains first. */
+    if (w->prefix != NULL && w->prefix_pos < w->prefix_len) {
         const size_t n = w->prefix_len - w->prefix_pos;
         if (dst != NULL) memcpy(dst, w->prefix + w->prefix_pos, n);
         return n;
@@ -160,6 +169,19 @@ h2_data_status_e h2_data_write(h2_data_writer_t* w, h2session_t* s,
              * frame; a caller whose final buffer arrives empty appends its own
              * empty DATA frame instead. */
             if (remaining == 0) return H2_DATA_DRAINED;
+
+            /* A header block still held for a ride goes now if this stream is
+             * about to stop for its quantum or its windows. HEADERS are not
+             * flow-controlled, and the block has already changed the HPACK
+             * context: left behind, it would be overtaken by the next stream's
+             * block, and the peer decodes them in the order they arrive. */
+            const int64_t window_now = s->send_window < stream->send_window ?
+                s->send_window : stream->send_window;
+            if ((stream->write_credit <= 0 || window_now <= 0) &&
+                w->prefix != NULL && w->prefix_len > w->prefix_pos) {
+                const h2_data_status_e st = h2_data_flush_prefix(w, s);
+                if (st != H2_DATA_DRAINED) return st;
+            }
 
             /* Quantum spent, and we are between frames — hand the socket back so
              * the other streams on this connection get a turn. Only ever here:

@@ -123,6 +123,14 @@ typedef struct {
      * on the same connection. The request's own server is the one its
      * middlewares belong to. */
     server_t* server;
+    /* The item, and nobody else, holds request and response: an HTTP/1.1 item
+     * that is queued and has not run. Running it hands them to the connection
+     * context (h2 and h3 keep them on the stream all along), so a runner clears
+     * this first. Without it a connection closed with items still queued -- a
+     * pipeline behind a "Connection: close", or behind a request the parser
+     * refused -- dropped their requests and responses with the queue, found by
+     * fuzz_h1_connection. */
+    int owned;
 } connection_queue_http_data_t;
 
 struct middleware_item;
@@ -234,6 +242,19 @@ int set_http(connection_t* connection) {
  * is what it did before any of this existed. */
 void __send_continue(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
+
+    /* Only for the request at the head of the line. With a pipeline, one read
+     * can take several requests: those in front of this one are answered from
+     * ctx->response or wait in ctx->queue, and a 100 written now would reach
+     * the client ahead of their answers, which it would then take for the
+     * first of them (RFC 9112 §9.3). Found by fuzz_h1_connection. Saying
+     * nothing is allowed -- a client may send the content without waiting for
+     * the 100 (RFC 9110 §10.1.1) -- and a pipelining client with an Expect is
+     * rare enough that its timer is an acceptable price. */
+    cqueue_lock(ctx->queue);
+    const int queue_empty = cqueue_empty(ctx->queue);
+    cqueue_unlock(ctx->queue);
+    if (ctx->response != NULL || !queue_empty) return;
 
     ctx->cont_pending = 1;
     ctx->cont_sent = 0;
@@ -551,6 +572,11 @@ int __deferred_handler(connection_t* connection, httprequest_t* request, httpres
      * and lets the chain pass the next one on (docs/concurrency/00 §5.2). */
     const int parallel = __is_multiplexed(connection);
 
+    /* Set before the append, not after: once it is in the queue a worker may
+     * run it -- and clear the flag -- before this thread gets another look. */
+    connection_queue_http_data_t* data = (connection_queue_http_data_t*)item->data;
+    data->owned = !parallel;
+
     /* ctx->queue used to be covered by connection_s_lock, which the worker held
      * for the whole handler run. It does not any more, so the queue needs its
      * own mutual exclusion — and the "was it empty" test has to be taken
@@ -561,6 +587,9 @@ int __deferred_handler(connection_t* connection, httprequest_t* request, httpres
     cqueue_unlock(ctx->queue);
 
     if (!appended) {
+        /* The caller still holds the request (the parser has not let go of it
+         * on a 0), so the item must not take it along. */
+        data->owned = 0;
         item->free(item);
         return 0;
     }
@@ -575,7 +604,11 @@ int __deferred_handler(connection_t* connection, httprequest_t* request, httpres
          * and under fan-out the head of the queue need not be the item we just
          * appended. Failing here means epoll or an allocation gave up, so take
          * the connection down instead and let __ctx_free drain the queue — the
-         * caller closes it on our 0. */
+         * caller closes it on our 0. No worker will run the item, and on a 0
+         * the parser keeps the request, so the item gives it up. */
+        cqueue_lock(ctx->queue);
+        data->owned = 0;
+        cqueue_unlock(ctx->queue);
         atomic_store(&ctx->destroyed, 1);
         return 0;
     }
@@ -989,6 +1022,7 @@ void* __queue_data_request_create(connection_t* connection, httprequest_t* reque
     data->response = response;
     data->ratelimiter = ratelimiter;
     data->server = ((connection_server_ctx_t*)connection->ctx)->server;
+    data->owned = 0;
 
     return data;
 }
@@ -1003,14 +1037,25 @@ void* __queue_data_response_create(connection_t* connection, httprequest_t* requ
     data->response = response;
     data->ratelimiter = ratelimiter;
     data->server = ((connection_server_ctx_t*)connection->ctx)->server;
+    data->owned = 0;
 
     return data;
+}
+
+/* An item that never ran still owns its request and response; see
+ * connection_queue_http_data_t::owned. */
+static void __queue_data_release(connection_queue_http_data_t* data) {
+    if (!data->owned) return;
+
+    if (data->response != NULL) httpresponse_free(data->response);
+    if (data->request != NULL) httprequest_free(data->request);
 }
 
 void __queue_data_request_free(void* arg) {
     if (arg == NULL) return;
 
     connection_queue_http_data_t* data = arg;
+    __queue_data_release(data);
 
     free(data);
 }
@@ -1019,6 +1064,7 @@ void __queue_data_response_free(void* arg) {
     if (arg == NULL) return;
 
     connection_queue_http_data_t* data = arg;
+    __queue_data_release(data);
 
     free(data);
 }
@@ -1040,6 +1086,9 @@ void __queue_request_handler(void* arg) {
         log_error("__queue_request_handler: item->connection is NULL\n");
         return;
     }
+
+    /* From here the pair is the connection's (h1.1) or the stream's. */
+    data->owned = 0;
 
     connection_server_ctx_t* conn_ctx = item->connection->ctx;
     if (conn_ctx == NULL) {
@@ -1111,6 +1160,9 @@ void __queue_response_handler(void* arg) {
         log_error("__queue_response_handler: conn_ctx is NULL\n");
         return;
     }
+
+    /* From here the pair is the connection's (h1.1) or the stream's. */
+    data->owned = 0;
 
     /* No user code here — the response is already built (a static file, or a
      * handler that finished earlier). h1.1 binds request/response under the
