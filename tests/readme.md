@@ -475,8 +475,9 @@ Targets, each with a seed corpus under `fuzz/corpus/`:
 | `http_response` | the HTTP/1.1 client reading a server's response: Content-Length, chunked, gzip |
 | `smtp_response` | the SMTP client reading replies, and the EHLO capabilities it trusts |
 | `jwt` | HS256 tokens: acceptance, tampering, algorithm substitution, expiry |
-| `mail_message` | MIME headers, folded encoded words, body and binary attachments, decoded back to their input |
+| `mail_message` | MIME headers, folded encoded words, body and binary attachments, decoded back to their input; the DKIM signature of every letter, checked by a verifier of its own; raw letters signed through `dkim.c` |
 | `quic_conn` | a whole QUIC connection on the in-process stand of `test_quic_conn.c`: real TLS 1.3, loss recovery, congestion control, streams, migration, over a path the input impairs |
+| `ratelimiter` | the token bucket in front of rate-limited routes: any schedule of clients, token counts and clock steps, forward and back |
 
 An application registers its own with the same function, and `run.sh` picks
 them up from the manifest; the site's `fuzz_feedback` (in `backend/tests/`) is
@@ -491,6 +492,20 @@ body and attachment data can then use the full input budget. Attachments use
 their explicit byte length, including NUL. Text fields use C-string semantics.
 Addresses remain capped at 80 bytes and attachment metadata at 120/60/40 bytes.
 The corpus includes both formats, large fields and binary data with NUL bytes.
+
+Every letter is signed: the fixture puts an RSA-2048 key (made once per
+process), a selector and `mail.host` into the configuration. A verifier written
+in the target from RFC 6376 -- not from `dkim.c` -- reads the DKIM-Signature
+off the letter, canonicalizes the fields h= names and the body (relaxed), and
+checks bh=, l= (it must cover the whole body) and b= with OpenSSL; the field
+must be there once, above MIME-Version, and a letter built twice from the same
+values at the same time must come out the same. A leading `0xfe` selects the
+raw mode instead: the next byte picks the domain and selector (IDN among
+them), the rest is a letter -- header fields, an empty line, a body -- whose
+fields go through `dkim_header_add` one by one. A field that cannot be carried
+as signed (a name outside ftext or with ';', a value with NUL or a bare CR or
+LF) must be refused; the rest are signed and verified the same way, and both
+canonicalizers must be idempotent and agree with the verifier's.
 
 ### What the targets check
 
@@ -533,6 +548,11 @@ broke it is saved like any crash:
   keeps the first arrival (overlaps, conflicting retransmissions, FIN and
   RESET_STREAM final sizes, the buffered cap) and `quicrange` against a bitset,
   near 0 and near `UINT64_MAX`; freeing must hand the QUIC memory budget back.
+  `ratelimiter` runs the limiter against a per-client token count written
+  from `ratelimiter.h` -- refill by whole tokens, the cap, all-or-nothing
+  takes, the sweep of idle clients -- on a clock the input steps by
+  milliseconds, by hours or backwards; after every call the verdict, the
+  number of buckets and each bucket's count must be the model's.
 - **A connection under an impaired path.** `quic_conn` takes the path from
   the input -- delay, loss each way, duplication, reordering, a bottleneck,
   scripted drops, blackouts, damaged datagrams, stalls of the clock -- and a
@@ -596,6 +616,26 @@ HTTP/2 write path, as a seed that replays it):
   damaged or forged packet uncovers random bits there, so one datagram sent to
   a connection id anyone can read off the wire closed the connection with
   PROTOCOL_VIOLATION.
+- `ratelimiter.c`: `elapsed * refill_rate` wrapped 64 bits after a long
+  pause and the refill was cast to `uint32_t` before the cap, so a pause that
+  should have filled the bucket gave nothing; a clock step backwards wrapped
+  the elapsed time to ~584 years, refilling the bucket and making the sweep
+  drop live clients; a NULL address was limited under key 0 though the header
+  promises it passes. Found writing `test_ratelimiter.c` against the header,
+  kept there and as seeds.
+- `ratelimiter.c` (found by `test_ratelimiter_cleanup_race` under ASan, not by
+  the single-threaded target): the sweep freed buckets, and the tree nodes
+  holding them, while another thread that had just found its bucket without a
+  lock was using it. The map is now under a `pthread_rwlock_t`: a request keeps
+  the read lock while it holds its bucket.
+- `dkim.c` (the DKIM checks of `mail_message`): a signed field name longer
+  than a line was folded inside h=, and since the signer signed the field
+  unfolded, the fold -- whitespace to a verifier -- broke the signature; a
+  repeated field was signed top-down where RFC 6376 §5.4.2 has verifiers take
+  it bottom-up; `dkim_header_add` accepted names and values no letter can
+  carry as signed (a space or ';' in the name, NUL or a bare CR/LF in the
+  value). The field is now signed as it is sent, folded, and the unit test's
+  own fixture turned out to pass a length that counted the NUL.
 
 One more came out of checking the HTTP/2 fix against a live server rather than
 out of a target: finishing a frame from the session's output buffer, like

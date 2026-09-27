@@ -4031,8 +4031,14 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
 #elif FUZZ_TARGET == FUZZ_MAIL_MESSAGE
 
+#include <ctype.h>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/sha.h>
 
+#include "dkim.h"
+#include "dkimcanonparser.h"
+#include "dkimheaderparser.h"
 #include "mailattachment.h"
 #include "mailmessage.h"
 
@@ -4050,7 +4056,10 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
  *     attachment byte for byte;
  *   - keep every line within RFC 5322's 998 characters;
  *   - end in exactly one "\r\n.\r\n", with no line consisting of a lone dot
- *     anywhere before it (RFC 5321 §4.5.2). */
+ *     anywhere before it (RFC 5321 §4.5.2);
+ *   - carry one DKIM-Signature, above MIME-Version, that verifies (below), and
+ *     be the same letter, signature included, when built twice from the same
+ *     values at the same time. */
 
 typedef struct {
     const uint8_t* p;
@@ -4139,8 +4148,8 @@ static const char* __mm_words(const char* s, const char* want) {
  * unfolded value per allowed name. */
 static const char* __mm_fields(const char* s, const char* end, const char* const* allowed,
                                size_t n_allowed, char** values) {
-    size_t lengths[8] = { 0 }, capacities[8] = { 0 };
-    if (n_allowed > 8) __builtin_trap();
+    size_t lengths[16] = { 0 }, capacities[16] = { 0 };
+    if (n_allowed > 16) __builtin_trap();
     for (size_t i = 0; i < n_allowed; i++) values[i] = NULL;
     size_t current = n_allowed;
     for (;;) {
@@ -4188,8 +4197,441 @@ static void __mm_free_values(char** values, size_t n) {
     for (size_t i = 0; i < n; i++) free(values[i]);
 }
 
+/* ---- DKIM ----
+ *
+ * The fixture signs every letter: a key, a selector and mail.host in the
+ * configuration, as a site that sends mail has them. The key is RSA-2048,
+ * made once per process the way test_dkim.c makes it, and the PEM stays in
+ * memory.
+ *
+ * The signature is checked by a verifier written here from RFC 6376, not from
+ * dkim.c: it reads the DKIM-Signature field off the letter as a receiving
+ * server would, canonicalizes the fields named in h= and the body with the
+ * relaxed algorithms (§3.4.2, §3.4.4), and checks bh= and b= with OpenSSL.
+ * What it must not do is reuse what the signer kept -- the unit test that
+ * rebuilds the signed bytes from the signer's own state agrees with the signer
+ * by construction. */
+
+static char* __mm_dkim_pem;
+static EVP_PKEY* __mm_dkim_pub;
+
+static void __mm_dkim_init(void) {
+    if (__mm_dkim_pub != NULL) return;
+
+    EVP_PKEY* pkey = NULL;
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+    if (ctx == NULL || EVP_PKEY_keygen_init(ctx) <= 0 ||
+        EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) <= 0 || EVP_PKEY_keygen(ctx, &pkey) <= 0) abort();
+    EVP_PKEY_CTX_free(ctx);
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    if (bio == NULL || PEM_write_bio_PrivateKey(bio, pkey, NULL, NULL, 0, NULL, NULL) != 1) abort();
+    BUF_MEM* mem = NULL;
+    BIO_get_mem_ptr(bio, &mem);
+    __mm_dkim_pem = strndup(mem->data, mem->length);
+    if (__mm_dkim_pem == NULL) abort();
+    BIO_free(bio);
+
+    __mm_dkim_pub = pkey;
+
+    env_t* e = env();
+    e->mail.dkim_private = __mm_dkim_pem;
+    e->mail.dkim_selector = "sel";
+    e->mail.host = "example.com";
+}
+
+typedef struct {
+    char* data;
+    size_t len;
+    size_t cap;
+} mm_buf_t;
+
+static void __mm_put(mm_buf_t* b, const void* p, size_t n) {
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 256;
+        while (cap < b->len + n + 1) cap *= 2;
+        char* grown = realloc(b->data, cap);
+        if (grown == NULL) abort();
+        b->data = grown;
+        b->cap = cap;
+    }
+    memcpy(b->data + b->len, p, n);
+    b->len += n;
+    b->data[b->len] = '\0';
+}
+
+static int __mm_wsp(char c) {
+    return c == ' ' || c == '\t';
+}
+
+/* §3.4.2: the value unfolded, every WSP run one SP, none at either end. */
+static void __mm_canon_value(mm_buf_t* out, const char* v, size_t n) {
+    int space = 0, any = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (v[i] == '\r' && i + 1 < n && v[i + 1] == '\n') { i++; continue; }
+        if (__mm_wsp(v[i])) { space = 1; continue; }
+        if (space && any) __mm_put(out, " ", 1);
+        space = 0;
+        any = 1;
+        __mm_put(out, v + i, 1);
+    }
+}
+
+/* §3.4.4: WSP runs to one SP, none at the end of a line, no empty lines at
+ * the end, and a CRLF after the last line unless the body is empty. */
+static void __mm_canon_body(mm_buf_t* out, const char* b, size_t n) {
+    size_t empty = 0;
+    for (size_t i = 0; i < n;) {
+        size_t eol = i;
+        while (eol < n && !(b[eol] == '\r' && eol + 1 < n && b[eol + 1] == '\n')) eol++;
+        mm_buf_t line = { 0 };
+        int space = 0;
+        for (size_t k = i; k < eol; k++) {
+            if (__mm_wsp(b[k])) { space = 1; continue; }
+            if (space) __mm_put(&line, " ", 1);
+            space = 0;
+            __mm_put(&line, b + k, 1);
+        }
+        if (line.len == 0) empty++;
+        else {
+            for (; empty > 0; empty--) __mm_put(out, "\r\n", 2);
+            __mm_put(out, line.data, line.len);
+            __mm_put(out, "\r\n", 2);
+        }
+        free(line.data);
+        i = eol + 2;
+    }
+}
+
+/* One field of a header block: its raw bytes, name included, folds kept. */
+typedef struct {
+    const char* p;
+    size_t n;
+    size_t name;
+    int used;
+} mm_field_t;
+
+static size_t __mm_split_fields(const char* h, size_t n, mm_field_t* f, size_t max) {
+    size_t count = 0;
+    for (size_t i = 0; i < n;) {
+        size_t eol = i;
+        while (eol + 1 < n && !(h[eol] == '\r' && h[eol + 1] == '\n')) eol++;
+        if (eol + 1 >= n) eol = n;
+        if ((h[i] == ' ' || h[i] == '\t') && count > 0) {
+            f[count - 1].n = eol - (size_t)(f[count - 1].p - h);
+        } else {
+            if (count == max) break;
+            const char* colon = memchr(h + i, ':', eol - i);
+            f[count++] = (mm_field_t){ h + i, eol - i, colon ? (size_t)(colon - (h + i)) : eol - i, 0 };
+        }
+        i = eol + 2;
+    }
+    return count;
+}
+
+/* Field name without trailing WSP, compared case-insensitively. */
+static int __mm_field_is(const mm_field_t* f, const char* name, size_t len) {
+    size_t n = f->name;
+    while (n > 0 && __mm_wsp(f->p[n - 1])) n--;
+    return n == len && strncasecmp(f->p, name, len) == 0;
+}
+
+static void __mm_canon_field(mm_buf_t* out, const mm_field_t* f, int b_empty) {
+    size_t n = f->name;
+    while (n > 0 && __mm_wsp(f->p[n - 1])) n--;
+    for (size_t i = 0; i < n; i++) {
+        const char c = (char)tolower((unsigned char)f->p[i]);
+        __mm_put(out, &c, 1);
+    }
+    __mm_put(out, ":", 1);
+
+    const char* v = f->p + f->name + 1;
+    const size_t vn = f->n - f->name - 1;
+    if (!b_empty) { __mm_canon_value(out, v, vn); return; }
+
+    /* The DKIM-Signature field itself, with the value of b= removed (§3.5,
+     * "b=" with nothing after it) and everything else as it stands. */
+    mm_buf_t without = { 0 };
+    for (size_t i = 0; i < vn;) {
+        size_t end = i;
+        while (end < vn && v[end] != ';') end++;
+        size_t t = i;
+        while (t < end && (__mm_wsp(v[t]) || v[t] == '\r' || v[t] == '\n')) t++;
+        size_t eq = t;
+        while (eq < end && v[eq] != '=') eq++;
+        size_t name_end = eq;
+        while (name_end > t && (__mm_wsp(v[name_end - 1]) || v[name_end - 1] == '\r' || v[name_end - 1] == '\n')) name_end--;
+        if (eq < end && name_end - t == 1 && v[t] == 'b') __mm_put(&without, v + i, eq + 1 - i);
+        else __mm_put(&without, v + i, end - i);
+        if (end < vn) __mm_put(&without, ";", 1);
+        i = end + 1;
+    }
+    __mm_canon_value(out, without.data ? without.data : "", without.len);
+    free(without.data);
+}
+
+/* The value of tag `name` with every FWS removed, NULL when absent. */
+static char* __mm_dkim_tag(const char* v, size_t n, const char* name) {
+    for (size_t i = 0; i < n;) {
+        size_t end = i;
+        while (end < n && v[end] != ';') end++;
+        mm_buf_t tag = { 0 };
+        for (size_t k = i; k < end; k++)
+            if (!__mm_wsp(v[k]) && v[k] != '\r' && v[k] != '\n') __mm_put(&tag, v + k, 1);
+        const size_t len = strlen(name);
+        if (tag.data != NULL && strncmp(tag.data, name, len) == 0 && tag.data[len] == '=') {
+            char* value = strdup(tag.data + len + 1);
+            free(tag.data);
+            if (value == NULL) abort();
+            return value;
+        }
+        free(tag.data);
+        i = end + 1;
+    }
+    return NULL;
+}
+
+static char* __mm_b64(const unsigned char* p, size_t n) {
+    char* out = malloc(4 * ((n + 2) / 3) + 1);
+    if (out == NULL) abort();
+    EVP_EncodeBlock((unsigned char*)out, p, (int)n);
+    return out;
+}
+
+/* Verifies the one DKIM-Signature of a letter whose header block is h[0..hn)
+ * (fields separated by CRLF, no empty line) and whose body is b[0..bn). Traps
+ * on anything a receiving server would reject; From must be signed in a letter
+ * the builder made (§5.4), not in a raw one that may have none. */
+static void __mm_dkim_verify(const char* h, size_t hn, const char* b, size_t bn, int require_from) {
+    mm_field_t fields[64];
+    const size_t count = __mm_split_fields(h, hn, fields, 64);
+
+    const mm_field_t* sig = NULL;
+    for (size_t i = 0; i < count; i++)
+        if (__mm_field_is(&fields[i], "DKIM-Signature", 14)) {
+            if (sig != NULL) __builtin_trap();                            /* once */
+            sig = &fields[i];
+        }
+    if (sig == NULL || sig->name == sig->n) __builtin_trap();
+    const char* sv = sig->p + sig->name + 1;
+    const size_t sn = sig->n - sig->name - 1;
+
+    char* v = __mm_dkim_tag(sv, sn, "v");
+    char* a = __mm_dkim_tag(sv, sn, "a");
+    char* c = __mm_dkim_tag(sv, sn, "c");
+    char* d = __mm_dkim_tag(sv, sn, "d");
+    char* s = __mm_dkim_tag(sv, sn, "s");
+    char* hl = __mm_dkim_tag(sv, sn, "h");
+    char* bh = __mm_dkim_tag(sv, sn, "bh");
+    char* bb = __mm_dkim_tag(sv, sn, "b");
+    char* l = __mm_dkim_tag(sv, sn, "l");
+    if (!v || !a || !c || !d || !s || !hl || !bh || !bb) __builtin_trap();
+    if (strcmp(v, "1") || strcmp(a, "rsa-sha1") || strcmp(c, "relaxed/relaxed") ||
+        strcmp(d, env()->mail.host) || strcmp(s, env()->mail.dkim_selector)) __builtin_trap();
+
+    /* Body: l= must cover all of it, or what follows could be anything. */
+    mm_buf_t body = { 0 };
+    __mm_canon_body(&body, b, bn);
+    if (l != NULL && (strspn(l, "0123456789") != strlen(l) || strtoull(l, NULL, 10) != body.len)) __builtin_trap();
+    unsigned char digest[20];
+    SHA1((const unsigned char*)(body.data ? body.data : ""), body.len, digest);
+    char* want_bh = __mm_b64(digest, sizeof digest);
+    if (strcmp(want_bh, bh) != 0) __builtin_trap();
+
+    /* Headers: each name in h=, the last unused instance of it (§5.4.2), then
+     * the signature field with b= emptied and no CRLF. From is mandatory. */
+    mm_buf_t signed_data = { 0 };
+    int from = 0;
+    for (char* save = NULL, *name = strtok_r(hl, ":", &save); name; name = strtok_r(NULL, ":", &save)) {
+        if (strcasecmp(name, "from") == 0) from = 1;
+        for (size_t i = count; i-- > 0;)
+            if (!fields[i].used && &fields[i] != sig && fields[i].name < fields[i].n && __mm_field_is(&fields[i], name, strlen(name))) {
+                fields[i].used = 1;
+                __mm_canon_field(&signed_data, &fields[i], 0);
+                __mm_put(&signed_data, "\r\n", 2);
+                break;
+            }
+    }
+    if (require_from && !from) __builtin_trap();
+    __mm_canon_field(&signed_data, sig, 1);
+
+    unsigned char raw[512];
+    const size_t bl = strlen(bb);
+    if (bl % 4 != 0 || bl / 4 * 3 > sizeof raw) __builtin_trap();
+    int rn = EVP_DecodeBlock(raw, (const unsigned char*)bb, (int)bl);
+    if (rn < 0) __builtin_trap();
+    if (bl > 0 && bb[bl - 1] == '=') rn--;
+    if (bl > 1 && bb[bl - 2] == '=') rn--;
+
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (ctx == NULL) abort();
+    if (EVP_DigestVerifyInit(ctx, NULL, EVP_sha1(), NULL, __mm_dkim_pub) != 1 ||
+        EVP_DigestVerifyUpdate(ctx, signed_data.data, signed_data.len) != 1 ||
+        EVP_DigestVerifyFinal(ctx, raw, (size_t)rn) != 1) __builtin_trap();
+    EVP_MD_CTX_free(ctx);
+
+    free(signed_data.data); free(body.data); free(want_bh);
+    free(v); free(a); free(c); free(d); free(s); free(hl); free(bh); free(bb); free(l);
+}
+
+/* Mode 0xfe: the input is a raw letter -- header fields, an empty line, a
+ * body -- signed through the dkim.c API directly, the way any application may
+ * call it, and then verified as above. A field dkim_header_add accepts must be
+ * one a letter can carry: a name of RFC 5322 ftext, a value with no NUL and no
+ * CR or LF other than a fold (CRLF followed by WSP). Anything else must be
+ * refused, or the signature covers a field that is not the one on the wire;
+ * and no ';' in the name, which h= cannot carry.
+ *
+ * The body is normalised the way it would reach a verifier over SMTP: C-string
+ * (dkim_create_sign takes one), lone CR and LF made CRLF. Both canonicalizers
+ * are also run on their own: relaxed canonicalization is idempotent, and on a
+ * value or a body a letter can carry it equals the one written above. The
+ * byte after 0xfe picks the signing domain and selector, IDN included. */
+
+static int __mm_ftext_name(const char* n, size_t len) {
+    if (len == 0) return 0;
+    for (size_t i = 0; i < len; i++)
+        if ((unsigned char)n[i] < 33 || (unsigned char)n[i] > 126 || n[i] == ':' || n[i] == ';') return 0;
+    return 1;
+}
+
+static int __mm_folded_value(const char* v, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (v[i] == '\0') return 0;
+        if (v[i] == '\r' || v[i] == '\n') {
+            if (!(v[i] == '\r' && i + 2 < len && v[i + 1] == '\n' && __mm_wsp(v[i + 2]))) return 0;
+            i++;
+        }
+    }
+    return 1;
+}
+
+static char* __mm_canon_run(int header, const char* p, size_t n, size_t* out_n) {
+    char* out;
+    if (header) {
+        dkimheaderparser_t* parser = dkimheaderparser_alloc();
+        if (parser == NULL) abort();
+        dkimheaderparser_init(parser);
+        dkimheaderparser_set_buffer(parser, p, n);
+        if (!dkimheaderparser_run(parser)) __builtin_trap();
+        out = dkimheaderparser_get_content(parser);
+        *out_n = dkimheaderparser_get_content_length(parser);
+        dkimheaderparser_free(parser);
+    } else {
+        dkimcanonparser_t* parser = dkimcanonparser_alloc();
+        if (parser == NULL) abort();
+        dkimcanonparser_init(parser);
+        dkimcanonparser_set_buffer(parser, p, n);
+        if (!dkimcanonparser_run(parser)) __builtin_trap();
+        out = dkimcanonparser_get_content(parser);
+        dkimcanonparser_free(parser);
+        if (out != NULL) *out_n = strlen(out);
+    }
+    if (out == NULL) abort();
+    return out;
+}
+
+static void __mm_canon_check(int header, const char* p, size_t n, int on_the_wire) {
+    size_t once_n, twice_n;
+    char* once = __mm_canon_run(header, p, n, &once_n);
+    char* twice = __mm_canon_run(header, once, once_n, &twice_n);
+    if (once_n != twice_n || memcmp(once, twice, once_n) != 0) __builtin_trap();
+    if (on_the_wire) {
+        mm_buf_t want = { 0 };
+        if (header) __mm_canon_value(&want, p, n);
+        else __mm_canon_body(&want, p, n);
+        if (once_n != want.len || memcmp(once, want.data ? want.data : "", once_n) != 0) __builtin_trap();
+        free(want.data);
+    }
+    free(once);
+    free(twice);
+}
+
+static void __mm_dkim_raw(const uint8_t* data, size_t size) {
+    static const char* const domains[] = { "example.com", "xn--e1afmkfd.xn--p1ai", "\xd0\xbf\xd1\x80\xd0\xb8\xd0\xbc\xd0\xb5\xd1\x80.\xd1\x80\xd1\x84" };
+    static const char* const selectors[] = { "sel", "s-2026.mail", "\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87" };
+    if (size < 1) return;
+    char* const host = env()->mail.host;
+    char* const selector = env()->mail.dkim_selector;
+    env()->mail.host = (char*)domains[data[0] % 3];
+    env()->mail.dkim_selector = (char*)selectors[data[0] / 3 % 3];
+    data++; size--;
+
+    const char* text = (const char*)data;
+    size_t hn = size;
+    const char* body_raw = "";
+    size_t body_raw_n = 0;
+    for (size_t i = 0; i + 3 < size; i++)
+        if (memcmp(text + i, "\r\n\r\n", 4) == 0) {
+            hn = i + 2;
+            body_raw = text + i + 4;
+            body_raw_n = size - i - 4;
+            break;
+        }
+
+    mm_field_t fields[32];
+    const size_t count = __mm_split_fields(text, hn, fields, 32);
+
+    dkim_t* dkim = dkim_create();
+    if (dkim == NULL) abort();
+    dkim_set_private_key(dkim, env()->mail.dkim_private);
+    dkim_set_domain(dkim, env()->mail.host);
+    dkim_set_selector(dkim, env()->mail.dkim_selector);
+    dkim_set_timestamp(dkim, 1700000000);
+
+    mm_buf_t letter = { 0 };
+    size_t accepted = 0;
+    for (size_t i = 0; i < count; i++) {
+        const mm_field_t* f = &fields[i];
+        if (f->name == f->n) continue;                                    /* no colon */
+        if (__mm_field_is(f, "DKIM-Signature", 14)) continue;             /* the one we add */
+        const char* value = f->p + f->name + 1;
+        const size_t vn = f->n - f->name - 1;
+        const int ok = dkim_header_add(dkim, f->p, f->name, value, vn);
+        const int valid = __mm_ftext_name(f->p, f->name) && __mm_folded_value(value, vn) && vn > 0 && value[0] != '\0';
+        if (ok && !valid) __builtin_trap();
+        __mm_canon_check(1, value, vn, valid);
+        if (!ok) continue;
+        accepted++;
+        __mm_put(&letter, f->p, f->n);
+        __mm_put(&letter, "\r\n", 2);
+    }
+
+    /* The body as SMTP carries it. */
+    mm_buf_t body = { 0 };
+    for (size_t i = 0; i < body_raw_n && body_raw[i] != '\0'; i++) {
+        if (body_raw[i] == '\r' && i + 1 < body_raw_n && body_raw[i + 1] == '\n') { __mm_put(&body, "\r\n", 2); i++; }
+        else if (body_raw[i] == '\r' || body_raw[i] == '\n') __mm_put(&body, "\r\n", 2);
+        else __mm_put(&body, body_raw + i, 1);
+    }
+    const char* b = body.data ? body.data : "";
+    __mm_canon_check(0, b, body.len, 1);
+
+    if (accepted > 0) {
+        char* sign = dkim_create_sign(dkim, b);
+        if (sign == NULL) __builtin_trap();
+        __mm_put(&letter, "DKIM-Signature: ", 16);
+        __mm_put(&letter, sign, strlen(sign));
+        const size_t headers = letter.len;
+        __mm_dkim_verify(letter.data, headers, b, body.len, 0);
+        free(sign);
+    }
+
+    dkim_free(dkim);
+    free(letter.data);
+    free(body.data);
+    env()->mail.host = host;
+    env()->mail.dkim_selector = selector;
+}
+
+
 int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     if (size < 2) return 0;
+    __mm_dkim_init();
+    if (data[0] == 0xfe) {
+        __mm_dkim_raw(data + 1, size - 1);
+        return 0;
+    }
     mm_in_t in = { .p = data, .end = data + size, .wide = data[0] == 0xff };
     if (in.wide) in.p++;
 
@@ -4227,7 +4669,20 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         mail_message_set_body(m, body);
         mail_message_set_attachments(m, count > 0 ? att : NULL, count);
 
-        if (mail_message_build(m, (time_t)1700000000)) {
+        /* A letter the setters took and the builder's own preconditions allow
+         * is built -- signature included: a DKIM failure is a letter that is
+         * never sent, and must not pass here as a refusal. */
+        int buildable = body[0] != '\0' && subject[0] != '\0';
+        for (size_t i = 0; i < count; i++) {
+            if (names[i][0] == '\0' || att[i].size == 0) buildable = 0;
+            if (cids[i] != NULL && cids[i][0] != '\0' && !mailattachment_cid_valid(cids[i])) buildable = 0;
+            for (const unsigned char* t = (const unsigned char*)(types[i] ? types[i] : ""); *t; t++)
+                if (*t < 0x20 || *t == 0x7F) buildable = 0;
+        }
+
+        const int built = mail_message_build(m, (time_t)1700000000);
+        if (buildable && !built) __builtin_trap();
+        if (built) {
             const char* d = m->data;
             const size_t len = m->data_size;
 
@@ -4245,11 +4700,19 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
             static const char* const top[] = {
                 "From", "To", "Subject", "Date", "Message-Id", "MIME-Version",
-                "Content-Type", "Content-Transfer-Encoding",
+                "Content-Type", "Content-Transfer-Encoding", "DKIM-Signature",
             };
-            char* v[8];
-            const char* bodypart = __mm_fields(d, d + len, top, 8, v);
+            char* v[9];
+            const char* bodypart = __mm_fields(d, d + len, top, 9, v);
             for (size_t i = 0; i < 7; i++) if (v[i] == NULL) __builtin_trap();
+            if (v[8] == NULL) __builtin_trap();
+
+            /* Signed, above MIME-Version, and verifiable by a stranger. The
+             * body a receiver hashes ends before the terminator's dot. */
+            const char* sig_at = strstr(d, "\r\nDKIM-Signature: ");
+            const char* mime_at = strstr(d, "\r\nMIME-Version: ");
+            if (sig_at == NULL || mime_at == NULL || sig_at > mime_at) __builtin_trap();
+            __mm_dkim_verify(d, (size_t)(bodypart - d) - 2, bodypart, (size_t)(d + len - 3 - bodypart), 1);
 
             char want[128];
             snprintf(want, sizeof want, " <%s>", from);
@@ -4297,7 +4760,21 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
                 }
                 if (strncmp(s, "--\r\n", 4) != 0) __builtin_trap();
             }
-            __mm_free_values(v, 8);
+            __mm_free_values(v, 9);
+
+            /* The same values at the same time make the same letter. With
+             * attachments the multipart boundary is random, so only then is
+             * the letter allowed to differ. */
+            if (count == 0) {
+                mail_message_t* again = mail_message_create();
+                if (again == NULL) abort();
+                if (!mail_message_set_from(again, from, from_name) || !mail_message_set_to(again, to) ||
+                    !mail_message_set_subject(again, subject)) __builtin_trap();
+                mail_message_set_body(again, body);
+                if (!mail_message_build(again, (time_t)1700000000)) __builtin_trap();
+                if (again->data_size != len || memcmp(again->data, d, len) != 0) __builtin_trap();
+                mail_message_free(again);
+            }
         }
     }
 
@@ -5738,6 +6215,197 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     free(conn->buffer);
     free(conn);
+
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_RATELIMITER
+
+#include <arpa/inet.h>
+#include "ipaddr.h"
+#include "map.h"
+#include "ratelimiter.h"
+
+/* The token bucket in front of the contact form, against a model of its own
+ * written from ratelimiter.h and nothing else: one integer count per client
+ * key, refilled from the last refill by refill_rate per whole elapsed second
+ * (what is left over below one token is dropped with the refill, as the code
+ * does), capped at max_tokens, taken whole or not at all; a sweep at most once
+ * per cleanup_interval_s that forgets every client idle for longer than that.
+ * A NULL address and a zero refill_rate are always allowed.
+ *
+ * The key is computed here from the address bytes as ipaddr.h describes it --
+ * the whole IPv4 address under ffff:ffff::/32, the first 64 bits of an IPv6
+ * one -- not by calling ipaddr_client_key. That includes the overlap the
+ * header documents: an IPv6 source in ffff:ffff::/32 shares a key with an IPv4
+ * one, which is harmless only because such a source cannot exist.
+ *
+ * The clock is the target's (ratelimiter_set_time_source) and the input moves
+ * it: not at all, a little, a lot, or backwards -- a backward step must grant
+ * nothing and forget nobody.
+ *
+ * Input: four bytes of configuration, then records of
+ *   [op] [clock argument] [address] [tokens]
+ * op bits 0-1: clock step (none, +arg ms, +arg*2^32 ns, -arg ms), bit 2:
+ * address is literal text (length byte, then bytes) instead of an index into
+ * the table below. The tokens byte is the request, with 254 meaning max_tokens
+ * and 255 one more than that.
+ *
+ * After every call: the verdict is the model's, the map holds exactly the
+ * model's clients, and each bucket holds the model's count. */
+
+#define RL_MAX_CLIENTS 64
+
+typedef struct {
+    uint64_t key;
+    uint32_t tokens;
+    uint64_t last_refill;
+    uint64_t last_access;
+} rl_model_bucket_t;
+
+typedef struct {
+    ratelimiter_config_t config;
+    rl_model_bucket_t buckets[RL_MAX_CLIENTS];
+    size_t count;
+    uint64_t last_cleanup;
+} rl_model_t;
+
+static uint64_t __rl_now;
+
+static uint64_t __rl_clock(void) {
+    return __rl_now;
+}
+
+static uint64_t __rl_elapsed(uint64_t now, uint64_t then) {
+    return now > then ? now - then : 0;
+}
+
+static uint64_t __rl_key(const ipaddr_t* ip) {
+    if (ip->family == AF_INET)
+        return 0xffffffff00000000ULL | ntohl(ip->u.v4.s_addr);
+
+    uint64_t key = 0;
+    for (int i = 0; i < 8; i++)
+        key = key << 8 | ip->u.v6.s6_addr[i];
+    return key;
+}
+
+static int __rl_model_allow(rl_model_t* m, const ipaddr_t* ip, uint32_t tokens, uint64_t now) {
+    const uint64_t interval = (uint64_t)m->config.cleanup_interval_s * 1000000000ULL;
+
+    if (__rl_elapsed(now, m->last_cleanup) >= interval) {
+        m->last_cleanup = now;
+        size_t kept = 0;
+        for (size_t i = 0; i < m->count; i++)
+            if (__rl_elapsed(now, m->buckets[i].last_access) <= interval)
+                m->buckets[kept++] = m->buckets[i];
+        m->count = kept;
+    }
+
+    if (m->config.refill_rate == 0 || ip == NULL) return 1;
+
+    const uint64_t key = __rl_key(ip);
+    rl_model_bucket_t* b = NULL;
+    for (size_t i = 0; i < m->count; i++)
+        if (m->buckets[i].key == key) b = &m->buckets[i];
+    if (b == NULL) {
+        if (m->count == RL_MAX_CLIENTS) __builtin_trap();  /* the input cannot name more */
+        b = &m->buckets[m->count++];
+        *b = (rl_model_bucket_t){ key, m->config.max_tokens, now, now };
+    }
+
+    /* Whole tokens, in 128 bits so that no pause is long enough to wrap. */
+    const unsigned __int128 add =
+        (unsigned __int128)__rl_elapsed(now, b->last_refill) * m->config.refill_rate / 1000000000ULL;
+    if (add > 0) {
+        const unsigned __int128 sum = (unsigned __int128)b->tokens + add;
+        b->tokens = sum > m->config.max_tokens ? m->config.max_tokens : (uint32_t)sum;
+        b->last_refill = now;
+    }
+    b->last_access = now;
+
+    if (b->tokens < tokens) return 0;
+    b->tokens -= tokens;
+    return 1;
+}
+
+static const char* const __rl_addresses[] = {
+    "192.0.2.1", "192.0.2.2", "10.0.0.1", "0.0.0.0", "255.255.255.255",
+    "2001:db8::1", "2001:db8::ffff:1", "[2001:db8::2]", "2001:db8:0:1::1",
+    "::1", "::", "::ffff:192.0.2.1", "fe80::1", "ffff:ffff:c000:201::1",
+    "not an address", "",
+};
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 4) return 0;
+
+    rl_model_t* m = calloc(1, sizeof *m);
+    if (m == NULL) return 0;
+
+    /* Small burst so that it runs out; a rate from one token a second to one
+     * large enough that elapsed*rate overflows 64 bits after a pause; an
+     * interval from "every call sweeps" to the longest there is. */
+    m->config.max_tokens = data[0];
+    m->config.refill_rate = ((uint32_t)data[1] | (uint32_t)(data[2] & 0x7f) << 8) << (data[2] & 0x80 ? 16 : 0);
+    m->config.time_window_ns = 1000000000ULL;
+    m->config.cleanup_interval_s = data[3] == 255 ? UINT32_MAX : data[3];
+    data += 4; size -= 4;
+
+    __rl_now = 1ULL << 40;
+    m->last_cleanup = __rl_now;
+    ratelimiter_set_time_source(__rl_clock);
+
+    ratelimiter_t* limiter = ratelimiter_init(&m->config);
+    if (limiter == NULL) __builtin_trap();
+
+    size_t pos = 0;
+    for (int record = 0; record < 4096 && pos + 3 <= size; record++) {
+        const uint8_t op = data[pos++];
+        const uint64_t arg = data[pos++];
+
+        switch (op & 3) {
+        case 1: __rl_now += arg * 1000000ULL; break;
+        case 2: __rl_now += arg << 32; break;
+        case 3: __rl_now = __rl_now > arg * 1000000ULL ? __rl_now - arg * 1000000ULL : 0; break;
+        }
+        if (__rl_now > 1ULL << 62) __rl_now = 1ULL << 62;
+
+        char text[64];
+        if (op & 4) {
+            size_t len = data[pos++] % sizeof text;
+            if (len > size - pos) len = size - pos;
+            memcpy(text, data + pos, len);
+            text[len] = '\0';
+            pos += len;
+        } else {
+            const size_t n = sizeof __rl_addresses / sizeof __rl_addresses[0];
+            snprintf(text, sizeof text, "%s", __rl_addresses[data[pos++] % n]);
+        }
+        if (pos >= size) break;
+
+        uint32_t tokens = data[pos++];
+        if (tokens == 254) tokens = m->config.max_tokens;
+        else if (tokens == 255) tokens = m->config.max_tokens + 1;
+
+        ipaddr_t ip;
+        const int parsed = ipaddr_parse(&ip, text);
+        const ipaddr_t* arg_ip = parsed ? &ip : NULL;
+
+        const int expected = __rl_model_allow(m, arg_ip, tokens, __rl_now);
+        const int got = ratelimiter_allow(limiter, arg_ip, tokens);
+        if (got != expected) __builtin_trap();
+
+        if (map_size(limiter->buckets) != m->count) __builtin_trap();
+        for (size_t i = 0; i < m->count; i++) {
+            const ratelimiter_bucket_t* b = map_find(limiter->buckets, (void*)(uintptr_t)m->buckets[i].key);
+            if (b == NULL || b->tokens != m->buckets[i].tokens) __builtin_trap();
+            if (b->tokens > m->config.max_tokens) __builtin_trap();
+        }
+    }
+
+    ratelimiter_free(limiter);
+    ratelimiter_set_time_source(NULL);
+    free(m);
 
     return 0;
 }
