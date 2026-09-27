@@ -20,6 +20,7 @@ typedef struct {
     char quote_char;        // The quote character (' or ") that started the string
     int in_line_comment;    // 1 if inside a line comment (--)
     int in_block_comment;   // 1 if inside a block comment (/* */)
+    size_t block_comment_start; // position of the '/' that opened it
 } sql_parse_state_t;
 
 static int __update_sql_parse_state(const char* query, size_t query_size, size_t* i, sql_parse_state_t* state);
@@ -164,15 +165,18 @@ int __update_sql_parse_state(const char* query, size_t query_size, size_t* i, sq
             return 1;
         }
 
-        // Block comment start
-        if (!state->in_line_comment && pos + 1 < query_size && query[pos] == '/' && query[pos+1] == '*') {
+        // Block comment start -- not inside one: SQL comments do not nest, and
+        // the '/' of a "*/" followed by '*' would otherwise reopen it.
+        if (!state->in_line_comment && !state->in_block_comment && pos + 1 < query_size && query[pos] == '/' && query[pos+1] == '*') {
             state->in_block_comment = 1;
+            state->block_comment_start = pos;
             (*i)++; // Skip asterisk
             return 1;
         }
 
-        // Block comment end
-        if (state->in_block_comment && pos > 0 && query[pos-1] == '*' && query[pos] == '/') {
+        // Block comment end -- a "*/" of its own, not the star of the opener:
+        // "/*/" is an open comment.
+        if (state->in_block_comment && pos >= state->block_comment_start + 3 && query[pos-1] == '*' && query[pos] == '/') {
             state->in_block_comment = 0;
             return 1;
         }
@@ -614,7 +618,7 @@ str_t* parse_sql_parameters(void* connection, const char* query, size_t query_si
     int in_param = 0;
 
     // Track string literals and comments to skip parameter parsing inside them
-    sql_parse_state_t parse_state = {0, 0, 0, 0};
+    sql_parse_state_t parse_state = {0, 0, 0, 0, 0};
 
     for (size_t i = 0; i < query_size; i++) {
         const unsigned char c = (unsigned char)query[i];
