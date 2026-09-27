@@ -211,6 +211,21 @@ TEST(test_db_query_builder_tail) {
     __assert_built("SELECT ':v', \"@w\", 'it''s :v'", "SELECT ':v', \"@w\", 'it''s :v'");
 }
 
+TEST(test_db_query_builder_block_comment) {
+    TEST_SUITE("dbquery builder");
+    TEST_CASE("a block comment ends at the first */ after its own /*");
+
+    /* Found by fuzz_db_query: the opening test ran inside a comment too, so
+     * the '/' of a "*" "/" that a '*' follows reopened it and the comment ran
+     * on; and the star of the opener counted as the star of "*" "/", so a
+     * comment starting with '/' closed at once. Either way, parameters were
+     * substituted inside the comment or not substituted outside it. */
+    __assert_built("SELECT 1 /* a */*:v", "SELECT 1 /* a */*<v>");
+    __assert_built("SELECT /*/ :v */ 1", "SELECT /*/ :v */ 1");
+    __assert_built("SELECT /**/ :v", "SELECT /**/ <v>");
+    __assert_built("SELECT /* /* :v */ :w", "SELECT /* /* :v */ <w>");
+}
+
 TEST(test_db_query_builder_param_boundary) {
     TEST_SUITE("dbquery builder");
     TEST_CASE("a parameter ends at a comment, a quote or a cast");
