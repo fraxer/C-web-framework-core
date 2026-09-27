@@ -480,6 +480,7 @@ Targets, each with a seed corpus under `fuzz/corpus/`:
 | `ratelimiter` | the token bucket in front of rate-limited routes: any schedule of clients, token counts and clock steps, forward and back |
 | `db_query` | the query layer on SQLite `:memory:`: templates, bound values, identifiers, lists, the result cursor, the insert/select/update/delete compilers (only with `-DINCLUDE_SQLITE=yes`) |
 | `db_model` | the model layer the feedback form writes through: create, read, update, delete and JSON of a schema like the form's, on SQLite `:memory:` (same condition) |
+| `quic_pmtud` | DPLPMTUD (RFC 8899) on a path whose MTU, losses and clock the input sets; the search must end, and the size stay within [base, ceiling] |
 
 An application registers its own with the same function, and `run.sh` picks
 them up from the manifest; the site's `fuzz_feedback` (in `backend/tests/`) is
@@ -550,6 +551,12 @@ broke it is saved like any crash:
   keeps the first arrival (overlaps, conflicting retransmissions, FIN and
   RESET_STREAM final sizes, the buffered cap) and `quicrange` against a bitset,
   near 0 and near `UINT64_MAX`; freeing must hand the QUIC memory budget back.
+  `quic_pmtud` drives the PMTU state machine with the calls quicconn.c makes
+  -- probe when due, the probe's ACK if the path carried it, other ACKs, the
+  probe timer, black holes -- and at the end a clean path on which the search
+  has to finish; `quic_conn`'s path has an MTU too (the ping's argument sets
+  it), so probes are lost for their size and a raised size can fall into a
+  black hole the server has to find.
   `db_query` generates each template from SQL words, literals, quoted
   identifiers, both comment forms and parameters followed by whatever may
   follow them, so the builder's output is known exactly; values of any bytes

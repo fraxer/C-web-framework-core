@@ -237,7 +237,7 @@ if(BUILD_FUZZERS STREQUAL "yes")
     if(INCLUDE_HTTP3 STREQUAL yes)
         list(APPEND FUZZ_TARGET_NAMES
             quic_packet quic_frame quic_tp h3_frame qpack_decode qpack_streams
-            h3_priority qpack_dynamic qpack_session quic_stream h3_request quic_conn)
+            h3_priority qpack_dynamic qpack_session quic_stream h3_request quic_conn quic_pmtud)
     endif()
 
     # The database layer on SQLite ":memory:": no server, but the driver only
@@ -281,6 +281,7 @@ if(BUILD_FUZZERS STREQUAL "yes")
     set(FUZZ_ID_ratelimiter 33)
     set(FUZZ_ID_db_query 34)
     set(FUZZ_ID_db_model 35)
+    set(FUZZ_ID_quic_pmtud 36)
 
     foreach(name ${FUZZ_TARGET_NAMES})
         set(exe fuzz_${name})
@@ -334,6 +335,7 @@ if(BUILD_FUZZERS STREQUAL "yes")
             FUZZ_RATELIMITER=33
             FUZZ_DB_QUERY=34
             FUZZ_DB_MODEL=35
+            FUZZ_QUIC_PMTUD=36
             FUZZ_TARGET=${FUZZ_ID_${name}}
         )
 

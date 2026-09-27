@@ -4885,7 +4885,8 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
  * client opening, writing, resetting and stopping streams, pinging, changing
  * address, updating keys, challenging the path, closing; the server answering;
  * bursts of loss and blackouts, damaged datagrams, the process stalling while
- * its clock runs on.
+ * its clock runs on, and a path MTU that PMTU probes run into and that can drop
+ * under a size already raised to.
  *
  * Every byte either side reads is checked against the pattern the other side
  * wrote, and a finished stream must have delivered exactly what was sent. The
@@ -5091,7 +5092,14 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             if (st[k].opened && quicclient_stop_sending(&s->client, 4 * k, arg))
                 st[k].responded = 0;        /* the server stops; the FIN may never come */
             break;
-        case 6: (void)quicclient_ping(&s->client); break;
+        case 6:
+            /* The ping's argument, unused otherwise, sets the path MTU: a
+             * probe over it is lost for its size, and a raised size it drops
+             * under is a black hole the server has to find its way out of.
+             * Never under the base (1350), which is all QUIC promises. */
+            if (arg & 0x80) s->mtu = arg == 0xff ? 0 : 1360 + (arg & 0x7f);
+            (void)quicclient_ping(&s->client);
+            break;
         case 7:
             if (s->client.handshake_complete && quicclient_rebind(&s->client)) {
                 /* The stand moves the client's address the way a NAT would. */
@@ -7222,6 +7230,152 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     dq_in_t in = { data + 1, data + size };
     if (data[0] % 2 == 0) __fm_script(&in);
     else __fm_types(&in);
+
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_QUIC_PMTUD
+
+#include "quicpmtud.h"
+
+/* DPLPMTUD (RFC 8899) as quicconn.c drives it, on a path the input controls:
+ * the path's MTU, which may change, whether a probe is lost for another
+ * reason, the clock, and the events -- a probe sent when one is due, the ACK
+ * of the probe or of any other packet, the probe timer, a black hole. The
+ * state machine needs no connection: quicconn.c only feeds it these calls.
+ *
+ * After every step: base <= current <= ceiling; a probe in flight is above
+ * the size in use and within the ceiling, with a finite deadline no earlier
+ * than when it was sent; the size rises only by the ACK of that probe, to
+ * the size probed, which the path carried; no more than QUICPMTUD_MAX_PROBES
+ * attempts at a size; an ACK, a timeout or a black hole repeated at once with
+ * the same arguments changes nothing.
+ *
+ * At the end the path stops losing and changing, and the search must finish
+ * in a bounded number of probes -- no probe repeated forever without its
+ * deadline moving. */
+
+typedef struct {
+    quicpmtud_t p;
+    uint64_t now;
+    size_t path;
+    uint64_t pn;
+    uint64_t sent_at;
+} pm_state_t;
+
+static void __pm_check(const pm_state_t* s) {
+    const quicpmtud_t* p = &s->p;
+    if (p->current < p->base || p->current > p->ceiling) __builtin_trap();
+    if (p->attempts > QUICPMTUD_MAX_PROBES) __builtin_trap();
+    if (p->outstanding) {
+        if (p->candidate <= p->current || p->candidate > p->ceiling) __builtin_trap();
+        const uint64_t d = quicpmtud_deadline(p);
+        if (d == 0 || d < s->sent_at) __builtin_trap();
+    } else if (quicpmtud_deadline(p) != 0) __builtin_trap();
+}
+
+/* The event repeated at once must be a no-op. */
+#define PM_TWICE(state, call) do { \
+    call; \
+    quicpmtud_t __snapshot = (state)->p; \
+    call; \
+    if (memcmp(&__snapshot, &(state)->p, sizeof __snapshot) != 0) __builtin_trap(); \
+} while (0)
+
+static void __pm_send(pm_state_t* s, uint64_t pto) {
+    if (!quicpmtud_should_probe(&s->p, s->now)) return;
+    const size_t target = quicpmtud_candidate(&s->p);
+    if (target <= s->p.current) return;                  /* what quicconn skips */
+    s->sent_at = s->now;
+    quicpmtud_on_probe_sent(&s->p, ++s->pn, s->now, pto);
+}
+
+/* The ACK of the probe, if the path carried it. */
+static void __pm_deliver(pm_state_t* s, uint64_t pto, int lost) {
+    if (!s->p.outstanding) return;
+    const size_t probed = s->p.candidate;
+    const size_t before = s->p.current;
+    if (lost || probed > s->path) return;
+    const uint64_t pn = s->p.probe_pn;
+    int raised = 0;
+    PM_TWICE(s, raised |= quicpmtud_on_ack(&s->p, pn, s->now, pto));
+    if (!raised || s->p.current != probed || s->p.current <= before) __builtin_trap();
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 4) return 0;
+
+    pm_state_t s = { 0 };
+    const size_t base = 1200 + data[0] % 200;
+    const size_t ceiling = 1200 + (size_t)(data[1] | data[2] << 8) % 400;
+    quicpmtud_init(&s.p, base, ceiling);
+    s.path = 1200 + (size_t)data[3] * 2;
+    s.now = 1000000;
+    __pm_check(&s);
+
+    for (size_t i = 4; i + 1 < size && i < 4 + 2 * 512; i += 2) {
+        const uint8_t op = data[i];
+        const uint8_t arg = data[i + 1];
+        const uint64_t pto = 1000 + (uint64_t)arg * 100;
+
+        switch (op % 7) {
+        case 0: s.now += (uint64_t)arg * 1000; break;
+        case 1: __pm_send(&s, pto); break;
+        case 2: __pm_deliver(&s, pto, arg & 1); break;
+        case 3: {
+            /* The ACK of some other packet. */
+            const quicpmtud_t before = s.p;
+            if (quicpmtud_on_ack(&s.p, s.pn + 1 + arg, s.now, pto)) __builtin_trap();
+            if (memcmp(&before, &s.p, sizeof before) != 0) __builtin_trap();
+            break;
+        }
+        case 4: {
+            const size_t before = s.p.current;
+            int flags = 0;
+            PM_TWICE(&s, flags |= quicpmtud_on_timeout(&s.p, s.now));
+            if (s.p.current != before) __builtin_trap();
+            (void)flags;
+            break;
+        }
+        case 5: {
+            const size_t before = s.p.current;
+            int taken = 0;
+            PM_TWICE(&s, taken |= quicpmtud_on_blackhole(&s.p, s.now, pto));
+            if (taken && (before == s.p.base || s.p.current != s.p.base || s.p.ceiling >= before)) __builtin_trap();
+            if (!taken && s.p.current != before) __builtin_trap();
+            break;
+        }
+        case 6:
+            s.path = 1200 + (size_t)arg * 2;
+            break;
+        }
+        __pm_check(&s);
+    }
+
+    /* Settle: a clean, stable path; the search has to end. */
+    const uint64_t pto = 10000;
+    for (int step = 0;; step++) {
+        if (step > 16 * QUICPMTUD_MAX_PROBES + 16) __builtin_trap();
+        if (s.p.outstanding) {
+            if (s.p.candidate <= s.path) __pm_deliver(&s, pto, 0);
+            else {
+                /* The timer fires at the deadline, or now if the clock has
+                 * already passed it. */
+                const uint64_t deadline = quicpmtud_deadline(&s.p);
+                if (deadline > s.now) s.now = deadline;
+                if (!(quicpmtud_on_timeout(&s.p, s.now) & QUICPMTUD_PROBE_LOST)) __builtin_trap();
+            }
+        } else if (s.p.current >= s.p.ceiling) {
+            break;
+        } else if (quicpmtud_should_probe(&s.p, s.now)) {
+            __pm_send(&s, pto);
+            if (!s.p.outstanding) break;                  /* nothing larger to try */
+        } else {
+            if (s.p.next_probe_us <= s.now) __builtin_trap();
+            s.now = s.p.next_probe_us;
+        }
+        __pm_check(&s);
+    }
 
     return 0;
 }

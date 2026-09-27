@@ -173,6 +173,11 @@ typedef struct stand {
     uint64_t delay_nth_to_server;
     int      blackhole_to_server;   /* everything, until cleared */
     int      blackhole_to_client;
+    /* The path MTU (UDP payload, 0 = none): a larger datagram is dropped as
+     * too big, in either direction, without the RNG being rolled. What makes
+     * a PMTU probe fail for its size rather than by chance, and what turns a
+     * raised size into a black hole when the MTU drops under it (RFC 8899). */
+    size_t   mtu;
     /* Damage the next datagrams in transit: one bit of one byte, the byte
      * picked from `corrupt_at`. Scripted like the drops above. A damaged
      * packet must fail authentication and be dropped as if lost -- unless the
@@ -317,6 +322,14 @@ static void __net_send(stand_t* s, const uint8_t* data, size_t len, int to_serve
         else s->lost_to_client++;
         __trace(s, "%s %zu bytes DROPPED (scripted)\n",
                 to_server ? "c->s" : "s->c", len);
+        return;
+    }
+
+    if (s->mtu != 0 && len > s->mtu) {
+        if (to_server) s->lost_to_server++;
+        else s->lost_to_client++;
+        __trace(s, "%s %zu bytes DROPPED (over the %zu-byte path MTU)\n",
+                to_server ? "c->s" : "s->c", len, s->mtu);
         return;
     }
 
