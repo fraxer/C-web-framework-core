@@ -499,169 +499,166 @@ dbhost_t* __get_host(const char* identificator) {
     return host;
 }
 
+#define MAX_PARAM_NAME 256
+
+/* A byte that ends a parameter name. */
+static int __sql_param_boundary(unsigned char c) {
+    return ispunct_custom(c) || iscntrl(c) || isspace(c);
+}
+
+/* Emits the parameter query[param_start..param_end) -- ':' or '@' and its
+ * name -- preceded by the template text since *position, and moves *position
+ * past it. A name that is empty or too long is not a parameter and stays in
+ * the text. 0 when the parameter is refused (unknown, or a list__ that is not
+ * a non-empty array). */
+static int __sql_emit_param(void* connection, const char* query, size_t param_start, size_t param_end,
+                            array_t* params, sql_param_processor_t processor, void* user_data,
+                            str_t* result_query, size_t* position) {
+    const size_t name_size = param_end - param_start - 1;
+    if (name_size == 0 || name_size >= MAX_PARAM_NAME)
+        return 1;
+
+    char param_name[MAX_PARAM_NAME];
+    memcpy(param_name, query + param_start + 1, name_size);
+    param_name[name_size] = 0;
+
+    const char parameter_type = query[param_start];
+    const char* param_name_p = param_name;
+    int is_in = 0;
+    if (starts_with_substr(param_name, "list__")) {
+        param_name_p += 6;
+        is_in = 1;
+    }
+
+    mfield_t* field = NULL;
+    for (size_t j = 0; j < array_size(params) && field == NULL; j++) {
+        mfield_t* candidate = array_get(params, j);
+        if (candidate != NULL && strcmp(param_name_p, candidate->name) == 0)
+            field = candidate;
+    }
+    if (field == NULL) {
+        log_error("parse_sql_parameters: param not found in params array <%s>\n", param_name_p);
+        return 0;
+    }
+
+    str_append(result_query, query + *position, param_start - *position);
+
+    if (!is_in) {
+        if (!processor(connection, parameter_type, param_name_p, field, result_query, user_data)) {
+            log_error("parse_sql_parameters: processor callback failed for param <%s>\n", param_name_p);
+            return 0;
+        }
+    } else {
+        if (field->type != MODEL_ARRAY) {
+            log_error("__build_query_processor: param @list__ requires array type <%s>\n", param_name);
+            return 0;
+        }
+
+        array_t* array = model_array(field);
+        const size_t size = array_size(array);
+        if (size == 0) {
+            log_error("__build_query_processor: empty array for list__ <%s>\n", param_name);
+            return 0;
+        }
+
+        // Expand each element through the same processor so a ':list__'
+        // becomes bound placeholders and '@list__' escaped identifiers,
+        // comma-separated.
+        for (size_t k = 0; k < size; k++) {
+            if (k > 0)
+                str_appendc(result_query, ',');
+
+            mfield_t elem;
+            if (!__sql_array_element_field(array, k, param_name_p, &elem)) {
+                log_error("parse_sql_parameters: failed to build list element field <%s>\n", param_name_p);
+                return 0;
+            }
+
+            const int ok = processor(connection, parameter_type, param_name_p, &elem, result_query, user_data);
+
+            // model_field_to_string may allocate _string for any type as its
+            // formatting buffer; the clone (if bound) owns an independent
+            // copy, so free the transient here.
+            if (elem.value._string != NULL)
+                str_free(elem.value._string);
+
+            if (!ok) {
+                log_error("parse_sql_parameters: processor failed for list element <%s>\n", param_name_p);
+                return 0;
+            }
+        }
+    }
+
+    *position = param_end;
+    return 1;
+}
+
 /**
  * Common SQL parameter parsing function
  * Parses SQL string and calls processor callback for each found parameter
  * Handles string literals, comments, and parameter detection
+ *
+ * A pending parameter is closed by the first boundary byte before that byte
+ * is looked at as SQL: a quote or a comment right after a name used to open
+ * the literal or the comment first, and the parameter -- with the rest of the
+ * template -- was lost. The text after the last parameter is appended once
+ * the scan is over, not on its last iteration, which a template ending inside
+ * a comment or a literal skipped (the query came out empty).
  */
 str_t* parse_sql_parameters(void* connection, const char* query, size_t query_size, array_t* params, sql_param_processor_t processor, void* user_data) {
-    #define MAX_PARAM_NAME 256
-    int param_start = -1;
-    char param_name[MAX_PARAM_NAME] = {0};
     str_t* result_query = str_create_empty(512);
     if (result_query == NULL) return NULL;
 
-    typedef struct {
-        size_t position;
-        size_t offset;
-    } point_t;
-
-    point_t point = {0, 0};
+    size_t position = 0;
+    size_t param_start = 0;
+    int in_param = 0;
 
     // Track string literals and comments to skip parameter parsing inside them
     sql_parse_state_t parse_state = {0, 0, 0, 0};
-    int skip_next_colon = 0;
 
     for (size_t i = 0; i < query_size; i++) {
-        // Update parser state based on current character
-        if (__update_sql_parse_state(query, query_size, &i, &parse_state)) {
-            continue;
-        }
+        const unsigned char c = (unsigned char)query[i];
 
-        // Skip parameter processing inside strings and comments
-        if (parse_state.in_string || parse_state.in_line_comment || parse_state.in_block_comment) {
-            continue;
-        }
-
-        // PostgreSQL type cast syntax :: — treat as literal SQL, not a parameter
-        if (query[i] == ':' && i + 1 < query_size && query[i + 1] == ':') {
-            if (param_start != -1) {
-                // Finalize pending parameter — ':' acts as boundary (ispunct_custom).
-                // Set flag to skip second ':' on next iteration, then fall through
-                // to parameter-end check (':' is ispunct_custom, so it triggers finalization).
-                skip_next_colon = 1;
-            } else {
-                i++;  // Skip second ':'
+        if (in_param) {
+            if (!__sql_param_boundary(c))
                 continue;
-            }
-            // Do NOT fall into the param-start block below — skip it.
-            goto param_end_check;
-        } else if (skip_next_colon && query[i] == ':') {
-            skip_next_colon = 0;
-            continue;
-        } else {
-            skip_next_colon = 0;
-        }
 
-        if (query[i] == ':' || query[i] == '@') {
-            if (param_start != -1) {
+            // Two names run together; '::' is PostgreSQL's cast and ends the name.
+            const int cast = c == ':' && i + 1 < query_size && query[i + 1] == ':';
+            if ((c == ':' || c == '@') && !cast) {
                 log_error("parse_sql_parameters: error param concats\n");
                 goto failed;
             }
 
-            param_start = i;
-            point.offset = i;
+            if (!__sql_emit_param(connection, query, param_start, i, params, processor, user_data, result_query, &position))
+                goto failed;
+            in_param = 0;
+        }
+
+        // Update parser state based on current character
+        if (__update_sql_parse_state(query, query_size, &i, &parse_state))
+            continue;
+
+        // Skip parameter processing inside strings and comments
+        if (parse_state.in_string || parse_state.in_line_comment || parse_state.in_block_comment)
+            continue;
+
+        // PostgreSQL type cast syntax :: — treat as literal SQL, not a parameter
+        if (c == ':' && i + 1 < query_size && query[i + 1] == ':') {
+            i++;
             continue;
         }
 
-        param_end_check:
-        ; // Check parameter end
-        const int string_end = i == query_size - 1;
-        // Cast to unsigned char to safely handle non-ASCII bytes and avoid undefined behavior with ctype functions
-        const int is_spec_symbol = ispunct_custom((unsigned char)query[i]) ||
-                                   iscntrl((unsigned char)query[i]) ||
-                                   isspace((unsigned char)query[i]);
-        if (param_start != -1 && (is_spec_symbol || string_end)) {
-            const size_t param_end = (string_end && !is_spec_symbol) ? i + 1 : i;
-            const char parameter_type = query[param_start];
-
-            size_t name_size = param_end - param_start - 1;
-            if (name_size > 0 && name_size < MAX_PARAM_NAME) {
-                // Safe copy with buffer size consideration
-                size_t copy_size = (name_size < MAX_PARAM_NAME - 1) ? name_size : MAX_PARAM_NAME - 1;
-                memcpy(param_name, query + param_start + 1, copy_size);
-                param_name[copy_size] = 0;
-
-                int param_finded = 0;
-                int is_in = 0;
-                const char* param_name_p = param_name;
-
-                if (starts_with_substr(param_name, "list__")) {
-                    param_name_p += 6;
-                    is_in = 1;
-                }
-
-                for (size_t j = 0; j < array_size(params); j++) {
-                    mfield_t* field = array_get(params, j);
-                    if (field != NULL && strcmp(param_name_p, field->name) == 0) {
-                        str_append(result_query, query + point.position, point.offset - point.position);
-
-                        if (is_in) {
-                            // Process list__ parameter
-                            if (field->type != MODEL_ARRAY) {
-                                log_error("__build_query_processor: param @list__ requires array type <%s>\n", param_name);
-                                return 0;
-                            }
-
-                            array_t* array = model_array(field);
-                            const size_t size = array_size(array);
-                            if (size == 0) {
-                                log_error("__build_query_processor: empty array for list__ <%s>\n", param_name);
-                                return 0;
-                            }
-
-                            // Expand each element through the same processor so a
-                            // ':list__' becomes bound placeholders and '@list__'
-                            // escaped identifiers, comma-separated.
-                            for (size_t k = 0; k < size; k++) {
-                                if (k > 0)
-                                    str_appendc(result_query, ',');
-
-                                mfield_t elem;
-                                if (!__sql_array_element_field(array, k, param_name_p, &elem)) {
-                                    log_error("parse_sql_parameters: failed to build list element field <%s>\n", param_name_p);
-                                    goto failed;
-                                }
-
-                                const int ok = processor(connection, parameter_type, param_name_p, &elem, result_query, user_data);
-
-                                // model_field_to_string may allocate _string for any
-                                // type as its formatting buffer; the clone (if bound)
-                                // owns an independent copy, so free the transient here.
-                                if (elem.value._string != NULL)
-                                    str_free(elem.value._string);
-
-                                if (!ok) {
-                                    log_error("parse_sql_parameters: processor failed for list element <%s>\n", param_name_p);
-                                    goto failed;
-                                }
-                            }
-                        } else {
-                            // Call processor callback to handle the parameter
-                            if (!processor(connection, parameter_type, param_name_p, field, result_query, user_data)) {
-                                log_error("parse_sql_parameters: processor callback failed for param <%s>\n", param_name_p);
-                                goto failed;
-                            }
-                        }
-
-                        point.position = param_end;
-                        point.offset = param_end;
-                        param_finded = 1;
-                        break;
-                    }
-                }
-
-                if (!param_finded) {
-                    log_error("parse_sql_parameters: param not found in params array <%s>\n", param_name_p);
-                    goto failed;
-                }
-            }
-            param_start = -1;
+        if (c == ':' || c == '@') {
+            param_start = i;
+            in_param = 1;
         }
-
-        if (param_start == -1 && string_end)
-            str_append(result_query, query + point.position, (i + 1) - point.position);
     }
+
+    if (in_param && !__sql_emit_param(connection, query, param_start, query_size, params, processor, user_data, result_query, &position))
+        goto failed;
+
+    str_append(result_query, query + position, query_size - position);
 
     return result_query;
 
