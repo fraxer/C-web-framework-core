@@ -233,12 +233,13 @@ if(BUILD_FUZZERS STREQUAL "yes")
         huffman hpack h2_frame json cookie urlencoded multipart request request_sequence
         websocket websocket_sequence ws_deflate h2_session h2_connection http_response
         smtp_response jwt h1_connection text mail_message ratelimiter session_crypto
-        misc_containers gzip)
+        misc_containers gzip view)
 
     if(INCLUDE_HTTP3 STREQUAL yes)
         list(APPEND FUZZ_TARGET_NAMES
             quic_packet quic_frame quic_tp h3_frame qpack_decode qpack_streams
-            h3_priority qpack_dynamic qpack_session quic_stream h3_request quic_conn quic_pmtud)
+            h3_priority qpack_dynamic qpack_session quic_stream h3_request quic_conn quic_pmtud
+            h3_response)
     endif()
 
     # The database layer on SQLite ":memory:": no server, but the driver only
@@ -286,6 +287,8 @@ if(BUILD_FUZZERS STREQUAL "yes")
     set(FUZZ_ID_session_crypto 37)
     set(FUZZ_ID_misc_containers 38)
     set(FUZZ_ID_gzip 39)
+    set(FUZZ_ID_h3_response 40)
+    set(FUZZ_ID_view 41)
 
     foreach(name ${FUZZ_TARGET_NAMES})
         set(exe fuzz_${name})
@@ -343,6 +346,8 @@ if(BUILD_FUZZERS STREQUAL "yes")
             FUZZ_SESSION_CRYPTO=37
             FUZZ_MISC_CONTAINERS=38
             FUZZ_GZIP=39
+            FUZZ_H3_RESPONSE=40
+            FUZZ_VIEW=41
             FUZZ_TARGET=${FUZZ_ID_${name}}
         )
 
@@ -370,6 +375,8 @@ if(BUILD_FUZZERS STREQUAL "yes")
             ${CMAKE_CURRENT_SOURCE_DIR}/../framework/database
             ${CMAKE_CURRENT_SOURCE_DIR}/../framework/model
             ${CMAKE_CURRENT_SOURCE_DIR}/../framework/session
+            ${CMAKE_CURRENT_SOURCE_DIR}/../framework/view
+            ${CMAKE_CURRENT_SOURCE_DIR}/../framework/storage
         )
 
         target_link_libraries(${exe} PRIVATE
