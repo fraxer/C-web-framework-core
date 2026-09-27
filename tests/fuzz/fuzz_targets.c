@@ -8013,6 +8013,1121 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     return 0;
 }
 
+#elif FUZZ_TARGET == FUZZ_MISC_CONTAINERS
+
+#include <math.h>
+#include <stdio.h>
+#include "arena.h"
+#include "array.h"
+#include "bufo.h"
+#include "hashmap.h"
+#include "map.h"
+#include "str.h"
+
+/* The containers of misc/ that every other target leans on without looking at
+ * them: arena, array, map (red-black tree), hashmap, str, bufo. Each one runs
+ * next to a model written here from its header -- a plain list, a byte buffer
+ * -- and after every operation the container must agree with the model: what
+ * was inserted is found with the same value until it is erased, the count is
+ * the number of inserts that took minus the erases that did, an iteration
+ * yields each key exactly once (the map in strict order, forwards and back),
+ * growth and rehash lose and duplicate nothing, and appends leave exactly the
+ * concatenation. Everything is freed at the end, so a leak is LeakSanitizer's.
+ *
+ * Input: one byte of configuration (hashmap capacity, load factor and hash,
+ * str initial capacity), then records of
+ *   [selector] [length] [length bytes of argument]
+ * selector % 6 picks the container, selector / 6 the operation. */
+
+#define MC_MAX_RECORDS 2048
+#define MC_KEY_MAX 8
+#define MC_BUFO_LIMIT (10 * 1024 * 1024)
+
+static uint32_t __mc_u32(const uint8_t* a, size_t n, size_t at) {
+    uint32_t v = 0;
+    for (size_t i = 0; i < 4; i++)
+        v = v << 8 | (at + i < n ? a[at + i] : 0);
+    return v;
+}
+
+static uint16_t __mc_u16(const uint8_t* a, size_t n, size_t at) {
+    return (uint16_t)(__mc_u32(a, n, at) >> 16);
+}
+
+static void* __mc_xmalloc(size_t n) {
+    void* p = malloc(n ? n : 1);
+    if (p == NULL) abort();
+    return p;
+}
+
+/* ---- keyed containers: one model for map and hashmap ---- */
+
+typedef struct {
+    char* keys[MC_MAX_RECORDS];
+    intptr_t values[MC_MAX_RECORDS];
+    size_t count;
+} mc_keyed_t;
+
+static char* __mc_key(const uint8_t* a, size_t n) {
+    return strndup((const char*)a, n < MC_KEY_MAX ? n : MC_KEY_MAX);
+}
+
+static ssize_t __mc_keyed_find(const mc_keyed_t* m, const char* key) {
+    for (size_t i = 0; i < m->count; i++)
+        if (strcmp(m->keys[i], key) == 0) return (ssize_t)i;
+    return -1;
+}
+
+static void __mc_keyed_put(mc_keyed_t* m, const char* key, intptr_t value) {
+    const ssize_t at = __mc_keyed_find(m, key);
+    if (at >= 0) { m->values[at] = value; return; }
+    if (m->count == MC_MAX_RECORDS) abort();
+    m->keys[m->count] = strdup(key);
+    if (m->keys[m->count] == NULL) abort();
+    m->values[m->count++] = value;
+}
+
+static void __mc_keyed_erase(mc_keyed_t* m, const char* key) {
+    const ssize_t at = __mc_keyed_find(m, key);
+    if (at < 0) return;
+    free(m->keys[at]);
+    m->keys[at] = m->keys[--m->count];
+    m->values[at] = m->values[m->count];
+}
+
+static void __mc_keyed_clear(mc_keyed_t* m) {
+    for (size_t i = 0; i < m->count; i++) free(m->keys[i]);
+    m->count = 0;
+}
+
+/* ---- map: string keys copied and freed by the map, boxed values it frees ---- */
+
+static intptr_t __mc_unbox(void* v) {
+    return v == NULL ? 0 : *(intptr_t*)v;
+}
+
+static void* __mc_box(intptr_t v) {
+    intptr_t* p = __mc_xmalloc(sizeof *p);
+    *p = v;
+    return p;
+}
+
+/* Red-black invariants: the root and nil are black, a red node has black
+ * children, every path has the same black count, parents point back, and an
+ * in-order walk is strictly increasing. Returns the black height. */
+static int __mc_rb_check(map_t* map, map_node_t* node, map_node_t* parent, size_t* count) {
+    if (node == map->nil) return 1;
+    if (node->parent != parent) __builtin_trap();
+    if (node->color == MAP_RED &&
+        (node->left->color != MAP_BLACK || node->right->color != MAP_BLACK)) __builtin_trap();
+    if (node->left != map->nil && strcmp(node->left->key, node->key) >= 0) __builtin_trap();
+    if (node->right != map->nil && strcmp(node->right->key, node->key) <= 0) __builtin_trap();
+    const int l = __mc_rb_check(map, node->left, node, count);
+    const int r = __mc_rb_check(map, node->right, node, count);
+    if (l != r) __builtin_trap();
+    (*count)++;
+    return l + (node->color == MAP_BLACK);
+}
+
+static void __mc_map_verify(map_t* map, const mc_keyed_t* m) {
+    if (map_size(map) != m->count || map_empty(map) != (m->count == 0)) __builtin_trap();
+    if (map->nil->color != MAP_BLACK || map->root->color != MAP_BLACK) __builtin_trap();
+    size_t count = 0;
+    __mc_rb_check(map, map->root, map->nil, &count);
+    if (count != m->count) __builtin_trap();
+}
+
+static void __mc_map_walk(map_t* map, const mc_keyed_t* m, int backwards) {
+    map_iterator_t it = backwards ? map_prev(map_end(map)) : map_begin(map);
+    const char* last = NULL;
+    size_t seen = 0;
+    for (; map_iterator_valid(it); it = backwards ? map_prev(it) : map_next(it)) {
+        const char* key = map_iterator_key(it);
+        if (last != NULL && (backwards ? strcmp(key, last) >= 0 : strcmp(key, last) <= 0)) __builtin_trap();
+        const ssize_t at = __mc_keyed_find(m, key);
+        if (at < 0 || m->values[at] != __mc_unbox(map_iterator_value(it))) __builtin_trap();
+        last = key;
+        if (++seen > m->count) __builtin_trap();
+    }
+    if (seen != m->count) __builtin_trap();
+}
+
+static void __mc_map(map_t* map, mc_keyed_t* m, unsigned op, const uint8_t* a, size_t n, intptr_t id) {
+    char* key = __mc_key(a, n);
+    if (key == NULL) abort();
+    const ssize_t at = __mc_keyed_find(m, key);
+
+    switch (op % 9) {
+    case 0: {
+        void* box = __mc_box(id);
+        const int r = map_insert(map, key, box);
+        if (r != (at < 0 ? 1 : 0)) __builtin_trap();
+        if (r == 1) __mc_keyed_put(m, key, id);
+        else free(box); /* refused: the value is still the caller's */
+        break;
+    }
+    case 1:
+        if (map_insert_or_assign(map, key, __mc_box(id)) != (at < 0 ? 1 : 2)) __builtin_trap();
+        __mc_keyed_put(m, key, id);
+        break;
+    case 2:
+        if (__mc_unbox(map_find(map, key)) != (at < 0 ? 0 : m->values[at])) __builtin_trap();
+        break;
+    case 3:
+        if (map_erase(map, key) != (at >= 0)) __builtin_trap();
+        __mc_keyed_erase(m, key);
+        break;
+    case 4:
+        if (map_contains(map, key) != (at >= 0)) __builtin_trap();
+        break;
+    case 5: __mc_map_walk(map, m, 0); break;
+    case 6: __mc_map_walk(map, m, 1); break;
+    case 7: __mc_map_verify(map, m); break;
+    case 8:
+        map_clear(map);
+        __mc_keyed_clear(m);
+        break;
+    }
+    free(key);
+    __mc_map_verify(map, m);
+}
+
+/* ---- hashmap: string keys copied and freed, plain integer values ---- */
+
+/* The length alone: every key of one length collides, so chains get long. */
+static uint64_t __mc_weak_hash(const void* key) {
+    return strlen(key);
+}
+
+static void __mc_hashmap_verify(hashmap_t* h, const mc_keyed_t* m) {
+    if (hashmap_size(h) != m->count || hashmap_empty(h) != (m->count == 0)) __builtin_trap();
+    size_t in_buckets = 0;
+    for (size_t i = 0; i < h->capacity; i++)
+        for (hashmap_entry_t* e = h->buckets[i]; e != NULL; e = e->next) {
+            if (e->hash != h->hash(e->key) || e->hash % h->capacity != i) __builtin_trap();
+            if (++in_buckets > m->count) __builtin_trap();
+        }
+    if (in_buckets != m->count) __builtin_trap();
+}
+
+static void __mc_hashmap_walk(hashmap_t* h, const mc_keyed_t* m) {
+    uint8_t seen[MC_MAX_RECORDS] = {0};
+    size_t count = 0;
+    hashmap_foreach(h, it) {
+        const ssize_t at = __mc_keyed_find(m, hashmap_iterator_key(it));
+        if (at < 0 || seen[at]++ || m->values[at] != (intptr_t)hashmap_iterator_value(it)) __builtin_trap();
+        count++;
+    }
+    if (count != m->count) __builtin_trap();
+    if (hashmap_iterator_valid(hashmap_end(h))) __builtin_trap();
+}
+
+static void __mc_hashmap(hashmap_t* h, mc_keyed_t* m, unsigned op, const uint8_t* a, size_t n, intptr_t id) {
+    char* key = __mc_key(a, n);
+    if (key == NULL) abort();
+    const ssize_t at = __mc_keyed_find(m, key);
+
+    switch (op % 9) {
+    case 0: {
+        const int r = hashmap_insert(h, key, (void*)id);
+        if (r != (at < 0 ? 1 : 0)) __builtin_trap();
+        if (r == 1) __mc_keyed_put(m, key, id);
+        break;
+    }
+    case 1:
+        if (hashmap_insert_or_assign(h, key, (void*)id) != (at < 0 ? 1 : 2)) __builtin_trap();
+        __mc_keyed_put(m, key, id);
+        break;
+    case 2:
+        if ((intptr_t)hashmap_find(h, key) != (at < 0 ? 0 : m->values[at])) __builtin_trap();
+        break;
+    case 3:
+        if (hashmap_erase(h, key) != (at >= 0)) __builtin_trap();
+        __mc_keyed_erase(m, key);
+        break;
+    case 4:
+        if (hashmap_contains(h, key) != (at >= 0)) __builtin_trap();
+        break;
+    case 5: __mc_hashmap_walk(h, m); break;
+    case 6: {
+        const size_t want = __mc_u16(a, n, 0) % 512;
+        const int r = hashmap_rehash(h, want);
+        if (r != (want == 0 || want < m->count ? -1 : 0)) __builtin_trap();
+        if (r == 0 && h->capacity != want) __builtin_trap();
+        break;
+    }
+    case 7: {
+        const size_t want = __mc_u16(a, n, 0);
+        if (hashmap_reserve(h, want) != 0) __builtin_trap();
+        if (h->capacity < 16 || (double)want > (double)h->capacity * (double)h->load_factor) __builtin_trap();
+        break;
+    }
+    case 8:
+        hashmap_clear(h);
+        __mc_keyed_clear(m);
+        break;
+    }
+    free(key);
+    __mc_hashmap_verify(h, m);
+}
+
+/* ---- array: typed values, the model keeps what each one must read back as ---- */
+
+typedef enum { MC_INT, MC_DOUBLE, MC_LDOUBLE, MC_STRING, MC_OWNED, MC_BORROWED, MC_UNCOPYABLE } mc_kind_t;
+
+typedef struct {
+    mc_kind_t kind;
+    int i;
+    double d;
+    long double ld;
+    char* bytes;     /* MC_STRING: what the element must hold; pointers: the blob */
+    size_t length;   /* MC_STRING: the length the array records */
+    size_t blob;     /* pointers: blob size */
+} mc_value_t;
+
+typedef struct {
+    mc_value_t items[MC_MAX_RECORDS];
+    size_t count;
+} mc_array_t;
+
+static const char __mc_borrowed[] = "borrowed";
+
+typedef struct { size_t size; uint8_t bytes[]; } mc_blob_t;
+
+static void* __mc_blob_copy(void* p) {
+    const mc_blob_t* b = p;
+    mc_blob_t* c = __mc_xmalloc(sizeof *c + b->size);
+    memcpy(c, b, sizeof *c + b->size);
+    return c;
+}
+
+/* The value for the array, and the model's record of it. */
+static avalue_t __mc_value(const uint8_t* a, size_t n, mc_value_t* v) {
+    memset(v, 0, sizeof *v);
+    const uint8_t kind = n > 0 ? a[0] : 0;
+    if (n > 0) { a++; n--; }
+    switch (kind % 7) {
+    case 0:
+        v->kind = MC_INT;
+        v->i = (int)__mc_u32(a, n, 0);
+        return array_create_int(v->i);
+    case 1: {
+        v->kind = MC_DOUBLE;
+        uint8_t raw[8] = {0};
+        memcpy(raw, a, n < 8 ? n : 8);
+        memcpy(&v->d, raw, 8);
+        return array_create_double(v->d);
+    }
+    case 2:
+        v->kind = MC_LDOUBLE;
+        v->ld = (long double)(int)__mc_u32(a, n, 0) / 7.0L;
+        return array_create_ldouble(v->ld);
+    case 3: {
+        /* array_create_stringn copies up to the first NUL and pads with zeros
+         * to the length it was given, which it keeps. */
+        v->kind = MC_STRING;
+        v->length = n;
+        v->bytes = __mc_xmalloc(n + 1);
+        const size_t text = strnlen((const char*)a, n);
+        memcpy(v->bytes, a, text);
+        memset(v->bytes + text, 0, n + 1 - text);
+        return array_create_stringn((const char*)a, n);
+    }
+    case 4: case 6: {
+        mc_blob_t* b = __mc_xmalloc(sizeof *b + n);
+        b->size = n;
+        memcpy(b->bytes, a, n);
+        v->kind = kind % 7 == 4 ? MC_OWNED : MC_UNCOPYABLE;
+        v->bytes = (char*)b;
+        return array_create_pointer(b, v->kind == MC_OWNED ? __mc_blob_copy : NULL, free);
+    }
+    default:
+        v->kind = MC_BORROWED;
+        v->bytes = (char*)__mc_borrowed;
+        return array_create_pointer((void*)__mc_borrowed, NULL, NULL);
+    }
+}
+
+static void __mc_value_forget(mc_value_t* v) {
+    /* The array owns the blob of an owned pointer; the model only points. */
+    if (v->kind == MC_STRING) free(v->bytes);
+    v->bytes = NULL;
+}
+
+static int __mc_same_double(double a, double b) {
+    return memcmp(&a, &b, sizeof a) == 0;
+}
+
+static int __mc_same_ldouble(long double a, long double b) {
+    return a == b || (isnan(a) && isnan(b));
+}
+
+static void __mc_element_check(array_t* arr, size_t at, const mc_value_t* v, int deep_copy) {
+    const avalue_t* e = &arr->elements[at];
+    switch (v->kind) {
+    case MC_INT:
+        if (e->type != ARRAY_INT || array_get_int(arr, at) != v->i) __builtin_trap();
+        if (*(int*)array_get(arr, at) != v->i) __builtin_trap();
+        break;
+    case MC_DOUBLE:
+        if (e->type != ARRAY_DOUBLE || !__mc_same_double(array_get_double(arr, at), v->d)) __builtin_trap();
+        break;
+    case MC_LDOUBLE:
+        if (e->type != ARRAY_LONGDOUBLE || !__mc_same_ldouble(array_get_ldouble(arr, at), v->ld)) __builtin_trap();
+        break;
+    case MC_STRING:
+        if (e->type != ARRAY_STRING || e->_length != v->length) __builtin_trap();
+        if (memcmp(array_get_string(arr, at), v->bytes, v->length + 1) != 0) __builtin_trap();
+        if (array_get(arr, at) != (void*)array_get_string(arr, at)) __builtin_trap();
+        break;
+    case MC_OWNED: case MC_UNCOPYABLE: case MC_BORROWED: {
+        if (e->type != ARRAY_POINTER) __builtin_trap();
+        void* p = array_get_pointer(arr, at);
+        if (v->kind == MC_BORROWED || !deep_copy) {
+            if (p != v->bytes) __builtin_trap();
+        } else {
+            const mc_blob_t* want = (const mc_blob_t*)v->bytes;
+            if (p == v->bytes || memcmp(p, want, sizeof *want + want->size) != 0) __builtin_trap();
+        }
+        break;
+    }
+    }
+    /* A getter of the wrong type reads nothing. */
+    if (v->kind != MC_INT && array_get_int(arr, at) != 0) __builtin_trap();
+    if (v->kind != MC_STRING && array_get_string(arr, at) != NULL) __builtin_trap();
+    if (v->kind < MC_OWNED && array_get_pointer(arr, at) != NULL) __builtin_trap();
+}
+
+static void __mc_array_verify(array_t* arr, const mc_array_t* m) {
+    if (array_size(arr) != m->count || arr->size > arr->capacity) __builtin_trap();
+    for (size_t i = 0; i < m->count; i++) __mc_element_check(arr, i, &m->items[i], 0);
+}
+
+static void __mc_array_to_string(array_t* arr, const mc_array_t* m, size_t at) {
+    str_t* s = array_item_to_string(arr, at);
+    if (at >= m->count) { if (s != NULL) __builtin_trap(); return; }
+    const mc_value_t* v = &m->items[at];
+    char want[1024];
+    int len = -1;
+    switch (v->kind) {
+    case MC_INT: len = snprintf(want, sizeof want, "%d", v->i); break;
+    case MC_DOUBLE: len = snprintf(want, sizeof want, "%.12f", v->d); break;
+    case MC_LDOUBLE: len = snprintf(want, sizeof want, "%.17Lg", v->ld); break;
+    case MC_STRING: len = (int)strlen(v->bytes); break;
+    default: break;
+    }
+    if (len < 0) { if (s != NULL) __builtin_trap(); return; }
+    if (s == NULL || str_size(s) != (size_t)len) __builtin_trap();
+    if (v->kind != MC_STRING && memcmp(str_get(s), want, (size_t)len) != 0) __builtin_trap();
+    if (v->kind == MC_STRING && memcmp(str_get(s), v->bytes, (size_t)len) != 0) __builtin_trap();
+    str_free(s);
+}
+
+static void __mc_array(array_t* arr, mc_array_t* m, unsigned op, const uint8_t* a, size_t n) {
+    const size_t index = n > 0 ? a[0] % (m->count + 2) : 0; /* one past the end, and further */
+    const uint8_t* rest = n > 0 ? a + 1 : a;
+    const size_t rest_n = n > 0 ? n - 1 : 0;
+
+    switch (op % 10) {
+    case 0: case 1: case 2: {
+        if (m->count == MC_MAX_RECORDS) break;
+        mc_value_t v;
+        const avalue_t value = __mc_value(rest, rest_n, &v);
+        const size_t at = op % 10 == 0 ? m->count : op % 10 == 1 ? 0 : index;
+        if (op % 10 == 0) array_push_back(arr, value);
+        else if (op % 10 == 1) array_push_front(arr, value);
+        else array_insert(arr, at, value);
+        if (at > m->count) { __mc_value_forget(&v); break; } /* refused, and freed */
+        memmove(&m->items[at + 1], &m->items[at], (m->count - at) * sizeof m->items[0]);
+        m->items[at] = v;
+        m->count++;
+        break;
+    }
+    case 3: {
+        mc_value_t v;
+        array_update(arr, index, __mc_value(rest, rest_n, &v));
+        if (index >= m->count) { __mc_value_forget(&v); break; } /* refused */
+        __mc_value_forget(&m->items[index]);
+        m->items[index] = v;
+        break;
+    }
+    case 4:
+        array_delete(arr, index);
+        if (index >= m->count) break;
+        __mc_value_forget(&m->items[index]);
+        memmove(&m->items[index], &m->items[index + 1], (m->count - index - 1) * sizeof m->items[0]);
+        m->count--;
+        break;
+    case 5:
+        if (index < m->count) __mc_element_check(arr, index, &m->items[index], 0);
+        else if (array_get(arr, index) != NULL || array_get_string(arr, index) != NULL) __builtin_trap();
+        break;
+    case 6: __mc_array_to_string(arr, m, index); break;
+    case 7: {
+        array_t* copy = array_copy(arr);
+        int copyable = 1;
+        for (size_t i = 0; i < m->count; i++)
+            if (m->items[i].kind == MC_UNCOPYABLE) copyable = 0;
+        if ((copy != NULL) != copyable) __builtin_trap();
+        if (copy == NULL) break;
+        if (array_size(copy) != m->count) __builtin_trap();
+        for (size_t i = 0; i < m->count; i++) __mc_element_check(copy, i, &m->items[i], 1);
+        array_free(copy);
+        break;
+    }
+    case 8:
+        array_clear(arr);
+        for (size_t i = 0; i < m->count; i++) __mc_value_forget(&m->items[i]);
+        m->count = 0;
+        break;
+    case 9: break;
+    }
+    __mc_array_verify(arr, m);
+}
+
+/* ---- str: bytes, NUL included, against a plain buffer ---- */
+
+typedef struct {
+    char* bytes;
+    size_t size;
+} mc_bytes_t;
+
+static void __mc_bytes_splice(mc_bytes_t* b, size_t pos, const void* p, size_t n) {
+    char* grown = realloc(b->bytes, b->size + n + 1);
+    if (grown == NULL) abort();
+    b->bytes = grown;
+    memmove(b->bytes + pos + n, b->bytes + pos, b->size - pos);
+    memcpy(b->bytes + pos, p, n);
+    b->size += n;
+}
+
+static void __mc_str_verify(str_t* s, const mc_bytes_t* b) {
+    if (str_size(s) != b->size) __builtin_trap();
+    const char* got = str_get(s);
+    if (memcmp(got, b->bytes, b->size) != 0 || got[b->size] != '\0') __builtin_trap();
+    if (s->is_dynamic ? s->capacity <= s->size : s->size >= STR_SSO_SIZE) __builtin_trap();
+    if (str_last(s) != (b->size ? b->bytes[b->size - 1] : '\0')) __builtin_trap();
+}
+
+static int __mc_sign(int v) {
+    return (v > 0) - (v < 0);
+}
+
+static void __mc_str(str_t** s, mc_bytes_t* b, unsigned op, const uint8_t* a, size_t n) {
+    const int w = (op / 12) & 1;
+    str_t* str = s[w];
+    mc_bytes_t* m = &b[w];
+    const size_t pos = n > 0 ? a[0] % (m->size + 2) : 0;
+    const uint8_t* rest = n > 0 ? a + 1 : a;
+    const size_t rest_n = n > 0 ? n - 1 : 0;
+
+    switch (op % 12) {
+    case 0:
+        if (!str_append(str, (const char*)a, n)) __builtin_trap();
+        __mc_bytes_splice(m, m->size, a, n);
+        break;
+    case 1:
+        if (!str_prepend(str, (const char*)a, n)) __builtin_trap();
+        __mc_bytes_splice(m, 0, a, n);
+        break;
+    case 2:
+        if (str_insert(str, (const char*)rest, rest_n, pos) != (pos <= m->size)) __builtin_trap();
+        if (pos <= m->size) __mc_bytes_splice(m, pos, rest, rest_n);
+        break;
+    case 3: {
+        const char c = rest_n ? (char)rest[0] : 'x';
+        if (!str_appendc(str, c)) __builtin_trap();
+        __mc_bytes_splice(m, m->size, &c, 1);
+        break;
+    }
+    case 4: {
+        const char c = rest_n ? (char)rest[0] : 'x';
+        if (str_insertc(str, c, pos) != (pos <= m->size)) __builtin_trap();
+        if (pos <= m->size) __mc_bytes_splice(m, pos, &c, 1);
+        break;
+    }
+    case 5:
+        if (!str_assign(str, (const char*)a, n)) __builtin_trap();
+        m->size = 0;
+        __mc_bytes_splice(m, 0, a, n);
+        break;
+    case 6:
+        if (!str_reserve(str, __mc_u16(a, n, 0) % 8192)) __builtin_trap();
+        break;
+    case 7:
+        if (str_pop(str) != (m->size > 0)) __builtin_trap();
+        if (m->size > 0) m->size--;
+        break;
+    case 8: {
+        char* copy = str_copy(str);
+        if (copy == NULL || memcmp(copy, m->bytes, m->size) != 0 || copy[m->size] != '\0') __builtin_trap();
+        free(copy);
+        /* Compared as C strings: up to the first NUL of each. */
+        char* x = strndup(b[0].bytes, b[0].size);
+        char* y = strndup(b[1].bytes, b[1].size);
+        if (x == NULL || y == NULL) abort();
+        if (__mc_sign(str_cmp(s[0], s[1])) != __mc_sign(strcmp(x, y))) __builtin_trap();
+        free(x); free(y);
+        break;
+    }
+    case 9:
+        if (rest_n & 1) str_clear(str);
+        else if (!str_reset(str)) __builtin_trap();
+        m->size = 0;
+        break;
+    case 10: {
+        /* Into the other one; this one is left empty. */
+        if (!str_move(str, s[!w])) __builtin_trap();
+        mc_bytes_t* other = &b[!w];
+        other->size = 0;
+        __mc_bytes_splice(other, 0, m->bytes, m->size);
+        m->size = 0;
+        __mc_str_verify(s[!w], other);
+        break;
+    }
+    case 11: {
+        const int len = (int)(rest_n < 4096 ? rest_n : 4096);
+        if (!str_appendf(str, "%.*s|%d", len, (const char*)rest, len)) __builtin_trap();
+        const size_t text = strnlen((const char*)rest, (size_t)len);
+        char tail[16];
+        const int t = snprintf(tail, sizeof tail, "|%d", len);
+        __mc_bytes_splice(m, m->size, rest, text);
+        __mc_bytes_splice(m, m->size, tail, (size_t)t);
+        break;
+    }
+    }
+    __mc_str_verify(str, m);
+}
+
+/* ---- bufo: a fixed window of bytes, with the bytes it has not written unknown ---- */
+
+typedef struct {
+    uint8_t* bytes;
+    uint8_t* known;
+    size_t capacity, size, pos;
+    size_t known_end; /* nothing at or past it was ever written */
+    int has_data;
+} mc_bufo_t;
+
+static void __mc_bufo_resize(mc_bufo_t* m, size_t capacity) {
+    uint8_t* b = realloc(m->bytes, capacity ? capacity : 1);
+    uint8_t* k = realloc(m->known, capacity ? capacity : 1);
+    if (b == NULL || k == NULL) abort();
+    if (capacity > m->capacity) memset(k + m->capacity, 0, capacity - m->capacity);
+    if (m->known_end > capacity) m->known_end = capacity;
+    m->bytes = b;
+    m->known = k;
+    m->capacity = capacity;
+}
+
+static void __mc_bufo_verify(bufo_t* buf, const mc_bufo_t* m) {
+    if (buf->capacity != m->capacity || buf->size != m->size || buf->pos != m->pos) __builtin_trap();
+    if ((buf->data != NULL) != m->has_data || bufo_size(buf) != m->size) __builtin_trap();
+    if (bufo_data(buf) != (m->has_data ? buf->data + m->pos : NULL)) __builtin_trap();
+    const size_t end = m->size < m->known_end ? m->size : m->known_end;
+    for (size_t i = 0; i < end; i++)
+        if (m->known[i] && (uint8_t)buf->data[i] != m->bytes[i]) __builtin_trap();
+}
+
+static void __mc_bufo(bufo_t* buf, mc_bufo_t* m, unsigned op, const uint8_t* a, size_t n) {
+    /* Capacities up to 16 MiB, so the 10 MiB ceiling is crossed; mostly small. */
+    const uint32_t raw = __mc_u32(a, n, 0);
+    const size_t big = raw & 0xFFFFFF;
+    const size_t amount = n > 0 && (a[0] & 0x80) ? big : big % 8192;
+
+    switch (op % 10) {
+    case 0: {
+        const int r = bufo_alloc(buf, amount);
+        const int want = m->has_data ? 1 : amount <= MC_BUFO_LIMIT;
+        if (r != want) __builtin_trap();
+        if (r && !m->has_data) { m->has_data = 1; __mc_bufo_resize(m, amount); }
+        break;
+    }
+    case 1: {
+        const int r = bufo_ensure_capacity(buf, amount);
+        if (amount <= m->capacity) { if (r != 1) __builtin_trap(); break; }
+        if (amount > MC_BUFO_LIMIT) { if (r != 0) __builtin_trap(); break; }
+        if (r != 1) __builtin_trap();
+        size_t cap = m->capacity == 0 ? 4096 : m->capacity;
+        while (cap < amount) cap *= 2;
+        if (cap > MC_BUFO_LIMIT) cap = MC_BUFO_LIMIT;
+        m->has_data = 1;
+        __mc_bufo_resize(m, cap);
+        break;
+    }
+    case 2: {
+        const ssize_t r = bufo_append(buf, (const char*)a, n);
+        ssize_t want;
+        if (n == 0) want = 0;
+        else if (!m->has_data) want = -1;
+        else if (m->pos >= m->capacity) want = 0;
+        else want = (ssize_t)(n < m->capacity - m->pos ? n : m->capacity - m->pos);
+        if (r != want) __builtin_trap();
+        if (want > 0) {
+            memcpy(m->bytes + m->pos, a, (size_t)want);
+            memset(m->known + m->pos, 1, (size_t)want);
+            m->pos += (size_t)want;
+            if (m->pos > m->known_end) m->known_end = m->pos;
+            if (m->pos > m->size) m->size = m->pos;
+        }
+        break;
+    }
+    case 3: {
+        const size_t r = bufo_move_front_pos(buf, amount);
+        size_t want = 0;
+        if (m->pos < m->size) {
+            want = m->pos + amount >= m->size ? m->size - m->pos : amount;
+            m->pos += want;
+        }
+        if (r != want) __builtin_trap();
+        break;
+    }
+    case 4: bufo_reset_pos(buf); m->pos = 0; break;
+    case 5: bufo_reset_size(buf); m->size = 0; break;
+    case 6:
+        bufo_set_size(buf, amount);
+        m->size = amount > m->capacity ? m->capacity : amount;
+        break;
+    case 7: {
+        const size_t want = m->pos >= m->size ? 0 : (amount < m->size - m->pos ? amount : m->size - m->pos);
+        if (bufo_chunk_size(buf, amount) != want) __builtin_trap();
+        break;
+    }
+    case 8: bufo_flush(buf); m->size = m->pos = 0; break;
+    case 9:
+        bufo_clear(buf);
+        m->size = m->pos = 0;
+        m->has_data = 0;
+        __mc_bufo_resize(m, 0);
+        break;
+    }
+    __mc_bufo_verify(buf, m);
+}
+
+/* ---- arena: every live allocation keeps its bytes until the reset ---- */
+
+typedef struct {
+    uint8_t* p;
+    size_t size;
+    uint8_t fill;
+} mc_alloc_t;
+
+typedef struct {
+    mc_alloc_t live[MC_MAX_RECORDS];
+    size_t count;
+} mc_arena_t;
+
+/* Past this an allocation is not filled or checked byte by byte. */
+#define MC_ARENA_FILL_MAX 65536
+
+static size_t __mc_arena_held(const arena_block_t* b, int* blocks) {
+    size_t held = 0;
+    for (; b != NULL; b = b->next) { held += b->capacity; (*blocks)++; }
+    return held;
+}
+
+static void __mc_arena_verify(arena_t* arena, const mc_arena_t* m, int bytes) {
+    int blocks = 0;
+    const size_t held = __mc_arena_held(arena->head, &blocks) + __mc_arena_held(arena->spare, &blocks);
+    if (held != arena->total_bytes) __builtin_trap();
+    for (const arena_block_t* b = arena->head; b != NULL; b = b->next)
+        if (b->used > b->capacity) __builtin_trap();
+    if (!bytes) return;
+    for (size_t i = 0; i < m->count; i++) {
+        const mc_alloc_t* x = &m->live[i];
+        const size_t n = x->size < MC_ARENA_FILL_MAX ? x->size : 0;
+        for (size_t j = 0; j < n; j++)
+            if (x->p[j] != (uint8_t)(x->fill + j)) __builtin_trap();
+    }
+}
+
+/* The block of the chain that holds [p, p + size), or a trap. */
+static void __mc_arena_contains(arena_t* arena, const uint8_t* p, size_t size) {
+    for (const arena_block_t* b = arena->head; b != NULL; b = b->next)
+        if (p >= b->data && p <= b->data + b->capacity && size <= (size_t)(b->data + b->capacity - p))
+            return;
+    __builtin_trap();
+}
+
+static void __mc_arena_record(arena_t* arena, mc_arena_t* m, uint8_t* p, size_t size, uint8_t fill) {
+    if (((uintptr_t)p & (2 * sizeof(void*) - 1)) != 0) __builtin_trap();
+    __mc_arena_contains(arena, p, size ? size : 1);
+    /* Nothing live overlaps it. */
+    for (size_t i = 0; i < m->count; i++) {
+        const mc_alloc_t* x = &m->live[i];
+        if (p < x->p + (x->size ? x->size : 1) && x->p < p + (size ? size : 1)) __builtin_trap();
+    }
+    if (m->count < MC_MAX_RECORDS) m->live[m->count++] = (mc_alloc_t){ p, size, fill };
+}
+
+static void __mc_arena(arena_t* arena, mc_arena_t* m, unsigned op, const uint8_t* a, size_t n) {
+    switch (op % 5) {
+    case 0: {
+        /* Small, larger than a block, or so large that the block header
+         * would wrap the allocation size around. */
+        const uint32_t raw = __mc_u32(a, n, 0);
+        size_t size;
+        switch (n > 0 ? a[0] >> 6 : 0) {
+        case 0: case 1: size = raw % 512; break;
+        case 2: size = raw % (1u << 20); break;
+        default: size = SIZE_MAX - (raw % 256); break;
+        }
+        uint8_t* p = arena_alloc(arena, size);
+        if (size > PTRDIFF_MAX) { if (p != NULL) __builtin_trap(); break; }
+        if (p == NULL) __builtin_trap();
+        const uint8_t fill = (uint8_t)raw;
+        if (size < MC_ARENA_FILL_MAX)
+            for (size_t j = 0; j < size; j++) p[j] = (uint8_t)(fill + j);
+        __mc_arena_record(arena, m, p, size < MC_ARENA_FILL_MAX ? size : 0, fill);
+        break;
+    }
+    case 1: {
+        char* p = arena_strndup(arena, (const char*)a, n);
+        if (p == NULL || memcmp(p, a, n) != 0 || p[n] != '\0') __builtin_trap();
+        /* Recorded as a pattern: rewrite it so. */
+        for (size_t j = 0; j <= n; j++) p[j] = (char)(uint8_t)(n + j);
+        __mc_arena_record(arena, m, (uint8_t*)p, n + 1, (uint8_t)n);
+        break;
+    }
+    case 2: {
+        const size_t held = arena->total_bytes;
+        arena_reset(arena);
+        if (arena->head != NULL || arena->total_bytes != held) __builtin_trap();
+        m->count = 0;
+        break;
+    }
+    case 3:
+        arena_free(arena);
+        if (arena->head != NULL || arena->spare != NULL || arena->total_bytes != 0) __builtin_trap();
+        m->count = 0;
+        break;
+    case 4: __mc_arena_verify(arena, m, 1); break;
+    }
+    __mc_arena_verify(arena, m, 0);
+}
+
+static mc_keyed_t __mc_map_model, __mc_hash_model;
+static mc_array_t __mc_array_model;
+static mc_arena_t __mc_arena_model;
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 1) return 0;
+    const uint8_t config = data[0];
+    data++; size--;
+
+    map_t* map = map_create_ex(map_compare_string, map_copy_string, free, NULL, free);
+    static const float factors[4] = { 0.0f, 0.25f, 0.75f, 1.0f };
+    hashmap_t* hash = hashmap_create_ex((config & 0x80) ? __mc_weak_hash : hashmap_hash_string,
+                                        hashmap_equals_string, config & 7, factors[(config >> 3) & 3],
+                                        map_copy_string, free, NULL, NULL);
+    array_t* arr = array_create();
+    str_t* strs[2] = { str_create_empty((config >> 5) & 1 ? 0 : 100), str_create_empty(0) };
+    bufo_t* buf = bufo_create();
+    arena_t arena;
+    arena_init(&arena);
+    if (map == NULL || hash == NULL || arr == NULL || strs[0] == NULL || strs[1] == NULL || buf == NULL) abort();
+
+    mc_keyed_t* mm = &__mc_map_model;
+    mc_keyed_t* hm = &__mc_hash_model;
+    mc_array_t* am = &__mc_array_model;
+    mc_arena_t* rm = &__mc_arena_model;
+    mc_bytes_t sm[2] = { { NULL, 0 }, { NULL, 0 } };
+    mc_bufo_t bm = { 0 };
+    mm->count = hm->count = am->count = rm->count = 0;
+    __mc_bytes_splice(&sm[0], 0, "", 0);
+    __mc_bytes_splice(&sm[1], 0, "", 0);
+
+    size_t records = 0;
+    intptr_t id = 0;
+    while (size >= 2 && records++ < MC_MAX_RECORDS) {
+        const uint8_t sel = data[0];
+        size_t n = data[1];
+        data += 2; size -= 2;
+        if (n > size) n = size;
+        const uint8_t* arg = data;
+        data += n; size -= n;
+        const unsigned op = sel / 6;
+        id++;
+
+        switch (sel % 6) {
+        case 0: __mc_arena(&arena, rm, op, arg, n); break;
+        case 1: __mc_array(arr, am, op, arg, n); break;
+        case 2: __mc_map(map, mm, op, arg, n, id); break;
+        case 3: __mc_hashmap(hash, hm, op, arg, n, id); break;
+        case 4: __mc_str(strs, sm, op, arg, n); break;
+        case 5: __mc_bufo(buf, &bm, op, arg, n); break;
+        }
+    }
+
+    __mc_map_walk(map, mm, 0);
+    __mc_map_walk(map, mm, 1);
+    __mc_hashmap_walk(hash, hm);
+    __mc_arena_verify(&arena, rm, 1);
+
+    map_free(map);
+    hashmap_free(hash);
+    array_free(arr);
+    str_free(strs[0]);
+    str_free(strs[1]);
+    bufo_free(buf);
+    arena_free(&arena);
+
+    __mc_keyed_clear(mm);
+    __mc_keyed_clear(hm);
+    for (size_t i = 0; i < am->count; i++) __mc_value_forget(&am->items[i]);
+    free(sm[0].bytes);
+    free(sm[1].bytes);
+    free(bm.bytes);
+    free(bm.known);
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_GZIP
+
+#include <zlib.h>
+#include "gzip.h"
+
+/* misc/gzip.c, driven the way its callers drive it: the response filter
+ * (http_gzip_filter.c) hands one input buffer at a time to gzip_deflate and
+ * calls again while the output buffer came back full and the stream has not
+ * ended; the HTTP client parsers (httpteparser.c, httpresponseparser.c) give
+ * each received chunk to gzip_inflate_init and call gzip_inflate while the
+ * output buffer came back full. The chunk and buffer sizes come from the
+ * input, down to one byte.
+ *
+ * The first byte picks the mode:
+ *   0 round trip at level 0-9 -- the stream decodes (zlib's own inflate, and
+ *     gzip_inflate chunk by chunk) to the input exactly, with no error on the
+ *     way and every input byte consumed before the next buffer;
+ *   1 arbitrary bytes into gzip_inflate -- the result does not depend on the
+ *     chunking: the same output, error and end as one zlib call on the whole;
+ *   2 a valid stream cut short, followed by another stream or garbage, or with
+ *     one byte changed -- cut short gives a prefix and no end, followed gives
+ *     the whole and an end with the tail left alone, changed gives an error or
+ *     the original. */
+
+#define GZ_OUT_LIMIT (4u << 20)
+
+static uint32_t __gz_mix(uint32_t x) {
+    x = (x + 1) * 2654435761u;
+    return x ^ x >> 15;
+}
+
+typedef struct {
+    uint32_t state;
+    uint8_t shape;
+} gz_sizes_t;
+
+/* Chunk sizes: one byte, a few, or the callers' GZIP_BUFFER, from a small
+ * generator the input seeds. */
+static size_t __gz_next(gz_sizes_t* g) {
+    g->state = g->state * 1103515245u + 12345u;
+    const uint32_t r = g->state >> 8;
+    switch (g->shape % 4) {
+    case 0: return 1 + r % 3;
+    case 1: return 1 + r % 64;
+    case 2: return 1 + r % 4096;
+    default: return GZIP_BUFFER;
+    }
+}
+
+typedef struct {
+    uint8_t* bytes;
+    size_t size, capacity;
+} gz_buf_t;
+
+static void __gz_put(gz_buf_t* b, const void* p, size_t n) {
+    if (n == 0) return;
+    if (b->size + n > b->capacity) {
+        size_t cap = b->capacity ? b->capacity : 256;
+        while (cap < b->size + n) cap *= 2;
+        uint8_t* grown = realloc(b->bytes, cap);
+        if (grown == NULL) abort();
+        b->bytes = grown;
+        b->capacity = cap;
+    }
+    memcpy(b->bytes + b->size, p, n);
+    b->size += n;
+}
+
+/* The response filter's loop, over the whole input. */
+static void __gz_deflate(const uint8_t* data, size_t size, int level, gz_sizes_t* in, gz_sizes_t* out, gz_buf_t* z) {
+    gzip_t gz;
+    gzip_init(&gz);
+    if (!gzip_deflate_init_level(&gz, level)) abort();
+    char* buffer = malloc(GZIP_BUFFER + 6);
+    if (buffer == NULL) abort();
+
+    size_t at = 0;
+    do {
+        size_t chunk = __gz_next(in);
+        if (chunk > size - at) chunk = size - at;
+        const int last = at + chunk == size;
+        gzip_set_in(&gz, (const char*)data + at, chunk);
+        for (;;) {
+            /* zlib.h: more than six bytes of room for a sync flush, or the
+             * flush marker repeats forever. The callers give GZIP_BUFFER. */
+            const size_t cap = 6 + __gz_next(out);
+            const size_t n = gzip_deflate(&gz, buffer, cap, last);
+            if (gzip_deflate_has_error(&gz) || n > cap) __builtin_trap();
+            __gz_put(z, buffer, n);
+            if (!(gzip_want_continue(&gz) && !gzip_is_end(&gz))) break;
+        }
+        if (gz.stream.avail_in != 0) __builtin_trap();
+        at += chunk;
+        if (last && !gzip_is_end(&gz)) __builtin_trap();
+    } while (at < size);
+
+    if (!gzip_free(&gz)) __builtin_trap();
+    free(buffer);
+}
+
+typedef struct {
+    int error, end;
+} gz_result_t;
+
+/* The client parsers' loop, one received chunk at a time; after an error or
+ * the end nothing more is fed, as they stop. */
+static gz_result_t __gz_inflate(const uint8_t* data, size_t size, gz_sizes_t* in, gz_sizes_t* out, gz_buf_t* plain) {
+    gz_result_t r = { 0, 0 };
+    gzip_t gz;
+    gzip_init(&gz);
+    char* buffer = malloc(GZIP_BUFFER);
+    if (buffer == NULL) abort();
+
+    size_t at = 0;
+    while (at < size && !r.error && !r.end && plain->size < GZ_OUT_LIMIT) {
+        size_t chunk = __gz_next(in);
+        if (chunk > size - at) chunk = size - at;
+        if (!gzip_inflate_init(&gz, (const char*)data + at, chunk)) abort();
+        do {
+            const size_t cap = __gz_next(out);
+            const size_t n = gzip_inflate(&gz, buffer, cap);
+            if (n > cap) __builtin_trap();
+            /* Kept even from the call that fails, for the comparison with
+             * the reference; the callers drop the lot on an error. */
+            __gz_put(plain, buffer, n);
+            if (gzip_inflate_has_error(&gz)) { r.error = 1; break; }
+        } while (gzip_want_continue(&gz) && plain->size < GZ_OUT_LIMIT);
+        r.end = gzip_is_end(&gz);
+        at += chunk;
+    }
+
+    gzip_free(&gz);
+    free(buffer);
+    return r;
+}
+
+/* The reference: one zlib inflate over everything, as far as it goes. */
+static gz_result_t __gz_reference(const uint8_t* data, size_t size, gz_buf_t* plain) {
+    gz_result_t r = { 0, 0 };
+    z_stream s;
+    memset(&s, 0, sizeof s);
+    if (inflateInit2(&s, MAX_WBITS + 16) != Z_OK) abort();
+    s.next_in = (Bytef*)data;
+    s.avail_in = (uInt)size;
+    uint8_t buffer[16384];
+    for (;;) {
+        s.next_out = buffer;
+        s.avail_out = sizeof buffer;
+        const int z = inflate(&s, Z_NO_FLUSH);
+        __gz_put(plain, buffer, sizeof buffer - s.avail_out);
+        if (z == Z_STREAM_END) { r.end = 1; break; }
+        if (z == Z_NEED_DICT || z == Z_DATA_ERROR || z == Z_MEM_ERROR || z == Z_STREAM_ERROR) { r.error = 1; break; }
+        if (s.avail_out != 0 || plain->size >= GZ_OUT_LIMIT) break;
+    }
+    inflateEnd(&s);
+    return r;
+}
+
+static void __gz_compress(const uint8_t* data, size_t size, gz_buf_t* z) {
+    z_stream s;
+    memset(&s, 0, sizeof s);
+    if (deflateInit2(&s, Z_DEFAULT_COMPRESSION, Z_DEFLATED, MAX_WBITS + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) abort();
+    const uLong bound = deflateBound(&s, size);
+    uint8_t* out = malloc(bound);
+    if (out == NULL) abort();
+    s.next_in = (Bytef*)data;
+    s.avail_in = (uInt)size;
+    s.next_out = out;
+    s.avail_out = (uInt)bound;
+    if (deflate(&s, Z_FINISH) != Z_STREAM_END) abort();
+    __gz_put(z, out, bound - s.avail_out);
+    deflateEnd(&s);
+    free(out);
+}
+
+static int __gz_equal(const gz_buf_t* a, const uint8_t* b, size_t n) {
+    return a->size == n && (n == 0 || memcmp(a->bytes, b, n) == 0);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 5) return 0;
+    const uint8_t mode = data[0], level = data[1];
+    gz_sizes_t in = { __gz_mix(data[2]), data[2] }, out = { data[3] * 2654435761u, data[3] >> 2 };
+    const uint8_t extra = data[4];
+    data += 5; size -= 5;
+
+    gz_buf_t z = { 0 }, plain = { 0 }, ref = { 0 };
+
+    switch (mode % 3) {
+    case 0: {
+        __gz_deflate(data, size, level % 10, &in, &out, &z);
+        const gz_result_t want = __gz_reference(z.bytes, z.size, &ref);
+        if (!want.end || want.error || !__gz_equal(&ref, data, size)) __builtin_trap();
+        const gz_result_t got = __gz_inflate(z.bytes, z.size, &in, &out, &plain);
+        if (!got.end || got.error || !__gz_equal(&plain, data, size)) __builtin_trap();
+        break;
+    }
+    case 1: {
+        const gz_result_t want = __gz_reference(data, size, &ref);
+        const gz_result_t got = __gz_inflate(data, size, &in, &out, &plain);
+        if (plain.size < GZ_OUT_LIMIT && ref.size < GZ_OUT_LIMIT) {
+            if (got.end != want.end || got.error != want.error) __builtin_trap();
+            if (!__gz_equal(&plain, ref.bytes, ref.size)) __builtin_trap();
+        }
+        break;
+    }
+    case 2: {
+        /* The payload is what follows the first `extra` bytes of input. */
+        const size_t split = size ? extra % (size + 1) : 0;
+        const uint8_t* tail = data;
+        const size_t tail_n = split;
+        const uint8_t* body = data + split;
+        const size_t body_n = size - split;
+        __gz_compress(body, body_n, &z);
+        const size_t cut = z.size ? __gz_mix(level) % z.size : 0;
+
+        switch (level % 3) {
+        case 0: { /* cut short */
+            const gz_result_t got = __gz_inflate(z.bytes, cut, &in, &out, &plain);
+            if (got.end || got.error) __builtin_trap();
+            if (plain.size > body_n || (plain.size && memcmp(plain.bytes, body, plain.size) != 0)) __builtin_trap();
+            break;
+        }
+        case 1: { /* followed by more */
+            __gz_put(&z, tail, tail_n);
+            const gz_result_t got = __gz_inflate(z.bytes, z.size, &in, &out, &plain);
+            if (!got.end || got.error || !__gz_equal(&plain, body, body_n)) __builtin_trap();
+            break;
+        }
+        default: { /* one byte changed */
+            z.bytes[cut] ^= (uint8_t)(extra | 1);
+            const gz_result_t got = __gz_inflate(z.bytes, z.size, &in, &out, &plain);
+            if (got.end && !__gz_equal(&plain, body, body_n)) __builtin_trap();
+            break;
+        }
+        }
+        break;
+    }
+    }
+
+    free(z.bytes);
+    free(plain.bytes);
+    free(ref.bytes);
+    return 0;
+}
+
 #else
 #error "FUZZ_TARGET is not set to a known target"
 #endif

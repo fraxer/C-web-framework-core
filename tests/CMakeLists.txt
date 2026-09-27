@@ -232,7 +232,8 @@ if(BUILD_FUZZERS STREQUAL "yes")
     set(FUZZ_TARGET_NAMES
         huffman hpack h2_frame json cookie urlencoded multipart request request_sequence
         websocket websocket_sequence ws_deflate h2_session h2_connection http_response
-        smtp_response jwt h1_connection text mail_message ratelimiter session_crypto)
+        smtp_response jwt h1_connection text mail_message ratelimiter session_crypto
+        misc_containers gzip)
 
     if(INCLUDE_HTTP3 STREQUAL yes)
         list(APPEND FUZZ_TARGET_NAMES
@@ -283,6 +284,8 @@ if(BUILD_FUZZERS STREQUAL "yes")
     set(FUZZ_ID_db_model 35)
     set(FUZZ_ID_quic_pmtud 36)
     set(FUZZ_ID_session_crypto 37)
+    set(FUZZ_ID_misc_containers 38)
+    set(FUZZ_ID_gzip 39)
 
     foreach(name ${FUZZ_TARGET_NAMES})
         set(exe fuzz_${name})
@@ -338,6 +341,8 @@ if(BUILD_FUZZERS STREQUAL "yes")
             FUZZ_DB_MODEL=35
             FUZZ_QUIC_PMTUD=36
             FUZZ_SESSION_CRYPTO=37
+            FUZZ_MISC_CONTAINERS=38
+            FUZZ_GZIP=39
             FUZZ_TARGET=${FUZZ_ID_${name}}
         )
 

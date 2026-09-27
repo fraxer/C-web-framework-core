@@ -482,6 +482,8 @@ Targets, each with a seed corpus under `fuzz/corpus/`:
 | `db_model` | the model layer the feedback form writes through: create, read, update, delete and JSON of a schema like the form's, on SQLite `:memory:` (same condition) |
 | `quic_pmtud` | DPLPMTUD (RFC 8899) on a path whose MTU, losses and clock the input sets; the search must end, and the size stay within [base, ceiling] |
 | `session_crypto` | the session cookie's AES-256-GCM: round trips, forgeries, tampering, the hex and passphrase keys |
+| `misc_containers` | arena, array, map, hashmap, str and bufo under any sequence of operations, each against a model of its own |
+| `gzip` | `gzip.c` in the loops of its callers: round trips at every level, any bytes, streams cut short, followed or changed |
 
 An application registers its own with the same function, and `run.sh` picks
 them up from the manifest; the site's `fuzz_feedback` (in `backend/tests/`) is
@@ -558,7 +560,28 @@ broke it is saved like any crash:
   RFC 791 quads and RFC 4291 text, brackets for IPv6 only, and back through
   `ipaddr_text` and `ipaddr_authority`; `base64` round trips, the `_nl` line
   lengths, and lenient decoding against a decoder of its own, `base64url`
-  included (the h2c Upgrade header).
+  included (the h2c Upgrade header). The rest of `helpers.c` and its
+  neighbours follow on the same byte: `urlencode`/`urldecode` against a
+  %-decoder of its own, `hex_to_bytes`/`bytes_to_hex`, `is_path_traversal`
+  (a segment that is exactly `..`), `secure_compare` against `memcmp`,
+  `http_format_date` as an IMF-fixdate with English names, the `typecheck`
+  predicates against `strto*` with `errno`, `utf8` against strict RFC 3629,
+  `queryparser` as its header describes it and back through
+  `query_stringify`, and `sha1`/`sha256` against OpenSSL.
+  `misc_containers` keeps a model next to each container -- a list for map
+  and hashmap, typed values for array, a byte buffer for str and bufo, the
+  live allocations for arena -- and after every operation the container must
+  agree: found until erased, counted, iterated once each (the map's
+  red-black shape and order checked, backwards too), grown and rehashed
+  without loss, appended to exactly, arena pointers aligned, disjoint and
+  inside their block. `gzip` deflates as `http_gzip_filter.c` does, a buffer
+  at a time until the output buffer comes back not full, and inflates as the
+  client parsers do, one received chunk at a time; chunk and buffer sizes
+  come from the input. The stream must decode to the input at levels 0-9;
+  arbitrary bytes must give the output, error and end of one zlib call on the
+  whole, however they are chunked. Deflate's output buffers are at least
+  seven bytes: below that zlib repeats sync-flush markers forever, which
+  `gzip.h` now says.
   `quic_pmtud` drives the PMTU state machine with the calls quicconn.c makes
   -- probe when due, the probe's ACK if the path carried it, other ACKs, the
   probe timer, black holes -- and at the end a clean path on which the search
@@ -687,6 +710,19 @@ HTTP/2 write path, as a seed that replays it):
   encryption of an empty value could not be decrypted -- exactly nonce and tag
   was refused; `aes256gcm_key_from_hex` read past the end of an odd-length
   string and took blanks, signs and 63 or 66 digits.
+- `helpers.c` (the date helper of `text`): `http_format_date` wrote year 1 as
+  `1` and year 10000 with five digits, neither an HTTP-date.
+- `typecheck.c` (the typecheck helper of `text`): `is_uint`/`is_ulong` looked
+  for a minus sign in the first character only, so `" -1"` passed and became
+  `ULONG_MAX` in `query_param_ulong`.
+- `map.c` (`test_map.c`, written for `misc_containers`): `map_prev` from
+  `map_end` of an empty map dereferenced the sentinel's NULL child.
+- `arena.c` (`test_arena.c`, the same): the block data followed a 24-byte
+  header, so no allocation was aligned to `max_align_t` as `arena.h`
+  promises; a size near `SIZE_MAX` wrapped the block size given to `malloc`
+  around to a few bytes and was handed back as allocated.
+- `array.c` (the same): `array_update` out of bounds or on NULL leaked the
+  value it refused, where `array_insert` frees it.
 
 One more came out of checking the HTTP/2 fix against a live server rather than
 out of a target: finishing a frame from the session's output buffer, like
