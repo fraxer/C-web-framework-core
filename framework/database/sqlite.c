@@ -243,6 +243,19 @@ str_t* __escape_string(void* connection, const char* str) {
     return quoted;
 }
 
+// A REAL as the shortest text that parses back to the same double. SQLite's
+// own rendering (sqlite3_column_text) keeps 15 significant digits, so a value
+// needing 16 or 17 came back as a different number -- 0.1 + 0.2 as 0.3.
+static size_t __format_real(double value, char* out, size_t size) {
+    int n = 0;
+    for (int digits = 15; digits <= 17; digits++) {
+        n = snprintf(out, size, "%.*g", digits, value);
+        if (strtod(out, NULL) == value)
+            break;
+    }
+    return n > 0 ? (size_t)n : 0;
+}
+
 // Materialize a stepped statement into result->query. SQLite exposes rows
 // through a forward-only cursor, so the row count is unknown until done — but
 // dbresult_query_create preallocates a rows*cols matrix. We therefore buffer
@@ -284,6 +297,13 @@ static int __fill_result(sqlite3* db, sqlite3_stmt* stmt, dbresult_t* result) {
             // surface every value as a string), this renders integers/reals in
             // their text form. column_bytes is then called on the same column,
             // as required, to get the length. NULL SQL values yield ptr=NULL.
+            if (sqlite3_column_type(stmt, c) == SQLITE_FLOAT) {
+                char real[32];
+                const size_t n = __format_real(sqlite3_column_double(stmt, c), real, sizeof real);
+                dbresult_cell_create(&cells[c], real, n);
+                continue;
+            }
+
             const void* ptr = sqlite3_column_text(stmt, c);
             int len = sqlite3_column_bytes(stmt, c);
             if (len < 0) len = 0;

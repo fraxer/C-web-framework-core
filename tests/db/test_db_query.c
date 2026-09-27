@@ -243,3 +243,27 @@ TEST(test_db_query_builder_param_boundary) {
     __assert_built("SELECT :v:w", NULL);
     __assert_built("SELECT :x", NULL);
 }
+
+TEST(test_db_query_real_exact) {
+    TEST_SUITE("dbquery (sqlite)");
+    TEST_CASE("a REAL reads back as text that parses to the same double");
+
+    /* The driver surfaces every value as text, and sqlite3_column_text renders
+     * a REAL with 15 significant digits: 0.1 + 0.2 came back as 0.3 (found
+     * by fuzz_db_model through model_double). Short values stay short. */
+    if (!__query_available()) return;
+
+    static const double values[] = { 0.1 + 0.2, 2.4626032915729627e-14, 1e300 / 3, 0.1, 19.99, -0.0, 5e-324 };
+    static const char* const texts[] = { NULL, NULL, NULL, "0.1", "19.99", NULL, NULL };
+    for (size_t i = 0; i < sizeof values / sizeof values[0]; i++) {
+        dbresult_t* r = __query1("SELECT :d AS d", mparam_double(d, values[i]));
+        db_table_cell_t* cell = dbresult_ok(r) ? dbresult_field(r, "d") : NULL;
+        TEST_ASSERT_NOT_NULL(cell, "a value comes back");
+        if (cell != NULL) {
+            TEST_ASSERT(strtod(cell->value, NULL) == values[i], cell->value);
+            if (texts[i] != NULL)
+                TEST_ASSERT_STR_EQUAL(texts[i], cell->value, "in its shortest form");
+        }
+        dbresult_free(r);
+    }
+}
