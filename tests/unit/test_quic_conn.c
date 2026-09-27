@@ -366,6 +366,88 @@ TEST(test_quic_stand_keepalive) {
     __stand_free(s);
 }
 
+TEST(test_quic_stand_ack_only_not_in_flight) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a packet carrying only ACK is not counted in flight (RFC 9002 §2)");
+    /* In flight means ack-eliciting or padded. A packet with nothing but an
+     * ACK is neither: the peer never acknowledges it on its own (RFC 9000
+     * §13.2.1), so bytes counted for it stay in the congestion window until
+     * something unrelated covers them. Found by the quic_conn fuzz target: a
+     * client that only pinged left the server's in-flight count growing by
+     * one acknowledgement at a time, 31, 63, 95, 127, 159. On an upload, where
+     * the server sends nothing but acknowledgements, that is the whole window
+     * spent on packets nobody will answer. */
+    stand_t* s = __stand_create(5);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    __run(s, 500000, NULL);
+    TEST_ASSERT(s->conn->cc.bytes_in_flight == 0, "nothing in flight once the handshake settled");
+
+    const uint64_t cwnd_before = s->conn->cc.cwnd;
+    const uint64_t delivered_before = s->delivered_to_client;
+
+    for (int i = 0; i < 5; i++) {
+        TEST_ASSERT(quicclient_ping(&s->client), "the client pings");
+        TEST_ASSERT(quicclient_flush(&s->client), "sent");
+        __run(s, 200000, NULL);
+    }
+
+    TEST_ASSERT(s->delivered_to_client - delivered_before >= 5,
+                "every ping was acknowledged");
+    TEST_ASSERT(s->conn->cc.bytes_in_flight == 0,
+                "and none of the acknowledgements is still in flight");
+    TEST_ASSERT(s->conn->cc.cwnd == cwnd_before, "the window did not move");
+
+    __stand_free(s);
+}
+
+TEST(test_quic_stand_damaged_header_dropped) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a packet that does not open cannot close the connection (RFC 9000 §17.3.1)");
+    /* The reserved bits are under header protection, whose mask is computed
+     * from a sample of the ciphertext. Damage the sample and the mask is
+     * garbage, and so are the reserved bits it uncovers -- three times in four
+     * not zero. §17.3.1 makes that an error only "after removing both packet
+     * and header protection": the packet has to open first. Checked before the
+     * AEAD, it let anyone who can see a connection id close the connection
+     * with one forged datagram. Found by the quic_conn fuzz target's damaged
+     * datagrams. */
+    stand_t* s = __stand_create(6);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    __run(s, 200000, NULL);
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    /* A short header is 1 byte, the 8-byte connection id, then the packet
+     * number; the sample starts four bytes past where the number begins and
+     * is 16 bytes long (RFC 9001 §5.4.2). One bit of each sample byte in turn. */
+    for (uint32_t at = 13; at < 29; at++) {
+        s->corrupt_at = at;
+        s->corrupt_next_to_server = 1;
+        TEST_ASSERT(quicclient_ping(&s->client), "the client pings");
+        TEST_ASSERT(quicclient_flush(&s->client), "sent");
+        __run(s, 100000, NULL);
+        if (s->conn == NULL || s->conn->state != QUICCONN_ACTIVE) break;
+    }
+
+    TEST_REQUIRE_NOT_NULL(s->conn, "the connection survived every damaged packet");
+    TEST_ASSERT(s->conn->state == QUICCONN_ACTIVE, "and is still active");
+
+    const uint64_t delivered_before = s->delivered_to_client;
+    TEST_ASSERT(quicclient_ping(&s->client), "an undamaged ping");
+    TEST_ASSERT(quicclient_flush(&s->client), "sent");
+    __run(s, 200000, NULL);
+    TEST_ASSERT(s->delivered_to_client > delivered_before, "is answered");
+
+    __stand_free(s);
+}
+
 TEST(test_quic_stand_stream_under_loss) {
     TEST_SUITE("quic_stand");
 
@@ -2282,6 +2364,64 @@ TEST(test_quic_stand_migration) {
     TEST_ASSERT(old_port == 50000, "it started on the old port");
     TEST_ASSERT(s->client.path_challenge_received, "the client was asked");
 
+    __stand_free(s);
+}
+
+/* What loss detection holds against the congestion window: the sum the
+ * controller's count must equal at every moment. */
+static uint64_t __in_flight_sum(const quicconn_t* conn) {
+    uint64_t sum = 0;
+    for (int level = 0; level < QUIC_ENC_COUNT; level++)
+        for (const quicsent_t* p = conn->loss.space[level].sent; p != NULL; p = p->next)
+            if (p->in_flight) sum += p->size;
+    return sum;
+}
+
+TEST(test_quic_stand_migration_in_flight) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("a migration mid-transfer leaves the in-flight count consistent (RFC 9000 §9.4)");
+    /* The new path starts from a fresh controller, but the packets sent on the
+     * old one are still tracked -- their acknowledgements are on the way. The
+     * reset zeroed the controller's count while those packets stayed counted
+     * in loss detection, so every one of them acknowledged or lost afterwards
+     * was subtracted from the new path's count instead: the window then held
+     * more than it said, by whatever was in flight at the move. Found by the
+     * quic_conn fuzz target's accounting check. */
+    stand_t* s = __stand_create(9);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    __run(s, 200000, NULL);
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    quicstream_t* qs = __open_request_stream(s);
+    TEST_REQUIRE_NOT_NULL(qs, "the server has the stream");
+
+    const size_t total = 256 * 1024;
+    uint8_t* body = __body_make(total);
+    TEST_REQUIRE_NOT_NULL(body, "body allocated");
+    TEST_ASSERT(__respond(s, qs, body, total), "queued on the stream");
+
+    __run(s, 30000, NULL);
+    TEST_ASSERT(s->conn->cc.bytes_in_flight > 0, "the response is in flight");
+
+    __addr(&s->client_path.remote, &s->client_path.remote_len, "127.0.0.1", 50001);
+    TEST_ASSERT(quicclient_rebind(&s->client), "the client moved");
+    TEST_ASSERT(quicclient_flush(&s->client), "sent");
+
+    TEST_ASSERT(__run(s, 2000000, __migrated), "the server moved to the new path");
+    TEST_ASSERT(s->conn->cc.bytes_in_flight == __in_flight_sum(s->conn),
+                "the count matches what is tracked right after the move");
+
+    __run(s, 3000000, NULL);
+    TEST_REQUIRE_NOT_NULL(s->conn, "still connected");
+    TEST_ASSERT(quicclient_stream_readable(&s->client, 0) == total,
+                "the whole response arrived");
+    TEST_ASSERT(s->conn->cc.bytes_in_flight == __in_flight_sum(s->conn),
+                "and still matches once the old path's packets are settled");
+
+    free(body);
     __stand_free(s);
 }
 

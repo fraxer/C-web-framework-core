@@ -4320,7 +4320,8 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
  * reordering and bottleneck, then a sequence of events -- time passing, the
  * client opening, writing, resetting and stopping streams, pinging, changing
  * address, updating keys, challenging the path, closing; the server answering;
- * bursts of loss and blackouts.
+ * bursts of loss and blackouts, damaged datagrams, the process stalling while
+ * its clock runs on.
  *
  * Every byte either side reads is checked against the pattern the other side
  * wrote, and a finished stream must have delivered exactly what was sent. The
@@ -4343,6 +4344,38 @@ typedef struct {
     uint64_t client_got;            /* read by the client, checked */
 } qc_stream_t;
 
+/* The congestion window's count against what loss detection holds. The count
+ * is raised and lowered in several places -- sent, acknowledged, lost,
+ * discarded with its keys -- and every one of them must agree with the list
+ * the packets actually sit on. And only what RFC 9002 §2 calls in flight
+ * belongs in it: ack-eliciting packets, or Initials, padded to 1200 bytes. An
+ * ACK-only packet counted here is one the peer will never acknowledge. */
+static void __qc_check(const stand_t* s) {
+    /* The client is correct, so the server has no cause to close with an
+     * error, whatever the path did: a datagram lost, duplicated, late or
+     * damaged is dropped or recovered from, never a protocol violation. A
+     * damaged header once was one -- the reserved bits were read before the
+     * packet was authenticated. */
+    if (s->client.close_received && s->client.close_error != QUIC_NO_ERROR) __builtin_trap();
+
+    if (s->conn == NULL) return;
+
+    /* A live connection always has a deadline -- at the least its idle
+     * timeout. One without any would be woken by nothing but the peer, and a
+     * peer that has gone never wakes it: it would stay in the table for good. */
+    if (s->conn->state != QUICCONN_DEAD && quicconn_next_timeout(s->conn) == 0) __builtin_trap();
+
+    uint64_t sum = 0;
+    for (int level = 0; level < QUIC_ENC_COUNT; level++) {
+        for (const quicsent_t* p = s->conn->loss.space[level].sent; p != NULL; p = p->next) {
+            if (!p->in_flight) continue;
+            if (!p->ack_eliciting && level != QUIC_ENC_INITIAL) __builtin_trap();
+            sum += p->size;
+        }
+    }
+    if (s->conn->cc.bytes_in_flight != sum) __builtin_trap();
+}
+
 /* The stand's own guard, but as a finding: events that keep coming while the
  * clock stands still are a spin in the code under test. */
 static void __qc_run(stand_t* s, uint64_t horizon_us) {
@@ -4351,7 +4384,9 @@ static void __qc_run(stand_t* s, uint64_t horizon_us) {
     unsigned still = 0;
     for (;;) {
         if (s->client_failed) return;
-        if (!__step(s, limit)) return;
+        const int stepped = __step(s, limit);
+        __qc_check(s);
+        if (!stepped) return;
         if (__now_us == last) {
             if (++still > 200000) __builtin_trap();
         } else {
@@ -4456,7 +4491,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         const uint8_t arg = p < end ? *p++ : 0;
         const size_t k = arg % QC_STREAMS;
 
-        switch (op % 13) {
+        switch (op % 15) {
         case 0:
             __qc_run(s, 1000 + (uint64_t)arg * 2000);
             break;
@@ -4517,6 +4552,16 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
                 (void)quicclient_close(&s->client, arg, arg & 1);
                 closed = 1;
             }
+            break;
+        case 13:                                    /* damage in transit */
+            s->corrupt_at = (uint32_t)arg * 97 + (uint32_t)(p - data);
+            if (arg & 1) s->corrupt_next_to_server = 1 + arg % 3;
+            else s->corrupt_next_to_client = 1 + arg % 3;
+            break;
+        case 14:
+            /* A stall: the clock jumps and every timer and datagram that fell
+             * due meanwhile is handled late, all at once. */
+            __now_us += 1000 + (uint64_t)arg * 20000;
             break;
         }
         (void)quicclient_flush(&s->client);

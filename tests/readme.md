@@ -476,6 +476,7 @@ Targets, each with a seed corpus under `fuzz/corpus/`:
 | `smtp_response` | the SMTP client reading replies, and the EHLO capabilities it trusts |
 | `jwt` | HS256 tokens: acceptance, tampering, algorithm substitution, expiry |
 | `mail_message` | MIME headers, folded encoded words, body and binary attachments, decoded back to their input |
+| `quic_conn` | a whole QUIC connection on the in-process stand of `test_quic_conn.c`: real TLS 1.3, loss recovery, congestion control, streams, migration, over a path the input impairs |
 
 An application registers its own with the same function, and `run.sh` picks
 them up from the manifest; the site's `fuzz_feedback` (in `backend/tests/`) is
@@ -532,6 +533,17 @@ broke it is saved like any crash:
   keeps the first arrival (overlaps, conflicting retransmissions, FIN and
   RESET_STREAM final sizes, the buffered cap) and `quicrange` against a bitset,
   near 0 and near `UINT64_MAX`; freeing must hand the QUIC memory budget back.
+- **A connection under an impaired path.** `quic_conn` takes the path from
+  the input -- delay, loss each way, duplication, reordering, a bottleneck,
+  scripted drops, blackouts, damaged datagrams, stalls of the clock -- and a
+  script of client actions: streams written, finished, reset and stopped,
+  pings, address changes, key updates, path challenges, closes. Every byte
+  either side reads is the pattern the other wrote, a finished stream delivered
+  exactly what was sent, and after every step the congestion window's
+  in-flight count equals what loss detection tracks and a live connection has
+  a deadline. The client is correct, so a CONNECTION_CLOSE from the server
+  with an error code is a finding. At the end the path goes dark and the connection must be gone by
+  its idle timeout, with the QUIC memory budget back where it started.
 - **What reaches the wire.** `h2_connection` checks the server's bytes the way
   a strict client would: SETTINGS first, every header block decodes with one
   HPACK decoder, no frame on a stream after END_STREAM, DATA never beyond the
@@ -570,6 +582,20 @@ HTTP/2 write path, as a seed that replays it):
   were appended to the body.
 - `jwt.c`: the signature was accepted with padding, a tail after '=', the
   standard alphabet or stray unused bits -- one token, many spellings.
+- `quicconn.c`: every packet counted against the congestion window, ACK-only
+  ones included, though RFC 9002 §2 counts only ack-eliciting and padded
+  packets. The peer never acknowledges an ACK-only packet on its own, so a
+  server that only acknowledged -- an upload -- filled its window with them.
+- `quicconn.c`: the controller reset on a validated migration (RFC 9000 §9.4)
+  zeroed its in-flight count while the old path's packets stayed counted in
+  loss detection; each one acknowledged or lost later came off the new path's
+  count, which then held more than it said.
+- `quicconn.c`: the reserved header bits were checked as soon as header
+  protection came off, before the AEAD had authenticated anything; RFC 9000
+  §17.3.1 makes them an error only after both protections are removed. A
+  damaged or forged packet uncovers random bits there, so one datagram sent to
+  a connection id anyone can read off the wire closed the connection with
+  PROTOCOL_VIOLATION.
 
 One more came out of checking the HTTP/2 fix against a live server rather than
 out of a target: finishing a frame from the session's output buffer, like

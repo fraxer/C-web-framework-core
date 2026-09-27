@@ -652,6 +652,14 @@ int quicloss_on_timeout(quicloss_t* loss, uint64_t now_us,
     return 0;
 }
 
+void quicloss_forget_in_flight(quicloss_t* loss) {
+    if (loss == NULL) return;
+
+    for (int level = 0; level < QUIC_ENC_COUNT; level++)
+        for (quicsent_t* sent = loss->space[level].sent; sent != NULL; sent = sent->next)
+            sent->in_flight = 0;
+}
+
 quicframe_ref_t* quicloss_discard_space(quicloss_t* loss, quic_enc_level_e level) {
     if (loss == NULL || level >= QUIC_ENC_COUNT) return NULL;
 

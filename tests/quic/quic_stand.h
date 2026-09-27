@@ -173,6 +173,13 @@ typedef struct stand {
     uint64_t delay_nth_to_server;
     int      blackhole_to_server;   /* everything, until cleared */
     int      blackhole_to_client;
+    /* Damage the next datagrams in transit: one bit of one byte, the byte
+     * picked from `corrupt_at`. Scripted like the drops above. A damaged
+     * packet must fail authentication and be dropped as if lost -- unless the
+     * damage lands where no packet is, and then it must change nothing. */
+    unsigned corrupt_next_to_server;
+    unsigned corrupt_next_to_client;
+    uint32_t corrupt_at;
 
     uint64_t sent_to_server, sent_to_client;
     uint64_t lost_to_server, lost_to_client;
@@ -359,6 +366,18 @@ static void __net_send(stand_t* s, const uint8_t* data, size_t len, int to_serve
     if (to_server && s->delay_nth_to_server != 0 &&
         s->sent_to_server == s->delay_nth_to_server)
         due += s->reorder_extra_us;
+
+    unsigned* corrupt = to_server ? &s->corrupt_next_to_server : &s->corrupt_next_to_client;
+    uint8_t damaged[STAND_MAX_DGRAM];
+    if (*corrupt > 0) {
+        (*corrupt)--;
+        memcpy(damaged, data, len);
+        damaged[s->corrupt_at % len] ^= (uint8_t)(1u << (s->corrupt_at / 7 % 8));
+        __trace(s, "%s %zu bytes CORRUPTED at %zu\n", to_server ? "c->s" : "s->c", len,
+                (size_t)(s->corrupt_at % len));
+        s->corrupt_at = s->corrupt_at * 2654435761u + 1;
+        data = damaged;
+    }
 
     __schedule(s, data, len, to_server, start, due);
     __trace(s, "%s %zu bytes, due %llu%s\n", to_server ? "c->s" : "s->c", len,

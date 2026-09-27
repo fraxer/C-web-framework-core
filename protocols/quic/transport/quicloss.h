@@ -152,6 +152,13 @@ void quicloss_set_cid_tag(quicloss_t* loss, const uint8_t* cid, size_t len);
  * is the path being measured after all. */
 void quicloss_app_limited(quicloss_t* loss);
 
+/* The congestion controller was just reset -- a new path (RFC 9000 §9.4).
+ * The packets already sent stay tracked, for their acknowledgements and for
+ * the PTO, but no longer count against the window: the fresh controller never
+ * counted them, and their fate on the old path says nothing about the new one.
+ * Call it right after the controller's reset. */
+void quicloss_forget_in_flight(quicloss_t* loss);
+
 /* Record a packet as sent. Takes ownership of `frames`. */
 int quicloss_on_sent(quicloss_t* loss, quic_enc_level_e level, uint64_t pn,
                      size_t size, int ack_eliciting, int in_flight,

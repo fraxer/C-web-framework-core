@@ -1845,6 +1845,10 @@ static void __path_probe_succeed(quicconn_t* conn) {
     quiccc_init_algorithm(&conn->cc, QUIC_DEFAULT_UDP_PAYLOAD,
                           quic_policy_conn()->initcwnd_packets,
                           quic_policy_conn()->cc_algorithm);
+    /* The reset zeroed the count, and the old path's packets must leave it
+     * with it: acknowledged or lost later, each was subtracted from the new
+     * path's count, which then held more than it said. */
+    quicloss_forget_in_flight(&conn->loss);
     quicpmtud_init(&conn->pmtud, QUIC_DEFAULT_UDP_PAYLOAD,
                    conn->path.remote.ss_family == AF_INET6
                        ? QUIC_MAX_UDP_PAYLOAD_V6 : QUIC_MAX_UDP_PAYLOAD_V4);
@@ -2064,19 +2068,6 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
         return 1;
     }
 
-    /* §17.2/§17.3: the reserved bits must be zero once protection is off. They
-     * are two bits that carry nothing, which is exactly why they are worth
-     * checking -- a peer that gets them wrong has a header-protection bug, and
-     * every other field it produces is suspect. The mask differs by header
-     * form: 0x0c in a long header, 0x18 in a short one, where the extra bits
-     * are the spin bit and the key phase. */
-    const uint8_t reserved_mask = (buf[0] & 0x80) != 0 ? 0x0c : 0x18;
-    if ((buf[0] & reserved_mask) != 0) {
-        log_error("quic: reserved bits set at level %d\n", (int)level);
-        quicconn_close(conn, QUIC_PROTOCOL_VIOLATION, 0, now_us);
-        return 0;
-    }
-
     const uint64_t largest = conn->ack[space].any_received
                              ? conn->ack[space].largest : QUICPKT_NO_ACKED;
     const uint64_t pn = quicpkt_decode_pn(
@@ -2134,6 +2125,25 @@ static int __process_packet(quicconn_t* conn, uint8_t* buf, size_t len,
             return 0;
         }
         return 1;
+    }
+
+    /* §17.2/§17.3.1: the reserved bits must be zero "after removing both
+     * packet and header protection" -- so here, once the packet has opened, and
+     * not a line earlier. They are two bits that carry nothing, which is exactly
+     * why they are worth checking: a peer that gets them wrong has a
+     * header-protection bug, and every other field it produces is suspect. The
+     * mask differs by header form: 0x0c in a long header, 0x18 in a short one,
+     * where the other bits are the spin bit and the key phase.
+     *
+     * Before the AEAD they were anyone's to set. The mask comes from a sample
+     * of the ciphertext, so a forged or damaged packet uncovers random reserved
+     * bits, three times in four not zero -- and one such datagram, sent to a
+     * connection id anyone can read off the wire, closed the connection. */
+    const uint8_t reserved_mask = (buf[0] & 0x80) != 0 ? 0x0c : 0x18;
+    if ((buf[0] & reserved_mask) != 0) {
+        log_error("quic: reserved bits set at level %d\n", (int)level);
+        quicconn_close(conn, QUIC_PROTOCOL_VIOLATION, 0, now_us);
+        return 0;
     }
 
     /* §4.9.1: the first Handshake packet that opens is what tells a server the
@@ -3320,9 +3330,11 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
      * probe was built and silently never sent, so a connection that lost its
      * last packet stalled for good while the PTO fired on forever. Found by
      * dropping one response in the test client (docs/http3/08 §2). */
+    int padded = 0;
     if (p < 4 && p + 4 <= payload_cap) {
         memset(payload + p, 0, 4 - p);
         p = 4;
+        padded = 1;
     }
 
     /* An Initial packet must travel in a datagram of at least 1200 bytes
@@ -3393,6 +3405,7 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
         cap >= QUIC_MIN_INITIAL_DATAGRAM) {
         memset(dst + total, 0, QUIC_MIN_INITIAL_DATAGRAM - total);
         total = QUIC_MIN_INITIAL_DATAGRAM;
+        padded = 1;
     }
 
     /* Here and nowhere earlier: every failure above returns without a packet,
@@ -3400,7 +3413,14 @@ static size_t __build_packet(quicconn_t* conn, quic_enc_level_e level,
      * the peer waits for until its own timer gives up on it. */
     if (ack_len > 0) quicack_on_sent(&conn->ack[level]);
 
-    quicloss_on_sent(&conn->loss, level, pn, total, ack_eliciting, 1, refs, now_us);
+    /* In flight means ack-eliciting or padded (RFC 9002 §2). An ACK-only
+     * packet is neither: the peer does not acknowledge it on its own (RFC 9000
+     * §13.2.1), and counting it left its bytes in the congestion window until
+     * something unrelated happened to cover them -- on an upload, where the
+     * server sends nothing else, one acknowledgement at a time until the
+     * window was gone. Loss detection still tracks it, for its ACK frame. */
+    const int in_flight = ack_eliciting || padded;
+    quicloss_on_sent(&conn->loss, level, pn, total, ack_eliciting, in_flight, refs, now_us);
     if (conn->ecn_enabled) {
         conn->ecn_sent[level]++;
         metrics_quic(METRICS_QUIC_ECN_TX_MARKED);
