@@ -24,42 +24,6 @@ static inline void spinlock_unlock(atomic_flag* lock) {
 }
 
 // =============================================================================
-// Seqlock implementation
-// =============================================================================
-
-static inline void seqlock_init(ratelimiter_seqlock_t* sl) {
-    atomic_init(&sl->seq, 0);
-    atomic_flag_clear(&sl->write_lock);
-}
-
-// Начать чтение - возвращает sequence number
-static inline uint64_t seqlock_read_begin(ratelimiter_seqlock_t* sl) {
-    uint64_t seq;
-    do {
-        seq = atomic_load_explicit(&sl->seq, memory_order_acquire);
-    } while (seq & 1);  // Ждём пока seq чётный (нет записи)
-    return seq;
-}
-
-// Проверить валидность чтения - true если данные консистентны
-static inline int seqlock_read_retry(ratelimiter_seqlock_t* sl, uint64_t start_seq) {
-    atomic_thread_fence(memory_order_acquire);
-    return atomic_load_explicit(&sl->seq, memory_order_relaxed) != start_seq;
-}
-
-// Захватить write lock
-static inline void seqlock_write_lock(ratelimiter_seqlock_t* sl) {
-    spinlock_lock(&sl->write_lock);
-    atomic_fetch_add_explicit(&sl->seq, 1, memory_order_release);  // seq становится нечётным
-}
-
-// Освободить write lock
-static inline void seqlock_write_unlock(ratelimiter_seqlock_t* sl) {
-    atomic_fetch_add_explicit(&sl->seq, 1, memory_order_release);  // seq становится чётным
-    spinlock_unlock(&sl->write_lock);
-}
-
-// =============================================================================
 // Time functions
 // =============================================================================
 
@@ -153,49 +117,25 @@ static void bucket_refill(ratelimiter_bucket_t* bucket, ratelimiter_config_t* co
     }
 }
 
-// =============================================================================
-// Lock-free find with seqlock
-// =============================================================================
+// Взять токены из корзины. Вызывается под limiter->lock (чтение или запись):
+// пока он удержан, очистка не освободит корзину.
+static int bucket_take(ratelimiter_bucket_t* bucket, ratelimiter_config_t* config, uint32_t tokens_required) {
+    spinlock_lock(&bucket->locked);
 
-static ratelimiter_bucket_t* find_bucket_lockfree(ratelimiter_t* limiter, uint64_t key) {
-    ratelimiter_bucket_t* bucket;
-    uint64_t seq;
+    bucket_refill(bucket, config);
+    atomic_store(&bucket->last_access_ns, ratelimiter_get_time_ns());
 
-    do {
-        seq = seqlock_read_begin(&limiter->seqlock);
-        bucket = map_find(limiter->buckets, (void*)bucket_key(key));
-    } while (seqlock_read_retry(&limiter->seqlock, seq));
+    uint32_t current_tokens = atomic_load(&bucket->tokens);
+    int allowed = 0;
 
-    return bucket;
-}
-
-// Найти или создать bucket для клиента
-static ratelimiter_bucket_t* find_or_create_bucket(ratelimiter_t* limiter, uint64_t key) {
-    // Сначала пробуем найти lock-free
-    ratelimiter_bucket_t* bucket = find_bucket_lockfree(limiter, key);
-    if (bucket) {
-        return bucket;
+    if (current_tokens >= tokens_required) {
+        atomic_store(&bucket->tokens, current_tokens - tokens_required);
+        allowed = 1;
     }
 
-    // Не найден - нужен write lock для создания
-    seqlock_write_lock(&limiter->seqlock);
+    spinlock_unlock(&bucket->locked);
 
-    // Повторная проверка (другой поток мог создать)
-    bucket = map_find(limiter->buckets, (void*)bucket_key(key));
-    if (bucket) {
-        seqlock_write_unlock(&limiter->seqlock);
-        return bucket;
-    }
-
-    // Создание нового bucket
-    bucket = bucket_create(key, limiter->config.max_tokens);
-    if (bucket) {
-        map_insert(limiter->buckets, (void*)bucket_key(key), bucket);
-    }
-
-    seqlock_write_unlock(&limiter->seqlock);
-
-    return bucket;
+    return allowed;
 }
 
 // =============================================================================
@@ -216,8 +156,11 @@ static void cleanup_old_buckets(ratelimiter_t* limiter) {
         return;
     }
 
-    // Берём write lock для cleanup
-    seqlock_write_lock(&limiter->seqlock);
+    /* Под блокировкой записи: ни один поток не держит корзину, которую мы
+     * освободим. Время читаем заново -- пока ждали блокировку, читатели могли
+     * обновить last_access_ns позже прежнего now. */
+    pthread_rwlock_wrlock(&limiter->lock);
+    now = ratelimiter_get_time_ns();
 
     // Подсчитываем количество для удаления
     size_t to_delete_count = 0;
@@ -249,7 +192,7 @@ static void cleanup_old_buckets(ratelimiter_t* limiter) {
         }
     }
 
-    seqlock_write_unlock(&limiter->seqlock);
+    pthread_rwlock_unlock(&limiter->lock);
 }
 
 // =============================================================================
@@ -270,7 +213,12 @@ ratelimiter_t* ratelimiter_init(ratelimiter_config_t* config) {
         return NULL;
     }
 
-    seqlock_init(&limiter->seqlock);
+    if (pthread_rwlock_init(&limiter->lock, NULL) != 0) {
+        map_free(limiter->buckets);
+        free(limiter);
+        return NULL;
+    }
+
     atomic_init(&limiter->last_cleanup_ns, ratelimiter_get_time_ns());
 
     return limiter;
@@ -280,6 +228,7 @@ void ratelimiter_free(ratelimiter_t* limiter) {
     if (!limiter) return;
 
     map_free(limiter->buckets);
+    pthread_rwlock_destroy(&limiter->lock);
     free(limiter);
 }
 
@@ -291,26 +240,36 @@ int ratelimiter_allow(ratelimiter_t* limiter, const ipaddr_t* ip, uint32_t token
     if (limiter->config.refill_rate == 0 || ip == NULL)
         return 1;
 
-    ratelimiter_bucket_t* bucket = find_or_create_bucket(limiter, ipaddr_client_key(ip));
+    const uint64_t key = ipaddr_client_key(ip);
+    int allowed;
+
+    pthread_rwlock_rdlock(&limiter->lock);
+    ratelimiter_bucket_t* bucket = map_find(limiter->buckets, (void*)bucket_key(key));
+    if (bucket) {
+        allowed = bucket_take(bucket, &limiter->config, tokens_required);
+        pthread_rwlock_unlock(&limiter->lock);
+        return allowed;
+    }
+    pthread_rwlock_unlock(&limiter->lock);
+
+    // Не найден - создаём под блокировкой записи (другой поток мог успеть раньше)
+    pthread_rwlock_wrlock(&limiter->lock);
+    bucket = map_find(limiter->buckets, (void*)bucket_key(key));
     if (!bucket) {
+        bucket = bucket_create(key, limiter->config.max_tokens);
+        if (bucket && map_insert(limiter->buckets, (void*)bucket_key(key), bucket) != 1) {
+            free(bucket);
+            bucket = NULL;
+        }
+    }
+    if (!bucket) {
+        pthread_rwlock_unlock(&limiter->lock);
         log_error("Failed to create rate limiter bucket");
         return 1;
     }
 
-    spinlock_lock(&bucket->locked);
-
-    bucket_refill(bucket, &limiter->config);
-    atomic_store(&bucket->last_access_ns, ratelimiter_get_time_ns());
-
-    uint32_t current_tokens = atomic_load(&bucket->tokens);
-    int allowed = 0;
-
-    if (current_tokens >= tokens_required) {
-        atomic_store(&bucket->tokens, current_tokens - tokens_required);
-        allowed = 1;
-    }
-
-    spinlock_unlock(&bucket->locked);
+    allowed = bucket_take(bucket, &limiter->config, tokens_required);
+    pthread_rwlock_unlock(&limiter->lock);
 
     return allowed;
 }

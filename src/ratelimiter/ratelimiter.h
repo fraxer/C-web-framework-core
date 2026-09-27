@@ -1,6 +1,7 @@
 #ifndef __RATELIMITER__
 #define __RATELIMITER__
 
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <time.h>
@@ -11,7 +12,11 @@
 
 /**
  * Rate Limiter - реализация Token Bucket алгоритма
- * Lock-free реализация с использованием seqlock для map_t (Red-Black Tree)
+ * Карта корзин (map_t, красно-чёрное дерево) под pthread_rwlock_t: запросы
+ * читают её параллельно и держат блокировку чтения, пока работают с корзиной;
+ * создание корзины и очистка берут блокировку записи. Прежний seqlock не
+ * защищал от очистки: map_erase освобождал корзину и узлы дерева, которые
+ * другой поток в этот момент читал (heap-use-after-free, test_ratelimiter.c).
  */
 
 // Конфигурация rate limiter
@@ -33,16 +38,10 @@ typedef struct ratelimiter_bucket {
     atomic_flag locked;                    // Spinlock для bucket
 } ratelimiter_bucket_t;
 
-// Seqlock для lock-free чтения map
-typedef struct ratelimiter_seqlock {
-    atomic_uint_fast64_t seq;              // Sequence counter (чётный = стабильно)
-    atomic_flag write_lock;                // Spinlock для писателей
-} ratelimiter_seqlock_t;
-
 typedef struct ratelimiter {
     ratelimiter_config_t config;
     map_t* buckets;                        // map_t: ключ клиента -> ratelimiter_bucket_t*
-    ratelimiter_seqlock_t seqlock;         // Seqlock для lock-free доступа
+    pthread_rwlock_t lock;                 // Защищает buckets и жизнь корзин
     atomic_uint_fast64_t last_cleanup_ns;
 } ratelimiter_t;
 

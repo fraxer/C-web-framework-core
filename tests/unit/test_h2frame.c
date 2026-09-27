@@ -60,7 +60,7 @@ static int feed_chunked(int preface, const uint8_t* buf, size_t len, size_t chun
                     c->payload_len = f.payload_len;
                     c->payload = malloc(f.payload_len ? f.payload_len : 1);
                     if (c->payload == NULL) { h2frame_parser_free(&p); return -1; }
-                    memcpy(c->payload, f.payload, f.payload_len);
+                    if (f.payload_len) memcpy(c->payload, f.payload, f.payload_len);
                     list->count++;
                 }
                 total++;
