@@ -884,8 +884,10 @@ TEST(test_view_render_loop_long_object_key) {
                                           "{% for v, k in obj %}{{ k }}={{ v }}{% endfor %}"),
                       "Template should be written", cleanup);
 
-    // ключ длиннее VIEWPARSER_VARIABLE_ITEM_NAME_SIZE (80): до фикса sprintf
-    // переполнял key_value (heap overflow под ASan), после — усечение
+    // ключ длиннее VIEWPARSER_VARIABLE_ITEM_NAME_SIZE (80): сначала sprintf
+    // переполнял key_value (heap overflow под ASan), потом ключ усекался до
+    // 79 байт — данные документа выходили искажёнными (цель view). Теперь
+    // ключ берётся из документа как есть.
     char long_key[161];
     memset(long_key, 'k', sizeof(long_key) - 1);
     long_key[sizeof(long_key) - 1] = 0;
@@ -899,10 +901,9 @@ TEST(test_view_render_loop_long_object_key) {
     char* result = render(doc, VIEW_TEST_STORAGE, "/for_longkey.html");
     TEST_REQUIRE_NOT_NULL_GOTO(result, "Render should not crash on long keys", cleanup_doc);
 
-    // ключ усечён до 79 символов + "=v"
-    char expected[128];
-    snprintf(expected, sizeof(expected), "%.79s=v", long_key);
-    TEST_ASSERT_STR_EQUAL(expected, result, "Long key should be truncated, not overflow");
+    char expected[200];
+    snprintf(expected, sizeof(expected), "%s=v", long_key);
+    TEST_ASSERT_STR_EQUAL(expected, result, "Long key should be rendered whole");
 
     free(result);
 

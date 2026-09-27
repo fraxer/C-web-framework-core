@@ -344,17 +344,18 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
             if (token != NULL) {
                 if (token->type == JSON_OBJECT || token->type == JSON_ARRAY) {
                     for (json_it_t it = json_init_it(token); !json_end_it(&it); it = json_next_it(&it)) {
-                        // key_value is a fixed-size buffer, object keys come
-                        // from the runtime document — never trust their length
+                        // the key is the document's, which outlives the
+                        // render: borrowed whole, never copied into a buffer
+                        // that would have to cut it
                         if (token->type == JSON_OBJECT) {
                             const char* key = json_it_key(&it);
-                            snprintf(tag_for->key_value, sizeof(tag_for->key_value), "%s", key != NULL ? key : "");
+                            tag_for->key_value = key != NULL ? key : "";
                             tag_for->key_is_index = 0;
                             tag_for->key_index = 0;
                         }
                         else {
                             const int key_index = *(int*)json_it_key(&it);
-                            snprintf(tag_for->key_value, sizeof(tag_for->key_value), "%d", key_index);
+                            tag_for->key_value = NULL;
                             tag_for->key_is_index = 1;
                             tag_for->key_index = key_index;
                         }
