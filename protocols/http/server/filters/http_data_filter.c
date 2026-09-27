@@ -144,8 +144,10 @@ int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf)
     if (request != NULL && request->method == ROUTE_HEAD)
         return CWF_OK;
 
-    // RFC 7232: 304 response MUST NOT contain a message body
-    if (response->status_code == 304)
+    // RFC 7232: 304 response MUST NOT contain a message body; RFC 9110
+    // §15.3.5: nor may a 204 -- the header stage gave it no Content-Length, so
+    // an HTTP/1.1 client would read a body sent anyway as the next response.
+    if (response->status_code == 304 || response->status_code == 204)
         return CWF_OK;
 
     int r = 0;
