@@ -1188,9 +1188,9 @@ TEST(test_update_null_with_string) {
     TEST_CASE("array_update NULL check with string value");
 
     // Test with different value types to ensure NULL check works
+    /* The value is consumed either way, as by array_insert. */
     avalue_t str_val = array_create_string("test");
     array_update(NULL, 0, str_val);
-    free(str_val._string);
 
     avalue_t dbl_val = array_create_double(3.14);
     array_update(NULL, 5, dbl_val);
@@ -1491,5 +1491,36 @@ TEST(test_type_validation_bounds) {
     int val4 = array_get_int(NULL, 0);
     TEST_ASSERT(val4 == 0, "NULL array should return 0");
 
+    array_free(arr);
+}
+
+static int __array_test_freed;
+
+static void __array_test_count_free(void* p) {
+    (void)p;
+    __array_test_freed++;
+}
+
+TEST(test_array_update_out_of_bounds_frees_value) {
+    TEST_CASE("a refused update releases the value it was given, as a refused insert does");
+
+    /* array_insert frees a value it refuses; array_update leaked it. Found by
+     * the misc_containers fuzz target. */
+    static int object;
+    array_t* arr = array_create();
+    TEST_REQUIRE_NOT_NULL(arr, "array");
+
+    __array_test_freed = 0;
+    array_update(arr, 0, array_create_pointer(&object, NULL, __array_test_count_free));
+    TEST_ASSERT_EQUAL(1, __array_test_freed, "past the end: freed");
+
+    array_push_back_int(arr, 1);
+    array_update(arr, 5, array_create_pointer(&object, NULL, __array_test_count_free));
+    TEST_ASSERT_EQUAL(2, __array_test_freed, "further past the end: freed");
+
+    array_update(NULL, 0, array_create_pointer(&object, NULL, __array_test_count_free));
+    TEST_ASSERT_EQUAL(3, __array_test_freed, "no array: freed");
+
+    TEST_ASSERT_EQUAL(1, array_get_int(arr, 0), "the element is untouched");
     array_free(arr);
 }

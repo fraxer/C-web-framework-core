@@ -217,9 +217,15 @@ void array_push_back_double(array_t* array, double value) {
 }
 
 void array_update(array_t* array, size_t index, avalue_t value) {
-    if (array == NULL) return;
+    /* The value is the array's from here on, as in array_insert: a refused
+     * one is released, not leaked. */
+    if (array == NULL) {
+        __array_free_value(&value);
+        return;
+    }
     if (index >= array->size) {
         log_error("array_update: Index out of bounds\n");
+        __array_free_value(&value);
         return;
     }
 
