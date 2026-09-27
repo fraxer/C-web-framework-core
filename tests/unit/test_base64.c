@@ -724,3 +724,19 @@ TEST(test_base64_encode_nl_wrap_equals_4) {
     TEST_ASSERT_EQUAL(4, max_line, "With wrap=4, max line length should be 4");
     free(buf);
 }
+
+TEST(test_base64_decode_line_break_inside_group) {
+    TEST_CASE("CR and LF are skipped wherever they fall, not only between groups");
+
+    /* base64_decode_len skipped them anywhere, the decoder only at the start
+     * of a group: a break inside one decoded the CR as data (found by the
+     * base64 helper of the text fuzz target). */
+    static const char* const inputs[] = { "QU\r\nJD", "Q\nUJD", "QUJ\rD", "QUJDRA\r\n==", "QUJD\r\nRA==" };
+    static const char* const outputs[] = { "ABC", "ABC", "ABC", "ABCD", "ABCD" };
+    for (size_t i = 0; i < sizeof inputs / sizeof inputs[0]; i++) {
+        char out[16] = { 0 };
+        const int n = base64_decode(out, inputs[i]);
+        TEST_ASSERT_EQUAL((int)strlen(outputs[i]), n, inputs[i]);
+        TEST_ASSERT(memcmp(out, outputs[i], strlen(outputs[i])) == 0, inputs[i]);
+    }
+}
