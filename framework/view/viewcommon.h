@@ -46,7 +46,7 @@ typedef struct view_loop {
 
     char element_name[VIEWPARSER_VARIABLE_ITEM_NAME_SIZE];
     char key_name[VIEWPARSER_VARIABLE_ITEM_NAME_SIZE];
-    char key_value[VIEWPARSER_VARIABLE_ITEM_NAME_SIZE];
+    const char* key_value;  // object loops: the current key, borrowed from the document
     long long key_index;
     int key_is_index;
 
