@@ -261,6 +261,93 @@ static uint64_t __fuzz_fnv_headers(uint64_t h, const http_header_t* header) {
 
 #endif
 
+#if FUZZ_TARGET == FUZZ_DB_QUERY || FUZZ_TARGET == FUZZ_DB_MODEL
+
+#include "array.h"
+#include "database.h"
+#include "dbquery.h"
+#include "dbresult.h"
+#include "json.h"
+#include "model.h"
+#include "mparams.h"
+#include "sqlite.h"
+#include "str.h"
+
+/* The database targets run on SQLite ":memory:" (dbid sqlite.test): the
+ * configuration is built here, the way tests/db/test_config.json declares it,
+ * rather than read from a file. */
+
+static appconfig_t* __db_config;
+
+static void __db_init(void) {
+    if (__db_config != NULL) return;
+
+    __db_config = calloc(1, sizeof *__db_config);
+    if (__db_config == NULL) abort();
+    __db_config->env.main.log.enabled = false;
+    __db_config->env.main.tmp = "/tmp";
+    __db_config->env.main.workers = 1;
+    __db_config->env.main.threads = 1;
+    __db_config->databases = array_create();
+
+    json_doc_t* doc = json_parse("[{\"host_id\":\"test\",\"path\":\":memory:\"}]");
+    db_t* db = doc != NULL ? sqlite_load("sqlite", json_root(doc)) : NULL;
+    if (db == NULL || __db_config->databases == NULL) abort();
+    json_free(doc);
+    array_push_back(__db_config->databases, array_create_pointer(db, array_nocopy, db_free));
+}
+
+__attribute__((weak)) appconfig_t* appconfig(void) {
+    __db_init();
+    return __db_config;
+}
+
+__attribute__((weak)) env_t* env(void) {
+    __db_init();
+    return &__db_config->env;
+}
+
+__attribute__((weak)) void appconfig_set(appconfig_t* config) {
+    (void)config;
+}
+
+#define DQ_DBID "sqlite.test"
+
+typedef struct {
+    const uint8_t* p;
+    const uint8_t* end;
+} dq_in_t;
+
+static uint8_t __dq_byte(dq_in_t* in) {
+    return in->p < in->end ? *in->p++ : 0;
+}
+
+typedef struct {
+    char* data;
+    size_t len;
+    size_t cap;
+} dq_buf_t;
+
+static void __dq_put(dq_buf_t* b, const void* p, size_t n) {
+    if (b->len + n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 256;
+        while (cap < b->len + n + 1) cap *= 2;
+        char* grown = realloc(b->data, cap);
+        if (grown == NULL) abort();
+        b->data = grown;
+        b->cap = cap;
+    }
+    memcpy(b->data + b->len, p, n);
+    b->len += n;
+    b->data[b->len] = '\0';
+}
+
+static void __dq_puts(dq_buf_t* b, const char* s) {
+    __dq_put(b, s, strlen(s));
+}
+
+#endif
+
 #if FUZZ_TARGET == FUZZ_QUIC_PACKET
 
 /* A datagram as it arrives from the socket: coalesced packets, arbitrary
@@ -6406,6 +6493,735 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     ratelimiter_free(limiter);
     ratelimiter_set_time_source(NULL);
     free(m);
+
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_DB_QUERY
+
+/* The query layer that user data reaches on its way to the database: the
+ * template builder (parse_sql_parameters), the bound execution of dbquery,
+ * the result cursor, and the dbinsert/dbselect/dbupdate/dbdelete compilers --
+ * on SQLite ":memory:", which needs no server. The first byte picks the mode:
+ *
+ *   0 builder -- a template generated from the input out of SQL words, string
+ *     literals, quoted identifiers, both kinds of comment, and :v @w :list__l
+ *     parameters with whatever follows them (a quote, a comment, a cast). The
+ *     builder, run with a processor that writes <name> and {name}, must give
+ *     exactly the template with those substitutions -- nothing inside a literal
+ *     or a comment, nothing lost at the end -- or refuse an unknown name, two
+ *     names run together, or a list that is empty. Backslash before a quote is
+ *     left out of the generator: the scanner treats it as an escape, which is
+ *     MySQL's reading and not SQLite's or PostgreSQL's (ruled, not tested);
+ *   1 values -- a value (any bytes, NUL included), a list and an identifier
+ *     go through dbquery and come back byte for byte; the identifier is quoted,
+ *     never spliced (one column, named as given up to its first NUL -- the
+ *     escaper works on C strings); an unknown name is refused;
+ *   2 results -- a VALUES table of the input's shape, NULLs included, walked
+ *     with every cursor call and arbitrary (negative too) indices against a
+ *     model of the cursor: nothing outside the table, NULL for SQL NULL;
+ *   3 compilers -- a table and two columns named from the input (quotes,
+ *     separators, any UTF-8; not the expression forms dbselect passes through
+ *     raw by contract), a row inserted, selected, updated, deleted.
+ *
+ * Throughout: a result that is not ok carries an error, one that is ok does
+ * not, and LeakSanitizer sees everything freed. */
+
+static void __dq_check(dbresult_t* r) {
+    if (r == NULL) return;
+    if (dbresult_ok(r) && dbresult_error(r) != NULL) __builtin_trap();
+    if (!dbresult_ok(r) && dbresult_error(r) == NULL) __builtin_trap();
+}
+
+/* ---- 0: builder ---- */
+
+static int __dq_marker(void* connection, char type, const char* name, mfield_t* field, str_t* sql, void* user_data) {
+    (void)connection; (void)field; (void)user_data;
+    str_appendc(sql, type == ':' ? '<' : '{');
+    str_append(sql, name, strlen(name));
+    str_appendc(sql, type == ':' ? '>' : '}');
+    return 1;
+}
+
+/* Bytes of a literal, identifier or comment: anything but a backslash (see
+ * above) and the terminator, which the caller doubles or avoids. */
+static void __dq_content(dq_in_t* in, dq_buf_t* t, char quote, int comment) {
+    const size_t n = __dq_byte(in) % 12;
+    char prev = 0;
+    for (size_t i = 0; i < n; i++) {
+        char c = (char)__dq_byte(in);
+        if (c == '\\') c = 'b';
+        if (comment == 1 && prev == '*' && c == '/') c = '|';
+        if (comment == 2 && (c == '\n' || c == '\r')) c = ' ';
+        if (quote != 0 && c == quote) __dq_put(t, &c, 1);
+        __dq_put(t, &c, 1);
+        prev = c;
+    }
+}
+
+static void __dq_builder(dq_in_t* in) {
+    static const char* const words[] = {
+        "SELECT", " ", ",", "(", ")", "1", "x", "AS", "=", "\n", "\t", ";", "*", ": ", "@ ", "x::int", "::",
+    };
+    static const char* const after[] = { " ", ",", ")", "::int", "'q'", "\"i\"", "--c\n", "/*c*/", "\n", "=1" };
+
+    const size_t list_n = __dq_byte(in) % 4;
+    array_t* list = array_create();
+    for (size_t i = 0; i < list_n; i++) array_push_back(list, array_create_int((int)i));
+    array_t* params = array_create();
+    mparams_fill_array(params, mparam_int(v, 1), mparam_int(w, 2), mparam_array(l, list));
+
+    dq_buf_t t = { 0 }, e = { 0 };
+    int refused = 0;
+    const size_t pieces = __dq_byte(in) % 48 + 1;
+    for (size_t k = 0; k < pieces && in->p < in->end; k++) {
+        const uint8_t op = __dq_byte(in);
+        const size_t start = t.len;
+        switch (op % 9) {
+        case 0:
+            __dq_puts(&t, words[__dq_byte(in) % (sizeof words / sizeof words[0])]);
+            break;
+        case 1:
+            __dq_puts(&t, "'"); __dq_content(in, &t, '\'', 0); __dq_puts(&t, "'");
+            break;
+        case 2:
+            __dq_puts(&t, "\""); __dq_content(in, &t, '"', 0); __dq_puts(&t, "\"");
+            break;
+        case 3:
+            __dq_puts(&t, "/*"); __dq_content(in, &t, 0, 1);
+            if (t.data[t.len - 1] == '*') __dq_puts(&t, " ");
+            __dq_puts(&t, "*/");
+            break;
+        case 4:
+            __dq_puts(&t, "--"); __dq_content(in, &t, 0, 2); __dq_puts(&t, "\n");
+            break;
+        case 5:
+        case 6: {
+            const char type = op % 9 == 5 ? ':' : '@';
+            const uint8_t which = __dq_byte(in) % 3;
+            const char* name = which == 0 ? "v" : which == 1 ? "w" : "list__l";
+            __dq_put(&t, &type, 1);
+            __dq_puts(&t, name);
+            if (which == 2) {
+                if (list_n == 0) refused = 1;
+                for (size_t i = 0; i < list_n; i++) {
+                    if (i > 0) __dq_puts(&e, ",");
+                    __dq_puts(&e, type == ':' ? "<l>" : "{l}");
+                }
+            } else {
+                __dq_puts(&e, type == ':' ? "<" : "{");
+                __dq_puts(&e, name);
+                __dq_puts(&e, type == ':' ? ">" : "}");
+            }
+            const size_t mark = t.len;
+            __dq_puts(&t, after[__dq_byte(in) % (sizeof after / sizeof after[0])]);
+            __dq_put(&e, t.data + mark, t.len - mark);
+            continue;
+        }
+        case 7:
+            __dq_puts(&t, ":zz ");
+            refused = 1;
+            break;
+        case 8:
+            __dq_puts(&t, ":v:w ");
+            refused = 1;
+            break;
+        }
+        __dq_put(&e, t.data + start, t.len - start);
+    }
+
+    str_t* built = parse_sql_parameters(NULL, t.data ? t.data : "", t.len, params, __dq_marker, NULL);
+    if (refused) {
+        if (built != NULL) __builtin_trap();
+    } else {
+        if (built == NULL) __builtin_trap();
+        if (str_size(built) != e.len || memcmp(str_get(built), e.data ? e.data : "", e.len) != 0) __builtin_trap();
+    }
+
+    str_free(built);
+    array_free(params);
+    free(t.data);
+    free(e.data);
+}
+
+/* ---- 1: values ---- */
+
+static void __dq_values(dq_in_t* in) {
+    uint8_t bytes[256];
+    const size_t n = __dq_byte(in);
+    size_t len = 0;
+    while (len < n && in->p < in->end) bytes[len++] = *in->p++;
+
+    /* The value, as a text field that keeps its NUL bytes. */
+    mfield_t* v = field_create_text("v", "");
+    if (v == NULL) abort();
+    str_assign(v->value._string, (const char*)bytes, len);
+    array_t* params = array_create();
+    array_push_back(params, array_create_pointer(v, NULL, model_param_free));
+    dbresult_t* r = dbquery(DQ_DBID, "SELECT :v AS v", params);
+    __dq_check(r);
+    if (!dbresult_ok(r)) __builtin_trap();
+    db_table_cell_t* cell = dbresult_field(r, "v");
+    if (cell == NULL || cell->value == NULL || cell->length != len || memcmp(cell->value, bytes, len) != 0) __builtin_trap();
+    dbresult_free(r);
+
+    /* Through a table and back. */
+    r = dbquery(DQ_DBID, "INSERT INTO fz (t) VALUES (:v) RETURNING t", params);
+    __dq_check(r);
+    cell = dbresult_ok(r) ? dbresult_field(r, "t") : NULL;
+    if (cell == NULL || cell->length != len || memcmp(cell->value, bytes, len) != 0) __builtin_trap();
+    dbresult_free(r);
+    r = dbquery(DQ_DBID, "DELETE FROM fz", NULL);
+    if (!dbresult_ok(r)) __builtin_trap();
+    dbresult_free(r);
+
+    /* An identifier: quoted, whatever it holds. */
+    mfield_t* w = field_create_text("w", "");
+    if (w == NULL) abort();
+    str_assign(w->value._string, (const char*)bytes, len);
+    array_push_back(params, array_create_pointer(w, NULL, model_param_free));
+    r = dbquery(DQ_DBID, "SELECT 1 AS @w", params);
+    __dq_check(r);
+    if (dbresult_ok(r)) {
+        const size_t name_len = strnlen((const char*)bytes, len);
+        const char* name = dbresult_col_name(r, 0);
+        if (dbresult_query_cols(r) != 1 || name == NULL || strlen(name) != name_len ||
+            memcmp(name, bytes, name_len) != 0) __builtin_trap();
+    }
+    dbresult_free(r);
+
+    /* A list: exactly as many values as elements, in order. Strings are C
+     * strings in an array_t, so these stop at NUL. */
+    const size_t count = __dq_byte(in) % 5 + 1;
+    array_t* list = array_create();
+    for (size_t i = 0; i < count; i++) {
+        if (i % 2 == 0) array_push_back(list, array_create_int((int)(int8_t)__dq_byte(in)));
+        else array_push_back(list, array_create_stringn((const char*)bytes + i % (len + 1), strnlen((const char*)bytes + i % (len + 1), len - i % (len + 1))));
+    }
+    array_push_back(params, array_create_pointer(mparam_array(l, list), NULL, model_param_free));
+    r = dbquery(DQ_DBID, "SELECT :list__l", params);
+    __dq_check(r);
+    if (!dbresult_ok(r) || dbresult_query_cols(r) != (int)count) __builtin_trap();
+    for (size_t i = 0; i < count; i++) {
+        cell = dbresult_cell(r, 0, (int)i);
+        char want[32];
+        const char* w_value = want;
+        size_t w_len;
+        if (i % 2 == 0) w_len = (size_t)snprintf(want, sizeof want, "%d", array_get_int(list, i));
+        else { w_value = array_get_string(list, i); w_len = strlen(w_value); }
+        if (cell == NULL || cell->value == NULL || cell->length != w_len || memcmp(cell->value, w_value, w_len) != 0) __builtin_trap();
+    }
+    dbresult_free(r);
+
+    r = dbquery(DQ_DBID, "SELECT :nope", params);
+    if (r != NULL) __builtin_trap();
+
+    array_free(params);
+}
+
+/* ---- 2: results ---- */
+
+static void __dq_results(dq_in_t* in) {
+    const int rows = __dq_byte(in) % 6;
+    const int cols = __dq_byte(in) % 5 + 1;
+    int values[5][5];
+    int nulls[5][5];
+
+    dq_buf_t sql = { 0 };
+    __dq_puts(&sql, "SELECT * FROM (VALUES ");
+    for (int r = 0; r < (rows ? rows : 1); r++) {
+        __dq_puts(&sql, r ? ",(" : "(");
+        for (int c = 0; c < cols; c++) {
+            const uint8_t b = __dq_byte(in);
+            nulls[r][c] = b % 5 == 0;
+            values[r][c] = (int8_t)b;
+            char num[16];
+            snprintf(num, sizeof num, "%s%d", c ? "," : "", values[r][c]);
+            __dq_puts(&sql, nulls[r][c] ? (c ? ",NULL" : "NULL") : num);
+        }
+        __dq_puts(&sql, ")");
+    }
+    __dq_puts(&sql, rows ? ")" : ") WHERE 0");
+
+    dbresult_t* r = dbquery(DQ_DBID, sql.data, NULL);
+    free(sql.data);
+    __dq_check(r);
+    if (!dbresult_ok(r) || dbresult_query_rows(r) != rows || dbresult_query_cols(r) != cols) __builtin_trap();
+
+    int cur_row = 0, cur_col = 0;
+    for (int step = 0; step < 64 && in->p < in->end; step++) {
+        const uint8_t op = __dq_byte(in);
+        const int a = (int8_t)__dq_byte(in);
+        const int b = (int8_t)__dq_byte(in);
+        int got, want;
+        const db_table_cell_t* cell = NULL;
+        int at_row = -1, at_col = -1;
+        switch (op % 8) {
+        case 0:
+            want = cur_row + 1 < rows;
+            if (dbresult_row_next(r) != want) __builtin_trap();
+            if (want) cur_row++;
+            continue;
+        case 1:
+            want = cur_col + 1 < cols;
+            if (dbresult_col_next(r) != want) __builtin_trap();
+            if (want) cur_col++;
+            continue;
+        case 2:
+            want = a >= 0 && a < rows;
+            if ((got = dbresult_row_set(r, a)) != want) __builtin_trap();
+            if (want) cur_row = a;
+            continue;
+        case 3:
+            want = a >= 0 && a < cols;
+            if ((got = dbresult_col_set(r, a)) != want) __builtin_trap();
+            if (want) cur_col = a;
+            continue;
+        case 4:
+            cell = dbresult_field(r, NULL);
+            at_row = cur_row; at_col = cur_col;
+            break;
+        case 5: {
+            char name[16];
+            snprintf(name, sizeof name, "column%d", (a & 7) + 1);
+            cell = dbresult_field(r, name);
+            at_row = cur_row; at_col = (a & 7) < cols ? (a & 7) : -1;
+            break;
+        }
+        case 6:
+            cell = dbresult_cell(r, a, b);
+            at_row = a; at_col = b;
+            break;
+        case 7:
+            dbresult_row_first(r);
+            dbresult_col_first(r);
+            cur_row = cur_col = 0;
+            if (dbresult_query_next(r) != NULL) __builtin_trap();
+            continue;
+        }
+        const int inside = at_row >= 0 && at_row < rows && at_col >= 0 && at_col < cols;
+        if (!inside) {
+            if (cell != NULL) __builtin_trap();
+            continue;
+        }
+        if (cell == NULL) __builtin_trap();
+        if (nulls[at_row][at_col]) {
+            if (cell->value != NULL) __builtin_trap();
+        } else {
+            char want_text[16];
+            snprintf(want_text, sizeof want_text, "%d", values[at_row][at_col]);
+            if (cell->value == NULL || strcmp(cell->value, want_text) != 0) __builtin_trap();
+        }
+    }
+
+    dbresult_free(r);
+}
+
+/* ---- 3: compilers ---- */
+
+/* A name from the input: never empty, no NUL, and starting with a letter
+ * with none of + / | : * - ( ' in it, so that dbselect does not take it for
+ * the expression it would pass through raw. */
+static void __dq_name(dq_in_t* in, char* out, size_t cap, const char* prefix) {
+    size_t n = strlen(prefix);
+    memcpy(out, prefix, n);
+    const size_t len = __dq_byte(in) % 16;
+    for (size_t i = 0; i < len && n + 1 < cap; i++) {
+        const char c = (char)__dq_byte(in);
+        if (c == '\0' || strchr("+/|:*-('", c) != NULL) continue;
+        out[n++] = c;
+    }
+    out[n] = '\0';
+}
+
+static void __dq_text(dq_in_t* in, char* out, size_t cap) {
+    size_t n = 0;
+    const size_t len = __dq_byte(in) % 24;
+    for (size_t i = 0; i < len && n + 1 < cap; i++) {
+        const char c = (char)__dq_byte(in);
+        if (c != '\0') out[n++] = c;
+    }
+    out[n] = '\0';
+}
+
+static dbresult_t* __dq_select(const char* table, const char* a, const char* b, const char* key) {
+    array_t* columns = array_create();
+    array_push_back(columns, array_create_string(a));
+    array_push_back(columns, array_create_string(b));
+    array_t* where = array_create();
+    array_push_back(where, array_create_pointer(field_create_text(a, key), NULL, model_param_free));
+    dbresult_t* r = dbselect(DQ_DBID, table, columns, where);
+    array_free(columns);
+    array_free(where);
+    __dq_check(r);
+    return r;
+}
+
+static void __dq_compilers(dq_in_t* in) {
+    char table[32], a[32], b[32], v1[32], v2[32], v3[32];
+    __dq_name(in, table, sizeof table, "t");
+    __dq_name(in, a, sizeof a, "a");
+    __dq_name(in, b, sizeof b, "b");
+    __dq_text(in, v1, sizeof v1);
+    __dq_text(in, v2, sizeof v2);
+    __dq_text(in, v3, sizeof v3);
+    if (strcasecmp(a, b) == 0) return;
+
+    array_t* ids = array_create();
+    mparams_fill_array(ids, mparam_text(t, table), mparam_text(a, a), mparam_text(b, b));
+    dbresult_t* r = dbquery(DQ_DBID, "DROP TABLE IF EXISTS @t", ids);
+    __dq_check(r);
+    dbresult_free(r);
+    r = dbquery(DQ_DBID, "CREATE TABLE @t (@a TEXT, @b TEXT)", ids);
+    __dq_check(r);
+    if (!dbresult_ok(r)) __builtin_trap();
+    dbresult_free(r);
+
+    array_t* row = array_create();
+    array_push_back(row, array_create_pointer(field_create_text(a, v1), NULL, model_param_free));
+    array_push_back(row, array_create_pointer(field_create_text(b, v2), NULL, model_param_free));
+    r = dbinsert(DQ_DBID, table, row);
+    array_free(row);
+    __dq_check(r);
+    if (!dbresult_ok(r)) __builtin_trap();
+    dbresult_free(r);
+
+    r = __dq_select(table, a, b, v1);
+    if (!dbresult_ok(r) || dbresult_query_rows(r) != 1 ||
+        strcmp(dbresult_cell(r, 0, 0)->value, v1) != 0 || strcmp(dbresult_cell(r, 0, 1)->value, v2) != 0) __builtin_trap();
+    dbresult_free(r);
+
+    array_t* set = array_create();
+    array_push_back(set, array_create_pointer(field_create_text(b, v3), NULL, model_param_free));
+    array_t* where = array_create();
+    array_push_back(where, array_create_pointer(field_create_text(a, v1), NULL, model_param_free));
+    r = dbupdate(DQ_DBID, table, set, where);
+    array_free(set);
+    __dq_check(r);
+    if (!dbresult_ok(r)) __builtin_trap();
+    dbresult_free(r);
+
+    r = __dq_select(table, a, b, v1);
+    if (!dbresult_ok(r) || dbresult_query_rows(r) != 1 || strcmp(dbresult_cell(r, 0, 1)->value, v3) != 0) __builtin_trap();
+    dbresult_free(r);
+
+    r = dbdelete(DQ_DBID, table, where);
+    array_free(where);
+    __dq_check(r);
+    if (!dbresult_ok(r)) __builtin_trap();
+    dbresult_free(r);
+
+    r = __dq_select(table, a, b, v1);
+    if (!dbresult_ok(r) || dbresult_query_rows(r) != 0) __builtin_trap();
+    dbresult_free(r);
+
+    r = dbquery(DQ_DBID, "DROP TABLE @t", ids);
+    if (!dbresult_ok(r)) __builtin_trap();
+    dbresult_free(r);
+    array_free(ids);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    static int ready;
+    if (!ready) {
+        dbresult_t* r = dbquery(DQ_DBID, "CREATE TABLE IF NOT EXISTS fz (t)", NULL);
+        if (!dbresult_ok(r)) abort();
+        dbresult_free(r);
+        ready = 1;
+    }
+    if (size < 1) return 0;
+
+    dq_in_t in = { data + 1, data + size };
+    switch (data[0] % 4) {
+    case 0: __dq_builder(&in); break;
+    case 1: __dq_values(&in); break;
+    case 2: __dq_results(&in); break;
+    case 3: __dq_compilers(&in); break;
+    }
+
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_DB_MODEL
+
+#include <math.h>
+
+/* The model layer the feedback form writes through (app/models/feedback.c
+ * uses model_create), on SQLite ":memory:". A schema of its own here, shaped
+ * like the feedback one -- auto-increment key, text, integer, real, an enum,
+ * a timestamp the database fills in -- and a script of operations from the
+ * input, checked against a table the target keeps:
+ *
+ *   create   -- the row reads back byte for byte, key assigned, created_at set;
+ *   read     -- a live row reads back as last written, a deleted one is
+ *               MODEL_ERR_NOTFOUND;
+ *   update   -- only the fields that were set change; nothing set is refused
+ *               without reaching the database;
+ *   delete   -- the row is gone;
+ *   stringify -- valid JSON with the same values (a name that is not UTF-8
+ *               only has to come out as valid JSON).
+ *
+ * Mode 1: enum values are accepted exactly when listed (or empty, which is
+ * unset), the same way twice,
+ * and a setter of the wrong type fails without touching the field. */
+
+enum { FM_ID, FM_NAME, FM_QTY, FM_PRICE, FM_STATE, FM_CREATED, FM_COUNT };
+
+static const char* const __fm_states[] = { "new", "done", "spam" };
+
+static const mcolumn_t __fm_columns[FM_COUNT] = {
+    [FM_ID]      = { .name = "id",         .type = MODEL_INT, .is_primary = 1, .auto_increment = 1 },
+    [FM_NAME]    = { .name = "name",       .type = MODEL_TEXT },
+    [FM_QTY]     = { .name = "qty",        .type = MODEL_INT },
+    [FM_PRICE]   = { .name = "price",      .type = MODEL_DOUBLE },
+    [FM_STATE]   = { .name = "state",      .type = MODEL_ENUM, .enum_values = __fm_states, .enum_count = 3 },
+    [FM_CREATED] = { .name = "created_at", .type = MODEL_TIMESTAMPTZ, .has_default = 1 },
+};
+
+static const int __fm_primary[] = { FM_ID };
+
+static const mschema_t __fm_schema = {
+    .table = "fm",
+    .columns = __fm_columns,
+    .columns_count = FM_COUNT,
+    .primary_keys = __fm_primary,
+    .primary_keys_count = 1,
+};
+
+typedef struct {
+    model_t record;
+} fm_t;
+
+static void* __fm_instance(void) {
+    fm_t* m = calloc(1, sizeof *m);
+    if (m == NULL || !model_init(&m->record, &__fm_schema)) abort();
+    return m;
+}
+
+typedef struct {
+    int id;
+    int live;
+    char name[40];
+    int qty;
+    double price;
+    const char* state;
+} fm_row_t;
+
+static fm_t* __fm_read(int id) {
+    array_t* params = array_create();
+    mparams_fill_array(params, mparam_int(id, id));
+    fm_t* m = model_one(DQ_DBID, __fm_instance, "SELECT * FROM fm WHERE id = :id", params);
+    array_free(params);
+    return m;
+}
+
+static void __fm_expect(fm_t* m, const fm_row_t* row) {
+    if (m == NULL) __builtin_trap();
+    str_t* name = model_text(model_field(m, FM_NAME));
+    if (name == NULL || str_size(name) != strlen(row->name) || memcmp(str_get(name), row->name, str_size(name)) != 0) __builtin_trap();
+    if (model_int(model_field(m, FM_ID)) != row->id) __builtin_trap();
+    if (model_int(model_field(m, FM_QTY)) != row->qty) __builtin_trap();
+    if (model_double(model_field(m, FM_PRICE)) != row->price) __builtin_trap();
+    str_t* state = model_enum(model_field(m, FM_STATE));
+    if (state == NULL || strcmp(str_get(state), row->state) != 0) __builtin_trap();
+    if (model_field(m, FM_CREATED)->is_null) __builtin_trap();
+}
+
+/* Strict UTF-8 (RFC 3629): no overlongs, no surrogates, nothing past U+10FFFF. */
+static int __fm_utf8(const char* text) {
+    const unsigned char* s = (const unsigned char*)text;
+    while (*s) {
+        size_t len;
+        uint32_t v;
+        if (*s < 0x80) { s++; continue; }
+        if (*s >= 0xC2 && *s <= 0xDF) { len = 2; v = *s & 0x1F; }
+        else if (*s >= 0xE0 && *s <= 0xEF) { len = 3; v = *s & 0x0F; }
+        else if (*s >= 0xF0 && *s <= 0xF4) { len = 4; v = *s & 0x07; }
+        else return 0;
+        for (size_t k = 1; k < len; k++) {
+            if ((s[k] & 0xC0) != 0x80) return 0;
+            v = v << 6 | (s[k] & 0x3F);
+        }
+        if (len == 3 && (v < 0x800 || (v >= 0xD800 && v <= 0xDFFF))) return 0;
+        if (len == 4 && (v < 0x10000 || v > 0x10FFFF)) return 0;
+        s += len;
+    }
+    return 1;
+}
+
+static void __fm_text(dq_in_t* in, char* out, size_t cap) {
+    size_t n = 0;
+    const size_t len = __dq_byte(in) % cap;
+    for (size_t i = 0; i < len && n + 1 < cap; i++) {
+        const char c = (char)__dq_byte(in);
+        if (c != '\0') out[n++] = c;
+    }
+    out[n] = '\0';
+}
+
+static double __fm_price(dq_in_t* in, uint8_t how) {
+    if (how & 0x80) {
+        uint64_t bits = 0;
+        for (int i = 0; i < 8; i++) bits = bits << 8 | __dq_byte(in);
+        double d;
+        memcpy(&d, &bits, sizeof d);
+        if (isfinite(d)) return d;
+    }
+    return (int16_t)(__dq_byte(in) | __dq_byte(in) << 8) / 100.0;
+}
+
+static void __fm_set(fm_t* m, fm_row_t* row, dq_in_t* in, uint8_t mask) {
+    if (mask & 1) {
+        __fm_text(in, row->name, sizeof row->name);
+        if (!model_set_text(model_field(m, FM_NAME), row->name)) __builtin_trap();
+    }
+    if (mask & 2) {
+        row->qty = (int32_t)(__dq_byte(in) | __dq_byte(in) << 8 | __dq_byte(in) << 16 | (uint32_t)__dq_byte(in) << 24);
+        if (!model_set_int(model_field(m, FM_QTY), row->qty)) __builtin_trap();
+    }
+    if (mask & 4) {
+        row->price = __fm_price(in, mask);
+        if (!model_set_double(model_field(m, FM_PRICE), row->price)) __builtin_trap();
+    }
+    if (mask & 8) {
+        row->state = __fm_states[__dq_byte(in) % 3];
+        if (!model_set_enum(model_field(m, FM_STATE), row->state)) __builtin_trap();
+    }
+}
+
+static void __fm_script(dq_in_t* in) {
+    dbresult_t* r = dbquery(DQ_DBID, "DELETE FROM fm", NULL);
+    if (!dbresult_ok(r)) __builtin_trap();
+    dbresult_free(r);
+
+    fm_row_t rows[6];
+    int count = 0;
+
+    for (int step = 0; step < 12 && in->p < in->end; step++) {
+        const uint8_t op = __dq_byte(in);
+        fm_row_t* row = count > 0 ? &rows[__dq_byte(in) % count] : NULL;
+
+        switch (op % 5) {
+        case 0: {
+            if (count == 6) break;
+            fm_row_t* fresh = &rows[count];
+            *fresh = (fm_row_t){ .live = 1, .name = "", .state = "new" };
+            fm_t* m = __fm_instance();
+            /* Every field set on create: a column left unset is written as
+             * its zero value, which is not what this test is about. */
+            __fm_set(m, fresh, in, (uint8_t)(op | 0x0f));
+            if (!model_create(DQ_DBID, m)) __builtin_trap();
+            fresh->id = model_int(model_field(m, FM_ID));
+            if (fresh->id <= 0) __builtin_trap();
+            model_free(m);
+            count++;
+            __fm_expect(m = __fm_read(fresh->id), fresh);
+            model_free(m);
+            break;
+        }
+        case 1: {
+            if (row == NULL) break;
+            fm_t* m = __fm_read(row->id);
+            if (row->live) __fm_expect(m, row);
+            else if (m != NULL || model_last_status() != MODEL_ERR_NOTFOUND) __builtin_trap();
+            model_free(m);
+            break;
+        }
+        case 2: {
+            if (row == NULL || !row->live) break;
+            fm_t* m = __fm_read(row->id);
+            const uint8_t mask = __dq_byte(in);
+            __fm_set(m, row, in, mask);
+            const int ok = model_update(DQ_DBID, m);
+            if ((mask & 0x0f) != 0 && !ok) __builtin_trap();
+            if ((mask & 0x0f) == 0 && (ok || model_last_status() == MODEL_ERR_DB)) __builtin_trap();
+            model_free(m);
+            __fm_expect(m = __fm_read(row->id), row);
+            model_free(m);
+            break;
+        }
+        case 3: {
+            if (row == NULL || !row->live) break;
+            fm_t* m = __fm_read(row->id);
+            if (!model_delete(DQ_DBID, m)) __builtin_trap();
+            model_free(m);
+            row->live = 0;
+            if ((m = __fm_read(row->id)) != NULL || model_last_status() != MODEL_ERR_NOTFOUND) __builtin_trap();
+            break;
+        }
+        case 4: {
+            if (row == NULL || !row->live) break;
+            fm_t* m = __fm_read(row->id);
+            char* text = model_stringify(m, NULL);
+            json_doc_t* doc = text != NULL ? json_parse(text) : NULL;
+            json_token_t* root = doc != NULL ? json_root(doc) : NULL;
+            if (root == NULL || !json_is_object(root)) __builtin_trap();
+            json_token_t* name = json_object_get(root, "name");
+            json_token_t* qty = json_object_get(root, "qty");
+            json_token_t* price = json_object_get(root, "price");
+            json_token_t* state = json_object_get(root, "state");
+            int ok_int = 0, ok_double = 0;
+            /* JSON carries UTF-8: a name that is not comes out with U+FFFD in
+             * place of what cannot be carried, so only a valid one must match. */
+            if (name == NULL || !json_is_string(name)) __builtin_trap();
+            if (__fm_utf8(row->name) && strcmp(json_string(name), row->name) != 0) __builtin_trap();
+            if (qty == NULL || json_int(qty, &ok_int) != row->qty || !ok_int) __builtin_trap();
+            if (price == NULL || json_double(price, &ok_double) != row->price || !ok_double) __builtin_trap();
+            if (state == NULL || !json_is_string(state) || strcmp(json_string(state), row->state) != 0) __builtin_trap();
+            json_free(doc);
+            free(text);
+            model_free(m);
+            break;
+        }
+        }
+    }
+}
+
+static void __fm_types(dq_in_t* in) {
+    fm_t* m = __fm_instance();
+    char value[16];
+    __fm_text(in, value, sizeof value);
+
+    /* The empty value is "unset" and always taken: it is what a NULL or
+     * empty column reads back as (model_set_enum_from_str, size 0). */
+    int listed = value[0] == '\0';
+    for (int i = 0; i < 3; i++)
+        if (strcmp(value, __fm_states[i]) == 0) listed = 1;
+
+    mfield_t* state = model_field(m, FM_STATE);
+    const int first = model_set_enum(state, value);
+    const int second = model_set_enum(state, value);
+    if (first != listed || second != listed) __builtin_trap();
+    if (listed && strcmp(str_get(model_enum(state)), value) != 0) __builtin_trap();
+
+    /* The wrong setter for the type fails and leaves the field as it was. */
+    mfield_t* name = model_field(m, FM_NAME);
+    model_set_text(name, value);
+    mfield_t* qty = model_field(m, FM_QTY);
+    model_set_int(qty, 7);
+    if (model_set_int(name, 5) || model_set_double(name, 1.5) || model_set_enum(name, "new")) __builtin_trap();
+    if (model_set_text(qty, "x") || model_set_double(qty, 2.5) || model_set_enum(qty, "new")) __builtin_trap();
+    if (model_set_int(state, 1) || model_set_text(state, "x")) __builtin_trap();
+    if (strcmp(str_get(model_text(name)), value) != 0 || model_int(qty) != 7) __builtin_trap();
+
+    model_free(m);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    static int ready;
+    if (!ready) {
+        dbresult_t* r = dbquery(DQ_DBID,
+            "CREATE TABLE IF NOT EXISTS fm (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, qty INTEGER, "
+            "price REAL, state TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)", NULL);
+        if (!dbresult_ok(r)) abort();
+        dbresult_free(r);
+        ready = 1;
+    }
+    if (size < 1) return 0;
+
+    dq_in_t in = { data + 1, data + size };
+    if (data[0] % 2 == 0) __fm_script(&in);
+    else __fm_types(&in);
 
     return 0;
 }
