@@ -386,8 +386,10 @@ static int __bind_field(sqlite3_stmt* stmt, int idx, mfield_t* field) {
                 (int)str_size(field->value._string), SQLITE_TRANSIENT);
 
         // Types without a native numeric mapping: serialize and bind as text.
-        // SQLITE_TRANSIENT makes SQLite copy the bytes, so the temp str_t can be
-        // freed immediately afterwards.
+        // SQLITE_TRANSIENT makes SQLite copy the bytes. The string is the
+        // field's own buffer (model_field_to_string returns field->value._string),
+        // so it is not freed here: the field frees it, and freeing it here too
+        // was a double free on every DECIMAL/DATE/TIMESTAMP/JSON parameter.
         case MODEL_DECIMAL:
         case MODEL_DATE:
         case MODEL_TIME:
@@ -400,9 +402,7 @@ static int __bind_field(sqlite3_stmt* stmt, int idx, mfield_t* field) {
             str_t* s = model_field_to_string(field);
             if (s == NULL)
                 return sqlite3_bind_null(stmt, idx);
-            int r = sqlite3_bind_text(stmt, idx, str_get(s), (int)str_size(s), SQLITE_TRANSIENT);
-            str_free(s);
-            return r;
+            return sqlite3_bind_text(stmt, idx, str_get(s), (int)str_size(s), SQLITE_TRANSIENT);
         }
     }
 }
