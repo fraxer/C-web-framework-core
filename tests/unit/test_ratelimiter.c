@@ -4,6 +4,8 @@
 #include "map.h"
 #include "ratelimiter.h"
 
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 /* src/ratelimiter -- the token bucket in front of every route that asks for
@@ -184,6 +186,62 @@ TEST(test_ratelimiter_long_idle_truncate) {
     __drain(limiter, &ip);
     __now_ns += (1ULL << 31) * NS_PER_S;
     TEST_ASSERT_EQUAL(3, __drain(limiter, &ip), "full bucket after the pause");
+
+    __done(limiter);
+}
+
+/* Every read of this clock is a nanosecond later than the one before, so with
+ * cleanup_interval_s = 0 every call sweeps, and every bucket another thread is
+ * holding is already "stale". */
+static atomic_uint_fast64_t __ticking_ns;
+
+static uint64_t __ticking_clock(void) {
+    return atomic_fetch_add(&__ticking_ns, 1);
+}
+
+typedef struct {
+    ratelimiter_t* limiter;
+    ipaddr_t ip;
+} __race_arg_t;
+
+static void* __race_worker(void* p) {
+    __race_arg_t* arg = p;
+    for (int i = 0; i < 20000; i++)
+        ratelimiter_allow(arg->limiter, &arg->ip, 1);
+    return NULL;
+}
+
+TEST(test_ratelimiter_cleanup_race) {
+    TEST_CASE("a sweep on one thread does not free a bucket another is using");
+
+    /* Run under the asan/tsan stages of tests/ci.sh: without a sanitizer a
+     * write to a freed bucket is silent, and the assertion below only proves
+     * the threads came back. */
+    ratelimiter_config_t config = {
+        .max_tokens = 1000000,
+        .refill_rate = 1,
+        .time_window_ns = NS_PER_S,
+        .cleanup_interval_s = 0,
+    };
+
+    atomic_store(&__ticking_ns, NS_PER_S);
+    ratelimiter_set_time_source(__ticking_clock);
+    ratelimiter_t* limiter = ratelimiter_init(&config);
+
+    enum { THREADS = 4 };
+    pthread_t threads[THREADS];
+    __race_arg_t args[THREADS];
+    int started = 0;
+    for (int i = 0; i < THREADS; i++) {
+        args[i].limiter = limiter;
+        args[i].ip = __ip(i % 2 ? "192.0.2.1" : "192.0.2.2");
+        if (pthread_create(&threads[i], NULL, __race_worker, &args[i]) == 0)
+            started++;
+    }
+    for (int i = 0; i < started; i++)
+        pthread_join(threads[i], NULL);
+
+    TEST_ASSERT_EQUAL(THREADS, started, "all threads ran");
 
     __done(limiter);
 }
