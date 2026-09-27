@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <ctype.h>
 
@@ -75,6 +76,21 @@ int __dkim_relaxed_header_canon(dkim_t* dkim) {
     return result;
 }
 
+/* One header value, relaxed (RFC 6376 §3.4.2); NULL on allocation failure. */
+static char* __dkim_relaxed_value(const char* value, size_t length, size_t* out_length) {
+    dkimheaderparser_t* parser = dkimheaderparser_alloc();
+    if (parser == NULL) return NULL;
+
+    dkimheaderparser_init(parser);
+    dkimheaderparser_set_buffer(parser, value, length);
+    char* result = dkimheaderparser_run(parser) ? dkimheaderparser_get_content(parser) : NULL;
+    *out_length = result != NULL ? dkimheaderparser_get_content_length(parser) : 0;
+
+    dkimheaderparser_free(parser);
+
+    return result;
+}
+
 /* "relaxed" body canonicalization */
 char* __dkim_relaxed_body_canon(const char *body) {
     dkimcanonparser_t* parser = dkimcanonparser_alloc();
@@ -90,34 +106,66 @@ char* __dkim_relaxed_body_canon(const char *body) {
     return new_body;
 }
 
-char* __dkim_wrap(char* str, size_t len) {
-    size_t count_newlines = 0;
-    int lcount = 0;
-    for (size_t i = 0; i < len; ++i) {
-        if (str[i] == ' ' || lcount == 75) {
-            count_newlines++;
-            lcount = 0;
-        }
-        else
-            ++lcount;
-    }
+/* Where a tag value may be folded when its line runs long (RFC 6376 §3.5):
+ * base64 values (b=, bh=) anywhere, h= only after a colon, the rest never --
+ * a fold is whitespace to a verifier, and inside a domain or a field name it
+ * would change the value. */
+typedef enum {
+    DKIM_WRAP_NEVER = 0,
+    DKIM_WRAP_ANYWHERE,
+    DKIM_WRAP_AFTER_COLON
+} dkim_wrap_rule_e;
 
-    lcount = 0;
-    char* tmp = malloc(len + (3 * count_newlines) + 1);
+static dkim_wrap_rule_e __dkim_wrap_rule(const char* name, size_t length) {
+    while (length > 0 && (*name == ' ' || *name == '\t')) { name++; length--; }
+    while (length > 0 && (name[length - 1] == ' ' || name[length - 1] == '\t')) length--;
+
+    if ((length == 1 && name[0] == 'b') || (length == 2 && name[0] == 'b' && name[1] == 'h'))
+        return DKIM_WRAP_ANYWHERE;
+    if (length == 1 && name[0] == 'h')
+        return DKIM_WRAP_AFTER_COLON;
+
+    return DKIM_WRAP_NEVER;
+}
+
+/* Folds a tag list: after every space, and past 75 characters on a line where
+ * the tag allows it. Decisions depend only on what precedes them, so folding a
+ * prefix gives the same folds as folding the whole -- dkim_create_sign relies
+ * on that to sign the field with an empty b= as it is later sent. */
+char* __dkim_wrap(char* str, size_t len) {
+    char* tmp = malloc(len * 4 + 1);
     if (tmp == NULL)
         return NULL;
 
     size_t tmp_len = 0;
+    size_t lcount = 0;
+    size_t tag_start = 0;
+    int in_name = 1;
+    dkim_wrap_rule_e rule = DKIM_WRAP_NEVER;
+
     for (size_t i = 0; i < len; ++i) {
-        if (str[i] == ' ' || lcount == 75) {
-            tmp[tmp_len++] = str[i];
+        const char c = str[i];
+        tmp[tmp_len++] = c;
+        ++lcount;
+
+        if (c == ';') {
+            in_name = 1;
+            tag_start = i + 1;
+            rule = DKIM_WRAP_NEVER;
+        }
+        else if (c == '=' && in_name) {
+            in_name = 0;
+            rule = __dkim_wrap_rule(str + tag_start, i - tag_start);
+        }
+
+        const int long_line = lcount >= 75 && !in_name &&
+            (rule == DKIM_WRAP_ANYWHERE || (rule == DKIM_WRAP_AFTER_COLON && c == ':'));
+
+        if ((c == ' ' || long_line) && i + 1 < len) {
             tmp[tmp_len++] = '\r';
             tmp[tmp_len++] = '\n';
             tmp[tmp_len++] = '\t';
             lcount = 0;
-        } else {
-            tmp[tmp_len++] = str[i];
-            ++lcount;
         }
     }
 
@@ -277,6 +325,30 @@ char* __dkim_sign_create(const unsigned char* data, int data_length, const char*
     return result;
 }
 
+/* The field to sign in the place of `header`. h= lists a name once per
+ * instance, and a verifier takes the instances of a repeated name from the
+ * bottom up (RFC 6376 §5.4.2): the k-th of n instances, counted from the top,
+ * is signed in the place of the k-th from the bottom. The lengths are the
+ * same either way, so the buffer sized over the list still fits. */
+static const mail_header_t* __dkim_bottom_up_instance(const mail_header_t* first, const mail_header_t* header) {
+    size_t above = 0;
+    size_t total = 0;
+    for (const mail_header_t* h = first; h != NULL; h = h->next) {
+        if (strcasecmp(h->key, header->key) != 0) continue;
+        if (h == header) above = total;
+        total++;
+    }
+
+    const size_t want = total - 1 - above;
+    size_t seen = 0;
+    for (const mail_header_t* h = first; h != NULL; h = h->next) {
+        if (strcasecmp(h->key, header->key) != 0) continue;
+        if (seen++ == want) return h;
+    }
+
+    return header;
+}
+
 char* __dkim_make_headers_string(dkim_t* dkim, int* headers_string_length) {
     *headers_string_length = 0;
 
@@ -297,9 +369,10 @@ char* __dkim_make_headers_string(dkim_t* dkim, int* headers_string_length) {
     size_t offset = 0;
     header = dkim->header;
     while (header) {
+        const mail_header_t* instance = __dkim_bottom_up_instance(dkim->header, header);
         const char* template = header->next != NULL ? "%s:%s\r\n" : "%s:%s";
         /* Cap by the remaining space from `offset`, not the whole buffer. */
-        offset += snprintf(string + offset, (size_t)(*headers_string_length) + 1 - offset, template, header->key, header->value);
+        offset += snprintf(string + offset, (size_t)(*headers_string_length) + 1 - offset, template, instance->key, instance->value);
 
         header = header->next;
     }
@@ -337,12 +410,42 @@ dkim_t* dkim_create() {
     return dkim;
 }
 
+/* A field name is RFC 5322 ftext -- printable US-ASCII except the colon --
+ * that h= can hold: no ';', which ends a tag (RFC 6376 §3.2). */
+static int __dkim_header_name_valid(const char* key, size_t key_length) {
+    for (size_t i = 0; i < key_length; i++)
+        if ((unsigned char)key[i] < 33 || (unsigned char)key[i] > 126 || key[i] == ':' || key[i] == ';')
+            return 0;
+
+    return 1;
+}
+
+/* A value may contain CR and LF only as a fold, CRLF followed by WSP, and no
+ * NUL: the signer works on C strings, so the value would be signed shorter
+ * than it is sent. */
+static int __dkim_header_value_valid(const char* value, size_t value_length) {
+    for (size_t i = 0; i < value_length; i++) {
+        if (value[i] == '\0') return 0;
+        if (value[i] == '\r' || value[i] == '\n') {
+            if (value[i] != '\r' || i + 2 >= value_length || value[i + 1] != '\n' ||
+                (value[i + 2] != ' ' && value[i + 2] != '\t'))
+                return 0;
+            i++;
+        }
+    }
+
+    return 1;
+}
+
 int dkim_header_add(dkim_t* dkim, const char* key, const size_t key_length, const char* value, const size_t value_length) {
     if (dkim == NULL) return 0;
     if (key == NULL) return 0;
     if (value == NULL) return 0;
     if (key[0] == 0) return 0;
     if (value[0] == 0) return 0;
+    /* Anything else is signed as one field and sent as another. */
+    if (!__dkim_header_name_valid(key, key_length)) return 0;
+    if (!__dkim_header_value_valid(value, value_length)) return 0;
 
     mail_header_t* header = mail_header_create(key, key_length, value, value_length);
     if (header == NULL) return 0;
@@ -391,6 +494,8 @@ char* dkim_create_sign(dkim_t* dkim, const char* body) {
         return NULL;
 
     char* data = NULL;
+    char* folded = NULL;
+    char* canonical = NULL;
     char* headers_string = NULL;
     char* sign = NULL;
     char* full_dkim = NULL;
@@ -412,8 +517,22 @@ char* dkim_create_sign(dkim_t* dkim, const char* body) {
 
     const size_t data_length = sprintf(data, template, dkim->selector, dkim->domain, canon_body_length, (long long)dkim->timestamp, header_list, base64_hash);
 
+    /* The field is signed as a verifier will see it: folded the way it is
+     * sent, then canonicalized (relaxed), with b= still empty. Signing the
+     * unfolded text instead breaks the signature wherever a fold falls
+     * outside existing whitespace. */
+    folded = __dkim_wrap(data, data_length);
+    if (folded == NULL)
+        goto failed;
+
+    size_t canonical_length = 0;
+    canonical = __dkim_relaxed_value(folded, strlen(folded), &canonical_length);
+    if (canonical == NULL)
+        goto failed;
+
     const char* h_dkim_sign = "dkim-signature";
-    dkim_header_add(dkim, h_dkim_sign, strlen(h_dkim_sign), data, data_length);
+    if (!dkim_header_add(dkim, h_dkim_sign, strlen(h_dkim_sign), canonical, canonical_length))
+        goto failed;
 
     int headers_string_length = 0;
     headers_string = __dkim_make_headers_string(dkim, &headers_string_length);
@@ -437,6 +556,8 @@ char* dkim_create_sign(dkim_t* dkim, const char* body) {
     if (base64_hash != NULL) free(base64_hash);
     if (header_list != NULL)free(header_list);
     if (data != NULL) free(data);
+    free(folded);
+    free(canonical);
     if (headers_string != NULL) free(headers_string);
     if (sign != NULL) free(sign);
 

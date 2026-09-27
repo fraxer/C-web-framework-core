@@ -137,7 +137,7 @@ static dkim_t* dkim_test_build(const char* private_key) {
     dkim_set_timestamp(dkim, 1700000000);
 
     dkim_header_add(dkim, "From", 4, "Alice <alice@example.com>", 25);
-    dkim_header_add(dkim, "To", 2, "bob@example.com", 16);
+    dkim_header_add(dkim, "To", 2, "bob@example.com", 15);
     dkim_header_add(dkim, "Subject", 7, "Hello DKIM", 10);
 
     return dkim;
@@ -215,6 +215,37 @@ TEST(test_dkim_header_add_rejects_bad_input) {
     TEST_ASSERT_EQUAL(0, dkim_header_add(dkim, "", 0, "x", 1), "empty key");
     TEST_ASSERT_EQUAL(0, dkim_header_add(dkim, "From", 4, "", 0), "empty value");
     TEST_ASSERT_NULL(dkim->header, "no header added on rejection");
+
+    dkim_free(dkim);
+}
+
+TEST(test_dkim_header_add_rejects_what_a_letter_cannot_carry) {
+    TEST_CASE("header_add refuses a name outside RFC 5322 ftext and a value with NUL or bare CR/LF");
+
+    /* Found by the dkim mode of the mail_message fuzz target: the signer
+     * canonicalizes and signs such a field, but on the wire it is a different
+     * field (a name with a space, a line cut by a bare LF) or a shorter one
+     * (the value up to the NUL), so the signature covers something no
+     * receiver sees. A fold -- CRLF followed by WSP -- is part of a value. */
+    dkim_t* dkim = dkim_create();
+    TEST_REQUIRE_NOT_NULL(dkim, "dkim_create should succeed");
+
+    TEST_ASSERT_EQUAL(0, dkim_header_add(dkim, "Bad Name", 8, "v", 1), "space in the name");
+    TEST_ASSERT_EQUAL(0, dkim_header_add(dkim, "X-Ctl\x01", 6, "v", 1), "control character in the name");
+    TEST_ASSERT_EQUAL(0, dkim_header_add(dkim, "X:Y", 3, "v", 1), "colon in the name");
+    /* ';' is ftext, but h= cannot hold it: it ends the tag (RFC 6376 §3.2
+     * VALCHAR), and "h=gro;;" signs a field list no verifier reads back. */
+    TEST_ASSERT_EQUAL(0, dkim_header_add(dkim, "Gro;", 4, "v", 1), "semicolon in the name");
+    TEST_ASSERT_EQUAL(0, dkim_header_add(dkim, "X-\xd0\xb9", 4, "v", 1), "8-bit name");
+    TEST_ASSERT_EQUAL(0, dkim_header_add(dkim, "X", 1, "a\rb", 3), "bare CR in the value");
+    TEST_ASSERT_EQUAL(0, dkim_header_add(dkim, "X", 1, "a\nb", 3), "bare LF in the value");
+    TEST_ASSERT_EQUAL(0, dkim_header_add(dkim, "X", 1, "a\r\nb", 4), "CRLF that is not a fold");
+    TEST_ASSERT_EQUAL(0, dkim_header_add(dkim, "X", 1, "a\r\n", 3), "CRLF at the end");
+    TEST_ASSERT_EQUAL(0, dkim_header_add(dkim, "X", 1, "a\0b", 3), "NUL in the value");
+    TEST_ASSERT_NULL(dkim->header, "no header added on rejection");
+
+    TEST_ASSERT_EQUAL(1, dkim_header_add(dkim, "Subject", 7, "a\r\n b", 5), "a folded value");
+    TEST_ASSERT_EQUAL(1, dkim_header_add(dkim, "X-\x7e!", 4, "\xd0\xb9 \t", 4), "ftext name, 8-bit value");
 
     dkim_free(dkim);
 }
@@ -306,6 +337,30 @@ TEST(test_dkim_make_headers_string_content) {
     /* relaxed header canon is not applied on a direct call, so keys keep case */
     TEST_ASSERT_STR_EQUAL("From:a@b.c\r\nTo:d@e.f", str, "joined headers");
     TEST_ASSERT_EQUAL((int)strlen("From:a@b.c\r\nTo:d@e.f"), length, "length matches content");
+
+    free(str);
+    dkim_free(dkim);
+}
+
+TEST(test_dkim_make_headers_string_repeated_bottom_up) {
+    TEST_CASE("a repeated field is signed from the bottom instance up (RFC 6376 §5.4.2)");
+
+    /* h= names "to" twice; a verifier takes the last To for the first "to"
+     * and the one above it for the second. Signing them top-down gave a
+     * signature no verifier accepts (found by the dkim mode of fuzz_mail_message). */
+    dkim_t* dkim = dkim_create();
+    TEST_REQUIRE_NOT_NULL(dkim, "dkim_create should succeed");
+
+    dkim_header_add(dkim, "From", 4, "a", 1);
+    dkim_header_add(dkim, "To", 2, "1", 1);
+    dkim_header_add(dkim, "X", 1, "2", 1);
+    dkim_header_add(dkim, "TO", 2, "3", 1);
+
+    int length = 0;
+    char* str = __dkim_make_headers_string(dkim, &length);
+    TEST_REQUIRE_NOT_NULL(str, "make_headers_string should succeed");
+    TEST_ASSERT_STR_EQUAL("From:a\r\nTO:3\r\nX:2\r\nTo:1", str, "the To fields bottom-up, in the To positions");
+    TEST_ASSERT_EQUAL((int)strlen(str), length, "length matches content");
 
     free(str);
     dkim_free(dkim);
@@ -446,6 +501,77 @@ TEST(test_dkim_create_sign_structure) {
     TEST_ASSERT(b_len > 0, "b= value non-empty");
 
     free(unfolded);
+    free(sign);
+    dkim_free(dkim);
+    free(pem);
+    EVP_PKEY_free(pkey);
+}
+
+/* Relaxed canonicalization of a header value (RFC 6376 §3.4.2) as a verifier
+ * applies it to the field it received: folds unfolded, WSP runs to one SP,
+ * none at either end. Heap-allocated. */
+static char* dkim_test_relaxed_value(const char* v) {
+    char* out = malloc(strlen(v) + 1);
+    if (out == NULL) return NULL;
+
+    size_t o = 0;
+    int space = 0;
+    for (const char* p = v; *p; p++) {
+        if (*p == '\r' || *p == '\n' || *p == ' ' || *p == '\t') { space = 1; continue; }
+        if (space && o > 0) out[o++] = ' ';
+        space = 0;
+        out[o++] = *p;
+    }
+    out[o] = '\0';
+    return out;
+}
+
+TEST(test_dkim_signature_field_signed_as_sent) {
+    TEST_CASE("the DKIM-Signature field is signed in the form it is sent, folded only where FWS is allowed");
+
+    /* A signed field name longer than a line: the folding used to cut h=
+     * every 75 characters wherever it stood. The fold is whitespace to a
+     * verifier, so the field it canonicalized was not the one signed, and
+     * RFC 6376 §3.5 allows FWS in h= only around the colons anyway (found by
+     * the dkim mode of fuzz_mail_message). */
+    EVP_PKEY* pkey = dkim_test_generate_keypair();
+    TEST_REQUIRE_NOT_NULL(pkey, "keypair generation should succeed");
+    char* pem = dkim_test_private_pem(pkey);
+    TEST_REQUIRE_NOT_NULL(pem, "private PEM extraction should succeed");
+
+    dkim_t* dkim = dkim_test_build(pem);
+    TEST_REQUIRE_NOT_NULL(dkim, "build should succeed");
+    char name[121];
+    memset(name, 'n', sizeof(name) - 1);
+    name[sizeof(name) - 1] = '\0';
+    TEST_ASSERT(dkim_header_add(dkim, name, strlen(name), "v", 1), "a long valid name is accepted");
+
+    char* sign = dkim_create_sign(dkim, "body\r\n");
+    TEST_REQUIRE_NOT_NULL(sign, "create_sign should succeed");
+
+    /* What a verifier hashes for this field: the field as sent with the value
+     * of b= removed, canonicalized. The signer's copy is the last header. */
+    char* sent = strdup(sign);
+    TEST_REQUIRE_NOT_NULL(sent, "copy");
+    char* b = strstr(sent, " b=");
+    if (b == NULL) b = strstr(sent, "\tb=");
+    TEST_REQUIRE_NOT_NULL(b, "b= tag present");
+    b[3] = '\0';
+    char* canonical = dkim_test_relaxed_value(sent);
+
+    mail_header_t* signed_field = dkim->last_header;
+    TEST_ASSERT_STR_EQUAL("dkim-signature", signed_field->key, "the signature field was signed last");
+    TEST_ASSERT_STR_EQUAL(canonical, signed_field->value, "signed as a verifier canonicalizes what is sent");
+
+    /* Folds inside h= only after a colon. */
+    const char* h = strstr(sign, "h=");
+    const char* h_end = strchr(h, ';');
+    for (const char* p = h; p < h_end; p++)
+        if (p[0] == '\r')
+            TEST_ASSERT(p > h && p[-1] == ':', "h= folded only after a colon");
+
+    free(canonical);
+    free(sent);
     free(sign);
     dkim_free(dkim);
     free(pem);
