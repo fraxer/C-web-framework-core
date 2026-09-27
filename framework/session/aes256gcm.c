@@ -78,7 +78,9 @@ char* aes256gcm_decrypt(const char* ciphertext_b64, const unsigned char key[AES2
 
     int decoded_len = base64_decode((char*)binary, ciphertext_b64);
 
-    if (decoded_len <= NONCE_SIZE + TAG_SIZE) {
+    /* Exactly nonce and tag is an empty plaintext, which encrypt produces for
+     * "" -- refusing it made an empty value impossible to read back. */
+    if (decoded_len < NONCE_SIZE + TAG_SIZE) {
         free(binary);
         return NULL;
     }
@@ -130,16 +132,32 @@ void aes256gcm_key_from_passphrase(const char* passphrase, unsigned char key_out
     sha256((const unsigned char*)passphrase, strlen(passphrase), key_out);
 }
 
+static int __hex_digit(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Exactly 64 hex digits and nothing else. sscanf("%02x") at every even offset
+ * read past the terminator of an odd-length string, took blanks and signs,
+ * and ignored whatever followed the 64th digit. */
 int aes256gcm_key_from_hex(const char* hex64, unsigned char key_out[AES256GCM_KEY_SIZE]) {
     if (hex64 == NULL || key_out == NULL)
         return 0;
 
+    if (strnlen(hex64, AES256GCM_KEY_SIZE * 2 + 1) != AES256GCM_KEY_SIZE * 2)
+        return 0;
+
+    unsigned char key[AES256GCM_KEY_SIZE];
     for (int i = 0; i < AES256GCM_KEY_SIZE; i++) {
-        unsigned int byte;
-        if (sscanf(hex64 + i * 2, "%02x", &byte) != 1)
+        const int high = __hex_digit(hex64[i * 2]);
+        const int low = __hex_digit(hex64[i * 2 + 1]);
+        if (high < 0 || low < 0)
             return 0;
-        key_out[i] = (unsigned char)byte;
+        key[i] = (unsigned char)(high << 4 | low);
     }
 
+    memcpy(key_out, key, sizeof key);
     return 1;
 }
