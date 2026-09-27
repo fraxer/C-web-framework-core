@@ -232,7 +232,7 @@ if(BUILD_FUZZERS STREQUAL "yes")
     set(FUZZ_TARGET_NAMES
         huffman hpack h2_frame json cookie urlencoded multipart request request_sequence
         websocket websocket_sequence ws_deflate h2_session h2_connection http_response
-        smtp_response jwt h1_connection text mail_message ratelimiter)
+        smtp_response jwt h1_connection text mail_message ratelimiter session_crypto)
 
     if(INCLUDE_HTTP3 STREQUAL yes)
         list(APPEND FUZZ_TARGET_NAMES
@@ -282,6 +282,7 @@ if(BUILD_FUZZERS STREQUAL "yes")
     set(FUZZ_ID_db_query 34)
     set(FUZZ_ID_db_model 35)
     set(FUZZ_ID_quic_pmtud 36)
+    set(FUZZ_ID_session_crypto 37)
 
     foreach(name ${FUZZ_TARGET_NAMES})
         set(exe fuzz_${name})
@@ -336,6 +337,7 @@ if(BUILD_FUZZERS STREQUAL "yes")
             FUZZ_DB_QUERY=34
             FUZZ_DB_MODEL=35
             FUZZ_QUIC_PMTUD=36
+            FUZZ_SESSION_CRYPTO=37
             FUZZ_TARGET=${FUZZ_ID_${name}}
         )
 
@@ -362,6 +364,7 @@ if(BUILD_FUZZERS STREQUAL "yes")
             ${CMAKE_CURRENT_SOURCE_DIR}/../misc/validation
             ${CMAKE_CURRENT_SOURCE_DIR}/../framework/database
             ${CMAKE_CURRENT_SOURCE_DIR}/../framework/model
+            ${CMAKE_CURRENT_SOURCE_DIR}/../framework/session
         )
 
         target_link_libraries(${exe} PRIVATE

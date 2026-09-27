@@ -3796,8 +3796,13 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
 #elif FUZZ_TARGET == FUZZ_TEXT
 
+#include <arpa/inet.h>
+#include <ctype.h>
+#include "base64.h"
 #include "cstr.h"
 #include "escape.h"
+#include "idn_utils.h"
+#include "ipaddr.h"
 #include "strtemplate.h"
 #include "validation.h"
 
@@ -3820,7 +3825,9 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
  *                       break the header or the attribute it is put into;
  *   strtemplate      -- the expansion equals a reference expansion.
  *
- * The first byte picks the helper, the rest is the value. */
+ * The first byte picks the helper, the rest is the value. A first byte of
+ * 0xE0 and up picks one of the helpers added later (idn, ipaddr, base64, ...),
+ * described where they are defined. */
 
 /* Strict UTF-8 (RFC 3629): no overlongs, no surrogates, nothing past U+10FFFF.
  * Decodes one code point at s[i..n); 0 when there is none. */
@@ -4082,6 +4089,235 @@ static void __text_template(const char* source, const char* subject, const uint8
     strtemplate_free(tpl);
 }
 
+/* ---- Stage 22 and on: helpers picked by a first byte of 0xE0 or more ----
+ *
+ * Kept out of the `% 5` above so the existing corpus keeps its meaning. */
+
+/* idn: the ASCII fast path copies whatever it is given; a name that needs
+ * conversion goes through libidn2 and comes out ASCII, labels of at most 63
+ * and the whole within 253 -- or NULL. */
+static void __text_idn(const char* value) {
+    int wide = 0;
+    for (const unsigned char* p = (const unsigned char*)value; *p; p++)
+        if (*p > 127) wide = 1;
+    if (idn_needs_conversion(value) != wide) __builtin_trap();
+
+    char* ascii = idn_to_ascii(value);
+    if (!wide) {
+        if (ascii == NULL || strcmp(ascii, value) != 0) __builtin_trap();
+    } else if (ascii != NULL) {
+        size_t label = 0;
+        for (const unsigned char* p = (const unsigned char*)ascii; *p; p++) {
+            if (*p > 127) __builtin_trap();
+            label = *p == '.' ? 0 : label + 1;
+            if (label > 63) __builtin_trap();
+        }
+        if (strlen(ascii) > 254 || (strlen(ascii) == 254 && ascii[253] != '.')) __builtin_trap();
+        char* again = idn_to_ascii(ascii);
+        if (again == NULL || strcmp(again, ascii) != 0) __builtin_trap();
+        free(again);
+    }
+    free(ascii);
+}
+
+/* ipaddr: against a parser written here from RFC 791 dotted quads (no leading
+ * zeros, as glibc) and RFC 4291 §2.2 text (1-4 hex digits a group, one "::"
+ * standing for at least one group, an IPv4 tail in place of the last two).
+ * The differences ipaddr.h documents, and only those: "[v6]" is accepted, and
+ * brackets around anything else are refused. */
+static int __ref_v4(const char* s, uint8_t out[4]) {
+    for (int part = 0; part < 4; part++) {
+        if (*s < '0' || *s > '9') return 0;
+        if (*s == '0' && s[1] >= '0' && s[1] <= '9') return 0;
+        unsigned v = 0;
+        while (*s >= '0' && *s <= '9') {
+            v = v * 10 + (unsigned)(*s++ - '0');
+            if (v > 255) return 0;
+        }
+        out[part] = (uint8_t)v;
+        if (part < 3 && *s++ != '.') return 0;
+    }
+    return *s == '\0';
+}
+
+static int __ref_hex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static int __ref_v6(const char* s, uint8_t out[16]) {
+    uint16_t head[8], tail[8];
+    int nh = 0, nt = 0, gap = 0;
+    const char* p = s;
+    if (p[0] == ':') {
+        if (p[1] != ':') return 0;
+        gap = 1;
+        p += 2;
+    }
+    while (*p != '\0') {
+        const char* start = p;
+        unsigned v = 0;
+        int digits = 0;
+        while (__ref_hex(*p) >= 0) {
+            v = v << 4 | (unsigned)__ref_hex(*p++);
+            if (++digits > 4) return 0;
+        }
+        if (*p == '.') {
+            uint8_t v4[4];
+            if ((gap ? nh + nt : nh) + 2 > 8 || !__ref_v4(start, v4)) return 0;
+            uint16_t* g = gap ? tail : head;
+            int* n = gap ? &nt : &nh;
+            g[(*n)++] = (uint16_t)(v4[0] << 8 | v4[1]);
+            g[(*n)++] = (uint16_t)(v4[2] << 8 | v4[3]);
+            p = start + strlen(start);
+            break;
+        }
+        if (digits == 0 || nh + nt == 8) return 0;
+        if (gap) tail[nt++] = (uint16_t)v;
+        else head[nh++] = (uint16_t)v;
+        if (*p == '\0') break;
+        if (*p++ != ':') return 0;
+        if (*p == ':') {
+            if (gap) return 0;
+            gap = 1;
+            p++;
+        } else if (*p == '\0') return 0;
+    }
+    if (gap ? nh + nt > 7 : nh + nt != 8) return 0;
+    memset(out, 0, 16);
+    for (int i = 0; i < nh; i++) { out[2 * i] = (uint8_t)(head[i] >> 8); out[2 * i + 1] = (uint8_t)head[i]; }
+    for (int i = 0; i < nt; i++) {
+        const int at = 8 - nt + i;
+        out[2 * at] = (uint8_t)(tail[i] >> 8);
+        out[2 * at + 1] = (uint8_t)tail[i];
+    }
+    return 1;
+}
+
+static void __text_ipaddr(const char* value, uint16_t port) {
+    uint8_t v4[4], v6[16];
+    int family = 0;
+    const size_t n = strlen(value);
+    if (n >= 2 && value[0] == '[' && value[n - 1] == ']') {
+        char* inner = strndup(value + 1, n - 2);
+        if (inner == NULL) abort();
+        if (__ref_v6(inner, v6)) family = AF_INET6;
+        free(inner);
+    } else if (__ref_v4(value, v4)) family = AF_INET;
+    else if (__ref_v6(value, v6)) family = AF_INET6;
+
+    ipaddr_t addr;
+    const int ok = ipaddr_parse(&addr, value);
+    if (ok != (family != 0)) __builtin_trap();
+    if (!ok) {
+        if (ipaddr_is_set(&addr)) __builtin_trap();
+        return;
+    }
+    if (addr.family != family) __builtin_trap();
+    if (family == AF_INET && memcmp(&addr.u.v4, v4, 4) != 0) __builtin_trap();
+    if (family == AF_INET6 && memcmp(&addr.u.v6, v6, 16) != 0) __builtin_trap();
+
+    /* Text and back, and the authority form. */
+    char text[IPADDR_STRLEN], authority[IPADDR_AUTHORITY_STRLEN], want[IPADDR_AUTHORITY_STRLEN];
+    ipaddr_t again;
+    if (!ipaddr_parse(&again, ipaddr_text(&addr, text, sizeof text)) || !ipaddr_equal(&again, &addr)) __builtin_trap();
+    snprintf(want, sizeof want, family == AF_INET6 ? "[%s]:%u" : "%s:%u", text, port);
+    if (strcmp(ipaddr_authority(&addr, port, authority, sizeof authority), want) != 0) __builtin_trap();
+}
+
+/* base64: encode then decode gives the bytes back; the encoding is the
+ * standard alphabet, padded, 4*ceil(n/3) long, and the _nl form breaks it
+ * into lines of exactly `wrap` characters when wrap is a whole number of
+ * groups. Decoding is lenient by contract (Apache's ap_base64decode): CR and
+ * LF are skipped, the first character outside the alphabet ends the input,
+ * and the result must be what a decoder written here makes of that. */
+static size_t __ref_unb64(const char* s, uint8_t* out) {
+    uint8_t six[4];
+    size_t n = 0, have = 0;
+    for (; *s; s++) {
+        if (*s == '\r' || *s == '\n') continue;
+        const char* at = strchr("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", *s);
+        if (at == NULL) break;
+        six[have++] = (uint8_t)(at - "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/");
+        if (have == 4) {
+            out[n++] = (uint8_t)(six[0] << 2 | six[1] >> 4);
+            out[n++] = (uint8_t)(six[1] << 4 | six[2] >> 2);
+            out[n++] = (uint8_t)(six[2] << 6 | six[3]);
+            have = 0;
+        }
+    }
+    if (have > 1) out[n++] = (uint8_t)(six[0] << 2 | six[1] >> 4);
+    if (have > 2) out[n++] = (uint8_t)(six[1] << 4 | six[2] >> 2);
+    return n;
+}
+
+static void __text_base64(const uint8_t* raw, size_t n, const char* value, uint8_t wrap) {
+    char* enc = malloc((size_t)base64_encode_len((int)n));
+    if (enc == NULL) abort();
+    const int elen = base64_encode(enc, (const char*)raw, (int)n);
+    if (elen != (int)(4 * ((n + 2) / 3)) || strlen(enc) != (size_t)elen) __builtin_trap();
+    for (int i = 0; i < elen; i++) {
+        const int pad = enc[i] == '=';
+        if (pad ? i < elen - 2 || (i == elen - 2 && enc[elen - 1] != '=') : strchr("+/", enc[i]) == NULL && !isalnum((unsigned char)enc[i])) __builtin_trap();
+    }
+    uint8_t* dec = malloc((size_t)base64_decode_len(enc));
+    if (dec == NULL) abort();
+    if (base64_decode((char*)dec, enc) != (int)n || memcmp(dec, raw, n) != 0) __builtin_trap();
+    free(dec);
+
+    if (wrap > 0) {
+        char* nl = malloc((size_t)base64_encode_nl_len((int)n, wrap));
+        if (nl == NULL) abort();
+        const int nlen = base64_encode_nl(nl, (const char*)raw, (int)n, wrap);
+        if (nlen < elen || nlen + 1 > base64_encode_nl_len((int)n, wrap)) __builtin_trap();
+        if (wrap % 4 == 0) {
+            const char* line = nl;
+            for (;;) {
+                const char* eol = strstr(line, "\r\n");
+                if (eol == NULL) { if (strlen(line) > wrap) __builtin_trap(); break; }
+                if (eol - line != wrap) __builtin_trap();
+                line = eol + 2;
+            }
+        }
+        dec = malloc((size_t)base64_decode_len(nl));
+        if (dec == NULL) abort();
+        if (base64_decode((char*)dec, nl) != (int)n || memcmp(dec, raw, n) != 0) __builtin_trap();
+        free(dec);
+        free(nl);
+    }
+    free(enc);
+
+    /* Whatever the input says, decoded leniently into a buffer of exactly the
+     * size base64_decode_len asks for. */
+    const int cap = base64_decode_len(value);
+    uint8_t* got = malloc((size_t)cap);
+    uint8_t* want = malloc(strlen(value) + 1);
+    if (got == NULL || want == NULL) abort();
+    const size_t want_n = __ref_unb64(value, want);
+    const int got_n = base64_decode((char*)got, value);
+    if (got_n < 0 || (size_t)got_n != want_n || got_n > cap || memcmp(got, want, want_n) != 0) __builtin_trap();
+    free(got);
+    free(want);
+
+    /* base64url, as the h2c Upgrade header brings it. */
+    const int ucap = base64url_decode_len(value);
+    uint8_t* ugot = malloc((size_t)(ucap > 0 ? ucap : 1));
+    if (ugot == NULL) abort();
+    const int ugot_n = base64url_decode((char*)ugot, value);
+    if (ugot_n < 0 || ugot_n > ucap) __builtin_trap();
+    free(ugot);
+}
+
+static void __text_extra(uint8_t which, uint8_t arg, const char* value, const uint8_t* raw, size_t n) {
+    switch (which) {
+    case 0: __text_idn(value); break;
+    case 1: __text_ipaddr(value, (uint16_t)(arg * 257)); break;
+    case 2: __text_base64(raw, n, value, arg % 100); break;
+    }
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     if (size < 2) return 0;
 
@@ -4090,6 +4326,12 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     if (value == NULL) return 0;
     memcpy(value, data + 2, size - 2);
     value[size - 2] = '\0';
+
+    if (data[0] >= 0xE0) {
+        __text_extra(data[0] & 0x1F, data[1], value, data + 2, size - 2);
+        free(value);
+        return 0;
+    }
 
     switch (data[0] % 5) {
     case 0: __text_html(value); break;
@@ -7377,6 +7619,146 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         __pm_check(&s);
     }
 
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_SESSION_CRYPTO
+
+#include <ctype.h>
+#include <openssl/evp.h>
+#include "aes256gcm.h"
+
+/* The session cookie's cryptography (framework/session/aes256gcm.c): what a
+ * cookie from the network is decrypted with before any session data is read.
+ * The first byte picks the mode:
+ *
+ *   0 round trip -- any C string (empty, not UTF-8, long) under any key comes
+ *     back from decrypt(encrypt(x)) unchanged; the sealed form is plain base64
+ *     of nonce, ciphertext and tag; the wrong key, one character changed, a
+ *     cut or a tail added give NULL or the same plaintext -- never another, and
+ *     never a part of it (GCM authenticates the whole);
+ *   1 forgery -- arbitrary bytes, as a cookie would bring them, never decrypt;
+ *   2 hex key -- aes256gcm_key_from_hex takes exactly 64 hex digits, agrees
+ *     with a parser written here, and leaves the key alone when it refuses;
+ *   3 passphrase -- the derived key is SHA-256 of the passphrase (OpenSSL). */
+
+static int __sc_b64(const char* s, size_t n) {
+    if (n % 4 != 0) return 0;
+    for (size_t i = 0; i < n; i++) {
+        const char c = s[i];
+        const int pad_ok = c == '=' && i >= n - 2 && (i == n - 1 || s[n - 1] == '=');
+        if (!(isalnum((unsigned char)c) || c == '+' || c == '/' || pad_ok)) return 0;
+    }
+    return 1;
+}
+
+static void __sc_expect(const char* got, const char* want) {
+    if (got != NULL && strcmp(got, want) != 0) __builtin_trap();
+}
+
+static void __sc_roundtrip(const uint8_t* data, size_t size) {
+    if (size < AES256GCM_KEY_SIZE + 2) return;
+    unsigned char key[AES256GCM_KEY_SIZE];
+    memcpy(key, data, sizeof key);
+    const uint8_t at = data[AES256GCM_KEY_SIZE];
+    const uint8_t how = data[AES256GCM_KEY_SIZE + 1];
+    data += AES256GCM_KEY_SIZE + 2; size -= AES256GCM_KEY_SIZE + 2;
+
+    char* plain = strndup((const char*)data, size);
+    if (plain == NULL) abort();
+    const size_t len = strlen(plain);
+
+    char* sealed = aes256gcm_encrypt(plain, key);
+    if (sealed == NULL) __builtin_trap();
+    const size_t n = strlen(sealed);
+    if (n != 4 * ((12 + len + 16 + 2) / 3) || !__sc_b64(sealed, n)) __builtin_trap();
+
+    char* opened = aes256gcm_decrypt(sealed, key);
+    if (opened == NULL || strcmp(opened, plain) != 0) __builtin_trap();
+    free(opened);
+
+    unsigned char other[AES256GCM_KEY_SIZE];
+    memcpy(other, key, sizeof other);
+    other[at % AES256GCM_KEY_SIZE] ^= (uint8_t)(1u << (how % 8));
+    if ((opened = aes256gcm_decrypt(sealed, other)) != NULL) __builtin_trap();
+
+    /* One character changed, cut, or a tail added. */
+    char* copy = malloc(n + 8);
+    if (copy == NULL) abort();
+    memcpy(copy, sealed, n + 1);
+    static const char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=!\r\n";
+    switch (how % 3) {
+    case 0: copy[at % n] = alphabet[how % (sizeof alphabet - 1)]; break;
+    case 1: copy[at % n] = '\0'; break;
+    case 2: memcpy(copy + n, "QUJD", 5); break;
+    }
+    opened = aes256gcm_decrypt(copy, key);
+    __sc_expect(opened, plain);
+    free(opened);
+
+    free(copy);
+    free(sealed);
+    free(plain);
+}
+
+static void __sc_forgery(const uint8_t* data, size_t size) {
+    static const unsigned char key[AES256GCM_KEY_SIZE] = { 7 };
+    char* cookie = strndup((const char*)data, size);
+    if (cookie == NULL) abort();
+    char* opened = aes256gcm_decrypt(cookie, key);
+    if (opened != NULL) __builtin_trap();
+    free(cookie);
+}
+
+static int __sc_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void __sc_hex(const uint8_t* data, size_t size) {
+    /* Exactly the string, so a read past its end is ASan's. */
+    char* hex = strndup((const char*)data, size);
+    if (hex == NULL) abort();
+    const size_t n = strlen(hex);
+
+    unsigned char want[AES256GCM_KEY_SIZE];
+    int valid = n == 64;
+    for (size_t i = 0; valid && i < AES256GCM_KEY_SIZE; i++) {
+        const int hi = __sc_nibble(hex[2 * i]), lo = __sc_nibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) valid = 0;
+        else want[i] = (unsigned char)(hi << 4 | lo);
+    }
+
+    unsigned char key[AES256GCM_KEY_SIZE];
+    memset(key, 0xa5, sizeof key);
+    const int ok = aes256gcm_key_from_hex(hex, key);
+    if (ok != valid) __builtin_trap();
+    for (size_t i = 0; i < AES256GCM_KEY_SIZE; i++)
+        if (key[i] != (valid ? want[i] : 0xa5)) __builtin_trap();
+    free(hex);
+}
+
+static void __sc_passphrase(const uint8_t* data, size_t size) {
+    char* pass = strndup((const char*)data, size);
+    if (pass == NULL) abort();
+    unsigned char key[AES256GCM_KEY_SIZE], want[32];
+    unsigned int want_len = 0;
+    aes256gcm_key_from_passphrase(pass, key);
+    if (EVP_Digest(pass, strlen(pass), want, &want_len, EVP_sha256(), NULL) != 1 || want_len != 32) abort();
+    if (memcmp(key, want, 32) != 0) __builtin_trap();
+    free(pass);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 1) return 0;
+    switch (data[0] % 4) {
+    case 0: __sc_roundtrip(data + 1, size - 1); break;
+    case 1: __sc_forgery(data + 1, size - 1); break;
+    case 2: __sc_hex(data + 1, size - 1); break;
+    case 3: __sc_passphrase(data + 1, size - 1); break;
+    }
     return 0;
 }
 
