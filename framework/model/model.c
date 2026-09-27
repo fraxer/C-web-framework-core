@@ -2387,7 +2387,8 @@ int model_update(const char* dbid, void* arg) {
     int idx = 0;
 
     // Pass 1 — SET clause: every dirty field bound with its (new) value.
-    for (int i = 0, iter_set = 0; i < schema->columns_count; i++) {
+    int iter_set = 0;
+    for (int i = 0; i < schema->columns_count; i++) {
         mfield_t* field = &record->fields[i];
 
         if (!field->dirty)
@@ -2411,6 +2412,14 @@ int model_update(const char* dbid, void* arg) {
         }
 
         iter_set++;
+    }
+
+    // Nothing set: "UPDATE t SET  WHERE ..." would only come back as a syntax
+    // error from the database. Refused here, as model_create refuses a row
+    // with nothing to write.
+    if (iter_set == 0) {
+        __model_set_status(MODEL_ERR_PARAM);
+        goto failed;
     }
 
     // Pass 2 — WHERE clause: locate the row by primary key. A dirty key is bound
