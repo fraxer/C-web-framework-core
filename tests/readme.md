@@ -481,6 +481,7 @@ Targets, each with a seed corpus under `fuzz/corpus/`:
 | `db_query` | the query layer on SQLite `:memory:`: templates, bound values, identifiers, lists, the result cursor, the insert/select/update/delete compilers (only with `-DINCLUDE_SQLITE=yes`) |
 | `db_model` | the model layer the feedback form writes through: create, read, update, delete and JSON of a schema like the form's, on SQLite `:memory:` (same condition) |
 | `quic_pmtud` | DPLPMTUD (RFC 8899) on a path whose MTU, losses and clock the input sets; the search must end, and the size stay within [base, ceiling] |
+| `session_crypto` | the session cookie's AES-256-GCM: round trips, forgeries, tampering, the hex and passphrase keys |
 
 An application registers its own with the same function, and `run.sh` picks
 them up from the manifest; the site's `fuzz_feedback` (in `backend/tests/`) is
@@ -673,6 +674,10 @@ HTTP/2 write path, as a seed that replays it):
   dereferenced.
 - `model.c`: an update with nothing set reached the database as
   `UPDATE t SET  WHERE ...`.
+- `aes256gcm.c` (`test_aes256gcm.c`, written for `session_crypto`): the
+  encryption of an empty value could not be decrypted -- exactly nonce and tag
+  was refused; `aes256gcm_key_from_hex` read past the end of an odd-length
+  string and took blanks, signs and 63 or 66 digits.
 
 One more came out of checking the HTTP/2 fix against a live server rather than
 out of a target: finishing a frame from the session's output buffer, like
