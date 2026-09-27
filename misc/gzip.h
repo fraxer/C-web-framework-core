@@ -20,6 +20,9 @@ int gzip_deflate_init(gzip_t* gzip);
  * response; a caller that compresses once and serves the result many times
  * should pay for size instead. */
 int gzip_deflate_init_level(gzip_t* gzip, int level);
+/* Without `end` this is a sync flush, and zlib wants more than six bytes of
+ * room for it (zlib.h, deflate): a smaller buffer that fills up makes the next
+ * call start another flush marker, forever. */
 size_t gzip_deflate(gzip_t* gzip, const char* compress_data, const size_t compress_length, const int end);
 void gzip_set_in(gzip_t* gzip, const char* data, size_t length);
 int gzip_deflate_free(gzip_t* gzip);
