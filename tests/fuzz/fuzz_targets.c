@@ -3798,11 +3798,21 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <errno.h>
+#include <limits.h>
+#include <math.h>
+#include <openssl/evp.h>
 #include "base64.h"
 #include "cstr.h"
 #include "escape.h"
+#include "helpers.h"
 #include "idn_utils.h"
 #include "ipaddr.h"
+#include "queryparser.h"
+#include "sha1.h"
+#include "sha256.h"
+#include "typecheck.h"
+#include "utf8.h"
 #include "strtemplate.h"
 #include "validation.h"
 
@@ -4310,11 +4320,252 @@ static void __text_base64(const uint8_t* raw, size_t n, const char* value, uint8
     free(ugot);
 }
 
+/* url: any bytes encode to the unreserved set, '+' and %XX, and decode back;
+ * decoding anything agrees with a decoder written here (%XX with two hex
+ * digits is a byte, any other '%' stays, '+' is a space) and is never longer
+ * than its input. */
+static size_t __ref_urldecode(const uint8_t* s, size_t n, uint8_t* out) {
+    size_t o = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (s[i] == '%' && i + 2 < n && __ref_hex((char)s[i + 1]) >= 0 && __ref_hex((char)s[i + 2]) >= 0) {
+            out[o++] = (uint8_t)(__ref_hex((char)s[i + 1]) << 4 | __ref_hex((char)s[i + 2]));
+            i += 2;
+        } else out[o++] = s[i] == '+' ? ' ' : s[i];
+    }
+    return o;
+}
+
+static void __text_url(const uint8_t* raw, size_t n) {
+    size_t elen = 0;
+    char* enc = urlencodel((const char*)raw, n, &elen);
+    if (enc == NULL || strlen(enc) != elen) __builtin_trap();
+    for (size_t i = 0; i < elen; i++)
+        if (!isalnum((unsigned char)enc[i]) && strchr("-_.~+%", enc[i]) == NULL) __builtin_trap();
+    size_t dlen = 0;
+    char* dec = urldecodel(enc, elen, &dlen);
+    if (dec == NULL || dlen != n || memcmp(dec, raw, n) != 0) __builtin_trap();
+    free(dec);
+    free(enc);
+
+    uint8_t* want = malloc(n + 1);
+    if (want == NULL) abort();
+    const size_t want_n = __ref_urldecode(raw, n, want);
+    dec = urldecodel((const char*)raw, n, &dlen);
+    if (dec == NULL || dlen != want_n || dlen > n || memcmp(dec, want, want_n) != 0 || dec[dlen] != '\0') __builtin_trap();
+    free(dec);
+    free(want);
+}
+
+/* hex: bytes_to_hex and back; hex_to_bytes takes an even number of hex
+ * digits that fit the buffer, and nothing else. */
+static void __text_hex(const uint8_t* raw, size_t n, const char* value, uint8_t arg) {
+    char* hex = malloc(2 * n + 1);
+    uint8_t* back = malloc(n + 1);
+    if (hex == NULL || back == NULL) abort();
+    bytes_to_hex(raw, n, hex);
+    if (strlen(hex) != 2 * n) __builtin_trap();
+    for (size_t i = 0; i < 2 * n; i++) if (!strchr("0123456789abcdef", hex[i])) __builtin_trap();
+    if (!hex_to_bytes(hex, back, n) || memcmp(back, raw, n) != 0) __builtin_trap();
+    free(hex);
+    free(back);
+
+    const size_t len = strlen(value);
+    const size_t cap = arg % 64;
+    int valid = len % 2 == 0 && len / 2 <= cap;
+    for (size_t i = 0; valid && i < len; i++) if (__ref_hex(value[i]) < 0) valid = 0;
+    uint8_t* out = malloc(cap + 1);
+    if (out == NULL) abort();
+    if (hex_to_bytes(value, out, cap) != valid) __builtin_trap();
+    for (size_t i = 0; valid && i < len / 2; i++)
+        if (out[i] != (uint8_t)(__ref_hex(value[2 * i]) << 4 | __ref_hex(value[2 * i + 1]))) __builtin_trap();
+    free(out);
+}
+
+/* is_path_traversal: a path climbs out when one of its '/'-separated
+ * segments is exactly "..". A backslash is a character of a Linux file
+ * name, not a separator. */
+static void __text_traversal(const uint8_t* raw, size_t n) {
+    int want = 0;
+    size_t start = 0;
+    for (size_t i = 0; i <= n; i++)
+        if (i == n || raw[i] == '/') {
+            if (i - start == 2 && raw[start] == '.' && raw[start + 1] == '.') want = 1;
+            start = i + 1;
+        }
+    char* copy = malloc(n + 1);
+    if (copy == NULL) abort();
+    memcpy(copy, raw, n);
+    if (is_path_traversal(copy, n) != want) __builtin_trap();
+    free(copy);
+}
+
+static void __text_compare(const uint8_t* raw, size_t n, uint8_t arg) {
+    const size_t cut = n ? arg % (n + 1) : 0;
+    const size_t la = cut, lb = n - cut, m = la < lb ? la : lb;
+    if (secure_compare_bytes(raw, raw + cut, m) != (memcmp(raw, raw + cut, m) == 0)) __builtin_trap();
+    char* a = strndup((const char*)raw, la);
+    char* b = strndup((const char*)raw + cut, lb);
+    if (a == NULL || b == NULL) abort();
+    if (secure_compare(a, b) != (strcmp(a, b) == 0)) __builtin_trap();
+    if (!secure_compare(a, a)) __builtin_trap();
+    free(a);
+    free(b);
+}
+
+/* http_format_date: IMF-fixdate (RFC 9110 §5.6.7) in English whatever the
+ * locale, for every year that has four digits, and 0 for any other year or a
+ * buffer it does not fit. */
+static void __text_date(const uint8_t* raw, size_t n, uint8_t arg) {
+    int64_t t = 0;
+    for (size_t i = 0; i < 8 && i < n; i++) t = (int64_t)((uint64_t)t << 8 | raw[i]);
+    if (n > 8 && raw[8] & 1) t %= 400LL * 366 * 86400;          /* mostly sane years */
+    static const char* const days[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    static const char* const months[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    const size_t size = 1 + arg % 40;
+    char buf[64];
+    memset(buf, 'x', sizeof buf);
+    const size_t got = http_format_date((time_t)t, buf, size);
+    if (got >= size || (got > 0 && buf[got] != '\0') || buf[size] != 'x') __builtin_trap();
+
+    struct tm tm;
+    const time_t tt = (time_t)t;
+    if (gmtime_r(&tt, &tm) == NULL) { if (got != 0) __builtin_trap(); return; }
+    if (tm.tm_year + 1900 < 0 || tm.tm_year + 1900 > 9999) { if (got != 0) __builtin_trap(); return; }
+    char want[40];
+    const int wn = snprintf(want, sizeof want, "%s, %02d %s %04d %02d:%02d:%02d GMT", days[tm.tm_wday], tm.tm_mday,
+                            months[tm.tm_mon], tm.tm_year + 1900, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    if ((size_t)wn + 1 > size) { if (got != 0) __builtin_trap(); return; }
+    if (got != (size_t)wn || strcmp(buf, want) != 0) __builtin_trap();
+}
+
+/* typecheck: each is_* against the strto* it is named after, read with errno:
+ * the whole string taken (is_int also allows trailing blanks, as it always
+ * has), no ERANGE, the value in range and finite; and an unsigned type takes
+ * no minus sign, before or after the blanks strtoul skips. */
+static int __ref_blank_tail(const char* e) {
+    while (*e) if (!isspace((unsigned char)*e++)) return 0;
+    return 1;
+}
+
+static void __text_typecheck(const char* v) {
+    char* e;
+    const int empty = *v == '\0';
+    const char* nb = v;
+    while (isspace((unsigned char)*nb)) nb++;
+
+    errno = 0; long l = strtol(v, &e, 10);
+    const int want_int = !empty && e != v && errno != ERANGE && l >= INT_MIN && l <= INT_MAX && __ref_blank_tail(e);
+    const int want_long = !empty && e != v && errno != ERANGE && *e == '\0';
+    errno = 0; unsigned long ul = strtoul(v, &e, 10);
+    const int want_ulong = !empty && *nb != '-' && e != v && errno != ERANGE && *e == '\0';
+    const int want_uint = want_ulong && ul <= UINT_MAX;
+    errno = 0; float f = strtof(v, &e);
+    const int want_float = !empty && e != v && *e == '\0' && errno != ERANGE && isfinite(f);
+    errno = 0; double d = strtod(v, &e);
+    const int want_double = !empty && e != v && *e == '\0' && errno != ERANGE && isfinite(d);
+    errno = 0; long double ld = strtold(v, &e);
+    const int want_ldouble = !empty && e != v && *e == '\0' && errno != ERANGE && isfinite(ld);
+
+    if (is_int(v) != want_int || is_long(v) != want_long || is_ulong(v) != want_ulong ||
+        is_uint(v) != want_uint || is_float(v) != want_float || is_double(v) != want_double ||
+        is_long_double(v) != want_ldouble) __builtin_trap();
+}
+
+/* utf8: utf8_decode agrees with the strict RFC 3629 decoder above at every
+ * position, and utf8_strlen counts a broken byte as one character. */
+static void __text_utf8(const char* value) {
+    const size_t n = strlen(value);
+    size_t count = 0;
+    for (size_t i = 0; i < n; count++) {
+        uint32_t want_cp = 0, got_cp = 0;
+        const size_t want = __text_utf8_next((const uint8_t*)value, n, i, &want_cp);
+        const size_t got = utf8_decode((const unsigned char*)value + i, &got_cp);
+        if (got != want || (got && got_cp != want_cp)) __builtin_trap();
+        i += want ? want : 1;
+    }
+    if (utf8_strlen(value) != count) __builtin_trap();
+}
+
+/* queryparser: as its header says -- pairs split on '&', the key to the first
+ * '=', a key without one gets "", '#' ends it, both halves %-decoded (and, as
+ * C strings, ending at a decoded NUL); and parsing what query_stringify makes
+ * of the result gives the same list. */
+static query_t* __text_qparse(const char* s, size_t n) {
+    query_t* first = NULL;
+    query_t* last = NULL;
+    if (queryparser_parse(s, n, 0, NULL, NULL, &first, &last) != QUERYPARSER_OK) __builtin_trap();
+    return first;
+}
+
+static void __text_query(const uint8_t* raw, size_t n) {
+    query_t* list = __text_qparse((const char*)raw, n);
+
+    /* The reference, pair by pair. */
+    const query_t* q = list;
+    size_t start = 0;
+    for (size_t i = 0; i <= n; i++) {
+        if (i < n && raw[i] != '&' && raw[i] != '#') continue;
+        size_t eq = start;
+        while (eq < i && raw[eq] != '=') eq++;
+        uint8_t* key = malloc(i - start + 1);
+        uint8_t* val = malloc(i - start + 1);
+        if (key == NULL || val == NULL) abort();
+        key[__ref_urldecode(raw + start, eq - start, key)] = 0;
+        const size_t vn = eq < i ? __ref_urldecode(raw + eq + 1, i - eq - 1, val) : 0;
+        val[vn] = 0;
+        if (q == NULL || strcmp(q->key, (char*)key) != 0 || strcmp(q->value, (char*)val) != 0) __builtin_trap();
+        free(key);
+        free(val);
+        q = q->next;
+        start = i + 1;
+        if (i < n && raw[i] == '#') break;
+    }
+    if (q != NULL) __builtin_trap();
+
+    char* text = query_stringify(list);
+    if (text == NULL) __builtin_trap();
+    query_t* again = __text_qparse(text, strlen(text));
+    const query_t* a = list;
+    const query_t* b = again;
+    for (; a != NULL && b != NULL; a = a->next, b = b->next)
+        if (strcmp(a->key, b->key) != 0 || strcmp(a->value, b->value) != 0) __builtin_trap();
+    if (a != NULL || b != NULL) __builtin_trap();
+    free(text);
+    queries_free(again);
+    queries_free(list);
+}
+
+/* sha1 / sha256: against OpenSSL, sha256_hex against hex of the digest. */
+static void __text_sha(const uint8_t* raw, size_t n) {
+    unsigned char got[32], want[32];
+    unsigned int wn = 0;
+    sha1(raw, n, got);
+    if (EVP_Digest(raw, n, want, &wn, EVP_sha1(), NULL) != 1 || wn != 20) abort();
+    if (memcmp(got, want, 20) != 0) __builtin_trap();
+    sha256(raw, n, got);
+    if (EVP_Digest(raw, n, want, &wn, EVP_sha256(), NULL) != 1 || wn != 32) abort();
+    if (memcmp(got, want, 32) != 0) __builtin_trap();
+    char hex[SHA256_HEX_SIZE], want_hex[SHA256_HEX_SIZE];
+    sha256_hex(raw, n, hex);
+    for (int i = 0; i < 32; i++) snprintf(want_hex + 2 * i, 3, "%02x", want[i]);
+    if (strcmp(hex, want_hex) != 0) __builtin_trap();
+}
+
 static void __text_extra(uint8_t which, uint8_t arg, const char* value, const uint8_t* raw, size_t n) {
     switch (which) {
     case 0: __text_idn(value); break;
     case 1: __text_ipaddr(value, (uint16_t)(arg * 257)); break;
     case 2: __text_base64(raw, n, value, arg % 100); break;
+    case 3: __text_url(raw, n); break;
+    case 4: __text_hex(raw, n, value, arg); break;
+    case 5: __text_traversal(raw, n); break;
+    case 6: __text_compare(raw, n, arg); break;
+    case 7: __text_date(raw, n, arg); break;
+    case 8: __text_typecheck(value); break;
+    case 9: __text_utf8(value); break;
+    case 10: __text_query(raw, n); break;
+    case 11: __text_sha(raw, n); break;
     }
 }
 
