@@ -272,8 +272,8 @@ map_iterator_t map_prev(map_iterator_t it) {
         return it;
     }
     if (it.node == it.map->nil) {
-        // Move to maximum
-        it.node = __map_maximum(it.map, it.map->root);
+        // Move to maximum; an empty map has none (the sentinel's children are NULL)
+        it.node = it.map->root == it.map->nil ? NULL : __map_maximum(it.map, it.map->root);
     } else {
         it.node = __map_predecessor(it.map, it.node);
     }

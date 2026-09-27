@@ -26,8 +26,9 @@ typedef struct arena_block {
     struct arena_block* next;
     size_t capacity;
     size_t used;
-    /* The block's bytes follow the header in the same allocation. */
-    unsigned char data[];
+    /* The block's bytes follow the header in the same allocation, on the
+     * boundary arena_alloc promises: the header alone is 24 bytes. */
+    _Alignas(max_align_t) unsigned char data[];
 } arena_block_t;
 
 typedef struct arena {

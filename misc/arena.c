@@ -20,7 +20,7 @@
  * following connection hold the high-water mark. */
 #define ARENA_MAX_BLOCK     65536
 
-#define ARENA_ALIGN sizeof(void*) * 2 /* max_align_t on every target here */
+#define ARENA_ALIGN _Alignof(max_align_t)
 
 void arena_init(arena_t* arena) {
     if (arena == NULL) return;
@@ -73,9 +73,11 @@ static arena_block_t* __block_get(arena_t* arena, size_t need) {
 void* arena_alloc(arena_t* arena, size_t size) {
     if (arena == NULL) return NULL;
     if (size == 0) size = 1;
+    /* No object is larger than PTRDIFF_MAX, and past it the block header
+     * would wrap the size handed to malloc around to a few bytes. */
+    if (size > PTRDIFF_MAX - sizeof(arena_block_t) - ARENA_ALIGN) return NULL;
 
     const size_t aligned = __align_up(size);
-    if (aligned < size) return NULL; /* overflow */
 
     arena_block_t* block = arena->head;
     if (block == NULL || block->capacity - block->used < aligned) {
