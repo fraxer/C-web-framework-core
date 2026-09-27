@@ -98,6 +98,52 @@ TEST(test_h2field_value_edge_whitespace) {
     TEST_ASSERT(value_ok("a b"), "interior space is legal");
 }
 
+TEST(test_h2field_response_name_charset) {
+    TEST_CASE("response names: tchar with uppercase, no pseudo-headers");
+
+    for (int c = 0; c < 256; c++) {
+        const char name = (char)c;
+        const int got = h2_field_response_name_valid(&name, 1);
+
+        const int is_alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        const int is_digit = (c >= '0' && c <= '9');
+        const int is_punct = strchr("!#$%&'*+-.^_`|~", c) != NULL && c != 0;
+        const int expect = is_alpha || is_digit || is_punct;
+
+        if (got != expect) {
+            TEST_ASSERT_EQUAL(expect, got, "octet verdict");
+            break;
+        }
+    }
+
+    TEST_ASSERT(h2_field_response_name_valid("Content-Type", 12), "uppercase is fine on the way out");
+    TEST_ASSERT(!h2_field_response_name_valid(":status", 7), "pseudo-header");
+    TEST_ASSERT(!h2_field_response_name_valid("X-A\r\nB", 6), "CRLF in a name");
+    TEST_ASSERT(!h2_field_response_name_valid("", 0), "empty name");
+    TEST_ASSERT(!h2_field_response_name_valid(NULL, 4), "NULL name");
+}
+
+TEST(test_h2field_response_value_charset) {
+    TEST_CASE("response values: same octets as a request value, edges not checked");
+
+    for (int c = 0; c < 256; c++) {
+        const char value[3] = {'a', (char)c, 'b'};
+        const int got = h2_field_response_value_valid(value, sizeof(value));
+        const int expect = !(c < 0x20 && c != '\t') && c != 0x7f;
+
+        if (got != expect) {
+            TEST_ASSERT_EQUAL(expect, got, "octet verdict");
+            break;
+        }
+    }
+
+    TEST_ASSERT(!h2_field_response_value_valid("a\r\nSet-Cookie: x=1", 18), "CRLF — response splitting");
+    TEST_ASSERT(h2_field_response_value_valid(" padded ", 8), "edge whitespace is not refused");
+    TEST_ASSERT(h2_field_response_value_valid("", 0), "an empty value is legal");
+    TEST_ASSERT(h2_field_response_value_valid(NULL, 0), "NULL with zero length is empty");
+    TEST_ASSERT(!h2_field_response_value_valid(NULL, 3), "NULL with a length");
+}
+
 TEST(test_h2field_validate_reports_which_side) {
     TEST_CASE("the two failure codes are distinguishable");
 

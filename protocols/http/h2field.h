@@ -38,4 +38,16 @@ h2_field_status_e h2_field_validate(const char* name, size_t name_len,
 int h2_field_name_valid(const char* name, size_t len);
 int h2_field_value_valid(const char* value, size_t len);
 
+/* The same octet rules for a field the server is about to send — what a
+ * handler hands add_header(), add_trailer() or add_early_hint(). Every write
+ * path (HTTP/1.1 text, HPACK, QPACK) copies these bytes verbatim, so this is
+ * the one place a CR LF from user input can be stopped before it ends a header
+ * and starts another (response splitting in HTTP/1.1).
+ *
+ * Differs from the request-side pair in what the sender may legitimately hand
+ * in: uppercase names ("Content-Type" -- the h2/h3 writers lowercase them),
+ * no pseudo-headers, and no edge-whitespace rule. */
+int h2_field_response_name_valid(const char* name, size_t len);
+int h2_field_response_value_valid(const char* value, size_t len);
+
 #endif

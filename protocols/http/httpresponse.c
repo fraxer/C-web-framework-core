@@ -12,6 +12,7 @@
 
 #include "connection_s.h"
 #include "h2session.h"
+#include "h2field.h"
 #include "log.h"
 #include "helpers.h"
 #include "json.h"
@@ -651,6 +652,28 @@ int __httpresponse_header_add(httpresponse_t* response, const char* key, const c
     return __httpresponse_headern_add(response, key, strlen(key), value, strlen(value));
 }
 
+/* Every field a handler adds -- header, trailer, early hint -- passes through
+ * here before it is stored, because no write path looks at the bytes again:
+ * HTTP/1.1 copies them between ": " and "\r\n", HPACK and QPACK encode them
+ * as they are. A CR LF that got this far would end the field and start another
+ * one of the caller's choosing (response splitting). Refused and logged rather
+ * than cleaned up: a header that silently came out different from what the
+ * handler asked for is worse than one that visibly did not come out at all. */
+static int __httpresponse_field_valid(const char* what, const char* key, size_t key_length,
+                                      const char* value, size_t value_length) {
+    if (!h2_field_response_name_valid(key, key_length)) {
+        log_error("httpresponse: invalid %s name, dropping it\n", what);
+        return 0;
+    }
+    if (!h2_field_response_value_valid(value, value_length)) {
+        log_error("httpresponse: invalid characters in %s \"%.*s\", dropping it\n",
+                  what, (int)(key_length > 64 ? 64 : key_length), key);
+        return 0;
+    }
+
+    return 1;
+}
+
 int __httpresponse_early_hint_add(httpresponse_t* response, const char* key, const char* value) {
     if (key == NULL || value == NULL) return 0;
 
@@ -673,6 +696,9 @@ int __httpresponse_early_hint_add(httpresponse_t* response, const char* key, con
         log_error("httpresponse: early hints need HTTP/2 or HTTP/3, dropping \"%s\"\n", key);
         return 0;
     }
+
+    if (!__httpresponse_field_valid("early hint", key, strlen(key), value, strlen(value)))
+        return 0;
 
     http_header_t* hint = http_header_create(key, strlen(key), value, strlen(value));
     if (hint == NULL) return 0;
@@ -749,6 +775,9 @@ int __httpresponse_trailern_add(httpresponse_t* response, const char* key, size_
         return 0;
     }
 
+    if (!__httpresponse_field_valid("trailer", key, key_length, value, value_length))
+        return 0;
+
     http_header_t* trailer = http_header_create(key, key_length, value, value_length);
     if (trailer == NULL) return 0;
     if (trailer->key == NULL || trailer->value == NULL) {
@@ -768,6 +797,9 @@ int __httpresponse_trailern_add(httpresponse_t* response, const char* key, size_
 }
 
 int __httpresponse_headern_add(httpresponse_t* response, const char* key, size_t key_length, const char* value, size_t value_length) {
+    if (!__httpresponse_field_valid("header", key, key_length, value, value_length))
+        return 0;
+
     /* key может быть слайсом без нуль-терминатора — сравниваем по key_length. */
     if (response->range &&
         (cmpstrn_lower(key, key_length, "Transfer-Encoding", 17) ||
