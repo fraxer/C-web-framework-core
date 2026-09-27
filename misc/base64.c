@@ -102,54 +102,44 @@ int base64_decode_len(const char* bufcoded) {
     return (((nprbytes + 3) / 4) * 3) + 1;
 }
 
+/* Lenient by contract (Apache's ap_base64decode): the first character
+ * outside the alphabet ends the input, and CR and LF are skipped -- wherever
+ * they fall, as base64_decode_len counts them. The decoder used to skip them
+ * only at the start of a group, and a line break inside one was decoded as
+ * data. */
 int base64_decode(char* bufplain, const char* bufcoded) {
-    register int nprbytes = 0;
-    register const unsigned char* bufin = (const unsigned char*)bufcoded;
+    const unsigned char* bufin = (const unsigned char*)bufcoded;
+    unsigned char* bufout = (unsigned char*)bufplain;
+    unsigned char six[4];
+    int have = 0;
 
-    while (1) {
-        if (*bufin == '\r' || *bufin == '\n') {
-            bufin++;
+    for (;; bufin++) {
+        if (*bufin == '\r' || *bufin == '\n')
             continue;
-        }
-        if (pr2six[*bufin++] > 63)
+        if (pr2six[*bufin] > 63)
             break;
 
-        nprbytes++;
-    }
-
-    int nbytesdecoded = ((nprbytes + 3) / 4) * 3;
-
-    register unsigned char* bufout = (unsigned char*)bufplain;
-    bufin = (const unsigned char*)bufcoded;
-
-    while (nprbytes > 4) {
-        if (*bufin == '\r' || *bufin == '\n') {
-            bufin++;
-            continue;
+        six[have++] = pr2six[*bufin];
+        if (have == 4) {
+            *(bufout++) = (unsigned char)(six[0] << 2 | six[1] >> 4);
+            *(bufout++) = (unsigned char)(six[1] << 4 | six[2] >> 2);
+            *(bufout++) = (unsigned char)(six[2] << 6 | six[3]);
+            have = 0;
         }
-
-        *(bufout++) = (unsigned char) (pr2six[*bufin] << 2 | pr2six[bufin[1]] >> 4);
-        *(bufout++) = (unsigned char) (pr2six[bufin[1]] << 4 | pr2six[bufin[2]] >> 2);
-        *(bufout++) = (unsigned char) (pr2six[bufin[2]] << 6 | pr2six[bufin[3]]);
-
-        bufin += 4;
-        nprbytes -= 4;
     }
 
-    /* Note: (nprbytes == 1) would be an error, so just ingore that case */
-    if (nprbytes > 1)
-        *(bufout++) = (unsigned char) (pr2six[*bufin] << 2 | pr2six[bufin[1]] >> 4);
+    /* A lone sixth of a byte (have == 1) would be an error; it decodes to
+     * nothing, as it always has. */
+    if (have > 1)
+        *(bufout++) = (unsigned char)(six[0] << 2 | six[1] >> 4);
+    if (have > 2)
+        *(bufout++) = (unsigned char)(six[1] << 4 | six[2] >> 2);
 
-    if (nprbytes > 2)
-        *(bufout++) = (unsigned char) (pr2six[bufin[1]] << 4 | pr2six[bufin[2]] >> 2);
+    /* Terminated, not counted: base64_decode_len leaves room for it, and
+     * callers read decoded JSON as a C string. */
+    *bufout = '\0';
 
-    if (nprbytes > 3)
-        *(bufout++) = (unsigned char) (pr2six[bufin[2]] << 6 | pr2six[bufin[3]]);
-
-    *(bufout++) = '\0';
-    nbytesdecoded -= (4 - nprbytes) & 3;
-
-    return nbytesdecoded;
+    return (int)(bufout - (unsigned char*)bufplain);
 }
 
 int __base64_encode_intenal_len(const int len, const int wrap) {
