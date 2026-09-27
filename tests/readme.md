@@ -485,6 +485,7 @@ Targets, each with a seed corpus under `fuzz/corpus/`:
 | `session_crypto` | the session cookie's AES-256-GCM: round trips, forgeries, tampering, the hex and passphrase keys |
 | `misc_containers` | arena, array, map, hashmap, str and bufo under any sequence of operations, each against a model of its own |
 | `view` | the template engine: any template against a document from the input, and generated templates rendered against a model of the engine |
+| `ws_connection` | two WebSocket connections after the upgrade: routing, handlers, the output order, broadcast between them, a shared rate limiter, the closing handshake |
 | `gzip` | `gzip.c` in the loops of its callers: round trips at every level, any bytes, streams cut short, followed or changed |
 
 An application registers its own with the same function, and `run.sh` picks
@@ -610,6 +611,18 @@ broke it is saved like any crash:
   strings, integers printed as integers, the engine's truthiness. The
   document's strings carry `{{`, `{%`, `}}` and any byte but NUL and must
   come out as themselves.
+  `ws_connection` upgrades two HTTP/1.1 connections on /ws (the default or
+  the "resource" subprotocol, per connection) and then sends frames from the
+  input through the server's own read path, workers and write path, the
+  interleaving chosen by the input. The handlers echo, route resource
+  messages (GET /echo?q=, POST /echo, /sub, /unsub, /pub, /item/{id}) and log
+  what they did. Each client must read, for every message in order, exactly
+  one answer -- the handler's, a refusal from the shared limiter, "resource
+  not found" -- a PONG for each PING, the CLOSE echoed and nothing after it;
+  broadcast frames anywhere in between, exactly those the other connection
+  published while this one was subscribed; and as many refusals in all as
+  routed messages beyond the burst. Messages are cut into frames anywhere,
+  with PINGs between the fragments.
   `db_query` generates each template from SQL words, literals, quoted
   identifiers, both comment forms and parameters followed by whatever may
   follow them, so the builder's output is known exactly; values of any bytes
@@ -745,6 +758,22 @@ HTTP/2 write path, as a seed that replays it):
   around to a few bytes and was handed back as allocated.
 - `array.c` (the same): `array_update` out of bounds or on NULL leaked the
   value it refused, where `array_insert` frees it.
+- `websocketsserverhandlers.c` (found by `ws_connection`): the write path
+  stopped after the first frame it wrote once keepalive was 0, which happens
+  when the peer's CLOSE is read, not when ours is written -- a PONG or a reply
+  queued ahead of it went out and the CLOSE never did; with a handler still
+  running the connection was destroyed before either
+  (`test_wsh_close_behind_pong_is_still_sent_regression`,
+  `test_wsh_close_waits_for_pending_reply_regression`). And a PING followed by
+  a message in one read hung the connection: the PONG was staged, dispatching
+  the message parked the connection, and the handler's publish found the
+  stage busy and armed nothing (`test_wsh_reply_behind_staged_pong_rearms_write_regression`).
+- `websocketsprotocolresource.c` (the same): the method was gathered in the
+  parser's buffer, which the next frame's header reuses, so a method cut by a
+  frame boundary failed the connection; and a message ending with an empty
+  frame never had its location parsed and got "resource not found"
+  (`test_wsh_resource_method_split_across_frames_regression`,
+  `test_wsh_resource_empty_final_frame_regression`).
 - `view.c` (`test_view_render_loop_long_object_key`, found by `view`): the key
   of an object loop was copied into an 80-byte buffer, so a longer key from
   the document rendered cut to 79 bytes; it is borrowed from the document now.

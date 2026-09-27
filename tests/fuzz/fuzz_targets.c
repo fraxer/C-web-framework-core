@@ -80,7 +80,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size);
     FUZZ_TARGET == FUZZ_H3_REQUEST || FUZZ_TARGET == FUZZ_HTTP_RESPONSE || \
     FUZZ_TARGET == FUZZ_SMTP_RESPONSE || FUZZ_TARGET == FUZZ_H1_CONNECTION || \
     FUZZ_TARGET == FUZZ_MAIL_MESSAGE || FUZZ_TARGET == FUZZ_H3_RESPONSE || \
-    FUZZ_TARGET == FUZZ_VIEW
+    FUZZ_TARGET == FUZZ_VIEW || FUZZ_TARGET == FUZZ_WS_CONNECTION
 
 /* The parser asks the running configuration what the largest acceptable body
  * is, and there is no configuration here. Overridden the way
@@ -178,7 +178,8 @@ static listener_t __fuzz_listener = {
 
 #endif
 
-#if FUZZ_TARGET == FUZZ_H1_CONNECTION || FUZZ_TARGET == FUZZ_H2_CONNECTION
+#if FUZZ_TARGET == FUZZ_H1_CONNECTION || FUZZ_TARGET == FUZZ_H2_CONNECTION || \
+    FUZZ_TARGET == FUZZ_WS_CONNECTION
 
 #include "connection_queue.h"
 
@@ -10168,6 +10169,745 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     free(want.p);
     free(g.tpl.p);
     __vw_doc_free(&doc);
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_WS_CONNECTION
+
+#include <sys/socket.h>
+#include "broadcast.h"
+#include "httpserverhandlers.h"
+#include "ratelimiter.h"
+#include "route.h"
+#include "websocketsbroadcast.h"
+#include "websocketsprotocolresource.h"
+#include "websocketsswitch.h"
+#include "wscontext.h"
+
+/* WebSocket after the handshake: two HTTP/1.1 connections upgrade on /ws, one
+ * of them or both with the "resource" subprotocol, and then every frame the
+ * client sends goes through the server's real path -- websockets_guard_read,
+ * the parser, get_resource and the routes, websockets_deferred_handler and a
+ * worker, the output order, websockets_guard_write -- on sockets with small
+ * buffers, with reads, writes, workers and the clients interleaved as the input
+ * says. websocket_sequence stops at the parser and h1_connection at the 101;
+ * this is what comes after both.
+ *
+ * The handlers are an application's: the default protocol echoes, and the
+ * resource protocol has GET /echo?q=, POST /echo, GET /sub and /unsub on a
+ * broadcast channel, POST /pub to it, and GET /item/{id|[0-9]+}. One rate
+ * limiter with a frozen clock is shared by both connections (same address),
+ * or there is none.
+ *
+ * What each client must read after its 101, frame by frame:
+ *   - for every message, in the order its last frame was sent: exactly one
+ *     reply -- the handler's, "Too Many Requests" for a routed message the
+ *     limiter refused, "resource not found" for one no route takes; a PONG
+ *     with the PING's payload; nothing for a PONG; the CLOSE echoed, and
+ *     after it nothing at all;
+ *   - broadcast frames ("B:" + payload) between them, anywhere: exactly the
+ *     payloads the other connection published while this one was subscribed,
+ *     in publish order, as the handlers' own log records it;
+ *   - and across both, as many refusals as routed messages beyond the
+ *     limiter's burst -- never fewer, never more.
+ * Messages are cut into frames anywhere, pings between the fragments, and
+ * the bytes reach the socket in pieces of any size. Everything is freed at the
+ * end, so a leak is LeakSanitizer's. */
+
+#define WSC_CONNS 2
+#define WSC_EXPECT 128
+#define WSC_LOG 256
+
+typedef enum { WSC_REPLY, WSC_PONG, WSC_CLOSE } wsc_kind_e;
+
+typedef struct {
+    wsc_kind_e kind;
+    int routed;          /* a refusal by the limiter is also a right answer */
+    int binary;
+    uint8_t* bytes;
+    size_t len;
+} wsc_expect_t;
+
+typedef struct {
+    int fd;                      /* the client's end */
+    connection_t* conn;          /* the server's */
+    int alive, armed, resource;
+    uint8_t* out; size_t out_len, out_pos, out_cap;         /* sent to the server */
+    uint8_t* frames; size_t frames_len, frames_cap;         /* held back until the 101 */
+    uint8_t* in; size_t in_len, in_cap;                     /* read from the server */
+    int switched, closed_by_server, eof;
+    wsc_expect_t expect[WSC_EXPECT];
+    size_t expect_count, expect_next;
+    uint8_t* bcast[WSC_LOG]; size_t bcast_len[WSC_LOG]; size_t bcast_count;
+    size_t refused;              /* "Too Many Requests" read */
+    int close_sent;
+} wsc_t;
+
+static wsc_t __wsc[WSC_CONNS];
+
+typedef enum { WSC_LOG_SUB, WSC_LOG_UNSUB, WSC_LOG_PUB } wsc_log_e;
+
+typedef struct {
+    wsc_log_e what;
+    int who;
+    uint8_t* bytes;
+    size_t len;
+} wsc_log_t;
+
+static wsc_log_t __wsc_log[WSC_LOG];
+static size_t __wsc_log_count;
+static size_t __wsc_routed;
+
+static void __wsc_append(uint8_t** buf, size_t* len, size_t* cap, const void* p, size_t n) {
+    if (n == 0) return;
+    if (*len + n > *cap) {
+        size_t c = *cap ? *cap : 1024;
+        while (c < *len + n) c *= 2;
+        uint8_t* g = realloc(*buf, c);
+        if (g == NULL) abort();
+        *buf = g;
+        *cap = c;
+    }
+    memcpy(*buf + *len, p, n);
+    *len += n;
+}
+
+static int __wsc_index(const connection_t* c) {
+    for (int i = 0; i < WSC_CONNS; i++)
+        if (__wsc[i].conn == c) return i;
+    return -1;
+}
+
+/* ---- the event loop's side ---- */
+
+static int __wsc_mpx_arm(connection_t* connection, int flags) {
+    const int i = __wsc_index(connection);
+    if (i >= 0) __wsc[i].armed = flags;
+    return 1;
+}
+
+static int __wsc_mpx_del(connection_t* connection) {
+    const int i = __wsc_index(connection);
+    if (i >= 0) __wsc[i].armed = 0;
+    return 1;
+}
+
+static mpxapi_t __wsc_mpxapi = {
+    .control_add = __wsc_mpx_arm,
+    .control_mod = __wsc_mpx_arm,
+    .control_del = __wsc_mpx_del,
+};
+
+static int __wsc_event(wsc_t* w, int event) {
+    if (!(w->armed & event)) return 1;
+    const connection_server_ctx_t* ctx = w->conn->ctx;
+    if (atomic_load(&ctx->destroyed)) return 0;
+    if (w->armed & MPXONESHOT) w->armed = 0;
+    const int alive = event == MPXIN ? w->conn->read(w->conn) : w->conn->write(w->conn);
+    if (getenv("FUZZ_TRACE") != NULL)
+        fprintf(stderr, "server %d %s -> %d, armed 0x%x\n", (int)(w - __wsc),
+                event == MPXIN ? "read" : "write", alive, w->armed);
+    return alive;
+}
+
+/* ---- the application ---- */
+
+static void __wsc_http_upgrade(void* arg) {
+    switch_to_websockets(arg);
+}
+
+/* The message's payload, whole: the protocols spool it to a file. */
+static uint8_t* __wsc_payload(websocketsrequest_t* request, size_t* len) {
+    *len = 0;
+    const int fd = request->protocol->payload.fd;
+    if (fd < 0) return NULL;
+    const off_t size = lseek(fd, 0, SEEK_END);
+    if (size <= 0) return NULL;
+    uint8_t* p = malloc((size_t)size);
+    if (p == NULL) abort();
+    if (pread(fd, p, (size_t)size, 0) != size) abort();
+    *len = (size_t)size;
+    return p;
+}
+
+static void __wsc_reply(wsctx_t* ctx, const char* prefix, const void* p, size_t n, int binary) {
+    const size_t k = strlen(prefix);
+    char* buf = malloc(k + n + 1);
+    if (buf == NULL) abort();
+    memcpy(buf, prefix, k);
+    if (n) memcpy(buf + k, p, n);
+    if (binary) ctx->response->send_binaryn(ctx->response, buf, k + n);
+    else ctx->response->send_textn(ctx->response, buf, k + n);
+    free(buf);
+}
+
+static void __wsc_log_add(wsc_log_e what, websocketsrequest_t* request, const void* p, size_t n) {
+    if (__wsc_log_count == WSC_LOG) abort();
+    wsc_log_t* e = &__wsc_log[__wsc_log_count++];
+    e->what = what;
+    e->who = __wsc_index(request->connection);
+    e->bytes = NULL;
+    e->len = n;
+    if (n) { e->bytes = malloc(n); if (e->bytes == NULL) abort(); memcpy(e->bytes, p, n); }
+}
+
+static void __wsc_default(void* arg) {
+    wsctx_t* ctx = arg;
+    __wsc_routed++;
+    size_t n = 0;
+    uint8_t* p = __wsc_payload(ctx->request, &n);
+    __wsc_reply(ctx, "E:", p, n, ctx->request->type != WEBSOCKETS_TEXT);
+    free(p);
+}
+
+static void __wsc_echo_get(void* arg) {
+    wsctx_t* ctx = arg;
+    __wsc_routed++;
+    websockets_protocol_resource_t* protocol = (websockets_protocol_resource_t*)ctx->request->protocol;
+    int ok = 0;
+    const char* q = protocol->get_query(protocol, "q", &ok);
+    __wsc_reply(ctx, "E:", ok && q ? q : "", ok && q ? strlen(q) : 0, 0);
+}
+
+static void __wsc_echo_post(void* arg) {
+    wsctx_t* ctx = arg;
+    __wsc_routed++;
+    size_t n = 0;
+    uint8_t* p = __wsc_payload(ctx->request, &n);
+    __wsc_reply(ctx, "E:", p, n, 0);
+    free(p);
+}
+
+static void __wsc_deliver(response_t* response, const char* payload, size_t size) {
+    websocketsresponse_t* r = (websocketsresponse_t*)response;
+    char* buf = malloc(size + 2);
+    if (buf == NULL) abort();
+    memcpy(buf, "B:", 2);
+    if (size) memcpy(buf + 2, payload, size);
+    r->send_textn(r, buf, size + 2);
+    free(buf);
+}
+
+static void __wsc_sub(void* arg) {
+    wsctx_t* ctx = arg;
+    __wsc_routed++;
+    websockets_broadcast_add("room", ctx->request, NULL, __wsc_deliver);
+    __wsc_log_add(WSC_LOG_SUB, ctx->request, NULL, 0);
+    __wsc_reply(ctx, "S", NULL, 0, 0);
+}
+
+static void __wsc_unsub(void* arg) {
+    wsctx_t* ctx = arg;
+    __wsc_routed++;
+    websockets_broadcast_remove("room", ctx->request);
+    __wsc_log_add(WSC_LOG_UNSUB, ctx->request, NULL, 0);
+    __wsc_reply(ctx, "U", NULL, 0, 0);
+}
+
+static void __wsc_pub(void* arg) {
+    wsctx_t* ctx = arg;
+    __wsc_routed++;
+    size_t n = 0;
+    uint8_t* p = __wsc_payload(ctx->request, &n);
+    websockets_broadcast_send_all("room", ctx->request, (const char*)p, n);
+    __wsc_log_add(WSC_LOG_PUB, ctx->request, p, n);
+    free(p);
+    __wsc_reply(ctx, "P", NULL, 0, 0);
+}
+
+static void __wsc_item(void* arg) {
+    wsctx_t* ctx = arg;
+    __wsc_routed++;
+    websockets_protocol_resource_t* protocol = (websockets_protocol_resource_t*)ctx->request->protocol;
+    int ok = 0;
+    const char* id = protocol->get_query(protocol, "id", &ok);
+    __wsc_reply(ctx, "I:", ok && id ? id : "", ok && id ? strlen(id) : 0, 0);
+}
+
+static uint64_t __wsc_clock(void) {
+    return 1000000000ULL;   /* frozen: the burst is all there is */
+}
+
+static void __wsc_init(void) {
+    static int done;
+    if (done) return;
+    done = 1;
+    __fuzz_listener.api = &__wsc_mpxapi;
+    if (!connection_queue_init()) abort();
+    ratelimiter_set_time_source(__wsc_clock);
+
+    route_t* upgrade = route_create("/ws");
+    if (upgrade == NULL || !route_set_http_handler(upgrade, "GET", __wsc_http_upgrade, NULL)) abort();
+    __fuzz_server.http.route = upgrade;
+
+    static const struct { const char* path; const char* method; void (*fn)(void*); } routes[] = {
+        { "/echo", "GET", __wsc_echo_get }, { "/echo", "POST", __wsc_echo_post },
+        { "/sub", "GET", __wsc_sub }, { "/unsub", "GET", __wsc_unsub },
+        { "/pub", "POST", __wsc_pub }, { "/item/{id|[0-9]+}", "GET", __wsc_item },
+    };
+    route_t* first = NULL, * last = NULL;
+    for (size_t i = 0; i < sizeof routes / sizeof routes[0]; i++) {
+        route_t* r = i > 0 && strcmp(routes[i].path, routes[i - 1].path) == 0 ? last : NULL;
+        if (r == NULL) {
+            r = route_create(routes[i].path);
+            if (r == NULL) abort();
+            if (last) last->next = r; else first = r;
+            last = r;
+        }
+        if (!route_set_websockets_handler(r, routes[i].method, routes[i].fn, NULL)) abort();
+    }
+    __fuzz_server.websockets.configured = 1;
+    __fuzz_server.websockets.default_handler = __wsc_default;
+    __fuzz_server.websockets.route = first;
+    __fuzz_server.broadcast = broadcast_init();
+    if (__fuzz_server.broadcast == NULL) abort();
+}
+
+/* ---- the client ---- */
+
+static uint8_t __wsc_byte(const uint8_t** p, const uint8_t* end) {
+    return *p < end ? *(*p)++ : 0;
+}
+
+/* One masked frame; the mask comes from the input too. */
+static void __wsc_frame(wsc_t* w, int fin, int opcode, const uint8_t* payload, size_t len, uint32_t mask) {
+    uint8_t h[14];
+    size_t n = 0;
+    h[n++] = (uint8_t)((fin ? 0x80 : 0) | opcode);
+    if (len < 126) h[n++] = (uint8_t)(0x80 | len);
+    else if (len < 65536) { h[n++] = 0x80 | 126; h[n++] = (uint8_t)(len >> 8); h[n++] = (uint8_t)len; }
+    else { h[n++] = 0x80 | 127; for (int i = 7; i >= 0; i--) h[n++] = (uint8_t)((uint64_t)len >> (8 * i)); }
+    const uint8_t m[4] = { (uint8_t)(mask >> 24), (uint8_t)(mask >> 16), (uint8_t)(mask >> 8), (uint8_t)mask };
+    memcpy(h + n, m, 4);
+    n += 4;
+    __wsc_append(&w->frames, &w->frames_len, &w->frames_cap, h, n);
+    for (size_t i = 0; i < len; i++) {
+        const uint8_t b = payload[i] ^ m[i % 4];
+        __wsc_append(&w->frames, &w->frames_len, &w->frames_cap, &b, 1);
+    }
+}
+
+static void __wsc_expect(wsc_t* w, wsc_kind_e kind, int routed, int binary, const void* p, size_t n) {
+    if (w->expect_count == WSC_EXPECT) abort();
+    wsc_expect_t* e = &w->expect[w->expect_count++];
+    e->kind = kind;
+    e->routed = routed;
+    e->binary = binary;
+    e->len = n;
+    e->bytes = malloc(n ? n : 1);
+    if (e->bytes == NULL) abort();
+    if (n) memcpy(e->bytes, p, n);
+}
+
+static void __wsc_expect_reply(wsc_t* w, int routed, int binary, const char* prefix, const void* p, size_t n) {
+    uint8_t buf[512];
+    const size_t k = strlen(prefix);
+    if (k + n > sizeof buf) abort();
+    memcpy(buf, prefix, k);
+    if (n) memcpy(buf + k, p, n);
+    __wsc_expect(w, WSC_REPLY, routed, binary, buf, k + n);
+}
+
+static const char __wsc_unreserved[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+
+/* One message from the input: its frames, and what the server must answer. */
+static int __wsc_message(wsc_t* w, const uint8_t** p, const uint8_t* end) {
+    if (*p >= end || w->close_sent) return 0;
+    const uint8_t kind = __wsc_byte(p, end);
+    const uint8_t m0 = __wsc_byte(p, end), m1 = __wsc_byte(p, end), m2 = __wsc_byte(p, end);
+    const uint32_t mask = (uint32_t)m0 << 24 | (uint32_t)m1 << 16 | (uint32_t)m2 << 8 | (uint8_t)(m0 ^ m1);
+    uint8_t msg[320];
+    size_t len = 0;
+    int binary = 0;
+
+    switch (kind % 8) {
+    case 0: {                                           /* ping */
+        len = __wsc_byte(p, end) % 126;
+        for (size_t i = 0; i < len; i++) msg[i] = __wsc_byte(p, end);
+        __wsc_frame(w, 1, 0x9, msg, len, mask);
+        __wsc_expect(w, WSC_PONG, 0, 0, msg, len);
+        return 1;
+    }
+    case 1:                                             /* pong: no answer */
+        len = __wsc_byte(p, end) % 20;
+        for (size_t i = 0; i < len; i++) msg[i] = __wsc_byte(p, end);
+        __wsc_frame(w, 1, 0xA, msg, len, mask);
+        return 1;
+    case 2: {                                           /* close, echoed, the end */
+        if ((kind >> 3) & 1) {
+            msg[len++] = 0x03; msg[len++] = 0xE8;       /* 1000 */
+            const size_t r = __wsc_byte(p, end) % 16;
+            for (size_t i = 0; i < r; i++) msg[len++] = (uint8_t)('a' + __wsc_byte(p, end) % 26);
+        }
+        __wsc_frame(w, 1, 0x8, msg, len, mask);
+        __wsc_expect(w, WSC_CLOSE, 0, 0, msg, len);
+        w->close_sent = 1;
+        return 1;
+    }
+    default:
+        break;
+    }
+
+    /* A data message. */
+    uint8_t body[256];
+    size_t body_len = __wsc_byte(p, end) % 200;
+    const uint8_t form = __wsc_byte(p, end);
+    if (!w->resource) {
+        binary = (form & 1);
+        for (size_t i = 0; i < body_len; i++) {
+            const uint8_t c = __wsc_byte(p, end);
+            body[i] = binary ? c : (uint8_t)(0x20 + c % 95);
+        }
+        memcpy(msg, body, body_len);
+        len = body_len;
+        __wsc_expect_reply(w, 1, binary, "E:", body, body_len);
+    } else {
+        for (size_t i = 0; i < body_len; i++) body[i] = (uint8_t)(0x20 + __wsc_byte(p, end) % 95);
+        char head[128];
+        int hn = 0;
+        switch (form % 8) {
+        case 0: {                                       /* GET /echo?q=... */
+            char q[96], decoded[64];
+            size_t qn = 0, dn = 0;
+            const size_t parts = __wsc_byte(p, end) % 12;
+            for (size_t i = 0; i < parts && dn < sizeof decoded - 1 && qn < sizeof q - 4; i++) {
+                const uint8_t c = __wsc_byte(p, end);
+                if (c & 0x80) {
+                    const uint8_t b = (uint8_t)(1 + __wsc_byte(p, end) % 255);
+                    qn += (size_t)snprintf(q + qn, sizeof q - qn, "%%%02X", b);
+                    decoded[dn++] = (char)b;
+                } else {
+                    q[qn++] = __wsc_unreserved[c % (sizeof __wsc_unreserved - 1)];
+                    decoded[dn++] = q[qn - 1];
+                }
+            }
+            q[qn] = 0;
+            hn = snprintf(head, sizeof head, "GET /echo?q=%s", q);
+            body_len = 0;
+            __wsc_expect_reply(w, 1, 0, "E:", decoded, dn);
+            break;
+        }
+        case 1:
+            hn = snprintf(head, sizeof head, "POST /echo ");
+            __wsc_expect_reply(w, 1, 0, "E:", body, body_len);
+            break;
+        case 2:
+            hn = snprintf(head, sizeof head, "GET /sub");
+            body_len = 0;
+            __wsc_expect_reply(w, 1, 0, "S", NULL, 0);
+            break;
+        case 3:
+            hn = snprintf(head, sizeof head, "GET /unsub");
+            body_len = 0;
+            __wsc_expect_reply(w, 1, 0, "U", NULL, 0);
+            break;
+        case 4:
+            hn = snprintf(head, sizeof head, "POST /pub ");
+            __wsc_expect_reply(w, 1, 0, "P", NULL, 0);
+            break;
+        case 5: {
+            const unsigned id = __wsc_byte(p, end) * 257u;
+            char digits[16];
+            snprintf(digits, sizeof digits, "%u", id);
+            hn = snprintf(head, sizeof head, "GET /item/%s", digits);
+            body_len = 0;
+            __wsc_expect_reply(w, 1, 0, "I:", digits, strlen(digits));
+            break;
+        }
+        case 6:                                         /* no route takes it */
+            hn = snprintf(head, sizeof head, (form >> 3) & 1 ? "GET /nowhere" : "DELETE /echo");
+            body_len = 0;
+            __wsc_expect_reply(w, 0, 0, "resource not found", NULL, 0);
+            break;
+        default:                                        /* a method without that route */
+            hn = snprintf(head, sizeof head, "POST /sub ");
+            __wsc_expect_reply(w, 0, 0, "resource not found", NULL, 0);
+            break;
+        }
+        memcpy(msg, head, (size_t)hn);
+        memcpy(msg + hn, body, body_len);
+        len = (size_t)hn + body_len;
+    }
+
+    /* Cut into 1..3 frames anywhere, a ping or a pong now and then between. */
+    const size_t pieces = 1 + __wsc_byte(p, end) % 3;
+    size_t at = 0;
+    for (size_t i = 0; i < pieces; i++) {
+        size_t to = i + 1 == pieces ? len : at + (len - at) * __wsc_byte(p, end) / 255;
+        if (to < at) to = at;
+        __wsc_frame(w, i + 1 == pieces, i == 0 ? (binary ? 0x2 : 0x1) : 0x0, msg + at, to - at, mask ^ (uint32_t)i);
+        at = to;
+        if (i + 1 < pieces && (__wsc_byte(p, end) & 3) == 0) {
+            const uint8_t ping[3] = { 'p', (uint8_t)i, (uint8_t)w->expect_count };
+            __wsc_frame(w, 1, 0x9, ping, sizeof ping, mask);
+            /* The PONG is posted when the PING is read -- ahead of the reply to
+             * the message it interrupted, which is only dispatched at its end. */
+            wsc_expect_t reply = w->expect[--w->expect_count];
+            __wsc_expect(w, WSC_PONG, 0, 0, ping, sizeof ping);
+            w->expect[w->expect_count++] = reply;
+        }
+    }
+    return 1;
+}
+
+/* What the server wrote: the 101 first, then frames. */
+static void __wsc_read(wsc_t* w) {
+    uint8_t buf[8192];
+    for (;;) {
+        const ssize_t n = recv(w->fd, buf, sizeof buf, 0);
+        if (n == 0) { w->eof = 1; break; }
+        if (n < 0) break;
+        __wsc_append(&w->in, &w->in_len, &w->in_cap, buf, (size_t)n);
+    }
+
+    size_t off = 0;
+    if (!w->switched) {
+        const uint8_t* end = w->in_len >= 4 ? memmem(w->in, w->in_len, "\r\n\r\n", 4) : NULL;
+        if (end == NULL) return;
+        const size_t head = (size_t)(end - w->in) + 4;
+        if (head < 12 || memcmp(w->in, "HTTP/1.1 101", 12) != 0) __builtin_trap();
+        if (memmem(w->in, head, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n", 51) == NULL) __builtin_trap();
+        const int proto = memmem(w->in, head, "Sec-WebSocket-Protocol: resource\r\n", 34) != NULL;
+        if (proto != w->resource) __builtin_trap();
+        w->switched = 1;
+        off = head;
+        __wsc_append(&w->out, &w->out_len, &w->out_cap, w->frames, w->frames_len);
+    }
+
+    while (w->in_len - off >= 2) {
+        const uint8_t* f = w->in + off;
+        const size_t avail = w->in_len - off;
+        if (f[1] & 0x80) __builtin_trap();                  /* a server never masks */
+        size_t hl = 2;
+        uint64_t len = f[1] & 0x7F;
+        if (len == 126) { if (avail < 4) break; len = (uint64_t)f[2] << 8 | f[3]; hl = 4; }
+        else if (len == 127) { if (avail < 10) break; len = 0; for (int i = 0; i < 8; i++) len = len << 8 | f[2 + i]; hl = 10; }
+        if (avail < hl || len > avail - hl) break;
+        const uint8_t* payload = f + hl;
+        const int opcode = f[0] & 0x0F;
+        if (!(f[0] & 0x80) || (f[0] & 0x70)) __builtin_trap();   /* whole, no RSV */
+        off += hl + (size_t)len;
+
+        if (w->closed_by_server) __builtin_trap();          /* nothing after CLOSE */
+        if ((opcode == 0x1 || opcode == 0x2) && len >= 2 && payload[0] == 'B' && payload[1] == ':') {
+            if (opcode != 0x1 || w->bcast_count == WSC_LOG) __builtin_trap();
+            uint8_t* copy = malloc(len ? len : 1);
+            if (copy == NULL) abort();
+            memcpy(copy, payload, len);
+            w->bcast[w->bcast_count] = copy;
+            w->bcast_len[w->bcast_count++] = len;
+            continue;
+        }
+        if (w->expect_next == w->expect_count) __builtin_trap();   /* an answer nobody asked for */
+        const wsc_expect_t* e = &w->expect[w->expect_next++];
+        switch (e->kind) {
+        case WSC_PONG:
+            if (opcode != 0xA || len != e->len || memcmp(payload, e->bytes, e->len) != 0) __builtin_trap();
+            break;
+        case WSC_CLOSE:
+            if (opcode != 0x8 || len != e->len || memcmp(payload, e->bytes, e->len) != 0) __builtin_trap();
+            w->closed_by_server = 1;
+            break;
+        default: {
+            static const char refused[] = "Too Many Requests";
+            if (e->routed && opcode == 0x1 && len == sizeof refused - 1 && memcmp(payload, refused, len) == 0) {
+                w->refused++;
+                break;
+            }
+            if (opcode != (e->binary ? 0x2 : 0x1) || len != e->len || memcmp(payload, e->bytes, e->len) != 0) {
+                if (getenv("FUZZ_TRACE") != NULL)
+                    fprintf(stderr, "conn %d answer %zu: want op %d [%.*s], got op %d [%.*s]\n",
+                            (int)(w - __wsc), w->expect_next - 1, e->binary ? 2 : 1, (int)e->len, e->bytes,
+                            opcode, (int)len, payload);
+                __builtin_trap();
+            }
+            break;
+        }
+        }
+    }
+    memmove(w->in, w->in + off, w->in_len - off);
+    w->in_len -= off;
+}
+
+static void __wsc_send(wsc_t* w, size_t amount) {
+    const size_t left = w->out_len - w->out_pos;
+    const size_t n = left < amount ? left : amount;
+    if (n == 0) return;
+    const ssize_t s = send(w->fd, w->out + w->out_pos, n, MSG_NOSIGNAL);
+    if (s > 0) w->out_pos += (size_t)s;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 3) return 0;
+    __fuzz_appconfig_init();
+    __wsc_init();
+
+    const uint8_t flags = data[0];
+    const uint64_t seed = data[1];
+    const uint8_t* p = data + 2;
+    const uint8_t* end = data + size;
+
+    /* The limiter: none, or a burst of 1..7 shared by both connections. */
+    ratelimiter_t* limiter = NULL;
+    const uint32_t burst = (flags >> 2) & 7;
+    if (burst) {
+        ratelimiter_config_t cfg = { burst, 1, 1000000000ULL, 3600 };
+        limiter = ratelimiter_init(&cfg);
+        if (limiter == NULL) abort();
+    }
+    __fuzz_server.websockets.ratelimiter = limiter;
+    __wsc_log_count = 0;
+    __wsc_routed = 0;
+
+    char* buffers[WSC_CONNS] = { NULL };
+    int client_fds[WSC_CONNS];
+    memset(__wsc, 0, sizeof __wsc);
+    for (int i = 0; i < WSC_CONNS; i++) {
+        wsc_t* w = &__wsc[i];
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv) != 0) abort();
+        const int small = 4096;
+        setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+        setsockopt(sv[1], SOL_SOCKET, SO_SNDBUF, &small, sizeof small);
+        w->fd = sv[1];
+        client_fds[i] = sv[0];
+        buffers[i] = malloc(16384);
+        if (buffers[i] == NULL) abort();
+        const ipaddr_t loopback = ipaddr_from_v4(0x0100007F);
+        w->conn = connection_s_alloc(&__fuzz_listener, sv[0], &loopback, 8080, &loopback,
+                                     (unsigned short)(40000 + i), buffers[i], 16384);
+        if (w->conn == NULL) abort();
+        connection_server_ctx_t* ctx = w->conn->ctx;
+        ctx->server = &__fuzz_server;
+        w->alive = set_http(w->conn);
+        w->armed = MPXIN | MPXRDHUP;
+        w->resource = (flags >> i) & 1;
+        char req[256];
+        const int n = snprintf(req, sizeof req,
+            "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n%s\r\n",
+            w->resource ? "Sec-WebSocket-Protocol: resource\r\n" : "");
+        __wsc_append(&w->out, &w->out_len, &w->out_cap, req, (size_t)n);
+    }
+
+    /* The messages, alternating between the connections as the input says. */
+    for (size_t k = 0; k < 64 && p < end; k++) {
+        wsc_t* w = &__wsc[__wsc_byte(&p, end) & 1];
+        if (!__wsc_message(w, &p, end)) {
+            wsc_t* other = &__wsc[w == &__wsc[0]];
+            if (!__wsc_message(other, &p, end)) break;
+        }
+    }
+
+    if (getenv("FUZZ_TRACE") != NULL)
+        for (int i = 0; i < WSC_CONNS; i++) {
+            fprintf(stderr, "frames %d:", i);
+            for (size_t k = 0; k < __wsc[i].frames_len; k++) fprintf(stderr, " %02x", __wsc[i].frames[k]);
+            fprintf(stderr, "\n");
+        }
+    uint64_t rng = seed * 0x9E3779B97F4A7C15ULL + 1;
+    for (size_t steps = 0; steps < 20000; steps++) {
+        int pending = 0;
+        for (int i = 0; i < WSC_CONNS; i++)
+            pending |= __wsc[i].alive && (__wsc[i].out_pos < __wsc[i].out_len || !__wsc[i].switched ||
+                                          __wsc[i].expect_next < __wsc[i].expect_count);
+        if (!pending) break;
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        wsc_t* w = &__wsc[(rng >> 20) & 1];
+        const size_t amount = 1 + (size_t)((rng >> 8) % 700);
+        switch (rng % 5) {
+        case 0: __wsc_send(w, amount); break;
+        case 1: if (w->alive) w->alive = __wsc_event(w, MPXIN); break;
+        case 2: if (w->alive) w->alive = __wsc_event(w, MPXOUT); break;
+        case 3: __wsc_read(w); break;
+        case 4: (void)__fuzz_worker(); break;
+        }
+    }
+
+    /* Drain: everything in, every worker run, everything out. */
+    for (int idle = 0; idle < 6;) {
+        int moved = 0;
+        for (int i = 0; i < WSC_CONNS; i++) {
+            wsc_t* w = &__wsc[i];
+            const size_t before = w->out_pos;
+            __wsc_send(w, SIZE_MAX);
+            if (w->out_pos != before) moved = 1;
+            if (w->alive) w->alive = __wsc_event(w, MPXIN);
+        }
+        while (__fuzz_worker()) moved = 1;
+        for (int i = 0; i < WSC_CONNS; i++) {
+            wsc_t* w = &__wsc[i];
+            if (w->alive) w->alive = __wsc_event(w, MPXOUT);
+            const size_t before = w->expect_next + w->bcast_count + w->in_len;
+            __wsc_read(w);
+            if (w->expect_next + w->bcast_count + w->in_len != before) moved = 1;
+        }
+        idle = moved ? 0 : idle + 1;
+    }
+
+    if (getenv("FUZZ_TRACE") != NULL)
+        for (int i = 0; i < WSC_CONNS; i++)
+            fprintf(stderr, "conn %d: resource %d switched %d alive %d sent %zu/%zu answers %zu/%zu broadcast %zu refused %zu\n",
+                    i, __wsc[i].resource, __wsc[i].switched, __wsc[i].alive, __wsc[i].out_pos, __wsc[i].out_len,
+                    __wsc[i].expect_next, __wsc[i].expect_count, __wsc[i].bcast_count, __wsc[i].refused);
+
+    /* Every message answered, in order; broadcast exactly as the log says. */
+    size_t refused = 0;
+    for (int i = 0; i < WSC_CONNS; i++) {
+        wsc_t* w = &__wsc[i];
+        if (!w->switched) __builtin_trap();
+        if (w->expect_next != w->expect_count) __builtin_trap();
+        if (w->close_sent && w->alive) __builtin_trap();     /* a CLOSE ends the connection */
+        refused += w->refused;
+    }
+    size_t routed_sent = 0;
+    for (int i = 0; i < WSC_CONNS; i++)
+        for (size_t k = 0; k < __wsc[i].expect_count; k++) routed_sent += __wsc[i].expect[k].routed;
+    if (__wsc_routed + refused != routed_sent) __builtin_trap();
+    const size_t allowed = limiter == NULL ? routed_sent : routed_sent < burst ? routed_sent : burst;
+    if (__wsc_routed != allowed) __builtin_trap();
+
+    for (int i = 0; i < WSC_CONNS; i++) {
+        wsc_t* w = &__wsc[i];
+        int subscribed = 0;
+        size_t want = 0;
+        for (size_t k = 0; k < __wsc_log_count; k++) {
+            const wsc_log_t* e = &__wsc_log[k];
+            if (e->who == i && e->what == WSC_LOG_SUB) subscribed = 1;
+            else if (e->who == i && e->what == WSC_LOG_UNSUB) subscribed = 0;
+            else if (e->who != i && e->what == WSC_LOG_PUB && subscribed) {
+                if (want < w->bcast_count) {
+                    if (w->bcast_len[want] != e->len + 2 ||
+                        (e->len && memcmp(w->bcast[want] + 2, e->bytes, e->len) != 0)) __builtin_trap();
+                } else if (!w->close_sent) {
+                    __builtin_trap();                        /* a delivery that never came */
+                }
+                want++;
+            }
+        }
+        if (w->bcast_count > want) __builtin_trap();         /* one nobody published */
+    }
+
+    while (__fuzz_worker()) {}
+    for (int i = 0; i < WSC_CONNS; i++) {
+        wsc_t* w = &__wsc[i];
+        /* What connection_close does and the local free does not: the server
+         * outlives this input, and so would a subscription of a freed
+         * connection. */
+        broadcast_clear(w->conn);
+        connection_s_free_local(w->conn);
+        close(w->fd);
+        close(client_fds[i]);
+        free(buffers[i]);
+        free(w->out);
+        free(w->frames);
+        free(w->in);
+        for (size_t k = 0; k < w->expect_count; k++) free(w->expect[k].bytes);
+        for (size_t k = 0; k < w->bcast_count; k++) free(w->bcast[k]);
+    }
+    for (size_t k = 0; k < __wsc_log_count; k++) free(__wsc_log[k].bytes);
+    __fuzz_server.websockets.ratelimiter = NULL;
+    ratelimiter_free(limiter);
     return 0;
 }
 
