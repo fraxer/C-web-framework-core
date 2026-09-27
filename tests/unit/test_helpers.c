@@ -1241,3 +1241,17 @@ TEST(test_secure_compare_bytes_buffers) {
     TEST_ASSERT(secure_compare_bytes(a, b, 0), "Zero length is a match");
     TEST_ASSERT(!secure_compare_bytes(NULL, b, sizeof a), "NULL fails");
 }
+
+TEST(test_http_format_date_four_digit_year) {
+    TEST_CASE("the year has four digits (IMF-fixdate), or there is no date");
+
+    /* strftime's %Y wrote year 1 as "1"; year 10000 as five digits. Neither
+     * is an HTTP-date (RFC 9110 §5.6.7), found by the date helper of the text
+     * fuzz target. */
+    char buf[64];
+    TEST_ASSERT_EQUAL_SIZE((size_t)29, http_format_date((time_t)-62135596800LL, buf, sizeof buf), "year 1");
+    TEST_ASSERT_STR_EQUAL("Mon, 01 Jan 0001 00:00:00 GMT", buf, "zero-padded");
+    TEST_ASSERT_EQUAL_SIZE((size_t)29, http_format_date((time_t)253402300799LL, buf, sizeof buf), "the last second of 9999");
+    TEST_ASSERT_STR_EQUAL("Fri, 31 Dec 9999 23:59:59 GMT", buf, "as is");
+    TEST_ASSERT_EQUAL_SIZE((size_t)0, http_format_date((time_t)253402300800LL, buf, sizeof buf), "year 10000: none");
+}

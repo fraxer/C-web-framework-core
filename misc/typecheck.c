@@ -37,7 +37,11 @@ int is_uint(const char* str) {
     if (str == NULL || *str == '\0')
         return 0;
 
-    if (*str == '-')
+    /* strtoul skips blanks and then negates a minus: " -1" is ULONG_MAX. */
+    const char* sign = str;
+    while (isspace((unsigned char)*sign))
+        sign++;
+    if (*sign == '-')
         return 0;
 
     char* endptr = NULL;
@@ -76,7 +80,11 @@ int is_ulong(const char* str) {
     if (str == NULL || *str == '\0')
         return 0;
 
-    if (*str == '-')
+    /* strtoul skips blanks and then negates a minus: " -1" is ULONG_MAX. */
+    const char* sign = str;
+    while (isspace((unsigned char)*sign))
+        sign++;
+    if (*sign == '-')
         return 0;
 
     char* endptr = NULL;

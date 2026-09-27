@@ -344,7 +344,28 @@ size_t http_format_date(time_t time, char* buf, size_t buf_size) {
     if (tm == NULL)
         return 0;
 
-    return strftime(buf, buf_size, "%a, %d %b %Y %H:%M:%S GMT", tm);
+    /* IMF-fixdate (RFC 9110 §5.6.7): English names whatever the locale, and a
+     * year of exactly four digits -- strftime's %Y wrote year 1 as "1" and
+     * year 10000 with five, neither of which is an HTTP-date. */
+    const int year = tm->tm_year + 1900;
+    if (year < 0 || year > 9999)
+        return 0;
+
+    static const char* const days[] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
+    static const char* const months[] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+    const int n = snprintf(buf, buf_size, "%s, %02d %s %04d %02d:%02d:%02d GMT",
+                           days[tm->tm_wday], tm->tm_mday, months[tm->tm_mon], year,
+                           tm->tm_hour, tm->tm_min, tm->tm_sec);
+
+    /* strftime's contract, kept: 0 and nothing usable when it does not fit. */
+    if (n < 0 || (size_t)n >= buf_size) {
+        buf[0] = '\0';
+        return 0;
+    }
+
+    return (size_t)n;
 }
 
 int secure_compare_bytes(const void* a, const void* b, size_t size) {
