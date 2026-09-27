@@ -11,6 +11,7 @@
 #include "wscontext.h"
 #include "middleware.h"
 #include "connection_s.h"
+#include "multiplexing.h"
 #include "openssl.h"
 
 typedef struct connection_queue_websockets_data connection_queue_websockets_data_t;
@@ -205,11 +206,16 @@ int __out_publish(connection_t* connection, connection_out_slot_t* slot, websock
 
     int r = 1;
 
-    /* Arming only when the head became writable is what keeps a level-triggered
+    /* Arming only when something is writable is what keeps a level-triggered
      * EPOLLOUT from spinning on a connection whose head is still unfilled. The
      * handler that does fill the head arms it then; because publish and take
-     * are both under this lock, the wakeup cannot be lost between them. */
-    if (__out_promote(connection)) {
+     * are both under this lock, the wakeup cannot be lost between them.
+     *
+     * "Writable" includes a response already staged: a PONG taken off the read
+     * path is staged and armed, and dispatching a message read right after it
+     * parks the connection -- nothing armed -- so the promote below finds the
+     * stage busy and the arm has to come from here, or neither goes out. */
+    if (__out_promote(connection) || ctx->response != NULL) {
         atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
         r = connection_after_read(connection);
     }
@@ -249,7 +255,7 @@ static int __out_publish_new(websocketsresponse_t* response, cqueue_t* out_queue
 
     if (out_queue != NULL)
         r = out_wake != NULL ? out_wake(connection, out_owner, handler_done) : 1;
-    else if (__out_promote(connection)) {
+    else if (__out_promote(connection) || ctx->response != NULL) {   /* see __out_publish */
         atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
         r = connection_after_read(connection);
     }
@@ -450,16 +456,30 @@ int __write(connection_t* connection) {
     /* Drain as far as the output order allows: everything already filled goes
      * out in one pass, which is what keeps N parallel handlers from costing N
      * event-loop turns. */
+    int close_sent = 0;
     while (ctx->response != NULL || __out_promote(connection)) {
         const int r = __write_staged(connection, ctx->response);
         if (r == 0) return 0;
         if (r < 0) return 1; /* stays staged for the next EPOLLOUT */
 
+        close_sent = ((websocketsresponse_t*)ctx->response)->frame_code == 0x88;
+
         __out_finish_current(connection);
 
-        /* A CLOSE frame just left; anything behind it is moot. */
-        if (connection->keepalive == 0)
+        /* A CLOSE frame just left; anything behind it is moot. keepalive
+         * alone does not say that: it drops when the peer's CLOSE is read,
+         * while replies ahead of ours may still be queued -- stopping at the
+         * first of them lost the CLOSE (RFC 6455 §5.5.1). */
+        if (close_sent)
             break;
+    }
+
+    /* The connection is closing, but our CLOSE has not left: it waits behind
+     * a reply whose handler is still running. Ending the connection now would
+     * drop both; the handler that fills the head asks for EPOLLOUT again. */
+    if (connection->keepalive == 0 && !close_sent) {
+        connection_server_ctx_t* conn_ctx = connection->ctx;
+        return conn_ctx->listener->api->control_mod(connection, MPXONESHOT);
     }
 
     return connection_after_write(connection);
