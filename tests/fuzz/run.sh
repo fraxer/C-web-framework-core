@@ -68,6 +68,9 @@ if grep -Eq '^INCLUDE_HTTP3:[A-Z]+=yes$' "$build_dir/CMakeCache.txt" 2>/dev/null
                fuzz_qpack_decode fuzz_qpack_streams fuzz_h3_priority fuzz_qpack_dynamic
                fuzz_qpack_session fuzz_quic_stream fuzz_h3_request fuzz_quic_conn)
 fi
+if grep -Eq '^INCLUDE_SQLITE:[A-Z]+=yes$' "$build_dir/CMakeCache.txt" 2>/dev/null; then
+    expected+=(fuzz_db_query fuzz_db_model)
+fi
 read -r -a extra <<< "${FUZZ_EXPECT_EXTRA:-}"
 expected+=("${extra[@]}")
 

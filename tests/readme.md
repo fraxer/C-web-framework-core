@@ -478,6 +478,8 @@ Targets, each with a seed corpus under `fuzz/corpus/`:
 | `mail_message` | MIME headers, folded encoded words, body and binary attachments, decoded back to their input; the DKIM signature of every letter, checked by a verifier of its own; raw letters signed through `dkim.c` |
 | `quic_conn` | a whole QUIC connection on the in-process stand of `test_quic_conn.c`: real TLS 1.3, loss recovery, congestion control, streams, migration, over a path the input impairs |
 | `ratelimiter` | the token bucket in front of rate-limited routes: any schedule of clients, token counts and clock steps, forward and back |
+| `db_query` | the query layer on SQLite `:memory:`: templates, bound values, identifiers, lists, the result cursor, the insert/select/update/delete compilers (only with `-DINCLUDE_SQLITE=yes`) |
+| `db_model` | the model layer the feedback form writes through: create, read, update, delete and JSON of a schema like the form's, on SQLite `:memory:` (same condition) |
 
 An application registers its own with the same function, and `run.sh` picks
 them up from the manifest; the site's `fuzz_feedback` (in `backend/tests/`) is
@@ -548,6 +550,18 @@ broke it is saved like any crash:
   keeps the first arrival (overlaps, conflicting retransmissions, FIN and
   RESET_STREAM final sizes, the buffered cap) and `quicrange` against a bitset,
   near 0 and near `UINT64_MAX`; freeing must hand the QUIC memory budget back.
+  `db_query` generates each template from SQL words, literals, quoted
+  identifiers, both comment forms and parameters followed by whatever may
+  follow them, so the builder's output is known exactly; values of any bytes
+  come back from SQLite unchanged, an identifier is quoted rather than
+  spliced, a list gives one placeholder per element, and the cursor is walked
+  with any index against a model of it. `db_model` keeps its own copy of every
+  row it writes and compares each read, update and JSON rendering with it.
+  Both need the SQLite driver, which the site does not build: configure with
+  `-DINCLUDE_SQLITE=yes` (the host `CMakeLists.txt` then finds it); `run.sh`
+  expects them only in such a build. The PostgreSQL and MySQL escapers call
+  into libpq and libmysqlclient with a live connection, so they stay with
+  `tests/db` (`test_db_postgres_identifier.c`).
   `ratelimiter` runs the limiter against a per-client token count written
   from `ratelimiter.h` -- refill by whole tokens, the cap, all-or-nothing
   takes, the sweep of idle clients -- on a clock the input steps by
@@ -636,6 +650,22 @@ HTTP/2 write path, as a seed that replays it):
   carry as signed (a space or ';' in the name, NUL or a bare CR/LF in the
   value). The field is now signed as it is sent, folded, and the unit test's
   own fixture turned out to pass a length that counted the NUL.
+- `dbquery.c` (`db_query` and the tests written for it): a template ending
+  inside a comment or a literal lost its tail -- `SELECT 1 /* c */` became an
+  empty query; a parameter followed at once by a quote, `--` or `/*` was never
+  closed and vanished with the rest of the template; a block comment reopened
+  on the `/` of `*/*` and closed on the star of its own `/*`; a refused
+  `list__` leaked the half-built query.
+- `sqlite.c`: every DECIMAL, DATE, TIMESTAMP or JSON parameter was freed
+  twice (the bind freed the field's own string); a REAL read back with 15
+  significant digits, so 0.1 + 0.2 came back as 0.3. The SQLite tests had been
+  skipped silently all along: no build compiled the driver.
+- `dbresult.c`: `row_next` never ran out on an empty result, `row_set` and
+  `col_set` refused the last position and took negative ones, which
+  `dbresult_cell` then indexed with; NULL and results without rows were
+  dereferenced.
+- `model.c`: an update with nothing set reached the database as
+  `UPDATE t SET  WHERE ...`.
 
 One more came out of checking the HTTP/2 fix against a live server rather than
 out of a target: finishing a frame from the session's output buffer, like

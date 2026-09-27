@@ -240,6 +240,12 @@ if(BUILD_FUZZERS STREQUAL "yes")
             h3_priority qpack_dynamic qpack_session quic_stream h3_request quic_conn)
     endif()
 
+    # The database layer on SQLite ":memory:": no server, but the driver only
+    # exists in a build that asked for it (-DINCLUDE_SQLITE=yes).
+    if(SQLite_FOUND AND INCLUDE_SQLITE STREQUAL "yes")
+        list(APPEND FUZZ_TARGET_NAMES db_query db_model)
+    endif()
+
     set(FUZZ_ID_quic_packet    1)
     set(FUZZ_ID_quic_frame     2)
     set(FUZZ_ID_quic_tp        3)
@@ -273,6 +279,8 @@ if(BUILD_FUZZERS STREQUAL "yes")
     set(FUZZ_ID_mail_message 31)
     set(FUZZ_ID_quic_conn 32)
     set(FUZZ_ID_ratelimiter 33)
+    set(FUZZ_ID_db_query 34)
+    set(FUZZ_ID_db_model 35)
 
     foreach(name ${FUZZ_TARGET_NAMES})
         set(exe fuzz_${name})
@@ -324,6 +332,8 @@ if(BUILD_FUZZERS STREQUAL "yes")
             FUZZ_MAIL_MESSAGE=31
             FUZZ_QUIC_CONN=32
             FUZZ_RATELIMITER=33
+            FUZZ_DB_QUERY=34
+            FUZZ_DB_MODEL=35
             FUZZ_TARGET=${FUZZ_ID_${name}}
         )
 
@@ -348,6 +358,8 @@ if(BUILD_FUZZERS STREQUAL "yes")
             ${CMAKE_CURRENT_SOURCE_DIR}/../src/server
             ${CMAKE_CURRENT_SOURCE_DIR}/../misc
             ${CMAKE_CURRENT_SOURCE_DIR}/../misc/validation
+            ${CMAKE_CURRENT_SOURCE_DIR}/../framework/database
+            ${CMAKE_CURRENT_SOURCE_DIR}/../framework/model
         )
 
         target_link_libraries(${exe} PRIVATE
