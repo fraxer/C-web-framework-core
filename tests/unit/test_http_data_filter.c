@@ -545,6 +545,30 @@ TEST(test_data_body_head_request_no_body) {
     fixture_teardown(&fx);
 }
 
+TEST(test_data_body_204_no_body) {
+    TEST_SUITE("http_data_filter: body");
+    TEST_CASE("204 responses short-circuit without a body (RFC 9110 §15.3.5)");
+
+    /* REGRESSION: the header stage already treated 204 as bodiless (no
+     * Content-Length), but the body stage sent a handler's body anyway -- after
+     * a 204 without a length an HTTP/1.1 client reads those bytes as the next
+     * response, and an HTTP/3 one gets DATA on a message that cannot have any.
+     * Found by the h3_response fuzz target. */
+    data_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx, 64), "fixture should be created");
+    TEST_REQUIRE_GOTO(body_set(fx.response, "Hello world", 11), "body should be set", cleanup);
+
+    fx.response->status_code = 204;
+
+    const int r = run_body(&fx, NULL, NULL);
+    TEST_ASSERT_EQUAL(CWF_OK, r, "204 should finish with CWF_OK without a body");
+    TEST_ASSERT_EQUAL(0, fx.sink.body_calls, "downstream body should not be called");
+    TEST_ASSERT_EQUAL_SIZE(0, fx.sink.size, "nothing should be emitted for 204");
+
+    cleanup:
+    fixture_teardown(&fx);
+}
+
 TEST(test_data_body_304_no_body) {
     TEST_SUITE("http_data_filter: body");
     TEST_CASE("304 responses short-circuit without a body (RFC 7232)");
