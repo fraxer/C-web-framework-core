@@ -480,9 +480,11 @@ Targets, each with a seed corpus under `fuzz/corpus/`:
 | `ratelimiter` | the token bucket in front of rate-limited routes: any schedule of clients, token counts and clock steps, forward and back |
 | `db_query` | the query layer on SQLite `:memory:`: templates, bound values, identifiers, lists, the result cursor, the insert/select/update/delete compilers (only with `-DINCLUDE_SQLITE=yes`) |
 | `db_model` | the model layer the feedback form writes through: create, read, update, delete and JSON of a schema like the form's, on SQLite `:memory:` (same condition) |
+| `h3_response` | a handler's response through the HTTP/3 filter chain and write stage onto the stream, read back by a client: fields, body, gzip, 304, trailers, FIN |
 | `quic_pmtud` | DPLPMTUD (RFC 8899) on a path whose MTU, losses and clock the input sets; the search must end, and the size stay within [base, ceiling] |
 | `session_crypto` | the session cookie's AES-256-GCM: round trips, forgeries, tampering, the hex and passphrase keys |
 | `misc_containers` | arena, array, map, hashmap, str and bufo under any sequence of operations, each against a model of its own |
+| `view` | the template engine: any template against a document from the input, and generated templates rendered against a model of the engine |
 | `gzip` | `gzip.c` in the loops of its callers: round trips at every level, any bytes, streams cut short, followed or changed |
 
 An application registers its own with the same function, and `run.sh` picks
@@ -588,6 +590,26 @@ broke it is saved like any crash:
   has to finish; `quic_conn`'s path has an MTU too (the ping's argument sets
   it), so probes are lost for their size and a raised size can fall into a
   black hole the server has to find.
+  `h3_response` is `h1_connection`'s response half for HTTP/3, on the bare
+  connection of `test_h3dispatch.c` (an h3conn in the ctx, no handshake): the
+  handler sets a status, fields, a body and trailers, the write turn runs the
+  chain, and between turns the "network" takes as much of the stream as the
+  input says. The client decodes the HEADERS with QPACK, joins the DATA and
+  checks `:status` alone and first, lower-case names, no connection-specific
+  field, every field the handler set, Content-Length against the payload, no
+  DATA for HEAD, 204 or 304, gzip only when accepted and inflating to the
+  body, the trailers after it, FIN with nothing behind it, and the QUIC memory
+  budget back where it was.
+  `view` writes the template into a directory made once and renders it
+  through a fresh viewstore. Raw templates must parse to the same tree twice,
+  render the same from the store and from the cache, and render to NULL
+  exactly when the parser refuses them. Generated ones -- text, expressions
+  printed with the fewest parentheses precedence allows (and some more), if /
+  elseif / else, loops over arrays and an object -- come with the output a
+  model of the engine's rules expects: null through arithmetic, strcmp for
+  strings, integers printed as integers, the engine's truthiness. The
+  document's strings carry `{{`, `{%`, `}}` and any byte but NUL and must
+  come out as themselves.
   `db_query` generates each template from SQL words, literals, quoted
   identifiers, both comment forms and parameters followed by whatever may
   follow them, so the builder's output is known exactly; values of any bytes
@@ -723,6 +745,13 @@ HTTP/2 write path, as a seed that replays it):
   around to a few bytes and was handed back as allocated.
 - `array.c` (the same): `array_update` out of bounds or on NULL leaked the
   value it refused, where `array_insert` frees it.
+- `view.c` (`test_view_render_loop_long_object_key`, found by `view`): the key
+  of an object loop was copied into an 80-byte buffer, so a longer key from
+  the document rendered cut to 79 bytes; it is borrowed from the document now.
+- `http_data_filter.c` (`test_data_body_204_no_body`, found by `h3_response`):
+  a 204 got no Content-Length but its handler's body was sent anyway -- DATA
+  on an HTTP/3 message that cannot have any, and on HTTP/1.1 bytes the client
+  reads as the next response.
 
 One more came out of checking the HTTP/2 fix against a live server rather than
 out of a target: finishing a frame from the session's output buffer, like

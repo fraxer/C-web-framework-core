@@ -61,7 +61,7 @@
     FUZZ_TARGET == FUZZ_QPACK_DECODE || FUZZ_TARGET == FUZZ_QPACK_STREAMS || \
     FUZZ_TARGET == FUZZ_H3_PRIORITY || FUZZ_TARGET == FUZZ_QPACK_DYNAMIC || \
     FUZZ_TARGET == FUZZ_QPACK_SESSION || FUZZ_TARGET == FUZZ_QUIC_STREAM || \
-    FUZZ_TARGET == FUZZ_H3_REQUEST
+    FUZZ_TARGET == FUZZ_H3_REQUEST || FUZZ_TARGET == FUZZ_H3_RESPONSE
 #include "h3frame.h"
 #include "h3priority.h"
 #include "qpack.h"
@@ -79,7 +79,8 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size);
     FUZZ_TARGET == FUZZ_H2_SESSION || FUZZ_TARGET == FUZZ_H2_CONNECTION || \
     FUZZ_TARGET == FUZZ_H3_REQUEST || FUZZ_TARGET == FUZZ_HTTP_RESPONSE || \
     FUZZ_TARGET == FUZZ_SMTP_RESPONSE || FUZZ_TARGET == FUZZ_H1_CONNECTION || \
-    FUZZ_TARGET == FUZZ_MAIL_MESSAGE
+    FUZZ_TARGET == FUZZ_MAIL_MESSAGE || FUZZ_TARGET == FUZZ_H3_RESPONSE || \
+    FUZZ_TARGET == FUZZ_VIEW
 
 /* The parser asks the running configuration what the largest acceptable body
  * is, and there is no configuration here. Overridden the way
@@ -9125,6 +9126,1048 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     free(z.bytes);
     free(plain.bytes);
     free(ref.bytes);
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_H3_RESPONSE
+
+#include <zlib.h>
+#include "h3conn.h"
+#include "h3frame.h"
+#include "h3response.h"
+#include "quicmemory.h"
+#include "quicsendbuf.h"
+#include "varint.h"
+
+/* The serving half of an HTTP/3 request stream: a response a handler built,
+ * through the h3 filter chain (not_modified, range, data, gzip) into
+ * h3response.c, h3_write_filter.c and h3data.c, onto the QUIC stream -- what
+ * h1_connection does for HTTP/1.1.
+ *
+ * The connection is the bare one of test_h3dispatch.c: a quicconn_t whose ctx
+ * resolves to an h3conn, with no handshake. Nothing on the response path looks
+ * past the stream list, quicstream_write/finish and the write-ahead budget, so
+ * a TLS handshake would add time and nothing under test; the transport under
+ * the stream is quic_conn's. Between write turns the "network" takes what the
+ * stream queued the way the packetiser does (quicsendbuf_next, mark_sent, ack),
+ * as much per turn as the input says, which is what frees the budget.
+ *
+ * The client reads the stream: HEADERS decoded by QPACK, DATA frames joined,
+ * an optional trailing HEADERS, then FIN and nothing after it. It checks
+ *   - :status first and alone among pseudo-fields, the status the handler set
+ *     (or 304 when the validator matched), names in lower case, no
+ *     connection-specific field, every field the handler added with its value;
+ *   - Content-Length, when there is one, equals the DATA payload;
+ *   - no DATA for HEAD, 204 or 304; otherwise the body, or with Content-Encoding:
+ *     gzip a stream that inflates to it -- and gzip only when the request
+ *     accepted it;
+ *   - the trailers the handler added, minus what §4.1 drops, after the body;
+ *   - after everything is freed the QUIC memory budget is where it started.
+ *
+ * Input: [flags] [status] [network] [body size, 2 bytes] [fields] [trailers],
+ * then the bytes the body repeats. Fields and trailers are a count and then
+ * name/value pairs of a length byte and bytes each. */
+
+#define H3P_WINDOW (64u * 1024 * 1024)
+#define H3P_FIELDS 8
+#define H3P_TURNS 4096
+
+typedef struct {
+    char name[32];
+    size_t name_len;
+    char value[64];
+    size_t value_len;
+} h3p_field_t;
+
+typedef struct {
+    uint8_t* bytes;
+    size_t len, cap;
+} h3p_buf_t;
+
+static void __h3p_put(h3p_buf_t* b, const void* p, size_t n) {
+    if (n == 0) return;
+    if (b->len + n > b->cap) {
+        size_t cap = b->cap ? b->cap : 4096;
+        while (cap < b->len + n) cap *= 2;
+        uint8_t* grown = realloc(b->bytes, cap);
+        if (grown == NULL) abort();
+        b->bytes = grown;
+        b->cap = cap;
+    }
+    memcpy(b->bytes + b->len, p, n);
+    b->len += n;
+}
+
+static int __h3p_ieq(const char* a, size_t al, const char* b, size_t bl) {
+    return al == bl && strncasecmp(a, b, al) == 0;
+}
+
+/* Fields no HTTP/3 message may carry (RFC 9114 §4.2), which the server drops. */
+static int __h3p_connection_specific(const char* n, size_t l) {
+    return __h3p_ieq(n, l, "connection", 10) || __h3p_ieq(n, l, "keep-alive", 10) ||
+           __h3p_ieq(n, l, "proxy-connection", 16) || __h3p_ieq(n, l, "transfer-encoding", 17) ||
+           __h3p_ieq(n, l, "upgrade", 7) || __h3p_ieq(n, l, "te", 2);
+}
+
+/* Fields the chain itself decides; a handler's copy of one is not compared. */
+static int __h3p_chain_owned(const char* n, size_t l) {
+    return __h3p_connection_specific(n, l) ||
+           __h3p_ieq(n, l, "content-length", 14) || __h3p_ieq(n, l, "content-encoding", 16) ||
+           __h3p_ieq(n, l, "content-type", 12) || __h3p_ieq(n, l, "vary", 4) ||
+           __h3p_ieq(n, l, "etag", 4) || __h3p_ieq(n, l, "last-modified", 13) ||
+           __h3p_ieq(n, l, "content-range", 13) || __h3p_ieq(n, l, "accept-ranges", 13) ||
+           __h3p_ieq(n, l, "cache-control", 13) || __h3p_ieq(n, l, "date", 4) ||
+           __h3p_ieq(n, l, "server", 6);
+}
+
+static size_t __h3p_fields(const uint8_t** data, size_t* size, h3p_field_t* out, size_t max) {
+    if (*size < 1) return 0;
+    size_t n = (*data)[0] % (max + 1);
+    (*data)++; (*size)--;
+    size_t count = 0;
+    for (size_t i = 0; i < n && *size >= 2; i++) {
+        h3p_field_t* f = &out[count];
+        /* A token of a name, never empty; a value of any byte but CR, LF and
+         * NUL, which RFC 9114 §4.2 forbids in a field and nothing on the
+         * server's path claims to filter. */
+        size_t nl = 1 + (*data)[0] % (sizeof f->name - 1);
+        size_t vl = (*data)[1] % sizeof f->value;
+        (*data) += 2; (*size) -= 2;
+        if (nl > *size) nl = *size;
+        if (nl == 0) break;
+        static const char token[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.!#$%&'*+^`|~";
+        for (size_t j = 0; j < nl; j++) f->name[j] = token[(*data)[j] % (sizeof token - 1)];
+        f->name_len = nl;
+        /* What the chain decides itself -- framing, encoding, validators --
+         * is not the handler's to set here: renamed out of the way. */
+        if (__h3p_chain_owned(f->name, nl) && !__h3p_connection_specific(f->name, nl)) f->name[0] = 'x';
+        (*data) += nl; (*size) -= nl;
+        if (vl > *size) vl = *size;
+        for (size_t j = 0; j < vl; j++) {
+            const uint8_t c = (*data)[j];
+            f->value[j] = (char)(c == '\r' || c == '\n' || c == 0 ? ' ' : c);
+        }
+        /* A field value has no leading or trailing whitespace (RFC 9110 §5.5). */
+        while (vl > 0 && (f->value[vl - 1] == ' ' || f->value[vl - 1] == '\t')) vl--;
+        size_t lead = 0;
+        while (lead < vl && (f->value[lead] == ' ' || f->value[lead] == '\t')) lead++;
+        memmove(f->value, f->value + lead, vl - lead);
+        f->value_len = vl - lead;
+        (*data) += vl; (*size) -= vl;
+        count++;
+    }
+    return count;
+}
+
+static const qpack_header_t* __h3p_find(const qpack_header_t* f, size_t n, const char* name) {
+    for (size_t i = 0; i < n; i++)
+        if (__h3p_ieq(f[i].name, f[i].name_len, name, strlen(name))) return &f[i];
+    return NULL;
+}
+
+static void __h3p_check_section(const qpack_header_t* f, size_t n, int is_trailer) {
+    for (size_t i = 0; i < n; i++) {
+        for (size_t j = 0; j < f[i].name_len; j++)
+            if (f[i].name[j] >= 'A' && f[i].name[j] <= 'Z') __builtin_trap();
+        if (f[i].name_len > 0 && f[i].name[0] == ':' && (is_trailer || i != 0)) __builtin_trap();
+        if (__h3p_connection_specific(f[i].name, f[i].name_len)) __builtin_trap();
+        if (is_trailer && __h3p_ieq(f[i].name, f[i].name_len, "content-length", 14)) __builtin_trap();
+    }
+}
+
+/* Every field the handler added and the chain leaves alone, with its value.
+ * Several copies of one name: each value must be there. */
+static void __h3p_expect_fields(const qpack_header_t* f, size_t n, const h3p_field_t* want, size_t count) {
+    for (size_t k = 0; k < count; k++) {
+        const h3p_field_t* w = &want[k];
+        if (__h3p_chain_owned(w->name, w->name_len) || w->name[0] == ':') continue;
+        int found = 0;
+        for (size_t i = 0; i < n && !found; i++)
+            found = __h3p_ieq(f[i].name, f[i].name_len, w->name, w->name_len) &&
+                    f[i].value_len == w->value_len && memcmp(f[i].value, w->value, w->value_len) == 0;
+        if (!found) __builtin_trap();
+    }
+}
+
+static int __h3p_inflate(const uint8_t* z, size_t zn, h3p_buf_t* out) {
+    z_stream s;
+    memset(&s, 0, sizeof s);
+    if (inflateInit2(&s, MAX_WBITS + 16) != Z_OK) abort();
+    s.next_in = (Bytef*)z;
+    s.avail_in = (uInt)zn;
+    uint8_t buf[16384];
+    int r;
+    do {
+        s.next_out = buf;
+        s.avail_out = sizeof buf;
+        r = inflate(&s, Z_NO_FLUSH);
+        __h3p_put(out, buf, sizeof buf - s.avail_out);
+    } while (r == Z_OK && (s.avail_in > 0 || s.avail_out == 0));
+    inflateEnd(&s);
+    return r == Z_STREAM_END && s.avail_in == 0;
+}
+
+typedef struct {
+    quicconn_t* qc;
+    connection_server_ctx_t ctx;
+    h3conn_t* c;
+    quicstream_t* qs;
+} h3p_stand_t;
+
+static void __h3p_request(h3p_stand_t* s, int method, int gzip, int conditional) {
+    static const char* methods[] = { "GET", "HEAD", "POST", "GET" };
+    qpack_header_t fields[6] = {
+        { (char*)":method", 7, (char*)methods[method], strlen(methods[method]), 0 },
+        { (char*)":path", 5, (char*)"/", 1, 0 },
+        { (char*)":scheme", 7, (char*)"https", 5, 0 },
+        { (char*)":authority", 10, (char*)"localhost", 9, 0 },
+    };
+    size_t n = 4;
+    if (gzip) fields[n++] = (qpack_header_t){ (char*)"accept-encoding", 15, (char*)"gzip, br", 8, 0 };
+    if (conditional) fields[n++] = (qpack_header_t){ (char*)"if-none-match", 13, (char*)"\"v1\"", 4, 0 };
+
+    uint8_t block[512], frame[600];
+    qpack_encoder_t* enc = qpack_encoder_create(0, 0);
+    if (enc == NULL) abort();
+    const size_t blen = qpack_encode_block(enc, fields, n, block, sizeof block);
+    qpack_encoder_free(enc);
+    const size_t flen = h3frame_write(frame, sizeof frame, H3_FRAME_HEADERS, block, blen);
+    if (blen == 0 || flen == 0) abort();
+    quicstream_on_data(s->qs, 0, frame, flen, 1);
+    h3conn_stream_read(s->c, NULL, s->qs);
+}
+
+/* What the network takes from the stream in one turn, then acknowledges. */
+static void __h3p_drain(quicstream_t* qs, size_t quota, size_t mtu, h3p_buf_t* wire, int* fin) {
+    while (quota > 0) {
+        uint64_t off = 0;
+        const uint8_t* p = NULL;
+        size_t n = 0;
+        int f = 0;
+        if (!quicsendbuf_next(&qs->send, mtu < quota ? mtu : quota, &off, &p, &n, &f)) break;
+        if (off != wire->len) __builtin_trap();        /* nothing lost, so in order */
+        if (*fin && n > 0) __builtin_trap();            /* bytes after FIN */
+        __h3p_put(wire, p, n);
+        if (f) *fin = 1;
+        quicsendbuf_mark_sent(&qs->send, off, n, f);
+        quicsendbuf_ack(&qs->send, off, n, f);
+        quota = quota > n ? quota - n : 0;
+        if (n == 0 && !f) break;
+    }
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 5) return 0;
+    const uint8_t flags = data[0], status_sel = data[1], net = data[2];
+    /* Up to 256 KiB: past the connection's write-ahead budget, so a response
+     * takes several turns, and no further, so a run stays fast. */
+    const size_t body_len = ((size_t)data[3] << 8 | data[4]) * ((flags & 0x80) ? 17 : 1) % (1u << 18);
+    data += 5; size -= 5;
+
+    h3p_field_t fields[H3P_FIELDS], trailers[H3P_FIELDS];
+    const size_t nfields = __h3p_fields(&data, &size, fields, H3P_FIELDS);
+    const size_t ntrailers = (flags & 8) ? __h3p_fields(&data, &size, trailers, H3P_FIELDS) : 0;
+
+    static const int statuses[8] = { 200, 200, 201, 404, 500, 299, 204, 410 };
+    const int method = flags & 3;
+    const int accept_gzip = (flags >> 2) & 1;
+    const int conditional = (flags >> 4) & 1;   /* handler sets ETag "v1", request If-None-Match */
+    const int status = statuses[status_sel % 8];
+
+    char* body = malloc(body_len ? body_len : 1);
+    if (body == NULL) abort();
+    for (size_t i = 0; i < body_len; i++)
+        body[i] = size ? (char)data[i % size] : (char)('a' + i % 26);
+
+    __fuzz_appconfig_init();
+    static env_gzip_str_t html = { (char*)"text/html; charset=utf-8", NULL };
+    env()->main.gzip = &html;
+
+    const size_t budget_before = quicmemory_current();
+
+    h3p_stand_t s;
+    s.qc = calloc(1, sizeof *s.qc);
+    s.c = h3conn_create(NULL, 65536, 0);
+    if (s.qc == NULL || s.c == NULL) abort();
+    memset(&s.ctx, 0, sizeof s.ctx);
+    s.ctx.parser = s.c;
+    s.qc->conn.transport = CONN_TRANSPORT_QUIC;
+    s.qc->conn.ctx = &s.ctx;
+    s.qs = quicstream_create(0, H3P_WINDOW, H3P_WINDOW, H3P_WINDOW);
+    if (s.qs == NULL) abort();
+    s.qc->streams = s.qs;
+    s.qc->stream_count = 1;
+    __h3p_request(&s, method, accept_gzip, conditional);
+
+    h3stream_t* st = h3conn_request_of(s.qs);
+    if (st == NULL || st->request == NULL) __builtin_trap();   /* a valid request */
+
+    /* The handler. */
+    httpresponse_t* r = httpresponse_create_h3(&s.qc->conn);
+    if (r == NULL) abort();
+    if (accept_gzip) httpresponse_set_accept_encoding(r, "gzip, br", 8);
+    if (!h3_server_attach_response(&s.qc->conn, st->request, r)) __builtin_trap();
+    r->status_code = status;
+    for (size_t i = 0; i < nfields; i++)
+        r->add_headern(r, fields[i].name, fields[i].name_len, fields[i].value, fields[i].value_len);
+    if (conditional) r->add_header(r, "ETag", "\"v1\"");
+    r->send_datan(r, body, body_len);
+    for (size_t i = 0; i < ntrailers; i++)
+        r->add_trailern(r, trailers[i].name, trailers[i].name_len, trailers[i].value, trailers[i].value_len);
+    h3_server_publish_inline(&s.qc->conn, r);
+
+    /* Write turns, the network in between. */
+    static const size_t quotas[4] = { SIZE_MAX, 16384, 65536, 1200 };
+    const size_t quota = quotas[net % 4];
+    const size_t mtu = 1 + (size_t)(net >> 2) * 37;
+    h3p_buf_t wire = { 0 };
+    int fin = 0;
+    int turns = 0;
+    while (!st->response_done && turns++ < H3P_TURNS) {
+        if (!h3conn_write(s.c, s.qc)) __builtin_trap();
+        __h3p_drain(s.qs, quota, mtu, &wire, &fin);
+    }
+    while (!fin && turns++ < H3P_TURNS) __h3p_drain(s.qs, SIZE_MAX, mtu, &wire, &fin);
+    if (!st->response_done || !fin || !s.qs->send.fin) __builtin_trap();
+    if (h3conn_write(s.c, s.qc) != 1) __builtin_trap();
+    __h3p_drain(s.qs, SIZE_MAX, mtu, &wire, &fin);     /* nothing after FIN */
+
+    /* The client. */
+    qpack_decoder_t* dec = qpack_decoder_create(0, 0);
+    if (dec == NULL) abort();
+    qpack_header_t* head = NULL, * tail = NULL;
+    size_t nhead = 0, ntail = 0;
+    h3p_buf_t payload = { 0 };
+    int sections = 0, data_after_trailers = 0;
+    for (size_t off = 0; off < wire.len;) {
+        uint64_t type = 0, len = 0;
+        size_t a = varint_read(wire.bytes + off, wire.len - off, &type);
+        if (a == 0) __builtin_trap();
+        size_t b = varint_read(wire.bytes + off + a, wire.len - off - a, &len);
+        if (b == 0 || len > wire.len - off - a - b) __builtin_trap();
+        const uint8_t* p = wire.bytes + off + a + b;
+        off += a + b + (size_t)len;
+        if (type == H3_FRAME_HEADERS) {
+            if (sections == 2) __builtin_trap();
+            qpack_header_t** out = sections == 0 ? &head : &tail;
+            size_t* count = sections == 0 ? &nhead : &ntail;
+            if (qpack_decode_block(dec, p, (size_t)len, 1u << 20, out, count) != QPACK_OK) __builtin_trap();
+            sections++;
+        } else if (type == H3_FRAME_DATA) {
+            if (sections != 1) data_after_trailers = 1;
+            __h3p_put(&payload, p, (size_t)len);
+        } else __builtin_trap();                         /* the server sends no other frame here */
+    }
+    if (sections == 0 || data_after_trailers) __builtin_trap();
+
+    __h3p_check_section(head, nhead, 0);
+    if (nhead == 0 || !__h3p_ieq(head[0].name, head[0].name_len, ":status", 7)) __builtin_trap();
+    char status_text[8];
+    const int not_modified = head[0].value_len == 3 && memcmp(head[0].value, "304", 3) == 0;
+    snprintf(status_text, sizeof status_text, "%d", status);
+    if (!not_modified && !__h3p_ieq(head[0].value, head[0].value_len, status_text, strlen(status_text))) __builtin_trap();
+    if (not_modified && !conditional) __builtin_trap();
+    if (conditional && method != 2 && status == 200 && !not_modified) __builtin_trap();
+    __h3p_expect_fields(head, nhead, fields, nfields);
+
+    const qpack_header_t* cl = __h3p_find(head, nhead, "content-length");
+    if (cl != NULL) {
+        char want[24];
+        snprintf(want, sizeof want, "%zu", payload.len);
+        if (method != 1 && !not_modified && !__h3p_ieq(cl->value, cl->value_len, want, strlen(want))) __builtin_trap();
+    }
+    const qpack_header_t* ce = __h3p_find(head, nhead, "content-encoding");
+    const int gzipped = ce != NULL && __h3p_ieq(ce->value, ce->value_len, "gzip", 4);
+    if (gzipped && !accept_gzip) __builtin_trap();
+    if (getenv("FUZZ_TRACE") != NULL)
+        fprintf(stderr, "method %d status %.*s gzip %d payload %zu body %zu sections %d turns %d\n",
+                method, (int)head[0].value_len, head[0].value, gzipped, payload.len, body_len,
+                sections, turns);
+
+    /* RFC 9110 §15.3.5: a 204 ends with its header section, like a 304. */
+    if (method == 1 || not_modified || status == 204) {
+        if (payload.len != 0) __builtin_trap();
+    } else if (gzipped) {
+        h3p_buf_t plain = { 0 };
+        if (!__h3p_inflate(payload.bytes, payload.len, &plain)) __builtin_trap();
+        if (plain.len != body_len || (body_len && memcmp(plain.bytes, body, body_len) != 0)) __builtin_trap();
+        free(plain.bytes);
+    } else if (payload.len != body_len || (body_len && memcmp(payload.bytes, body, body_len) != 0)) {
+        __builtin_trap();
+    }
+
+    /* Trailers: what the handler added, minus pseudo-fields, content-length and
+     * connection-specific ones. */
+    size_t kept = 0;
+    for (size_t i = 0; i < ntrailers; i++)
+        if (!__h3p_connection_specific(trailers[i].name, trailers[i].name_len) &&
+            !__h3p_ieq(trailers[i].name, trailers[i].name_len, "content-length", 14))
+            kept++;
+    if (sections == 2) {
+        __h3p_check_section(tail, ntail, 1);
+        if (ntail != kept) __builtin_trap();
+        __h3p_expect_fields(tail, ntail, trailers, ntrailers);
+    } else if (kept != 0 && method != 1 && !not_modified) {
+        __builtin_trap();
+    }
+
+    qpack_headers_free(head, nhead);
+    qpack_headers_free(tail, ntail);
+    qpack_decoder_free(dec);
+    free(payload.bytes);
+    free(wire.bytes);
+
+    h3conn_stream_release(s.qs);
+    quicstream_free(s.qs);
+    h3conn_free(s.c);
+    free(s.qc);
+    free(body);
+
+    if (quicmemory_current() != budget_before) __builtin_trap();   /* budget leaked */
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_VIEW
+
+#include <fcntl.h>
+#include <math.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include "storagefs.h"
+#include "view.h"
+#include "viewparser.h"
+#include "viewstore.h"
+
+/* The template engine (framework/view): viewparser turns a template file into
+ * a tag tree, viewexpr parses and evaluates the expressions in it, render()
+ * walks the tree against a JSON document. Templates are the developer's, but
+ * the document is built from whatever a request brought, so what matters most
+ * is that a value is only ever data.
+ *
+ * The first byte picks the mode:
+ *   raw -- any bytes as the template, against a document of strings, numbers,
+ *     booleans, arrays and an object from the input. Parsing twice gives the
+ *     same tree; rendering from a fresh store and again from the cache gives
+ *     the same bytes; a template the parser refuses renders to NULL; nothing
+ *     crashes or leaks.
+ *   generated -- a template assembled from text, {{ expressions }}, if /
+ *     elseif / else and for loops over arrays and objects, with the output it
+ *     must render to computed here: RFC-free, just the engine's own rules --
+ *     null propagates through arithmetic, strings compare with strcmp, a
+ *     number prints as an integer, truthiness as viewexpr_value_istrue says.
+ *     Values carry "{{", "{%", "}}" and any other byte but NUL, and must come
+ *     out as themselves.
+ *
+ * The templates live in a directory made once; a fresh viewstore per input
+ * keeps the cache from carrying one input's tree into the next. */
+
+#define VW_STORAGE "fuzz_view"
+#define VW_VALUES 4
+#define VW_ITEMS 4
+
+static char __vw_root[64];
+static storagefs_t* __vw_fs;
+
+static int __vw_init(void) {
+    if (__vw_fs != NULL) return 1;
+    snprintf(__vw_root, sizeof __vw_root, "/tmp/cwfr_fuzz_view_XXXXXX");
+    if (mkdtemp(__vw_root) == NULL) return 0;
+    __vw_fs = storage_create_fs(VW_STORAGE, __vw_root);
+    if (__vw_fs == NULL) return 0;
+    char path[128];
+    snprintf(path, sizeof path, "%s/inc.html", __vw_root);
+    FILE* f = fopen(path, "w");
+    if (f == NULL) return 0;
+    fputs("<{{ s0 }}>", f);
+    fclose(f);
+    appconfig()->storages = (storage_t*)__vw_fs;
+    return 1;
+}
+
+static void __vw_write(const char* name, const char* data, size_t size) {
+    char path[128];
+    snprintf(path, sizeof path, "%s/%s", __vw_root, name);
+    const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) abort();
+    for (size_t off = 0; off < size;) {
+        const ssize_t n = write(fd, data + off, size - off);
+        if (n <= 0) abort();
+        off += (size_t)n;
+    }
+    close(fd);
+}
+
+/* ---- the input, read a byte at a time ---- */
+
+typedef struct {
+    const uint8_t* p;
+    size_t n;
+} vw_in_t;
+
+static uint8_t __vw_byte(vw_in_t* in) {
+    if (in->n == 0) return 0;
+    in->n--;
+    return *in->p++;
+}
+
+/* ---- the document ---- */
+
+typedef struct {
+    char* s[VW_VALUES];                 /* strings: any byte but NUL */
+    long long n[VW_VALUES];
+    int b[2];
+    char* a[2][VW_ITEMS];               /* arrays of strings */
+    size_t a_len[2];
+    char* keys[VW_ITEMS];               /* the object o0: keys to strings */
+    char* vals[VW_ITEMS];
+    size_t o_len;
+    json_doc_t* doc;
+} vw_doc_t;
+
+static char* __vw_string(vw_in_t* in, size_t max) {
+    size_t len = __vw_byte(in) % (max + 1);
+    char* s = malloc(len + 1);
+    if (s == NULL) abort();
+    for (size_t i = 0; i < len; i++) {
+        const uint8_t c = __vw_byte(in);
+        s[i] = (char)(c ? c : '{');
+    }
+    s[len] = 0;
+    return s;
+}
+
+static void __vw_doc_build(vw_doc_t* d, vw_in_t* in) {
+    memset(d, 0, sizeof *d);
+    d->doc = json_root_create_object();
+    if (d->doc == NULL) abort();
+    json_token_t* root = json_root(d->doc);
+    char name[8];
+    for (int i = 0; i < VW_VALUES; i++) {
+        d->s[i] = __vw_string(in, 40);
+        snprintf(name, sizeof name, "s%d", i);
+        json_object_set(root, name, json_create_string(d->s[i]));
+        d->n[i] = (long long)(int8_t)__vw_byte(in) * (1 + __vw_byte(in) % 3);
+        snprintf(name, sizeof name, "n%d", i);
+        json_object_set(root, name, json_create_number((long double)d->n[i]));
+    }
+    for (int i = 0; i < 2; i++) {
+        d->b[i] = __vw_byte(in) & 1;
+        snprintf(name, sizeof name, "b%d", i);
+        json_object_set(root, name, json_create_bool(d->b[i]));
+        json_token_t* arr = json_create_array();
+        d->a_len[i] = __vw_byte(in) % (VW_ITEMS + 1);
+        for (size_t j = 0; j < d->a_len[i]; j++) {
+            d->a[i][j] = __vw_string(in, 12);
+            json_array_append(arr, json_create_string(d->a[i][j]));
+        }
+        snprintf(name, sizeof name, "a%d", i);
+        json_object_set(root, name, arr);
+    }
+    json_token_t* obj = json_create_object();
+    const size_t want = __vw_byte(in) % (VW_ITEMS + 1);
+    for (size_t j = 0; j < want; j++) {
+        char* key = __vw_string(in, 100);
+        int dup = 0;
+        for (size_t k = 0; k < d->o_len; k++) dup |= strcmp(d->keys[k], key) == 0;
+        if (dup) { free(key); continue; }
+        d->keys[d->o_len] = key;
+        d->vals[d->o_len] = __vw_string(in, 12);
+        json_object_set(obj, key, json_create_string(d->vals[d->o_len]));
+        d->o_len++;
+    }
+    json_object_set(root, "o0", obj);
+}
+
+static void __vw_doc_free(vw_doc_t* d) {
+    for (int i = 0; i < VW_VALUES; i++) free(d->s[i]);
+    for (int i = 0; i < 2; i++)
+        for (size_t j = 0; j < d->a_len[i]; j++) free(d->a[i][j]);
+    for (size_t j = 0; j < d->o_len; j++) { free(d->keys[j]); free(d->vals[j]); }
+    json_free(d->doc);
+}
+
+/* ---- growable text ---- */
+
+typedef struct {
+    char* p;
+    size_t len, cap;
+} vw_text_t;
+
+static void __vw_put(vw_text_t* t, const char* s, size_t n) {
+    if (t->len + n + 1 > t->cap) {
+        size_t cap = t->cap ? t->cap : 256;
+        while (cap < t->len + n + 1) cap *= 2;
+        char* grown = realloc(t->p, cap);
+        if (grown == NULL) abort();
+        t->p = grown;
+        t->cap = cap;
+    }
+    memcpy(t->p + t->len, s, n);
+    t->len += n;
+    t->p[t->len] = 0;
+}
+
+static void __vw_puts(vw_text_t* t, const char* s) {
+    __vw_put(t, s, strlen(s));
+}
+
+/* ---- the model's values ---- */
+
+typedef enum { VW_NULL, VW_BOOL, VW_NUM, VW_STR, VW_ARR } vw_type_e;
+
+typedef struct {
+    vw_type_e type;
+    int b;
+    long long n;         /* numbers stay integral and small */
+    const char* s;
+    size_t arr_len;
+} vw_val_t;
+
+static int __vw_true(vw_val_t v) {
+    switch (v.type) {
+    case VW_BOOL: return v.b;
+    case VW_NUM: return v.n != 0;
+    case VW_STR: return v.s[0] != 0;
+    case VW_ARR: return v.arr_len > 0;
+    default: return 0;
+    }
+}
+
+static void __vw_render_val(vw_text_t* out, vw_val_t v) {
+    char buf[32];
+    switch (v.type) {
+    case VW_STR: __vw_puts(out, v.s); break;
+    case VW_NUM: snprintf(buf, sizeof buf, "%lld", v.n); __vw_puts(out, buf); break;
+    case VW_BOOL: __vw_puts(out, v.b ? "true" : "false"); break;
+    default: break;
+    }
+}
+
+/* Loop variables in scope, innermost last. */
+typedef struct {
+    char elem[8], key[8];
+    int with_key;        /* without one the default key name is not ours to guess */
+    const char* elem_value;
+    int key_is_index;
+    long long index;
+    const char* key_value;
+} vw_frame_t;
+
+typedef struct {
+    vw_in_t* in;
+    vw_doc_t* doc;
+    vw_frame_t frames[4];
+    int depth;
+    int budget;          /* tags left, so templates stay small */
+    vw_text_t tpl;
+} vw_gen_t;
+
+/* Precedence, lowest first: || && == != < <= > >= + - * / % unary. */
+enum { P_OR = 1, P_AND, P_EQ, P_REL, P_ADD, P_MUL, P_UNARY, P_ATOM };
+
+typedef struct {
+    vw_text_t text;
+    int prec;
+    vw_val_t v;
+} vw_expr_t;
+
+static void __vw_expr_free(vw_expr_t* e) {
+    free(e->text.p);
+}
+
+static void __vw_wrap(vw_expr_t* e, int need, int force) {
+    if (e->prec >= need && !force) return;
+    vw_text_t t = { 0 };
+    __vw_puts(&t, "(");
+    __vw_put(&t, e->text.p, e->text.len);
+    __vw_puts(&t, ")");
+    free(e->text.p);
+    e->text = t;
+    e->prec = P_ATOM;
+}
+
+static const char* __vw_space(vw_in_t* in) {
+    static const char* spaces[4] = { "", " ", "  ", "\t" };
+    return spaces[__vw_byte(in) % 4];
+}
+
+static vw_expr_t __vw_leaf(vw_gen_t* g) {
+    vw_expr_t e = { { 0 }, P_ATOM, { VW_NULL, 0, 0, NULL, 0 } };
+    char buf[48];
+    const uint8_t pick = __vw_byte(g->in);
+    switch (pick % 10) {
+    case 0: case 1: {
+        const long long n = __vw_byte(g->in) % 100;
+        snprintf(buf, sizeof buf, "%lld", n);
+        __vw_puts(&e.text, buf);
+        e.v = (vw_val_t){ VW_NUM, 0, n, NULL, 0 };
+        break;
+    }
+    case 2: {
+        const int i = __vw_byte(g->in) % VW_VALUES;
+        snprintf(buf, sizeof buf, "s%d", i);
+        __vw_puts(&e.text, buf);
+        e.v = (vw_val_t){ VW_STR, 0, 0, g->doc->s[i], 0 };
+        break;
+    }
+    case 3: {
+        const int i = __vw_byte(g->in) % VW_VALUES;
+        snprintf(buf, sizeof buf, "n%d", i);
+        __vw_puts(&e.text, buf);
+        e.v = (vw_val_t){ VW_NUM, 0, g->doc->n[i], NULL, 0 };
+        break;
+    }
+    case 4: {
+        const int i = __vw_byte(g->in) % 2;
+        snprintf(buf, sizeof buf, "b%d", i);
+        __vw_puts(&e.text, buf);
+        e.v = (vw_val_t){ VW_BOOL, g->doc->b[i], 0, NULL, 0 };
+        break;
+    }
+    case 5: {
+        /* A string literal: quotes, braces and escapes inside it are text. */
+        static const char* lits[][2] = {
+            { "'abc'", "abc" }, { "\"x}}y\"", "x}}y" }, { "'{% z %}'", "{% z %}" },
+            { "'it\\'s'", "it's" }, { "''", "" }, { "\"a\\\\b\"", "a\\b" },
+        };
+        const int i = __vw_byte(g->in) % 6;
+        __vw_puts(&e.text, lits[i][0]);
+        e.v = (vw_val_t){ VW_STR, 0, 0, lits[i][1], 0 };
+        break;
+    }
+    case 6: {
+        static const char* kw[3] = { "true", "false", "null" };
+        const int i = __vw_byte(g->in) % 3;
+        __vw_puts(&e.text, kw[i]);
+        e.v = i == 2 ? (vw_val_t){ VW_NULL, 0, 0, NULL, 0 } : (vw_val_t){ VW_BOOL, i == 0, 0, NULL, 0 };
+        break;
+    }
+    case 7: {
+        /* An element of an array, in range or not. */
+        const int i = __vw_byte(g->in) % 2;
+        const size_t k = __vw_byte(g->in) % (VW_ITEMS + 1);
+        snprintf(buf, sizeof buf, "a%d[%zu]", i, k);
+        __vw_puts(&e.text, buf);
+        if (k < g->doc->a_len[i]) e.v = (vw_val_t){ VW_STR, 0, 0, g->doc->a[i][k], 0 };
+        break;
+    }
+    case 8:
+        if (g->depth > 0) {
+            const vw_frame_t* f = &g->frames[__vw_byte(g->in) % g->depth];
+            if ((__vw_byte(g->in) & 1) || !f->with_key) {
+                __vw_puts(&e.text, f->elem);
+                e.v = (vw_val_t){ VW_STR, 0, 0, f->elem_value, 0 };
+            } else {
+                __vw_puts(&e.text, f->key);
+                e.v = f->key_is_index ? (vw_val_t){ VW_NUM, 0, f->index, NULL, 0 }
+                                      : (vw_val_t){ VW_STR, 0, 0, f->key_value, 0 };
+            }
+            break;
+        }
+        /* fall through */
+    default:
+        __vw_puts(&e.text, (__vw_byte(g->in) & 1) ? "missing" : "o0.nothing");
+        break;
+    }
+    return e;
+}
+
+/* Arithmetic stays integral and within ±2^40, where long double and long long
+ * agree exactly: a result that would leave that range is not generated. */
+#define VW_LIMIT (1LL << 40)
+
+static vw_expr_t __vw_expr(vw_gen_t* g, int depth) {
+    const uint8_t pick = __vw_byte(g->in);
+    if (depth <= 0 || pick % 3 == 0) return __vw_leaf(g);
+
+    if (pick % 7 == 1) {
+        vw_expr_t a = __vw_expr(g, depth - 1);
+        const int neg = __vw_byte(g->in) & 1;
+        __vw_wrap(&a, P_UNARY, 0);
+        vw_text_t t = { 0 };
+        __vw_puts(&t, neg ? "-" : "!");
+        __vw_put(&t, a.text.p, a.text.len);
+        free(a.text.p);
+        a.text = t;
+        a.prec = P_UNARY;
+        if (!neg) a.v = (vw_val_t){ VW_BOOL, !__vw_true(a.v), 0, NULL, 0 };
+        else if (a.v.type == VW_NUM) a.v.n = -a.v.n;
+        else a.v = (vw_val_t){ VW_NULL, 0, 0, NULL, 0 };
+        return a;
+    }
+
+    static const struct { const char* op; int prec; } ops[] = {
+        { "||", P_OR }, { "&&", P_AND }, { "==", P_EQ }, { "!=", P_EQ },
+        { "<", P_REL }, { "<=", P_REL }, { ">", P_REL }, { ">=", P_REL },
+        { "+", P_ADD }, { "-", P_ADD }, { "*", P_MUL }, { "/", P_MUL }, { "%", P_MUL },
+    };
+    const int k = __vw_byte(g->in) % 13;
+    vw_expr_t a = __vw_expr(g, depth - 1);
+    vw_expr_t b = __vw_expr(g, depth - 1);
+    const int prec = ops[k].prec;
+    /* Left-associative: the right operand needs strictly higher precedence.
+     * Now and then parentheses that change nothing. */
+    const int extra = __vw_byte(g->in);
+    __vw_wrap(&a, prec, (extra & 3) == 0);
+    __vw_wrap(&b, prec + 1, (extra & 12) == 0);
+
+    vw_val_t r = { VW_NULL, 0, 0, NULL, 0 };
+    const vw_val_t x = a.v, y = b.v;
+    const int nums = x.type == VW_NUM && y.type == VW_NUM;
+    const int strs = x.type == VW_STR && y.type == VW_STR;
+    switch (k) {
+    case 0: r = (vw_val_t){ VW_BOOL, __vw_true(x) || __vw_true(y), 0, NULL, 0 }; break;
+    case 1: r = (vw_val_t){ VW_BOOL, __vw_true(x) && __vw_true(y), 0, NULL, 0 }; break;
+    case 2: case 3: {
+        int eq = x.type == y.type;
+        if (eq && x.type == VW_BOOL) eq = x.b == y.b;
+        if (eq && x.type == VW_NUM) eq = x.n == y.n;
+        if (eq && x.type == VW_STR) eq = strcmp(x.s, y.s) == 0;
+        if (eq && x.type == VW_ARR) eq = 0;      /* never generated as operands */
+        r = (vw_val_t){ VW_BOOL, k == 2 ? eq : !eq, 0, NULL, 0 };
+        break;
+    }
+    case 4: case 5: case 6: case 7: {
+        int less = 0, equal = 0;
+        if (nums) { less = x.n < y.n; equal = x.n == y.n; }
+        else if (strs) { const int c = strcmp(x.s, y.s); less = c < 0; equal = c == 0; }
+        const int res = !(nums || strs) ? 0 : k == 4 ? less : k == 5 ? less || equal
+                      : k == 6 ? !less && !equal : !less;
+        r = (vw_val_t){ VW_BOOL, res, 0, NULL, 0 };
+        break;
+    }
+    default: {
+        if (!nums) break;
+        long long v = 0;
+        int ok = 1;
+        switch (k) {
+        case 8: v = x.n + y.n; break;
+        case 9: v = x.n - y.n; break;
+        case 10: ok = x.n == 0 || llabs(y.n) <= VW_LIMIT / llabs(x.n); v = ok ? x.n * y.n : 0; break;
+        case 11:
+            if (y.n == 0) { ok = 2; break; }           /* null */
+            ok = x.n % y.n == 0;                        /* whole quotients only */
+            v = ok ? x.n / y.n : 0;
+            break;
+        default:
+            if (y.n == 0) { ok = 2; break; }
+            v = x.n % y.n;                              /* fmodl on integers: C's remainder */
+            break;
+        }
+        if (ok == 1 && llabs(v) <= VW_LIMIT) r = (vw_val_t){ VW_NUM, 0, v, NULL, 0 };
+        else if (ok == 0 || ok == 1) {
+            /* Not generated: fall back to the left operand alone. */
+            __vw_expr_free(&b);
+            return a;
+        }
+        break;
+    }
+    }
+
+    vw_expr_t e = { { 0 }, prec, r };
+    __vw_put(&e.text, a.text.p, a.text.len);
+    __vw_puts(&e.text, " ");
+    __vw_puts(&e.text, ops[k].op);
+    __vw_puts(&e.text, " ");
+    __vw_put(&e.text, b.text.p, b.text.len);
+    __vw_expr_free(&a);
+    __vw_expr_free(&b);
+    return e;
+}
+
+static void __vw_block(vw_gen_t* g, vw_text_t* out, int live);
+
+static void __vw_item(vw_gen_t* g, vw_text_t* out, int live) {
+    const uint8_t pick = __vw_byte(g->in);
+    if (g->budget <= 0) return;
+    switch (pick % 6) {
+    case 0: case 1: {
+        /* Text: no '{' before '{', '%' or '*' -- that would open a tag. */
+        static const char alphabet[] = "abcXYZ 019.,;:<>/-_\n}%*#'\"";
+        const size_t n = 1 + __vw_byte(g->in) % 12;
+        char buf[16];
+        for (size_t i = 0; i < n; i++) buf[i] = alphabet[__vw_byte(g->in) % (sizeof alphabet - 1)];
+        __vw_put(&g->tpl, buf, n);
+        if (live) __vw_put(out, buf, n);
+        break;
+    }
+    case 2: case 3: {
+        g->budget--;
+        vw_expr_t e = __vw_expr(g, 3);
+        __vw_puts(&g->tpl, "{{");
+        __vw_puts(&g->tpl, __vw_space(g->in));
+        __vw_put(&g->tpl, e.text.p, e.text.len);
+        __vw_puts(&g->tpl, __vw_space(g->in));
+        __vw_puts(&g->tpl, "}}");
+        if (live) __vw_render_val(out, e.v);
+        __vw_expr_free(&e);
+        break;
+    }
+    case 4: {
+        g->budget--;
+        /* if [elseif]* [else] endif: the first true branch renders. */
+        int taken = 0;
+        const int branches = 1 + __vw_byte(g->in) % 3;
+        const int has_else = __vw_byte(g->in) & 1;
+        for (int i = 0; i < branches; i++) {
+            vw_expr_t c = __vw_expr(g, 2);
+            __vw_puts(&g->tpl, i == 0 ? "{% if " : "{% elseif ");
+            __vw_put(&g->tpl, c.text.p, c.text.len);
+            __vw_puts(&g->tpl, " %}");
+            const int now = !taken && __vw_true(c.v);
+            __vw_expr_free(&c);
+            __vw_block(g, out, live && now);
+            taken |= now;
+        }
+        if (has_else) {
+            __vw_puts(&g->tpl, "{% else %}");
+            __vw_block(g, out, live && !taken);
+        }
+        __vw_puts(&g->tpl, "{% endif %}");
+        break;
+    }
+    default: {
+        if (g->depth >= 4) break;
+        g->budget--;
+        vw_frame_t* f = &g->frames[g->depth];
+        snprintf(f->elem, sizeof f->elem, "e%d", g->depth);
+        snprintf(f->key, sizeof f->key, "k%d", g->depth);
+        const int which = __vw_byte(g->in) % 3;     /* a0, a1, o0 */
+        const int with_key = __vw_byte(g->in) & 1;
+        char head[64];
+        if (with_key) snprintf(head, sizeof head, "{%% for %s, %s in %s %%}", f->elem, f->key,
+                               which == 2 ? "o0" : which ? "a1" : "a0");
+        else snprintf(head, sizeof head, "{%% for %s in %s %%}", f->elem,
+                      which == 2 ? "o0" : which ? "a1" : "a0");
+        __vw_puts(&g->tpl, head);
+        /* The body is generated once and rendered once per element: remember
+         * where the input and the template were, and replay. */
+        const size_t count = which == 2 ? g->doc->o_len : g->doc->a_len[which];
+        const vw_in_t saved_in = *g->in;
+        const size_t tpl_mark = g->tpl.len;
+        const int saved_budget = g->budget;
+        g->depth++;
+        for (size_t i = 0; i < (count ? count : 1); i++) {
+            *g->in = saved_in;
+            g->tpl.len = tpl_mark;
+            g->budget = saved_budget;
+            f->key_is_index = which != 2;
+            f->index = (long long)i;
+            if (count) {
+                f->elem_value = which == 2 ? g->doc->vals[i] : g->doc->a[which][i];
+                f->key_value = which == 2 ? g->doc->keys[i] : NULL;
+            } else {
+                f->elem_value = "";
+                f->key_value = "";
+            }
+            f->with_key = with_key;
+            __vw_block(g, out, live && count > 0);
+        }
+        g->depth--;
+        __vw_puts(&g->tpl, "{% endfor %}");
+        break;
+    }
+    }
+}
+
+static void __vw_block(vw_gen_t* g, vw_text_t* out, int live) {
+    const int n = __vw_byte(g->in) % 4;
+    for (int i = 0; i < n; i++) __vw_item(g, out, live);
+}
+
+/* ---- tree comparison ---- */
+
+static int __vw_same_tree(const view_tag_t* a, const view_tag_t* b) {
+    for (; a != NULL || b != NULL; a = a->next, b = b->next) {
+        if (a == NULL || b == NULL) return 0;
+        if (a->type != b->type || a->parent_text_offset != b->parent_text_offset ||
+            a->parent_text_size != b->parent_text_size) return 0;
+        const size_t an = bufferdata_writed((bufferdata_t*)&a->result_content);
+        const size_t bn = bufferdata_writed((bufferdata_t*)&b->result_content);
+        if (an != bn) return 0;
+        if (an && memcmp(bufferdata_get((bufferdata_t*)&a->result_content),
+                         bufferdata_get((bufferdata_t*)&b->result_content), an) != 0) return 0;
+        if ((a->expr == NULL) != (b->expr == NULL)) return 0;
+        if (!__vw_same_tree(a->child, b->child)) return 0;
+    }
+    return 1;
+}
+
+static view_tag_t* __vw_parse(const char* name, int* ok) {
+    viewparser_t* p = viewparser_init(VW_STORAGE, name);
+    if (p == NULL) abort();
+    *ok = viewparser_run(p);
+    view_tag_t* root = *ok ? viewparser_move_root_tag(p) : NULL;
+    viewparser_free(p);
+    return root;
+}
+
+static char* __vw_render(json_doc_t* doc, const char* name) {
+    viewstore_t* store = viewstore_create();
+    if (store == NULL) abort();
+    appconfig()->viewstore = store;
+    char* first = render(doc, VW_STORAGE, "/%s", name);
+    char* cached = render(doc, VW_STORAGE, "/%s", name);
+    if ((first == NULL) != (cached == NULL) || (first && strcmp(first, cached) != 0)) __builtin_trap();
+    free(cached);
+    appconfig()->viewstore = NULL;
+    viewstore_destroy(store);
+    return first;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 2) return 0;
+    if (!__vw_init()) abort();
+    const uint8_t mode = data[0];
+    const size_t split = data[1];
+    data += 2; size -= 2;
+
+    if (mode & 1) {
+        /* raw: the template first, then the document's bytes */
+        const size_t tlen = size < split * 8 ? size : split * 8;
+        vw_in_t din = { data + tlen, size - tlen };
+        vw_doc_t doc;
+        __vw_doc_build(&doc, &din);
+        __vw_write("t.html", (const char*)data, tlen);
+
+        int ok1 = 0, ok2 = 0;
+        view_tag_t* t1 = __vw_parse("/t.html", &ok1);
+        view_tag_t* t2 = __vw_parse("/t.html", &ok2);
+        if (ok1 != ok2 || (ok1 && !__vw_same_tree(t1, t2))) __builtin_trap();
+        if (t1) t1->free(t1);
+        if (t2) t2->free(t2);
+
+        char* a = __vw_render(doc.doc, "t.html");
+        char* b = __vw_render(doc.doc, "t.html");
+        if ((a == NULL) != (b == NULL) || (a && strcmp(a, b) != 0)) __builtin_trap();
+        if ((a != NULL) != ok1) __builtin_trap();     /* refused exactly when the parser refuses */
+        free(a);
+        free(b);
+        __vw_doc_free(&doc);
+        return 0;
+    }
+
+    /* generated: the document from the first bytes, the template from the rest */
+    vw_in_t in = { data, size };
+    vw_doc_t doc;
+    __vw_doc_build(&doc, &in);
+    vw_gen_t g = { &in, &doc, { { { 0 } } }, 0, 24, { 0 } };
+    vw_text_t want = { 0 };
+    __vw_puts(&want, "");
+    __vw_puts(&g.tpl, "");
+    const int items = 1 + __vw_byte(&in) % 6;
+    for (int i = 0; i < items; i++) __vw_item(&g, &want, 1);
+    __vw_write("g.html", g.tpl.p, g.tpl.len);
+
+    char* got = __vw_render(doc.doc, "g.html");
+    if (getenv("FUZZ_TRACE") != NULL)
+        fprintf(stderr, "template [%s]\nwant [%s]\ngot  [%s]\n", g.tpl.p, want.p, got ? got : "(null)");
+    if (got == NULL || strcmp(got, want.p) != 0) __builtin_trap();
+    free(got);
+
+    free(want.p);
+    free(g.tpl.p);
+    __vw_doc_free(&doc);
     return 0;
 }
 

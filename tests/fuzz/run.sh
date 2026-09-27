@@ -63,12 +63,13 @@ expected=(fuzz_huffman fuzz_hpack fuzz_h2_frame fuzz_json fuzz_cookie
           fuzz_websocket fuzz_websocket_sequence fuzz_ws_deflate fuzz_h2_session
           fuzz_h2_connection fuzz_http_response fuzz_smtp_response fuzz_jwt
           fuzz_h1_connection fuzz_text fuzz_mail_message fuzz_ratelimiter
-          fuzz_session_crypto fuzz_misc_containers fuzz_gzip)
+          fuzz_session_crypto fuzz_misc_containers fuzz_gzip
+          fuzz_view)
 if grep -Eq '^INCLUDE_HTTP3:[A-Z]+=yes$' "$build_dir/CMakeCache.txt" 2>/dev/null; then
     expected+=(fuzz_quic_packet fuzz_quic_frame fuzz_quic_tp fuzz_h3_frame
                fuzz_qpack_decode fuzz_qpack_streams fuzz_h3_priority fuzz_qpack_dynamic
                fuzz_qpack_session fuzz_quic_stream fuzz_h3_request fuzz_quic_conn
-               fuzz_quic_pmtud)
+               fuzz_quic_pmtud fuzz_h3_response)
 fi
 if grep -Eq '^INCLUDE_SQLITE:[A-Z]+=yes$' "$build_dir/CMakeCache.txt" 2>/dev/null; then
     expected+=(fuzz_db_query fuzz_db_model)
