@@ -552,6 +552,13 @@ broke it is saved like any crash:
   keeps the first arrival (overlaps, conflicting retransmissions, FIN and
   RESET_STREAM final sizes, the buffered cap) and `quicrange` against a bitset,
   near 0 and near `UINT64_MAX`; freeing must hand the QUIC memory budget back.
+  `text` takes a first byte of `0xE0` and up for the helpers added after its
+  first five: `idn` (the ASCII path copies, the rest comes out ASCII within
+  RFC 1035's lengths or not at all), `ipaddr` against a parser of its own for
+  RFC 791 quads and RFC 4291 text, brackets for IPv6 only, and back through
+  `ipaddr_text` and `ipaddr_authority`; `base64` round trips, the `_nl` line
+  lengths, and lenient decoding against a decoder of its own, `base64url`
+  included (the h2c Upgrade header).
   `quic_pmtud` drives the PMTU state machine with the calls quicconn.c makes
   -- probe when due, the probe's ACK if the path carried it, other ACKs, the
   probe timer, black holes -- and at the end a clean path on which the search
@@ -674,6 +681,8 @@ HTTP/2 write path, as a seed that replays it):
   dereferenced.
 - `model.c`: an update with nothing set reached the database as
   `UPDATE t SET  WHERE ...`.
+- `base64.c` (the base64 helper of `text`): a line break inside a group of
+  four was decoded as data, though `base64_decode_len` skipped it.
 - `aes256gcm.c` (`test_aes256gcm.c`, written for `session_crypto`): the
   encryption of an empty value could not be decrypted -- exactly nonce and tag
   was refused; `aes256gcm_key_from_hex` read past the end of an odd-length
