@@ -43,17 +43,8 @@ int h2_field_name_valid(const char* name, size_t len) {
     return 1;
 }
 
-int h2_field_value_valid(const char* value, size_t len) {
-    if (len == 0) return 1; /* an empty value is legal */
-    if (value == NULL) return 0;
-
-    /* §8.2.1: a value must not start or end with SP or HTAB. HPACK/QPACK carry
-     * the bytes verbatim, unlike HTTP/1.1 where the framing strips leading OWS,
-     * so this is a check only the multiplexed protocols need. */
-    const char first = value[0];
-    const char last = value[len - 1];
-    if (first == ' ' || first == '\t' || last == ' ' || last == '\t') return 0;
-
+/* The octets of a value, edges aside. */
+static int h2_field_value_octets_valid(const char* value, size_t len) {
     for (size_t i = 0; i < len; i++) {
         const unsigned char c = (unsigned char)value[i];
 
@@ -69,6 +60,44 @@ int h2_field_value_valid(const char* value, size_t len) {
     }
 
     return 1;
+}
+
+int h2_field_value_valid(const char* value, size_t len) {
+    if (len == 0) return 1; /* an empty value is legal */
+    if (value == NULL) return 0;
+
+    /* §8.2.1: a value must not start or end with SP or HTAB. HPACK/QPACK carry
+     * the bytes verbatim, unlike HTTP/1.1 where the framing strips leading OWS,
+     * so this is a check only the multiplexed protocols need. */
+    const char first = value[0];
+    const char last = value[len - 1];
+    if (first == ' ' || first == '\t' || last == ' ' || last == '\t') return 0;
+
+    return h2_field_value_octets_valid(value, len);
+}
+
+int h2_field_response_name_valid(const char* name, size_t len) {
+    if (name == NULL || len == 0) return 0;
+
+    /* A plain token, uppercase included: the h2/h3 write paths lowercase the
+     * name themselves, and HTTP/1.1 sends it as written. No pseudo-headers --
+     * :status is the write path's to emit. */
+    for (size_t i = 0; i < len; i++) {
+        const unsigned char c = (unsigned char)name[i];
+        if (c >= 'A' && c <= 'Z') continue;
+        if (!h2_tchar[c]) return 0;
+    }
+
+    return 1;
+}
+
+int h2_field_response_value_valid(const char* value, size_t len) {
+    if (len == 0) return 1;
+    if (value == NULL) return 0;
+
+    /* Edge SP/HTAB is not refused here: HTTP/1.1 strips it on the receiving
+     * side, and what this guards against is a value that ends the field early. */
+    return h2_field_value_octets_valid(value, len);
 }
 
 h2_field_status_e h2_field_validate(const char* name, size_t name_len,

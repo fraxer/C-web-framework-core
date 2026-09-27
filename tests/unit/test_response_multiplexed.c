@@ -96,3 +96,30 @@ TEST(test_response_early_hints_by_protocol) {
     TEST_ASSERT(r->early_hint_ == NULL, "nothing staged");
     httpresponse_free(r);
 }
+
+/* Trailers and early hints are encoded by HPACK/QPACK straight from these
+ * lists, so they need the same octet check as add_header — on either protocol. */
+TEST(test_response_trailers_and_hints_reject_injection) {
+    TEST_SUITE("response-multiplexed");
+
+    const int transports[] = {CONN_TRANSPORT_TCP, CONN_TRANSPORT_QUIC};
+    for (size_t i = 0; i < sizeof(transports) / sizeof(transports[0]); i++) {
+        response_fixture_t f;
+        fixture_init(&f, transports[i], transports[i] == CONN_TRANSPORT_TCP);
+
+        TEST_CASE("trailers refuse CR/LF in a name or value");
+        httpresponse_t* r = httpresponse_create(&f.connection);
+        TEST_ASSERT(r->add_trailer(r, "grpc-message", "a\r\nb") == 0, "CRLF in value");
+        TEST_ASSERT(r->add_trailern(r, "grpc-message", 12, "a\0b", 3) == 0, "NUL in value");
+        TEST_ASSERT(r->add_trailer(r, "grpc\r\nstatus", "0") == 0, "CRLF in name");
+        TEST_ASSERT(r->trailer_ == NULL, "nothing staged");
+        httpresponse_free(r);
+
+        TEST_CASE("early hints refuse CR/LF in a name or value");
+        r = httpresponse_create(&f.connection);
+        TEST_ASSERT(r->add_early_hint(r, "link", "</a.css>\r\nx: y") == 0, "CRLF in value");
+        TEST_ASSERT(r->add_early_hint(r, "li nk", "</a.css>") == 0, "space in name");
+        TEST_ASSERT(r->early_hint_ == NULL, "nothing staged");
+        httpresponse_free(r);
+    }
+}

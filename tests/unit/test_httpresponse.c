@@ -259,6 +259,45 @@ TEST(test_httpresponse_headeru_add_is_unique) {
     free_response(response, conn);
 }
 
+/* REGRESSION: add_header stored whatever it was given, and the HTTP/1.1 write
+ * filter copied the bytes verbatim between ": " and "\r\n". A handler putting
+ * user input into a header (a Location built from ?next=, a filename in
+ * Content-Disposition) split the response: "a\r\nSet-Cookie: x=1" became a
+ * header of its own, and "\r\n\r\n<html>" a body. HPACK/QPACK carried the same
+ * bytes to the client as a malformed field. */
+TEST(test_httpresponse_header_add_rejects_injection) {
+    TEST_SUITE("httpresponse: headers");
+    TEST_CASE("add_header refuses CR, LF and other controls in a name or value");
+
+    connection_t* conn = NULL;
+    httpresponse_t* response = make_response(&conn);
+    TEST_REQUIRE_NOT_NULL(response, "response allocated");
+
+    TEST_ASSERT_EQUAL(0, response->add_header(response, "Location", "/a\r\nSet-Cookie: x=1"), "CRLF in value");
+    TEST_ASSERT_EQUAL(0, response->add_header(response, "Location", "/a\nSet-Cookie: x=1"), "bare LF in value");
+    TEST_ASSERT_EQUAL(0, response->add_header(response, "Location", "/a\rb"), "bare CR in value");
+    TEST_ASSERT_EQUAL(0, response->add_headern(response, "Location", 8, "/a\0b", 4), "NUL in value");
+    TEST_ASSERT_EQUAL(0, response->add_header(response, "Location", "/a\x7f"), "DEL in value");
+    TEST_ASSERT_EQUAL(0, response->add_header(response, "X-A\r\nSet-Cookie", "1"), "CRLF in name");
+    TEST_ASSERT_EQUAL(0, response->add_header(response, "X-A: b", "1"), "colon and space in name");
+    TEST_ASSERT_EQUAL(0, response->add_header(response, ":status", "200"), "pseudo-header name");
+    TEST_ASSERT_EQUAL(0, response->add_header(response, "", "1"), "empty name");
+    TEST_ASSERT_EQUAL(0, response->add_headeru(response, "Location", 8, "/a\r\nb", 5), "add_headeru goes through the same check");
+
+    TEST_ASSERT_NULL((void*)response->header_, "nothing was stored");
+    TEST_ASSERT_NULL((void*)response->last_header, "tail untouched");
+
+    TEST_ASSERT_EQUAL(1, response->add_header(response, "Content-Disposition",
+                                              "attachment; filename=\"\xd0\xb0.txt\""), "obs-text stays legal");
+    TEST_ASSERT_EQUAL(1, response->add_header(response, "X-Tab", "a\tb"), "interior HTAB stays legal");
+    TEST_ASSERT_EQUAL(1, response->add_header(response, "X-Empty", ""), "empty value stays legal");
+    TEST_ASSERT_EQUAL(3, (int)(header_count(response, "Content-Disposition") +
+                               header_count(response, "X-Tab") +
+                               header_count(response, "X-Empty")), "valid headers stored");
+
+    free_response(response, conn);
+}
+
 // ============================================================================
 // Header removal
 // ============================================================================
