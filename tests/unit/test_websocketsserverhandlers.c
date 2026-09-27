@@ -55,6 +55,7 @@
 #include "middleware.h"
 #include "multiplexing.h"
 #include "ratelimiter.h"
+#include "route.h"
 #include "websocketsparser.h"
 #include "websocketsprotocoldefault.h"
 #include "websocketsprotocolresource.h"
@@ -1285,6 +1286,202 @@ TEST(test_wsh_queue_request_handler_middleware_denies) {
 
     item->free(item);
 
+    teardown:
+    wsh_harness_free(&h);
+}
+
+/* ==========================================================================
+ * The CLOSE reply behind other frames (found by the ws_connection fuzz target)
+ * ========================================================================== */
+
+TEST(test_wsh_close_behind_pong_is_still_sent_regression) {
+    TEST_SUITE("websocketsserverhandlers: close");
+    /* REGRESSION: keepalive drops when the CLOSE is read, and __write stopped
+     * after the first frame it wrote once keepalive was 0 -- here the PONG --
+     * so the CLOSE reply queued behind it never left: the peer saw the
+     * connection drop without the closing handshake (RFC 6455 §5.5.1). */
+    TEST_CASE("PING then CLOSE in one read: PONG, then the CLOSE, then the end");
+
+    wsh_harness_t h;
+    TEST_REQUIRE(wsh_harness_init(&h), "harness init");
+    TEST_REQUIRE_GOTO(wsh_attach_parser(&h, websockets_protocol_default_create), "parser attach", teardown);
+
+    const unsigned char status[2] = {0x03, 0xE8};
+    unsigned char frames[64];
+    size_t n = wsh_build_frame(frames, 0x09, 1, (const unsigned char*)"hi", 2);
+    n += wsh_build_frame(frames + n, 0x08, 1, status, sizeof status);
+    TEST_REQUIRE_GOTO(send(h.peer_fd, frames, n, 0) == (ssize_t)n, "frames sent", teardown);
+
+    TEST_ASSERT_EQUAL(1, websockets_guard_read(h.conn), "read keeps the connection for the replies");
+    TEST_ASSERT_EQUAL(1, websockets_guard_write(h.conn), "replies written");
+    TEST_ASSERT_EQUAL(1, atomic_load(&h.ctx.destroyed), "and then the connection goes");
+
+    unsigned char wire[64];
+    const size_t received = wsh_drain(h.peer_fd, wire, sizeof(wire), 0);
+    TEST_ASSERT_EQUAL_SIZE(8, received, "PONG and CLOSE");
+    TEST_ASSERT_EQUAL(0x8A, wire[0], "PONG first");
+    TEST_ASSERT_EQUAL(0x88, wire[4], "CLOSE second");
+    TEST_ASSERT(memcmp(wire + 6, status, 2) == 0, "status code echoed");
+
+    teardown:
+    wsh_harness_free(&h);
+}
+
+static void wsh_reply_handle(void* arg) {
+    wsctx_t* ctx = arg;
+    ctx->response->send_text(ctx->response, "done");
+}
+
+TEST(test_wsh_close_waits_for_pending_reply_regression) {
+    TEST_SUITE("websocketsserverhandlers: close");
+    /* REGRESSION: with a handler still running for an earlier message, the
+     * write turn found the head of the output order unfilled, and with
+     * keepalive at 0 connection_after_write destroyed the connection -- the
+     * reply and the CLOSE behind it were both lost. */
+    TEST_CASE("a message, then CLOSE: the reply is waited for, then the CLOSE goes");
+
+    wsh_harness_t h;
+    TEST_REQUIRE(wsh_harness_init(&h), "harness init");
+    TEST_REQUIRE_GOTO(wsh_attach_parser(&h, websockets_protocol_default_create), "parser attach", teardown);
+    h.server.websockets.default_handler = wsh_reply_handle;
+
+    const unsigned char status[2] = {0x03, 0xE8};
+    unsigned char frames[64];
+    size_t n = wsh_build_frame(frames, 0x01, 1, (const unsigned char*)"hello", 5);
+    n += wsh_build_frame(frames + n, 0x08, 1, status, sizeof status);
+    TEST_REQUIRE_GOTO(send(h.peer_fd, frames, n, 0) == (ssize_t)n, "frames sent", teardown);
+
+    TEST_ASSERT_EQUAL(1, websockets_guard_read(h.conn), "read dispatches and queues the CLOSE");
+    TEST_ASSERT_EQUAL(1, websockets_guard_write(h.conn), "write turn with the head unfilled");
+    TEST_ASSERT_EQUAL(0, atomic_load(&h.ctx.destroyed), "the connection waits for the handler");
+
+    unsigned char wire[64];
+    TEST_ASSERT_EQUAL_SIZE(0, wsh_drain(h.peer_fd, wire, sizeof(wire), 0), "nothing out of order");
+
+    /* The worker's turn. */
+    connection_queue_item_t* item = cqueue_pop(h.ctx.queue);
+    TEST_REQUIRE_NOT_NULL_GOTO(item, "the message was dispatched", teardown);
+    item->run(item);
+    item->free(item);
+
+    TEST_ASSERT_EQUAL(1, websockets_guard_write(h.conn), "reply and CLOSE written");
+    TEST_ASSERT_EQUAL(1, atomic_load(&h.ctx.destroyed), "and then the connection goes");
+
+    const size_t received = wsh_drain(h.peer_fd, wire, sizeof(wire), 0);
+    TEST_ASSERT_EQUAL_SIZE(10, received, "the reply and the CLOSE");
+    TEST_ASSERT_EQUAL(0x81, wire[0], "text reply first");
+    TEST_ASSERT(memcmp(wire + 2, "done", 4) == 0, "the handler's reply");
+    TEST_ASSERT_EQUAL(0x88, wire[6], "CLOSE second");
+
+    teardown:
+    wsh_harness_free(&h);
+}
+
+TEST(test_wsh_reply_behind_staged_pong_rearms_write_regression) {
+    TEST_SUITE("websocketsserverhandlers: output order");
+    /* REGRESSION: a PING and a message in one read. The PONG is staged and the
+     * connection armed for writing; dispatching the message then parks it
+     * (MPXONESHOT, nothing armed). When the handler published its reply the
+     * head could not be promoted -- the PONG still held ctx->response -- so
+     * nobody re-armed the connection: neither frame was ever written, and the
+     * connection sat parked until it timed out. Found by ws_connection. */
+    TEST_CASE("the handler's publish re-arms the write even when the head is the staged PONG");
+
+    wsh_harness_t h;
+    TEST_REQUIRE(wsh_harness_init(&h), "harness init");
+    TEST_REQUIRE_GOTO(wsh_attach_parser(&h, websockets_protocol_default_create), "parser attach", teardown);
+    h.server.websockets.default_handler = wsh_reply_handle;
+
+    unsigned char frames[64];
+    size_t n = wsh_build_frame(frames, 0x09, 1, (const unsigned char*)"hi", 2);
+    n += wsh_build_frame(frames + n, 0x01, 1, (const unsigned char*)"hello", 5);
+    TEST_REQUIRE_GOTO(send(h.peer_fd, frames, n, 0) == (ssize_t)n, "frames sent", teardown);
+
+    TEST_ASSERT_EQUAL(1, websockets_guard_read(h.conn), "read stages the PONG and dispatches");
+    TEST_ASSERT(stub_control_mod_last_events == MPXONESHOT, "parked while the handler runs");
+
+    connection_queue_item_t* item = cqueue_pop(h.ctx.queue);
+    TEST_REQUIRE_NOT_NULL_GOTO(item, "the message was dispatched", teardown);
+    item->run(item);
+    item->free(item);
+
+    TEST_ASSERT(stub_control_mod_last_events == (MPXOUT | MPXRDHUP), "armed for writing again");
+
+    TEST_ASSERT_EQUAL(1, websockets_guard_write(h.conn), "PONG and reply written");
+    unsigned char wire[64];
+    const size_t received = wsh_drain(h.peer_fd, wire, sizeof(wire), 0);
+    TEST_ASSERT_EQUAL_SIZE(10, received, "PONG and the reply");
+    TEST_ASSERT_EQUAL(0x8A, wire[0], "PONG first");
+    TEST_ASSERT_EQUAL(0x81, wire[4], "the reply second");
+
+    teardown:
+    wsh_harness_free(&h);
+}
+
+TEST(test_wsh_resource_method_split_across_frames_regression) {
+    TEST_SUITE("websocketsserverhandlers: resource protocol");
+    /* REGRESSION: the resource protocol gathered the method in parser->buf,
+     * which the frame parser reuses for the next frame's header -- so a method
+     * cut by a frame boundary ("GE" + "T /sub"), which RFC 6455 §5.4 allows
+     * anywhere, lost its first half and failed the connection. The location
+     * already survived the same cut. Found by ws_connection. */
+    TEST_CASE("a method cut between two frames of one message still routes");
+
+    wsh_harness_t h;
+    TEST_REQUIRE(wsh_harness_init(&h), "harness init");
+    TEST_REQUIRE_GOTO(wsh_attach_parser(&h, websockets_protocol_resource_create), "parser attach", teardown);
+
+    route_t* route = route_create("/sub");
+    TEST_REQUIRE_NOT_NULL_GOTO(route, "route", teardown);
+    TEST_REQUIRE_GOTO(route_set_websockets_handler(route, "GET", wsh_reply_handle, NULL), "handler", teardown_route);
+    h.server.websockets.route = route;
+
+    unsigned char frames[64];
+    size_t n = wsh_build_frame(frames, 0x01, 0, (const unsigned char*)"GE", 2);
+    n += wsh_build_frame(frames + n, 0x09, 1, (const unsigned char*)"p", 1);
+    n += wsh_build_frame(frames + n, 0x00, 1, (const unsigned char*)"T /sub", 6);
+    TEST_REQUIRE_GOTO(send(h.peer_fd, frames, n, 0) == (ssize_t)n, "frames sent", teardown_route);
+
+    TEST_ASSERT_EQUAL(1, websockets_guard_read(h.conn), "read keeps the connection");
+    TEST_ASSERT_EQUAL(0, cqueue_empty(h.ctx.queue), "the message was routed to its handler");
+
+    teardown_route:
+    h.server.websockets.route = NULL;
+    routes_free(route);
+    teardown:
+    wsh_harness_free(&h);
+}
+
+TEST(test_wsh_resource_empty_final_frame_regression) {
+    TEST_SUITE("websocketsserverhandlers: resource protocol");
+    /* REGRESSION: the location is parsed on the space after it or on the last
+     * byte of the message. A message whose final frame is empty ("GET /sub",
+     * then a zero-length continuation with FIN -- valid, RFC 6455 §5.4) has
+     * no such byte: the frame parser skips payload_parse for an empty frame,
+     * the path was never set and the message was answered "resource not
+     * found". Found by ws_connection. */
+    TEST_CASE("a message ended by an empty final frame still routes");
+
+    wsh_harness_t h;
+    TEST_REQUIRE(wsh_harness_init(&h), "harness init");
+    TEST_REQUIRE_GOTO(wsh_attach_parser(&h, websockets_protocol_resource_create), "parser attach", teardown);
+
+    route_t* route = route_create("/sub");
+    TEST_REQUIRE_NOT_NULL_GOTO(route, "route", teardown);
+    TEST_REQUIRE_GOTO(route_set_websockets_handler(route, "GET", wsh_reply_handle, NULL), "handler", teardown_route);
+    h.server.websockets.route = route;
+
+    unsigned char frames[64];
+    size_t n = wsh_build_frame(frames, 0x01, 0, (const unsigned char*)"GET /sub", 8);
+    n += wsh_build_frame(frames + n, 0x00, 1, NULL, 0);
+    TEST_REQUIRE_GOTO(send(h.peer_fd, frames, n, 0) == (ssize_t)n, "frames sent", teardown_route);
+
+    TEST_ASSERT_EQUAL(1, websockets_guard_read(h.conn), "read keeps the connection");
+    TEST_ASSERT_EQUAL(0, cqueue_empty(h.ctx.queue), "the message was routed to its handler");
+
+    teardown_route:
+    h.server.websockets.route = NULL;
+    routes_free(route);
     teardown:
     wsh_harness_free(&h);
 }

@@ -31,6 +31,12 @@ typedef struct websockets_protocol_resource {
     /** Current parser stage (method -> location -> data) */
     websockets_protocol_resource_stage_e parser_stage;
 
+    /** The method read so far. Kept here, not in the parser's buffer, which
+     *  the next frame's header overwrites: a message may be cut into frames
+     *  anywhere, the method included (RFC 6455 §5.4). */
+    char method_buf[8];
+    size_t method_length;
+
     /** Length of raw URI string (before decoding) */
     size_t uri_length;
 

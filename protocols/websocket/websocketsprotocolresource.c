@@ -41,6 +41,7 @@ websockets_protocol_t* websockets_protocol_resource_create(void) {
     protocol->get_payload_json = (json_doc_t*(*)(websockets_protocol_resource_t*))websocketsrequest_payload_json;
     protocol->method = ROUTE_NONE;
     protocol->parser_stage = WSPROTRESOURCE_METHOD;
+    protocol->method_length = 0;
     protocol->uri_length = 0;
     protocol->path_length = 0;
     protocol->uri = NULL;
@@ -58,6 +59,7 @@ void websockets_protocol_resource_reset(void* arg) {
 
     protocol->method = ROUTE_NONE;
     protocol->parser_stage = WSPROTRESOURCE_METHOD;
+    protocol->method_length = 0;
     protocol->uri_length = 0;
     protocol->path_length = 0;
 
@@ -80,6 +82,23 @@ void websockets_protocol_resource_free(void* arg) {
 
 int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t* request) {
     websockets_protocol_resource_t* protocol = (websockets_protocol_resource_t*)request->protocol;
+
+    /* The method and the location are finished on the byte that ends them,
+     * and the last byte of a message is one such byte -- but a message may end
+     * with an empty frame, which the frame parser never hands to
+     * payload_parse. Whatever was still open is finished here, at the end of
+     * the message, exactly as its last byte would have. */
+    if (protocol->parser_stage == WSPROTRESOURCE_METHOD && protocol->method_length > 0) {
+        protocol->parser_stage = WSPROTRESOURCE_LOCATION;
+        if (!websocketsparser_parse_method(protocol, protocol->method_buf, protocol->method_length))
+            return 0;
+        protocol->method_length = 0;
+    }
+    if (protocol->parser_stage == WSPROTRESOURCE_LOCATION && protocol->path == NULL && protocol->uri != NULL) {
+        protocol->parser_stage = WSPROTRESOURCE_DATA;
+        if (!websocketsparser_parse_location(protocol, protocol->uri, protocol->uri_length))
+            return 0;
+    }
 
     if (protocol->method == ROUTE_NONE) return 0;
     if (protocol->path == NULL) return 0;
@@ -195,24 +214,20 @@ int websockets_protocol_resource_payload_parse(websocketsparser_t* parser, char*
         switch (protocol->parser_stage) {
         case WSPROTRESOURCE_METHOD:
             {
-                size_t s = bufferdata_writed(&parser->buf);
-                if (s > method_max_length)
-                    return 0;
+                if (ch != ' ') {
+                    if (protocol->method_length >= method_max_length)
+                        return 0;
 
-                if (ch != ' ')
-                    bufferdata_push(&parser->buf, ch);
+                    protocol->method_buf[protocol->method_length++] = ch;
+                }
 
                 if (ch == ' ' || last_data) {
                     protocol->parser_stage = WSPROTRESOURCE_LOCATION;
 
-                    bufferdata_complete(&parser->buf);
-
-                    char* value = bufferdata_get(&parser->buf);
-                    size_t value_length = bufferdata_writed(&parser->buf);
-                    if (!websocketsparser_parse_method(protocol, value, value_length))
+                    if (!websocketsparser_parse_method(protocol, protocol->method_buf, protocol->method_length))
                         return 0;
 
-                    bufferdata_reset(&parser->buf);
+                    protocol->method_length = 0;
                 }
 
                 if (last_data)
