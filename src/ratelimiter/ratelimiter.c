@@ -63,10 +63,20 @@ static inline void seqlock_write_unlock(ratelimiter_seqlock_t* sl) {
 // Time functions
 // =============================================================================
 
-uint64_t ratelimiter_get_time_ns(void) {
+static uint64_t __ratelimiter_clock_monotonic(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t (*__ratelimiter_clock)(void) = __ratelimiter_clock_monotonic;
+
+uint64_t ratelimiter_get_time_ns(void) {
+    return __ratelimiter_clock();
+}
+
+void ratelimiter_set_time_source(uint64_t (*source)(void)) {
+    __ratelimiter_clock = source != NULL ? source : __ratelimiter_clock_monotonic;
 }
 
 // =============================================================================
@@ -112,20 +122,31 @@ static ratelimiter_bucket_t* bucket_create(uint64_t key, uint32_t initial_tokens
     return bucket;
 }
 
+/* Сколько прошло от then до now; 0, если часы ушли назад. Без этого разность
+ * беззнаковых заворачивается в ~584 года: корзина пополняется до максимума, а
+ * очистка считает её давно заброшенной. */
+static uint64_t elapsed_since(uint64_t now, uint64_t then) {
+    return now > then ? now - then : 0;
+}
+
 static void bucket_refill(ratelimiter_bucket_t* bucket, ratelimiter_config_t* config) {
     uint64_t now = ratelimiter_get_time_ns();
-    uint64_t last_refill = atomic_load(&bucket->last_refill_ns);
-    uint64_t elapsed_ns = now - last_refill;
+    uint64_t elapsed_ns = elapsed_since(now, atomic_load(&bucket->last_refill_ns));
 
-    uint64_t tokens_to_add = (elapsed_ns * config->refill_rate) / 1000000000ULL;
+    /* elapsed_ns * refill_rate переполняет uint64_t после долгой паузы (2^60 нс
+     * при 16/с дают ровно 2^64, то есть 0 токенов); такая пауза в любом случае
+     * наполняет корзину целиком. */
+    uint64_t tokens_to_add = elapsed_ns > UINT64_MAX / config->refill_rate
+        ? UINT64_MAX
+        : (elapsed_ns * config->refill_rate) / 1000000000ULL;
 
     if (tokens_to_add > 0) {
         uint32_t current_tokens = atomic_load(&bucket->tokens);
-        uint32_t new_tokens = current_tokens + (uint32_t)tokens_to_add;
+        uint32_t room = current_tokens < config->max_tokens ? config->max_tokens - current_tokens : 0;
 
-        if (new_tokens > config->max_tokens) {
-            new_tokens = config->max_tokens;
-        }
+        /* Сравнение до сложения: приведение tokens_to_add к uint32_t обнуляло
+         * пополнение ровно в 2^32 токенов. */
+        uint32_t new_tokens = tokens_to_add >= room ? config->max_tokens : current_tokens + (uint32_t)tokens_to_add;
 
         atomic_store(&bucket->tokens, new_tokens);
         atomic_store(&bucket->last_refill_ns, now);
@@ -186,7 +207,7 @@ static void cleanup_old_buckets(ratelimiter_t* limiter) {
     uint64_t last_cleanup = atomic_load(&limiter->last_cleanup_ns);
 
     uint64_t cleanup_interval_ns = (uint64_t)limiter->config.cleanup_interval_s * 1000000000ULL;
-    if (now - last_cleanup < cleanup_interval_ns) {
+    if (elapsed_since(now, last_cleanup) < cleanup_interval_ns) {
         return;
     }
 
@@ -203,7 +224,7 @@ static void cleanup_old_buckets(ratelimiter_t* limiter) {
     for (map_iterator_t it = map_begin(limiter->buckets); map_iterator_valid(it); it = map_next(it)) {
         ratelimiter_bucket_t* bucket = map_iterator_value(it);
         uint64_t last_access = atomic_load(&bucket->last_access_ns);
-        if (now - last_access > cleanup_interval_ns) {
+        if (elapsed_since(now, last_access) > cleanup_interval_ns) {
             to_delete_count++;
         }
     }
@@ -215,7 +236,7 @@ static void cleanup_old_buckets(ratelimiter_t* limiter) {
             for (map_iterator_t it = map_begin(limiter->buckets); map_iterator_valid(it); it = map_next(it)) {
                 ratelimiter_bucket_t* bucket = map_iterator_value(it);
                 uint64_t last_access = atomic_load(&bucket->last_access_ns);
-                if (now - last_access > cleanup_interval_ns) {
+                if (elapsed_since(now, last_access) > cleanup_interval_ns) {
                     keys_to_delete[idx++] = bucket->key;
                 }
             }
@@ -267,7 +288,7 @@ int ratelimiter_allow(ratelimiter_t* limiter, const ipaddr_t* ip, uint32_t token
 
     cleanup_old_buckets(limiter);
     
-    if (limiter->config.refill_rate == 0)
+    if (limiter->config.refill_rate == 0 || ip == NULL)
         return 1;
 
     ratelimiter_bucket_t* bucket = find_or_create_bucket(limiter, ipaddr_client_key(ip));

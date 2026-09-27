@@ -70,4 +70,12 @@ int ratelimiter_allow(ratelimiter_t* limiter, const ipaddr_t* ip, uint32_t token
  */
 uint64_t ratelimiter_get_time_ns(void);
 
+/**
+ * Подменить часы лимитера; NULL возвращает CLOCK_MONOTONIC.
+ * По образцу quic_time_set_source (quictime.h): пополнение и очистка заданы
+ * через прошедшее время, и проверить их можно только, управляя часами.
+ * Только для однопоточных тестов: указатель не синхронизирован.
+ */
+void ratelimiter_set_time_source(uint64_t (*source)(void));
+
 #endif
