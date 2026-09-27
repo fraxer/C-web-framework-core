@@ -142,11 +142,15 @@ void dbresult_free(dbresult_t* result) {
     free(result);
 }
 
+/* The cursor moves only onto a position that exists: `>=`, not `==`, or a
+ * result with no rows (or no columns) has a "next" forever; a set to an index
+ * outside the table is refused, since dbresult_cell would index with it. */
 int dbresult_row_next(dbresult_t* result) {
+    if (result == NULL) return 0;
     dbresultquery_t* query = result->current;
 
     if (query == NULL) return 0;
-    if (query->current_row + 1 == query->rows) return 0;
+    if (query->current_row + 1 >= query->rows) return 0;
 
     query->current_row++;
 
@@ -154,10 +158,11 @@ int dbresult_row_next(dbresult_t* result) {
 }
 
 int dbresult_col_next(dbresult_t* result) {
+    if (result == NULL) return 0;
     dbresultquery_t* query = result->current;
 
     if (query == NULL) return 0;
-    if (query->current_col + 1 == query->cols) return 0;
+    if (query->current_col + 1 >= query->cols) return 0;
 
     query->current_col++;
 
@@ -165,10 +170,11 @@ int dbresult_col_next(dbresult_t* result) {
 }
 
 int dbresult_row_set(dbresult_t* result, int index) {
+    if (result == NULL) return 0;
     dbresultquery_t* query = result->current;
 
     if (query == NULL) return 0;
-    if (index + 1 == query->rows) return 0;
+    if (index < 0 || index >= query->rows) return 0;
 
     query->current_row = index;
 
@@ -176,10 +182,11 @@ int dbresult_row_set(dbresult_t* result, int index) {
 }
 
 int dbresult_col_set(dbresult_t* result, int index) {
+    if (result == NULL) return 0;
     dbresultquery_t* query = result->current;
 
     if (query == NULL) return 0;
-    if (index + 1 == query->cols) return 0;
+    if (index < 0 || index >= query->cols) return 0;
 
     query->current_col = index;
 
@@ -187,6 +194,7 @@ int dbresult_col_set(dbresult_t* result, int index) {
 }
 
 dbresultquery_t* dbresult_query_next(dbresult_t* result) {
+    if (result == NULL) return NULL;
     if (result->current == NULL) return NULL;
     if (result->current->next == NULL) return NULL;
 
@@ -203,6 +211,7 @@ int dbresult_query_rows(dbresult_t* result) {
 }
 
 int dbresult_query_cols(dbresult_t* result) {
+    if (result == NULL) return 0;
     if (result->current == NULL) return 0;
 
     return result->current->cols;
@@ -217,6 +226,7 @@ const char* dbresult_col_name(dbresult_t* result, int col) {
 }
 
 db_table_cell_t* dbresult_field(dbresult_t* result, const char* field) {
+    if (result == NULL || result->current == NULL) return NULL;
     if (field == NULL) return dbresult_cell(result, result->current->current_row, result->current->current_col);
 
     return __dbresult_field(result, field);
@@ -249,11 +259,12 @@ db_table_cell_t* __dbresult_field(dbresult_t* result, const char* field) {
 }
 
 db_table_cell_t* dbresult_cell(dbresult_t* result, int row, int col) {
+    if (result == NULL) return NULL;
     dbresultquery_t* query = result->current;
 
     if (query == NULL) return NULL;
     if (query->table == NULL) return NULL;
-    if (row >= query->rows || col >= query->cols) return NULL;
+    if (row < 0 || col < 0 || row >= query->rows || col >= query->cols) return NULL;
 
     return &query->table[row * query->cols + col];
 }
