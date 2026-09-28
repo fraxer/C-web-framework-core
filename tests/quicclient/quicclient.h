@@ -47,6 +47,9 @@
  * reusable (quicclient_stream_release), so a run that opens hundreds one after
  * another needs no more than this. */
 #define CLIENT_MAX_STREAMS 64
+/* The most quicclient_inject takes: what is left of a packet after the header,
+ * the acknowledgement and the tag. */
+#define CLIENT_MAX_INJECT 1100
 
 typedef struct clientstream {
     uint64_t      id;
@@ -207,6 +210,7 @@ typedef struct quicclient {
      * those look identical without this. */
     int      close_received;
     uint64_t close_error;
+    int      close_is_app;           /* 0x1d rather than 0x1c */
 
     /* A stateless reset arrived (RFC 9000 §10.3): the server has no state for
      * this connection any more. Recognised by the 16-byte token at the end,
@@ -387,6 +391,13 @@ typedef struct quicclient {
      * working one from the outside, and that is exactly what a client whose
      * request went out at the 1-RTT level instead would look like. */
     uint64_t early_data_sent_packets;
+
+    /* Frame bytes for the next packet at `inject_level`, written verbatim after
+     * the acknowledgement (quicclient_inject). */
+    uint8_t  inject[CLIENT_MAX_INJECT];
+    size_t   inject_len;
+    int      inject_level;
+    int      inject_queued;
 } quicclient_t;
 
 /* Impair the path in both directions. Percentages are per datagram; `seed` of 0
@@ -443,6 +454,16 @@ int quicclient_retire_cid(quicclient_t* client, uint64_t seq);
  * see §19.15 enforced. One frame is queued at a time. */
 int quicclient_new_cid(quicclient_t* client, uint64_t seq,
                        uint64_t retire_prior_to, uint8_t fill);
+
+/* Put `len` bytes of frames, exactly as given, into the next packet built at
+ * `level`, right after its acknowledgement. The bytes go through the real
+ * packet protection, so the server opens them and hands them to its frame loop
+ * like any other payload -- which is the point: a fuzz target can then reach
+ * frames the client would never write, or write wrong, and a damaged packet
+ * could not deliver. One payload at a time; 0 if one is already queued or it
+ * is larger than CLIENT_MAX_INJECT. */
+int quicclient_inject(quicclient_t* client, quic_enc_level_e level,
+                      const uint8_t* data, size_t len);
 
 /* Whether the server has sent RETIRE_CONNECTION_ID for `seq`. */
 int quicclient_saw_retire(const quicclient_t* client, uint64_t seq);

@@ -1478,10 +1478,23 @@ static int __handle_frame(quicconn_t* conn, quic_enc_level_e level,
         return 1;
     }
 
+    case QUIC_FRAME_STREAM_DATA_BLOCKED: {
+        /* Advisory like the rest of its family, but it names a stream, and
+         * that is not advisory: it speaks about the peer's send side, so on a
+         * stream only we send on it is STREAM_STATE_ERROR (§19.13), past the
+         * limit it is STREAM_LIMIT_ERROR (§4.6), and an unseen peer stream it
+         * opens like a STREAM frame would (§3.2) -- the same four cases as
+         * RESET_STREAM. Both errors are MUSTs, and the frame used to be
+         * dropped unread (found by the fuzz target quic_frames). */
+        int ignore = 0;
+        quicstream_t* s = __stream_for_recv_frame(conn, frame->u.stream_data_blocked.id,
+                                                  now_us, &ignore);
+        return s != NULL ? 1 : ignore;
+    }
+
     case QUIC_FRAME_MAX_STREAMS_BIDI:
     case QUIC_FRAME_MAX_STREAMS_UNI:
     case QUIC_FRAME_DATA_BLOCKED:
-    case QUIC_FRAME_STREAM_DATA_BLOCKED:
     case QUIC_FRAME_STREAMS_BLOCKED_BIDI:
     case QUIC_FRAME_STREAMS_BLOCKED_UNI:
         /* The BLOCKED family is advisory: it tells us the peer is stuck, which
