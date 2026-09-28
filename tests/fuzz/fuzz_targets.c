@@ -5674,16 +5674,14 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
  * across two reads is ordinary, and the parser's resumption is state like any
  * other.
  *
- * Run this one with detect_leaks=0. A dispatched response is owned in turn by
- * the stream, the publish queue, the worker's write pass and the response
- * pool, and the teardown below imitates as much of that as it can reach --
- * ctx.parser so the session is findable, one guarded write pass to drain the
- * queue, the pool emptied, the pending-handler flags cleared. It is still not
- * the event loop, and what remains is reported as leaked. That is a limit of
- * this fixture and not a finding about the session: it cannot be read either
- * way, which is exactly why the option is off rather than the report ignored.
- * ASan and UBSan stay on, and between them they are what found the null
- * memcpy in h2_on_headers that this target's first run turned up. */
+ * LeakSanitizer is on. It was off for a long time, with every dispatched
+ * request reported as leaked: the fixture's context lacked is_http2, so the
+ * dispatcher built an HTTP/1.1 response that no stream owned. With the flag
+ * set, as h2_server_set_http2 sets it, a response belongs to its stream and
+ * goes with it through the pool, and the teardown below -- one write pass to
+ * drain the publish queue, the pending-handler flags cleared, the session
+ * freed -- releases everything. ASan and UBSan found the null memcpy in
+ * h2_on_headers on this target's first run. */
 
 static uint64_t __fuzz_now_ms(void) {
     struct timespec ts;
@@ -5740,6 +5738,10 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     connection_server_ctx_t ctx;
     memset(&ctx, 0, sizeof ctx);
     ctx.listener = &__fuzz_listener;
+    /* What h2_server_set_http2 sets: without it a dispatched request got an
+     * HTTP/1.1 response, taken from the connection's cache and never bound to
+     * its stream, and nothing the teardown can reach owned it. */
+    ctx.is_http2 = 1;
     connection.ctx = (connection_ctx_t*)&ctx;
 
     h2session_t* s = __fuzz_h2_session_create(&connection);
@@ -5781,9 +5783,9 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
      * fd -1, which fails and is meant to. */
     (void)h2_server_guard_write(&connection);
 
-    httpresponse_t* parked;
-    while ((parked = h2_server_take_response(&connection)) != NULL)
-        httpresponse_free(parked);
+    /* The response pool goes with the session (h2_session_free). Emptying it
+     * here is no option: on an empty pool h2_server_take_response makes a new
+     * response, and a loop waiting for NULL never ends. */
 
     /* No handler ever reports back in here, so a stream that dispatched is
      * still marked as having one in flight, and a stream in that state keeps

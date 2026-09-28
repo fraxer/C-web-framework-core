@@ -1,0 +1,10 @@
+[Unit]
+Description=cwfr fuzzing, every night
+
+[Timer]
+OnCalendar=*-*-* 01:30:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

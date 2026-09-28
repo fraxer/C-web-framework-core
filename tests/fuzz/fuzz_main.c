@@ -13,6 +13,7 @@
  * which bytes caused it has found nothing.
  *
  * Usage: fuzz_<target> [-seconds=N] [-runs=N] [-seed=N] [corpus_dir]
+ *        fuzz_<target> -minimize=OUT_DIR [-base=SEED_DIR] corpus_dir
  */
 
 #define _GNU_SOURCE
@@ -347,8 +348,8 @@ static char __crash_path[4096];
  * Without it every run re-derives the same inputs from the seeds, and §5's
  * "24 hours per target" would mean 24 hours in one sitting. Named by content
  * hash, so re-running never duplicates an entry. */
-static void __corpus_save(const uint8_t* data, size_t len) {
-    if (__corpus_dir == NULL) return;
+static void __save_to(const char* dir, const uint8_t* data, size_t len) {
+    if (dir == NULL) return;
 
     uint64_t h = 1469598103934665603ULL;
     for (size_t i = 0; i < len; i++) {
@@ -357,14 +358,17 @@ static void __corpus_save(const uint8_t* data, size_t len) {
     }
 
     char path[4096];
-    snprintf(path, sizeof path, "%s/id-%016llx", __corpus_dir,
-             (unsigned long long)h);
+    snprintf(path, sizeof path, "%s/id-%016llx", dir, (unsigned long long)h);
 
     FILE* f = fopen(path, "wb");
     if (f == NULL) return;
 
     fwrite(data, 1, len, f);
     fclose(f);
+}
+
+static void __corpus_save(const uint8_t* data, size_t len) {
+    __save_to(__corpus_dir, data, len);
 }
 
 void __sanitizer_set_death_callback(void (*callback)(void));
@@ -422,10 +426,77 @@ static void __run(const uint8_t* data, size_t len) {
     __current = NULL;
 }
 
+/* ---- Minimisation ----
+ *
+ * The inputs of `corpus_dir` that reach something `base_dir` does not, and the
+ * fewest of them: every input is run, smallest first, and one is kept when it
+ * adds an edge nothing before it reached. Kept inputs go to `out_dir`, named by
+ * content like everything the fuzzer saves. With the seeds as the base, what
+ * comes out is what a long run has to add to them (tests/fuzz/minimize.sh).
+ *
+ * Coverage is checked once more on the base and the kept inputs alone: a
+ * target whose edges depend on more than its input (threads, time) can lose
+ * some, and that is said rather than hidden. */
+static int __input_cmp(const void* a, const void* b) {
+    const input_t* x = a;
+    const input_t* y = b;
+    if (x->len != y->len) return x->len < y->len ? -1 : 1;
+    return x->len == 0 ? 0 : memcmp(x->data, y->data, x->len);
+}
+
+static int __minimize(const char* base_dir, const char* corpus_dir, const char* out_dir,
+                      size_t* kept_out, size_t* total_out) {
+    memset(__cov_map, 0, sizeof __cov_map);
+
+    if (base_dir != NULL) __corpus_load(base_dir);
+    const size_t base = __corpus_count;
+    for (size_t i = 0; i < base; i++) __run(__corpus[i].data, __corpus[i].len);
+
+    __corpus_load(corpus_dir);
+    const size_t total = __corpus_count - base;
+    qsort(__corpus + base, total, sizeof __corpus[0], __input_cmp);
+
+    size_t kept = 0;
+    size_t cov = __cov_count();
+    for (size_t i = base; i < __corpus_count; i++) {
+        __run(__corpus[i].data, __corpus[i].len);
+        const size_t now = __cov_count();
+        if (now > cov) {
+            __save_to(out_dir, __corpus[i].data, __corpus[i].len);
+            /* Kept in place, for the check below. */
+            __corpus[base + kept++] = __corpus[i];
+            if (base + kept - 1 != i) __corpus[i].data = NULL;
+            cov = now;
+        } else {
+            free(__corpus[i].data);
+            __corpus[i].data = NULL;
+        }
+    }
+    __corpus_count = base + kept;
+
+    memset(__cov_map, 0, sizeof __cov_map);
+    for (size_t i = 0; i < __corpus_count; i++) __run(__corpus[i].data, __corpus[i].len);
+    const size_t again = __cov_count();
+    if (again != cov)
+        fprintf(stderr, "[fuzz] minimised set reaches %zu edges, the whole corpus %zu: "
+                        "the target's coverage depends on more than its input\n", again, cov);
+
+    printf("minimised %s: kept %zu of %zu inputs, %zu edges\n", corpus_dir, kept, total, cov);
+
+    for (size_t i = 0; i < __corpus_count; i++) free(__corpus[i].data);
+    __corpus_count = 0;
+
+    if (kept_out != NULL) *kept_out = kept;
+    if (total_out != NULL) *total_out = total;
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     unsigned seconds = 60;
     uint64_t runs = 0;   /* 0 = unlimited, bounded by time */
     const char* corpus_dir = NULL;
+    const char* minimize_dir = NULL;
+    const char* base_dir = NULL;
     int replay_only = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -436,6 +507,8 @@ int main(int argc, char* argv[]) {
         else if (strncmp(argv[i], "-dict=", 6) == 0) __dict_load(argv[i] + 6);
         else if (strncmp(argv[i], "-timeout=", 9) == 0) __input_timeout = (unsigned)strtoul(argv[i] + 9, NULL, 10);
         else if (strncmp(argv[i], "-max_len=", 9) == 0) __input_max = (size_t)strtoull(argv[i] + 9, NULL, 10);
+        else if (strncmp(argv[i], "-minimize=", 10) == 0) minimize_dir = argv[i] + 10;
+        else if (strncmp(argv[i], "-base=", 6) == 0) base_dir = argv[i] + 6;
         else corpus_dir = argv[i];
     }
 
@@ -443,6 +516,19 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "[fuzz] timeout and max_len must be positive; max_len <= %u\n", INPUT_LIMIT);
         return 2;
     }
+    if (minimize_dir != NULL) {
+        if (corpus_dir == NULL) {
+            fprintf(stderr, "[fuzz] -minimize needs a corpus directory\n");
+            return 2;
+        }
+        snprintf(__crash_path, sizeof __crash_path, "%s/crash-%u.bin", __artifact_dir, (unsigned)getpid());
+        __sanitizer_set_death_callback(__on_death);
+        signal(SIGILL, __on_signal);
+        signal(SIGABRT, __on_signal);
+        signal(SIGALRM, __on_signal);
+        return __minimize(base_dir, corpus_dir, minimize_dir, NULL, NULL) == 0 ? 0 : 2;
+    }
+
     if (corpus_dir != NULL) {
         struct stat st;
         replay_only = stat(corpus_dir, &st) == 0 && S_ISREG(st.st_mode);

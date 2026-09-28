@@ -294,17 +294,12 @@ if(BUILD_FUZZERS STREQUAL "yes")
     set(FUZZ_ID_quic_token 44)
     set(FUZZ_ID_quic_version 45)
     set(FUZZ_ID_h3_session 46)
+    set(FUZZ_ID_route 47)
 
     foreach(name ${FUZZ_TARGET_NAMES})
         set(exe fuzz_${name})
 
-        # h2_session: see the comment above its target in fuzz_targets.c.
-        set(fuzz_leak_option)
-        if(name STREQUAL h2_session)
-            set(fuzz_leak_option NO_LEAK_CHECK)
-        endif()
-
-        cwfr_add_fuzzer(${exe} ${fuzz_leak_option}
+        cwfr_add_fuzzer(${exe}
             SOURCES fuzz/fuzz_targets.c
             CORPUS "${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus/${name}"
             DICTIONARY "${CMAKE_CURRENT_SOURCE_DIR}/fuzz/dict/${name}.dict"

@@ -864,12 +864,11 @@ sizes, and what it tests is what the previous frame left behind -- the stream
 table, flow control, the token buckets. The named HTTP/2 denial-of-service
 families live at that level and none of them is a malformed frame: Rapid Reset
 and a CONTINUATION flood are both sequences of correct ones, which a target
-that validates frames in isolation cannot reach. It runs with
-`detect_leaks=0`, and the comment on the target says why at length: a
-dispatched response is owned in turn by the stream, the publish queue, the
-worker's write pass and the response pool, and a fixture without an event loop
-cannot follow it all the way. ASan and UBSan stay on, and they are what turned
-up the null `memcpy` in `h2_on_headers` on this target's first run.
+that validates frames in isolation cannot reach. LeakSanitizer is on: it was
+off while the fixture's context lacked `is_http2`, which made every dispatched
+request's response an HTTP/1.1 one that no stream owned. ASan and UBSan are
+what turned up the null `memcpy` in `h2_on_headers` on this target's first
+run.
 
 `request` is the one with a fixture rather than a bare call: `httpparser_run`
 wants a connection, a server context and a configuration to ask about
@@ -971,9 +970,29 @@ script, Dockerfile and `project.yaml` — with its own readme.
 
 `tests/ci.sh fuzz` is the gate; `FUZZ_PROFILE=long tests/ci.sh fuzz` is the
 scheduled run. A reproducer belongs in the seed corpus once the bug behind it
-is fixed, next to a unit test that pins the fix. Targets registered with
-`NO_LEAK_CHECK` (`h2_session`) run with `detect_leaks=0` both here and under
-OSS-Fuzz, where `build.sh` writes the matching `.options` file.
+is fixed, next to a unit test that pins the fix. A target registered with
+`NO_LEAK_CHECK` would run with `detect_leaks=0` both here and under OSS-Fuzz,
+where `build.sh` writes the matching `.options` file; none is at present.
+
+The schedule is `tests/fuzz/schedule/`: `scheduled.sh` runs the long profile
+of `tests/ci.sh fuzz` in both builds (`FUZZ_SECONDS` per target, one hour by
+default), minimises what the corpora grew into, and on a failure hands a
+report -- the failed targets and how each reproduces -- to
+`FUZZ_NOTIFY_COMMAND` on stdin (`logger` unless set: a mail pipe or a webhook
+fit as well). `cwfr-fuzz.service` and `cwfr-fuzz.timer` run it every night on
+a build server, configured from `/etc/cwfr-fuzz.env` (`fuzz.env.example`);
+installing them is a step on that server, not something the repository does.
+`CI_BUILD_DIR` must persist between runs: the corpora grow there.
+
+Growth comes back through `tests/fuzz/minimize.sh BUILD_DIR [RESULTS_DIR]
+[--apply]`. For each target it runs the driver's `-minimize=OUT -base=SEEDS
+CORPUS` mode, which runs every input smallest first and keeps one only when it
+reaches an edge nothing before it did, starting from what the seeds reach --
+so the result is what the run has to add to the seeds, and no more. It lands
+in `RESULTS_DIR/<target>/minimized/`; `--apply` copies it into the seed
+directory, named by content, beside the hand-named seeds. The driver checks
+the kept set once more on its own and says so when a target's edges depend on
+more than its input.
 
 `corpus/hpack/regression_dynamic_index_oob.bin` is there for a different
 reason, and stands for no bug this code ever had: the bounds check in
