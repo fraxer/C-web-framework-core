@@ -2197,9 +2197,13 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
 #elif FUZZ_TARGET == FUZZ_H2_CONNECTION
 
+#include "httpcontext.h"
+#include "route.h"
 #include "wscontext.h"
 
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 
@@ -2231,7 +2235,14 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
  *     the client's SETTINGS, GOAWAY's last stream id never grows.
  *
  * Requests are answered from a directory with a small file and one larger
- * than the default 64 KiB window, so a response has to wait for credit. */
+ * than the default 64 KiB window, so a response has to wait for credit, and
+ * /h/... by a handler, which goes through the handler queue and reports back
+ * with h2_server_response_ready. With the first input byte odd the queue is
+ * run by a real worker thread, concurrently with the event-loop calls, the way
+ * the server runs it: a handler then finishes whenever the thread gets to it,
+ * in the middle of a read pass or a write pass. Such a run does not replay
+ * exactly, and is not meant to -- it is the publish queue and the locks that
+ * are under test, and ASan reports what they get wrong. */
 
 #define H2C_STREAMS 256
 
@@ -2502,8 +2513,30 @@ static void __h2c_ws_answer(void* arg) {
 
 /* Once per process: a document root with one small and one large file,
  * removed again when the process exits normally. */
+/* The handler behind /h/...: a body of the path's length, so the answer
+ * differs per request. */
+static void __h2c_handler(void* arg) {
+    httpctx_t* ctx = arg;
+    char body[512];
+    const size_t n = ctx->request->path_length < sizeof body ? ctx->request->path_length : sizeof body;
+    memset(body, 'h', n);
+    ctx->response->send_datan(ctx->response, body, n);
+}
+
+static atomic_int __h2c_stop;
+
+static void* __h2c_worker_thread(void* arg) {
+    (void)arg;
+    while (!atomic_load(&__h2c_stop))
+        if (!__fuzz_worker()) sched_yield();
+    return NULL;
+}
+
 static void __h2c_root_init(void) {
     if (__h2c_root[0] != '\0') return;
+    route_t* handled = route_create("^/h/(.*)$");
+    if (handled == NULL || !route_set_http_handler(handled, "GET", __h2c_handler, NULL)) abort();
+    __fuzz_server.http.route = handled;
     __fuzz_server.websockets.configured = 1;
     __fuzz_server.websockets.default_handler = __h2c_ws_answer;
     if (!connection_queue_init()) abort();
@@ -2575,6 +2608,11 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     int alive = h2_server_set_http2(connection) && c->hpack != NULL;
 
+    const int threaded = data[0] & 1;
+    pthread_t worker;
+    atomic_store(&__h2c_stop, 0);
+    if (threaded && pthread_create(&worker, NULL, __h2c_worker_thread, NULL) != 0) abort();
+
     uint64_t rng = (uint64_t)data[0] * 0x9E3779B97F4A7C15ULL + 1;
     const uint8_t* p = data + 1;
     const uint8_t* end = data + size;
@@ -2605,12 +2643,20 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         }
         case 1: alive = h2_server_guard_read(connection); break;
         case 2:
-            /* Handlers queued since the last write have run by now. */
-            while (__fuzz_worker()) {}
+            /* Handlers queued since the last write have run by now -- or, with
+             * the worker thread, whenever it got to them. */
+            if (!threaded) while (__fuzz_worker()) {}
             alive = h2_server_guard_write(connection);
             break;
         case 3: (void)__h2c_pump(c, sv[1], amount * 8); break;
         }
+    }
+
+    /* The worker stops before the drain, which is then the same either way:
+     * what it left in the queue runs here. */
+    if (threaded) {
+        atomic_store(&__h2c_stop, 1);
+        pthread_join(worker, NULL);
     }
 
     /* Drain: whatever the server still has to say, until it stops. */
