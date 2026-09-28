@@ -448,6 +448,11 @@ static int __minimize(const char* base_dir, const char* corpus_dir, const char* 
                       size_t* kept_out, size_t* total_out) {
     memset(__cov_map, 0, sizeof __cov_map);
 
+    /* Every input whole, whatever -max_len says: a long run grows inputs up
+     * to 256 KiB, and one cut to the default 8 KiB loses whatever it reached
+     * past that -- and would be written back, cut. */
+    __input_max = INPUT_LIMIT;
+
     if (base_dir != NULL) __corpus_load(base_dir);
     const size_t base = __corpus_count;
     for (size_t i = 0; i < base; i++) __run(__corpus[i].data, __corpus[i].len);
