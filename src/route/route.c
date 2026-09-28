@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include <string.h>
 
 #include "log.h"
@@ -17,12 +18,14 @@
 typedef struct route_parser {
     int is_primitive;
     int params_count;
-    unsigned short int dirty_pos;
-    unsigned short int pos;
+    /* size_t, not the unsigned short they were: a location past 65535 bytes
+     * wrapped them and the scan never found the end of the string. */
+    size_t dirty_pos;
+    size_t pos;
     /* `location` is the pattern and `path` is the literal string a primitive
      * route is compared against, and they are no longer the same text: a dot is
      * escaped in the pattern and plain in the path. Two cursors, one pass. */
-    unsigned short int path_pos;
+    size_t path_pos;
     const char* dirty_location;
     char* path;
     char* location;
@@ -62,15 +65,32 @@ route_t* route_create(const char* dirty_location) {
 
     int error_code = 0;
     PCRE2_SIZE error_offset = 0;
-    route->location = pcre2_compile((PCRE2_SPTR)parser.location, PCRE2_ZERO_TERMINATED, 0, &error_code, &error_offset, NULL);
+    /* The path is percent-decoded before matching and may hold a newline:
+     * '.' matches it and '$' is the end of the path, as the primitive
+     * comparison already has it (redirect.c says the same). */
+    route->location = pcre2_compile((PCRE2_SPTR)parser.location, PCRE2_ZERO_TERMINATED,
+                                    PCRE2_DOTALL | PCRE2_DOLLAR_ENDONLY,
+                                    &error_code, &error_offset, NULL);
 
     if (route->location == NULL) {
-        /* Get error message */
         PCRE2_UCHAR error_buffer[256];
         pcre2_get_error_message(error_code, error_buffer, sizeof(error_buffer));
-        route->location_error = (char*)strdup((char*)error_buffer);
-        route->location_erroffset = (int)error_offset;
+        log_error("Route error: %s at %zu in \"%s\"\n", (char*)error_buffer,
+                  (size_t)error_offset, dirty_location);
         goto failed;
+    }
+
+    uint32_t captures = 0;
+    if (pcre2_pattern_info(route->location, PCRE2_INFO_CAPTURECOUNT, &captures) != 0) goto failed;
+    route->captures = (int)captures;
+
+    int index = 1;
+    for (route_param_t* param = parser.first_param; param != NULL; param = param->next, index++) {
+        char name[16];
+        snprintf(name, sizeof name, "_p%d", index);
+        const int group = pcre2_substring_number_from_name(route->location, (PCRE2_SPTR)name);
+        if (group <= 0) goto failed;
+        param->group = group;
     }
 
     route->is_primitive = parser.is_primitive;
@@ -86,6 +106,7 @@ route_t* route_create(const char* dirty_location) {
     failed:
 
     if (result == -1 && route) {
+        if (route->location != NULL) pcre2_code_free(route->location);
         free(route);
         route = NULL;
     }
@@ -105,7 +126,6 @@ route_t* route_init_route() {
 
     route->path = NULL;
     route->path_length = 0;
-    route->location_error = NULL;
 
     route->handler[ROUTE_GET] = NULL;
     route->handler[ROUTE_POST] = NULL;
@@ -120,10 +140,10 @@ route_t* route_init_route() {
         route->cache_control[i] = NULL;
     }
 
-    route->location_erroffset = 0;
     route->location = NULL;
     route->is_primitive = 0;
     route->params_count = 0;
+    route->captures = 0;
     route->param = NULL;
     route->next = NULL;
     route->ratelimiter = NULL;
@@ -138,9 +158,10 @@ int route_init_parser(route_parser_t* parser, const char* dirty_location) {
     parser->pos = 0;
     parser->path_pos = 0;
     parser->dirty_location = dirty_location;
-    /* Twice the input plus the anchors: escaping a metacharacter adds a byte,
-     * and in the worst case every byte is one. */
-    const size_t room = strlen(dirty_location) * 2 + 3; // + ^, + $, + \0
+    /* Escaping a metacharacter doubles a byte, and a param's "{n|" becomes
+     * "(?<_pN>" -- at most ten bytes for three. Five times the input plus the
+     * anchors covers both. */
+    const size_t room = strlen(dirty_location) * 5 + 16;
     parser->path = calloc(room, 1);
     parser->location = calloc(room, 1);
     parser->first_param = NULL;
@@ -154,17 +175,25 @@ int route_init_parser(route_parser_t* parser, const char* dirty_location) {
     return 0;
 }
 
-/* Is this location plain text -- no {param} tokens and nothing PCRE reads as an
- * operator? Only then may '.' and '?' be taken literally: an operator anywhere
- * in the string means the author is writing a pattern, and "/assets/(.*)" must
- * keep meaning what it says.
+/* Is the text outside the {param} tokens plain -- nothing PCRE reads as an
+ * operator? Only then may '.' and '?' there be taken literally: an operator
+ * means the author is writing a pattern, and "/assets/(.*)" must keep meaning
+ * what it says. A token is the author's pattern by definition and is not
+ * looked at: "/files/{name|[a-z]+}.json" means a dot before "json", not any
+ * character (found by the fuzz target route).
  *
  * '.' and '?' are deliberately absent from this list: they are what the answer
  * decides about, and counting them would make every dotted path a pattern. */
 static int __location_is_literal(const char* location) {
+    size_t depth = 0;
+
     for (const char* p = location; *p != 0; p++) {
+        if (*p == '{') { depth++; continue; }
+        if (*p == '}') { if (depth > 0) depth--; continue; }
+        if (depth > 0) continue;
+
         switch (*p) {
-        case '{': case '}': case '*': case '+': case '(': case ')':
+        case '*': case '+': case '(': case ')':
         case '[': case ']': case '|': case '^': case '$': case '\\':
             return 0;
         default:
@@ -277,7 +306,7 @@ int route_parse_token(route_parser_t* parser) {
 
     int separator_found = 0;
     int brakets_count = 0;
-    int start = parser->pos;
+    size_t start = parser->pos;
     int symbol_finded = 0;
 
     if (route_alloc_param(parser) == -1) return -1;
@@ -298,7 +327,7 @@ int route_parse_token(route_parser_t* parser) {
                 log_error(ROUTE_EMPTY_TOKEN, parser->dirty_location);
                 return -1;
             }
-            if (parser->pos - start <= 1) { // only "(" emitted, expression is empty
+            if (parser->pos == start) { // only the group's opening emitted, expression is empty
                 log_error(ROUTE_EMPTY_PARAM_EXPRESSION, parser->dirty_location);
                 return -1;
             }
@@ -348,7 +377,14 @@ int route_parse_token(route_parser_t* parser) {
             symbol_finded = 0;
             if (route_fill_param(parser) == -1) return -1;
             parser->pos = start;
-            route_insert_custom_symbol(parser, '(');
+            {
+                /* Named, so the param's group can be found whatever groups its
+                 * own expression or an earlier one opens (route_create). */
+                char open[24];
+                const int n = snprintf(open, sizeof open, "(?<_p%d>", parser->params_count);
+                for (int i = 0; i < n; i++) route_insert_custom_symbol(parser, open[i]);
+            }
+            start = parser->pos;
             break;
         default:
             route_insert_symbol(parser);
@@ -399,6 +435,7 @@ int route_alloc_param(route_parser_t* parser) {
 
     param->start = parser->pos;
     param->end = parser->pos;
+    param->group = 0;
     param->string_len = 0;
     param->string = NULL;
     param->next = NULL;
@@ -525,6 +562,16 @@ int route_set_http_static(route_t* route, const char* method, const char* static
         route_drop_ratelimiter(route, ratelimiter);
         return 0;
     }
+
+    /* {N} is expanded from the match's offsets, and there are only as many as
+     * the location has groups: a larger N read past them. */
+    if (strtemplate_max_param(route->static_file[m]) > route->captures) {
+        log_error(ROUTE_BAD_STATIC_FILE, static_file);
+        strtemplate_free(route->static_file[m]);
+        route->static_file[m] = NULL;
+        route_drop_ratelimiter(route, ratelimiter);
+        return 0;
+    }
     route_own_ratelimiter(route, ratelimiter);
 
     return 1;
@@ -581,7 +628,6 @@ void routes_free(route_t* route) {
 
         if (route->location != NULL)
             pcre2_code_free(route->location);
-        free((void*)route->location_error);  /* strdup'd in pcre2_compile error path */
 
         for (int i = 0; i < 7; i++) {
             strtemplate_free(route->static_file[i]);
@@ -596,11 +642,53 @@ void routes_free(route_t* route) {
     }
 }
 
-int route_compare_primitive(route_t* route, const char* path, size_t length) {
+int route_compare_primitive(const route_t* route, const char* path, size_t length) {
     if (route->path_length != length) return 0;
 
     for (size_t i = 0; i < length; i++)
         if (route->path[i] != path[i]) return 0;
 
     return 1;
+}
+int route_vector_size(const route_t* route) {
+    return route == NULL ? 0 : (route->captures + 1) * 2;
+}
+
+int route_match(const route_t* route, const char* path, size_t length,
+                int* vector, int vector_size) {
+    if (route == NULL || path == NULL || vector == NULL || vector_size < 2) return -1;
+
+    for (int i = 0; i < vector_size; i++) vector[i] = -1;
+
+    /* A primitive location is answered by the comparison alone, whichever way
+     * it goes. Its pattern is the same string anchored at both ends
+     * (route_parse_location clears `is_primitive` for anything PCRE reads as
+     * more than itself), so running it after a miss asks the same question a
+     * second time and pays a pcre2_match for the answer it already has. With a
+     * handful of routes on the server that was the top line of the profile --
+     * 5.4% of the worker, all of it in libpcre. */
+    if (route->is_primitive) {
+        if (!route_compare_primitive(route, path, length)) return 0;
+        vector[0] = 0;
+        vector[1] = (int)length;
+        return 1;
+    }
+
+    pcre2_match_data* match_data = pcre2_match_data_create_from_pattern(route->location, NULL);
+    if (match_data == NULL) return -1;
+
+    const int rc = pcre2_match(route->location, (PCRE2_SPTR)path, length, 0, 0, match_data, NULL);
+    if (rc > 0) {
+        const PCRE2_SIZE* ovector = pcre2_get_ovector_pointer(match_data);
+        const uint32_t pairs = pcre2_get_ovector_count(match_data);
+
+        for (uint32_t i = 0; i < pairs && (int)(i * 2 + 1) < vector_size; i++) {
+            if (ovector[i * 2] == PCRE2_UNSET) continue;
+            vector[i * 2] = (int)ovector[i * 2];
+            vector[i * 2 + 1] = (int)ovector[i * 2 + 1];
+        }
+    }
+    pcre2_match_data_free(match_data);
+
+    return rc > 0;
 }

@@ -568,3 +568,108 @@ TEST(test_route_dot_with_named_param_is_still_allowed) {
 
     routes_free(r);
 }
+
+/* The value route_match gives a named param, as the server would store it. */
+static int route_param_value(const route_t* r, const int* vector, const char* path,
+                             const char* name, char* out, size_t cap) {
+    for (const route_param_t* p = r->param; p != NULL; p = p->next) {
+        if (strcmp(p->string, name) != 0) continue;
+        const int start = vector[p->group * 2], end = vector[p->group * 2 + 1];
+        if (start < 0 || (size_t)(end - start) >= cap) return 0;
+        memcpy(out, path + start, (size_t)(end - start));
+        out[end - start] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+TEST(test_route_match_param_after_group_in_expression) {
+    TEST_CASE("a group inside one param's expression does not shift the next param");
+    /* Params used to be read as capture groups 1, 2, ... in order, so "(en|ru)"
+     * inside the first one handed the second one the first one's inner group.
+     * Found by the fuzz target route. */
+    route_t* r = route_create("/{lang|(en|ru)}/{page|[a-z]+}");
+    TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
+
+    const char* path = "/ru/about";
+    int vector[32];
+    TEST_REQUIRE(route_vector_size(r) <= 32, "vector fits");
+    TEST_ASSERT_EQUAL(1, route_match(r, path, strlen(path), vector, route_vector_size(r)), "matches");
+
+    char value[32];
+    TEST_ASSERT(route_param_value(r, vector, path, "lang", value, sizeof value) &&
+                strcmp(value, "ru") == 0, "lang");
+    TEST_ASSERT(route_param_value(r, vector, path, "page", value, sizeof value) &&
+                strcmp(value, "about") == 0, "page");
+
+    routes_free(r);
+}
+
+TEST(test_route_match_primitive) {
+    TEST_CASE("a primitive route matches by comparison and reports the whole path");
+    route_t* r = route_create("/health");
+    TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
+
+    int vector[2] = { 7, 7 };
+    TEST_ASSERT_EQUAL(2, route_vector_size(r), "one pair");
+    TEST_ASSERT_EQUAL(1, route_match(r, "/health", 7, vector, 2), "matches");
+    TEST_ASSERT(vector[0] == 0 && vector[1] == 7, "the whole path");
+    TEST_ASSERT_EQUAL(0, route_match(r, "/healthz", 8, vector, 2), "not a prefix");
+
+    routes_free(r);
+}
+
+TEST(test_route_dot_next_to_param_is_literal) {
+    TEST_CASE("'.' outside a {param} of a param route means a dot");
+    /* The same rule as for a plain location: nobody writing
+     * "/files/{name|...}.json" means "any character before json". */
+    route_t* r = route_create("/files/{name|[a-z]+}.json");
+    TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
+
+    int vector[8];
+    TEST_REQUIRE(route_vector_size(r) <= 8, "vector fits");
+    TEST_ASSERT_EQUAL(1, route_match(r, "/files/report.json", 18, vector, route_vector_size(r)),
+                      "the dot matches a dot");
+    TEST_ASSERT_EQUAL(0, route_match(r, "/files/reportxjson", 18, vector, route_vector_size(r)),
+                      "and nothing else");
+
+    routes_free(r);
+}
+
+TEST(test_route_static_file_beyond_captures_refused) {
+    TEST_CASE("a static_file placeholder must name a group the location has");
+    /* {N} is expanded from the match's offsets; a group that does not exist
+     * was read from past the end of the offsets the server keeps. */
+    route_t* r = route_create("^/assets/(.*)$");
+    TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
+    TEST_ASSERT_EQUAL(1, route_set_http_static(r, "GET", "/files/{1}", NULL), "{1} exists");
+    TEST_ASSERT_EQUAL(0, route_set_http_static(r, "HEAD", "/files/{2}", NULL), "{2} does not");
+    routes_free(r);
+
+    r = route_create("/plain");
+    TEST_REQUIRE_NOT_NULL(r, "route_create should succeed");
+    TEST_ASSERT_EQUAL(0, route_set_http_static(r, "GET", "/files/{1}", NULL), "a plain route has none");
+    routes_free(r);
+}
+
+TEST(test_route_long_location) {
+    TEST_CASE("a location longer than 65535 bytes");
+    /* The parser's positions were unsigned short: past 65535 they wrapped and
+     * the scan never reached the end of the string. Now it returns -- with a
+     * refusal, since PCRE2 does not compile a pattern this long, or with a
+     * route that works. */
+    const size_t n = 70000;
+    char* location = malloc(n + 1);
+    TEST_REQUIRE_NOT_NULL(location, "allocated");
+    location[0] = '/';
+    memset(location + 1, 'a', n - 1);
+    location[n] = 0;
+
+    route_t* r = route_create(location);
+    if (r != NULL) {
+        int vector[2];
+        TEST_ASSERT_EQUAL(1, route_match(r, location, n, vector, 2), "matches itself");
+    }
+    routes_free(r);
+    free(location);
+}

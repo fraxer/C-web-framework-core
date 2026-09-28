@@ -108,86 +108,50 @@ int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t
     for (route_t* route = ctx->server->websockets.route; route; route = route->next) {
         ratelimiter_t* ratelimiter = __ratelimiter_find(&ctx->server->websockets, route);
 
-        /* Same shortcut as the HTTP dispatcher: a primitive location that did
-         * not compare equal cannot match its own pattern either. */
-        if (route->is_primitive) {
-            if (!route_compare_primitive(route, protocol->path, protocol->path_length))
-                continue;
-
-            if (route->handler[protocol->method] == NULL) continue;
-
-            if (!websockets_deferred_handler(connection, request, websockets_queue_request_handler, route->handler[protocol->method], websockets_queue_data_request_create, ratelimiter))
-                return 0;
-
-            return 1;
-        }
-
-        int vector_size = route->params_count > 0 ? route->params_count * 6 : 20 * 6;
+        const int vector_size = route_vector_size(route);
         int vector[vector_size];
+        const int matched = route_match(route, protocol->path, protocol->path_length,
+                                        vector, vector_size);
+        if (matched < 0) return 0;
+        if (matched == 0) continue;
 
-        // find resource by template (PCRE2)
-        pcre2_match_data* match_data = pcre2_match_data_create_from_pattern(route->location, NULL);
-        if (match_data == NULL) return 0;
+        /* Skip the route before materializing its params: a matching route
+         * without a handler for this method used to append its params to the
+         * chain and then continue to the next route, polluting the params the
+         * dispatched route sees. */
+        if (route->handler[protocol->method] == NULL) continue;
 
-        int matches_count = pcre2_match(route->location, (PCRE2_SPTR)protocol->path, protocol->path_length, 0, 0, match_data, NULL);
+        query_t* last_query = websocketsrequest_last_query_item(protocol);
 
-        if (matches_count > 0) {
-            /* Copy ovector to vector for backward compatibility */
-            PCRE2_SIZE* ovector = pcre2_get_ovector_pointer(match_data);
-            int copy_count = (matches_count * 2 < vector_size) ? (matches_count * 2) : vector_size;
-            for (int i = 0; i < copy_count; i++) {
-                vector[i] = (int)ovector[i];
-            }
-        }
-        pcre2_match_data_free(match_data);
+        for (route_param_t* param = route->param; param; param = param->next) {
+            const int start = vector[param->group * 2];
+            if (start < 0) continue;
 
-        if (matches_count > 1) {
-            /* Skip the route before materializing its params: a matching
-             * route without a handler for this method used to append its
-             * params to the chain and then continue to the next route,
-             * polluting the params the dispatched route sees. */
-            if (route->handler[protocol->method] == NULL) continue;
+            const size_t substring_length = (size_t)(vector[param->group * 2 + 1] - start);
 
-            int i = 1; // escape full string match
+            query_t* query = query_create(param->string, param->string_len, &protocol->path[start], substring_length);
 
-            query_t* last_query = websocketsrequest_last_query_item(protocol);
-
-            for (route_param_t* param = route->param; param; param = param->next, i++) {
-                size_t substring_length = vector[i * 2 + 1] - vector[i * 2];
-
-                query_t* query = query_create(param->string, param->string_len, &protocol->path[vector[i * 2]], substring_length);
-
-                if (query == NULL || query->key == NULL || query->value == NULL) {
-                    query_free(query);
-                    return 0;
-                }
-
-                /* The chain head must land in protocol->query_: with no query
-                 * string in the location last_query starts NULL, and params
-                 * linked only through the local tail were invisible to
-                 * get_query and leaked (reset frees only protocol->query_). */
-                if (last_query)
-                    last_query->next = query;
-                else
-                    protocol->query_ = query;
-
-                last_query = query;
+            if (query == NULL || query->key == NULL || query->value == NULL) {
+                query_free(query);
+                return 0;
             }
 
-            if (!websockets_deferred_handler(connection, request, websockets_queue_request_handler, route->handler[protocol->method], websockets_queue_data_request_create, ratelimiter))
-                return 0;
+            /* The chain head must land in protocol->query_: with no query
+             * string in the location last_query starts NULL, and params
+             * linked only through the local tail were invisible to
+             * get_query and leaked (reset frees only protocol->query_). */
+            if (last_query)
+                last_query->next = query;
+            else
+                protocol->query_ = query;
 
-            return 1;
+            last_query = query;
         }
-        else if (matches_count == 1) {
-            if (route->handler[protocol->method] == NULL)
-                continue;
 
-            if (!websockets_deferred_handler(connection, request, websockets_queue_request_handler, route->handler[protocol->method], websockets_queue_data_request_create, ratelimiter))
-                return 0;
+        if (!websockets_deferred_handler(connection, request, websockets_queue_request_handler, route->handler[protocol->method], websockets_queue_data_request_create, ratelimiter))
+            return 0;
 
-            return 1;
-        }
+        return 1;
     }
 
     return 0;

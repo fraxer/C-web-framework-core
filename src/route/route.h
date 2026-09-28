@@ -20,20 +20,25 @@ typedef enum route_methods {
 } route_methods_e;
 
 typedef struct route_param {
-    unsigned short int start;
-    unsigned short int end;
+    size_t start;
+    size_t end;
+    /* The capture group that holds the value. Not the param's position: a
+     * group inside an expression ("{lang|(en|ru)}") shifts every group after
+     * it, so each param's group is named (_p1, _p2, ...) and looked up once
+     * the location is compiled. */
+    int group;
     size_t string_len;
     char* string;
     struct route_param* next;
 } route_param_t;
 
 typedef struct route {
-    int location_erroffset;
     int is_primitive;
     int params_count;
+    /* Capture groups of the compiled location, the params' included. */
+    int captures;
     char* path;
     size_t path_length;
-    const char* location_error;
     pcre2_code* location;
     route_param_t* param;
     struct route* next;
@@ -55,6 +60,17 @@ int route_set_http_static(route_t*, const char* method, const char* static_file,
 int route_set_http_cache_control(route_t*, const char* method, const char* cache_control);
 int route_set_websockets_handler(route_t*, const char*, void(*)(void*), ratelimiter_t* ratelimiter);
 void routes_free(route_t* route);
-int route_compare_primitive(route_t*, const char*, size_t);
+int route_compare_primitive(const route_t*, const char*, size_t);
+
+/* How many ints route_match writes: a (start, end) pair for the whole match
+ * and one for each capture group. */
+int route_vector_size(const route_t* route);
+
+/* Does `path` match the route? `vector` receives the offsets route_vector_size
+ * describes, -1 for a group that took no part; a param's value is the pair of
+ * its `group`. A primitive route is answered by comparison and reports only the
+ * whole path. Returns 1 on a match, 0 on none, -1 when out of memory. */
+int route_match(const route_t* route, const char* path, size_t length,
+                int* vector, int vector_size);
 
 #endif
