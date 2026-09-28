@@ -214,7 +214,12 @@ quic_token_status_e quic_token_read(const uint8_t* token, size_t token_len,
     size_t q = 0;
     if (p < 1 + 8 + 1) return QUIC_TOKEN_BAD;
 
-    const quic_token_kind_e kind = (quic_token_kind_e)plain[q++];
+    /* Laid out exactly as quic_token_write lays it out, or not ours: only a
+     * holder of the key can get past the AEAD with anything else, and nothing
+     * should read it the way it reads a token we issued. */
+    const uint8_t kind_byte = plain[q++];
+    if (kind_byte != QUIC_TOKEN_RETRY && kind_byte != QUIC_TOKEN_NEW_TOKEN) return QUIC_TOKEN_BAD;
+    const quic_token_kind_e kind = (quic_token_kind_e)kind_byte;
 
     uint64_t issued = 0;
     for (int i = 0; i < 8; i++)
@@ -228,7 +233,8 @@ quic_token_status_e quic_token_read(const uint8_t* token, size_t token_len,
     q += addr_len;
 
     const uint8_t odcid_len = plain[q++];
-    if (odcid_len > QUIC_MAX_CID_LEN || q + odcid_len > p) return QUIC_TOKEN_BAD;
+    if (odcid_len > QUIC_MAX_CID_LEN || q + odcid_len != p) return QUIC_TOKEN_BAD;
+    if (kind == QUIC_TOKEN_NEW_TOKEN && odcid_len != 0) return QUIC_TOKEN_BAD;
 
     /* Kind before anything else: a Retry token presented where a NEW_TOKEN is
      * expected (or the reverse) is a different claim about the client, and

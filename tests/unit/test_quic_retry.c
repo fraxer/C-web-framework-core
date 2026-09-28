@@ -4,6 +4,7 @@
 #include "quicversion.h"
 
 #include <arpa/inet.h>
+#include <openssl/evp.h>
 #include <string.h>
 
 /* Retry packets and address validation tokens (RFC 9000 §8, RFC 9001 §5.8).
@@ -291,4 +292,65 @@ TEST(test_quic_token) {
     TEST_ASSERT(quic_token_write(token, sizeof token, key, QUIC_TOKEN_RETRY,
                                  (struct sockaddr*)&peer, sizeof peer, NULL, now) == 0,
                 "refused");
+}
+
+/* Seal `plain` under `key` the way quic_token_write does: nonce, ciphertext,
+ * tag. What a holder of the key could make; nobody else can reach the reader's
+ * parsing at all. */
+static size_t seal(const uint8_t key[32], const uint8_t* plain, size_t p, uint8_t* out) {
+    static const uint8_t nonce[12] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    memcpy(out, nonce, sizeof nonce);
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    int len = 0, ok = ctx != NULL;
+    size_t n = sizeof nonce;
+    ok = ok && EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, nonce) == 1;
+    ok = ok && EVP_EncryptUpdate(ctx, out + n, &len, plain, (int)p) == 1;
+    if (ok) n += (size_t)len;
+    ok = ok && EVP_EncryptFinal_ex(ctx, out + n, &len) == 1;
+    if (ok) n += (size_t)len;
+    ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, 16, out + n) == 1;
+    EVP_CIPHER_CTX_free(ctx);
+
+    return ok ? n + 16 : 0;
+}
+
+TEST(test_quic_token_layout) {
+    TEST_SUITE("quic_retry");
+    /* The reader accepts what quic_token_write lays out and nothing else, even
+     * under the right key. Found by the fuzz target quic_token. */
+    uint8_t key[32];
+    memset(key, 0x7e, sizeof key);
+    struct sockaddr_in peer = addr_v4("192.0.2.10", 44444);
+    const uint64_t now = 1000000000ULL;
+
+    /* kind | timestamp | address length | address | odcid length | odcid */
+    uint8_t plain[64] = { QUIC_TOKEN_RETRY, 0, 0, 0, 0, 0x3b, 0x9a, 0xca, 0x00,
+                          4, 192, 0, 2, 10, 2, 0xaa, 0xbb };
+    const size_t p = 17;
+    uint8_t token[QUIC_TOKEN_MAX_LEN];
+    quiccid_t odcid;
+
+    TEST_CASE("as issued");
+    size_t n = seal(key, plain, p, token);
+    TEST_ASSERT(quic_token_read(token, n, key, QUIC_TOKEN_RETRY, (struct sockaddr*)&peer,
+                                sizeof peer, now, 1000, &odcid) == QUIC_TOKEN_OK, "accepted");
+    TEST_ASSERT(odcid.len == 2 && odcid.data[0] == 0xaa && odcid.data[1] == 0xbb, "odcid");
+
+    TEST_CASE("a byte past the odcid");
+    n = seal(key, plain, p + 1, token);
+    TEST_ASSERT(quic_token_read(token, n, key, QUIC_TOKEN_RETRY, (struct sockaddr*)&peer,
+                                sizeof peer, now, 1000, &odcid) == QUIC_TOKEN_BAD, "rejected");
+
+    TEST_CASE("an odcid in a NEW_TOKEN");
+    plain[0] = QUIC_TOKEN_NEW_TOKEN;
+    n = seal(key, plain, p, token);
+    TEST_ASSERT(quic_token_read(token, n, key, QUIC_TOKEN_NEW_TOKEN, (struct sockaddr*)&peer,
+                                sizeof peer, now, 1000, &odcid) == QUIC_TOKEN_BAD, "rejected");
+
+    TEST_CASE("a kind that does not exist");
+    plain[0] = 2;
+    n = seal(key, plain, p, token);
+    TEST_ASSERT(quic_token_read(token, n, key, QUIC_TOKEN_RETRY, (struct sockaddr*)&peer,
+                                sizeof peer, now, 1000, &odcid) == QUIC_TOKEN_BAD, "rejected");
 }
