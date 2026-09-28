@@ -544,3 +544,63 @@ TEST(test_redirect_query_greedy_group) {
 
     redirect_free(r);
 }
+
+/* A destination for a decoded path that may hold any byte: matched and
+ * expanded through the calls the server makes, with lengths, not strlen. */
+static char* redirect_uri_for(redirect_t* r, const char* path, size_t path_length,
+                              const char* uri) {
+    int vector[30];
+    memset(vector, -1, sizeof vector);
+    if (!redirect_matches(r, path, path_length, vector, 30)) return NULL;
+    return redirect_uri_with_query(r, path, vector, uri, strlen(uri));
+}
+
+TEST(test_redirect_capture_is_percent_encoded) {
+    TEST_SUITE("redirect: what the path brings");
+    /* The path is percent-decoded before matching, so a capture can hold any
+     * byte a client encoded: CR LF made the Location two fields, '?' and '#'
+     * moved the rest of the path into a query or a fragment, and a second
+     * decoding (an internal redirect parses the destination again) turned %25
+     * into a '%' of its own. The capture goes back encoded. Found by the fuzz
+     * target route. */
+    redirect_t* r = redirect_create("^/old/(.*)$", "https://example.com/new/{1}");
+    TEST_REQUIRE_NOT_NULL(r, "redirect_create should succeed");
+
+    TEST_CASE("CR, LF and a space");
+    static const char crlf[] = "/old/a\r\nSet-Cookie: x";
+    char* uri = redirect_uri_for(r, crlf, sizeof crlf - 1, "/old/a%0D%0ASet-Cookie:%20x");
+    TEST_ASSERT_STR_EQUAL("https://example.com/new/a%0D%0ASet-Cookie:%20x", uri, "encoded");
+    free(uri);
+
+    TEST_CASE("what a URI reads as structure");
+    static const char structure[] = "/old/a?b#c%d&e=f+g";
+    uri = redirect_uri_for(r, structure, sizeof structure - 1, "/old/x");
+    TEST_ASSERT_STR_EQUAL("https://example.com/new/a%3Fb%23c%25d%26e%3Df%2Bg", uri, "encoded");
+    free(uri);
+
+    TEST_CASE("NUL and UTF-8");
+    static const char bytes[] = "/old/a\0caf\xc3\xa9";
+    uri = redirect_uri_for(r, bytes, sizeof bytes - 1, "/old/x");
+    TEST_ASSERT_STR_EQUAL("https://example.com/new/a%00caf%C3%A9", uri, "encoded");
+    free(uri);
+
+    TEST_CASE("what a path may hold stays as it is");
+    static const char plain[] = "/old/a-b_c.d~e/f:g@h!$'()*,;";
+    uri = redirect_uri_for(r, plain, sizeof plain - 1, "/old/x");
+    TEST_ASSERT_STR_EQUAL("https://example.com/new/a-b_c.d~e/f:g@h!$'()*,;", uri, "unchanged");
+    free(uri);
+
+    redirect_free(r);
+}
+
+TEST(test_redirect_carried_query_has_no_controls) {
+    TEST_SUITE("redirect: what the path brings");
+    TEST_CASE("control bytes in the carried query are encoded");
+    redirect_t* r = redirect_create("^/old$", "/new");
+    TEST_REQUIRE_NOT_NULL(r, "redirect_create should succeed");
+
+    char* uri = redirect_uri_for(r, "/old", 4, "/old?a=1\r\nb= \x7f");
+    TEST_ASSERT_STR_EQUAL("/new?a=1%0D%0Ab=%20%7F", uri, "the query's own structure kept");
+    free(uri);
+    redirect_free(r);
+}
