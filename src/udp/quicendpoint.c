@@ -1051,13 +1051,12 @@ size_t quicendpoint_versions(const quicversion_t** out, size_t cap) {
     return n;
 }
 
-static void __send_version_negotiation(quicendpoint_t* ep, const udp_datagram_t* dgram,
-                                       const quicinvariants_t* inv) {
-    if (!__budget_spend(&__quic_vn_bucket, atomic_load(&__quic_vn_rate),
-                        atomic_load(&__quic_vn_burst))) {
-        metrics_quic(METRICS_QUIC_DROP_NO_BUDGET);
-        return;
-    }
+size_t quicendpoint_version_negotiation(const quicinvariants_t* inv, size_t dgram_len,
+                                        uint8_t unused_bits, uint8_t* dst, size_t cap) {
+    if (inv == NULL || dst == NULL) return 0;
+    if (!inv->long_header || quic_invariants_is_version_negotiation(inv)) return 0;
+    if (dgram_len < QUIC_MIN_INITIAL_DATAGRAM) return 0;
+    if (__version_accept(inv->version) != NULL) return 0;
 
     /* Offer what we implement *and* are willing to speak, plus a reserved
      * version, so that a client cannot come to depend on the exact list
@@ -1070,19 +1069,36 @@ static void __send_version_negotiation(quicendpoint_t* ep, const udp_datagram_t*
     const quicversion_t* const* all = quicversion_all(&known);
     for (size_t i = 0; i < known && version_count < (sizeof versions / sizeof versions[0]) - 1; i++)
         if (__version_offered(all[i])) versions[version_count++] = all[i]->number;
-    versions[version_count++] = QUIC_VERSION_GREASE;
+    /* Never the version the client asked for, reserved or not: §6.2 has it
+     * discard a list that holds its own choice, and a reserved version is
+     * exactly what a client picks to force negotiation. Another one from the
+     * same pattern (§15) instead. */
+    versions[version_count++] = inv->version == QUIC_VERSION_GREASE
+        ? QUIC_VERSION_GREASE + 0x10101010u : QUIC_VERSION_GREASE;
+
+    /* Swapped: our Destination is their Source. Passing them the other way
+     * round produces a packet the client silently ignores. */
+    const size_t len = quic_invariants_write_version_negotiation(
+        dst, cap, &inv->scid, &inv->dcid, unused_bits, versions, version_count);
+
+    return len < dgram_len ? len : 0;
+}
+
+static void __send_version_negotiation(quicendpoint_t* ep, const udp_datagram_t* dgram,
+                                       const quicinvariants_t* inv) {
+    if (!__budget_spend(&__quic_vn_bucket, atomic_load(&__quic_vn_rate),
+                        atomic_load(&__quic_vn_burst))) {
+        metrics_quic(METRICS_QUIC_DROP_NO_BUDGET);
+        return;
+    }
 
     uint8_t unused = 0;
     if (RAND_bytes(&unused, 1) != 1) unused = 0;
 
     uint8_t packet[64];
-    /* Swapped: our Destination is their Source. Passing them the other way
-     * round produces a packet the client silently ignores. */
-    const size_t len = quic_invariants_write_version_negotiation(
-        packet, sizeof packet, &inv->scid, &inv->dcid, unused,
-        versions, version_count);
-
-    if (len == 0 || len >= dgram->len) {
+    const size_t len = quicendpoint_version_negotiation(inv, dgram->len, unused,
+                                                        packet, sizeof packet);
+    if (len == 0) {
         metrics_quic(METRICS_QUIC_DROP_UNKNOWN_CID);
         return;
     }

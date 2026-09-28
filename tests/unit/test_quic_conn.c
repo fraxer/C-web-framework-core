@@ -2884,3 +2884,74 @@ TEST(test_quic_stand_dplpmtud) {
     free(body);
     __stand_free(s);
 }
+
+TEST(test_quic_endpoint_version_negotiation) {
+    TEST_SUITE("quic_endpoint");
+    /* RFC 9000 §6.1: a long header with a version we do not speak, in a
+     * datagram big enough to carry an Initial, is answered with the versions we
+     * do -- and nothing else is. */
+    uint8_t dgram[1200];
+    memset(dgram, 0, sizeof dgram);
+    const uint8_t head[] = { 0xc0, 0xba, 0xba, 0xba, 0xba, 3, 1, 2, 3, 2, 9, 8 };
+    memcpy(dgram, head, sizeof head);
+
+    quicinvariants_t inv;
+    TEST_REQUIRE(quic_invariants_parse(dgram, sizeof dgram, QUIC_LOCAL_CID_LEN, &inv) == QUICINV_OK,
+                 "parsed");
+
+    uint8_t vn[128];
+    TEST_CASE("an unknown version");
+    const size_t n = quicendpoint_version_negotiation(&inv, sizeof dgram, 0x2a, vn, sizeof vn);
+    TEST_ASSERT(n > 0, "answered");
+
+    quicinvariants_t back;
+    TEST_REQUIRE(quic_invariants_parse(vn, n, QUIC_LOCAL_CID_LEN, &back) == QUICINV_OK, "readable");
+    TEST_ASSERT(quic_invariants_is_version_negotiation(&back), "a Version Negotiation packet");
+    TEST_ASSERT((vn[0] & 0x7f) == 0x2a, "with the unused bits given");
+    TEST_ASSERT(back.dcid.len == 2 && back.dcid.data[0] == 9, "to the client's source id");
+    TEST_ASSERT(back.scid.len == 3 && back.scid.data[0] == 1, "from its destination id");
+    TEST_ASSERT((n - back.header_len) % 4 == 0, "whole versions");
+
+    int v1 = 0, grease = 0, asked = 0;
+    for (size_t i = back.header_len; i + 4 <= n; i += 4) {
+        const uint32_t v = (uint32_t)vn[i] << 24 | (uint32_t)vn[i + 1] << 16 |
+                           (uint32_t)vn[i + 2] << 8 | vn[i + 3];
+        if (v == QUIC_VERSION_1) v1 = 1;
+        if (v == QUIC_VERSION_GREASE) grease = 1;
+        if (v == 0xbabababau) asked = 1;
+    }
+    TEST_ASSERT(v1 && grease && !asked, "v1 and a reserved version, not the one asked for");
+
+    TEST_CASE("a client that asked with our own reserved version");
+    /* §6.2: a client discards a list that has the version it chose, and a
+     * reserved version is what a client picks to force negotiation. Found by
+     * the fuzz target quic_version. */
+    quicinvariants_t greased = inv;
+    greased.version = QUIC_VERSION_GREASE;
+    const size_t g = quicendpoint_version_negotiation(&greased, sizeof dgram, 0, vn, sizeof vn);
+    TEST_ASSERT(g == n, "answered as long");
+    int listed = 0, reserved = 0;
+    for (size_t i = back.header_len; i + 4 <= g; i += 4) {
+        const uint32_t v = (uint32_t)vn[i] << 24 | (uint32_t)vn[i + 1] << 16 |
+                           (uint32_t)vn[i + 2] << 8 | vn[i + 3];
+        if (v == QUIC_VERSION_GREASE) listed = 1;
+        if ((v & 0x0f0f0f0fu) == 0x0a0a0a0au) reserved = 1;
+    }
+    TEST_ASSERT(!listed && reserved, "another reserved version instead");
+
+    TEST_CASE("nothing else is answered");
+    TEST_ASSERT(quicendpoint_version_negotiation(&inv, sizeof dgram - 1, 0, vn, sizeof vn) == 0,
+                "a datagram under 1200 bytes");
+    TEST_ASSERT(quicendpoint_version_negotiation(&inv, sizeof dgram, 0, vn, n - 1) == 0,
+                "no room");
+    inv.version = QUIC_VERSION_1;
+    TEST_ASSERT(quicendpoint_version_negotiation(&inv, sizeof dgram, 0, vn, sizeof vn) == 0,
+                "a version we speak");
+    inv.version = 0;
+    TEST_ASSERT(quicendpoint_version_negotiation(&inv, sizeof dgram, 0, vn, sizeof vn) == 0,
+                "a Version Negotiation packet");
+    inv.version = 0xbabababau;
+    inv.long_header = 0;
+    TEST_ASSERT(quicendpoint_version_negotiation(&inv, sizeof dgram, 0, vn, sizeof vn) == 0,
+                "a short header");
+}

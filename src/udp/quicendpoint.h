@@ -40,6 +40,7 @@
  * seen inside a parameter list would be a different, incompatible type. */
 struct quicconn;
 struct quicpath;
+struct quicinvariants;
 
 typedef struct quicendpoint {
     /* MUST be first: the endpoint's connection stores &endpoint->listener in
@@ -424,6 +425,19 @@ int  quicendpoint_reset_token(const quiccid_t* cid, uint8_t out[16]);
  * The connection layer needs it for RFC 9368 §2.3: a version may only be
  * chosen if both ends offer it, and "we offer it" is this list. */
 size_t quicendpoint_versions(const quicversion_t** out, size_t cap);
+
+/* The Version Negotiation packet owed for a datagram of `dgram_len` bytes that
+ * opens with the invariant header `inv` (RFC 9000 §6.1), written to `dst`: the
+ * versions quicendpoint_versions lists and a reserved one, the connection ids
+ * swapped, `unused_bits` in the seven bits §17.2.1 leaves arbitrary.
+ *
+ * 0 when none is owed -- a short header, a Version Negotiation packet, a version
+ * accepted, a datagram too small to carry an Initial (§14.1) -- and when the
+ * answer would not be smaller than the datagram or does not fit `cap`. What
+ * decides to send it is here, apart from the rate limit and the socket, so
+ * that it can be checked without either. */
+size_t quicendpoint_version_negotiation(const struct quicinvariants* inv, size_t dgram_len,
+                                        uint8_t unused_bits, uint8_t* dst, size_t cap);
 
 /* A NEW_TOKEN for a peer whose address is now proven (§8.1.3): something it can
  * present on its *next* connection to skip the Retry round trip. Returns the
