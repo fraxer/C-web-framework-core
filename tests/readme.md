@@ -469,7 +469,7 @@ Targets, each with a seed corpus under `fuzz/corpus/`:
 | `websocket_sequence` | one WebSocket connection: fragmented, compressed and control frames across reads |
 | `qpack_dynamic` | the QPACK encoder stream changing a live dynamic table under a field section |
 | `qpack_session` | our QPACK encoder and decoder joined by both service streams |
-| `h2_connection` | a whole HTTP/2 connection through the event-loop entry points, over a socket that takes writes in part |
+| `h2_connection` | a whole HTTP/2 connection through the event-loop entry points, over a socket that takes writes in part; handlers answer through the queue, and with an odd first byte a real worker thread runs it concurrently |
 | `quic_stream` | QUIC stream reassembly (`quicrecvbuf`) and range sets (`quicrange`) against models |
 | `h3_request` | an HTTP/3 request stream: frame order, FIN, the body |
 | `http_response` | the HTTP/1.1 client reading a server's response: Content-Length, chunked, gzip |
