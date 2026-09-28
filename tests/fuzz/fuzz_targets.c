@@ -9229,8 +9229,8 @@ static size_t __h3p_fields(const uint8_t** data, size_t* size, h3p_field_t* out,
     for (size_t i = 0; i < n && *size >= 2; i++) {
         h3p_field_t* f = &out[count];
         /* A token of a name, never empty; a value of any byte but CR, LF and
-         * NUL, which RFC 9114 §4.2 forbids in a field and nothing on the
-         * server's path claims to filter. */
+         * NUL. The other controls are left in: the response drops a field
+         * that holds one, and the checks below expect exactly that. */
         size_t nl = 1 + (*data)[0] % (sizeof f->name - 1);
         size_t vl = (*data)[1] % sizeof f->value;
         (*data) += 2; (*size) -= 2;
@@ -9278,10 +9278,22 @@ static void __h3p_check_section(const qpack_header_t* f, size_t n, int is_traile
 
 /* Every field the handler added and the chain leaves alone, with its value.
  * Several copies of one name: each value must be there. */
+/* Whether the response keeps a field with this value: one holding a C0
+ * control other than HTAB, or DEL, is dropped where the handler adds it
+ * (httpresponse.c, h2_field_response_value_valid). */
+static int __h3p_value_kept(const h3p_field_t* w) {
+    for (size_t i = 0; i < w->value_len; i++) {
+        const unsigned char c = (unsigned char)w->value[i];
+        if (c == 0x7f || (c < 0x20 && c != '\t')) return 0;
+    }
+    return 1;
+}
+
 static void __h3p_expect_fields(const qpack_header_t* f, size_t n, const h3p_field_t* want, size_t count) {
     for (size_t k = 0; k < count; k++) {
         const h3p_field_t* w = &want[k];
         if (__h3p_chain_owned(w->name, w->name_len) || w->name[0] == ':') continue;
+        if (!__h3p_value_kept(w)) continue;
         int found = 0;
         for (size_t i = 0; i < n && !found; i++)
             found = __h3p_ieq(f[i].name, f[i].name_len, w->name, w->name_len) &&
@@ -9502,7 +9514,8 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     size_t kept = 0;
     for (size_t i = 0; i < ntrailers; i++)
         if (!__h3p_connection_specific(trailers[i].name, trailers[i].name_len) &&
-            !__h3p_ieq(trailers[i].name, trailers[i].name_len, "content-length", 14))
+            !__h3p_ieq(trailers[i].name, trailers[i].name_len, "content-length", 14) &&
+            __h3p_value_kept(&trailers[i]))
             kept++;
     if (sections == 2) {
         __h3p_check_section(tail, ntail, 1);
@@ -13346,6 +13359,600 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     quic_time_set_source(NULL);
     if (quicmemory_current() != budget_before) __builtin_trap();
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_ROUTE
+
+#include "domain.h"
+#include "idn_utils.h"
+#include "redirect.h"
+#include "route.h"
+#include "strtemplate.h"
+
+/* Routing: the location templates of routes and redirects, the destinations
+ * redirects expand, and the virtual host a Host field selects. The templates
+ * come from configuration, but the path and the Host they are matched against
+ * come from the request.
+ *
+ * route (first byte % 6 == 0 or 1): a location built from literal text -- '.'
+ * and '?' included -- and {name|expression} params, or from literal text and
+ * raw regex with no params. The target writes its own regex for it: literal
+ * text escaped, each param a named group around its expression, anchored when
+ * there are params or nothing but text, unanchored for a raw regex. A path
+ * built to match (then perhaps damaged) or taken from the input must get the
+ * same answer from route_match as from that regex, every param the value of
+ * its own group and a substring of the path. A static_file placeholder is
+ * accepted exactly when the location has that group.
+ *
+ * raw route (2): any location. When it compiles, route_match agrees with its
+ * compiled pattern on any path -- the primitive comparison included -- and
+ * params lie inside the path.
+ *
+ * redirect (3): a location of literal text and capture groups, some optional,
+ * and a destination spending every group. On any path -- CR, LF, NUL, '?',
+ * UTF-8 -- the result is the destination's own text with each capture
+ * percent-encoded as strtemplate.h says, plus the request's query when the
+ * destination has none, control bytes encoded: never a byte below 0x21 or
+ * above 0x7e. A literal location answers as its pattern does.
+ *
+ * domain (4, 5): a vhost template of labels, a Unicode one perhaps, with '*'
+ * at either end, and a Host built from it -- case changed, labels for the '*',
+ * a port, a trailing dot, punycode or not -- or taken from the input.
+ * domain_host_normalize agrees with a normaliser written here, and
+ * domain_matches with a glob match written here; a literal template answers as
+ * its pattern does. */
+
+#define RT_TOKENS 8
+
+typedef struct {
+    const uint8_t* p;
+    const uint8_t* end;
+} rt_in_t;
+
+static uint8_t __rt_u8(rt_in_t* in) {
+    return in->p < in->end ? *in->p++ : 0;
+}
+
+typedef struct {
+    char   b[4096];
+    size_t n;
+} rt_buf_t;
+
+static void __rt_put(rt_buf_t* s, const char* text, size_t n) {
+    if (s->n + n >= sizeof s->b) n = sizeof s->b - 1 - s->n;
+    memcpy(s->b + s->n, text, n);
+    s->n += n;
+    s->b[s->n] = 0;
+}
+
+static void __rt_puts(rt_buf_t* s, const char* text) {
+    __rt_put(s, text, strlen(text));
+}
+
+static void __rt_putc(rt_buf_t* s, char c) {
+    __rt_put(s, &c, 1);
+}
+
+static pcre2_code* __rt_compile(const char* pattern) {
+    int error = 0;
+    PCRE2_SIZE offset = 0;
+    return pcre2_compile((PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
+                         PCRE2_DOTALL | PCRE2_DOLLAR_ENDONLY, &error, &offset, NULL);
+}
+
+/* Offsets of every group, -1 when unset; the match's return, or 0. */
+static int __rt_pcre(const pcre2_code* code, const char* s, size_t n, int* v, int vn) {
+    for (int i = 0; i < vn; i++) v[i] = -1;
+    pcre2_match_data* md = pcre2_match_data_create_from_pattern(code, NULL);
+    if (md == NULL) return -1;
+    const int rc = pcre2_match(code, (PCRE2_SPTR)s, n, 0, 0, md, NULL);
+    if (rc > 0) {
+        const PCRE2_SIZE* ov = pcre2_get_ovector_pointer(md);
+        const uint32_t pairs = pcre2_get_ovector_count(md);
+        for (uint32_t i = 0; i < pairs && (int)(2 * i + 1) < vn; i++) {
+            if (ov[2 * i] == PCRE2_UNSET) continue;
+            v[2 * i] = (int)ov[2 * i];
+            v[2 * i + 1] = (int)ov[2 * i + 1];
+        }
+    }
+    pcre2_match_data_free(md);
+    return rc > 0;
+}
+
+/* ---- route ---- */
+
+static const char* __rt_lit_chars = "abcxyz019-_~/.?";
+
+/* Expressions a param may carry, each with a way to write a value it takes.
+ * Two open groups of their own, one has a quantifier in braces. */
+static const char* __rt_exprs[] = {
+    "[0-9]+", "[a-z]+", "[^/]+", "(en|ru)", "[a-z]{2,3}", "(?:x|yz)+", "(a)(b)?",
+};
+
+static void __rt_value(rt_in_t* in, int expr, rt_buf_t* out) {
+    const size_t n = 1 + __rt_u8(in) % 4;
+    switch (expr) {
+    case 0: for (size_t i = 0; i < n; i++) __rt_putc(out, (char)('0' + __rt_u8(in) % 10)); break;
+    case 1: for (size_t i = 0; i < n; i++) __rt_putc(out, (char)('a' + __rt_u8(in) % 26)); break;
+    case 2:
+        for (size_t i = 0; i < n; i++) {
+            char c = (char)__rt_u8(in);
+            if (c == '/' || c == 0) c = 'q';
+            __rt_putc(out, c);
+        }
+        break;
+    case 3: __rt_puts(out, __rt_u8(in) & 1 ? "en" : "ru"); break;
+    case 4: for (size_t i = 0; i < 2 + (n & 1); i++) __rt_putc(out, (char)('a' + __rt_u8(in) % 26)); break;
+    case 5: for (size_t i = 0; i < n; i++) __rt_puts(out, __rt_u8(in) & 1 ? "x" : "yz"); break;
+    default: __rt_puts(out, __rt_u8(in) & 1 ? "ab" : "a"); break;
+    }
+}
+
+typedef struct {
+    int  kind;          /* 0 literal text, 1 param, 2 raw regex */
+    char text[16];
+    int  expr;
+} rt_token_t;
+
+static void __rt_route(rt_in_t* in) {
+    rt_token_t tok[RT_TOKENS];
+    size_t count = 1 + __rt_u8(in) % RT_TOKENS;
+    const int regex = (__rt_u8(in) % 4) == 0;      /* raw regex, no params */
+    int params = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        const uint8_t b = __rt_u8(in);
+        rt_token_t* t = &tok[i];
+        memset(t, 0, sizeof *t);
+        if (regex && (b % 3) == 0) {
+            static const char* raw[] = { "(.*)", "[0-9]+", "x*", "(a|b)", "c?", "\\.", "(?:y)+" };
+            t->kind = 2;
+            snprintf(t->text, sizeof t->text, "%s", raw[__rt_u8(in) % 7]);
+        } else if (!regex && (b % 3) == 0 && params < 6) {
+            t->kind = 1;
+            t->expr = __rt_u8(in) % (int)(sizeof __rt_exprs / sizeof __rt_exprs[0]);
+            snprintf(t->text, sizeof t->text, "p%c%d", 'a' + params, params);
+            params++;
+        } else {
+            /* No '?' in a raw regex route: there it is an operator, and one
+             * with nothing before it does not compile. */
+            const char* chars = regex ? "abcxyz019-_~/." : __rt_lit_chars;
+            const size_t n = 1 + __rt_u8(in) % 6;
+            for (size_t k = 0; k < n; k++) t->text[k] = chars[__rt_u8(in) % strlen(chars)];
+        }
+    }
+
+    /* The location as a configuration writes it, and the regex it means. */
+    rt_buf_t loc = { .n = 0 }, ref = { .n = 0 };
+    loc.b[0] = ref.b[0] = 0;
+    for (size_t i = 0; i < count; i++) {
+        const rt_token_t* t = &tok[i];
+        if (t->kind == 1) {
+            __rt_puts(&loc, "{"); __rt_puts(&loc, t->text); __rt_puts(&loc, "|");
+            __rt_puts(&loc, __rt_exprs[t->expr]); __rt_puts(&loc, "}");
+        } else {
+            __rt_puts(&loc, t->text);
+        }
+    }
+    /* A regex is what has an operator outside the params; '.' and '?' alone
+     * do not make one ("c?" among plain text is a question mark). */
+    int raw = 0;
+    if (params == 0)
+        for (const char* c = loc.b; *c; c++)
+            if (strchr("*+()[]|^$\\", *c) != NULL) raw = 1;
+    const int anchored = !raw;
+
+    if (anchored) __rt_putc(&ref, '^');
+    for (size_t i = 0; i < count; i++) {
+        const rt_token_t* t = &tok[i];
+        if (t->kind == 1) {
+            __rt_puts(&ref, "(?<"); __rt_puts(&ref, t->text); __rt_puts(&ref, ">");
+            __rt_puts(&ref, __rt_exprs[t->expr]); __rt_puts(&ref, ")");
+        } else if (raw) {
+            __rt_puts(&ref, t->text);
+        } else {
+            for (const char* c = t->text; *c; c++) {
+                /* Plain text: all but letters and digits escaped. */
+                if (!((*c >= 'a' && *c <= 'z') || (*c >= '0' && *c <= '9'))) __rt_putc(&ref, '\\');
+                __rt_putc(&ref, *c);
+            }
+        }
+    }
+    if (anchored) __rt_putc(&ref, '$');
+
+    route_t* r = route_create(loc.b);
+    pcre2_code* want = __rt_compile(ref.b);
+    if (want == NULL) __builtin_trap();
+    if (r == NULL) __builtin_trap();                 /* every generated location is valid */
+    if (r->params_count != params) __builtin_trap();
+
+    /* A path: built to match, then perhaps damaged, or the input's. */
+    rt_buf_t path = { .n = 0 };
+    path.b[0] = 0;
+    const uint8_t how = __rt_u8(in);
+    if (how % 4 != 3) {
+        for (size_t i = 0; i < count; i++) {
+            const rt_token_t* t = &tok[i];
+            if (t->kind == 1) __rt_value(in, t->expr, &path);
+            else if (t->kind == 2) __rt_puts(&path, __rt_u8(in) & 1 ? "ab" : "7");
+            else __rt_puts(&path, t->text);
+        }
+        if (how % 4 == 1 && path.n > 0) path.b[__rt_u8(in) % path.n] = (char)__rt_u8(in);
+        if (how % 4 == 2) __rt_putc(&path, (char)(__rt_u8(in) % 3 == 0 ? '\n' : 'x'));
+    } else {
+        const size_t n = __rt_u8(in) % 48;
+        for (size_t i = 0; i < n; i++) __rt_putc(&path, (char)__rt_u8(in));
+    }
+
+    const int vn = route_vector_size(r);
+    int* vector = malloc((size_t)vn * sizeof *vector);
+    int wv[64];
+    if (vector == NULL) __builtin_trap();
+    const int got = route_match(r, path.b, path.n, vector, vn);
+    const int expect = __rt_pcre(want, path.b, path.n, wv, 64);
+    if (getenv("FUZZ_TRACE") != NULL)
+        printf("location %s\nregex    %s\npath     %.*s\nroute_match %d, regex %d, primitive %d\n",
+               loc.b, ref.b, (int)path.n, path.b, got, expect, r->is_primitive), fflush(stdout);
+    if (got != expect) __builtin_trap();
+
+    if (got == 1) {
+        if (vector[0] < 0 || vector[1] > (int)path.n || vector[0] > vector[1]) __builtin_trap();
+        for (const route_param_t* p = r->param; p != NULL; p = p->next) {
+            if (p->group <= 0 || p->group > r->captures) __builtin_trap();
+            const int s = vector[p->group * 2], e = vector[p->group * 2 + 1];
+            if (s < 0 || e < s || e > (int)path.n) __builtin_trap();
+            const int ng = pcre2_substring_number_from_name(want, (PCRE2_SPTR)p->string);
+            if (ng <= 0 || ng >= 32) __builtin_trap();
+            if (wv[ng * 2] != s || wv[ng * 2 + 1] != e) __builtin_trap();
+        }
+    }
+
+    /* static_file: accepted exactly when the group exists. */
+    const int k = __rt_u8(in) % (r->captures + 3);
+    char tpl[32];
+    snprintf(tpl, sizeof tpl, "/f/{%d}", k);
+    const int set = route_set_http_static(r, "GET", tpl, NULL);
+    if (set != (k <= r->captures)) __builtin_trap();
+    if (set && got == 1) {
+        char* file = strtemplate_expand(r->static_file[ROUTE_GET], path.b, r->is_primitive ? NULL : vector);
+        if (file == NULL) __builtin_trap();
+        free(file);
+    }
+
+    free(vector);
+    pcre2_code_free(want);
+    routes_free(r);
+}
+
+static void __rt_route_raw(rt_in_t* in) {
+    rt_buf_t loc = { .n = 0 }, path = { .n = 0 };
+    loc.b[0] = path.b[0] = 0;
+    const size_t ln = __rt_u8(in) % 64;
+    for (size_t i = 0; i < ln; i++) {
+        const char c = (char)__rt_u8(in);
+        if (c != 0) __rt_putc(&loc, c);
+    }
+    const size_t pn = (size_t)(in->end - in->p);
+    __rt_put(&path, (const char*)in->p, pn);
+
+    route_t* r = route_create(loc.b);
+    if (r == NULL) return;
+
+    const int vn = route_vector_size(r);
+    int* vector = malloc((size_t)vn * sizeof *vector);
+    int wv[256];
+    if (vector == NULL) __builtin_trap();
+    const int got = route_match(r, path.b, path.n, vector, vn);
+    /* The primitive shortcut must say what the pattern says. */
+    if (got != __rt_pcre(r->location, path.b, path.n, wv, 256)) __builtin_trap();
+    if (got == 1)
+        for (const route_param_t* p = r->param; p != NULL; p = p->next) {
+            const int s = vector[p->group * 2], e = vector[p->group * 2 + 1];
+            if (s >= 0 && (e < s || e > (int)path.n)) __builtin_trap();
+        }
+    free(vector);
+    routes_free(r);
+}
+
+/* ---- redirect ---- */
+
+static int __rt_uri_keeps(unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+           (c != 0 && strchr("-._~/:@!$'()*,;", c) != NULL);
+}
+
+static void __rt_encode(rt_buf_t* out, const char* s, size_t n, int (*keeps)(unsigned char)) {
+    static const char hex[] = "0123456789ABCDEF";
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char c = (unsigned char)s[i];
+        if (keeps(c)) {
+            __rt_putc(out, (char)c);
+        } else {
+            __rt_putc(out, '%');
+            __rt_putc(out, hex[c >> 4]);
+            __rt_putc(out, hex[c & 15]);
+        }
+    }
+}
+
+static int __rt_query_keeps(unsigned char c) {
+    return c > 0x20 && c < 0x7f;
+}
+
+static void __rt_redirect(rt_in_t* in) {
+    static const char* groups[] = { "(.*)", "([^/]*)", "(x|y)?", "([0-9]+)", "(?:z)(w?)" };
+    rt_buf_t loc = { .n = 0 }, dst = { .n = 0 };
+    loc.b[0] = dst.b[0] = 0;
+
+    const int literal = (__rt_u8(in) % 4) == 0;
+    int captures = 0;
+    if (literal) {
+        const size_t n = 1 + __rt_u8(in) % 5;
+        for (size_t i = 0; i < n; i++) __rt_putc(&loc, "abc/-_~"[__rt_u8(in) % 7]);
+    } else {
+        if (__rt_u8(in) & 1) __rt_putc(&loc, '^');
+        const size_t parts = 1 + __rt_u8(in) % 4;
+        for (size_t i = 0; i < parts; i++) {
+            if (__rt_u8(in) & 1) {
+                __rt_puts(&loc, groups[__rt_u8(in) % 5]);
+                captures++;
+            } else {
+                const char c = "abc/-_~."[__rt_u8(in) % 8];
+                if (c == '.') __rt_putc(&loc, '\\');
+                __rt_putc(&loc, c);
+            }
+        }
+        if (__rt_u8(in) & 1) __rt_putc(&loc, '$');
+    }
+
+    /* The destination: its own text and exactly one placeholder per group,
+     * any of them, in any order. */
+    const char* prefixes[] = { "https://example.com", "/new", "", "/a?x=1&y=" };
+    const char* prefix = prefixes[__rt_u8(in) % 4];
+    __rt_puts(&dst, prefix);
+    for (int i = 0; i < captures; i++) {
+        char ph[8];
+        snprintf(ph, sizeof ph, "{%d}", 1 + __rt_u8(in) % captures);
+        __rt_puts(&dst, ph);
+        __rt_puts(&dst, (__rt_u8(in) & 1) ? "/" : "-");
+    }
+    if (dst.n == 0) __rt_puts(&dst, "/");
+
+    redirect_t* r = redirect_create(loc.b, dst.b);
+    if (r == NULL) __builtin_trap();
+
+    /* The decoded path, any bytes; the request target, with a query perhaps. */
+    rt_buf_t path = { .n = 0 }, uri = { .n = 0 };
+    path.b[0] = uri.b[0] = 0;
+    __rt_putc(&path, '/');
+    const size_t pn = __rt_u8(in) % 40;
+    for (size_t i = 0; i < pn; i++) __rt_putc(&path, (char)__rt_u8(in));
+    __rt_puts(&uri, "/orig");
+    if (__rt_u8(in) & 1) {
+        __rt_putc(&uri, '?');
+        const size_t qn = __rt_u8(in) % 16;
+        for (size_t i = 0; i < qn; i++) {
+            const char c = (char)__rt_u8(in);
+            __rt_putc(&uri, c != 0 ? c : 'q');
+        }
+    }
+
+    const int vn = (r->params_count + 1) * 3;
+    int* vector = malloc((size_t)vn * sizeof *vector);
+    int wv[64];
+    if (vector == NULL) __builtin_trap();
+    for (int i = 0; i < vn; i++) vector[i] = -1;
+
+    const int got = redirect_matches(r, path.b, path.n, vector, vn);
+    const int expect = __rt_pcre(r->location, path.b, path.n, wv, 64);
+    if (got != expect) __builtin_trap();
+
+    if (got) {
+        char* out = redirect_uri_with_query(r, path.b, vector, uri.b, uri.n);
+        if (out == NULL) __builtin_trap();
+
+        /* The same, written here. */
+        rt_buf_t want = { .n = 0 };
+        want.b[0] = 0;
+        __rt_puts(&want, prefix);
+        for (const char* c = dst.b + strlen(prefix); *c; c++) {
+            if (*c != '{') { __rt_putc(&want, *c); continue; }
+            const int g = atoi(c + 1);
+            const int s = wv[g * 2], e = wv[g * 2 + 1];
+            if (s >= 0) __rt_encode(&want, path.b + s, (size_t)(e - s), __rt_uri_keeps);
+            c = strchr(c, '}');
+        }
+        const char* q = memchr(uri.b, '?', uri.n);
+        if (strchr(dst.b, '?') == NULL && q != NULL && uri.n - (size_t)(q - uri.b) >= 2)
+            __rt_encode(&want, q, uri.n - (size_t)(q - uri.b), __rt_query_keeps);
+
+        if (strcmp(out, want.b) != 0) __builtin_trap();
+        for (const char* c = out; *c; c++)
+            if ((unsigned char)*c < 0x21 || (unsigned char)*c > 0x7e) __builtin_trap();
+        free(out);
+    }
+
+    free(vector);
+    redirect_free(r);
+}
+
+/* ---- domain ---- */
+
+static char __rt_fold(char c) {
+    return c >= 'A' && c <= 'Z' ? (char)(c - 'A' + 'a') : c;
+}
+
+static int __rt_ieq(const char* a, const char* b, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (__rt_fold(a[i]) != __rt_fold(b[i])) return 0;
+    return 1;
+}
+
+/* The template's meaning: '*' at either end stands for anything. */
+static int __rt_glob(const char* tpl, const char* host) {
+    const size_t tn = strlen(tpl), hn = strlen(host);
+    const int lead = tn > 0 && tpl[0] == '*';
+    const int trail = tn > 1 && tpl[tn - 1] == '*';
+    const char* core = tpl + lead;
+    const size_t cn = tn - lead - trail;
+    if (tn == 1 && lead) return 1;
+    if (hn < cn) return 0;
+    if (lead && trail) {
+        for (size_t i = 0; i + cn <= hn; i++)
+            if (__rt_ieq(host + i, core, cn)) return 1;
+        return 0;
+    }
+    if (lead) return __rt_ieq(host + hn - cn, core, cn);
+    if (trail) return __rt_ieq(host, core, cn);
+    return hn == cn && __rt_ieq(host, core, cn);
+}
+
+/* domain_host_normalize, as the header says it. */
+static domain_host_e __rt_normalize(const char* h, size_t n, char* out) {
+    if (n == 0 || n >= DOMAIN_MAX_HOST) return DOMAIN_HOST_BAD;
+    for (size_t i = 0; i < n; i++)
+        if ((unsigned char)h[i] <= 0x20 || (unsigned char)h[i] == 0x7f) return DOMAIN_HOST_BAD;
+    char name[DOMAIN_MAX_HOST];
+    size_t nn;
+    const char* port;
+    size_t pn = 0;
+    if (h[0] == '[') {
+        const char* close = memchr(h, ']', n);
+        if (close == NULL) return DOMAIN_HOST_BAD;
+        const size_t after = (size_t)(close - h) + 1;
+        port = h + after + 1;
+        if (after < n) {
+            if (h[after] != ':') return DOMAIN_HOST_BAD;
+            pn = n - after - 1;
+        }
+        nn = (size_t)(close - h) - 1;
+        memcpy(name, h + 1, nn);
+    } else {
+        const char* colon = memchr(h, ':', n);
+        nn = colon ? (size_t)(colon - h) : n;
+        port = colon ? colon + 1 : NULL;
+        pn = colon ? n - nn - 1 : 0;
+        memcpy(name, h, nn);
+        if (nn > 0 && name[nn - 1] == '.') {
+            nn--;
+            if (nn > 0 && name[nn - 1] == '.') return DOMAIN_HOST_BAD;
+        }
+    }
+    name[nn] = 0;
+    for (size_t i = 0; i < pn; i++)
+        if (port[i] < '0' || port[i] > '9') return DOMAIN_HOST_BAD;
+    char* ascii = idn_to_ascii(name);
+    if (ascii == NULL) return DOMAIN_HOST_UNKNOWN;
+    snprintf(out, DOMAIN_MAX_HOST * 4, "%s", ascii);
+    free(ascii);
+    return DOMAIN_HOST_OK;
+}
+
+static void __rt_domain(rt_in_t* in, int raw) {
+    static const char* labels[] = { "example", "www", "a", "api-2", "xn--p1ai", "пример", "münchen", "b0" };
+    rt_buf_t tpl = { .n = 0 }, host = { .n = 0 };
+    tpl.b[0] = host.b[0] = 0;
+
+    if (raw) {
+        const size_t n = 1 + __rt_u8(in) % 32;
+        for (size_t i = 0; i < n; i++) {
+            const char c = (char)__rt_u8(in);
+            __rt_putc(&tpl, c != 0 ? c : 'a');
+        }
+        __rt_put(&host, (const char*)in->p, (size_t)(in->end - in->p));
+    } else {
+        const uint8_t star = __rt_u8(in) % 5;           /* 0 none, 1 lead, 2 trail, 3 both, 4 alone */
+        const size_t nl = 1 + __rt_u8(in) % 3;
+        const char* chosen[4];
+        for (size_t i = 0; i < nl; i++) chosen[i] = labels[__rt_u8(in) % 8];
+
+        if (star == 4) {
+            __rt_puts(&tpl, "*");
+        } else {
+            if (star == 1 || star == 3) __rt_puts(&tpl, "*.");
+            for (size_t i = 0; i < nl; i++) {
+                if (i) __rt_putc(&tpl, '.');
+                __rt_puts(&tpl, chosen[i]);
+            }
+            if (star == 2 || star == 3) __rt_puts(&tpl, ".*");
+        }
+
+        /* A host built from it: labels for the stars, case changed, punycode or
+         * not, a port, a trailing dot; or damaged. */
+        const uint8_t how = __rt_u8(in);
+        if (star == 1 || star == 3 || star == 4) {
+            const size_t extra = __rt_u8(in) % 3;
+            for (size_t i = 0; i < extra; i++) { __rt_puts(&host, labels[__rt_u8(in) % 8]); __rt_putc(&host, '.'); }
+        }
+        if (star != 4)
+            for (size_t i = 0; i < nl; i++) {
+                if (i) __rt_putc(&host, '.');
+                const char* l = chosen[i];
+                if ((how & 1) && (unsigned char)l[0] >= 0x80) {
+                    char* a = idn_to_ascii(l);
+                    if (a != NULL) { __rt_puts(&host, a); free(a); continue; }
+                }
+                for (const char* c = l; *c; c++)
+                    __rt_putc(&host, (how & 2) && *c >= 'a' && *c <= 'z' ? (char)(*c - 32) : *c);
+            }
+        if (star == 2 || star == 3) { __rt_putc(&host, '.'); __rt_puts(&host, labels[__rt_u8(in) % 8]); }
+        if (how & 4) __rt_putc(&host, '.');
+        if (how & 8) {
+            __rt_putc(&host, ':');
+            const size_t pn = __rt_u8(in) % 6;
+            for (size_t i = 0; i < pn; i++) __rt_putc(&host, (how & 16) && i == 2 ? 'x' : (char)('0' + __rt_u8(in) % 10));
+        }
+        if ((how & 0xe0) == 0x20 && host.n > 0) host.b[__rt_u8(in) % host.n] = (char)__rt_u8(in);
+        if ((how & 0xe0) == 0x40) __rt_puts(&host, "..");
+    }
+
+    domain_t* d = domain_create(tpl.b);
+    if (d == NULL) {
+        if (!raw) __builtin_trap();
+        return;
+    }
+
+    char* norm = NULL;
+    const domain_host_e st = domain_host_normalize(host.b, host.n, &norm);
+    char want[DOMAIN_MAX_HOST * 4];
+    if (st != __rt_normalize(host.b, host.n, want)) __builtin_trap();
+    if (st == DOMAIN_HOST_OK) {
+        if (strcmp(norm, want) != 0) __builtin_trap();
+        const size_t nn = strlen(norm);
+        const int got = domain_matches(d, norm, nn);
+
+        /* The literal shortcut says what the pattern says. */
+        int wv[120];
+        if (d->is_literal && got != __rt_pcre(d->pcre_template, norm, nn, wv, 120)) __builtin_trap();
+
+        if (!raw) {
+            char* ascii_tpl = idn_to_ascii(tpl.b);
+            if (ascii_tpl == NULL) __builtin_trap();
+            if (got != __rt_glob(ascii_tpl, norm)) __builtin_trap();
+            free(ascii_tpl);
+        }
+    } else if (norm != NULL) __builtin_trap();
+    free(norm);
+
+    /* And on the raw host too: whatever the parser hands over. */
+    int wv[120];
+    const int any = domain_matches(d, host.b, host.n);
+    if (d->is_literal && any != __rt_pcre(d->pcre_template, host.b, host.n, wv, 120)) __builtin_trap();
+
+    domains_free(d);
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 1) return 0;
+    rt_in_t in = { data + 1, data + size };
+
+    switch (data[0] % 6) {
+    case 0: case 1: __rt_route(&in); break;
+    case 2: __rt_route_raw(&in); break;
+    case 3: __rt_redirect(&in); break;
+    default: __rt_domain(&in, data[0] % 6 == 5 && (data[0] & 0x80)); break;
+    }
     return 0;
 }
 

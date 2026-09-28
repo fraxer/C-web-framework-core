@@ -64,7 +64,7 @@ expected=(fuzz_huffman fuzz_hpack fuzz_h2_frame fuzz_json fuzz_cookie
           fuzz_h2_connection fuzz_http_response fuzz_smtp_response fuzz_jwt
           fuzz_h1_connection fuzz_text fuzz_mail_message fuzz_ratelimiter
           fuzz_session_crypto fuzz_misc_containers fuzz_gzip
-          fuzz_view fuzz_ws_connection)
+          fuzz_view fuzz_ws_connection fuzz_route)
 if grep -Eq '^INCLUDE_HTTP3:[A-Z]+=yes$' "$build_dir/CMakeCache.txt" 2>/dev/null; then
     expected+=(fuzz_quic_packet fuzz_quic_frame fuzz_quic_tp fuzz_h3_frame
                fuzz_qpack_decode fuzz_qpack_streams fuzz_h3_priority fuzz_qpack_dynamic

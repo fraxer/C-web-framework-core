@@ -233,7 +233,7 @@ if(BUILD_FUZZERS STREQUAL "yes")
         huffman hpack h2_frame json cookie urlencoded multipart request request_sequence
         websocket websocket_sequence ws_deflate h2_session h2_connection http_response
         smtp_response jwt h1_connection text mail_message ratelimiter session_crypto
-        misc_containers gzip view ws_connection)
+        misc_containers gzip view ws_connection route)
 
     if(INCLUDE_HTTP3 STREQUAL yes)
         list(APPEND FUZZ_TARGET_NAMES
@@ -358,6 +358,7 @@ if(BUILD_FUZZERS STREQUAL "yes")
             FUZZ_QUIC_TOKEN=44
             FUZZ_QUIC_VERSION=45
             FUZZ_H3_SESSION=46
+            FUZZ_ROUTE=47
             FUZZ_TARGET=${FUZZ_ID_${name}}
         )
 
@@ -411,6 +412,11 @@ if(BUILD_FUZZERS STREQUAL "yes")
                 TEST_QUIC_KEY="${CMAKE_CURRENT_SOURCE_DIR}/data/quic_test_key.pem"
             )
             target_link_libraries(${exe} PRIVATE idn2 resolv)
+        endif()
+
+        # route checks the compiled patterns against PCRE2 itself.
+        if(name STREQUAL route)
+            target_link_libraries(${exe} PRIVATE ${PCRE2_LIBRARIES})
         endif()
 
         # quic_version asks the endpoint what Version Negotiation it owes.

@@ -491,6 +491,7 @@ Targets, each with a seed corpus under `fuzz/corpus/`:
 | `quic_token` | address validation tokens: bytes nobody issued, issued tokens read back by any peer at any time and then damaged, plaintexts sealed under the key |
 | `quic_version` | the version-independent header (RFC 8999) and the Version Negotiation the endpoint owes for a datagram |
 | `h3_session` | the client's HTTP/3 unidirectional streams: control stream, SETTINGS, GOAWAY, MAX_PUSH_ID, PRIORITY_UPDATE, QPACK encoder and decoder instructions, grease, budgets -- against a model, and the same whole, byte by byte and in pieces |
+| `route` | route and redirect locations against a regex of the target's own, params, static_file placeholders, redirect destinations built from any decoded path, and the virtual host a Host field selects |
 
 An application registers its own with the same function, and `run.sh` picks
 them up from the manifest; the site's `fuzz_feedback` (in `backend/tests/`) is
@@ -679,6 +680,15 @@ broke it is saved like any crash:
   a model builds the units -- correct but for at most one violation -- and
   predicts every verdict and the end state (settings, GOAWAY, MAX_PUSH_ID,
   budgets, queued priorities); with an odd one the bytes are raw.
+- **Templates against a regex of the target's own.** `route` builds a
+  location from literal text and `{name|expression}` params (or raw regex),
+  writes the regex it means -- text escaped, each param a named group,
+  anchored unless it is a raw regex -- and checks `route_match` and every
+  param's value against it on paths built to match, damaged, or raw. A
+  redirect is expanded from any decoded path and compared with an expansion
+  written in the target; a Host is normalised and matched by a normaliser and
+  a glob of the target's own. Literal shortcuts are checked against their
+  patterns on arbitrary input.
 - **What reaches the wire.** `h2_connection` checks the server's bytes the way
   a strict client would: SETTINGS first, every header block decodes with one
   HPACK decoder, no frame on a stream after END_STREAM, DATA never beyond the
@@ -822,6 +832,20 @@ HTTP/2 write path, as a seed that replays it):
   `quic_version`): Version Negotiation always listed the reserved version
   0x1a2a3a4a, so a client forcing negotiation with that very version got a
   list holding its own choice, which RFC 9000 §6.2 has it discard.
+- `route.c` (`test_route_match_param_after_group_in_expression`,
+  `test_route_dot_next_to_param_is_literal`,
+  `test_route_static_file_beyond_captures_refused`, found by `route`): a group
+  inside a param's expression shifted every later param onto the wrong group;
+  '.' next to a param matched any character; a static_file `{N}` past the
+  location's groups read beyond the offsets; positions were `unsigned short`,
+  so a location past 65535 bytes never finished parsing.
+- `redirect.c`, `strtemplate.c` (`test_redirect_capture_is_percent_encoded`,
+  found by `route`): captures of the decoded path went into the destination
+  raw -- CR LF, '?', '#', '%' -- and `^(.*)$` did not match a path with a
+  newline at all.
+- `domain.c` (`test_domain_host_normalize`, `test_domain_pattern_takes_any_byte`,
+  found by `route`): a trailing dot found no virtual host, a NUL cut the name
+  short, the port was not checked, and '*' stopped at a newline.
 
 One more came out of checking the HTTP/2 fix against a live server rather than
 out of a target: finishing a frame from the session's output buffer, like
