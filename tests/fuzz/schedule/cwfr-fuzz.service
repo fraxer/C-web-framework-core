@@ -1,0 +1,19 @@
+# The scheduled fuzzing run (tests/fuzz/schedule/scheduled.sh). Install with
+# its timer on the build server:
+#
+#   sudo cp cwfr-fuzz.service cwfr-fuzz.timer /etc/systemd/system/
+#   sudo cp fuzz.env.example /etc/cwfr-fuzz.env   # then edit it
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now cwfr-fuzz.timer
+[Unit]
+Description=cwfr fuzzing, long profile
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/cwfr-fuzz.env
+User=cwfr-fuzz
+Nice=10
+IOSchedulingClass=idle
+ExecStart=/bin/sh -c 'exec "$CWFR_CORE/tests/fuzz/schedule/scheduled.sh"'
