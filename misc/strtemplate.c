@@ -175,7 +175,52 @@ static size_t __param_length(const int* vector, int number) {
     return (size_t)(end - start);
 }
 
-char* strtemplate_expand(const strtemplate_t* tpl, const char* subject, const int* vector) {
+/* Bytes a capture may keep as they are when it lands in a URI: unreserved and
+ * the rest of what a path segment holds (RFC 3986 §3.3), less "&", "=" and "+",
+ * which mean something in a query, where a destination may put a capture too.
+ * The path a capture comes from is already percent-decoded, so anything else --
+ * CR, LF, NUL, '?', '#', '%', a space, UTF-8 -- is encoded back. */
+static int __uri_keeps(unsigned char c) {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return 1;
+    switch (c) {
+    case '-': case '.': case '_': case '~': case '/': case ':': case '@':
+    case '!': case '$': case '\'': case '(': case ')': case '*': case ',': case ';':
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static size_t __encoded_length(const char* s, size_t length, int encode) {
+    if (!encode) return length;
+
+    size_t n = 0;
+    for (size_t i = 0; i < length; i++)
+        n += __uri_keeps((unsigned char)s[i]) ? 1 : 3;
+    return n;
+}
+
+static void __append_encoded(char* out, size_t* offset, const char* s, size_t length, int encode) {
+    if (!encode) {
+        __append(out, offset, s, length);
+        return;
+    }
+
+    static const char hex[] = "0123456789ABCDEF";
+    for (size_t i = 0; i < length; i++) {
+        const unsigned char c = (unsigned char)s[i];
+        if (__uri_keeps(c)) {
+            out[(*offset)++] = (char)c;
+        } else {
+            out[(*offset)++] = '%';
+            out[(*offset)++] = hex[c >> 4];
+            out[(*offset)++] = hex[c & 0x0f];
+        }
+    }
+    out[*offset] = 0;
+}
+
+static char* __expand(const strtemplate_t* tpl, const char* subject, const int* vector, int encode) {
     if (tpl == NULL) return NULL;
 
     if (tpl->param == NULL) {
@@ -192,7 +237,10 @@ char* strtemplate_expand(const strtemplate_t* tpl, const char* subject, const in
 
     for (const strtemplate_param_t* param = tpl->param; param; param = param->next) {
         length += param->start - start_pos;
-        length += __param_length(vector, param->number);
+
+        const size_t param_length = __param_length(vector, param->number);
+        if (param_length > 0)
+            length += __encoded_length(&subject[vector[param->number * 2]], param_length, encode);
 
         start_pos = param->end;
     }
@@ -211,7 +259,7 @@ char* strtemplate_expand(const strtemplate_t* tpl, const char* subject, const in
 
         const size_t param_length = __param_length(vector, param->number);
         if (param_length > 0)
-            __append(out, &length, &subject[vector[param->number * 2]], param_length);
+            __append_encoded(out, &length, &subject[vector[param->number * 2]], param_length, encode);
 
         start_pos = param->end;
     }
@@ -222,6 +270,14 @@ char* strtemplate_expand(const strtemplate_t* tpl, const char* subject, const in
     out[length] = 0;
 
     return out;
+}
+
+char* strtemplate_expand(const strtemplate_t* tpl, const char* subject, const int* vector) {
+    return __expand(tpl, subject, vector, 0);
+}
+
+char* strtemplate_expand_uri(const strtemplate_t* tpl, const char* subject, const int* vector) {
+    return __expand(tpl, subject, vector, 1);
 }
 
 void __append(char* out, size_t* offset, const char* string, size_t length) {

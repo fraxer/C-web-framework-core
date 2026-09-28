@@ -75,7 +75,13 @@ redirect_t* redirect_create(const char* location, const char* destination) {
 
     int error_code = 0;
     PCRE2_SIZE error_offset = 0;
-    redirect->location = pcre2_compile((PCRE2_SPTR)location, PCRE2_ZERO_TERMINATED, 0,
+    /* The path is percent-decoded before it is matched, so it may hold any
+     * byte, a newline included: '.' matches it and '$' means the end of the
+     * path rather than "before a final newline" -- otherwise "^/old/(.*)$"
+     * does not match "/old/a%0A" at all, and matches "/old/a%0A" with the
+     * newline cut off the capture when it is last. */
+    redirect->location = pcre2_compile((PCRE2_SPTR)location, PCRE2_ZERO_TERMINATED,
+                                       PCRE2_DOTALL | PCRE2_DOLLAR_ENDONLY,
                                        &error_code, &error_offset, NULL);
 
     if (redirect->location == NULL) {
@@ -180,7 +186,16 @@ void redirect_free(redirect_t* redirect) {
 }
 
 char* redirect_get_uri(redirect_t* redirect, const char* string, int* vector) {
-    return strtemplate_expand(redirect->destination, string, vector);
+    /* Captures come from the decoded path and go back encoded: raw, a CR LF
+     * split the Location field, a '?' or '#' moved the rest of the path into a
+     * query or a fragment, and an internal redirect, which parses the
+     * destination again, decoded a second time. */
+    return strtemplate_expand_uri(redirect->destination, string, vector);
+}
+
+/* Printable ASCII, the query's own delimiters included. */
+static int __query_keeps(unsigned char c) {
+    return c > 0x20 && c < 0x7f;
 }
 
 const char* redirect_carry_query(const char* target, const char* uri, size_t uri_length, size_t* length) {
@@ -210,16 +225,34 @@ char* redirect_uri_with_query(redirect_t* redirect, const char* path, int* vecto
     const char* query = redirect_carry_query(target, uri, uri_length, &query_length);
     if (query_length == 0) return target;
 
+    /* The query is carried as the client wrote it, structure and all, except
+     * for bytes no URI holds: a parser that let a control byte through must
+     * not get it into a Location. */
+    size_t encoded_length = 0;
+    for (size_t i = 0; i < query_length; i++)
+        encoded_length += __query_keeps((unsigned char)query[i]) ? 1 : 3;
+
     /* strtemplate_expand hands back a plain malloc'd string. */
     const size_t target_length = strlen(target);
-    char* merged = realloc(target, target_length + query_length + 1);
+    char* merged = realloc(target, target_length + encoded_length + 1);
     if (merged == NULL) {
         free(target);
         return NULL;
     }
 
-    memcpy(merged + target_length, query, query_length);
-    merged[target_length + query_length] = 0;
+    static const char hex[] = "0123456789ABCDEF";
+    size_t p = target_length;
+    for (size_t i = 0; i < query_length; i++) {
+        const unsigned char c = (unsigned char)query[i];
+        if (__query_keeps(c)) {
+            merged[p++] = (char)c;
+        } else {
+            merged[p++] = '%';
+            merged[p++] = hex[c >> 4];
+            merged[p++] = hex[c & 0x0f];
+        }
+    }
+    merged[p] = 0;
 
     return merged;
 }

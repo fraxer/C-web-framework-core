@@ -32,4 +32,10 @@ int strtemplate_max_param(const strtemplate_t* tpl);
  * failure. `vector` may be NULL when the template has no placeholders. */
 char* strtemplate_expand(const strtemplate_t* tpl, const char* subject, const int* vector);
 
+/* The same, for a URI: every substituted byte a path segment may not hold as it
+ * is, or that a query reads as structure ("&", "=", "+"), is percent-encoded.
+ * The template's own text is left as written. For a redirect destination,
+ * whose captures come from a path that was percent-decoded before matching. */
+char* strtemplate_expand_uri(const strtemplate_t* tpl, const char* subject, const int* vector);
+
 #endif
