@@ -2530,6 +2530,66 @@ TEST(test_quic_stand_peer_cid_reuse) {
     __stand_free(s);
 }
 
+/* A frame of the client's choosing in a 1-RTT packet, through the real packet
+ * protection: what the fuzz target quic_frames does, for one frame. */
+static void __inject_frame(stand_t* s, const quicframe_t* f) {
+    uint8_t buf[64];
+    const size_t n = quicframe_write(buf, sizeof buf, f);
+    TEST_ASSERT(n > 0 && quicclient_inject(&s->client, QUIC_ENC_APP, buf, n), "frame queued");
+    quicclient_flush(&s->client);
+    __run(s, 300000, NULL);
+}
+
+static stand_t* __stand_connected(uint64_t seed) {
+    stand_t* s = __stand_create(seed);
+    if (s == NULL) return NULL;
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    __run(s, 200000, NULL);
+    return s;
+}
+
+TEST(test_quic_stand_stream_data_blocked) {
+    TEST_SUITE("quic_stand");
+    /* §19.13: STREAM_DATA_BLOCKED speaks about the sender's side of a stream,
+     * so on a stream only the server sends on it is a state error, and like
+     * every frame naming a stream it answers to the stream limit (§4.6). Both
+     * are MUSTs, and the frame used to be dropped unread. Found by the fuzz
+     * target quic_frames. */
+    quicframe_t f;
+    memset(&f, 0, sizeof f);
+    f.type = QUIC_FRAME_STREAM_DATA_BLOCKED;
+
+    TEST_CASE("on a client stream it is advisory");
+    stand_t* s = __stand_connected(31);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+    f.u.stream_data_blocked.id = 4;
+    __inject_frame(s, &f);
+    TEST_ASSERT(!s->client.close_received, "not closed");
+    __stand_free(s);
+
+    TEST_CASE("on a server unidirectional stream it is STREAM_STATE_ERROR");
+    s = __stand_connected(32);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+    f.u.stream_data_blocked.id = 3;
+    __inject_frame(s, &f);
+    TEST_ASSERT(s->client.close_received, "closed");
+    TEST_ASSERT(s->client.close_error == QUIC_STREAM_STATE_ERROR, "as a stream state error");
+    __stand_free(s);
+
+    TEST_CASE("past the stream limit it is STREAM_LIMIT_ERROR");
+    s = __stand_connected(33);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+    f.u.stream_data_blocked.id = s->conn->local_params.initial_max_streams_bidi << 2;
+    __inject_frame(s, &f);
+    TEST_ASSERT(s->client.close_received, "closed");
+    TEST_ASSERT(s->client.close_error == QUIC_STREAM_LIMIT_ERROR, "as a stream limit error");
+    __stand_free(s);
+}
+
 TEST(test_quic_stand_peer_cid_retire_prior_to) {
     TEST_SUITE("quic_stand");
 

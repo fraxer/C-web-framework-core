@@ -466,6 +466,19 @@ int quicclient_new_cid(quicclient_t* client, uint64_t seq,
     return 1;
 }
 
+int quicclient_inject(quicclient_t* client, quic_enc_level_e level,
+                      const uint8_t* data, size_t len) {
+    if (client == NULL || client->inject_queued || level >= QUIC_ENC_COUNT) return 0;
+    if (len == 0 || len > sizeof client->inject || data == NULL) return 0;
+
+    memcpy(client->inject, data, len);
+    client->inject_len = len;
+    client->inject_level = (int)level;
+    client->inject_queued = 1;
+
+    return 1;
+}
+
 int quicclient_saw_retire(const quicclient_t* client, uint64_t seq) {
     if (client == NULL) return 0;
 
@@ -633,6 +646,17 @@ static size_t __build(quicclient_t* c, quic_enc_level_e level,
             p += n;
             c->ack_pending[level] = 0;
         }
+    }
+
+    /* Before everything the client builds itself, so what the server makes of
+     * these bytes is what it makes of them, not of whatever came first. Left
+     * queued when it does not fit, rather than truncated into other frames. */
+    if (c->inject_queued && c->inject_level == (int)level &&
+        c->inject_len <= payload_cap - p) {
+        memcpy(payload + p, c->inject, c->inject_len);
+        p += c->inject_len;
+        c->inject_queued = 0;
+        __log(c, "  [client] -> %zu injected bytes at level %d\n", c->inject_len, (int)level);
     }
 
     if (level == QUIC_ENC_APP && c->retire_queued) {
@@ -1344,6 +1368,7 @@ static int __handle_frames(quicclient_t* c, quic_enc_level_e level,
         case QUIC_FRAME_CONNECTION_CLOSE_APP:
             c->close_received = 1;
             c->close_error = f.u.close.error;
+            c->close_is_app = f.type == QUIC_FRAME_CONNECTION_CLOSE_APP;
             /* Logged rather than printed: a close is a normal outcome for
              * several tests (they provoke one on purpose), and the stand runs
              * inside a test runner where an unexplained line is noise. What
