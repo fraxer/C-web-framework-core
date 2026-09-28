@@ -823,66 +823,31 @@ int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
         ratelimiter_t* ratelimiter = __ratelimiter_find(&ctx->server->http, route);
         int queued = 0;
 
-        /* A primitive location is answered by the comparison alone, whichever
-         * way it goes. Its pattern is the same string anchored at both ends
-         * (route_parse_location clears `is_primitive` for anything PCRE reads as
-         * more than itself), so running it after a miss asks the same question
-         * a second time and pays a pcre_exec for the answer it already has.
-         * With a handful of routes on the server that was the top line of the
-         * profile -- 5.4% of the worker, all of it in libpcre. */
-        if (route->is_primitive) {
-            if (!route_compare_primitive(route, request->path, request->path_length))
-                continue;
-
-            switch (__route_dispatch(connection, request, response, route, NULL, ratelimiter, &queued)) {
-            case ROUTE_DISPATCH_ERROR: return 0;
-            case ROUTE_DISPATCH_DONE: return queued;
-            case ROUTE_DISPATCH_SKIP: continue;
-            }
-        }
-
-        int vector_size = route->params_count > 0 ? route->params_count * 6 : 20 * 6;
+        /* route_match answers a primitive location by comparison alone; the
+         * vector it fills is not handed on for one, whose static_file has no
+         * groups to expand. */
+        const int vector_size = route_vector_size(route);
         int vector[vector_size];
-        /* pcre2_match leaves the entries of non-participating capture groups
-         * untouched, and both the named-param loop below and the static_file
-         * template read them; pre-mark every offset as "unset". */
-        memset(vector, -1, sizeof(vector));
+        const int matched = route_match(route, request->path, request->path_length,
+                                        vector, vector_size);
+        if (matched < 0) return 0;
+        if (matched == 0) continue;
 
-        // find resource by template (PCRE2)
-        pcre2_match_data* match_data = pcre2_match_data_create_from_pattern(route->location, NULL);
-        if (match_data == NULL) return 0;
+        for (route_param_t* param = route->param; param; param = param->next) {
+            const int start = vector[param->group * 2];
+            if (start < 0) continue;
 
-        int matches_count = pcre2_match(route->location, (PCRE2_SPTR)request->path, request->path_length, 0, 0, match_data, NULL);
+            const size_t substring_length = (size_t)(vector[param->group * 2 + 1] - start);
 
-        if (matches_count > 0) {
-            /* Copy ovector to vector for backward compatibility */
-            PCRE2_SIZE* ovector = pcre2_get_ovector_pointer(match_data);
-            int copy_count = (matches_count * 2 < vector_size) ? (matches_count * 2) : vector_size;
-            for (int i = 0; i < copy_count; i++) {
-                vector[i] = (int)ovector[i];
-            }
-        }
-        pcre2_match_data_free(match_data);
+            query_t* query = query_create(param->string, param->string_len, &request->path[start], substring_length);
 
-        if (matches_count < 1) continue;
+            if (query == NULL || query->key == NULL || query->value == NULL) return 0;
 
-        if (matches_count > 1) {
-            int i = 1; // escape full string match
-
-            for (route_param_t* param = route->param; param; param = param->next, i++) {
-                if (vector[i * 2] < 0) continue;
-
-                size_t substring_length = vector[i * 2 + 1] - vector[i * 2];
-
-                query_t* query = query_create(param->string, param->string_len, &request->path[vector[i * 2]], substring_length);
-
-                if (query == NULL || query->key == NULL || query->value == NULL) return 0;
-
-                httpparser_append_query(request, query);
-            }
+            httpparser_append_query(request, query);
         }
 
-        switch (__route_dispatch(connection, request, response, route, vector, ratelimiter, &queued)) {
+        switch (__route_dispatch(connection, request, response, route,
+                                 route->is_primitive ? NULL : vector, ratelimiter, &queued)) {
         case ROUTE_DISPATCH_ERROR: return 0;
         case ROUTE_DISPATCH_DONE: return queued;
         case ROUTE_DISPATCH_SKIP: continue;
