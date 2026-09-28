@@ -93,8 +93,13 @@ domain_t* domain_create(const char* value) {
      * server. */
     int error_code = 0;
     PCRE2_SIZE error_offset = 0;
+    /* PCRE2_DOTALL and PCRE2_DOLLAR_ENDONLY, as for route and redirect
+     * locations: without them '*' stopped at a newline and '$' matched before
+     * a final one, so "example.com\n" matched the pattern of a literal
+     * template the shortcut above refuses it for. */
     domain->pcre_template = pcre2_compile((PCRE2_SPTR)domain->prepared_template, PCRE2_ZERO_TERMINATED,
-                                          PCRE2_CASELESS, &error_code, &error_offset, NULL);
+                                          PCRE2_CASELESS | PCRE2_DOTALL | PCRE2_DOLLAR_ENDONLY,
+                                          &error_code, &error_offset, NULL);
     if (domain->pcre_template == NULL) {
         /* Get error message */
         PCRE2_UCHAR error_buffer[256];
@@ -342,4 +347,68 @@ int domain_count(domain_t* domain) {
     }
 
     return count;
+}
+domain_host_e domain_host_normalize(const char* host, size_t length, char** out) {
+    if (out == NULL) return DOMAIN_HOST_BAD;
+    *out = NULL;
+
+    if (host == NULL || length == 0 || length >= DOMAIN_MAX_HOST) return DOMAIN_HOST_BAD;
+
+    /* No control byte, space or DEL belongs in a host (RFC 3986 §3.2.2). A NUL
+     * in particular used to end the copy the name was matched from, so
+     * "example.com\0anything" selected example.com. */
+    for (size_t i = 0; i < length; i++) {
+        const unsigned char c = (unsigned char)host[i];
+        if (c <= 0x20 || c == 0x7f) return DOMAIN_HOST_BAD;
+    }
+
+    char name[DOMAIN_MAX_HOST];
+    const char* port = NULL;
+    size_t port_length = 0;
+    size_t name_length = 0;
+
+    if (host[0] == '[') {
+        /* An IPv6 literal (RFC 3986 §3.2.2): the colons are inside the
+         * brackets, and a port may follow the closing one. Matched without the
+         * brackets. */
+        const char* closing = memchr(host, ']', length);
+        if (closing == NULL) return DOMAIN_HOST_BAD;
+
+        const size_t after = (size_t)(closing - host) + 1;
+        if (after < length) {
+            if (host[after] != ':') return DOMAIN_HOST_BAD;
+            port = host + after + 1;
+            port_length = length - after - 1;
+        }
+
+        name_length = (size_t)(closing - host) - 1;
+        memcpy(name, host + 1, name_length);
+    }
+    else {
+        const char* colon = memchr(host, ':', length);
+        name_length = colon != NULL ? (size_t)(colon - host) : length;
+        if (colon != NULL) {
+            port = colon + 1;
+            port_length = length - name_length - 1;
+        }
+
+        memcpy(name, host, name_length);
+
+        /* A fully qualified name is the same host; it used to find no virtual
+         * host at all. One dot only: "example.com.." is not a name. */
+        if (name_length > 0 && name[name_length - 1] == '.') {
+            name_length--;
+            if (name_length > 0 && name[name_length - 1] == '.') return DOMAIN_HOST_BAD;
+        }
+    }
+    name[name_length] = 0;
+
+    for (size_t i = 0; i < port_length; i++)
+        if (port[i] < '0' || port[i] > '9') return DOMAIN_HOST_BAD;
+
+    char* ascii = idn_to_ascii(name);
+    if (ascii == NULL) return DOMAIN_HOST_UNKNOWN;
+
+    *out = ascii;
+    return DOMAIN_HOST_OK;
 }
