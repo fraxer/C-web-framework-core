@@ -487,6 +487,10 @@ Targets, each with a seed corpus under `fuzz/corpus/`:
 | `view` | the template engine: any template against a document from the input, and generated templates rendered against a model of the engine |
 | `ws_connection` | two WebSocket connections after the upgrade: routing, handlers, the output order, broadcast between them, a shared rate limiter, the closing handshake |
 | `gzip` | `gzip.c` in the loops of its callers: round trips at every level, any bytes, streams cut short, followed or changed |
+| `quic_frames` | frames on an established QUIC connection, through the real packet protection: every packet correct but for at most one violation, and the close code RFC 9000 names for it |
+| `quic_token` | address validation tokens: bytes nobody issued, issued tokens read back by any peer at any time and then damaged, plaintexts sealed under the key |
+| `quic_version` | the version-independent header (RFC 8999) and the Version Negotiation the endpoint owes for a datagram |
+| `h3_session` | the client's HTTP/3 unidirectional streams: control stream, SETTINGS, GOAWAY, MAX_PUSH_ID, PRIORITY_UPDATE, QPACK encoder and decoder instructions, grease, budgets -- against a model, and the same whole, byte by byte and in pieces |
 
 An application registers its own with the same function, and `run.sh` picks
 them up from the manifest; the site's `fuzz_feedback` (in `backend/tests/`) is
@@ -651,6 +655,30 @@ broke it is saved like any crash:
   a deadline. The client is correct, so a CONNECTION_CLOSE from the server
   with an error code is a finding. At the end the path goes dark and the connection must be gone by
   its idle timeout, with the QUIC memory budget back where it started.
+- **Frames past the packet protection.** `quic_frames` cannot damage a packet
+  to reach the frame loop -- a damaged packet does not open -- so the stand's
+  client carries frame bytes from the input (`quicclient_inject`) inside
+  packets it protects properly. Each packet is correct but for at most one
+  violation, and a model of the client's streams, windows, final sizes and
+  connection ids predicts the verdict: accepted, or closed with exactly the
+  code of RFC 9000 §19 or §12.4 (one packet may go out at Initial or
+  Handshake, where most frames are forbidden). After every packet: limits
+  never go down, the server holds exactly the client's active ids and no more
+  of its own than allowed, retired ids do not route, the last PATH_CHALLENGE
+  of a packet is answered. `quic_token` seals plaintexts of its own under the
+  server's key, which is the only way to reach the reader's parsing, and
+  requires the exact layout `quic_token_write` produces. `quic_version`
+  pads the input to a length it chooses, so the 1200-byte line is crossed
+  cheaply, and checks `quicendpoint_version_negotiation`, the decision taken
+  out of the endpoint's dispatch.
+- **One session, three deliveries.** `h3_session` turns the input into a
+  script of units on eight client unidirectional streams (bytes, FIN,
+  reset), clock steps and request cancellations and acceptances, and plays it
+  three times: each unit whole, a byte at a time, and in pieces of sizes the
+  input picks. Verdicts and the end state must agree. With an even first byte
+  a model builds the units -- correct but for at most one violation -- and
+  predicts every verdict and the end state (settings, GOAWAY, MAX_PUSH_ID,
+  budgets, queued priorities); with an odd one the bytes are raw.
 - **What reaches the wire.** `h2_connection` checks the server's bytes the way
   a strict client would: SETTINGS first, every header block decodes with one
   HPACK decoder, no frame on a stream after END_STREAM, DATA never beyond the
@@ -781,6 +809,19 @@ HTTP/2 write path, as a seed that replays it):
   a 204 got no Content-Length but its handler's body was sent anyway -- DATA
   on an HTTP/3 message that cannot have any, and on HTTP/1.1 bytes the client
   reads as the next response.
+- `quicconn.c` (`test_quic_stand_stream_data_blocked`, found by
+  `quic_frames`): STREAM_DATA_BLOCKED was dropped unread with the rest of the
+  BLOCKED family, though it names a stream: on one only the server sends on
+  it is STREAM_STATE_ERROR (§19.13), past the stream limit
+  STREAM_LIMIT_ERROR (§4.6).
+- `quicretry.c` (`test_quic_token_layout`, found by `quic_token`): the token
+  reader took bytes after the original connection id, an id in a NEW_TOKEN
+  and a kind that does not exist. Only a holder of the key gets that far, but
+  nothing should read such a token as one the server issued.
+- `quicendpoint.c` (`test_quic_endpoint_version_negotiation`, found by
+  `quic_version`): Version Negotiation always listed the reserved version
+  0x1a2a3a4a, so a client forcing negotiation with that very version got a
+  list holding its own choice, which RFC 9000 §6.2 has it discard.
 
 One more came out of checking the HTTP/2 fix against a live server rather than
 out of a target: finishing a frame from the session's output buffer, like
