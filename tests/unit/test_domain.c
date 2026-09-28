@@ -431,6 +431,14 @@ TEST(test_domain_host_normalize) {
     TEST_ASSERT_STR_EQUAL("BAD", host_of("example.com\n", 12, buf, sizeof buf), "LF");
     TEST_ASSERT_STR_EQUAL("BAD", host_of("exam\x7fple.com", 12, buf, sizeof buf), "DEL");
 
+    TEST_CASE("a host needs a name");
+    /* RFC 9110 §4.2.1: an http URI with an empty host is invalid. These used
+     * to come out as "" and reach a "*" virtual host. */
+    TEST_ASSERT_STR_EQUAL("BAD", host_of(":80", 3, buf, sizeof buf), "port only");
+    TEST_ASSERT_STR_EQUAL("BAD", host_of(".", 1, buf, sizeof buf), "a dot");
+    TEST_ASSERT_STR_EQUAL("BAD", host_of("[]", 2, buf, sizeof buf), "empty brackets");
+    TEST_ASSERT_STR_EQUAL("BAD", host_of("[]:1", 4, buf, sizeof buf), "empty brackets, port");
+
     TEST_CASE("a NUL ends nothing");
     /* It used to end the copy the name was matched from: "example.com\0x"
      * selected example.com. */

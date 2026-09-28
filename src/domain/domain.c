@@ -403,6 +403,10 @@ domain_host_e domain_host_normalize(const char* host, size_t length, char** out)
     }
     name[name_length] = 0;
 
+    /* ":80", ".", "[]": no host at all (RFC 9110 §4.2.1), not one a "*"
+     * virtual host should answer for. */
+    if (name_length == 0) return DOMAIN_HOST_BAD;
+
     for (size_t i = 0; i < port_length; i++)
         if (port[i] < '0' || port[i] > '9') return DOMAIN_HOST_BAD;
 
