@@ -13888,6 +13888,7 @@ static domain_host_e __rt_normalize(const char* h, size_t n, char* out) {
         }
     }
     name[nn] = 0;
+    if (nn == 0) return DOMAIN_HOST_BAD;
     for (size_t i = 0; i < pn; i++)
         if (port[i] < '0' || port[i] > '9') return DOMAIN_HOST_BAD;
     char* ascii = idn_to_ascii(name);

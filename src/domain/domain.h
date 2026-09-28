@@ -47,9 +47,10 @@ int domain_count(domain_t*);
  * "example.com" -- and the rest in ASCII/punycode. `*out` is a new string for
  * the caller to free on DOMAIN_HOST_OK.
  *
- * DOMAIN_HOST_BAD for what cannot be a Host: empty, DOMAIN_MAX_HOST bytes or
- * more, a control byte, space or DEL anywhere, a port with anything but
- * digits, an unclosed or trailed IPv6 literal, two trailing dots.
+ * DOMAIN_HOST_BAD for what cannot be a Host: empty or with an empty name
+ * (":80", ".", "[]"), DOMAIN_MAX_HOST bytes or more, a control byte, space or
+ * DEL anywhere, a port with anything but digits, an unclosed or trailed IPv6
+ * literal, two trailing dots.
  * DOMAIN_HOST_UNKNOWN for a name IDN cannot convert: well formed, but no
  * virtual host can have it. */
 #define DOMAIN_MAX_HOST 256
