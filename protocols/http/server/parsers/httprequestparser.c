@@ -22,7 +22,6 @@
 #define MAX_HEADER_VALUE_SIZE 8192
 #define MAX_URI_SIZE 32768             // Maximum URI size to prevent DoS
 #define MAX_HEADERS_COUNT 100          // Maximum number of headers to prevent DoS
-#define MAX_HOST_SIZE 256              // Maximum Host header length (DNS name limit is 255)
 #define PCRE_VECTOR_SIZE 120           // Use static array instead of VLA for better portability
 
 static int __parse_payload(httprequestparser_t* parser);
@@ -696,39 +695,17 @@ int __try_set_server(httprequestparser_t* parser, http_header_t* header) {
  * authority arrives as the :authority pseudo-header rather than a Host field).
  * On success ctx->server points at the matching server. */
 int httpparser_select_server(connection_t* connection, const char* host, size_t host_length) {
-    if (host_length == 0 || host_length >= MAX_HOST_SIZE) {
-        log_error("HTTP error: invalid Host header length %zu\n", host_length);
-        return HTTP1PARSER_BAD_REQUEST;
-    }
+    char* ascii_domain = NULL;
 
-    char domain[MAX_HOST_SIZE];
-    memcpy(domain, host, host_length);
-    domain[host_length] = '\0';
-
-    // Отрезаем опциональный порт; в IPv6-литерале двоеточия находятся
-    // внутри квадратных скобок (RFC 3986), порт идет после ']'
-    if (domain[0] == '[') {
-        char* closing = strchr(domain, ']');
-        if (closing == NULL || (closing[1] != '\0' && closing[1] != ':')) {
-            log_error("HTTP error: malformed IPv6 literal in Host header: %s\n", domain);
-            return HTTP1PARSER_BAD_REQUEST;
-        }
-
-        // Матчинг по адресу без скобок
-        const size_t address_length = (size_t)(closing - domain) - 1;
-        memmove(domain, domain + 1, address_length);
-        domain[address_length] = '\0';
-    }
-    else {
-        char* colon = strchr(domain, ':');
-        if (colon != NULL) *colon = '\0';
-    }
-
-    // Convert to ASCII/Punycode for matching
-    char* ascii_domain = idn_to_ascii(domain);
-    if (ascii_domain == NULL) {
-        log_warning("Invalid domain in Host header: %s\n", domain);
+    switch (domain_host_normalize(host, host_length, &ascii_domain)) {
+    case DOMAIN_HOST_OK:
+        break;
+    case DOMAIN_HOST_UNKNOWN:
+        log_warning("Invalid domain in Host header: %.*s\n", (int)host_length, host);
         return HTTP1PARSER_HOST_NOT_FOUND;
+    default:
+        log_error("HTTP error: malformed Host header (%zu bytes)\n", host_length);
+        return HTTP1PARSER_BAD_REQUEST;
     }
 
     const size_t ascii_length = strlen(ascii_domain);
@@ -743,7 +720,7 @@ int httpparser_select_server(connection_t* connection, const char* host, size_t 
             return HTTP1PARSER_CONTINUE;
         }
 
-        log_error("HTTP error: Host header does not match SNI-selected server: %s\n", domain);
+        log_error("HTTP error: Host header does not match SNI-selected server: %s\n", ascii_domain);
         free(ascii_domain);
         return HTTP1PARSER_HOST_NOT_FOUND;
     }

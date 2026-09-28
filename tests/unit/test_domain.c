@@ -1,5 +1,7 @@
 #include "framework.h"
 #include "domain.h"
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // ============================================================================
@@ -387,4 +389,75 @@ TEST(test_domain_matching_is_case_insensitive) {
     TEST_ASSERT_EQUAL(0, domain_matches_host(w, "example.com"), "and it still needs a label");
 
     domains_free(w);
+}
+
+/* domain_host_normalize, with the answer as a string for the assertions. */
+static const char* host_of(const char* host, size_t length, char* buf, size_t cap) {
+    char* out = NULL;
+    const int rc = domain_host_normalize(host, length, &out);
+    if (rc == DOMAIN_HOST_BAD) return "BAD";
+    if (rc == DOMAIN_HOST_UNKNOWN) return "UNKNOWN";
+    snprintf(buf, cap, "%s", out);
+    free(out);
+    return buf;
+}
+
+TEST(test_domain_host_normalize) {
+    TEST_SUITE("domain: the Host a request names");
+    char buf[300];
+
+    TEST_CASE("the port comes off, and only digits make one");
+    TEST_ASSERT_STR_EQUAL("example.com", host_of("example.com:8443", 16, buf, sizeof buf), "port");
+    TEST_ASSERT_STR_EQUAL("example.com", host_of("example.com:", 12, buf, sizeof buf), "empty port");
+    TEST_ASSERT_STR_EQUAL("BAD", host_of("example.com:80a", 15, buf, sizeof buf), "not a port");
+    TEST_ASSERT_STR_EQUAL("BAD", host_of("example.com:80:81", 17, buf, sizeof buf), "two ports");
+
+    TEST_CASE("an IPv6 literal loses its brackets");
+    TEST_ASSERT_STR_EQUAL("::1", host_of("[::1]:443", 9, buf, sizeof buf), "with a port");
+    TEST_ASSERT_STR_EQUAL("::1", host_of("[::1]", 5, buf, sizeof buf), "without");
+    TEST_ASSERT_STR_EQUAL("BAD", host_of("[::1", 4, buf, sizeof buf), "unclosed");
+    TEST_ASSERT_STR_EQUAL("BAD", host_of("[::1]x", 6, buf, sizeof buf), "junk after it");
+
+    TEST_CASE("a fully qualified name is the same host");
+    /* "example.com." names the same host as "example.com" (RFC 3986 §3.2.2 is
+     * silent, DNS is not), and it used to find no virtual host at all. Found by
+     * the fuzz target route. */
+    TEST_ASSERT_STR_EQUAL("example.com", host_of("example.com.", 12, buf, sizeof buf), "dot");
+    TEST_ASSERT_STR_EQUAL("example.com", host_of("example.com.:80", 15, buf, sizeof buf), "dot, port");
+    TEST_ASSERT_STR_EQUAL("BAD", host_of("example.com..", 13, buf, sizeof buf), "two dots");
+
+    TEST_CASE("control bytes, a space and DEL are no part of a host");
+    TEST_ASSERT_STR_EQUAL("BAD", host_of("exa mple.com", 12, buf, sizeof buf), "space");
+    TEST_ASSERT_STR_EQUAL("BAD", host_of("example.com\n", 12, buf, sizeof buf), "LF");
+    TEST_ASSERT_STR_EQUAL("BAD", host_of("exam\x7fple.com", 12, buf, sizeof buf), "DEL");
+
+    TEST_CASE("a NUL ends nothing");
+    /* It used to end the copy the name was matched from: "example.com\0x"
+     * selected example.com. */
+    TEST_ASSERT_STR_EQUAL("BAD", host_of("example.com\0evil", 16, buf, sizeof buf), "refused");
+
+    TEST_CASE("IDN and length");
+    TEST_ASSERT_STR_EQUAL("xn--e1afmkfd.xn--p1ai",
+                          host_of("пример.рф", strlen("пример.рф"), buf, sizeof buf), "punycode");
+    TEST_ASSERT_STR_EQUAL("BAD", host_of("", 0, buf, sizeof buf), "empty");
+    char longhost[300];
+    memset(longhost, 'a', sizeof longhost);
+    TEST_ASSERT_STR_EQUAL("BAD", host_of(longhost, sizeof longhost, buf, sizeof buf), "too long");
+}
+
+TEST(test_domain_pattern_takes_any_byte) {
+    TEST_SUITE("domain: the Host a request names");
+    TEST_CASE("'*' matches every byte, and '$' is the end");
+    /* Compiled like the route and redirect locations: a template must not
+     * mean one thing to the literal shortcut and another to its pattern. Found
+     * by the fuzz target route. */
+    domain_t* any = domain_create("*");
+    TEST_REQUIRE_NOT_NULL(any, "created");
+    TEST_ASSERT(domain_matches(any, "a\nb", 3), "a newline is a byte like any other");
+    domains_free(any);
+
+    domain_t* d = domain_create("(example).com");
+    TEST_REQUIRE_NOT_NULL(d, "created");
+    TEST_ASSERT(!domain_matches(d, "example.com\n", 12), "no match before a final newline");
+    domains_free(d);
 }

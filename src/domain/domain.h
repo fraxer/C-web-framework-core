@@ -1,6 +1,8 @@
 #ifndef __DOMAIN__
 #define __DOMAIN__
 
+#include <stddef.h>
+
 #include <pcre2.h>
 
 typedef struct domain {
@@ -38,5 +40,26 @@ int domain_parse(domain_t*);
 int domain_matches(const domain_t* domain, const char* host, size_t length);
 
 int domain_count(domain_t*);
+
+/* The name a Host field or :authority asks for, as domain_matches compares it:
+ * the port off (only digits make one, RFC 9110 §7.2), the brackets off an IPv6
+ * literal, one trailing dot off -- "example.com." names the same host as
+ * "example.com" -- and the rest in ASCII/punycode. `*out` is a new string for
+ * the caller to free on DOMAIN_HOST_OK.
+ *
+ * DOMAIN_HOST_BAD for what cannot be a Host: empty, DOMAIN_MAX_HOST bytes or
+ * more, a control byte, space or DEL anywhere, a port with anything but
+ * digits, an unclosed or trailed IPv6 literal, two trailing dots.
+ * DOMAIN_HOST_UNKNOWN for a name IDN cannot convert: well formed, but no
+ * virtual host can have it. */
+#define DOMAIN_MAX_HOST 256
+
+typedef enum {
+    DOMAIN_HOST_OK = 0,
+    DOMAIN_HOST_BAD,
+    DOMAIN_HOST_UNKNOWN
+} domain_host_e;
+
+domain_host_e domain_host_normalize(const char* host, size_t length, char** out);
 
 #endif
