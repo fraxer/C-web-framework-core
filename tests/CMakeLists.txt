@@ -239,7 +239,7 @@ if(BUILD_FUZZERS STREQUAL "yes")
         list(APPEND FUZZ_TARGET_NAMES
             quic_packet quic_frame quic_tp h3_frame qpack_decode qpack_streams
             h3_priority qpack_dynamic qpack_session quic_stream h3_request quic_conn quic_pmtud
-            h3_response)
+            h3_response quic_frames quic_token quic_version h3_session)
     endif()
 
     # The database layer on SQLite ":memory:": no server, but the driver only
@@ -290,6 +290,10 @@ if(BUILD_FUZZERS STREQUAL "yes")
     set(FUZZ_ID_h3_response 40)
     set(FUZZ_ID_view 41)
     set(FUZZ_ID_ws_connection 42)
+    set(FUZZ_ID_quic_frames 43)
+    set(FUZZ_ID_quic_token 44)
+    set(FUZZ_ID_quic_version 45)
+    set(FUZZ_ID_h3_session 46)
 
     foreach(name ${FUZZ_TARGET_NAMES})
         set(exe fuzz_${name})
@@ -350,6 +354,10 @@ if(BUILD_FUZZERS STREQUAL "yes")
             FUZZ_H3_RESPONSE=40
             FUZZ_VIEW=41
             FUZZ_WS_CONNECTION=42
+            FUZZ_QUIC_FRAMES=43
+            FUZZ_QUIC_TOKEN=44
+            FUZZ_QUIC_VERSION=45
+            FUZZ_H3_SESSION=46
             FUZZ_TARGET=${FUZZ_ID_${name}}
         )
 
@@ -388,10 +396,10 @@ if(BUILD_FUZZERS STREQUAL "yes")
             ${CMAKE_DL_LIBS}
         )
 
-        # quic_conn drives the in-process stand of test_quic_conn.c
+        # quic_conn and quic_frames drive the in-process stand of test_quic_conn.c
         # (tests/quic/quic_stand.h), which talks to the test client and loads
         # the test certificate -- what h3_runner is given, given here too.
-        if(name STREQUAL quic_conn)
+        if(name STREQUAL quic_conn OR name STREQUAL quic_frames)
             target_sources(${exe} PRIVATE ${QUIC_CLIENT_SOURCES})
             target_include_directories(${exe} PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}/quicclient
@@ -403,6 +411,11 @@ if(BUILD_FUZZERS STREQUAL "yes")
                 TEST_QUIC_KEY="${CMAKE_CURRENT_SOURCE_DIR}/data/quic_test_key.pem"
             )
             target_link_libraries(${exe} PRIVATE idn2 resolv)
+        endif()
+
+        # quic_version asks the endpoint what Version Negotiation it owes.
+        if(name STREQUAL quic_version)
+            target_include_directories(${exe} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/udp)
         endif()
     endforeach()
 endif()

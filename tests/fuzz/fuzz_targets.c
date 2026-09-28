@@ -10911,6 +10911,2444 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     return 0;
 }
 
+#elif FUZZ_TARGET == FUZZ_QUIC_FRAMES
+
+#include "quic_stand.h"
+#include "quicmemory.h"
+
+/* Frames on an established QUIC connection, and the error each wrong one must
+ * close it with.
+ *
+ * quic_conn cannot get here: its input decides what the path does, and a packet
+ * it damages simply fails to open. In this target the test client carries bytes
+ * the input chose (quicclient_inject) inside a packet it protects properly, so
+ * the server opens it and its frame loop reads exactly those bytes -- the same
+ * loop, the same keys, and nothing compiled into the server for the purpose.
+ *
+ * Every packet is built from frames that are correct except, at most, for one
+ * deliberate violation, and the target works out by itself what RFC 9000 asks
+ * of the server: accept the packet, or close with the code §19 or §12.4 names
+ * for that violation. The model behind the verdict keeps what makes a frame
+ * right or wrong -- which client streams exist, how far each has reached and
+ * where it ends, the connection ids the client has issued -- and starts from the
+ * transport parameters the server announced, not from its bookkeeping.
+ *
+ * One injection may go out before the handshake completes, at the Initial or
+ * Handshake level, where §12.4 admits only PADDING, PING, ACK, CRYPTO and the
+ * transport CONNECTION_CLOSE; after the handshake every packet is 1-RTT.
+ *
+ * Checked after every packet, besides the verdict: limits the client lowered
+ * stay where they were (MAX_DATA and MAX_STREAM_DATA only ever raise, §19.9,
+ * §19.10); the server holds exactly the client ids the model says are active,
+ * never more than it allowed (§5.1.1); of its own ids no more are active than
+ * the client allowed, every active one routes and every retired one does not
+ * (§5.1.2); the last PATH_CHALLENGE of a packet comes back with its own data
+ * (§8.2.2). At the end the connection goes, and the QUIC memory budget is back
+ * where it started.
+ *
+ * Where the RFC leaves the choice to the implementation the verdict follows the
+ * server's: an ACK of a packet never sent is PROTOCOL_VIOLATION (§13.1, SHOULD),
+ * a sequence number reused for another id is PROTOCOL_VIOLATION (§19.15, MAY),
+ * CRYPTO past 64 KiB is CRYPTO_BUFFER_EXCEEDED (§7.5), and a stream frame after
+ * the stream's reset is ignored rather than checked against its final size
+ * (§4.5, SHOULD). */
+
+#define QF_STREAMS 16
+#define QF_OK      UINT64_MAX         /* the packet is accepted */
+#define QF_DRAIN   (UINT64_MAX - 1)   /* the client closed; the server drains */
+#define QF_CID_LEN 8                  /* the client's own ids, like its scid */
+
+typedef struct {
+    uint64_t high;       /* one past the highest byte received */
+    uint64_t final;
+    int has_final, reset;
+} qf_stream_t;
+
+typedef struct {
+    uint64_t seq;
+    quiccid_t cid;
+} qf_pcid_t;
+
+typedef struct {
+    /* The server's transport parameters, read once after the handshake. */
+    uint64_t max_bidi, max_uni, win_bidi, win_uni, max_data, cid_limit;
+
+    uint64_t conn_used;                  /* the connection window spent */
+    qf_stream_t bidi[QF_STREAMS], uni[QF_STREAMS];
+
+    /* The client's ids the server must hold: every one at or above the
+     * Retire Prior To watermark. */
+    qf_pcid_t pcid[QUICCONN_MAX_PEER_CIDS + 1];
+    size_t pcid_count;
+    uint64_t rpt, next_seq;
+
+    /* What the server may send, as last seen; never allowed to go down. */
+    uint64_t send_limit;
+    uint64_t stream_send_limit[QF_STREAMS];
+
+    /* The server's own ids the client retired: none may route again. */
+    quiccid_t retired[64];
+    size_t retired_count;
+} qf_model_t;
+
+typedef struct {
+    uint8_t b[CLIENT_MAX_INJECT];
+    size_t n;
+    uint64_t expect;
+    int challenge;
+    uint8_t challenge_data[8];
+} qf_pkt_t;
+
+typedef struct {
+    uint8_t b[1400];
+    size_t n;
+} qf_frame_t;
+
+typedef struct {
+    const uint8_t* p;
+    const uint8_t* end;
+} qf_in_t;
+
+static uint8_t __qf_u8(qf_in_t* in) {
+    return in->p < in->end ? *in->p++ : 0;
+}
+
+static uint64_t __qf_u16(qf_in_t* in) {
+    const uint64_t hi = __qf_u8(in);
+    return hi << 8 | __qf_u8(in);
+}
+
+static uint64_t __qf_u32(qf_in_t* in) {
+    const uint64_t hi = __qf_u16(in);
+    return hi << 16 | __qf_u16(in);
+}
+
+/* Any value a varint can carry, small ones most often. */
+static uint64_t __qf_any(qf_in_t* in) {
+    const uint8_t shift = __qf_u8(in);
+    return (__qf_u16(in) << (shift % 47)) & QUIC_VARINT_MAX;
+}
+
+/* A number in [0, range], small ones most often. */
+static uint64_t __qf_upto(qf_in_t* in, uint64_t range) {
+    const uint8_t how = __qf_u8(in);
+    const uint64_t v = how < 128 ? how : how < 224 ? __qf_u16(in) : __qf_u32(in);
+    return range == UINT64_MAX ? v : v % (range + 1);
+}
+
+static void __qf_byte(qf_frame_t* f, uint8_t v) {
+    if (f->n < sizeof f->b) f->b[f->n] = v;
+    f->n++;
+}
+
+/* The shortest encoding (RFC 9000 §16); values past 2^62 do not occur here. */
+static void __qf_vi(qf_frame_t* f, uint64_t v) {
+    if (v < 64) {
+        __qf_byte(f, (uint8_t)v);
+    } else if (v < 16384) {
+        __qf_byte(f, (uint8_t)(0x40 | v >> 8));
+        __qf_byte(f, (uint8_t)v);
+    } else if (v < (1ULL << 30)) {
+        __qf_byte(f, (uint8_t)(0x80 | v >> 24));
+        for (int i = 2; i >= 0; i--) __qf_byte(f, (uint8_t)(v >> (i * 8)));
+    } else {
+        __qf_byte(f, (uint8_t)(0xc0 | v >> 56));
+        for (int i = 6; i >= 0; i--) __qf_byte(f, (uint8_t)(v >> (i * 8)));
+    }
+}
+
+static void __qf_bytes(qf_frame_t* f, uint8_t fill, size_t n) {
+    for (size_t i = 0; i < n; i++) __qf_byte(f, (uint8_t)(fill + i * 7));
+}
+
+static uint64_t __qf_client_bidi(size_t idx) { return (uint64_t)idx << 2; }
+static uint64_t __qf_client_uni(size_t idx) { return (uint64_t)idx << 2 | 2; }
+
+/* A stream the client may use: bidirectional or unidirectional, below the limit
+ * the server announced and within what the model tracks. 0 if there is none. */
+static int __qf_pick(qf_in_t* in, const qf_model_t* m, int* uni, size_t* idx) {
+    const uint8_t b = __qf_u8(in);
+    const uint64_t nb = m->max_bidi < QF_STREAMS ? m->max_bidi : QF_STREAMS;
+    const uint64_t nu = m->max_uni < QF_STREAMS ? m->max_uni : QF_STREAMS;
+
+    *uni = (b & 1) && nu > 0;
+    if (!*uni && nb == 0) *uni = nu > 0;
+    if (*uni ? nu == 0 : nb == 0) return 0;
+
+    *idx = (size_t)((b >> 1) % (*uni ? nu : nb));
+    return 1;
+}
+
+static uint64_t __qf_id(int uni, size_t idx) {
+    return uni ? __qf_client_uni(idx) : __qf_client_bidi(idx);
+}
+
+/* One past what any client stream of this kind may be numbered, with room for
+ * whatever the server granted since: every stream the client has opened, at
+ * most QF_STREAMS, may have been released and credited back. */
+static uint64_t __qf_beyond(const qf_model_t* m, int uni, uint8_t extra) {
+    const uint64_t index = (uni ? m->max_uni : m->max_bidi + QF_STREAMS) + extra % 4;
+    return index << 2 | (uni ? 2 : 0);
+}
+
+static int __qf_cid_eq(const quiccid_t* a, const quiccid_t* b) {
+    return a->len == b->len && memcmp(a->data, b->data, a->len) == 0;
+}
+
+static quiccid_t __qf_pcid_of(uint64_t seq, uint8_t salt) {
+    quiccid_t cid;
+    cid.len = QF_CID_LEN;
+    for (size_t i = 0; i < QF_CID_LEN; i++)
+        cid.data[i] = (uint8_t)(seq * 131 + i * 7 + 0x40 + salt);
+    return cid;
+}
+
+static void __qf_new_cid(qf_frame_t* f, uint64_t seq, uint64_t rpt, const quiccid_t* cid) {
+    __qf_vi(f, QUIC_FRAME_NEW_CONNECTION_ID);
+    __qf_vi(f, seq);
+    __qf_vi(f, rpt);
+    __qf_byte(f, cid->len);
+    for (size_t i = 0; i < cid->len; i++) __qf_byte(f, cid->data[i]);
+    __qf_bytes(f, (uint8_t)seq, 16);
+}
+
+/* A frame §12.4 forbids in Initial and Handshake packets, well formed. */
+static void __qf_forbidden(qf_in_t* in, qf_frame_t* f) {
+    static const uint64_t types[] = {
+        QUIC_FRAME_RESET_STREAM, QUIC_FRAME_STOP_SENDING, QUIC_FRAME_NEW_TOKEN,
+        QUIC_FRAME_STREAM, QUIC_FRAME_MAX_DATA, QUIC_FRAME_MAX_STREAM_DATA,
+        QUIC_FRAME_MAX_STREAMS_BIDI, QUIC_FRAME_MAX_STREAMS_UNI, QUIC_FRAME_DATA_BLOCKED,
+        QUIC_FRAME_STREAM_DATA_BLOCKED, QUIC_FRAME_STREAMS_BLOCKED_BIDI,
+        QUIC_FRAME_STREAMS_BLOCKED_UNI, QUIC_FRAME_NEW_CONNECTION_ID,
+        QUIC_FRAME_RETIRE_CONNECTION_ID, QUIC_FRAME_PATH_CHALLENGE,
+        QUIC_FRAME_PATH_RESPONSE, QUIC_FRAME_CONNECTION_CLOSE_APP,
+        QUIC_FRAME_HANDSHAKE_DONE,
+    };
+    const uint64_t type = types[__qf_u8(in) % (sizeof types / sizeof types[0])];
+
+    switch (type) {
+    case QUIC_FRAME_RESET_STREAM:
+        __qf_vi(f, type); __qf_vi(f, 0); __qf_vi(f, 0); __qf_vi(f, 0);
+        break;
+    case QUIC_FRAME_STOP_SENDING:
+    case QUIC_FRAME_MAX_STREAM_DATA:
+    case QUIC_FRAME_STREAM_DATA_BLOCKED:
+        __qf_vi(f, type); __qf_vi(f, 0); __qf_vi(f, 0);
+        break;
+    case QUIC_FRAME_NEW_TOKEN:
+        __qf_vi(f, type); __qf_vi(f, 1); __qf_byte(f, 0x55);
+        break;
+    case QUIC_FRAME_STREAM:
+        __qf_vi(f, QUIC_FRAME_STREAM | QUIC_STREAM_FLAG_LEN); __qf_vi(f, 0);
+        __qf_vi(f, 1); __qf_byte(f, 'x');
+        break;
+    case QUIC_FRAME_NEW_CONNECTION_ID: {
+        const quiccid_t cid = __qf_pcid_of(1, 0);
+        __qf_new_cid(f, 1, 0, &cid);
+        break;
+    }
+    case QUIC_FRAME_PATH_CHALLENGE:
+    case QUIC_FRAME_PATH_RESPONSE:
+        __qf_vi(f, type); __qf_bytes(f, 0x21, 8);
+        break;
+    case QUIC_FRAME_CONNECTION_CLOSE_APP:
+        __qf_vi(f, type); __qf_vi(f, 0); __qf_vi(f, 0);
+        break;
+    case QUIC_FRAME_HANDSHAKE_DONE:
+        __qf_vi(f, type);
+        break;
+    default:   /* MAX_DATA, MAX_STREAMS, DATA_BLOCKED, STREAMS_BLOCKED, RETIRE */
+        __qf_vi(f, type); __qf_vi(f, 0);
+        break;
+    }
+}
+
+/* ---- One frame: its bytes, its verdict, and what it does to the model ---- */
+
+static uint64_t __qf_stream(qf_in_t* in, qf_model_t* m, qf_frame_t* f) {
+    int uni;
+    size_t idx;
+    if (!__qf_pick(in, m, &uni, &idx)) return QF_OK;
+
+    qf_stream_t* st = uni ? &m->uni[idx] : &m->bidi[idx];
+    const uint64_t win = uni ? m->win_uni : m->win_bidi;
+
+    size_t len = (size_t)(__qf_u8(in) % 48);
+    if (__qf_u8(in) >= 240) len = (size_t)(__qf_u16(in) % 900);
+    int fin = __qf_u8(in) & 1;
+    uint64_t offset;
+
+    if (st->reset) {
+        /* §4.5 asks for a check against the final size even here, as a SHOULD;
+         * the server ignores whatever arrives once the stream is reset. */
+        offset = __qf_upto(in, 1000);
+    } else if (st->has_final) {
+        if (len > st->final) len = (size_t)st->final;
+        offset = fin ? st->final - len : __qf_upto(in, st->final - len);
+    } else {
+        if (len > win) len = (size_t)win;
+        offset = __qf_upto(in, win - len);
+        /* A FIN may not end the stream below what has already arrived. */
+        if (fin && offset + len < st->high) offset = st->high > len ? st->high - len : 0;
+
+        /* Within the connection window too, or this is a violation of a kind
+         * the verdict does not predict: the window may have grown since. */
+        const uint64_t end = offset + len;
+        if (end > st->high && m->conn_used + (end - st->high) > m->max_data) {
+            offset = st->high > len ? st->high - len : 0;
+            if (offset + len > st->high) len = (size_t)(st->high - offset);
+            fin = 0;
+        }
+    }
+
+    const int has_off = offset > 0 || (__qf_u8(in) & 1);
+    __qf_vi(f, QUIC_FRAME_STREAM | QUIC_STREAM_FLAG_LEN |
+               (has_off ? QUIC_STREAM_FLAG_OFF : 0) | (fin ? QUIC_STREAM_FLAG_FIN : 0));
+    __qf_vi(f, __qf_id(uni, idx));
+    if (has_off) __qf_vi(f, offset);
+    __qf_vi(f, len);
+    __qf_bytes(f, (uint8_t)offset, len);
+
+    if (!st->reset) {
+        const uint64_t end = offset + len;
+        if (end > st->high) {
+            m->conn_used += end - st->high;
+            st->high = end;
+        }
+        if (fin) {
+            st->has_final = 1;
+            st->final = end;
+        }
+    }
+
+    return QF_OK;
+}
+
+static uint64_t __qf_stream_bad(qf_in_t* in, qf_model_t* m, qf_frame_t* f) {
+    int uni;
+    size_t idx;
+    const uint8_t sub = __qf_u8(in) % 6;
+    uint64_t id, offset = 0, expect;
+    size_t len = 1 + __qf_u8(in) % 16;
+    int fin = 0;
+
+    const int have = __qf_pick(in, m, &uni, &idx);
+    if (!have) { uni = 0; idx = 0; }
+    qf_stream_t* st = uni ? &m->uni[idx] : &m->bidi[idx];
+    const uint64_t win = uni ? m->win_uni : m->win_bidi;
+
+    switch (sub) {
+    case 1:     /* past the stream's window, §4.1 */
+        if (have && !st->reset && !st->has_final) {
+            id = __qf_id(uni, idx);
+            offset = win - len + 1 + __qf_u8(in) % 16;
+            expect = QUIC_FLOW_CONTROL_ERROR;
+            break;
+        }
+        /* fall through */
+    case 0:     /* a stream the server did not allow, §4.6 */
+        id = __qf_beyond(m, uni, __qf_u8(in));
+        expect = QUIC_STREAM_LIMIT_ERROR;
+        break;
+    case 2:     /* one the server would have had to open, §19.8 */
+        id = (uint64_t)(__qf_u8(in) % 8) << 2 | 3;
+        expect = QUIC_STREAM_STATE_ERROR;
+        break;
+    case 3:
+        id = (uint64_t)(__qf_u8(in) % 8) << 2 | 1;
+        expect = QUIC_STREAM_STATE_ERROR;
+        break;
+    case 4:     /* against a final size, §4.5 */
+        if (!have || st->reset) goto limit;
+        id = __qf_id(uni, idx);
+        if (st->has_final && st->final + len <= win) {
+            offset = st->final;                 /* data past the end */
+        } else if (st->has_final && st->final > 0) {
+            offset = 0;                         /* a different end */
+            len = (size_t)(st->final - 1 < 16 ? st->final - 1 : 16);
+            fin = 1;
+        } else if (!st->has_final && st->high > 0) {
+            len = (size_t)(st->high - 1 < 16 ? st->high - 1 : 16);
+            offset = st->high - 1 - len;        /* an end below what arrived */
+            fin = 1;
+        } else {
+            goto limit;
+        }
+        expect = QUIC_FINAL_SIZE_ERROR;
+        break;
+    default:    /* an offset past 2^62 - 1, §19.8 */
+        id = have ? __qf_id(uni, idx) : 0;
+        offset = QUIC_VARINT_MAX - len + 1;
+        expect = QUIC_FRAME_ENCODING_ERROR;
+        break;
+    }
+
+    if (0) {
+limit:
+        id = __qf_beyond(m, uni, __qf_u8(in));
+        expect = QUIC_STREAM_LIMIT_ERROR;
+    }
+
+    __qf_vi(f, QUIC_FRAME_STREAM | QUIC_STREAM_FLAG_LEN | QUIC_STREAM_FLAG_OFF |
+               (fin ? QUIC_STREAM_FLAG_FIN : 0));
+    __qf_vi(f, id);
+    __qf_vi(f, offset);
+    __qf_vi(f, len);
+    __qf_bytes(f, 0x33, len);
+
+    return expect;
+}
+
+static uint64_t __qf_reset(qf_in_t* in, qf_model_t* m, qf_frame_t* f) {
+    int uni;
+    size_t idx;
+    const uint8_t sub = __qf_u8(in) % 6;
+    uint64_t id, final_size = 0, expect = QF_OK;
+    const int have = __qf_pick(in, m, &uni, &idx);
+
+    if (!have) { uni = 0; idx = 0; }
+    qf_stream_t* st = uni ? &m->uni[idx] : &m->bidi[idx];
+    const uint64_t win = uni ? m->win_uni : m->win_bidi;
+
+    if (!have && sub < 3) goto limit;
+
+    switch (sub) {
+    case 0:     /* an ordinary reset */
+        id = __qf_id(uni, idx);
+        if (st->reset) {
+            final_size = __qf_upto(in, 1000);
+        } else if (st->has_final) {
+            final_size = st->final;
+        } else {
+            uint64_t room = win - st->high;
+            const uint64_t conn_room = m->max_data - m->conn_used;
+            if (room > conn_room) room = conn_room;
+            final_size = st->high + __qf_upto(in, room);
+        }
+        if (!st->reset) {
+            m->conn_used += final_size - st->high;
+            st->high = final_size;
+            st->final = final_size;
+            st->has_final = 1;
+            st->reset = 1;
+        }
+        break;
+    case 1:     /* a final size that disagrees, §4.5 */
+        if (st->reset) goto limit;
+        id = __qf_id(uni, idx);
+        if (st->has_final && st->final > 0)
+            final_size = st->final - 1 - __qf_upto(in, st->final - 1);
+        else if (st->has_final && win > 0)
+            final_size = 1 + __qf_upto(in, win - 1 < 16 ? win - 1 : 16);   /* not 0 */
+        else if (!st->has_final && st->high > 0)
+            final_size = st->high - 1 - __qf_upto(in, st->high - 1);        /* below it */
+        else
+            goto limit;
+        expect = QUIC_FINAL_SIZE_ERROR;
+        break;
+    case 2:     /* past the window, §4.5 */
+        if (st->reset) goto limit;
+        id = __qf_id(uni, idx);
+        final_size = win + 1 + __qf_u8(in);
+        expect = QUIC_FLOW_CONTROL_ERROR;
+        break;
+    case 3:     /* a stream only the server sends on, §19.4 */
+        id = (uint64_t)(__qf_u8(in) % 8) << 2 | 3;
+        expect = QUIC_STREAM_STATE_ERROR;
+        break;
+    case 4:     /* one the server would have had to open, §19.4 */
+        id = (uint64_t)(__qf_u8(in) % 8) << 2 | 1;
+        expect = QUIC_STREAM_STATE_ERROR;
+        break;
+    default:
+        goto limit;
+    }
+
+    if (0) {
+limit:
+        id = __qf_beyond(m, have ? uni : 0, __qf_u8(in));
+        expect = QUIC_STREAM_LIMIT_ERROR;
+    }
+
+    __qf_vi(f, QUIC_FRAME_RESET_STREAM);
+    __qf_vi(f, id);
+    __qf_vi(f, __qf_upto(in, 1000));
+    __qf_vi(f, final_size);
+
+    return expect;
+}
+
+/* STOP_SENDING, MAX_STREAM_DATA and STREAM_DATA_BLOCKED name a stream and carry
+ * one number. The first two are about the server's send side: a client
+ * unidirectional stream has none (§19.5, §19.10). STREAM_DATA_BLOCKED is about
+ * the client's: a server unidirectional stream is send-only for the server
+ * (§19.13). All three answer to the stream limit (§4.6). */
+static uint64_t __qf_stream_ctl(qf_in_t* in, qf_model_t* m, qf_frame_t* f, uint64_t type) {
+    int uni;
+    size_t idx;
+    const uint8_t sub = __qf_u8(in) % 4;
+    uint64_t id, expect = QF_OK;
+    const int have = __qf_pick(in, m, &uni, &idx);
+    const int blocked = type == QUIC_FRAME_STREAM_DATA_BLOCKED;
+
+    switch (have ? sub : 3) {
+    case 0:
+        if (blocked) {
+            id = __qf_id(uni, idx);
+        } else {
+            /* The server's side of a client bidirectional stream. */
+            if (m->max_bidi == 0) goto limit;
+            id = __qf_client_bidi(idx % (m->max_bidi < QF_STREAMS ? m->max_bidi : QF_STREAMS));
+        }
+        break;
+    case 1:
+        if (blocked) {
+            id = (uint64_t)(__qf_u8(in) % 8) << 2 | 3;
+        } else {
+            if (m->max_uni == 0) goto limit;
+            id = __qf_client_uni(idx % (m->max_uni < QF_STREAMS ? m->max_uni : QF_STREAMS));
+        }
+        expect = QUIC_STREAM_STATE_ERROR;
+        break;
+    case 2:
+        if (blocked) goto limit;
+        /* A stream only the server could open, and has not. */
+        id = (uint64_t)(__qf_u8(in) % 8) << 2 | (__qf_u8(in) & 1 ? 3 : 1);
+        expect = QUIC_STREAM_STATE_ERROR;
+        break;
+    default:
+        goto limit;
+    }
+
+    if (0) {
+limit:
+        id = __qf_beyond(m, blocked && have ? uni : 0, __qf_u8(in));
+        expect = QUIC_STREAM_LIMIT_ERROR;
+    }
+
+    __qf_vi(f, type);
+    __qf_vi(f, id);
+    __qf_vi(f, __qf_any(in));
+
+    return expect;
+}
+
+static size_t __qf_pcid_active(const qf_model_t* m, uint64_t rpt) {
+    size_t n = 0;
+    for (size_t i = 0; i < m->pcid_count; i++)
+        if (m->pcid[i].seq >= rpt) n++;
+    return n;
+}
+
+static void __qf_pcid_retire(qf_model_t* m, uint64_t rpt) {
+    size_t kept = 0;
+    for (size_t i = 0; i < m->pcid_count; i++)
+        if (m->pcid[i].seq >= rpt) m->pcid[kept++] = m->pcid[i];
+    m->pcid_count = kept;
+    if (rpt > m->rpt) m->rpt = rpt;
+}
+
+static uint64_t __qf_new_cid_frame(qf_in_t* in, qf_model_t* m, qf_frame_t* f) {
+    const uint8_t sub = __qf_u8(in) % 8;
+
+    switch (sub) {
+    case 0: case 1: case 2: {   /* a new id, retiring as much as it must */
+        const uint64_t seq = m->next_seq;
+        uint64_t rpt = m->rpt + __qf_upto(in, seq - m->rpt);
+        while (__qf_pcid_active(m, rpt) + 1 > m->cid_limit) rpt++;
+
+        const quiccid_t cid = __qf_pcid_of(seq, 0);
+        __qf_new_cid(f, seq, rpt, &cid);
+
+        __qf_pcid_retire(m, rpt);
+        m->pcid[m->pcid_count].seq = seq;
+        m->pcid[m->pcid_count].cid = cid;
+        m->pcid_count++;
+        m->next_seq++;
+        return QF_OK;
+    }
+    case 3: {   /* one already given: the same id again is a retransmission */
+        if (m->pcid_count == 0) return QF_OK;
+        const qf_pcid_t* p = &m->pcid[__qf_u8(in) % m->pcid_count];
+        const int other = __qf_u8(in) & 1;
+        quiccid_t cid = p->cid;
+        if (other) cid.data[0] ^= 0xff;
+        __qf_new_cid(f, p->seq, m->rpt, &cid);
+        /* §19.15: a different id under the same number. */
+        return other ? QUIC_PROTOCOL_VIOLATION : QF_OK;
+    }
+    case 4: {   /* one retired already: retired again, whatever it says */
+        if (m->rpt == 0) return QF_OK;
+        const uint64_t seq = __qf_upto(in, m->rpt - 1);
+        const quiccid_t cid = __qf_pcid_of(seq, 0x80);
+        __qf_new_cid(f, seq, 0, &cid);
+        return QF_OK;
+    }
+    case 5: {   /* a new id with nothing retired, §5.1.1 */
+        const uint64_t seq = m->next_seq;
+        const quiccid_t cid = __qf_pcid_of(seq, 0);
+        __qf_new_cid(f, seq, m->rpt, &cid);
+        if (__qf_pcid_active(m, m->rpt) + 1 > m->cid_limit)
+            return QUIC_CONNECTION_ID_LIMIT_ERROR;
+        m->pcid[m->pcid_count].seq = seq;
+        m->pcid[m->pcid_count].cid = cid;
+        m->pcid_count++;
+        m->next_seq++;
+        return QF_OK;
+    }
+    case 6: {   /* Retire Prior To past the frame's own number, §19.15 */
+        const uint64_t seq = m->next_seq;
+        const quiccid_t cid = __qf_pcid_of(seq, 0);
+        __qf_new_cid(f, seq, seq + 1 + __qf_u8(in), &cid);
+        return QUIC_FRAME_ENCODING_ERROR;
+    }
+    default: {  /* a length outside 1..20, §19.15 */
+        const uint64_t seq = m->next_seq;
+        __qf_vi(f, QUIC_FRAME_NEW_CONNECTION_ID);
+        __qf_vi(f, seq);
+        __qf_vi(f, m->rpt);
+        const uint8_t len = __qf_u8(in) & 1 ? 0 : 21;
+        __qf_byte(f, len);
+        __qf_bytes(f, 0x10, len + 16u);
+        return QUIC_FRAME_ENCODING_ERROR;
+    }
+    }
+}
+
+static uint64_t __qf_retire(qf_in_t* in, qf_model_t* m, qf_frame_t* f, stand_t* s) {
+    const quicconn_t* c = s->conn;
+
+    if (__qf_u8(in) % 4 == 0) {
+        /* A number the server never gave out, §19.16. */
+        __qf_vi(f, QUIC_FRAME_RETIRE_CONNECTION_ID);
+        __qf_vi(f, c->next_cid_seq + 1000 + __qf_u8(in));
+        return QUIC_PROTOCOL_VIOLATION;
+    }
+
+    if (c->next_cid_seq == 0) return QF_OK;
+    const uint64_t seq = __qf_upto(in, c->next_cid_seq - 1);
+
+    for (size_t i = 0; i < QUICCONN_MAX_LOCAL_CIDS; i++) {
+        const quiccid_entry_t* e = &c->local_cids[i];
+        if (!e->active || e->seq != seq) continue;
+
+        /* Not one the client has not been told of, and not the one it is
+         * addressing the server by: §19.16 lets the server close for the
+         * second, and either way the client would have nothing to reach it
+         * with afterwards. */
+        if (!e->announced || __qf_cid_eq(&e->cid, &s->client.dcid)) return QF_OK;
+        if (m->retired_count < sizeof m->retired / sizeof m->retired[0])
+            m->retired[m->retired_count++] = e->cid;
+    }
+
+    __qf_vi(f, QUIC_FRAME_RETIRE_CONNECTION_ID);
+    __qf_vi(f, seq);
+    return QF_OK;
+}
+
+static uint64_t __qf_ack(qf_in_t* in, qf_frame_t* f, stand_t* s) {
+    const uint64_t np = s->conn->loss.space[QUIC_ENC_APP].next_pn;
+    const uint8_t sub = __qf_u8(in) % 4;
+    const int ecn = __qf_u8(in) & 1;
+
+    uint64_t largest, first, expect = QF_OK;
+    uint64_t gap = 0, range = 0;
+    int ranges = 0;
+
+    if (sub == 1) {
+        /* A packet the server never sent, §13.1. */
+        largest = np + 1000 + __qf_u16(in);
+        first = __qf_upto(in, 8);
+        expect = QUIC_PROTOCOL_VIOLATION;
+    } else if (sub == 2) {
+        /* A range that runs below packet number 0, §19.3.1. */
+        largest = __qf_u8(in) % 16;
+        if (__qf_u8(in) & 1) {
+            first = largest + 1 + __qf_u8(in);
+        } else {
+            first = 0;
+            ranges = 1;
+            gap = largest + __qf_u8(in);
+            range = __qf_u8(in);
+        }
+        expect = QUIC_FRAME_ENCODING_ERROR;
+    } else {
+        if (np == 0) return QF_OK;
+        largest = __qf_upto(in, np - 1);
+        first = __qf_upto(in, largest);
+        const uint64_t floor = largest - first;
+        /* A second range where one fits: it needs a gap of at least one packet
+         * and something below it. */
+        if (sub == 3 && floor >= 3) {
+            ranges = 1;
+            gap = __qf_upto(in, floor - 3);
+            range = __qf_upto(in, floor - gap - 2 - 1);
+        }
+    }
+
+    __qf_vi(f, ecn ? QUIC_FRAME_ACK_ECN : QUIC_FRAME_ACK);
+    __qf_vi(f, largest);
+    __qf_vi(f, __qf_upto(in, 5000));
+    __qf_vi(f, (uint64_t)ranges);
+    __qf_vi(f, first);
+    if (ranges) {
+        __qf_vi(f, gap);
+        __qf_vi(f, range);
+    }
+    if (ecn) {
+        __qf_vi(f, __qf_upto(in, 100));
+        __qf_vi(f, __qf_upto(in, 100));
+        __qf_vi(f, __qf_upto(in, 100));
+    }
+
+    return expect;
+}
+
+static uint64_t __qf_frame(qf_in_t* in, qf_model_t* m, qf_pkt_t* pk, qf_frame_t* f, stand_t* s) {
+    const uint8_t kind = __qf_u8(in);
+
+    switch (kind % 22) {
+    case 0:
+        __qf_vi(f, QUIC_FRAME_PING);
+        return QF_OK;
+    case 1: {
+        const size_t n = 1 + __qf_u8(in) % 32;
+        for (size_t i = 0; i < n; i++) __qf_byte(f, 0);
+        return QF_OK;
+    }
+    case 2: case 3: case 4:
+        return __qf_stream(in, m, f);
+    case 5:
+        return __qf_stream_bad(in, m, f);
+    case 6:
+        return __qf_reset(in, m, f);
+    case 7:
+        return __qf_stream_ctl(in, m, f, QUIC_FRAME_STOP_SENDING);
+    case 8:
+        return __qf_stream_ctl(in, m, f, QUIC_FRAME_MAX_STREAM_DATA);
+    case 9:
+        return __qf_stream_ctl(in, m, f, QUIC_FRAME_STREAM_DATA_BLOCKED);
+    case 10:
+        /* Any value: one below the current limit changes nothing (§19.9). */
+        __qf_vi(f, __qf_u8(in) & 1 ? QUIC_FRAME_MAX_DATA : QUIC_FRAME_DATA_BLOCKED);
+        __qf_vi(f, __qf_any(in));
+        return QF_OK;
+    case 11: {
+        /* MAX_STREAMS and STREAMS_BLOCKED: no more than 2^60, §19.11, §19.14. */
+        static const uint64_t types[] = {
+            QUIC_FRAME_MAX_STREAMS_BIDI, QUIC_FRAME_MAX_STREAMS_UNI,
+            QUIC_FRAME_STREAMS_BLOCKED_BIDI, QUIC_FRAME_STREAMS_BLOCKED_UNI,
+        };
+        const uint8_t b = __qf_u8(in);
+        __qf_vi(f, types[b % 4]);
+        if (b & 0x80) {
+            __qf_vi(f, (1ULL << 60) + 1 + __qf_u16(in));
+            return QUIC_FRAME_ENCODING_ERROR;
+        }
+        __qf_vi(f, __qf_any(in) % ((1ULL << 60) + 1));
+        return QF_OK;
+    }
+    case 12: case 13:
+        return __qf_new_cid_frame(in, m, f);
+    case 14:
+        return __qf_retire(in, m, f, s);
+    case 15: {
+        __qf_vi(f, QUIC_FRAME_PATH_CHALLENGE);
+        uint8_t data[8];
+        for (int i = 0; i < 8; i++) data[i] = __qf_u8(in);
+        for (int i = 0; i < 8; i++) __qf_byte(f, data[i]);
+        /* Several in one datagram get one answer, to the last of them: the
+         * server keeps a single slot on purpose (quicconn.h,
+         * path_response_data), and §8.2.2 leaves the peer to ask again. */
+        pk->challenge = 1;
+        memcpy(pk->challenge_data, data, 8);
+        return QF_OK;
+    }
+    case 16:
+        __qf_vi(f, QUIC_FRAME_PATH_RESPONSE);
+        for (int i = 0; i < 8; i++) __qf_byte(f, __qf_u8(in));
+        return QF_OK;
+    case 17:
+        return __qf_ack(in, f, s);
+    case 18:
+        __qf_vi(f, QUIC_FRAME_CRYPTO);
+        if (__qf_u8(in) & 1) {
+            /* A TLS KeyUpdate: RFC 9001 §6 names the error. */
+            __qf_vi(f, 0);
+            __qf_vi(f, 5);
+            __qf_byte(f, 24); __qf_byte(f, 0); __qf_byte(f, 0); __qf_byte(f, 1);
+            __qf_byte(f, __qf_u8(in) & 1);
+            return QUIC_CRYPTO_ERROR(10);
+        } else {
+            const size_t len = 1 + __qf_u8(in) % 32;
+            __qf_vi(f, QUICTLS_MAX_CRYPTO_BUFFER - len + 1 + __qf_upto(in, 100000));
+            __qf_vi(f, len);
+            __qf_bytes(f, 0x16, len);
+            return QUIC_CRYPTO_BUFFER_EXCEEDED;
+        }
+    case 19: {
+        /* Server-only frames, §19.7 and §19.20; an empty token, §19.7. */
+        const uint8_t b = __qf_u8(in) % 3;
+        if (b == 0) {
+            __qf_vi(f, QUIC_FRAME_HANDSHAKE_DONE);
+            return QUIC_PROTOCOL_VIOLATION;
+        }
+        __qf_vi(f, QUIC_FRAME_NEW_TOKEN);
+        if (b == 1) {
+            __qf_vi(f, 0);
+            return QUIC_FRAME_ENCODING_ERROR;
+        }
+        const size_t len = 1 + __qf_u8(in) % 64;
+        __qf_vi(f, len);
+        __qf_bytes(f, 0x44, len);
+        return QUIC_PROTOCOL_VIOLATION;
+    }
+    case 20: {
+        /* A type this server does not know, extensions included: §12.4 makes
+         * it FRAME_ENCODING_ERROR. DATAGRAM (0x30, 0x31) is left out, since a
+         * server that implemented RFC 9221 would call it something else. */
+        uint64_t type = 0x1f + __qf_upto(in, 0x3fffffff);
+        if (type == 0x30 || type == 0x31) type = 0x1f;
+        __qf_vi(f, type);
+        __qf_bytes(f, 0, __qf_u8(in) % 8);
+        return QUIC_FRAME_ENCODING_ERROR;
+    }
+    default: {
+        /* The client closes; the server drains and says nothing (§10.2.2). */
+        const int app = __qf_u8(in) & 1;
+        __qf_vi(f, app ? QUIC_FRAME_CONNECTION_CLOSE_APP : QUIC_FRAME_CONNECTION_CLOSE);
+        __qf_vi(f, __qf_any(in));
+        if (!app) __qf_vi(f, __qf_upto(in, 0x1e));
+        const size_t len = __qf_u8(in) % 16;
+        __qf_vi(f, len);
+        __qf_bytes(f, 'r', len);
+        return QF_DRAIN;
+    }
+    }
+}
+
+/* A packet's worth of frames, stopping at the first one the server must close
+ * on: it never reads what follows. */
+static void __qf_build(qf_in_t* in, qf_model_t* m, qf_pkt_t* pk, stand_t* s) {
+    const size_t frames = 1 + __qf_u8(in) % 6;
+
+    pk->n = 0;
+    pk->expect = QF_OK;
+    pk->challenge = 0;
+
+    for (size_t i = 0; i < frames && pk->expect == QF_OK && in->p < in->end; i++) {
+        qf_frame_t f;
+        f.n = 0;
+        qf_model_t next = *m;
+        qf_pkt_t pk_next = *pk;
+
+        const uint8_t* at = in->p;
+        const uint64_t verdict = __qf_frame(in, &next, &pk_next, &f, s);
+        if (s->trace) {
+            printf("   frame kind %u: expect 0x%llx:", at < in->end ? *at % 22 : 0,
+                   (unsigned long long)verdict);
+            for (size_t k = 0; k < f.n && k < 40; k++) printf(" %02x", f.b[k]);
+            printf("\n");
+        }
+        if (f.n == 0 || f.n > sizeof f.b || pk->n + f.n > sizeof pk->b) continue;
+
+        memcpy(pk->b + pk->n, f.b, f.n);
+        pk->n += f.n;
+        pk->expect = verdict;
+        pk->challenge = pk_next.challenge;
+        memcpy(pk->challenge_data, pk_next.challenge_data, 8);
+        if (verdict == QF_OK || verdict == QF_DRAIN) *m = next;
+    }
+}
+
+/* ---- Observing the server ---- */
+
+static void __qf_run(stand_t* s, uint64_t horizon_us) {
+    const uint64_t limit = __now_us + horizon_us;
+    uint64_t last = __now_us;
+    unsigned still = 0;
+
+    for (;;) {
+        if (s->client_failed) return;
+        if (!__step(s, limit)) return;
+        if (__now_us == last) {
+            if (++still > 200000) __builtin_trap();
+        } else {
+            last = __now_us;
+            still = 0;
+        }
+    }
+}
+
+static int __qf_routes(stand_t* s, const quiccid_t* cid) {
+    quicconn_t* c = quiccidtable_lookup_acquire(s->table, cid);
+    if (c == NULL) return 0;
+    connection_s_dec(&c->conn);
+    return c == s->conn;
+}
+
+static void __qf_check(stand_t* s, qf_model_t* m) {
+    quicconn_t* c = s->conn;
+    if (c == NULL || c->state != QUICCONN_ACTIVE) return;
+
+    /* §19.9, §19.10: a limit only goes up. */
+    if (c->send_flow.limit < m->send_limit) __builtin_trap();
+    m->send_limit = c->send_flow.limit;
+
+    for (size_t i = 0; i < QF_STREAMS; i++) {
+        const quicstream_t* st = quicconn_stream_find(c, __qf_client_bidi(i));
+        if (st == NULL) continue;
+        if (st->send_flow.limit < m->stream_send_limit[i]) __builtin_trap();
+        m->stream_send_limit[i] = st->send_flow.limit;
+    }
+
+    /* The client's ids: exactly the model's, within the limit (§5.1.1). */
+    if (c->peer_cid_count > m->cid_limit) __builtin_trap();
+    if (c->peer_cid_count != m->pcid_count) __builtin_trap();
+    for (size_t i = 0; i < c->peer_cid_count; i++) {
+        int found = 0;
+        for (size_t j = 0; j < m->pcid_count; j++)
+            if (m->pcid[j].seq == c->peer_cids[i].seq &&
+                __qf_cid_eq(&m->pcid[j].cid, &c->peer_cids[i].cid)) found = 1;
+        if (!found) __builtin_trap();
+    }
+
+    /* The server's own: no more than the client allowed, the active ones
+     * reachable, the retired ones gone from the routing table (§5.1.2). */
+    uint64_t want = c->peer_params.active_connection_id_limit;
+    if (want < 2) want = 2;
+    if (want > QUICCONN_MAX_LOCAL_CIDS) want = QUICCONN_MAX_LOCAL_CIDS;
+
+    size_t active = 0;
+    for (size_t i = 0; i < QUICCONN_MAX_LOCAL_CIDS; i++) {
+        if (!c->local_cids[i].active) continue;
+        active++;
+        if (!__qf_routes(s, &c->local_cids[i].cid)) __builtin_trap();
+    }
+    if (active > want) __builtin_trap();
+
+    for (size_t i = 0; i < m->retired_count; i++)
+        if (quiccidtable_lookup_acquire(s->table, &m->retired[i]) != NULL) __builtin_trap();
+}
+
+/* The verdict: accepted, drained, or closed with exactly the code expected. */
+static int __qf_verdict(stand_t* s, const qf_pkt_t* pk) {
+    const quicclient_t* cl = &s->client;
+
+    if (s->trace)
+        printf("   verdict: expected 0x%llx, server %s, close %d (0x%llx%s)\n",
+               (unsigned long long)pk->expect,
+               s->conn == NULL ? "gone" : s->conn->state == QUICCONN_ACTIVE ? "active" : "not active",
+               cl->close_received, (unsigned long long)cl->close_error,
+               cl->close_is_app ? ", app" : "");
+    if (s->trace) fflush(stdout);
+
+    if (pk->expect == QF_OK) {
+        if (cl->close_received) __builtin_trap();
+        if (s->conn == NULL || s->conn->state != QUICCONN_ACTIVE) __builtin_trap();
+        if (pk->challenge &&
+            (!cl->path_response_received || !cl->path_response_matched)) __builtin_trap();
+        return 1;
+    }
+
+    if (pk->expect == QF_DRAIN) {
+        if (cl->close_received) __builtin_trap();
+        if (s->conn != NULL && s->conn->state != QUICCONN_DRAINING) __builtin_trap();
+        return 0;
+    }
+
+    if (!cl->close_received || cl->close_is_app || cl->close_error != pk->expect)
+        __builtin_trap();
+    return 0;
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 2) return 0;
+
+    const size_t budget_before = quicmemory_current();
+
+    stand_t* s = __stand_create(0x5eed);
+    if (s == NULL) return 0;
+    s->trace = getenv("FUZZ_TRACE") != NULL;
+
+    if (!__start(s)) { __stand_free(s); return 0; }
+
+    qf_in_t in = { data + 1, data + size };
+
+    /* Before the handshake: at most one packet, at Initial or Handshake. */
+    const uint8_t pre = data[0] % 3;
+    uint64_t pre_expect = QF_OK;
+    if (pre != 0) {
+        const quic_enc_level_e level = pre == 1 ? QUIC_ENC_INITIAL : QUIC_ENC_HANDSHAKE;
+        qf_frame_t f;
+        f.n = 0;
+        const uint8_t b = __qf_u8(&in);
+        if (b % 3 == 0) {
+            __qf_vi(&f, QUIC_FRAME_PING);
+        } else if (b % 3 == 1) {
+            for (size_t i = 0, n = 1 + b % 16; i < n; i++) __qf_byte(&f, 0);
+        } else {
+            __qf_forbidden(&in, &f);
+            pre_expect = QUIC_PROTOCOL_VIOLATION;
+        }
+        if (!quicclient_inject(&s->client, level, f.b, f.n)) __builtin_trap();
+    }
+
+    __qf_run(s, 3000000);
+
+    int alive = 0;
+    if (pre_expect == QF_OK) {
+        if (s->client.inject_queued) __builtin_trap();   /* it never went out */
+        if (!__handshake_done(s) || s->client.close_received) __builtin_trap();
+        alive = 1;
+    } else {
+        if (!s->client.close_received || s->client.close_is_app ||
+            s->client.close_error != pre_expect) __builtin_trap();
+    }
+
+    qf_model_t m;
+    memset(&m, 0, sizeof m);
+
+    if (alive) {
+        quicconn_t* c = s->conn;
+        if (c == NULL) __builtin_trap();
+
+        m.max_bidi = c->local_params.initial_max_streams_bidi;
+        m.max_uni = c->local_params.initial_max_streams_uni;
+        m.win_bidi = c->local_params.initial_max_stream_data_bidi_remote;
+        m.win_uni = c->local_params.initial_max_stream_data_uni;
+        m.max_data = c->local_params.initial_max_data;
+        m.cid_limit = c->local_params.active_connection_id_limit;
+        if (m.cid_limit > QUICCONN_MAX_PEER_CIDS) m.cid_limit = QUICCONN_MAX_PEER_CIDS;
+
+        /* The client's first id, from the handshake; the model issues the rest. */
+        for (size_t i = 0; i < c->peer_cid_count; i++) {
+            m.pcid[m.pcid_count].seq = c->peer_cids[i].seq;
+            m.pcid[m.pcid_count].cid = c->peer_cids[i].cid;
+            m.pcid_count++;
+            if (c->peer_cids[i].seq >= m.next_seq) m.next_seq = c->peer_cids[i].seq + 1;
+        }
+        m.rpt = c->peer_retire_prior_to;
+        m.send_limit = c->send_flow.limit;
+    }
+
+    for (unsigned packets = 0; alive && packets < 64 && in.p < in.end; packets++) {
+        qf_pkt_t pk;
+        __qf_build(&in, &m, &pk, s);
+        if (pk.n == 0) continue;
+
+        if (pk.challenge) {
+            memcpy(s->client.path_challenge_data, pk.challenge_data, 8);
+            s->client.path_challenge_sent = 1;
+            s->client.path_response_received = 0;
+            s->client.path_response_matched = 0;
+        }
+
+        if (!quicclient_inject(&s->client, QUIC_ENC_APP, pk.b, pk.n)) __builtin_trap();
+        (void)quicclient_flush(&s->client);
+        if (s->client.inject_queued) __builtin_trap();
+
+        __qf_run(s, 60000);
+        if (s->client_failed) break;
+
+        alive = __qf_verdict(s, &pk);
+        __qf_check(s, &m);
+    }
+
+    /* The path goes dark: past the idle timeout nothing may be left. */
+    s->blackhole_to_server = s->blackhole_to_client = 1;
+    __qf_run(s, 400000000);
+    if (s->conn != NULL) __builtin_trap();
+
+    __stand_free(s);
+
+    if (quicmemory_current() != budget_before) __builtin_trap();
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_QUIC_TOKEN
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <openssl/evp.h>
+
+#include "quicretry.h"
+
+/* Address validation tokens (RFC 9000 §8.1): the bytes a client sends back in
+ * its Initial, read before its address is known to be real.
+ *
+ * Three kinds of input:
+ *
+ *   - bytes nobody issued: never accepted, whatever the kind asked for and
+ *     whoever presents them;
+ *   - a token quic_token_write issued, for an address, kind, original
+ *     connection id and moment the input chooses, read back by a peer, at a
+ *     time and with a lifetime the input chooses: the status is the one the
+ *     rules below give, the connection id comes back for a Retry token, and
+ *     any change to the token -- one bit, a byte less, a byte more, another
+ *     key -- makes it unreadable;
+ *   - a plaintext of the input's choosing, sealed under the server's key the
+ *     way quic_token_write seals: what a holder of the key could make, and the
+ *     only way past the AEAD to the reader's parsing. It is accepted only if
+ *     it is laid out exactly as quic_token_write lays it out.
+ *
+ * The rules, in the reader's order: not ours or not laid out as issued, BAD; a
+ * kind other than the one expected, WRONG_KIND; issued later than now or more
+ * than the lifetime ago, EXPIRED; a peer with no address to compare, BAD; an
+ * address other than the one issued to, WRONG_ADDR -- the port is not part of
+ * it, for either kind (quicretry.h). Whatever the status, the output
+ * connection id is written only on success. */
+
+#define QT_NONCE 12
+#define QT_TAG   16
+
+typedef struct {
+    const uint8_t* p;
+    const uint8_t* end;
+} qt_in_t;
+
+static uint8_t __qt_u8(qt_in_t* in) {
+    return in->p < in->end ? *in->p++ : 0;
+}
+
+static uint64_t __qt_u64(qt_in_t* in) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v = v << 8 | __qt_u8(in);
+    return v;
+}
+
+typedef struct {
+    struct sockaddr_storage ss;
+    socklen_t len;
+    uint8_t addr[16];
+    size_t addr_len;          /* 0: nothing a token can be bound to */
+} qt_peer_t;
+
+static void __qt_peer_v4(qt_peer_t* pr, const uint8_t a[4], uint16_t port) {
+    memset(pr, 0, sizeof *pr);
+    struct sockaddr_in* sin = (struct sockaddr_in*)&pr->ss;
+    sin->sin_family = AF_INET;
+    sin->sin_port = htons(port);
+    memcpy(&sin->sin_addr, a, 4);
+    pr->len = sizeof *sin;
+    memcpy(pr->addr, a, 4);
+    pr->addr_len = 4;
+}
+
+static void __qt_peer_v6(qt_peer_t* pr, const uint8_t a[16], uint16_t port) {
+    memset(pr, 0, sizeof *pr);
+    struct sockaddr_in6* sin6 = (struct sockaddr_in6*)&pr->ss;
+    sin6->sin6_family = AF_INET6;
+    sin6->sin6_port = htons(port);
+    memcpy(&sin6->sin6_addr, a, 16);
+    pr->len = sizeof *sin6;
+    memcpy(pr->addr, a, 16);
+    pr->addr_len = 16;
+}
+
+static void __qt_peer_read(qt_in_t* in, qt_peer_t* pr) {
+    uint8_t a[16];
+    const uint8_t how = __qt_u8(in);
+    for (size_t i = 0; i < 16; i++) a[i] = __qt_u8(in);
+    const uint16_t port = (uint16_t)(__qt_u8(in) << 8 | __qt_u8(in));
+
+    switch (how % 8) {
+    case 0: case 1: case 2:
+        __qt_peer_v4(pr, a, port);
+        break;
+    case 3: case 4: case 5:
+        __qt_peer_v6(pr, a, port);
+        break;
+    case 6:
+        /* A family with no address a token can carry. */
+        memset(pr, 0, sizeof *pr);
+        ((struct sockaddr_un*)&pr->ss)->sun_family = AF_UNIX;
+        pr->len = sizeof(struct sockaddr_un);
+        break;
+    default:
+        /* An IPv4 or IPv6 family with a length too short to hold it. */
+        __qt_peer_v4(pr, a, port);
+        if (how & 0x80) __qt_peer_v6(pr, a, port);
+        pr->len = (socklen_t)(__qt_u8(in) % pr->len);
+        pr->addr_len = 0;
+        break;
+    }
+}
+
+/* The peer that reads the token back: the one it was issued to, or another. */
+static void __qt_reader(qt_in_t* in, const qt_peer_t* issued, qt_peer_t* pr) {
+    const uint8_t how = __qt_u8(in) % 6;
+    uint16_t port = 0;
+    if (issued->ss.ss_family == AF_INET)
+        port = ntohs(((const struct sockaddr_in*)&issued->ss)->sin_port);
+    else if (issued->ss.ss_family == AF_INET6)
+        port = ntohs(((const struct sockaddr_in6*)&issued->ss)->sin6_port);
+
+    if (how >= 3 || issued->addr_len == 0) {
+        __qt_peer_read(in, pr);
+        return;
+    }
+
+    uint8_t a[16];
+    memcpy(a, issued->addr, issued->addr_len);
+    if (how == 1) port = (uint16_t)(port + 1 + __qt_u8(in));     /* another port */
+    if (how == 2) a[__qt_u8(in) % issued->addr_len] ^= (uint8_t)(1 << (__qt_u8(in) % 8));
+
+    if (issued->addr_len == 4) __qt_peer_v4(pr, a, port);
+    else __qt_peer_v6(pr, a, port);
+}
+
+/* The reader's verdict on a plaintext, worked out independently. */
+static quic_token_status_e __qt_expect(const uint8_t* plain, size_t p,
+                                       quic_token_kind_e want, const qt_peer_t* peer,
+                                       uint64_t now, uint64_t lifetime, quiccid_t* odcid) {
+    if (p < 10) return QUIC_TOKEN_BAD;
+
+    const uint8_t kind = plain[0];
+    if (kind != QUIC_TOKEN_RETRY && kind != QUIC_TOKEN_NEW_TOKEN) return QUIC_TOKEN_BAD;
+
+    uint64_t issued = 0;
+    for (size_t i = 1; i <= 8; i++) issued = issued << 8 | plain[i];
+
+    const size_t alen = plain[9];
+    if (alen != 4 && alen != 16) return QUIC_TOKEN_BAD;
+    if (10 + alen + 1 > p) return QUIC_TOKEN_BAD;
+
+    const uint8_t* addr = plain + 10;
+    const size_t olen = plain[10 + alen];
+    const size_t at = 10 + alen + 1;
+    if (kind == QUIC_TOKEN_NEW_TOKEN ? olen != 0 : olen > QUIC_MAX_CID_LEN) return QUIC_TOKEN_BAD;
+    if (at + olen != p) return QUIC_TOKEN_BAD;
+
+    if (kind != want) return QUIC_TOKEN_WRONG_KIND;
+    if (now < issued || now - issued > lifetime) return QUIC_TOKEN_EXPIRED;
+    if (peer->addr_len == 0) return QUIC_TOKEN_BAD;
+    if (peer->addr_len != alen || memcmp(peer->addr, addr, alen) != 0) return QUIC_TOKEN_WRONG_ADDR;
+
+    odcid->len = (uint8_t)olen;
+    memcpy(odcid->data, plain + at, olen);
+    return QUIC_TOKEN_OK;
+}
+
+static void __qt_fill(quiccid_t* c) {
+    memset(c, 0xa5, sizeof *c);
+}
+
+static int __qt_untouched(const quiccid_t* c) {
+    quiccid_t f;
+    __qt_fill(&f);
+    return memcmp(c, &f, sizeof f) == 0;
+}
+
+/* Read `token` and compare with the verdict; the output id only on success. */
+static quic_token_status_e __qt_read(const uint8_t* token, size_t n, const uint8_t key[32],
+                                     quic_token_kind_e want, const qt_peer_t* peer,
+                                     uint64_t now, uint64_t lifetime, quiccid_t* out) {
+    /* Exactly `n` bytes of its own, so a read past the token is caught. */
+    uint8_t* copy = malloc(n > 0 ? n : 1);
+    if (copy == NULL) return QUIC_TOKEN_BAD;
+    if (n > 0) memcpy(copy, token, n);
+
+    __qt_fill(out);
+    const quic_token_status_e st = quic_token_read(copy, n, key, want,
+                                                   (const struct sockaddr*)&peer->ss, peer->len,
+                                                   now, lifetime, out);
+    free(copy);
+
+    if (st != QUIC_TOKEN_OK && !__qt_untouched(out)) __builtin_trap();
+    return st;
+}
+
+static uint64_t __qt_now(qt_in_t* in, uint64_t issued, uint64_t lifetime) {
+    switch (__qt_u8(in) % 7) {
+    case 0: return issued;
+    case 1: return issued + lifetime;                 /* the last moment it is good */
+    case 2: return issued + lifetime + 1;             /* the first it is not */
+    case 3: return issued - 1;                        /* before it was issued */
+    case 4: return issued + __qt_u8(in);
+    default: return __qt_u64(in);
+    }
+}
+
+static uint64_t __qt_lifetime(qt_in_t* in) {
+    switch (__qt_u8(in) % 4) {
+    case 0: return 30ULL * 1000000;
+    case 1: return 0;
+    case 2: return UINT64_MAX;
+    default: return __qt_u64(in);
+    }
+}
+
+static const uint8_t __qt_key[32] = {
+    0x5c, 0x1e, 0x93, 0x07, 0x4a, 0xb2, 0x66, 0xd0, 0x21, 0x8f, 0x3c, 0xe5, 0x70, 0x19, 0xab, 0x44,
+    0x02, 0xfe, 0x57, 0x9d, 0xc3, 0x38, 0x6a, 0x81, 0xb4, 0x0d, 0xe9, 0x52, 0x2f, 0x76, 0xca, 0x13,
+};
+
+/* Bytes nobody issued. */
+static void __qt_garbage(qt_in_t* in) {
+    qt_peer_t peer;
+    __qt_peer_read(in, &peer);
+    const uint64_t now = __qt_u64(in);
+    const uint64_t lifetime = __qt_lifetime(in);
+    const size_t n = (size_t)(in->end - in->p);
+    quiccid_t out;
+
+    for (int k = 0; k < 2; k++)
+        if (__qt_read(in->p, n, __qt_key, (quic_token_kind_e)k, &peer, now, lifetime, &out) !=
+            QUIC_TOKEN_BAD) __builtin_trap();
+}
+
+/* A token issued by quic_token_write, read back, and damaged. */
+static void __qt_issued(qt_in_t* in) {
+    const quic_token_kind_e kind = (quic_token_kind_e)(__qt_u8(in) & 1);
+    qt_peer_t issued_to;
+    __qt_peer_read(in, &issued_to);
+
+    quiccid_t odcid;
+    memset(&odcid, 0, sizeof odcid);
+    odcid.len = (uint8_t)(__qt_u8(in) % (QUIC_MAX_CID_LEN + 1));
+    for (size_t i = 0; i < odcid.len; i++) odcid.data[i] = __qt_u8(in);
+    const int no_odcid = (__qt_u8(in) % 16) == 0;
+
+    const uint64_t issued = __qt_u64(in);
+    const uint8_t cap_how = __qt_u8(in);
+
+    const size_t want_len = QT_NONCE + 1 + 8 + 1 + issued_to.addr_len + 1 +
+                            (kind == QUIC_TOKEN_RETRY ? odcid.len : 0) + QT_TAG;
+    const int writable = issued_to.addr_len != 0 && !(kind == QUIC_TOKEN_RETRY && no_odcid);
+    const size_t cap = cap_how < 32 ? cap_how : QUIC_TOKEN_MAX_LEN;
+
+    /* Exactly `cap` bytes of its own, so a write past it is caught. */
+    uint8_t* dst = malloc(cap > 0 ? cap : 1);
+    if (dst == NULL) return;
+    const size_t n = quic_token_write(dst, cap, __qt_key, kind,
+                                      (const struct sockaddr*)&issued_to.ss, issued_to.len,
+                                      no_odcid ? NULL : &odcid, issued);
+
+    if (!writable || cap < want_len) {
+        if (n != 0) __builtin_trap();
+        free(dst);
+        return;
+    }
+    if (n != want_len || n > QUIC_TOKEN_MAX_LEN) __builtin_trap();
+
+    uint8_t token[QUIC_TOKEN_MAX_LEN + 1];
+    memcpy(token, dst, n);
+    free(dst);
+
+    /* Read back. */
+    const quic_token_kind_e want = (quic_token_kind_e)(__qt_u8(in) & 1);
+    qt_peer_t reader;
+    __qt_reader(in, &issued_to, &reader);
+    const uint64_t lifetime = __qt_lifetime(in);
+    const uint64_t now = __qt_now(in, issued, lifetime);
+
+    quic_token_status_e expect;
+    if (kind != want) expect = QUIC_TOKEN_WRONG_KIND;
+    else if (now < issued || now - issued > lifetime) expect = QUIC_TOKEN_EXPIRED;
+    else if (reader.addr_len == 0) expect = QUIC_TOKEN_BAD;
+    else if (reader.addr_len != issued_to.addr_len ||
+             memcmp(reader.addr, issued_to.addr, reader.addr_len) != 0) expect = QUIC_TOKEN_WRONG_ADDR;
+    else expect = QUIC_TOKEN_OK;
+
+    quiccid_t out;
+    if (__qt_read(token, n, __qt_key, want, &reader, now, lifetime, &out) != expect)
+        __builtin_trap();
+    if (expect == QUIC_TOKEN_OK) {
+        const size_t olen = kind == QUIC_TOKEN_RETRY ? odcid.len : 0;
+        if (out.len != olen || memcmp(out.data, odcid.data, olen) != 0) __builtin_trap();
+    }
+
+    /* Damaged, it is nobody's: a bit anywhere, a byte less, a byte more, or
+     * another server's key. */
+    uint8_t bad[QUIC_TOKEN_MAX_LEN + 1];
+    memcpy(bad, token, n);
+    bad[__qt_u8(in) % n] ^= (uint8_t)(1 << (__qt_u8(in) % 8));
+    if (__qt_read(bad, n, __qt_key, want, &reader, now, lifetime, &out) != QUIC_TOKEN_BAD)
+        __builtin_trap();
+
+    if (__qt_read(token, __qt_u8(in) % n, __qt_key, want, &reader, now, lifetime, &out) !=
+        QUIC_TOKEN_BAD) __builtin_trap();
+
+    memcpy(bad, token, n);
+    bad[n] = __qt_u8(in);
+    if (__qt_read(bad, n + 1, __qt_key, want, &reader, now, lifetime, &out) != QUIC_TOKEN_BAD)
+        __builtin_trap();
+
+    uint8_t other[32];
+    memcpy(other, __qt_key, sizeof other);
+    other[__qt_u8(in) % 32] ^= (uint8_t)(1 << (__qt_u8(in) % 8));
+    if (__qt_read(token, n, other, want, &reader, now, lifetime, &out) != QUIC_TOKEN_BAD)
+        __builtin_trap();
+}
+
+/* A plaintext sealed under the key, as quic_token_write seals it. */
+static void __qt_sealed(qt_in_t* in) {
+    const quic_token_kind_e want = (quic_token_kind_e)(__qt_u8(in) & 1);
+    qt_peer_t reader;
+    __qt_peer_read(in, &reader);
+    const uint64_t lifetime = __qt_lifetime(in);
+    const uint64_t now = __qt_u64(in);
+
+    uint8_t nonce[QT_NONCE];
+    for (size_t i = 0; i < QT_NONCE; i++) nonce[i] = __qt_u8(in);
+
+    uint8_t plain[QUIC_TOKEN_MAX_LEN];
+    size_t p = (size_t)(in->end - in->p);
+    if (p > QUIC_TOKEN_MAX_LEN - QT_NONCE - QT_TAG) p = QUIC_TOKEN_MAX_LEN - QT_NONCE - QT_TAG;
+    memcpy(plain, in->p, p);
+
+    uint8_t token[QUIC_TOKEN_MAX_LEN];
+    memcpy(token, nonce, QT_NONCE);
+
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    if (ctx == NULL) return;
+    int len = 0, ok = 1;
+    size_t n = QT_NONCE;
+    ok = ok && EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, __qt_key, nonce) == 1;
+    ok = ok && EVP_EncryptUpdate(ctx, token + n, &len, plain, (int)p) == 1;
+    if (ok) n += (size_t)len;
+    ok = ok && EVP_EncryptFinal_ex(ctx, token + n, &len) == 1;
+    if (ok) n += (size_t)len;
+    ok = ok && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_GET_TAG, QT_TAG, token + n) == 1;
+    n += QT_TAG;
+    EVP_CIPHER_CTX_free(ctx);
+    if (!ok) __builtin_trap();
+
+    /* An empty plaintext makes a token of nonce and tag alone, which the
+     * reader turns away before decrypting: the same verdict either way. */
+    quiccid_t odcid, out;
+    const quic_token_status_e expect = __qt_expect(plain, p, want, &reader, now, lifetime, &odcid);
+    if (__qt_read(token, n, __qt_key, want, &reader, now, lifetime, &out) != expect)
+        __builtin_trap();
+    if (expect == QUIC_TOKEN_OK &&
+        (out.len != odcid.len || memcmp(out.data, odcid.data, odcid.len) != 0)) __builtin_trap();
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 1) return 0;
+    qt_in_t in = { data + 1, data + size };
+
+    switch (data[0] % 3) {
+    case 0: __qt_garbage(&in); break;
+    case 1: __qt_issued(&in); break;
+    default: __qt_sealed(&in); break;
+    }
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_QUIC_VERSION
+
+#include "quicendpoint.h"
+#include "quicinvariants.h"
+#include "quicversion.h"
+
+/* The version-independent header (RFC 8999) and the Version Negotiation the
+ * endpoint owes for it (RFC 9000 §6).
+ *
+ * A datagram of the input's choosing, padded with zeros to a length the input
+ * also chooses, so that the 1200-byte line is crossed without the input being
+ * that long. quic_invariants_parse, for any version and any length of the ids
+ * this endpoint issues, agrees with a parser written here from RFC 8999: form,
+ * version, both ids and where the header ends, or the same refusal.
+ *
+ * quicendpoint_version_negotiation answers exactly when it must: a long header,
+ * not itself Version Negotiation, a version the endpoint does not offer, a
+ * datagram of at least 1200 bytes (§14.1), and an answer that fits and is
+ * smaller than the datagram. The answer parses back as Version Negotiation with
+ * the ids swapped (§17.2.1), the first byte's unused bits as given, every
+ * version offered and one reserved (§6.3, §15), and never the version the
+ * client asked for -- a client discards a list that has it (§6.2). */
+
+static quicinv_status_e __qv_parse(const uint8_t* b, size_t len, size_t lcid,
+                                   int* is_long, uint32_t* version,
+                                   quiccid_t* dcid, quiccid_t* scid, size_t* header_len) {
+    if (len < 1) return QUICINV_TRUNCATED;
+    *is_long = (b[0] & 0x80) != 0;
+    *version = 0;
+    memset(dcid, 0, sizeof *dcid);
+    memset(scid, 0, sizeof *scid);
+
+    if (!*is_long) {
+        if (1 + lcid > len) return QUICINV_TRUNCATED;
+        dcid->len = (uint8_t)lcid;
+        memcpy(dcid->data, b + 1, lcid);
+        *header_len = 1 + lcid;
+        return QUICINV_OK;
+    }
+
+    if (len < 5) return QUICINV_TRUNCATED;
+    *version = (uint32_t)b[1] << 24 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 8 | b[4];
+
+    size_t off = 5;
+    quiccid_t* ids[2] = { dcid, scid };
+    for (int i = 0; i < 2; i++) {
+        if (off >= len) return QUICINV_TRUNCATED;
+        const size_t n = b[off++];
+        if (n > QUIC_MAX_CID_LEN) return QUICINV_CID_TOO_LONG;
+        if (off + n > len) return QUICINV_TRUNCATED;
+        ids[i]->len = (uint8_t)n;
+        memcpy(ids[i]->data, b + off, n);
+        off += n;
+    }
+    *header_len = off;
+    return QUICINV_OK;
+}
+
+static int __qv_cid_eq(const quiccid_t* a, const quiccid_t* b) {
+    return a->len == b->len && memcmp(a->data, b->data, a->len) == 0;
+}
+
+static uint32_t __qv_be32(const uint8_t* p) {
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 5) return 0;
+
+    const size_t lcid = data[0] % (QUIC_MAX_CID_LEN + 2);   /* one past the cap too */
+    const size_t declared = ((size_t)data[1] << 8 | data[2]) % 2049;
+    const uint8_t unused = data[3];
+    const uint8_t cap_how = data[4];
+    const uint8_t* body = data + 5;
+    const size_t body_len = size - 5;
+
+    /* Exactly `len` bytes of its own, so a read past the datagram is caught. */
+    const size_t len = body_len > declared ? body_len : declared;
+    uint8_t* dgram = malloc(len > 0 ? len : 1);
+    if (dgram == NULL) return 0;
+    memset(dgram, 0, len > 0 ? len : 1);
+    memcpy(dgram, body, body_len);
+
+    /* The parser, for whatever id length the endpoint might issue. */
+    quicinvariants_t inv;
+    const quicinv_status_e st = quic_invariants_parse(dgram, len, lcid, &inv);
+    int is_long;
+    uint32_t version;
+    quiccid_t dcid, scid;
+    size_t header_len = 0;
+    const quicinv_status_e want = lcid > QUIC_MAX_CID_LEN
+        ? QUICINV_CID_TOO_LONG
+        : __qv_parse(dgram, len, lcid, &is_long, &version, &dcid, &scid, &header_len);
+
+    if (st != want) __builtin_trap();
+    if (st == QUICINV_OK) {
+        if (inv.long_header != is_long || inv.version != version) __builtin_trap();
+        if (!__qv_cid_eq(&inv.dcid, &dcid) || !__qv_cid_eq(&inv.scid, &scid)) __builtin_trap();
+        if (inv.header_len != header_len || inv.first != dgram[0]) __builtin_trap();
+    }
+
+    /* The endpoint's answer, for the id length it does issue. */
+    if (quic_invariants_parse(dgram, len, QUIC_LOCAL_CID_LEN, &inv) != QUICINV_OK) {
+        free(dgram);
+        return 0;
+    }
+
+    const quicversion_t* offered[8];
+    const size_t offered_count = quicendpoint_versions(offered, 8);
+    int speaks = 0;
+    for (size_t i = 0; i < offered_count; i++)
+        if (offered[i]->number == inv.version) speaks = 1;
+
+    const size_t need = 7 + inv.dcid.len + inv.scid.len + 4 * (offered_count + 1);
+    const size_t cap = cap_how < 128 ? cap_how : 256;
+    const int owed = inv.long_header && inv.version != 0 && !speaks &&
+                     len >= QUIC_MIN_INITIAL_DATAGRAM;
+    const int sent = owed && need <= cap && need < len;
+
+    uint8_t* vn = malloc(cap > 0 ? cap : 1);
+    if (vn == NULL) { free(dgram); return 0; }
+    const size_t n = quicendpoint_version_negotiation(&inv, len, unused, vn, cap);
+
+    if (!sent) {
+        if (n != 0) __builtin_trap();
+        free(vn);
+        free(dgram);
+        return 0;
+    }
+    if (n != need) __builtin_trap();
+
+    quicinvariants_t back;
+    if (quic_invariants_parse(vn, n, QUIC_LOCAL_CID_LEN, &back) != QUICINV_OK) __builtin_trap();
+    if (!quic_invariants_is_version_negotiation(&back)) __builtin_trap();
+    if ((vn[0] & 0x7f) != (unused & 0x7f)) __builtin_trap();
+    if (!__qv_cid_eq(&back.dcid, &inv.scid) || !__qv_cid_eq(&back.scid, &inv.dcid)) __builtin_trap();
+    if ((n - back.header_len) % 4 != 0) __builtin_trap();
+
+    size_t reserved = 0, listed = 0;
+    for (size_t i = back.header_len; i + 4 <= n; i += 4) {
+        const uint32_t v = __qv_be32(vn + i);
+        if (v == inv.version) __builtin_trap();
+        if ((v & 0x0f0f0f0fu) == 0x0a0a0a0au) { reserved++; continue; }
+        int found = 0;
+        for (size_t k = 0; k < offered_count; k++)
+            if (offered[k]->number == v) found = 1;
+        if (!found) __builtin_trap();
+        listed++;
+    }
+    if (reserved != 1 || listed != offered_count) __builtin_trap();
+
+    free(vn);
+    free(dgram);
+    return 0;
+}
+
+#elif FUZZ_TARGET == FUZZ_H3_SESSION
+
+#include "h3frame.h"
+#include "h3priority.h"
+#include "h3session.h"
+#include "qpack.h"
+#include "quicmemory.h"
+#include "quictime.h"
+
+/* The HTTP/3 session: the client's unidirectional streams and what the server
+ * makes of them (RFC 9114 §6.2, §7.2; RFC 9204 §4.2).
+ *
+ * The input becomes a script of units -- bytes on one of eight client
+ * unidirectional streams, a FIN, a reset, a step of the clock, a request
+ * stream's cancellation (the abort budget) or acceptance (priority credit) --
+ * and the script is played three times against fresh sessions: each unit
+ * whole, one byte at a time, and in pieces of sizes the input picks. The
+ * verdict of every unit and the session's state at the end must be the same
+ * all three times.
+ *
+ * In the generated mode (first byte even) the units are built by a model of
+ * the session: a control stream whose first frame is SETTINGS, GOAWAY and
+ * MAX_PUSH_ID moving the way they may, PRIORITY_UPDATE, CANCEL_PUSH, QPACK
+ * encoder and decoder instructions, grease and unknown streams and frames,
+ * floods of frames that advance nothing -- correct except for at most one
+ * violation, which ends the script. The model predicts each verdict exactly:
+ * a second control, encoder or decoder stream or a push stream
+ * (H3_STREAM_CREATION_ERROR), a frame before SETTINGS (H3_MISSING_SETTINGS),
+ * DATA, HEADERS or an HTTP/2 type on the control stream
+ * (H3_FRAME_UNEXPECTED), a critical stream closed (H3_CLOSED_CRITICAL_STREAM),
+ * a GOAWAY that raises its id or a MAX_PUSH_ID that lowers it (H3_ID_ERROR),
+ * an HTTP/2 or repeated setting (H3_SETTINGS_ERROR), a frame over the size
+ * the parser accumulates or a budget spent (H3_EXCESSIVE_LOAD), a table
+ * capacity above the advertised one or an insertion that does not fit
+ * (QPACK_ENCODER_STREAM_ERROR), an Insert Count Increment for an encoder that
+ * inserted nothing (QPACK_DECODER_STREAM_ERROR). Its end state -- the peer's
+ * settings, GOAWAY and MAX_PUSH_ID, the budgets, the queued priorities --
+ * must be the session's.
+ *
+ * Where RFC 9114 has two MUSTs for one frame the model follows the server:
+ * DATA or an HTTP/2 type as the first control frame is H3_FRAME_UNEXPECTED
+ * (§7.2.1, §11.2.1) rather than H3_MISSING_SETTINGS (§6.2.1), and grease or
+ * unknown frames may come before SETTINGS (§9).
+ *
+ * In the raw mode (first byte odd) the bytes are the input's, on streams of
+ * any type: nothing is predicted, the three plays must agree.
+ *
+ * After every unit, in every play: no budget below zero, the control bucket
+ * no fuller than its burst. At the end the QUIC memory budget is back where it
+ * started. */
+
+#define HS_STREAMS  8
+#define HS_UNITS    192
+#define HS_POOL     (48 * 1024)
+#define HS_RATE     100          /* h3session.c's defaults: no policy is loaded */
+#define HS_BURST    200
+#define HS_CREDIT0  256
+#define HS_CREDIT_PER_REQUEST 4
+#define HS_CREDIT_MAX 1024
+#define HS_QCAP     4096         /* the dynamic table we advertise */
+#define HS_NOT_RUN  UINT64_MAX   /* a unit after the connection closed, or on a dead stream */
+
+enum { HS_BYTES, HS_RESET, HS_TIME, HS_ABORT, HS_EARN };
+
+typedef struct {
+    uint8_t  kind;
+    uint8_t  stream;
+    uint8_t  fin;
+    uint32_t off, len;
+    uint64_t dt_ms;
+    int      expect_action;
+    uint64_t expect_error;
+} hs_unit_t;
+
+typedef struct {
+    hs_unit_t u[HS_UNITS];
+    size_t    count;
+    uint8_t   pool[HS_POOL];
+    size_t    used;
+    int       predicted;
+} hs_script_t;
+
+typedef struct {
+    h3settings_t peer;
+    int          peer_seen;
+    int          mps, gs;
+    uint64_t     mp, gid;
+    int64_t      ctrl_tokens, abort_tokens, credit;
+    size_t       prio_n;
+    h3session_priority_t prio[H3SESSION_PRIORITY_QUEUE];
+} hs_state_t;
+
+typedef struct {
+    int      action[HS_UNITS];
+    uint64_t error[HS_UNITS];
+    hs_state_t end;
+    uint8_t  bits;
+    uint64_t ins, evi;
+} hs_trace_t;
+
+typedef struct {
+    const uint8_t* p;
+    const uint8_t* end;
+} hs_in_t;
+
+static uint64_t __hs_now_us;
+static uint64_t __hs_clock(void) { return __hs_now_us; }
+
+static uint8_t __hs_u8(hs_in_t* in) {
+    return in->p < in->end ? *in->p++ : 0;
+}
+
+static uint64_t __hs_u16(hs_in_t* in) {
+    const uint64_t hi = __hs_u8(in);
+    return hi << 8 | __hs_u8(in);
+}
+
+/* ---- Writing units ---- */
+
+static hs_unit_t* __hs_unit(hs_script_t* sc, uint8_t kind, uint8_t stream) {
+    if (sc->count >= HS_UNITS) return NULL;
+    hs_unit_t* u = &sc->u[sc->count++];
+    memset(u, 0, sizeof *u);
+    u->kind = kind;
+    u->stream = stream;
+    u->off = (uint32_t)sc->used;
+    return u;
+}
+
+static void __hs_put(hs_script_t* sc, hs_unit_t* u, uint8_t b) {
+    if (sc->used < HS_POOL) {
+        sc->pool[sc->used++] = b;
+        u->len++;
+    }
+}
+
+/* A varint in the width the caller asks for, or the shortest when it cannot. */
+static void __hs_vi_w(hs_script_t* sc, hs_unit_t* u, uint64_t v, unsigned width) {
+    unsigned need = v < 64 ? 1 : v < 16384 ? 2 : v < (1u << 30) ? 4 : 8;
+    unsigned w = width < need ? need : width > 8 ? 8 : width;
+    if (w == 3) w = 4;
+    if (w > 4 && w < 8) w = 8;
+    const uint8_t tag = w == 1 ? 0x00 : w == 2 ? 0x40 : w == 4 ? 0x80 : 0xc0;
+    for (int i = (int)w - 1; i >= 0; i--) {
+        uint8_t b = (uint8_t)(v >> (i * 8));
+        if (i == (int)w - 1) b = (uint8_t)(b | tag);
+        __hs_put(sc, u, b);
+    }
+}
+
+static void __hs_vi(hs_script_t* sc, hs_unit_t* u, uint64_t v) {
+    __hs_vi_w(sc, u, v, 1);
+}
+
+static size_t __hs_vi_len(uint64_t v) {
+    return v < 64 ? 1 : v < 16384 ? 2 : v < (1u << 30) ? 4 : 8;
+}
+
+static void __hs_frame(hs_script_t* sc, hs_unit_t* u, uint64_t type,
+                       const uint8_t* payload, size_t len) {
+    __hs_vi(sc, u, type);
+    __hs_vi(sc, u, len);
+    for (size_t i = 0; i < len; i++) __hs_put(sc, u, payload[i]);
+}
+
+/* An RFC 7541 §5.1 integer with an N-bit prefix under `flags`. */
+static void __hs_prefix_int(hs_script_t* sc, hs_unit_t* u, uint8_t flags, unsigned bits, uint64_t v) {
+    const uint64_t max = (1u << bits) - 1;
+    if (v < max) {
+        __hs_put(sc, u, (uint8_t)(flags | v));
+        return;
+    }
+    __hs_put(sc, u, (uint8_t)(flags | max));
+    v -= max;
+    while (v >= 128) {
+        __hs_put(sc, u, (uint8_t)(0x80 | (v & 0x7f)));
+        v >>= 7;
+    }
+    __hs_put(sc, u, (uint8_t)v);
+}
+
+static size_t __hs_pvi(uint8_t* b, uint64_t v) {
+    if (v < 64) { b[0] = (uint8_t)v; return 1; }
+    if (v < 16384) { b[0] = (uint8_t)(0x40 | v >> 8); b[1] = (uint8_t)v; return 2; }
+    if (v < (1u << 30)) {
+        b[0] = (uint8_t)(0x80 | v >> 24);
+        for (int i = 1; i < 4; i++) b[i] = (uint8_t)(v >> ((3 - i) * 8));
+        return 4;
+    }
+    b[0] = (uint8_t)(0xc0 | v >> 56);
+    for (int i = 1; i < 8; i++) b[i] = (uint8_t)(v >> ((7 - i) * 8));
+    return 8;
+}
+
+/* ---- The model ---- */
+
+enum { HS_NONE, HS_CONTROL, HS_ENC, HS_DEC, HS_IGNORED, HS_DEAD };
+
+typedef struct {
+    int      kind[HS_STREAMS];
+    int      have[4];                /* control, encoder, decoder already open */
+    int      settings_seen;
+    h3settings_t peer;
+    int      gs, mps;
+    uint64_t gid, mp;
+    uint64_t now_ms;
+    int64_t  ctrl_tokens, abort_tokens, credit;
+    uint64_t ctrl_epoch, abort_epoch;
+    uint64_t qcap;                   /* the capacity the encoder stream set */
+    h3session_priority_t prio[H3SESSION_PRIORITY_QUEUE];
+    size_t   prio_head, prio_n;
+    int      closed;                 /* a connection error was predicted */
+} hs_model_t;
+
+static int __hs_spend(int64_t* tokens, uint64_t* epoch, uint64_t now) {
+    const uint64_t elapsed = now > *epoch ? now - *epoch : 0;
+    *epoch = now;
+    *tokens += (int64_t)elapsed * HS_RATE;
+    if (*tokens > HS_BURST * 1000) *tokens = HS_BURST * 1000;
+    if (*tokens < 1000) return 0;
+    *tokens -= 1000;
+    return 1;
+}
+
+static int __hs_find(const hs_model_t* m, int kind) {
+    for (int i = 0; i < HS_STREAMS; i++)
+        if (m->kind[i] == kind) return i;
+    return -1;
+}
+
+static int __hs_free_slot(const hs_model_t* m) {
+    return __hs_find(m, HS_NONE);
+}
+
+static void __hs_expect(hs_model_t* m, hs_unit_t* u, uint64_t error) {
+    if (u == NULL) return;
+    if (error == 0) {
+        u->expect_action = H3SESSION_OK;
+        u->expect_error = 0;
+        return;
+    }
+    u->expect_action = H3SESSION_CONN_ERROR;
+    u->expect_error = error;
+    m->closed = 1;
+}
+
+/* Open a stream: its type, nothing else. */
+static void __hs_gen_open(hs_in_t* in, hs_model_t* m, hs_script_t* sc) {
+    const int slot = __hs_free_slot(m);
+    if (slot < 0) return;
+    hs_unit_t* u = __hs_unit(sc, HS_BYTES, (uint8_t)slot);
+    if (u == NULL) return;
+
+    const uint8_t b = __hs_u8(in);
+    const unsigned width = 1u << (__hs_u8(in) % 4);
+    uint64_t type;
+    int kind;
+
+    switch (b % 8) {
+    case 0: case 1: type = H3_UNI_STREAM_CONTROL; kind = HS_CONTROL; break;
+    case 2: type = H3_UNI_STREAM_QPACK_ENCODER; kind = HS_ENC; break;
+    case 3: type = H3_UNI_STREAM_QPACK_DECODER; kind = HS_DEC; break;
+    case 4: type = 0x21 + 0x1f * (uint64_t)__hs_u16(in); kind = HS_IGNORED; break;   /* grease */
+    case 5: type = H3_UNI_STREAM_PUSH; kind = HS_DEAD; break;
+    default:
+        /* Unknown and not grease. */
+        type = 0x04 + __hs_u16(in);
+        if (type >= 0x21 && (type - 0x21) % 0x1f == 0) type++;
+        kind = HS_DEAD;
+        break;
+    }
+
+    __hs_vi_w(sc, u, type, width);
+
+    if (type == H3_UNI_STREAM_PUSH) {
+        __hs_expect(m, u, H3_STREAM_CREATION_ERROR);
+        return;
+    }
+    if (kind == HS_CONTROL || kind == HS_ENC || kind == HS_DEC) {
+        if (m->have[kind]) {
+            __hs_expect(m, u, H3_STREAM_CREATION_ERROR);
+            return;
+        }
+        m->have[kind] = 1;
+    }
+    if (kind == HS_DEAD) {
+        /* Unknown: STOP_SENDING, paid for out of the control bucket. */
+        if (!__hs_spend(&m->ctrl_tokens, &m->ctrl_epoch, m->now_ms)) {
+            __hs_expect(m, u, H3_EXCESSIVE_LOAD);
+            return;
+        }
+        u->expect_action = H3SESSION_STOP_SENDING;
+        u->expect_error = H3_STREAM_CREATION_ERROR;
+    } else {
+        __hs_expect(m, u, 0);
+    }
+    m->kind[slot] = kind;
+}
+
+static void __hs_prio_queue(hs_model_t* m, uint64_t id, const h3priority_t* p) {
+    if (m->prio_n == H3SESSION_PRIORITY_QUEUE) {
+        m->prio_head = (m->prio_head + 1) % H3SESSION_PRIORITY_QUEUE;
+        m->prio_n--;
+    }
+    h3session_priority_t* e = &m->prio[(m->prio_head + m->prio_n) % H3SESSION_PRIORITY_QUEUE];
+    e->stream_id = id;
+    e->priority = *p;
+    m->prio_n++;
+}
+
+/* A setting the server knows, with a value it accepts. */
+static void __hs_setting(hs_in_t* in, h3settings_t* peer, uint8_t* pl, size_t* n, uint32_t* seen) {
+    uint64_t id, value;
+    const uint8_t b = __hs_u8(in);
+
+    switch (b % 7) {
+    case 0: id = H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY; value = __hs_u16(in) << (__hs_u8(in) % 24); break;
+    case 1: id = H3_SETTINGS_MAX_FIELD_SECTION_SIZE; value = __hs_u16(in) << (__hs_u8(in) % 40); break;
+    case 2: id = H3_SETTINGS_QPACK_BLOCKED_STREAMS; value = __hs_u16(in); break;
+    case 3: id = H3_SETTINGS_ENABLE_CONNECT_PROTOCOL; value = __hs_u8(in) & 1; break;
+    case 4: id = 0x21 + 0x1f * (uint64_t)__hs_u16(in); value = __hs_u16(in); break;   /* grease */
+    default:
+        /* Unknown, neither an HTTP/2 one nor grease. */
+        id = (b & 0x80) ? 0x00 : 0x09 + __hs_u8(in);
+        if (id >= 0x21 && (id - 0x21) % 0x1f == 0) id++;
+        value = __hs_u16(in);
+        break;
+    }
+    value &= 0x3fffffffffffffffULL;
+
+    unsigned bit = id == H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY ? 1
+                 : id == H3_SETTINGS_MAX_FIELD_SECTION_SIZE ? 2
+                 : id == H3_SETTINGS_QPACK_BLOCKED_STREAMS ? 4
+                 : id == H3_SETTINGS_ENABLE_CONNECT_PROTOCOL ? 8 : 0;
+    if (bit & *seen) return;          /* the valid form repeats nothing */
+    *seen |= bit;
+
+    *n += __hs_pvi(pl + *n, id);
+    *n += __hs_pvi(pl + *n, value);
+
+    if (id == H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY) peer->qpack_max_table_capacity = value;
+    if (id == H3_SETTINGS_MAX_FIELD_SECTION_SIZE) peer->max_field_section_size = value;
+    if (id == H3_SETTINGS_QPACK_BLOCKED_STREAMS) peer->qpack_blocked_streams = value;
+    if (id == H3_SETTINGS_ENABLE_CONNECT_PROTOCOL) peer->enable_connect_protocol = (int)value;
+}
+
+/* One frame on the control stream. */
+static void __hs_gen_control(hs_in_t* in, hs_model_t* m, hs_script_t* sc) {
+    const int slot = __hs_find(m, HS_CONTROL);
+    if (slot < 0) { __hs_gen_open(in, m, sc); return; }
+    hs_unit_t* u = __hs_unit(sc, HS_BYTES, (uint8_t)slot);
+    if (u == NULL) return;
+
+    uint8_t pl[256];
+    size_t n = 0;
+    const uint8_t kind = __hs_u8(in) % 14;
+    uint64_t error = 0;
+
+    switch (kind) {
+    case 0: case 1: {   /* SETTINGS */
+        h3settings_t peer;
+        h3settings_defaults(&peer);
+        uint32_t seen = 0;
+        const size_t count = __hs_u8(in) % 6;
+        for (size_t i = 0; i < count; i++) __hs_setting(in, &peer, pl, &n, &seen);
+        __hs_frame(sc, u, H3_FRAME_SETTINGS, pl, n);
+        if (m->settings_seen) { error = H3_FRAME_UNEXPECTED; break; }
+        m->settings_seen = 1;
+        m->peer = peer;
+        break;
+    }
+    case 2: {           /* SETTINGS, wrong */
+        h3settings_t peer;
+        h3settings_defaults(&peer);
+        uint32_t seen = 0;
+        __hs_setting(in, &peer, pl, &n, &seen);
+        const uint8_t how = __hs_u8(in) % 4;
+        if (how == 0) {
+            n += __hs_pvi(pl + n, 0x02 + __hs_u8(in) % 4);       /* HTTP/2's */
+            n += __hs_pvi(pl + n, __hs_u8(in));
+            error = H3_SETTINGS_ERROR;
+        } else if (how == 1) {
+            static const uint64_t known[] = {
+                H3_SETTINGS_QPACK_MAX_TABLE_CAPACITY, H3_SETTINGS_MAX_FIELD_SECTION_SIZE,
+                H3_SETTINGS_QPACK_BLOCKED_STREAMS, H3_SETTINGS_ENABLE_CONNECT_PROTOCOL,
+            };
+            const uint64_t id = known[__hs_u8(in) % 4];
+            n += __hs_pvi(pl + n, id);
+            n += __hs_pvi(pl + n, 0);
+            n += __hs_pvi(pl + n, id);                             /* again */
+            n += __hs_pvi(pl + n, 1);
+            error = H3_SETTINGS_ERROR;
+        } else if (how == 2) {
+            n = 0;
+            if (__hs_u8(in) & 1) {
+                n += __hs_pvi(pl + n, H3_SETTINGS_QPACK_BLOCKED_STREAMS);
+                n += __hs_pvi(pl + n, 0);
+            }
+            n += __hs_pvi(pl + n, H3_SETTINGS_ENABLE_CONNECT_PROTOCOL);
+            n += __hs_pvi(pl + n, 2 + __hs_u8(in));
+            error = H3_SETTINGS_ERROR;
+        } else {
+            n += __hs_pvi(pl + n, 0x4000 + __hs_u8(in));           /* an id and no value */
+            error = H3_FRAME_ERROR;
+        }
+        __hs_frame(sc, u, H3_FRAME_SETTINGS, pl, n);
+        if (m->settings_seen) error = H3_FRAME_UNEXPECTED;
+        break;
+    }
+    case 3: case 4: {   /* GOAWAY */
+        const int wrong = kind == 4 ? __hs_u8(in) % 3 : -1;
+        /* The same id again as often as a lower one: repeating is legal. */
+        const uint8_t pick = __hs_u8(in);
+        uint64_t id = !m->gs ? __hs_u16(in) << (pick % 30)
+                    : (pick & 1) ? m->gid : __hs_u16(in) % (m->gid + 1);
+        if (wrong == 0) id = m->gs ? m->gid + 1 + __hs_u8(in) : id;
+        n = __hs_pvi(pl, id);
+        if (wrong == 1) pl[n++] = __hs_u8(in);                    /* a byte past the id */
+        if (wrong == 2) n = 0;                                     /* no id */
+        __hs_frame(sc, u, H3_FRAME_GOAWAY, pl, n);
+
+        if (!m->settings_seen) { error = H3_MISSING_SETTINGS; break; }
+        if (!__hs_spend(&m->ctrl_tokens, &m->ctrl_epoch, m->now_ms)) { error = H3_EXCESSIVE_LOAD; break; }
+        if (wrong == 1 || wrong == 2) { error = H3_FRAME_ERROR; break; }
+        if (m->gs && id > m->gid) { error = H3_ID_ERROR; break; }
+        m->gs = 1;
+        m->gid = id;
+        break;
+    }
+    case 5: {           /* MAX_PUSH_ID */
+        const int lower = (__hs_u8(in) % 4) == 0 && m->mps && m->mp > 0;
+        const uint8_t pick = __hs_u8(in);
+        uint64_t id = !m->mps ? __hs_u16(in) : (pick & 1) ? m->mp : m->mp + 1 + __hs_u16(in);
+        if (lower) id = m->mp - 1 - __hs_u8(in) % m->mp;
+        n = __hs_pvi(pl, id);
+        __hs_frame(sc, u, H3_FRAME_MAX_PUSH_ID, pl, n);
+
+        if (!m->settings_seen) { error = H3_MISSING_SETTINGS; break; }
+        if (!__hs_spend(&m->ctrl_tokens, &m->ctrl_epoch, m->now_ms)) { error = H3_EXCESSIVE_LOAD; break; }
+        if (lower) { error = H3_ID_ERROR; break; }
+        m->mps = 1;
+        m->mp = id;
+        break;
+    }
+    case 6: {           /* CANCEL_PUSH: we promise nothing, so any id is too high */
+        n = __hs_pvi(pl, __hs_u16(in));
+        __hs_frame(sc, u, H3_FRAME_CANCEL_PUSH, pl, n);
+        error = m->settings_seen ? H3_ID_ERROR : H3_MISSING_SETTINGS;
+        break;
+    }
+    case 7: case 8: {   /* PRIORITY_UPDATE */
+        static const char* fields[] = {
+            "", "u=1", "u=5, i", "i", "u=7;x=1", "u=0, i=?0", "u=3,foo=bar",
+            "u=", "=", "u=1,,", "u=8", "i=?2", "(", "u=1;", " u=2",
+        };
+        const uint8_t b = __hs_u8(in);
+        const int push = kind == 8 && (b & 0x80);
+        const int bad_id = kind == 8 && !push;
+        uint64_t element = (uint64_t)(__hs_u8(in) % 64) << 2;
+        if (bad_id) element |= 1 + __hs_u8(in) % 3;
+        n = __hs_pvi(pl, element);
+        const char* f = fields[b % (sizeof fields / sizeof fields[0])];
+        memcpy(pl + n, f, strlen(f));
+        n += strlen(f);
+        __hs_frame(sc, u, push ? H3_FRAME_PRIORITY_UPDATE_PUSH : H3_FRAME_PRIORITY_UPDATE_REQUEST, pl, n);
+
+        if (!m->settings_seen) { error = H3_MISSING_SETTINGS; break; }
+        if (m->credit <= 0) { error = H3_EXCESSIVE_LOAD; break; }
+        m->credit--;
+        if (push || bad_id) { error = H3_ID_ERROR; break; }
+        h3priority_t prio;
+        if (!h3priority_parse((const uint8_t*)f, strlen(f), &prio)) { error = H3_FRAME_ERROR; break; }
+        __hs_prio_queue(m, element, &prio);
+        break;
+    }
+    case 9: {           /* request-stream frames */
+        const uint8_t b = __hs_u8(in) % 3;
+        const size_t len = __hs_u8(in) % 8;
+        for (size_t i = 0; i < len; i++) pl[i] = (uint8_t)(0x80 + i);
+        if (b == 0) {
+            __hs_frame(sc, u, H3_FRAME_DATA, pl, len);
+            error = H3_FRAME_UNEXPECTED;
+        } else {
+            __hs_frame(sc, u, b == 1 ? H3_FRAME_HEADERS : H3_FRAME_PUSH_PROMISE, pl, len);
+            error = m->settings_seen ? H3_FRAME_UNEXPECTED : H3_MISSING_SETTINGS;
+        }
+        break;
+    }
+    case 10: {          /* an HTTP/2 type */
+        static const uint64_t h2[] = { 0x02, 0x06, 0x08, 0x09 };
+        __hs_frame(sc, u, h2[__hs_u8(in) % 4], pl, __hs_u8(in) % 4);
+        error = H3_FRAME_UNEXPECTED;
+        break;
+    }
+    case 11: {          /* more than the parser accumulates */
+        static const uint64_t kept[] = {
+            H3_FRAME_SETTINGS, H3_FRAME_GOAWAY, H3_FRAME_MAX_PUSH_ID, H3_FRAME_HEADERS,
+            H3_FRAME_PRIORITY_UPDATE_REQUEST,
+        };
+        __hs_vi(sc, u, kept[__hs_u8(in) % 5]);
+        __hs_vi(sc, u, H3FRAME_MAX_ACCUMULATED + 1 + __hs_u8(in));
+        error = H3_EXCESSIVE_LOAD;
+        break;
+    }
+    default: {          /* frames that advance nothing: one grease or unknown, or a flood */
+        const size_t frames = kind == 13 ? 1 + (size_t)__hs_u8(in) * 2 : 1;
+        for (size_t i = 0; i < frames && error == 0; i++) {
+            uint64_t type = 0x21 + 0x1f * (uint64_t)(__hs_u8(in) % 64);
+            if (kind == 12 && (__hs_u8(in) & 1))
+                type = 0x0a + __hs_u8(in) % 0x14;      /* 0x0a-0x1d: unknown, not HTTP/2's */
+            if (type == H3_FRAME_MAX_PUSH_ID) type = 0x0e;
+            const size_t len = __hs_u8(in) % 4;
+            __hs_frame(sc, u, type, pl, len);
+            if (!__hs_spend(&m->ctrl_tokens, &m->ctrl_epoch, m->now_ms)) error = H3_EXCESSIVE_LOAD;
+        }
+        break;
+    }
+    }
+
+    __hs_expect(m, u, error);
+}
+
+/* One QPACK encoder instruction (RFC 9204 §4.3), onto our decoder's table. */
+static void __hs_gen_encoder(hs_in_t* in, hs_model_t* m, hs_script_t* sc) {
+    const int slot = __hs_find(m, HS_ENC);
+    if (slot < 0) { __hs_gen_open(in, m, sc); return; }
+    hs_unit_t* u = __hs_unit(sc, HS_BYTES, (uint8_t)slot);
+    if (u == NULL) return;
+
+    uint64_t error = 0;
+    if (__hs_u8(in) & 1) {
+        /* Set Dynamic Table Capacity. */
+        uint64_t cap = __hs_u16(in) % (HS_QCAP + 1);
+        if ((__hs_u8(in) % 8) == 0) cap = HS_QCAP + 1 + __hs_u8(in);
+        __hs_prefix_int(sc, u, 0x20, 5, cap);
+        if (cap > HS_QCAP) error = QPACK_ENCODER_STREAM_ERROR;
+        else m->qcap = cap;
+    } else {
+        /* Insert With Literal Name: a lower-case name, a printable value. */
+        const size_t nl = 1 + __hs_u8(in) % 24;
+        size_t vl = __hs_u8(in) % 40;
+        if ((__hs_u8(in) % 8) == 0) vl = __hs_u16(in) % 4200;
+        __hs_prefix_int(sc, u, 0x40, 5, nl);
+        for (size_t i = 0; i < nl; i++) __hs_put(sc, u, (uint8_t)('a' + (i * 7 + nl) % 26));
+        __hs_prefix_int(sc, u, 0x00, 7, vl);
+        for (size_t i = 0; i < vl; i++) __hs_put(sc, u, (uint8_t)('0' + (i * 3) % 40));
+        if (nl + vl + 32 > m->qcap) error = QPACK_ENCODER_STREAM_ERROR;
+    }
+    __hs_expect(m, u, error);
+}
+
+/* One QPACK decoder instruction (§4.4), onto an encoder that inserts nothing. */
+static void __hs_gen_decoder(hs_in_t* in, hs_model_t* m, hs_script_t* sc) {
+    const int slot = __hs_find(m, HS_DEC);
+    if (slot < 0) { __hs_gen_open(in, m, sc); return; }
+    hs_unit_t* u = __hs_unit(sc, HS_BYTES, (uint8_t)slot);
+    if (u == NULL) return;
+
+    if ((__hs_u8(in) % 4) != 0) {
+        __hs_prefix_int(sc, u, 0x40, 6, (uint64_t)(__hs_u8(in) % 64) << 2);   /* Stream Cancellation */
+        __hs_expect(m, u, 0);
+    } else {
+        __hs_prefix_int(sc, u, 0x00, 6, __hs_u8(in));                          /* Insert Count Increment */
+        __hs_expect(m, u, QPACK_DECODER_STREAM_ERROR);
+    }
+}
+
+static void __hs_gen_ignored(hs_in_t* in, hs_model_t* m, hs_script_t* sc) {
+    const int slot = __hs_find(m, HS_IGNORED);
+    if (slot < 0) { __hs_gen_open(in, m, sc); return; }
+    hs_unit_t* u = __hs_unit(sc, HS_BYTES, (uint8_t)slot);
+    if (u == NULL) return;
+    const size_t len = __hs_u8(in) % 64;
+    for (size_t i = 0; i < len; i++) __hs_put(sc, u, __hs_u8(in));
+    __hs_expect(m, u, 0);
+}
+
+/* A FIN or a reset: fatal on the three critical streams (§6.2.1, §4.2 of
+ * RFC 9204), the end of the stream on the rest. */
+static void __hs_gen_end(hs_in_t* in, hs_model_t* m, hs_script_t* sc, int reset) {
+    const int slot = __hs_u8(in) % HS_STREAMS;
+    const int kind = m->kind[slot];
+    if (kind == HS_NONE || kind == HS_DEAD) return;
+    hs_unit_t* u = __hs_unit(sc, reset ? HS_RESET : HS_BYTES, (uint8_t)slot);
+    if (u == NULL) return;
+    u->fin = !reset;
+    m->kind[slot] = HS_DEAD;
+    __hs_expect(m, u, kind == HS_IGNORED ? 0 : H3_CLOSED_CRITICAL_STREAM);
+}
+
+/* The end state the model predicts for the last generated script. */
+static hs_state_t __hs_model_end;
+
+static void __hs_generate(hs_in_t* in, hs_script_t* sc) {
+    hs_model_t m;
+    memset(&m, 0, sizeof m);
+    h3settings_defaults(&m.peer);
+    m.now_ms = 1000000;
+    m.ctrl_epoch = m.abort_epoch = m.now_ms;
+    m.ctrl_tokens = m.abort_tokens = HS_BURST * 1000;
+    m.credit = HS_CREDIT0;
+
+    sc->predicted = 1;
+    while (!m.closed && in->p < in->end && sc->count < HS_UNITS && sc->used + 8192 < HS_POOL) {
+        const uint8_t op = __hs_u8(in) % 16;
+        switch (op) {
+        case 0: case 1: __hs_gen_open(in, &m, sc); break;
+        case 2: case 3: case 4: case 5: case 6: __hs_gen_control(in, &m, sc); break;
+        case 7: case 8: __hs_gen_encoder(in, &m, sc); break;
+        case 9: __hs_gen_decoder(in, &m, sc); break;
+        case 10: __hs_gen_ignored(in, &m, sc); break;
+        case 11: __hs_gen_end(in, &m, sc, 0); break;
+        case 12: __hs_gen_end(in, &m, sc, 1); break;
+        case 13: {
+            hs_unit_t* u = __hs_unit(sc, HS_TIME, 0);
+            if (u == NULL) break;
+            const uint8_t b = __hs_u8(in);
+            u->dt_ms = b < 200 ? b : __hs_u16(in) * 10;
+            m.now_ms += u->dt_ms;
+            break;
+        }
+        case 14: {
+            hs_unit_t* u = __hs_unit(sc, HS_ABORT, 0);
+            if (u == NULL) break;
+            u->expect_error = (uint64_t)__hs_spend(&m.abort_tokens, &m.abort_epoch, m.now_ms);
+            break;
+        }
+        default: {
+            hs_unit_t* u = __hs_unit(sc, HS_EARN, 0);
+            if (u == NULL) break;
+            m.credit += HS_CREDIT_PER_REQUEST;
+            if (m.credit > HS_CREDIT_MAX) m.credit = HS_CREDIT_MAX;
+            break;
+        }
+        }
+    }
+
+    hs_state_t* e = &__hs_model_end;
+    memset(e, 0, sizeof *e);
+    e->peer = m.peer;
+    e->peer_seen = m.settings_seen;
+    e->mps = m.mps;
+    e->mp = m.mp;
+    e->gs = m.gs;
+    e->gid = m.gid;
+    e->ctrl_tokens = m.ctrl_tokens;
+    e->abort_tokens = m.abort_tokens;
+    e->credit = m.credit;
+    e->prio_n = m.prio_n;
+    for (size_t i = 0; i < m.prio_n; i++)
+        e->prio[i] = m.prio[(m.prio_head + i) % H3SESSION_PRIORITY_QUEUE];
+}
+
+static void __hs_raw(hs_in_t* in, hs_script_t* sc) {
+    sc->predicted = 0;
+    while (in->p < in->end && sc->count < HS_UNITS) {
+        const uint8_t b = __hs_u8(in);
+        const uint8_t stream = (uint8_t)((b >> 4) % HS_STREAMS);
+        switch (b % 8) {
+        case 0: __hs_unit(sc, HS_RESET, stream); break;
+        case 1: {
+            hs_unit_t* u = __hs_unit(sc, HS_TIME, 0);
+            if (u != NULL) u->dt_ms = __hs_u8(in);
+            break;
+        }
+        case 2: __hs_unit(sc, HS_ABORT, 0); break;
+        case 3: __hs_unit(sc, HS_EARN, 0); break;
+        default: {
+            hs_unit_t* u = __hs_unit(sc, HS_BYTES, stream);
+            if (u == NULL) break;
+            u->fin = (b & 0x08) && (b % 8) == 7;
+            size_t len = __hs_u8(in);
+            if ((size_t)(in->end - in->p) < len) len = (size_t)(in->end - in->p);
+            for (size_t i = 0; i < len; i++) __hs_put(sc, u, *in->p++);
+            break;
+        }
+        }
+    }
+}
+
+/* ---- Playing a script ---- */
+
+static void __hs_check(const h3session_t* s) {
+    if (s->ctrl_tokens < 0 || s->abort_tokens < 0 || s->priority_credit < 0) __builtin_trap();
+    if (s->ctrl_tokens > HS_BURST * 1000 || s->abort_tokens > HS_BURST * 1000) __builtin_trap();
+    if (s->priority_credit > HS_CREDIT_MAX) __builtin_trap();
+    if (s->priority_count > H3SESSION_PRIORITY_QUEUE) __builtin_trap();
+}
+
+static void __hs_play(const hs_script_t* sc, int split, uint32_t seed, hs_trace_t* tr) {
+    memset(tr, 0, sizeof *tr);
+    __hs_now_us = 1000000000ULL;
+
+    h3session_t* s = h3session_create(65536, 1);
+    if (s == NULL) __builtin_trap();
+    h3uni_recv_t* uni[HS_STREAMS] = { 0 };
+    int dead[HS_STREAMS] = { 0 };
+    int over = 0;
+    uint32_t rng = seed | 1;
+
+    for (size_t k = 0; k < sc->count; k++) {
+        const hs_unit_t* u = &sc->u[k];
+        tr->action[k] = H3SESSION_OK;
+        tr->error[k] = HS_NOT_RUN;
+        if (over) continue;
+
+        switch (u->kind) {
+        case HS_TIME:
+            __hs_now_us += u->dt_ms * 1000;
+            tr->error[k] = 0;
+            break;
+        case HS_ABORT:
+            tr->error[k] = (uint64_t)h3session_abort_spend(s);
+            break;
+        case HS_EARN:
+            h3session_priority_earn(s);
+            tr->error[k] = 0;
+            break;
+        default: {
+            const int i = u->stream;
+            if (dead[i]) break;
+            if (uni[i] == NULL) uni[i] = h3uni_recv_create((uint64_t)i * 4 + 2);
+            if (uni[i] == NULL) __builtin_trap();
+
+            h3session_verdict_t v = { H3SESSION_OK, 0 };
+            if (u->kind == HS_RESET) {
+                v = h3session_uni_closed(s, uni[i]);
+                dead[i] = 1;
+            } else {
+                const uint8_t* p = sc->pool + u->off;
+                size_t left = u->len;
+                do {
+                    size_t piece = left;
+                    if (split == 1 && piece > 1) piece = 1;
+                    if (split == 2) {
+                        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                        const size_t want = 1 + rng % 17;
+                        if (piece > want) piece = want;
+                    }
+                    const int fin = u->fin && piece == left;
+                    /* Exactly the piece, so a read past it is caught. */
+                    uint8_t* copy = piece > 0 ? malloc(piece) : NULL;
+                    if (piece > 0 && copy == NULL) __builtin_trap();
+                    if (piece > 0) memcpy(copy, p, piece);
+                    v = h3session_uni_feed(s, uni[i], copy, piece, fin);
+                    free(copy);
+                    p += piece;
+                    left -= piece;
+                    if (fin) dead[i] = 1;
+                } while (left > 0 && v.action == H3SESSION_OK);
+            }
+
+            tr->action[k] = v.action;
+            tr->error[k] = v.error;
+            if (v.action == H3SESSION_STOP_SENDING) dead[i] = 1;
+            if (v.action == H3SESSION_CONN_ERROR) over = 1;
+            break;
+        }
+        }
+        __hs_check(s);
+    }
+
+    hs_state_t* e = &tr->end;
+    e->peer = s->peer_settings;
+    e->peer_seen = s->peer_settings_seen;
+    e->mps = s->max_push_id_seen;
+    e->mp = s->max_push_id;
+    e->gs = s->peer_goaway_seen;
+    e->gid = s->peer_goaway_id;
+    e->ctrl_tokens = s->ctrl_tokens;
+    e->abort_tokens = s->abort_tokens;
+    e->credit = s->priority_credit;
+    while (e->prio_n < H3SESSION_PRIORITY_QUEUE && h3session_take_priority(s, &e->prio[e->prio_n]))
+        e->prio_n++;
+    tr->bits = s->peer_uni.bits;
+    tr->ins = s->qdec->insertions;
+    tr->evi = s->qdec->evictions;
+
+    for (int i = 0; i < HS_STREAMS; i++) h3uni_recv_free(uni[i]);
+    h3session_free(s);
+}
+
+static int __hs_state_eq(const hs_state_t* a, const hs_state_t* b) {
+    if (a->peer.qpack_max_table_capacity != b->peer.qpack_max_table_capacity ||
+        a->peer.max_field_section_size != b->peer.max_field_section_size ||
+        a->peer.qpack_blocked_streams != b->peer.qpack_blocked_streams ||
+        a->peer.enable_connect_protocol != b->peer.enable_connect_protocol) return 0;
+    if (a->peer_seen != b->peer_seen || a->mps != b->mps || a->gs != b->gs) return 0;
+    if (a->mps && a->mp != b->mp) return 0;
+    if (a->gs && a->gid != b->gid) return 0;
+    if (a->ctrl_tokens != b->ctrl_tokens || a->abort_tokens != b->abort_tokens) return 0;
+    if (a->credit != b->credit || a->prio_n != b->prio_n) return 0;
+    for (size_t i = 0; i < a->prio_n; i++) {
+        if (a->prio[i].stream_id != b->prio[i].stream_id) return 0;
+        if (memcmp(&a->prio[i].priority, &b->prio[i].priority, sizeof a->prio[i].priority) != 0)
+            return 0;
+    }
+    return 1;
+}
+
+static hs_script_t __hs_script;
+static hs_trace_t __hs_traces[3];
+
+int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 2) return 0;
+    quic_time_set_source(__hs_clock);
+    const size_t budget_before = quicmemory_current();
+
+    hs_script_t* sc = &__hs_script;
+    sc->count = 0;
+    sc->used = 0;
+
+    hs_in_t in = { data + 2, data + size };
+    if (data[0] & 1) __hs_raw(&in, sc);
+    else __hs_generate(&in, sc);
+
+    for (int play = 0; play < 3; play++)
+        __hs_play(sc, play, 0x9e3779b9u * (uint32_t)(data[1] + 1), &__hs_traces[play]);
+
+    for (int play = 1; play < 3; play++) {
+        const hs_trace_t* a = &__hs_traces[0];
+        const hs_trace_t* b = &__hs_traces[play];
+        for (size_t k = 0; k < sc->count; k++)
+            if (a->action[k] != b->action[k] || a->error[k] != b->error[k]) __builtin_trap();
+        if (!__hs_state_eq(&a->end, &b->end)) __builtin_trap();
+        if (a->bits != b->bits || a->ins != b->ins || a->evi != b->evi) __builtin_trap();
+    }
+
+    if (getenv("FUZZ_TRACE") != NULL)
+        for (size_t k = 0; k < sc->count; k++)
+            printf("unit %zu: kind %u stream %u len %u fin %u -> %d 0x%llx (expected %d 0x%llx)\n",
+                   k, sc->u[k].kind, sc->u[k].stream, sc->u[k].len, sc->u[k].fin,
+                   __hs_traces[0].action[k], (unsigned long long)__hs_traces[0].error[k],
+                   sc->u[k].expect_action, (unsigned long long)sc->u[k].expect_error);
+
+    if (sc->predicted) {
+        const hs_trace_t* t = &__hs_traces[0];
+        for (size_t k = 0; k < sc->count; k++) {
+            const hs_unit_t* u = &sc->u[k];
+            if (u->kind == HS_TIME || u->kind == HS_EARN) continue;
+            if (u->kind == HS_ABORT) {
+                if (t->error[k] != u->expect_error) __builtin_trap();
+                continue;
+            }
+            if (t->action[k] != u->expect_action || t->error[k] != u->expect_error) __builtin_trap();
+        }
+        if (!__hs_state_eq(&t->end, &__hs_model_end)) __builtin_trap();
+    }
+
+    quic_time_set_source(NULL);
+    if (quicmemory_current() != budget_before) __builtin_trap();
+    return 0;
+}
+
 #else
 #error "FUZZ_TARGET is not set to a known target"
 #endif
