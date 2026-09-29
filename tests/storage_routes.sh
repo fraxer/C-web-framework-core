@@ -6,6 +6,10 @@
 # Два случая здесь — про то, чего у статики от server.root нет и не было: путь
 # storage-маршрута раскрывается из пути запроса, так что шаблон "*" и
 # нерегулярный файл — это входные данные клиента, а не конфигурация.
+#
+# И третье отличие, общее для FS и S3: на storage-маршруте работают middleware
+# и ratelimit маршрута, а Cache-Control маршрута ложится только на то, что
+# хранилище действительно отдало, — не на отказ middleware, 429 или 404.
 
 set -u -o pipefail
 
@@ -13,11 +17,12 @@ BUILD_DIR=${1:?usage: tests/storage_routes.sh BUILD_DIR [WORK_DIR]}
 WORK_DIR=${2:-/tmp/cwfr-storage-routes}
 CORE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SERVER="$BUILD_DIR/exec/cwfr"
+FRAMEWORK=$(find "$BUILD_DIR" -name libcwfr_framework.so -print -quit)
 PORT=${STORAGE_ROUTES_PORT:-18511}
 BASE="http://127.0.0.1:$PORT"
 
-if [ ! -x "$SERVER" ]; then
-    printf 'storage routes: server is missing in %s\n' "$BUILD_DIR" >&2
+if [ ! -x "$SERVER" ] || [ -z "$FRAMEWORK" ]; then
+    printf 'storage routes: cwfr or libcwfr_framework.so is missing in %s\n' "$BUILD_DIR" >&2
     exit 2
 fi
 
@@ -33,6 +38,31 @@ printf 'nested' > "$WORK_DIR/assets/sub/b.txt"
   printf '</body></html>\n'; } > "$WORK_DIR/assets/page.html"
 gzip -kf "$WORK_DIR/assets/page.html"
 mkfifo "$WORK_DIR/assets/pipe.txt"
+
+# Модуль приложения с одной middleware: отказывает 403, только если в запросе
+# есть X-Deny, поэтому остальные проверки её не замечают.
+mapfile -t INCLUDES < <(find "$CORE_DIR/src" "$CORE_DIR/misc" "$CORE_DIR/framework" \
+    "$CORE_DIR/protocols" -name '*.h' -printf '-I%h\n' | sort -u)
+cat > "$WORK_DIR/module.c" <<'EOF'
+#include "httpcontext.h"
+#include "middleware_registry.h"
+
+static int mw_deny(httpctx_t* ctx) {
+    if (ctx->request->get_header(ctx->request, "X-Deny") == NULL) return 1;
+
+    ctx->response->send_default(ctx->response, 403);
+    return 0;
+}
+
+int app_init(void) {
+    return middleware_registry_register("mw_deny", (middleware_fn_p)mw_deny);
+}
+EOF
+if ! gcc -shared -fPIC -o "$WORK_DIR/libstoragetest.so" "$WORK_DIR/module.c" \
+        -DPCRE2_CODE_UNIT_WIDTH=8 "${INCLUDES[@]}" "$FRAMEWORK"; then
+    printf 'storage routes: the test module did not build\n' >&2
+    exit 2
+fi
 
 failed=0
 fail() { printf 'FAIL: %s\n' "$1" >&2; failed=1; }
@@ -55,15 +85,19 @@ cat > "$WORK_DIR/config.json" <<JSON
         "buffer_size": 16384, "client_max_body_size": 1048576,
         "tmp": "/tmp", "gzip": ["text/html"],
         "env": { "gzip_static": true },
+        "modules": ["$WORK_DIR/libstoragetest.so"],
         "log": { "enabled": true, "level": "error" }
     },
     "servers": {
         "s1": {
             "domains": ["localhost", "127.0.0.1"], "ip": "127.0.0.1", "port": $PORT,
             "root": "$WORK_DIR/www", "index": "index.html",
+            "ratelimits": { "strict": { "burst": 1, "rate": 1 } },
             "http": {
+                "middlewares": ["mw_deny"],
                 "routes": {
-                    "/assets/(.*)": { "GET": { "static_file": "{1}", "storage": "assets" } },
+                    "/assets/(.*)": { "GET": { "static_file": "{1}", "storage": "assets", "cache_control": "public, max-age=60" } },
+                    "/limited/(.*)": { "GET": { "static_file": "{1}", "storage": "assets", "ratelimit": "strict", "cache_control": "public, max-age=60" } },
                     "/local/(.*)": { "GET": { "static_file": "{1}" } }
                 }
             }
@@ -135,6 +169,39 @@ body=$(curl -s --max-time 10 "$BASE/local/index.html")
 [ "$body" = "from server root" ] && ok 'a route without storage is unchanged' \
     || fail "route without storage: got '$body'"
 
+# 9a: Cache-Control маршрута — на отданном файле, но не на 404
+headers=$(curl -s -D - -o /dev/null --max-time 10 "$BASE/assets/a.txt")
+contains "$headers" 'cache-control: public, max-age=60' && ok 'a served file carries the route Cache-Control' \
+    || fail "served file Cache-Control: $(printf '%s' "$headers" | grep -i cache-control)"
+headers=$(curl -s -D - -o /dev/null --max-time 10 "$BASE/assets/nosuch.txt")
+contains "$headers" ' 404' && ! contains "$headers" 'max-age=60' \
+    && ok 'a missing file answers 404 without the route Cache-Control' \
+    || fail "missing file: $(printf '%s' "$headers" | head -1), $(printf '%s' "$headers" | grep -i cache-control)"
+
+# 9b: middleware работает на FS-маршруте, и её отказ не получает Cache-Control
+headers=$(curl -s -D - -o /dev/null --max-time 10 -H 'X-Deny: 1' "$BASE/assets/a.txt")
+contains "$headers" ' 403' && ok 'a middleware refuses a filesystem storage route' \
+    || fail "middleware on a filesystem storage route: $(printf '%s' "$headers" | head -1)"
+contains "$headers" 'max-age=60' && fail 'the middleware refusal carries the route Cache-Control' \
+    || ok 'the middleware refusal has no route Cache-Control'
+
+# 9c: статика от server.root middleware не запускает — отличие намеренное
+code=$(status -H 'X-Deny: 1' "$BASE/local/index.html")
+[ "$code" = "200" ] && ok 'a route without storage runs no middlewares' \
+    || fail "route without storage under X-Deny: got $code"
+
+# 9d: ratelimit маршрута работает на FS-маршруте. rate 0 не годится: нулевая
+# скорость пополнения выключает ограничитель целиком. burst 1, rate 1 — второй
+# запрос, пришедший в ту же секунду, получает 429.
+code=$(status "$BASE/limited/a.txt")
+[ "$code" = "200" ] && ok 'the first request within the ratelimit is served' \
+    || fail "the first limited request: got $code"
+headers=$(curl -s -D - -o /dev/null --max-time 10 "$BASE/limited/a.txt")
+contains "$headers" ' 429' && ok 'the route ratelimit refuses with 429' \
+    || fail "the route ratelimit: $(printf '%s' "$headers" | head -1)"
+contains "$headers" 'max-age=60' && fail 'the 429 carries the route Cache-Control' \
+    || ok 'the 429 has no route Cache-Control'
+
 # 10: сервер пережил всё это
 kill -0 "$SERVER_PID" 2>/dev/null && ok 'the server is still running' \
     || fail 'the server died during the run'
@@ -183,6 +250,7 @@ else
         "workers": 1, "threads": 4, "reload": "hard",
         "buffer_size": 16384, "client_max_body_size": 16777216,
         "tmp": "/tmp", "gzip": ["text/html"],
+        "modules": ["$WORK_DIR/libstoragetest.so"],
         "log": { "enabled": true, "level": "error" }
     },
     "servers": {
@@ -190,10 +258,11 @@ else
             "domains": ["localhost", "127.0.0.1"], "ip": "127.0.0.1", "port": $PORT_S3,
             "root": "$WORK_DIR/www", "index": "index.html",
             "http": {
+                "middlewares": ["mw_deny"],
                 "routes": {
                     "/media/(.*)": {
-                        "GET": { "static_file": "{1}", "storage": "media" },
-                        "HEAD": { "static_file": "{1}", "storage": "media" }
+                        "GET": { "static_file": "{1}", "storage": "media", "cache_control": "public, max-age=60" },
+                        "HEAD": { "static_file": "{1}", "storage": "media", "cache_control": "public, max-age=60" }
                     }
                 }
             }
@@ -289,9 +358,24 @@ JSON
     [ "$length" = "$S3_OBJECT_SIZE" ] && ok 'HEAD reports the full size' || fail "HEAD Content-Length: $length"
     [ "$elapsed" -lt 5 ] && ok 'HEAD does not download the body' || fail "HEAD took ${elapsed}s"
 
-    # 10: отсутствующий объект
-    code=$(s3status "$S3BASE/media/nosuch.bin")
-    [ "$code" = "404" ] && ok 'a missing object answers 404' || fail "missing object: got $code"
+    # 10: отсутствующий объект, и Cache-Control маршрута на нём нет
+    headers=$(curl -s -D - -o /dev/null --max-time 30 "$S3BASE/media/nosuch.bin")
+    contains "$headers" ' 404' && ok 'a missing object answers 404' \
+        || fail "missing object: $(printf '%s' "$headers" | head -1)"
+    contains "$headers" 'max-age=60' && fail 'the missing object carries the route Cache-Control' \
+        || ok 'the missing object has no route Cache-Control'
+
+    # 10a: Cache-Control маршрута — на найденном объекте
+    headers=$(curl -s -I --max-time 30 "$S3BASE/media/video.bin")
+    contains "$headers" 'cache-control: public, max-age=60' && ok 'an S3 object carries the route Cache-Control' \
+        || fail "S3 object Cache-Control: $(printf '%s' "$headers" | grep -i cache-control)"
+
+    # 10b: отказ middleware — без похода в S3 и без Cache-Control маршрута
+    headers=$(curl -s -D - -o /dev/null --max-time 30 -H 'X-Deny: 1' "$S3BASE/media/video.bin")
+    contains "$headers" ' 403' && ok 'a middleware refuses an S3 storage route' \
+        || fail "middleware on an S3 storage route: $(printf '%s' "$headers" | head -1)"
+    contains "$headers" 'max-age=60' && fail 'the S3 middleware refusal carries the route Cache-Control' \
+        || ok 'the S3 middleware refusal has no route Cache-Control'
 
     # 11: перемотки не растят потребление. Мерить надо после прогрева: до этого
     # места процесс уже скачал объект целиком дважды, и остывающие арены
