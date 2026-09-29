@@ -118,9 +118,13 @@ typedef struct {
     ratelimiter_t* ratelimiter;
     /* Storage branch only: the expanded path and the storage name have to
      * outlive dispatch, because the dispatcher expands them and the worker is
-     * what goes to the storage. NULL for every other runner. */
+     * what goes to the storage. The route's Cache-Control travels along too:
+     * whether it applies is known only once the storage has answered. NULL for
+     * every other runner. */
     char* storage_name;
     char* storage_path;
+    char* cache_control;
+    storage_type_e storage_type;
     /* The virtual host this request resolved to, captured at dispatch time.
      *
      * ctx->server is per-connection but rewritten per request by
@@ -165,7 +169,8 @@ static int __write(connection_t* connection);
 static int __deferred_handler(connection_t* connection, httprequest_t* request, httpresponse_t* response, queue_handler runner, queue_handler handle, queue_data_create data_create, ratelimiter_t* ratelimiter);
 static int __deferred_enqueue(connection_t* connection, connection_queue_item_t* item);
 static int __deferred_storage_handler(connection_t* connection, httprequest_t* request, httpresponse_t* response,
-                                      const char* storage_name, const char* path, ratelimiter_t* ratelimiter);
+                                      storage_type_e type, const char* storage_name, const char* path,
+                                      const char* cache_control, ratelimiter_t* ratelimiter);
 static void __queue_storage_handler(void* arg);
 static void* __queue_data_storage_create(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter);
 static void __queue_data_storage_free(void* arg);
@@ -817,16 +822,16 @@ static route_dispatch_e __route_dispatch(connection_t* connection, httprequest_t
                 response->send_default(response, 503);
                 prepared = 1;
             }
-            else if (type == STORAGE_TYPE_FS)
-                prepared = __prepare_storage_fs_response(response, storage_name, path);
             else {
-                /* S3: the answer has to be fetched, which cannot happen on the
-                 * event loop. The queue takes it from here, and the path is
-                 * freed on this way out -- the branch leaves before the common
-                 * free below. */
-                __apply_route_cache_control(response, route, method);
-                *queued = __deferred_storage_handler(connection, request, response,
-                                                     storage_name, path, ratelimiter);
+                /* Both kinds go to the storage runner: S3 has to be fetched,
+                 * which cannot happen on the event loop, and a filesystem
+                 * storage is a route like S3 is -- with the route's ratelimit
+                 * and the middlewares that the static path never had. The path
+                 * is freed on this way out -- the branch leaves before the
+                 * common free below. */
+                *queued = __deferred_storage_handler(connection, request, response, type,
+                                                     storage_name, path,
+                                                     route->cache_control[method], ratelimiter);
                 free(path);
 
                 return ROUTE_DISPATCH_DONE;
@@ -1039,6 +1044,8 @@ void* __queue_data_request_create(connection_t* connection, httprequest_t* reque
 
     data->storage_name = NULL;
     data->storage_path = NULL;
+    data->cache_control = NULL;
+    data->storage_type = STORAGE_TYPE_FS;
 
     return data;
 }
@@ -1057,6 +1064,8 @@ void* __queue_data_response_create(connection_t* connection, httprequest_t* requ
 
     data->storage_name = NULL;
     data->storage_path = NULL;
+    data->cache_control = NULL;
+    data->storage_type = STORAGE_TYPE_FS;
 
     return data;
 }
@@ -1083,6 +1092,8 @@ void* __queue_data_storage_create(connection_t* connection, httprequest_t* reque
     data->owned = 0;
     data->storage_name = NULL;
     data->storage_path = NULL;
+    data->cache_control = NULL;
+    data->storage_type = STORAGE_TYPE_FS;
 
     return data;
 }
@@ -1095,16 +1106,18 @@ void __queue_data_storage_free(void* arg) {
 
     free(data->storage_name);
     free(data->storage_path);
+    free(data->cache_control);
     free(data);
 }
 
-/* Like __deferred_handler, but with the storage name and the expanded path on
- * the item. A function of its own rather than two more parameters on the
- * common one: the other three callers know nothing about storages. The copies
- * are made before the item is enqueued -- afterwards it belongs to the queue
- * and a worker may already be running it. */
+/* Like __deferred_handler, but with the storage, the expanded path and the
+ * route's Cache-Control on the item. A function of its own rather than more
+ * parameters on the common one: the other three callers know nothing about
+ * storages. The copies are made before the item is enqueued -- afterwards it
+ * belongs to the queue and a worker may already be running it. */
 int __deferred_storage_handler(connection_t* connection, httprequest_t* request, httpresponse_t* response,
-                               const char* storage_name, const char* path, ratelimiter_t* ratelimiter) {
+                               storage_type_e type, const char* storage_name, const char* path,
+                               const char* cache_control, ratelimiter_t* ratelimiter) {
     connection_queue_item_t* item = connection_queue_item_create();
     if (item == NULL) return 0;
 
@@ -1119,10 +1132,14 @@ int __deferred_storage_handler(connection_t* connection, httprequest_t* request,
     }
 
     connection_queue_http_data_t* data = (connection_queue_http_data_t*)item->data;
+    data->storage_type = type;
     data->storage_name = strdup(storage_name);
     data->storage_path = strdup(path);
+    if (cache_control != NULL)
+        data->cache_control = strdup(cache_control);
 
-    if (data->storage_name == NULL || data->storage_path == NULL) {
+    if (data->storage_name == NULL || data->storage_path == NULL ||
+        (cache_control != NULL && data->cache_control == NULL)) {
         item->free(item);
         return 0;
     }
@@ -1222,11 +1239,11 @@ void __queue_request_handler(void* arg) {
 }
 
 /* The storage branch. Unlike __queue_response_handler the answer is not built
- * yet -- it has to be fetched, and that is what belongs in a worker. Unlike
+ * yet -- S3 has to be fetched, and that is what belongs in a worker. Unlike
  * __queue_request_handler there is no handler to call: the core takes its
- * place. Ratelimit and middlewares do run: a route into S3 costs egress, and a
- * private file behind authorization is the reason to bind a route to a storage
- * in the first place. */
+ * place. Ratelimit and middlewares do run, for both kinds of storage: a route
+ * into S3 costs egress, and a private file behind authorization is the reason
+ * to bind a route to a storage in the first place. */
 void __queue_storage_handler(void* arg) {
     if (arg == NULL) {
         log_error("__queue_storage_handler: arg is NULL\n");
@@ -1271,8 +1288,21 @@ void __queue_storage_handler(void* arg) {
     httpctx_init(&ctx, data->request, data->response,
                  data->server->config != NULL ? data->server->config->httpctx_user_data_free : NULL);
 
-    if (run_middlewares(data->server->http.middleware, &ctx))
-        http_storage_respond(data->request, data->response, data->storage_name, data->storage_path);
+    if (run_middlewares(data->server->http.middleware, &ctx)) {
+        if (data->storage_type == STORAGE_TYPE_FS)
+            __prepare_storage_fs_response(data->response, data->storage_name, data->storage_path);
+        else
+            http_storage_respond(data->request, data->response, data->storage_name, data->storage_path);
+
+        /* Only on what the storage actually served, as the static path does
+         * once its file is open: a route that caches for a year must not put
+         * that on a 404, a 502 or a middleware's refusal. A filesystem file is
+         * still 200 here -- 206 and 304 come later, from the filters. */
+        const int status = data->response->status_code;
+        if (data->cache_control != NULL && (status == 200 || status == 206 || status == 304))
+            data->response->add_headeru(data->response, "Cache-Control", 13,
+                                        data->cache_control, strlen(data->cache_control));
+    }
 
     httpctx_clear(&ctx);
 
