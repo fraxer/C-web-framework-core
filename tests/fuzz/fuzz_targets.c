@@ -9321,6 +9321,17 @@ static void __h3p_check_section(const qpack_header_t* f, size_t n, int is_traile
         if (f[i].name_len > 0 && f[i].name[0] == ':' && (is_trailer || i != 0)) __builtin_trap();
         if (__h3p_connection_specific(f[i].name, f[i].name_len)) __builtin_trap();
         if (is_trailer && __h3p_ieq(f[i].name, f[i].name_len, "content-length", 14)) __builtin_trap();
+        /* The handler's fields with a control byte are dropped, not sent
+         * (__h3p_value_kept): that one is missing from the expected fields
+         * proves nothing unless none arrives. HTAB only inside a value. */
+        for (size_t j = 0; j < f[i].name_len; j++) {
+            const unsigned char c = (unsigned char)f[i].name[j];
+            if (c <= 0x20 || c >= 0x7f) __builtin_trap();
+        }
+        for (size_t j = 0; j < f[i].value_len; j++) {
+            const unsigned char c = (unsigned char)f[i].value[j];
+            if (c == 0x7f || (c < 0x20 && c != '\t')) __builtin_trap();
+        }
     }
 }
 
@@ -12402,6 +12413,8 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
 #elif FUZZ_TARGET == FUZZ_QUIC_VERSION
 
+#include "appconfig.h"
+#include "json.h"
 #include "quicendpoint.h"
 #include "quicinvariants.h"
 #include "quicversion.h"
@@ -12421,7 +12434,32 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
  * smaller than the datagram. The answer parses back as Version Negotiation with
  * the ids swapped (§17.2.1), the first byte's unused bits as given, every
  * version offered and one reserved (§6.3, §15), and never the version the
- * client asked for -- a client discards a list that has it (§6.2). */
+ * client asked for -- a client discards a list that has it (§6.2).
+ *
+ * What the endpoint offers is v1, and v2 when http3_version_2 is on (the top
+ * bit of the byte of unused bits turns it on). The target knows that from the
+ * configuration it sets, not from quicendpoint_versions: that is the list
+ * Version Negotiation is built from, so it is checked here rather than trusted. */
+
+/* The configuration quic_policy_init reads, and nothing else. */
+static env_t __qv_env;
+
+env_t* env(void) {
+    return &__qv_env;
+}
+
+static void __qv_version_2(int on) {
+    static json_doc_t* docs[2];
+    static int current = -1;
+    if (on == current) return;
+    if (docs[on] == NULL) {
+        docs[on] = json_parse(on ? "{\"http3_version_2\": true}" : "{\"http3_version_2\": false}");
+        if (docs[on] == NULL) abort();
+    }
+    __qv_env.custom_store = docs[on];
+    if (!quic_policy_init()) abort();
+    current = on;
+}
 
 static quicinv_status_e __qv_parse(const uint8_t* b, size_t len, size_t lcid,
                                    int* is_long, uint32_t* version,
@@ -12507,11 +12545,23 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         return 0;
     }
 
-    const quicversion_t* offered[8];
-    const size_t offered_count = quicendpoint_versions(offered, 8);
+    const int v2 = (unused & 0x80) != 0;
+    __qv_version_2(v2);
+    const uint32_t offered[2] = { QUIC_VERSION_1, QUIC_VERSION_2 };
+    const size_t offered_count = v2 ? 2 : 1;
     int speaks = 0;
     for (size_t i = 0; i < offered_count; i++)
-        if (offered[i]->number == inv.version) speaks = 1;
+        if (offered[i] == inv.version) speaks = 1;
+
+    /* The list the connection layer chooses from (RFC 9368 §2.3) is the same set. */
+    const quicversion_t* listed_by[8];
+    if (quicendpoint_versions(listed_by, 8) != offered_count) __builtin_trap();
+    for (size_t i = 0; i < offered_count; i++) {
+        int found = 0;
+        for (size_t k = 0; k < offered_count; k++)
+            if (listed_by[k]->number == offered[i]) found = 1;
+        if (!found) __builtin_trap();
+    }
 
     const size_t need = 7 + inv.dcid.len + inv.scid.len + 4 * (offered_count + 1);
     const size_t cap = cap_how < 128 ? cap_how : 256;
@@ -12545,7 +12595,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         if ((v & 0x0f0f0f0fu) == 0x0a0a0a0au) { reserved++; continue; }
         int found = 0;
         for (size_t k = 0; k < offered_count; k++)
-            if (offered[k]->number == v) found = 1;
+            if (offered[k] == v) found = 1;
         if (!found) __builtin_trap();
         listed++;
     }
@@ -13447,7 +13497,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
  * domain (4, 5): a vhost template of labels, a Unicode one perhaps, with '*'
  * at either end, and a Host built from it -- case changed, labels for the '*',
  * a port, a trailing dot, punycode or not -- or taken from the input.
- * domain_host_normalize agrees with a normaliser written here, and
+ * domain_host_normalize agrees with a pattern written here from its header, and
  * domain_matches with a glob match written here; a literal template answers as
  * its pattern does. */
 
@@ -13856,41 +13906,34 @@ static int __rt_glob(const char* tpl, const char* host) {
     return hn == cn && __rt_ieq(host, core, cn);
 }
 
-/* domain_host_normalize, as the header says it. */
+/* domain_host_normalize, as the header says it -- but as one pattern over the
+ * whole Host rather than the function's walk through it, so that a slip in
+ * that walk is not copied here too: a name, bracketed or not, then a port of
+ * digits or none. Unbracketed, the name stops at the first ':' and loses one
+ * trailing dot, and what is left may neither be empty nor end in another. No
+ * control byte, space or DEL anywhere. The name is the group that took part. */
 static domain_host_e __rt_normalize(const char* h, size_t n, char* out) {
-    if (n == 0 || n >= DOMAIN_MAX_HOST) return DOMAIN_HOST_BAD;
-    for (size_t i = 0; i < n; i++)
-        if ((unsigned char)h[i] <= 0x20 || (unsigned char)h[i] == 0x7f) return DOMAIN_HOST_BAD;
-    char name[DOMAIN_MAX_HOST];
-    size_t nn;
-    const char* port;
-    size_t pn = 0;
-    if (h[0] == '[') {
-        const char* close = memchr(h, ']', n);
-        if (close == NULL) return DOMAIN_HOST_BAD;
-        const size_t after = (size_t)(close - h) + 1;
-        port = h + after + 1;
-        if (after < n) {
-            if (h[after] != ':') return DOMAIN_HOST_BAD;
-            pn = n - after - 1;
-        }
-        nn = (size_t)(close - h) - 1;
-        memcpy(name, h + 1, nn);
-    } else {
-        const char* colon = memchr(h, ':', n);
-        nn = colon ? (size_t)(colon - h) : n;
-        port = colon ? colon + 1 : NULL;
-        pn = colon ? n - nn - 1 : 0;
-        memcpy(name, h, nn);
-        if (nn > 0 && name[nn - 1] == '.') {
-            nn--;
-            if (nn > 0 && name[nn - 1] == '.') return DOMAIN_HOST_BAD;
-        }
+    static pcre2_code* host;
+    if (host == NULL) {
+        int err = 0;
+        PCRE2_SIZE at = 0;
+        host = pcre2_compile((PCRE2_SPTR)
+            "^(?:\\[([^\\x00-\\x20\\x7f\\]]+)\\]"
+            "|(?!\\[)([^\\x00-\\x20\\x7f:]*[^\\x00-\\x20\\x7f:.])\\.?)"
+            "(?::[0-9]*)?$",
+            PCRE2_ZERO_TERMINATED, PCRE2_DOLLAR_ENDONLY, &err, &at, NULL);
+        if (host == NULL) abort();
     }
+    if (n >= DOMAIN_MAX_HOST) return DOMAIN_HOST_BAD;
+
+    int v[6];
+    if (__rt_pcre(host, h, n, v, 6) != 1) return DOMAIN_HOST_BAD;
+    const int g = v[2] >= 0 ? 1 : 2;
+    char name[DOMAIN_MAX_HOST];
+    const size_t nn = (size_t)(v[2 * g + 1] - v[2 * g]);
+    memcpy(name, h + v[2 * g], nn);
     name[nn] = 0;
-    if (nn == 0) return DOMAIN_HOST_BAD;
-    for (size_t i = 0; i < pn; i++)
-        if (port[i] < '0' || port[i] > '9') return DOMAIN_HOST_BAD;
+
     char* ascii = idn_to_ascii(name);
     if (ascii == NULL) return DOMAIN_HOST_UNKNOWN;
     snprintf(out, DOMAIN_MAX_HOST * 4, "%s", ascii);

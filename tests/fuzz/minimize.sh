@@ -29,7 +29,7 @@ manifest="$build_dir/fuzz-targets.txt"
 [[ -d $results_dir ]] || { echo "No results directory: $results_dir" >&2; exit 1; }
 
 status=0
-while IFS='|' read -r name executable seeds _dictionary engine _leaks; do
+while IFS='|' read -r name executable seeds _dictionary engine leaks; do
     corpus="$results_dir/$name/corpus"
     [[ -d $corpus ]] || continue
     if [[ $engine != gcc ]]; then
@@ -37,10 +37,15 @@ while IFS='|' read -r name executable seeds _dictionary engine _leaks; do
         continue
     fi
 
+    # As run.sh has it: a target registered without leak checking would
+    # otherwise fail here on the leak its fuzzing run was told to ignore.
+    asan=${ASAN_OPTIONS:-}
+    [[ ${leaks:-1} == 1 ]] || asan="${asan:+$asan:}detect_leaks=0"
+
     out="$results_dir/$name/minimized"
     rm -rf "$out"
     mkdir -p "$out"
-    if ! "$executable" "-minimize=$out" "-base=$seeds" "-artifacts=$results_dir/$name/artifacts" \
+    if ! ASAN_OPTIONS=$asan "$executable" "-minimize=$out" "-base=$seeds" "-artifacts=$results_dir/$name/artifacts" \
             "$corpus" > "$results_dir/$name/minimize.log" 2>&1; then
         echo "$name: FAILED (log: $results_dir/$name/minimize.log)" >&2
         status=1

@@ -52,7 +52,7 @@ static int __minimize_test(void) {
     if (mkdtemp(base) == NULL || mkdtemp(corpus) == NULL || mkdtemp(out) == NULL) return 1;
 
     __put(base, "seed", "a");
-    __put(corpus, "1", "a");      /* the base has it */
+    __put(corpus, "1", "a");      /* the base has it: run.sh copies the seeds in */
     __put(corpus, "2", "bb");     /* nothing "b" and "ab" do not */
     __put(corpus, "3", "ab");     /* the second 'b' */
     __put(corpus, "4", "b");
@@ -66,6 +66,16 @@ static int __minimize_test(void) {
     big[sizeof big - 1] = 0;
     __put(corpus, "6", big);
 
+    /* More inputs than a fuzzing run holds (CORPUS_MAX): none reaches an
+     * edge, but each is read and counted -- a long run's corpus grows past
+     * that, and what was never read cannot be kept. */
+    for (unsigned i = 0; i < CORPUS_MAX + 4; i++) {
+        char name[16], text[16];
+        snprintf(name, sizeof name, "n%u", i);
+        snprintf(text, sizeof text, "%08u", i);
+        __put(corpus, name, text);
+    }
+
     size_t kept = 0, total = 0;
     const int rc = __minimize(base, corpus, out, &kept, &total);
     const size_t written = __files(out);
@@ -74,7 +84,7 @@ static int __minimize_test(void) {
     snprintf(cmd, sizeof cmd, "rm -rf %s %s %s", base, corpus, out);
     if (system(cmd) != 0) return 1;
 
-    if (rc != 0 || total != 6 || kept != 4 || written != 4) {
+    if (rc != 0 || total != 5 + CORPUS_MAX + 4 || kept != 4 || written != 4) {
         fprintf(stderr, "minimize: rc %d, kept %zu of %zu, %zu files written\n", rc, kept, total, written);
         return 1;
     }

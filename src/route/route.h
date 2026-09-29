@@ -62,8 +62,15 @@ int route_set_websockets_handler(route_t*, const char*, void(*)(void*), ratelimi
 void routes_free(route_t* route);
 int route_compare_primitive(const route_t*, const char*, size_t);
 
+/* The most capture groups a location may have; route_create refuses more.
+ * The offsets route_match fills live on the stack of the worker matching the
+ * request, and a pattern from the configuration must not decide how deep that
+ * goes: callers size them by ROUTE_VECTOR_MAX, not by the route. */
+#define ROUTE_MAX_CAPTURES 64
+#define ROUTE_VECTOR_MAX ((ROUTE_MAX_CAPTURES + 1) * 2)
+
 /* How many ints route_match writes: a (start, end) pair for the whole match
- * and one for each capture group. */
+ * and one for each capture group. Never more than ROUTE_VECTOR_MAX. */
 int route_vector_size(const route_t* route);
 
 /* Does `path` match the route? `vector` receives the offsets route_vector_size

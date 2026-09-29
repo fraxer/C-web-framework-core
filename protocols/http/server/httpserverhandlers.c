@@ -827,7 +827,7 @@ int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
          * vector it fills is not handed on for one, whose static_file has no
          * groups to expand. */
         const int vector_size = route_vector_size(route);
-        int vector[vector_size];
+        int vector[ROUTE_VECTOR_MAX];
         const int matched = route_match(route, request->path, request->path_length,
                                         vector, vector_size);
         if (matched < 0) return 0;
@@ -905,8 +905,8 @@ int __get_redirect(connection_t* connection, httprequest_t* request, httprespons
     while (redirect) {
         if (loop_cycle >= 10) return REDIRECT_LOOP_CYCLE;
 
-        int vector_size = (redirect->params_count + 1) * 3;
-        int vector[vector_size];
+        const int vector_size = (redirect->params_count + 1) * 3;
+        int vector[REDIRECT_VECTOR_MAX];
         // pcre_exec leaves entries of non-participating capture groups untouched,
         // so pre-mark all offsets as "unset" for redirect_get_uri
         memset(vector, -1, sizeof(vector));

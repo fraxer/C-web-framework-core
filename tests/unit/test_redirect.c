@@ -604,3 +604,32 @@ TEST(test_redirect_carried_query_has_no_controls) {
     free(uri);
     redirect_free(r);
 }
+
+TEST(test_redirect_groups_are_bounded) {
+    TEST_SUITE("redirect: what the configuration brings");
+    TEST_CASE("a location with more groups than REDIRECT_MAX_CAPTURES is refused");
+    /* The http server keeps the match's offsets on the stack; they were sized
+     * by the location's group count, and are now by REDIRECT_VECTOR_MAX. */
+    char location[8 + 3 * (REDIRECT_MAX_CAPTURES + 1)];
+    char destination[8 + 5 * (REDIRECT_MAX_CAPTURES + 1)];
+    for (int groups = REDIRECT_MAX_CAPTURES; groups <= REDIRECT_MAX_CAPTURES + 1; groups++) {
+        size_t n = 0, d = 0;
+        location[n++] = '^';
+        location[n++] = '/';
+        destination[d++] = '/';
+        for (int i = 0; i < groups; i++) {
+            memcpy(location + n, "(a)", 3);
+            n += 3;
+            d += (size_t)sprintf(destination + d, "{%d}", i + 1);
+        }
+        location[n++] = '$';
+        location[n] = 0;
+
+        redirect_t* r = redirect_create(location, destination);
+        if (groups == REDIRECT_MAX_CAPTURES)
+            TEST_ASSERT_NOT_NULL(r, "as many as the bound load");
+        else
+            TEST_ASSERT_NULL(r, "one more does not");
+        redirect_free(r);
+    }
+}

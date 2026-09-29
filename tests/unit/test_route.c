@@ -673,3 +673,42 @@ TEST(test_route_long_location) {
     routes_free(r);
     free(location);
 }
+
+TEST(test_route_groups_are_bounded) {
+    TEST_CASE("a location with more groups than ROUTE_MAX_CAPTURES is refused");
+    /* The server keeps route_match's offsets on the worker's stack. They were
+     * sized by the location's own group count, so a location with thousands of
+     * groups decided how deep that stack went; now by ROUTE_VECTOR_MAX, and a
+     * location past it does not load. */
+    char location[8 + 3 * (ROUTE_MAX_CAPTURES + 1)];
+    for (int groups = ROUTE_MAX_CAPTURES; groups <= ROUTE_MAX_CAPTURES + 1; groups++) {
+        size_t n = 0;
+        location[n++] = '^';
+        location[n++] = '/';
+        for (int i = 0; i < groups; i++) {
+            memcpy(location + n, "(a)", 3);
+            n += 3;
+        }
+        location[n++] = '$';
+        location[n] = 0;
+
+        route_t* r = route_create(location);
+        if (groups == ROUTE_MAX_CAPTURES) {
+            TEST_REQUIRE_NOT_NULL(r, "as many as the bound load");
+            TEST_ASSERT_EQUAL(ROUTE_VECTOR_MAX, route_vector_size(r), "and fill the whole vector");
+        }
+        else {
+            TEST_ASSERT_NULL(r, "one more does not");
+        }
+        routes_free(r);
+    }
+}
+
+TEST(test_route_param_without_its_own_group_refused) {
+    TEST_CASE("a param whose group name is not unique is refused");
+    /* The expression names a second _p1 and allows duplicates, so the param's
+     * group cannot be told apart; route_create refused it without saying why. */
+    route_t* r = route_create("/{a|(?J)(?<_p1>x)}");
+    TEST_ASSERT_NULL(r, "refused");
+    routes_free(r);
+}

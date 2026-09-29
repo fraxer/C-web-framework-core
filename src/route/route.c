@@ -14,6 +14,9 @@
 #define ROUTE_PARAM_ONE_WORD "Route error: For param need one word in \"%s\"\n"
 #define ROUTE_REGEX_AND_PARAMS "Route error: Can't use named params with regex \"%s\"\n"
 #define ROUTE_BAD_STATIC_FILE "Route error: Bad static file template \"%s\"\n"
+#define ROUTE_TOO_MANY_GROUPS "Route error: More than %d groups in \"%s\"\n"
+#define ROUTE_PARAM_GROUP_NOT_FOUND "Route error: No group of its own for param \"%s\" in \"%s\"\n"
+#define ROUTE_PATTERN_INFO "Route error: Can't count groups in \"%s\"\n"
 
 typedef struct route_parser {
     int is_primitive;
@@ -81,15 +84,27 @@ route_t* route_create(const char* dirty_location) {
     }
 
     uint32_t captures = 0;
-    if (pcre2_pattern_info(route->location, PCRE2_INFO_CAPTURECOUNT, &captures) != 0) goto failed;
+    if (pcre2_pattern_info(route->location, PCRE2_INFO_CAPTURECOUNT, &captures) != 0) {
+        log_error(ROUTE_PATTERN_INFO, dirty_location);
+        goto failed;
+    }
+    if (captures > ROUTE_MAX_CAPTURES) {
+        log_error(ROUTE_TOO_MANY_GROUPS, ROUTE_MAX_CAPTURES, dirty_location);
+        goto failed;
+    }
     route->captures = (int)captures;
 
     int index = 1;
     for (route_param_t* param = parser.first_param; param != NULL; param = param->next, index++) {
         char name[16];
         snprintf(name, sizeof name, "_p%d", index);
+        /* Unreachable unless the param's expression names a group _pN itself
+         * and allows duplicates with (?J): the name then has no one group. */
         const int group = pcre2_substring_number_from_name(route->location, (PCRE2_SPTR)name);
-        if (group <= 0) goto failed;
+        if (group <= 0) {
+            log_error(ROUTE_PARAM_GROUP_NOT_FOUND, param->string, dirty_location);
+            goto failed;
+        }
         param->group = group;
     }
 

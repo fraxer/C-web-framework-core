@@ -109,7 +109,7 @@ int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t
         ratelimiter_t* ratelimiter = __ratelimiter_find(&ctx->server->websockets, route);
 
         const int vector_size = route_vector_size(route);
-        int vector[vector_size];
+        int vector[ROUTE_VECTOR_MAX];
         const int matched = route_match(route, protocol->path, protocol->path_length,
                                         vector, vector_size);
         if (matched < 0) return 0;

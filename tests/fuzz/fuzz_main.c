@@ -76,14 +76,30 @@ typedef struct {
     size_t   len;
 } input_t;
 
-static input_t __corpus[CORPUS_MAX];
-static size_t  __corpus_count;
+/* A fuzzing run stops adding at CORPUS_MAX; -minimize has no ceiling, since an
+ * input it never read is coverage it silently drops. What was not added is
+ * counted either way, so that neither loses inputs without saying so. */
+static input_t* __corpus;
+static size_t   __corpus_count;
+static size_t   __corpus_cap;
+static size_t   __corpus_limit = CORPUS_MAX;
+static size_t   __corpus_dropped;
 
 static void __corpus_add(const uint8_t* data, size_t len) {
-    if (__corpus_count >= CORPUS_MAX || len > __input_max) return;
+    if (__corpus_count >= __corpus_limit || len > __input_max) {
+        __corpus_dropped++;
+        return;
+    }
+    if (__corpus_count == __corpus_cap) {
+        const size_t cap = __corpus_cap ? __corpus_cap * 2 : 256;
+        input_t* grown = realloc(__corpus, cap * sizeof *grown);
+        if (grown == NULL) { __corpus_dropped++; return; }
+        __corpus = grown;
+        __corpus_cap = cap;
+    }
 
     uint8_t* copy = malloc(len > 0 ? len : 1);
-    if (copy == NULL) return;
+    if (copy == NULL) { __corpus_dropped++; return; }
 
     memcpy(copy, data, len);
     __corpus[__corpus_count].data = copy;
@@ -452,13 +468,34 @@ static int __minimize(const char* base_dir, const char* corpus_dir, const char* 
      * to 256 KiB, and one cut to the default 8 KiB loses whatever it reached
      * past that -- and would be written back, cut. */
     __input_max = INPUT_LIMIT;
+    __corpus_limit = SIZE_MAX;
+    __corpus_dropped = 0;
 
     if (base_dir != NULL) __corpus_load(base_dir);
     const size_t base = __corpus_count;
+    qsort(__corpus, base, sizeof __corpus[0], __input_cmp);
     for (size_t i = 0; i < base; i++) __run(__corpus[i].data, __corpus[i].len);
 
     __corpus_load(corpus_dir);
-    const size_t total = __corpus_count - base;
+    if (__corpus_dropped > 0) {
+        fprintf(stderr, "[fuzz] %zu inputs could not be read into memory\n", __corpus_dropped);
+        for (size_t i = 0; i < __corpus_count; i++) free(__corpus[i].data);
+        __corpus_count = 0;
+        return -1;
+    }
+
+    /* run.sh starts every corpus as a copy of the seeds, so the base comes
+     * back a second time under the corpus: run once, and not counted as
+     * what the corpus holds. */
+    size_t total = 0;
+    for (size_t i = base; i < __corpus_count; i++) {
+        if (bsearch(&__corpus[i], __corpus, base, sizeof __corpus[0], __input_cmp) != NULL) {
+            free(__corpus[i].data);
+            continue;
+        }
+        __corpus[base + total++] = __corpus[i];
+    }
+    __corpus_count = base + total;
     qsort(__corpus + base, total, sizeof __corpus[0], __input_cmp);
 
     size_t kept = 0;
@@ -552,6 +589,9 @@ int main(int argc, char* argv[]) {
 
     __corpus_dir = replay_only ? NULL : corpus_dir;
     if (corpus_dir != NULL) __corpus_load(corpus_dir);
+    if (__corpus_dropped > 0)
+        fprintf(stderr, "[fuzz] %zu inputs of %s not loaded: the corpus holds %d\n",
+                __corpus_dropped, corpus_dir, CORPUS_MAX);
 
     /* An empty corpus is not fatal, it is just a slower start: the mutator
      * grows inputs out of nothing soon enough. */
@@ -571,6 +611,7 @@ int main(int argc, char* argv[]) {
         printf("replayed %s (%zu bytes)\n", corpus_dir, __corpus[0].len);
         for (size_t i = 0; i < __corpus_count; i++) free(__corpus[i].data);
         for (size_t i = 0; i < __dict_count; i++) free(__dict[i].data);
+        free(__corpus);
         return 0;
     }
 
@@ -619,6 +660,7 @@ int main(int argc, char* argv[]) {
 
     for (size_t i = 0; i < __dict_count; i++) free(__dict[i].data);
     for (size_t i = 0; i < __corpus_count; i++) free(__corpus[i].data);
+    free(__corpus);
     free(buf);
 
     return 0;

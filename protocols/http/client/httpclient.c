@@ -754,30 +754,25 @@ httpresponse_t* __httpclient_self_invoke(httpclient_t* client, server_t* server)
         return client->response;
     }
 
-    route_t* route = server->http.route;
+    /* The route the server would pick for this path, and its params in the
+     * query the way the server puts them there (__handler_added_to_queue):
+     * a handler reads them the same whichever way the request came. */
+    httprequest_t* request = client->request;
     route_t* matched_route = NULL;
+    int vector[ROUTE_VECTOR_MAX];
 
-    while (route) {
-        if (route->is_primitive) {
-            if (route_compare_primitive(route, path, strlen(path))) {
-                matched_route = route;
-                break;
-            }
-        } else {
-            /* PCRE2: need match_data */
-            pcre2_match_data* match_data = pcre2_match_data_create_from_pattern(route->location, NULL);
-            if (match_data == NULL) {
-                route = route->next;
-                continue;
-            }
-            int rc = pcre2_match(route->location, (PCRE2_SPTR)path, strlen(path), 0, 0, match_data, NULL);
-            pcre2_match_data_free(match_data);
-            if (rc >= 0) {
-                matched_route = route;
-                break;
-            }
+    for (route_t* route = server->http.route; route != NULL; route = route->next) {
+        const int matched = route_match(route, path, request->path_length,
+                                        vector, route_vector_size(route));
+        if (matched < 0) {
+            log_error("Self-invoke: out of memory matching %s\n", path);
+            client->response->status_code = 500;
+            return client->response;
         }
-        route = route->next;
+        if (matched == 1) {
+            matched_route = route;
+            break;
+        }
     }
 
     if (!matched_route) {
@@ -791,6 +786,22 @@ httpresponse_t* __httpclient_self_invoke(httpclient_t* client, server_t* server)
         log_error("Self-invoke: handler not found for method %d\n", client->method);
         client->response->status_code = 405;
         return client->response;
+    }
+
+    for (route_param_t* param = matched_route->param; param != NULL; param = param->next) {
+        const int start = vector[param->group * 2];
+        if (start < 0) continue;
+
+        query_t* query = query_create(param->string, param->string_len, &path[start],
+                                      (size_t)(vector[param->group * 2 + 1] - start));
+        if (query == NULL || query->key == NULL || query->value == NULL) {
+            query_free(query);
+            log_error("Self-invoke: out of memory for route params\n");
+            client->response->status_code = 500;
+            return client->response;
+        }
+
+        httpparser_append_query(request, query);
     }
 
     connection_t* connection = connection_s_create_local(server);

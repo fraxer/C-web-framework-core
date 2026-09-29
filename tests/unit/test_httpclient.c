@@ -4,6 +4,8 @@
 #include <string.h>
 
 #include "route.h"
+#include "server.h"
+#include "httpcontext.h"
 
 // ============================================================================
 // init / free
@@ -157,4 +159,44 @@ TEST(test_set_method_changes_method) {
     TEST_ASSERT_EQUAL(ROUTE_HEAD, client->method, "switched to HEAD");
 
     client->free(client);
+}
+
+// ============================================================================
+// self-invocation
+// ============================================================================
+
+httpresponse_t* __httpclient_self_invoke(httpclient_t*, server_t*);
+
+static char __self_queries[128];
+
+static void __self_handler(void* arg) {
+    httpctx_t* ctx = arg;
+    size_t n = 0;
+    for (query_t* q = ctx->request->query_; q != NULL; q = q->next)
+        n += (size_t)snprintf(__self_queries + n, sizeof __self_queries - n, "%s=%s;", q->key, q->value);
+    ctx->response->status_code = 200;
+}
+
+TEST(test_self_invoke_matches_like_the_server) {
+    TEST_CASE("a request to this server picks its route with route_match, params included");
+    /* It used to run pcre2_match on its own and hand the handler no route
+     * params at all: "/users/{id}" answered, with no id in the query. */
+    server_t server = {0};
+    route_t* plain = route_create("/health");
+    route_t* users = route_create("/users/{id|\\d+}");
+    TEST_REQUIRE(plain != NULL && users != NULL, "routes created");
+    TEST_REQUIRE(route_set_http_handler(users, "GET", __self_handler, NULL), "handler set");
+    plain->next = users;
+    server.http.route = plain;
+
+    httpclient_t* client = httpclient_init(ROUTE_GET, "http://localhost/users/42?x=1", 5);
+    TEST_REQUIRE_NOT_NULL(client, "client created");
+
+    __self_queries[0] = 0;
+    httpresponse_t* response = __httpclient_self_invoke(client, &server);
+    TEST_ASSERT_EQUAL(200, response->status_code, "the params route answered");
+    TEST_ASSERT_STR_EQUAL("x=1;id=42;", __self_queries, "the query, then the route's params");
+
+    client->free(client);
+    routes_free(plain);
 }

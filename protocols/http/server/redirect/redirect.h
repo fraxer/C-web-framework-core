@@ -6,6 +6,11 @@
 
 #include "strtemplate.h"
 
+/* The most capture groups a location may have, for the reason ROUTE_MAX_CAPTURES
+ * gives: the http server keeps the offsets on the stack, sized by this. */
+#define REDIRECT_MAX_CAPTURES 64
+#define REDIRECT_VECTOR_MAX ((REDIRECT_MAX_CAPTURES + 1) * 3)
+
 enum redirect_status {
     REDIRECT_OUT_OF_MEMORY,
     REDIRECT_LOOP_CYCLE,

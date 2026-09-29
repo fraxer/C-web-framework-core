@@ -7,6 +7,7 @@
 #define REDIRECT_ERROR_OUT_OF_MEMORY "Redirect error: Out of memory\n"
 #define REDIRECT_ERROR_CHECK_PARAM "Redirect error: params count is not equal substrings count in location \"%s\"\n"
 #define REDIRECT_ERROR_PARAM_NUMBER "Redirect error: param number exceeds captures count in location \"%s\"\n"
+#define REDIRECT_ERROR_TOO_MANY_GROUPS "Redirect error: more than %d groups in the location redirecting to \"%s\"\n"
 
 static redirect_t* redirect_init(const char* destination);
 static int redirect_check_params(redirect_t* redirect, const char* destination);
@@ -155,6 +156,10 @@ int redirect_check_params(redirect_t* redirect, const char* destination) {
     /* PCRE2: pattern info via pcre2_pattern_info */
     uint32_t capture_count = 0;
     if (pcre2_pattern_info(redirect->location, PCRE2_INFO_CAPTURECOUNT, &capture_count) != 0) return -1;
+    if (capture_count > REDIRECT_MAX_CAPTURES) {
+        log_error(REDIRECT_ERROR_TOO_MANY_GROUPS, REDIRECT_MAX_CAPTURES, destination);
+        return -1;
+    }
     where = (int)capture_count;
 
     if (where != redirect->params_count) {
