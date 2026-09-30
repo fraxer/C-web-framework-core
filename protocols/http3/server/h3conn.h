@@ -73,6 +73,16 @@ typedef struct h3app {
      * keeps moving, but nothing looks at them. */
     int            drained;
     int            qpack_blocked_counted;
+    /* The request was given up on before anything answered it -- the peer
+     * reset it, it was malformed, or it arrived past our GOAWAY -- so no
+     * response will ever be written on this stream. A request stream is
+     * otherwise finished only by its response (__app_done), and the transport
+     * keeps a stream until the application is finished with it: without this
+     * the stream, and the stream credit it holds, stayed until the connection
+     * closed. Set only while st->response is NULL, i.e. before dispatch and
+     * before any inline answer, which is what makes "nothing will come"
+     * true. */
+    int            abandoned;
 
     /* A PRIORITY_UPDATE has been applied to this stream. RFC 9218 §7: the frame
      * overrides the `priority` request header field, and it does so whichever
