@@ -22,6 +22,7 @@
 #include "quictime.h"
 
 #include "quic_stand.h"
+#include "h3error.h"
 
 TEST(test_quic_stand_handshake) {
     TEST_SUITE("quic_stand");
@@ -1035,6 +1036,80 @@ TEST(test_quic_stand_stream_credit) {
     /* The transport really did let them go, rather than accumulating them: the
      * per-packet walk over conn->streams is only short if this happens. */
     TEST_ASSERT(s->conn->stream_count < allowance, "and released the finished ones");
+
+    __stand_free(s);
+}
+
+static uint64_t __h3_released_target;
+
+static int __h3_released(stand_t* s) {
+    return s->conn != NULL && s->conn->peer_bidi_closed >= __h3_released_target;
+}
+
+TEST(test_quic_stand_h3_cancelled_requests_release_credit) {
+    TEST_SUITE("quic_stand");
+
+    TEST_CASE("requests cancelled before they are complete give their stream credit back");
+    /* A request the client abandons before its HEADERS are even whole -- a
+     * browser cancelling a navigation, or an upload given up halfway -- never
+     * reaches a handler, so no response will ever finish it. The h3 layer held
+     * such a stream until the connection went: __app_done waited for a
+     * response_done that could not come, and after a lone RESET_STREAM our
+     * own half of the stream was never ended either. The transport releases a
+     * stream only when both are settled, and MAX_STREAMS renews credit only for
+     * released streams (test_quic_stand_stream_credit), so every such cancel
+     * cost the connection one request slot for the rest of its life:
+     * initial_max_streams_bidi of them and the client could open nothing more.
+     *
+     * Alternates the two ways a client gives up: RESET_STREAM alone, and
+     * RESET_STREAM with STOP_SENDING, which is what a browser sends. */
+    stand_t* s = __stand_create(18);
+    TEST_REQUIRE_NOT_NULL(s, "stand created");
+    s->h3 = 1;
+
+    TEST_ASSERT(__start(s), "connecting");
+    TEST_ASSERT(__run(s, 2000000, __handshake_done), "handshake complete");
+    TEST_REQUIRE_NOT_NULL(s->conn, "connected");
+
+    const uint64_t allowance = s->conn->local_params.initial_max_streams_bidi;
+    TEST_ASSERT(allowance > 0, "an allowance was advertised");
+    const uint64_t wanted = allowance + allowance / 2;
+
+    /* A HEADERS frame that announces sixteen bytes and delivers two: the
+     * request is open and cannot complete. */
+    static const uint8_t partial[] = { 0x01, 0x10, 0x00, 0x00 };
+    uint64_t released = 0;
+
+    for (uint64_t i = 0; i < wanted; i++) {
+        const uint64_t id = i * 4;
+        if (s->conn == NULL) break;
+        const uint64_t closed_before = s->conn->peer_bidi_closed;
+
+        if (!quicclient_stream_write(&s->client, id, partial, sizeof partial, 0)) break;
+        if (!quicclient_flush(&s->client)) break;
+        __run(s, 100000, NULL);
+
+        if (!quicclient_reset_stream(&s->client, id, H3_REQUEST_CANCELLED)) break;
+        if (i % 2 == 1 && !quicclient_stop_sending(&s->client, id, H3_REQUEST_CANCELLED)) break;
+        if (!quicclient_flush(&s->client)) break;
+
+        __h3_released_target = closed_before + 1;
+        if (!__run(s, 2000000, __h3_released)) break;
+
+        quicclient_stream_release(&s->client, id);
+        released++;
+    }
+
+    if (released != wanted || s->trace)
+        printf("      released %llu of %llu (allowance %llu), streams held %zu, state %d\n",
+               (unsigned long long)released, (unsigned long long)wanted,
+               (unsigned long long)allowance,
+               s->conn != NULL ? s->conn->stream_count : 0,
+               s->conn != NULL ? (int)s->conn->state : -1);
+
+    TEST_ASSERT(released == wanted, "every cancelled request's stream was released");
+    TEST_REQUIRE_NOT_NULL(s->conn, "the connection is still there");
+    TEST_ASSERT(s->conn->state == QUICCONN_ACTIVE, "and active past the allowance");
 
     __stand_free(s);
 }

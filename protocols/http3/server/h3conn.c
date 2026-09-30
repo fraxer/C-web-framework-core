@@ -161,7 +161,22 @@ static int __app_done(h3app_t* app) {
     if (app == NULL) return 1;
     if (!app->is_request) return 0;
 
-    return app->req == NULL || app->req->response_done;
+    return app->req == NULL || app->req->response_done || app->abandoned;
+}
+
+/* Give up on a request nothing has answered yet (h3app_t::abandoned): no
+ * response is coming, so our half of the stream is ended here as well -- a
+ * lone RESET_STREAM from the peer leaves it open, and the transport releases a
+ * stream only once both halves are done. H3_REQUEST_CANCELLED is the code
+ * RFC 9114 §8.1 gives for a response that will not be sent. A request that
+ * already has a response -- dispatched, or answered on the read path -- is
+ * left alone: that response finishes the stream when it is written. */
+static void __abandon(quicstream_t* qs, h3app_t* app, uint64_t code) {
+    if (app->req != NULL && app->req->response != NULL) return;
+
+    app->abandoned = 1;
+    app->drained = 1;
+    quicstream_reset(qs, code);
 }
 
 static void __app_free(h3app_t* app) {
@@ -477,6 +492,7 @@ static h3conn_result_t __apply_stream_status(quicstream_t* qs, h3app_t* app,
         quicstream_reset(qs, code);
         quicstream_stop_sending(qs, code);
         app->drained = 1;
+        __abandon(qs, app, code);
         return __reset(code);
     }
 
@@ -540,6 +556,7 @@ static h3conn_result_t __on_reset(h3conn_t* c, quicstream_t* qs, h3app_t* app) {
         h3stream_qpack_unblock(app->req);
     }
     app->drained = 1;
+    __abandon(qs, app, H3_REQUEST_CANCELLED);
 
     metrics_h3(METRICS_H3_STREAMS_CANCELLED);
 
@@ -675,6 +692,7 @@ static h3conn_result_t __read_request(h3conn_t* c, quicconn_t* qc, quicstream_t*
                     quicstream_reset(qs, H3_REQUEST_REJECTED);
                     quicstream_stop_sending(qs, H3_REQUEST_REJECTED);
                     app->drained = 1;
+                    __abandon(qs, app, H3_REQUEST_REJECTED);
                     return __reset(H3_REQUEST_REJECTED);
                 }
 
@@ -751,7 +769,12 @@ static void __answer_status(connection_t* connection, quicstream_t* qs, int stat
     if (st == NULL) return;
 
     httpresponse_t* response = h3conn_take_response(h3_conn_of(connection), connection);
-    if (response == NULL) return;
+    if (response == NULL) {
+        /* Nothing to answer with, and nothing else will: end the stream rather
+         * than hold it open for a response that cannot be built. */
+        if (qs->app != NULL) __abandon(qs, qs->app, H3_INTERNAL_ERROR);
+        return;
+    }
 
     httpresponse_default(response, status_code);
     st->response = response;
@@ -1314,7 +1337,10 @@ size_t h3conn_requests_in_flight(const h3conn_t* c, const quicconn_t* qc) {
 
     for (const quicstream_t* qs = qc->streams; qs != NULL; qs = qs->next) {
         const h3stream_t* st = h3conn_request_of((quicstream_t*)qs);
-        if (st != NULL && !st->response_done) n++;
+        const h3app_t* app = qs->app;
+        /* An abandoned request is not in flight: nothing will finish it, and a
+         * graceful close waiting on one waited for the grace window to run out. */
+        if (st != NULL && !st->response_done && !app->abandoned) n++;
     }
 
     return n;

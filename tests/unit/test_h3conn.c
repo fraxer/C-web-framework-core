@@ -159,6 +159,7 @@ TEST(test_h3conn_request_errors) {
     TEST_ASSERT(r.h3_error == H3_MESSAGE_ERROR, "H3_MESSAGE_ERROR");
     TEST_ASSERT(qs->send_reset_pending, "RESET_STREAM queued");
     TEST_ASSERT(qs->send_stop_sending_pending, "STOP_SENDING queued too");
+    TEST_ASSERT(qs->app_done(qs->app), "and nothing holds the stream past that");
     stream_free(qs);
     h3conn_free(c);
 
@@ -197,7 +198,14 @@ TEST(test_h3conn_request_errors) {
     quicstream_on_reset(qs, H3_REQUEST_CANCELLED, n);
     r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_REQUEST_RESET, "cancelled");
-    TEST_ASSERT(!qs->send_reset_pending, "nothing owed back -- they asked for it");
+    TEST_ASSERT(h3conn_request_of(qs)->response == NULL && qs->send.len == 0,
+                "no response -- they asked for none");
+    /* But our half is ended (RFC 9114 §4.1.1: cancel by terminating every
+     * direction still open). Left open, with nothing ever to send on it, the
+     * stream was never released and its credit never came back. */
+    TEST_ASSERT(qs->send_reset_pending && qs->send_reset_code == H3_REQUEST_CANCELLED,
+                "our half is reset with H3_REQUEST_CANCELLED");
+    TEST_ASSERT(qs->app_done(qs->app), "and the stream can be released");
     stream_free(qs);
     h3conn_free(c);
 
@@ -211,6 +219,7 @@ TEST(test_h3conn_request_errors) {
     r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_REQUEST_RESET, "reset");
     TEST_ASSERT(r.h3_error == H3_REQUEST_REJECTED, "H3_REQUEST_REJECTED -- safe to retry");
+    TEST_ASSERT(qs->app_done(qs->app), "and nothing holds the stream past that");
     stream_free(qs);
     h3conn_free(c);
 }

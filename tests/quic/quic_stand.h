@@ -29,6 +29,8 @@
 #include "quicversion.h"
 #include "quictime.h"
 
+#include "h3conn.h"
+
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
 
@@ -220,6 +222,16 @@ typedef struct stand {
      * Off by default, and the first thing to turn on when a scenario fails --
      * it is the whole log of the connection, in order, in one screen. */
     int trace;
+
+    /* Run the HTTP/3 layer on the server, between the timers and the send, the
+     * way quicendpoint.c's __h3_turn does: attach h3conn once the handshake is
+     * done, then read and write it on every received datagram. Off by default
+     * -- the transport scenarios write to their streams directly -- and what
+     * it cannot reach is a handler: a request that completes goes to a vhost
+     * the stand does not configure. It is for what the h3 layer does to the
+     * transport's streams on its own: releasing them, and the credit that
+     * rides on that. */
+    int h3;
 
     /* ---- server ---- */
     mpxapi_t        api;
@@ -514,6 +526,27 @@ static quicconn_t* __lookup_or_accept(stand_t* s, const uint8_t* data, size_t le
     return conn;
 }
 
+static void __server_h3_turn(stand_t* s, quicconn_t* conn) {
+    if (!s->h3 || conn->state != QUICCONN_ACTIVE) return;
+
+    connection_server_ctx_t* ctx = conn->conn.ctx;
+    if (ctx->parser == NULL) {
+        h3conn_t* c = h3conn_create(&conn->conn, h3_policy_max_field_section_size(), 0);
+        if (c == NULL) return;
+        ctx->parser = c;
+        if (!h3conn_open_service_streams(c, conn)) return;
+    }
+
+    uint64_t error = 0;
+    if (!h3conn_read(ctx->parser, conn, &error)) {
+        __trace(s, "h3 closes the connection: 0x%llx\n", (unsigned long long)error);
+        quicconn_close(conn, error, 1, __now_us);
+        return;
+    }
+
+    h3conn_write(ctx->parser, conn);
+}
+
 static void __server_recv(stand_t* s, const uint8_t* data, size_t len) {
     quicconn_t* conn = __lookup_or_accept(s, data, len);
     if (conn == NULL) return;
@@ -526,6 +559,7 @@ static void __server_recv(stand_t* s, const uint8_t* data, size_t len) {
      * connection is locked and hot, so it is free), then build packets. The
      * h3 turn that sits between the last two is what the stand leaves out. */
     if (alive) alive = quicconn_tick(conn, __now_us);
+    if (alive) __server_h3_turn(s, conn);
     if (!quicconn_send(conn, __now_us)) alive = 0;
 
     if (!alive || conn->state == QUICCONN_DEAD) {
