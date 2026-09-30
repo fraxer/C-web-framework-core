@@ -2800,6 +2800,26 @@ static mpxapi_t __h1c_mpxapi = {
     .control_del = __h1c_mpx_del,
 };
 
+/* F-01, RFC 9112 §9.6: a request the parser refused is answered, and the
+ * connection ends with that answer -- the parser cannot say where the broken
+ * request stops, so nothing after it may be read as a request. Held to on the
+ * server's own state rather than on the wire, where a refused WebSocket
+ * handshake is a 400 too, and raw input has no requests to match answers to:
+ * the answer to a refusal is the one response the connection holds without a
+ * request (__post_parse_refusal passes none, and the queued path carries
+ * that NULL through). It must not keep the connection, and once it exists the
+ * server must not read again. */
+static int __h1c_refused;
+
+static void __h1c_refusal(connection_t* connection) {
+    if (connection->read != http_server_guard_read) return;  /* switched protocols */
+    const connection_server_ctx_t* ctx = connection->ctx;
+    const httpresponse_t* response = ctx->response;
+    if (response == NULL || ctx->request != NULL) return;
+    if (response->keepalive) __builtin_trap();
+    __h1c_refused = 1;
+}
+
 static int __h1c_event(connection_t* connection, int event) {
     if (!(__h1c_armed & event)) return 1;                 /* epoll would not call */
     /* multiplexingepoll.c: a connection marked destroyed -- the write path's
@@ -2808,8 +2828,11 @@ static int __h1c_event(connection_t* connection, int event) {
     const connection_server_ctx_t* ctx = connection->ctx;
     if (atomic_load(&ctx->destroyed)) return 0;
     if (__h1c_armed & MPXONESHOT) __h1c_armed = 0;
+    __h1c_refusal(connection);                            /* a worker may have posted it */
+    if (event == MPXIN && __h1c_refused) __builtin_trap();
     const int alive = event == MPXIN ? http_server_guard_read(connection)
                                      : http_server_guard_write(connection);
+    if (alive) __h1c_refusal(connection);
     if (getenv("FUZZ_TRACE") != NULL)
         fprintf(stderr, "server %s -> %d, armed 0x%x\n",
                 event == MPXIN ? "read" : "write", alive, __h1c_armed);
@@ -3659,6 +3682,15 @@ static int __h1c_take(h1c_t* c) {
     /* Which request this answers decides whether a body follows. */
     if (c->answered == c->queued) __builtin_trap();       /* an answer to nothing */
     const h1c_req_t* r = &c->reqs[c->answered];
+
+    /* F-01, RFC 9112 §9.6: an answer to a request the parser refused ends the
+     * connection. Every request generated here frames, so the only 400 one may
+     * get is a refused WebSocket handshake -- a handler's answer to a request
+     * that was read whole, which may keep the connection. Anything else with
+     * 400 or 413 is the parser's, and must say "Connection: close". */
+    if ((rs.status == 400 || rs.status == 413) && !rs.conn_close &&
+        !(r->upgrade && r->ws_status == 400))
+        __builtin_trap();
     const uint8_t* body = head_end + 4;
     uint8_t* decoded = NULL;
     size_t decoded_len = 0, decoded_cap = 0;
@@ -3769,6 +3801,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     ctx->server = &__fuzz_server;
     int alive = set_http(connection);
     __h1c_armed = MPXIN | MPXRDHUP;           /* what accept() arms a connection for */
+    __h1c_refused = 0;
 
     const uint8_t* p = data + 2;
     const uint8_t* end = data + size;
@@ -3818,6 +3851,13 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             while (c->queued - c->answered < c->depth && __h1c_generate(c, &p, end)) moved = 1;
         idle = moved ? 0 : idle + 1;
     }
+
+    /* The server refused a request: by the time everything has been drained it
+     * must have marked the connection for closing (F-01 -- a 4xx on a parse
+     * error used to be sent as keep-alive, and the connection stayed open to
+     * read on whatever the broken request left behind). */
+    if (__h1c_refused && alive && !atomic_load(&ctx->destroyed))
+        __builtin_trap();
 
     if (!c->raw) {
         /* The server stopped: every request it was sent must have been

@@ -187,6 +187,7 @@ static int __sni_callback(SSL* ssl, int* ad, void* arg);
 static void* __queue_data_response_create(connection_t* connection, httprequest_t* request, httpresponse_t* response, ratelimiter_t* ratelimiter);
 static void __queue_data_response_free(void* arg);
 static int __post_response_default(connection_t* connection, int status_code);
+static int __post_parse_refusal(connection_t* connection, int status_code);
 static int __handler_finished(connection_t* connection, httprequest_t* request, httpresponse_t* response);
 static int __post_response(httprequest_t* request, httpresponse_t* response);
 static int __post_deffered_response(httprequest_t* request, httpresponse_t* response);
@@ -460,11 +461,11 @@ int __read(connection_t* connection) {
                 case HTTP1PARSER_OUT_OF_MEMORY:
                     return 0;
                 case HTTP1PARSER_PAYLOAD_LARGE:
-                    return __post_response_default(connection, 413);
+                    return __post_parse_refusal(connection, 413);
                 case HTTP1PARSER_BAD_REQUEST:
-                    return __post_response_default(connection, 400);
+                    return __post_parse_refusal(connection, 400);
                 case HTTP1PARSER_HOST_NOT_FOUND:
-                    return __post_response_default(connection, 404);
+                    return __post_parse_refusal(connection, 404);
                 case HTTP1PARSER_CONTINUE:
                     /* The headers are in and the client is holding its body
                      * back until we answer (RFC 9110 §10.1.1) — docs/http2/10,
@@ -1683,6 +1684,22 @@ int __post_response_default(connection_t* connection, int status_code) {
     httpresponse_default(response, status_code);
 
     return __post_response(NULL, response);
+}
+
+/* The answer to a request the parser refused, and the last thing said on this
+ * connection (RFC 9112 §9.6). The parser cannot say where the broken request
+ * stops -- it has just been reset, and whatever is left in the socket would be
+ * read as the start of a new one; behind a proxy that reuses the upstream
+ * connection that is request smuggling. connection->keepalive is cleared
+ * before the response is created, because the response snapshots it
+ * (httpresponse_t::keepalive) and the header, the write path and
+ * connection_after_write all follow that snapshot. It cannot be left to the
+ * parser: keepalive is set once the request line names HTTP/1.1, so a refusal
+ * inside the headers arrives with it already on. */
+int __post_parse_refusal(connection_t* connection, int status_code) {
+    connection->keepalive = 0;
+
+    return __post_response_default(connection, status_code);
 }
 
 int __post_response(httprequest_t* request, httpresponse_t* response) {
