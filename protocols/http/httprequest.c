@@ -86,6 +86,7 @@ httprequest_t* httprequest_create(connection_t* connection) {
 
     request->method = ROUTE_NONE;
     request->asterisk_form = 0;
+    request->keepalive = 0;
     request->version = HTTP1_VER_NONE;
     request->transfer_encoding = TE_NONE;
     request->content_encoding = CE_NONE;
@@ -134,6 +135,7 @@ httprequest_t* httprequest_create(connection_t* connection) {
 void httprequest_reset(httprequest_t* request) {
     request->method = ROUTE_NONE;
     request->asterisk_form = 0;
+    request->keepalive = 0;
     request->version = HTTP1_VER_NONE;
     /* Set by httprequest_create and, until the object started being recycled,
      * never anywhere else — so a reused request carried the framing of the

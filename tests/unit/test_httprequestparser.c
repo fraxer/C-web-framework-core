@@ -1356,7 +1356,7 @@ TEST(test_httprequestparser_keepalive) {
     int result = httpparser_run(parser);
 
     TEST_ASSERT_EQUAL(HTTP1PARSER_COMPLETE, result, "Should parse keep-alive");
-    TEST_ASSERT_EQUAL(1, conn->keepalive, "Keep-alive should be enabled");
+    TEST_ASSERT_EQUAL(1, parser->request->keepalive, "Keep-alive should be enabled");
 
     httpparser_free(parser);
     free_mock_connection(conn);
@@ -1854,7 +1854,7 @@ TEST(test_httprequestparser_connection_close) {
     int result = httpparser_run(parser);
 
     TEST_ASSERT_EQUAL(HTTP1PARSER_COMPLETE, result, "Should parse Connection: close");
-    TEST_ASSERT_EQUAL(0, conn->keepalive, "Keep-alive should be disabled");
+    TEST_ASSERT_EQUAL(0, parser->request->keepalive, "Keep-alive should be disabled");
 
     httpparser_free(parser);
     free_mock_connection(conn);
@@ -2189,7 +2189,7 @@ TEST(test_httprequestparser_http10_with_keepalive) {
     int result = httpparser_run(parser);
 
     TEST_ASSERT_EQUAL(HTTP1PARSER_COMPLETE, result, "Should accept HTTP/1.0 with keep-alive");
-    TEST_ASSERT_EQUAL(1, conn->keepalive, "Keep-alive should be enabled");
+    TEST_ASSERT_EQUAL(1, parser->request->keepalive, "Keep-alive should be enabled");
 
     httpparser_free(parser);
     free_mock_connection(conn);

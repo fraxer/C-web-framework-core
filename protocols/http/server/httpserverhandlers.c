@@ -592,6 +592,21 @@ int __deferred_handler(connection_t* connection, httprequest_t* request, httpres
 /* Parking the connection and handing the item to the workers: the part both
  * the ordinary deferred answer and the storage branch need, the latter having
  * to write the storage name and path onto the item first. */
+/* h1.1 answers one request at a time, in order, and ctx->request/response hold
+ * the one being answered. An empty ctx->queue does not mean that slot is free:
+ * a worker takes its item off the queue before it runs it (threadhandler.c), so
+ * while a handler builds its answer the queue is empty and the connection is
+ * parked -- broadcast_ref_count is 2 from connection_queue_append until
+ * connection_after_write lets it go. And an answer the read path bound itself
+ * sits in ctx->response until it is written. An answer that took the slot in
+ * either state would be overwritten by the one ahead of it, or overwrite it:
+ * one of them lost and leaked, and the write path retiring a response a
+ * handler is still writing to. Called with connection_s_lock held, which is
+ * what ctx->response is published under. */
+static int __h1_answer_in_flight(connection_server_ctx_t* ctx) {
+    return atomic_load(&ctx->broadcast_ref_count) == 2 || ctx->response != NULL;
+}
+
 int __deferred_enqueue(connection_t* connection, connection_queue_item_t* item) {
     connection_server_ctx_t* ctx = connection->ctx;
 
@@ -622,8 +637,15 @@ int __deferred_enqueue(connection_t* connection, connection_queue_item_t* item) 
     }
 
     /* Past this point the item belongs to ctx->queue and must not be freed here
-     * — a worker may already be running it. */
-    if (!parallel && !queue_empty)
+     * — a worker may already be running it.
+     *
+     * An answer already bound to the connection and waiting for its write (the
+     * read path made it itself, and TLS read-ahead brought the next request
+     * into the same __read) is ahead of this item as surely as a queued one:
+     * parking the connection would take away the MPXOUT that write waits for,
+     * and the worker would bind this item over it. connection_after_write
+     * starts the queue once that answer is out. */
+    if (!parallel && (!queue_empty || ctx->response != NULL))
         return 1;
 
     if (parallel ? !connection_queue_append_parallel(item) : !connection_queue_append(item)) {
@@ -707,6 +729,15 @@ int __handle(connection_t* connection, httprequest_t* request, deferred_handler 
     connection_server_ctx_t* conn_ctx = connection->ctx;
     httpresponse_t* response = __create_response(connection);
     if (response == NULL) return 0;
+
+    /* h1.1: whether the connection survives this answer is its request's to
+     * say (httprequest_t::keepalive). The snapshot __create_response took is
+     * of connection->keepalive, which __write last set from the answer before
+     * this one -- and a "Connection: close" on a request whose body arrived
+     * after that answer went out was lost to it. h2 and h3 keep their
+     * connection whatever one stream asks. */
+    if (!__is_multiplexed(connection))
+        response->keepalive = request->keepalive ? 1 : 0;
 
     /* Before anything builds the response: the content-type rules in main.gzip
      * are applied as headers are added, and they must know whether this client
@@ -1693,9 +1724,10 @@ int __post_response_default(connection_t* connection, int status_code) {
  * connection that is request smuggling. connection->keepalive is cleared
  * before the response is created, because the response snapshots it
  * (httpresponse_t::keepalive) and the header, the write path and
- * connection_after_write all follow that snapshot. It cannot be left to the
- * parser: keepalive is set once the request line names HTTP/1.1, so a refusal
- * inside the headers arrives with it already on. */
+ * connection_after_write all follow that snapshot. It cannot be left as it is:
+ * __write sets it from every answer, so on a connection that has already kept
+ * one request it arrives on (and the refused request never got as far as
+ * __handle, which is where an answer takes its request's own verdict). */
 int __post_parse_refusal(connection_t* connection, int status_code) {
     connection->keepalive = 0;
 
@@ -1738,7 +1770,7 @@ int __post_response(httprequest_t* request, httpresponse_t* response) {
     const int queue_empty = cqueue_empty(ctx->queue);
     cqueue_unlock(ctx->queue);
 
-    if (queue_empty) {
+    if (queue_empty && !__h1_answer_in_flight(ctx)) {
         ctx->request = request;
         ctx->response = response;
         atomic_store_explicit(&ctx->need_write, 1, memory_order_release);

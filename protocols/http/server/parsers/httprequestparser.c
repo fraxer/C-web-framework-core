@@ -251,7 +251,7 @@ int httpparser_run(httprequestparser_t* parser) {
 
                 // RFC 7230 (6.3): HTTP/1.1 connections are persistent by default,
                 // HTTP/1.0 connections are not; a Connection header may override this
-                parser->connection->keepalive = parser->request->version == HTTP1_VER_1_1;
+                parser->request->keepalive = parser->request->version == HTTP1_VER_1_1;
 
                 bufferdata_reset(&parser->buf);
 
@@ -790,9 +790,9 @@ void __try_set_keepalive(httprequestparser_t* parser) {
     }
 
     if (found_close)
-        parser->connection->keepalive = 0;
+        request->keepalive = 0;
     else if (found_keepalive)
-        parser->connection->keepalive = 1;
+        request->keepalive = 1;
 }
 
 void __try_set_range(httprequestparser_t* parser) {
