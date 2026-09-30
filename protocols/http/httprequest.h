@@ -276,6 +276,13 @@ typedef struct httprequest {
      * server rather than any resource — so it is answered before routing, and
      * `path` carries the literal "*" that no route will ever match. */
     int asterisk_form;
+    /* h1.1 only: whether this request leaves the connection open -- the
+     * version's default, then what its Connection field says (RFC 9112 §9.3).
+     * The parser's verdict, kept on the request it belongs to: the connection
+     * it used to be written to also carries the verdict of the last answer
+     * written, and with pipelining that answer belongs to an earlier request.
+     * The response takes it over when it is created (__handle). */
+    int keepalive;
     http_version_e version;
     http_payload_t payload_;
     http_trunsfer_encoding_t transfer_encoding;

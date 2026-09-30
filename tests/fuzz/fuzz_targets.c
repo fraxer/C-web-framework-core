@@ -3852,11 +3852,16 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         idle = moved ? 0 : idle + 1;
     }
 
-    /* The server refused a request: by the time everything has been drained it
-     * must have marked the connection for closing (F-01 -- a 4xx on a parse
+    /* The server refused a request, or the last answer is whole on the wire and
+     * closes (the request asked, or the server said so): either way the
+     * connection must be marked for closing by now. F-01 -- a 4xx on a parse
      * error used to be sent as keep-alive, and the connection stayed open to
-     * read on whatever the broken request left behind). */
-    if (__h1c_refused && alive && !atomic_load(&ctx->destroyed))
+     * read on whatever the broken request left behind; and a "Connection:
+     * close" on a request whose body came in after the previous answer was
+     * written used to be answered as keep-alive (__write had set
+     * connection->keepalive from that answer, over the parser's verdict). */
+    if ((__h1c_refused || (c->closing && c->out_pos == c->out_len && !c->switched)) &&
+        alive && !atomic_load(&ctx->destroyed))
         __builtin_trap();
 
     if (!c->raw) {
