@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Fallback requests share a rate limit, including missing files.
+# Root static routes and fallback requests count missing files too.
 set -euo pipefail
 
 BUILD_DIR=${1:?usage: tests/root_ratelimit.sh BUILD_DIR}
@@ -45,8 +45,30 @@ cat > "$WORK_DIR/config.json" <<JSON
         "limited": {
             "domains": ["limited.local"], "ip": "127.0.0.1", "port": $PORT,
             "root": "$WORK_DIR", "index": "index.html",
+            "ratelimits": {
+                "test": { "burst": 2, "rate": 1 },
+                "route": { "burst": 2, "rate": 1 },
+                "off": { "burst": 2, "rate": 0 }
+            },
+            "http": {
+                "ratelimit": "test",
+                "routes": {
+                    "/inherited/(.*)": { "GET": { "static_file": "{1}", "cache_control": "public, max-age=60" } },
+                    "/own/(.*)": { "GET": { "static_file": "{1}", "ratelimit": "route", "cache_control": "public, max-age=60" } },
+                    "/off/(.*)": { "GET": { "static_file": "{1}", "ratelimit": "off" } }
+                }
+            }
+        },
+        "route_only": {
+            "domains": ["route.local"], "ip": "127.0.0.1", "port": $PORT,
+            "root": "$WORK_DIR", "index": "index.html",
             "ratelimits": { "test": { "burst": 2, "rate": 1 } },
-            "http": { "ratelimit": "test" }
+            "http": {
+                "routes": {
+                    "/own/(.*)": { "GET": { "static_file": "{1}", "ratelimit": "test" } },
+                    "/plain/(.*)": { "GET": { "static_file": "{1}" } }
+                }
+            }
         },
         "disabled": {
             "domains": ["disabled.local"], "ip": "127.0.0.1", "port": $PORT,
@@ -84,13 +106,34 @@ expect() {
     if [ "$expected" = 429 ]; then
         tr -d '\r' < "$WORK_DIR/headers" | grep -qi '^Retry-After: 1$' \
             || fail "$path: missing Retry-After: 1"
+        if grep -qi '^Cache-Control:.*max-age=60' "$WORK_DIR/headers"; then
+            fail "$path: rate-limit refusal has the route's Cache-Control"
+        fi
     fi
 }
 
 expect /missing-first 404
-expect /index.html 200
+expect /inherited/index.html 200
 expect /missing-second 429
 expect /index.html 429
+expect /inherited/missing 429
+expect /inherited/index.html 429
+# The route's own bucket remains available after the shared bucket is exhausted.
+expect /own/missing 404
+expect /own/index.html 200
+expect /own/missing-again 429
+expect /own/index.html 429
+expect /off/missing 404
+expect /off/index.html 200
+# Per-route limits also work without http.ratelimit; unassigned routes stay open.
+expect /own/missing 404 route.local
+expect /own/index.html 200 route.local
+expect /own/missing-again 429 route.local
+expect /own/index.html 429 route.local
+for ((attempt = 0; attempt < 3; attempt++)); do
+    expect /plain/missing 404 route.local
+    expect /plain/index.html 200 route.local
+done
 sleep 1.1
 expect /missing-after-refill 404
 expect /missing-again 429
@@ -98,4 +141,4 @@ for ((attempt = 0; attempt < 3; attempt++)); do
     expect /missing 404 disabled.local
     expect /index.html 200 disabled.local
 done
-printf 'ok: missing and existing root files share the limit; refill and rate=0 work\n'
+printf 'ok: root statics count missing files; inherited and own limits, refill and rate=0 work\n'
