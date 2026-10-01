@@ -19,7 +19,7 @@
 #            filesystem branch in full, and the S3 branch against MinIO
 #            (skipped when MinIO is unreachable; REQUIRE_S3=1 makes that a
 #            failure)
-#   ratelimit fallback requests count missing root files; refill and rate=0
+#   ratelimit root static routes and fallback count missing files; refill and rate=0
 #   keepalive a quiet connection outlives the idle timeout, and does not
 #            without http3_keepalive_sec (both arms, ~90 s)
 #   limits   process connection/memory exhaustion and drain
@@ -222,7 +222,7 @@ stage_storage() {
 }
 
 stage_ratelimit() {
-    say "ratelimit: missing and existing root files share the limit"
+    say "ratelimit: root static routes and fallback count missing files"
     if build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
              -DINCLUDE_HTTP3=yes -DSANITIZE=none &&
        "$CORE_DIR/tests/root_ratelimit.sh" "$CI_BUILD_DIR/limits"; then

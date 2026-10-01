@@ -833,8 +833,17 @@ static route_dispatch_e __route_dispatch(connection_t* connection, httprequest_t
                 return ROUTE_DISPATCH_DONE;
             }
         }
-        else
-            prepared = __prepare_static_file_response(ctx, response, path);
+        else {
+            /* Like fallback statics, count the request before opening the file,
+             * including missing files. The response runner does not take tokens. */
+            if (!ratelimiter_allow(ratelimiter, &connection->remote_ip, 1)) {
+                httpresponse_default(response, 429);
+                response->add_header(response, "Retry-After", "1");
+                prepared = 1;
+            }
+            else
+                prepared = __prepare_static_file_response(ctx, response, path);
+        }
 
         free(path);
 
