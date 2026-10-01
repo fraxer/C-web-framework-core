@@ -19,6 +19,7 @@
 #            filesystem branch in full, and the S3 branch against MinIO
 #            (skipped when MinIO is unreachable; REQUIRE_S3=1 makes that a
 #            failure)
+#   ratelimit fallback requests count missing root files; refill and rate=0
 #   keepalive a quiet connection outlives the idle timeout, and does not
 #            without http3_keepalive_sec (both arms, ~90 s)
 #   limits   process connection/memory exhaustion and drain
@@ -55,6 +56,7 @@
 #   tests/ci.sh release          # every stage; h3spec must be installed
 #   tests/ci.sh asan tsan        # a subset, in the order given
 #   tests/ci.sh startup          # a failed start must exit non-zero
+#   tests/ci.sh ratelimit        # missing root files also spend tokens
 #   FUZZ_SECONDS=600 tests/ci.sh fuzz
 #   FUZZ_PROFILE=long tests/ci.sh fuzz    # the scheduled run
 #   CI_BUILD_DIR=/var/tmp/ci tests/ci.sh
@@ -216,6 +218,17 @@ stage_storage() {
         record storage OK
     else
         record storage FAIL
+    fi
+}
+
+stage_ratelimit() {
+    say "ratelimit: missing and existing root files share the limit"
+    if build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes -DSANITIZE=none &&
+       "$CORE_DIR/tests/root_ratelimit.sh" "$CI_BUILD_DIR/limits"; then
+        record ratelimit OK
+    else
+        record ratelimit FAIL
     fi
 }
 
@@ -686,7 +699,7 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit config startup storage keepalive limits soak affinity earlydata vn version2 ipv6 qlog priority benchmark asan tsan fuzz reload softreload hotreload h2ws h3spec)
+ALL_STAGES=(noh3 h3unit config startup storage ratelimit keepalive limits soak affinity earlydata vn version2 ipv6 qlog priority benchmark asan tsan fuzz reload softreload hotreload h2ws h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
@@ -706,6 +719,7 @@ for stage in "${STAGES[@]}"; do
     config) stage_config ;;
     startup) stage_startup ;;
     storage) stage_storage ;;
+    ratelimit) stage_ratelimit ;;
     keepalive) stage_keepalive ;;
     limits) stage_limits ;;
     soak)    stage_soak ;;

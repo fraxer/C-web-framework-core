@@ -767,24 +767,20 @@ int __handle(connection_t* connection, httprequest_t* request, deferred_handler 
         return 1;
 
     connection_server_ctx_t* ctx = connection->ctx;
+    /* Count every fallback request before resolving the path: missing files
+     * share the same client bucket as existing files. */
+    if (!ratelimiter_allow(ctx->server->http.ratelimiter, &connection->remote_ip, 1)) {
+        httpresponse_default(response, 429);
+        response->add_header(response, "Retry-After", "1");
+        return handler(request, response);
+    }
+
     char file_full_path[PATH_MAX];
     file_t file;
     const file_status_e file_status = http_open_file(ctx->server, file_full_path, PATH_MAX, request->path, request->path_length, &file);
 
-    if (file_status == FILE_OK) {
-        /* The file is already open by the time the limiter is asked, because
-         * resolving the path is what opens it. A refused request closes it
-         * again: the rate-limited path pays one open, the served path saves a
-         * stat on every response. The order of the two checks is unchanged —
-         * a 404 still never counts against the limiter. */
-        if (!ratelimiter_allow(ctx->server->http.ratelimiter, &connection->remote_ip, 1)) {
-            file.close(&file);
-            httpresponse_default(response, 429);
-            response->add_header(response, "Retry-After", "1");
-        }
-        else
-            http_response_file_opened(response, &file, file_full_path);
-    }
+    if (file_status == FILE_OK)
+        http_response_file_opened(response, &file, file_full_path);
     else if (file_status == FILE_FORBIDDEN)
         httpresponse_default(response, 403);
     else if (file_status == FILE_UNAVAILABLE)
