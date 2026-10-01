@@ -22,8 +22,11 @@ contains. They exist so a protocol regression stays visible when an unrelated
 framework failure breaks the broad runner — additional gates, not replacements.
 
 Beyond the binaries, `tests/` holds the integration suites that need a live
-server: `h3_*.sh`, `hot_reload_shadow.sh`, `startup_failure.sh`,
+server: `h3_*.sh`, `hot_reload_shadow.sh`, `root_ratelimit.sh`, `startup_failure.sh`,
 `startup_lifetime.py` and `h2ws_probe.py`. `ci.sh` drives all of it.
+
+Run the root-file rate limiting gate with `bash backend/core/tests/ci.sh ratelimit`
+from the repository root. It is also included in the default and release gates.
 
 ## Structure
 
