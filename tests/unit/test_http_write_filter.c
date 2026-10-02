@@ -1731,18 +1731,19 @@ TEST(test_write_buffer_retention_growth_and_limit) {
 
 TEST(test_small_multipart_join_and_partial_resume) {
     TEST_SUITE("http_write_filter: hybrid files");
-    TEST_CASE("small multipart shares one write with the head and resumes a partial joined head exactly");
-    char payload[200];
+    TEST_CASE("small multipart joins the head; joined and separate buffered bodies resume partial heads exactly");
+    char payload[HTTP_WRITE_JOIN_MAX * 4];
     for (size_t i = 0; i < sizeof(payload); ++i) payload[i] = (char)(i * 17);
-    for (int partial = 0; partial < 2; ++partial) {
+    for (int partial = 0; partial < 3; ++partial) {
         write_fixture_t fx;
         TEST_REQUIRE(fixture_setup_type(&fx, 32768, partial ? SOCK_STREAM : SOCK_SEQPACKET), "fixture created");
         httprequest_t* request = httprequest_create(fx.conn);
         TEST_REQUIRE_GOTO(request != NULL, "request created", cleanup);
         request->method = ROUTE_GET;
-        TEST_REQUIRE_GOTO(sendfile_stage_file(&fx, payload, sizeof(payload)), "small file staged", cleanup_request);
-        TEST_REQUIRE_GOTO(sendfile_request_range(request, 0, 49), "first part", cleanup_request);
-        TEST_REQUIRE_GOTO(sendfile_append_range(request, 150, 199), "second part", cleanup_request);
+        const size_t source_size = partial == 2 ? sizeof(payload) : 200;
+        TEST_REQUIRE_GOTO(sendfile_stage_file(&fx, payload, source_size), "small file staged", cleanup_request);
+        TEST_REQUIRE_GOTO(sendfile_request_range(request, 0, source_size / 4 - 1), "first part", cleanup_request);
+        TEST_REQUIRE_GOTO(sendfile_append_range(request, 3 * source_size / 4, source_size - 1), "second part", cleanup_request);
         if (partial) {
             char value[20001];
             memset(value, 'x', sizeof(value) - 1); value[sizeof(value) - 1] = 0;
