@@ -647,6 +647,8 @@ TEST(test_connection_after_write_keepalive_pending_queue) {
 
     h.conn->keepalive = 1;
     connection_server_ctx_t* ctx = h.conn->ctx;
+    ctx->inline_write = 1;
+    atomic_store(&ctx->epoll_events, MPXIN | MPXRDHUP);
 
     connection_queue_item_t* item = connection_queue_item_create();
     TEST_REQUIRE_NOT_NULL_GOTO(item, "queue item created", cleanup);
@@ -694,6 +696,8 @@ TEST(test_connection_after_write_switch_to_protocol) {
 
     h.conn->keepalive = 1;
     connection_server_ctx_t* ctx = h.conn->ctx;
+    ctx->inline_write = 1;
+    atomic_store(&ctx->epoll_events, MPXIN | MPXRDHUP);
 
     int marker = 0;
     ctx->switch_to_protocol.fn = stub_switch_protocol;
@@ -702,6 +706,8 @@ TEST(test_connection_after_write_switch_to_protocol) {
 
     TEST_ASSERT_EQUAL(1, connection_after_write(h.conn), "returns control_mod result");
     TEST_ASSERT_EQUAL(1, switch_protocol_calls, "switch fn called once");
+    TEST_ASSERT_EQUAL(1, stub_control_mod_calls, "protocol switch keeps explicit rearm");
+    TEST_ASSERT(!ctx->inline_write, "inline state cleared before new protocol");
     TEST_ASSERT(switch_protocol_last_data == &marker, "switch fn received its data");
     TEST_ASSERT_EQUAL(1, switch_protocol_data_free_calls, "data_free called once");
     TEST_ASSERT(ctx->switch_to_protocol.fn == NULL, "switch fn cleared");
@@ -857,6 +863,8 @@ TEST(test_connection_close) {
     TEST_REQUIRE(conn_harness_init(&h, 1), "harness init");
 
     connection_server_ctx_t* ctx = h.conn->ctx;
+    ctx->inline_write = 1;
+    atomic_store(&ctx->epoll_events, MPXIN | MPXRDHUP);
 
     /* REGRESSION: broadcast_clear dereferenced server->broadcast without a
      * NULL check — closing a connection on a server that never initialized
@@ -872,6 +880,8 @@ TEST(test_connection_close) {
 
     TEST_ASSERT_EQUAL(1, stub_control_del_calls, "control_del called once");
     TEST_ASSERT_EQUAL(1, atomic_load(&ctx->destroyed), "destroyed flag set");
+    TEST_ASSERT(!ctx->inline_write, "closed connection has no inline response state");
+    TEST_ASSERT_EQUAL(0, atomic_load(&ctx->epoll_events), "closed descriptor is unregistered");
     TEST_ASSERT_EQUAL(1, atomic_load(&ctx->ref_count), "close dropped its reference");
     TEST_ASSERT_EQUAL(0, atomic_load(&ctx->locked), "lock released on the decrement path");
 
