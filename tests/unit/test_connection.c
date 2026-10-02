@@ -54,9 +54,10 @@ static int stub_control_del_result = 1;
 static int stub_control_del_calls = 0;
 
 static int stub_control_mod(connection_t* connection, int events) {
-    (void)connection;
     stub_control_mod_calls++;
     stub_control_mod_last_events = events;
+    if (stub_control_mod_result)
+        atomic_store(&((connection_server_ctx_t*)connection->ctx)->epoll_events, events);
     return stub_control_mod_result;
 }
 
@@ -522,6 +523,76 @@ TEST(test_connection_after_read_events) {
     stub_control_mod_result = 0;
     TEST_ASSERT_EQUAL(0, connection_after_read(h.conn), "propagates control_mod failure");
 
+    conn_harness_free(&h);
+}
+
+TEST(test_connection_inline_write_event_transitions) {
+    TEST_CASE("inline keepalive needs no MOD; yielding arms OUT once and completion restores IN");
+    conn_harness_t h;
+    TEST_REQUIRE(conn_harness_init(&h, 0), "harness init");
+    connection_server_ctx_t* ctx = h.conn->ctx;
+    h.conn->keepalive = 1;
+    atomic_store(&ctx->epoll_events, MPXIN | MPXRDHUP);
+    ctx->request = &stub_request;
+    ctx->response = &stub_response;
+    atomic_store(&ctx->need_write, 1);
+
+    TEST_ASSERT_EQUAL(1, connection_after_read_inline(h.conn), "inline publication");
+    TEST_ASSERT(ctx->inline_write, "response retains IN");
+    TEST_ASSERT_EQUAL(1, connection_after_write(h.conn), "inline completion");
+    TEST_ASSERT_EQUAL(0, stub_control_mod_calls, "entire cycle without MOD");
+    TEST_ASSERT_EQUAL(1, stub_request_free_calls, "request retired");
+    TEST_ASSERT_EQUAL(1, stub_response_free_calls, "response retired");
+    TEST_ASSERT(!ctx->inline_write && !atomic_load(&ctx->need_write), "reset clears output state");
+
+    TEST_ASSERT_EQUAL(1, connection_after_read_inline(h.conn), "next inline publication");
+    TEST_ASSERT_EQUAL(1, connection_wait_write(h.conn), "yield schedules later turn");
+    TEST_ASSERT_EQUAL(1, stub_control_mod_calls, "one OUT transition");
+    TEST_ASSERT_EQUAL(MPXOUT | MPXRDHUP, stub_control_mod_last_events, "waiting for write, not read");
+    TEST_ASSERT_EQUAL(1, connection_wait_write(h.conn), "another yield");
+    TEST_ASSERT_EQUAL(1, stub_control_mod_calls, "already waiting: no duplicate MOD");
+    TEST_ASSERT_EQUAL(1, connection_after_write(h.conn), "delayed completion");
+    TEST_ASSERT_EQUAL(2, stub_control_mod_calls, "one return to IN");
+    TEST_ASSERT_EQUAL(MPXIN | MPXRDHUP, stub_control_mod_last_events, "read restored");
+
+    TEST_ASSERT_EQUAL(1, connection_after_read_inline(h.conn), "third publication");
+    stub_control_mod_result = 0;
+    TEST_ASSERT_EQUAL(0, connection_wait_write(h.conn), "OUT registration failure propagated");
+    TEST_ASSERT(ctx->inline_write, "failed registration does not claim OUT installed");
+    TEST_ASSERT_EQUAL(MPXIN | MPXRDHUP, atomic_load(&ctx->epoll_events), "last successful mask preserved");
+    conn_harness_free(&h);
+}
+
+TEST(test_connection_inline_write_requires_live_plain_read_subscription) {
+    TEST_CASE("parked, TLS, multiplexed and detached connections retain ordinary handoff");
+    conn_harness_t h;
+    TEST_REQUIRE(conn_harness_init(&h, 0), "harness init");
+    connection_server_ctx_t* ctx = h.conn->ctx;
+    const unsigned masks[] = {0, MPXONESHOT, MPXIN | MPXRDHUP | MPXONESHOT, MPXOUT | MPXRDHUP};
+    for (size_t i = 0; i < sizeof masks / sizeof masks[0]; i++) {
+        atomic_store(&ctx->epoll_events, masks[i]);
+        TEST_ASSERT_EQUAL(1, connection_after_read_inline(h.conn), "ordinary handoff");
+        TEST_ASSERT(!ctx->inline_write, "not inline");
+        TEST_ASSERT_EQUAL(MPXOUT | MPXRDHUP, stub_control_mod_last_events, "OUT armed");
+    }
+    atomic_store(&ctx->epoll_events, MPXIN | MPXRDHUP);
+    h.conn->ssl = (SSL*)&h; /* eligibility only; never dereferenced */
+    TEST_ASSERT_EQUAL(1, connection_after_read_inline(h.conn), "TLS handoff");
+    TEST_ASSERT(!ctx->inline_write, "TLS excluded");
+    h.conn->ssl = NULL;
+    atomic_store(&ctx->epoll_events, MPXIN | MPXRDHUP);
+    ctx->is_http2 = 1;
+    TEST_ASSERT_EQUAL(1, connection_after_read_inline(h.conn), "h2 handoff");
+    TEST_ASSERT(!ctx->inline_write, "h2 excluded");
+    ctx->is_http2 = 0;
+    atomic_store(&ctx->epoll_events, MPXIN | MPXRDHUP);
+    atomic_store(&ctx->broadcast_ref_count, 2);
+    TEST_ASSERT_EQUAL(1, connection_after_read_inline(h.conn), "parked handler handoff");
+    TEST_ASSERT(!ctx->inline_write, "parked connection excluded");
+    const int calls = stub_control_mod_calls;
+    atomic_store(&ctx->detached, 1);
+    TEST_ASSERT_EQUAL(1, connection_after_read_inline(h.conn), "detached is a no-op");
+    TEST_ASSERT_EQUAL(calls, stub_control_mod_calls, "no operation on recycled fd");
     conn_harness_free(&h);
 }
 

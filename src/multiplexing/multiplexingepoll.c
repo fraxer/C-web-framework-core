@@ -315,6 +315,9 @@ int __mpx_epoll_control(connection_t* connection, int action, uint32_t flags) {
         return 0;
     }
 
+    atomic_store_explicit(&ctx->epoll_events,
+                          action == EPOLL_CTL_DEL ? 0 : flags, memory_order_release);
+
     return 1;
 }
 
@@ -349,4 +352,3 @@ static void __mpx_conns_remove(mpxapi_t* api, connection_t* connection) {
     connection->prev = NULL;
     connection->next = NULL;
 }
-
