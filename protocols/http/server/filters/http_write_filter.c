@@ -14,10 +14,10 @@ void http_write_free(void* arg);
 void http_write_reset(void* arg);
 
 /* Worker thread only — see the invariant on connection_data_write(). */
-ssize_t __write(connection_t* connection, const char* data, size_t size) {
+ssize_t __write(connection_t* connection, const char* data, size_t size, int flags) {
     return connection->ssl ?
         openssl_write(connection->ssl, data, size) :
-        send(connection->fd, data, size, MSG_NOSIGNAL);
+        send(connection->fd, data, size, MSG_NOSIGNAL | flags);
 }
 
 size_t __head_size(httpresponse_t* response) {
@@ -165,10 +165,10 @@ void http_write_reset(void* arg) {
         bufo_clear(module->buf);
 }
 
-int __wr(httpresponse_t* response, bufo_t* buf) {
+static int __wr_flags(httpresponse_t* response, bufo_t* buf, int flags) {
     size_t readed = 0;
     while ((readed = bufo_chunk_size(buf, BUF_SIZE)) > 0) {
-        const ssize_t writed = __write(response->connection, bufo_data(buf), readed);
+        const ssize_t writed = __write(response->connection, bufo_data(buf), readed, flags);
         if (writed < 0) {
             connection_t* connection = response->connection;
 
@@ -213,6 +213,10 @@ int __wr(httpresponse_t* response, bufo_t* buf) {
     }
 
     return CWF_OK;
+}
+
+int __wr(httpresponse_t* response, bufo_t* buf) {
+    return __wr_flags(response, buf, 0);
 }
 
 int http_write_header(httprequest_t* request, httpresponse_t* response) {
@@ -310,24 +314,25 @@ int http_write_body(httprequest_t* request, httpresponse_t* response, bufo_t* pa
     return result;
 }
 
-int http_write_flush(httprequest_t* request, httpresponse_t* response) {
+int http_write_file_header(httprequest_t* request, httpresponse_t* response, int more) {
     (void)request;
     http_module_write_t* module = response->cur_filter->module;
-    bufo_t* buf = module->buf;
+    /* MSG_MORE is per write: ordinary memory bodies and the final multipart
+     * delimiter use flags=0, so no persistent TCP_CORK state can leak. */
+    return __wr_flags(response, module->buf, more && HTTP_FILE_MSG_MORE ? MSG_MORE : 0);
+}
 
-    if (bufo_chunk_size(buf, BUF_SIZE) == 0)
-        return CWF_OK;
-
-    return __wr(response, buf);
+int http_write_flush(httprequest_t* request, httpresponse_t* response) {
+    return http_write_file_header(request, response, 0);
 }
 
 int http_write_file(httprequest_t* request, httpresponse_t* response, off_t* offset) {
     return http_write_file_span(request, response, offset, response->file_.size);
 }
 
-int http_write_file_text(httpresponse_t* response, bufo_t* buf) {
+int http_write_file_text(httpresponse_t* response, bufo_t* buf, int more) {
     const size_t before = buf->pos;
-    const int result = __wr(response, buf);
+    const int result = __wr_flags(response, buf, more && HTTP_FILE_MSG_MORE ? MSG_MORE : 0);
     response->body_bytes_sent += buf->pos - before;
 
     return result;
@@ -351,7 +356,7 @@ int http_write_file_span(httprequest_t* request, httpresponse_t* response, off_t
         return CWF_ERROR;
     /* The deferred head must be completely drained before any file bytes.
      * A partial head retains its cursor in the writer's own buffer. */
-    const int head_result = http_write_flush(request, response);
+    const int head_result = http_write_file_header(request, response, end > (size_t)*offset);
     if (head_result != CWF_OK) return head_result;
 
     size_t remaining = end - (size_t)*offset;

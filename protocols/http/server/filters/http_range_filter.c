@@ -466,7 +466,7 @@ int mp_fill_chunk(httpresponse_t* response, http_module_range_t* module) {
 /* Reuse the generator's state so unsupported sendfile descriptors can resume
  * through mp_fill_chunk at the exact text/part position already transmitted. */
 static int mp_send_file(httprequest_t* request, httpresponse_t* response, http_module_range_t* module) {
-    const int head = http_write_flush(request, response);
+    const int head = http_write_file_header(request, response, 1);
     if (head != CWF_OK)
         return head;
 
@@ -482,7 +482,7 @@ static int mp_send_file(httprequest_t* request, httpresponse_t* response, http_m
             text.pos = module->text_pos;
             text.is_proxy = 1;
 
-            const int result = http_write_file_text(response, &text);
+            const int result = http_write_file_text(response, &text, module->part_index < module->parts_count);
             module->text_pos = text.pos;
 
             if (result != CWF_OK)
