@@ -299,7 +299,12 @@ int http_write_body(httprequest_t* request, httpresponse_t* response, bufo_t* pa
     if (bufo_chunk_size(buf, BUF_SIZE) > 0) {
         __join_first_chunk(buf, parent_buf);
 
-        const int r = __wr(response, buf);
+        /* An unjoined file chunk is already available to write immediately
+         * after the head. Coalesce these two writes just like head+sendfile;
+         * joined bodies use flags=0 because no further bytes follow. */
+        const int more = HTTP_FILE_MSG_MORE && response->file_.fd > -1 &&
+                         bufo_chunk_size(parent_buf, SIZE_MAX) > 0;
+        const int r = __wr_flags(response, buf, more ? MSG_MORE : 0);
         if (r != CWF_OK) result = r;
     }
 
