@@ -266,6 +266,7 @@ connection_dec_result_e connection_s_dec(connection_t* connection) {
 
 int connection_after_write(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
+    const int inline_write = ctx->inline_write && ctx->switch_to_protocol.fn == NULL;
 
     if (connection->keepalive == 0) {
         atomic_store(&ctx->destroyed, 1);
@@ -320,6 +321,11 @@ int connection_after_write(connection_t* connection) {
          * supposed to be off the loop. */
         return 1;
     }
+
+    /* An inline response already had this subscription throughout read/write.
+     * Recheck after the queue/broadcast handoff: parking overrides this path. */
+    if (inline_write && atomic_load_explicit(&ctx->epoll_events, memory_order_acquire) == (MPXIN | MPXRDHUP))
+        return 1;
 
     return ctx->listener->api->control_mod(connection, MPXIN | MPXRDHUP);
 }
@@ -451,7 +457,28 @@ int connection_after_read(connection_t* connection) {
     if (atomic_load(&ctx->detached))
         return 1;
 
-    return ctx->listener->api->control_mod(connection, MPXOUT | MPXRDHUP);
+    const int result = ctx->listener->api->control_mod(connection, MPXOUT | MPXRDHUP);
+    if (result) ctx->inline_write = 0;
+    return result;
+}
+
+int connection_after_read_inline(connection_t* connection) {
+    connection_server_ctx_t* ctx = connection->ctx;
+    if (atomic_load(&ctx->detached)) return 1;
+
+    if (connection->transport == CONN_TRANSPORT_TCP && connection->ssl == NULL &&
+        !ctx->is_http2 && atomic_load(&ctx->broadcast_ref_count) == 1 &&
+        atomic_load_explicit(&ctx->epoll_events, memory_order_acquire) == (MPXIN | MPXRDHUP)) {
+        ctx->inline_write = 1;
+        return 1;
+    }
+    return connection_after_read(connection);
+}
+
+int connection_wait_write(connection_t* connection) {
+    connection_server_ctx_t* ctx = connection->ctx;
+    if (!ctx->inline_write) return 1;
+    return connection_after_read(connection);
 }
 
 int connection_close(connection_t* connection) {
@@ -471,6 +498,8 @@ int connection_close_locked(connection_t* connection) {
     /* From here the fd number may be recycled by the next accept(), so no epoll
      * re-arm may reference this connection again. */
     atomic_store(&ctx->detached, 1);
+    ctx->inline_write = 0;
+    atomic_store_explicit(&ctx->epoll_events, 0, memory_order_release);
 
     if (connection->ssl != NULL) {
         SSL_shutdown(connection->ssl);
@@ -496,6 +525,8 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
     ctx->base.reset = __ctx_reset;
     ctx->base.free = __ctx_free;
     atomic_store(&ctx->need_write, 0);
+    atomic_store(&ctx->epoll_events, 0);
+    ctx->inline_write = 0;
     ctx->is_http2 = 0;
     ctx->h2c_preface = 0;
     ctx->h2c_peeked = 0;
@@ -551,6 +582,7 @@ void __ctx_reset(void* arg) {
     connection_server_ctx_t* ctx = arg;
 
     atomic_store_explicit(&ctx->need_write, 0, memory_order_relaxed);
+    ctx->inline_write = 0;
 
     /* Owed to the request that is ending, not to the next one on the connection
      * (docs/http2/10, T.2). */

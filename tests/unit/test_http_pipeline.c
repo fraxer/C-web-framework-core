@@ -30,10 +30,12 @@
 #include "cqueue.h"
 #include "domain.h"
 #include "httpserverhandlers.h"
+#include "httpresponse.h"
 #include "multiplexing.h"
 #include "server.h"
 
 #include <fcntl.h>
+#include <errno.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -48,7 +50,7 @@
 extern connection_t* __connection_queue_pop(void);
 
 #define HPL_BUFFER 16384
-#define HPL_WIRE (1 << 20)
+#define HPL_WIRE (4 << 20)
 
 static char hpl_domain_template[] = "localhost";
 
@@ -70,9 +72,13 @@ static server_t hpl_server = {
 static cqueue_item_t hpl_queue_item = { .data = &hpl_server, .next = NULL };
 
 static _Atomic int hpl_armed;
+static int hpl_mod_calls;
+static int hpl_mod_result = 1;
 
 static int hpl_mpx_arm(connection_t* connection, int flags) {
-    (void)connection;
+    hpl_mod_calls++;
+    if (!hpl_mod_result) return 0;
+    atomic_store(&((connection_server_ctx_t*)connection->ctx)->epoll_events, flags);
     atomic_store(&hpl_armed, flags);
     return 1;
 }
@@ -114,6 +120,8 @@ typedef struct {
     char   order[64];      /* the status codes in wire order, "404 200 ..." */
 } hpl_result_t;
 
+static void hpl_close(hpl_t* h, hpl_result_t* out);
+
 static size_t hpl_count(const char* haystack, size_t length, const char* needle) {
     const size_t n = strlen(needle);
     size_t count = 0;
@@ -147,6 +155,9 @@ static int hpl_open(hpl_t* h, int blocking) {
     h->ctx->server = &hpl_server;
     h->alive = set_http(h->connection);
     atomic_store(&hpl_armed, MPXIN | MPXRDHUP);
+    atomic_store(&h->ctx->epoll_events, MPXIN | MPXRDHUP);
+    hpl_mod_calls = 0;
+    hpl_mod_result = 1;
     return 1;
 }
 
@@ -186,7 +197,7 @@ static void hpl_loop(hpl_t* h, const char* tail) {
             h->alive = http_server_guard_read(h->connection);
             moved = 1;
         }
-        else if (armed & MPXOUT) {
+        if (h->alive && ((armed & MPXOUT) || atomic_load(&h->ctx->need_write))) {
             if (armed & MPXONESHOT) atomic_store(&hpl_armed, 0);
             h->alive = http_server_guard_write(h->connection);
             moved = 1;
@@ -214,6 +225,160 @@ static void hpl_loop(hpl_t* h, const char* tail) {
         if (!moved) break;
     }
     hpl_drain_wire(h);
+}
+
+TEST(test_pipeline_inline_keepalive_without_mod) {
+    TEST_CASE("real inline 404 and bodiless responses complete without epoll mask transitions");
+    hpl_t h;
+    hpl_result_t r;
+    TEST_REQUIRE(hpl_open(&h, 0), "harness starts");
+    const char* requests[] = {
+        "GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "HEAD /missing HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        "OPTIONS * HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    };
+    for (size_t i = 0; i < sizeof requests / sizeof requests[0]; i++) {
+        hpl_send(&h, requests[i], strlen(requests[i]));
+        TEST_ASSERT(http_server_guard_read(h.connection), "request parsed");
+        TEST_ASSERT(h.ctx->inline_write && atomic_load(&h.ctx->need_write), "inline output published");
+        TEST_ASSERT(http_server_guard_write(h.connection), "response sent");
+        hpl_drain_wire(&h);
+        TEST_ASSERT_EQUAL(0, hpl_mod_calls, "no MOD across read/write");
+        TEST_ASSERT_EQUAL(MPXIN | MPXRDHUP, atomic_load(&hpl_armed), "idle subscription remains readable");
+        TEST_ASSERT(!atomic_load(&h.ctx->need_write), "idle connection has no pending output");
+    }
+    hpl_close(&h, &r);
+    TEST_ASSERT_EQUAL_SIZE(3, r.responses, "all responses reached the peer");
+    TEST_ASSERT(strcmp(r.order, "404 404 200") == 0, "wire status order");
+}
+
+TEST(test_pipeline_inline_header_eagain_and_mod_failure) {
+    TEST_CASE("full socket defers inline header once; MOD failure is a connection error");
+    for (int fail = 0; fail < 2; fail++) {
+        hpl_t h;
+        hpl_result_t r;
+        TEST_REQUIRE(hpl_open(&h, 0), "harness starts");
+        const char request[] = "GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        hpl_send(&h, request, sizeof request - 1);
+        TEST_ASSERT(http_server_guard_read(h.connection), "request parsed");
+        char fill[4096];
+        memset(fill, 'x', sizeof fill);
+        while (send(h.sv[0], fill, sizeof fill, MSG_NOSIGNAL) > 0) {}
+        if (fail) {
+            hpl_mod_result = 0;
+            TEST_ASSERT_EQUAL(0, http_server_guard_write(h.connection), "failed OUT registration closes the connection");
+            TEST_ASSERT_EQUAL(MPXIN | MPXRDHUP, atomic_load(&h.ctx->epoll_events), "failed mask not recorded");
+        }
+        if (!fail) {
+            TEST_ASSERT(http_server_guard_write(h.connection), "header EAGAIN is resumable");
+            TEST_ASSERT_EQUAL(1, hpl_mod_calls, "one OUT transition");
+            TEST_ASSERT_EQUAL(MPXOUT | MPXRDHUP, atomic_load(&hpl_armed), "OUT replaces IN");
+            TEST_ASSERT(http_server_guard_write(h.connection), "still blocked");
+            TEST_ASSERT_EQUAL(1, hpl_mod_calls, "no repeated MOD");
+            hpl_drain_wire(&h);
+            h.wire_len = 0; /* discard the deliberately prefilled socket */
+            hpl_loop(&h, NULL);
+            TEST_ASSERT_EQUAL(2, hpl_mod_calls, "completion restores IN once");
+        }
+        hpl_mod_result = 1;
+        hpl_close(&h, &r);
+        if (!fail) TEST_ASSERT_EQUAL_SIZE(1, r.responses, "resumed header/body complete");
+    }
+}
+
+static void* hpl_blocking_reader(void* arg) {
+    hpl_t* h = arg;
+    while (h->wire_len < HPL_WIRE) {
+        const ssize_t n = recv(h->sv[1], h->wire + h->wire_len, HPL_WIRE - h->wire_len, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        h->wire_len += (size_t)n;
+    }
+    return NULL;
+}
+
+TEST(test_pipeline_inline_file_eagain_and_budget) {
+    TEST_CASE("large inline file yields on kernel EAGAIN or work budget and restores keepalive");
+    char path[] = "/tmp/cwfr-inline-XXXXXX";
+    const int fd = mkstemp(path);
+    TEST_REQUIRE(fd >= 0, "fixture file");
+    char payload[4096];
+    memset(payload, 'z', sizeof payload);
+    int staged = 1;
+    for (int i = 0; i < 512; i++)
+        if (write(fd, payload, sizeof payload) != sizeof payload) { staged = 0; break; }
+    close(fd);
+    char* previous_root = hpl_server.root;
+    const size_t previous_length = hpl_server.root_length;
+    hpl_server.root = "/tmp";
+    hpl_server.root_length = 4;
+    if (staged) for (int budget = 0; budget < 2; budget++) {
+        hpl_t h;
+        hpl_result_t r;
+        const int opened = hpl_open(&h, 0);
+        TEST_ASSERT(opened, "harness starts");
+        if (!opened) { hpl_close(&h, &r); break; }
+        char request[256];
+        snprintf(request, sizeof request, "GET %s HTTP/1.1\r\nHost: localhost\r\n\r\n", path + 4);
+        hpl_send(&h, request, strlen(request));
+        TEST_ASSERT(http_server_guard_read(h.connection), "file request parsed");
+        httpresponse_t* response = h.ctx->response;
+        TEST_ASSERT(response != NULL && response->file_.fd >= 0, "file response prepared");
+        if (response == NULL || response->file_.fd < 0) { hpl_close(&h, &r); continue; }
+
+        pthread_t reader;
+        int reader_started = 0;
+        if (budget) {
+            /* A draining peer and blocking sendfile remove kernel EAGAIN:
+             * the first yield must be the 1 MiB worker budget. */
+            fcntl(h.sv[0], F_SETFL, fcntl(h.sv[0], F_GETFL) & ~O_NONBLOCK);
+            fcntl(h.sv[1], F_SETFL, fcntl(h.sv[1], F_GETFL) & ~O_NONBLOCK);
+            reader_started = pthread_create(&reader, NULL, hpl_blocking_reader, &h) == 0;
+            TEST_ASSERT(reader_started, "draining reader starts");
+            if (!reader_started) { hpl_close(&h, &r); continue; }
+        }
+        else {
+            const int size = 4096;
+            setsockopt(h.sv[0], SOL_SOCKET, SO_SNDBUF, &size, sizeof size);
+        }
+        TEST_ASSERT(http_server_guard_write(h.connection), "file write yields");
+        TEST_ASSERT_EQUAL(1, hpl_mod_calls, "one OUT transition");
+        TEST_ASSERT_EQUAL(MPXOUT | MPXRDHUP, atomic_load(&hpl_armed), "resume waits for OUT");
+        if (budget) {
+            TEST_ASSERT_EQUAL_SIZE(1024 * 1024, response->body_bytes_sent, "exact work budget sent before yield");
+            TEST_ASSERT(http_server_guard_write(h.connection), "second budget turn completes");
+            shutdown(h.sv[0], SHUT_WR);
+            pthread_join(reader, NULL);
+        }
+        else {
+            TEST_ASSERT(response->body_bytes_sent > 0 && response->body_bytes_sent < 1024 * 1024,
+                        "partial file stopped by kernel before budget");
+            TEST_ASSERT(http_server_guard_write(h.connection), "still blocked without draining");
+            TEST_ASSERT_EQUAL(1, hpl_mod_calls, "repeated EAGAIN does not rearm");
+            /* A later TCP segment arrives while the first answer is blocked. */
+            const char next[] = "GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            hpl_send(&h, next, sizeof next - 1);
+            hpl_loop(&h, NULL);
+        }
+        TEST_ASSERT_EQUAL(2, hpl_mod_calls, "one return to IN, next inline answer needs no MOD");
+        TEST_ASSERT_EQUAL(MPXIN | MPXRDHUP, atomic_load(&hpl_armed), "keepalive remains readable");
+        h.wire[h.wire_len] = '\0';
+        const char* body = strstr(h.wire, "\r\n\r\n");
+        TEST_ASSERT(body != NULL, "file headers on wire");
+        if (body != NULL) {
+            const size_t head = (size_t)(body + 4 - h.wire);
+            TEST_ASSERT(h.wire_len >= head + 2 * 1024 * 1024, "full body on wire");
+            if (h.wire_len >= head + 2 * 1024 * 1024)
+                TEST_ASSERT(hpl_count(h.wire + head, 2 * 1024 * 1024, "z") == 2 * 1024 * 1024, "exact file bytes");
+        }
+        hpl_close(&h, &r);
+        TEST_ASSERT_EQUAL_SIZE(budget ? 1 : 2, r.responses, "complete ordered responses");
+        TEST_ASSERT(!r.destroyed, "keepalive survives yielding");
+    }
+    hpl_server.root = previous_root;
+    hpl_server.root_length = previous_length;
+    unlink(path);
+    TEST_ASSERT(staged, "complete file staged");
 }
 
 static void hpl_close(hpl_t* h, hpl_result_t* out) {

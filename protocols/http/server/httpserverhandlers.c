@@ -534,13 +534,13 @@ int __write(connection_t* connection) {
 
     int r = __run_header_filters(ctx->request, response);
     if (r == CWF_EVENT_AGAIN)
-        return 1;
+        return connection_wait_write(connection);
     if (r == CWF_ERROR)
         return 0;
 
     r = __run_body_filters(ctx->request, response);
     if (r == CWF_EVENT_AGAIN)
-        return 1;
+        return connection_wait_write(connection);
     if (r == CWF_ERROR)
         return 0;
 
@@ -550,7 +550,7 @@ int __write(connection_t* connection) {
      * something to join it to (§10.1). This is where that head goes out. */
     r = __run_flush_filters(ctx->request, response);
     if (r == CWF_EVENT_AGAIN)
-        return 1;
+        return connection_wait_write(connection);
     if (r == CWF_ERROR)
         return 0;
 
@@ -1774,7 +1774,7 @@ int __post_response(httprequest_t* request, httpresponse_t* response) {
         ctx->request = request;
         ctx->response = response;
         atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
-        return connection_after_read(connection);
+        return connection_after_read_inline(connection);
     }
 
     return __deferred_handler(connection, request, response, __queue_response_handler, NULL, __queue_data_response_create, NULL);

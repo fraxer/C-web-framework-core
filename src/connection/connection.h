@@ -68,8 +68,10 @@ ssize_t connection_data_read(connection_t* connection);
 
 /* INVARIANT: only the worker thread that owns this connection's epoll writes to
  * the socket. Handler threads fill response buffers and then hand back through
- * connection_after_read() / h2_server_response_ready(), which do nothing but
- * epoll_ctl — the bytes go out later, from connection->write().
+ * connection_after_read() / h2_server_response_ready(), which arm epoll — the
+ * bytes go out from connection->write(). An inline HTTP/1.1 response produced
+ * by the worker can instead retain IN and set need_write: the event loop
+ * attempts its write immediately after read, arming OUT only if it yields.
  *
  * This is not stylistic. SSL* is not safe for concurrent SSL_write, and h2
  * frames a torn write cannot be recovered from: a DATA frame half on the wire

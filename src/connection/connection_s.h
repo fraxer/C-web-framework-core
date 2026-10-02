@@ -121,7 +121,8 @@ typedef struct {
      * process-wide gauge cannot (docs/concurrency/00, phase D). Only updated
      * while metrics are enabled, so it reads 0 otherwise. */
     atomic_int handlers_inflight;
-    /* A response is staged and needs an EPOLLOUT turn. Atomic, and deliberately
+    /* A response is staged and needs a worker write turn (inline after read,
+     * or through EPOLLOUT). Atomic, and deliberately
      * not a bitfield: it is set by whichever thread finished the response
      * (a handler thread, via __post_response / h2_server_response_ready) and
      * read by the worker in the event loop *outside* connection_s_lock
@@ -130,6 +131,15 @@ typedef struct {
      * Store with release / load with acquire: seeing the flag must imply seeing
      * the response it announces. */
     atomic_bool need_write;
+    /* Last successful TCP epoll registration. Handler threads may change it;
+     * acquire/release also lets the worker inspect it outside their turn.
+     * Zero means unregistered. EPOLLONESHOT describes the installed mask,
+     * not whether its one event has already been consumed. */
+    atomic_uint epoll_events;
+    /* HTTP/1.1 response published by the owning worker while IN remained
+     * installed. Protected by connection_s_lock; cleared on reset/close or
+     * when that response is handed to EPOLLOUT. */
+    int inline_write;
     /* The connection speaks HTTP/2: ctx->parser is an h2session_t and responses
      * must be built with the h2 filter chain (frames instead of a status line +
      * chunked encoding). Set by h2_server_set_http2.
@@ -241,6 +251,13 @@ int connection_queue_append_parallel(connection_queue_item_t*);
 
 int connection_queue_append_broadcast(connection_t*);
 int connection_after_read(connection_t*);
+/* Owning worker only, under connection_s_lock: publish an inline h1 response
+ * without changing an existing plain TCP IN registration. Other states use
+ * the ordinary epoll handoff. */
+int connection_after_read_inline(connection_t*);
+/* Owning worker only, under connection_s_lock: an inline write yielded (either
+ * EAGAIN or its work budget); arrange a later write turn exactly once. */
+int connection_wait_write(connection_t*);
 
 /* Re-arm the one-shot read of a connection that is still parked (h2 only; a
  * no-op returning 1 otherwise). docs/concurrency/01, phase E. */
