@@ -829,6 +829,14 @@ static int sendfile_stage_file(write_fixture_t* fx, const void* data, size_t siz
     return 1;
 }
 
+static int sendfile_probe_unsupported(write_fixture_t* fx, size_t start, size_t end) {
+    http_filter_t* writer = http_file_writer(fx->response, fx->response->filter);
+    if (writer == NULL) return CWF_ERROR;
+    fx->response->cur_filter = writer;
+    off_t offset = (off_t)start;
+    return http_write_file_span(NULL, fx->response, &offset, end);
+}
+
 static http_module_data_t* sendfile_data_module(write_fixture_t* fx) {
     return fx->response->filter->next->next->module;
 }
@@ -910,7 +918,7 @@ TEST(test_sendfile_chain_bodiless_and_precompressed) {
         TEST_REQUIRE_GOTO(__run_flush_filters(NULL, fx.response) == CWF_OK, "head flushed", cleanup);
         TEST_REQUIRE_GOTO(fixture_drain(&fx), "wire captured", cleanup);
         TEST_ASSERT_EQUAL_SIZE(head_size + (i == 4 ? size : 0), fx.captured_size, "body presence");
-        TEST_ASSERT(fx.response->body.data == NULL, "no file buffer allocated");
+        TEST_ASSERT((fx.response->body.data != NULL) == (i == 4), "only the small precompressed body uses a read buffer");
         fx.response->base.reset(fx.response);
         fx.captured_size = 0;
     }
@@ -968,6 +976,9 @@ TEST(test_sendfile_chain_fallback_proc_file) {
     fx.response->file_.size = (size_t)size;
     TEST_REQUIRE_GOTO(__run_header_filters(NULL, fx.response) == CWF_OK, "head prepared", cleanup);
     const size_t head_size = sendfile_head_size(&fx);
+    TEST_REQUIRE_GOTO(sendfile_probe_unsupported(&fx, 0, (size_t)size) == CWF_DATA_AGAIN,
+                      "procfs writer requests fallback", cleanup);
+    sendfile_data_module(&fx)->sendfile_disabled = 1;
     TEST_REQUIRE_GOTO(__run_body_filters(NULL, fx.response) == CWF_OK, "fallback completes", cleanup);
     TEST_REQUIRE_GOTO(fixture_drain(&fx), "wire captured", cleanup);
     TEST_ASSERT(sendfile_data_module(&fx)->sendfile_disabled, "unsupported descriptor disables sendfile");
@@ -1010,13 +1021,18 @@ TEST(test_sendfile_chain_truncated_and_closed_peer) {
     TEST_CASE("truncated files and disconnected clients fail without hanging");
     write_fixture_t fx;
     TEST_REQUIRE(fixture_setup(&fx, 8192), "fixture created");
-    TEST_REQUIRE_GOTO(sendfile_stage_file(&fx, "short", 5), "file staged", cleanup);
-    fx.response->file_.size = 10;
-    TEST_REQUIRE_GOTO(__run_header_filters(NULL, fx.response) == CWF_OK, "head prepared", cleanup);
-    TEST_ASSERT_EQUAL(CWF_ERROR, __run_body_filters(NULL, fx.response), "premature EOF closes response");
-    TEST_ASSERT_EQUAL_SIZE(5, fx.response->body_bytes_sent, "only actual bytes counted");
-    fx.response->base.reset(fx.response);
+    for (int mode = 0; mode < 3; ++mode) {
+        TEST_REQUIRE_GOTO(sendfile_stage_file(&fx, "short", 5), "file staged", cleanup);
+        fx.response->file_.size = mode == 0 ? 10 : HTTP_FILE_BUFFER_MAX + 10;
+        sendfile_data_module(&fx)->sendfile_disabled = mode == 2;
+        TEST_REQUIRE_GOTO(__run_header_filters(NULL, fx.response) == CWF_OK, "head prepared", cleanup);
+        TEST_ASSERT_EQUAL(CWF_ERROR, __run_body_filters(NULL, fx.response), "premature EOF closes response");
+        TEST_ASSERT_EQUAL_SIZE(5, fx.response->body_bytes_sent, "only actual bytes counted");
+        TEST_ASSERT((fx.response->body.data == NULL) == (mode == 1), "small, sendfile and forced buffered paths exercised");
+        fx.response->base.reset(fx.response);
+    }
     TEST_REQUIRE_GOTO(sendfile_stage_file(&fx, "file", 4), "next file staged", cleanup);
+    fx.response->file_.size = HTTP_FILE_BUFFER_MAX + 4;
     TEST_REQUIRE_GOTO(__run_header_filters(NULL, fx.response) == CWF_OK, "next head", cleanup);
     TEST_REQUIRE_GOTO(__run_flush_filters(NULL, fx.response) == CWF_OK, "head sent before disconnect", cleanup);
     close(fx.rd_fd);
@@ -1117,7 +1133,7 @@ TEST(test_sendfile_single_range_forms_and_bodiless) {
         TEST_ASSERT_EQUAL_SIZE(head + body, fx.captured_size, "exact wire length");
         TEST_ASSERT(memcmp(fx.captured + head, "0123456789" + cases[i].first, body) == 0, "exact selected bytes");
         TEST_ASSERT_EQUAL_SIZE(body, fx.response->body_bytes_sent, "range bytes counted");
-        TEST_ASSERT(sendfile_range_module(&fx)->buf->data == NULL, "no range read buffer");
+        TEST_ASSERT(body > 0 ? sendfile_range_module(&fx)->buf->data != NULL : sendfile_range_module(&fx)->buf->size == 0, "small ranges use a buffer; HEAD and 416 do not read");
         TEST_ASSERT(fx.response->body.data == NULL, "no data read buffer");
         fx.response->base.reset(fx.response);
         fx.captured_size = 0;
@@ -1201,6 +1217,9 @@ TEST(test_sendfile_single_range_fallback_and_continuation) {
     TEST_REQUIRE_GOTO(sendfile_request_range(request, 2, size - 3), "proc range", cleanup_request);
     TEST_REQUIRE_GOTO(__run_header_filters(request, fx.response) == CWF_OK, "proc header", cleanup_request);
     const size_t head = sendfile_head_size(&fx);
+    TEST_REQUIRE_GOTO(sendfile_probe_unsupported(&fx, 2, (size_t)size - 2) == CWF_DATA_AGAIN,
+                      "procfs range writer requests fallback", cleanup_request);
+    sendfile_range_module(&fx)->sendfile_disabled = 1;
     TEST_REQUIRE_GOTO(__run_body_filters(request, fx.response) == CWF_OK, "fallback completes", cleanup_request);
     TEST_REQUIRE_GOTO(fixture_drain(&fx), "proc drain", cleanup_request);
     TEST_ASSERT(sendfile_range_module(&fx)->sendfile_disabled, "sendfile rejected for this response");
@@ -1236,14 +1255,17 @@ TEST(test_sendfile_single_range_truncated) {
     httprequest_t* request = httprequest_create(fx.conn);
     TEST_REQUIRE_GOTO(request != NULL, "request created", cleanup);
     request->method = ROUTE_GET;
-    for (int buffered = 0; buffered < 2; ++buffered) {
+    for (int mode = 0; mode < 3; ++mode) {
+        bufo_clear(sendfile_range_module(&fx)->buf);
         TEST_REQUIRE_GOTO(sendfile_stage_file(&fx, "0123456789", 10), "file staged", cleanup_request);
-        TEST_REQUIRE_GOTO(sendfile_request_range(request, 2, 7), "range staged", cleanup_request);
+        fx.response->file_.size = mode == 0 ? 10 : HTTP_FILE_BUFFER_MAX + 10;
+        TEST_REQUIRE_GOTO(sendfile_request_range(request, 2, mode == 0 ? 7 : HTTP_FILE_BUFFER_MAX + 7), "range staged", cleanup_request);
         TEST_REQUIRE_GOTO(__run_header_filters(request, fx.response) == CWF_OK, "headers prepared", cleanup_request);
         TEST_REQUIRE_GOTO(ftruncate(fx.response->file_.fd, 5) == 0, "file truncated after headers", cleanup_request);
-        sendfile_range_module(&fx)->sendfile_disabled = buffered;
+        sendfile_range_module(&fx)->sendfile_disabled = mode == 2;
         TEST_ASSERT_EQUAL(CWF_ERROR, __run_body_filters(request, fx.response), "short range fails");
         TEST_ASSERT_EQUAL_SIZE(3, fx.response->body_bytes_sent, "only available range bytes counted");
+        TEST_ASSERT((sendfile_range_module(&fx)->buf->data == NULL) == (mode == 1), "small, sendfile and forced buffered range paths exercised");
         fx.response->base.reset(fx.response);
     }
     cleanup_request:
@@ -1286,7 +1308,7 @@ TEST(test_sendfile_single_range_if_range) {
 
 TEST(test_sendfile_writer_selection_and_multipart) {
     TEST_SUITE("http_write_filter: range sendfile");
-    TEST_CASE("TLS and HTTP/2 cannot select the raw writer; multipart uses sendfile");
+    TEST_CASE("TLS and HTTP/2 cannot select the raw writer; small multipart keeps its framing");
     write_fixture_t fx;
     TEST_REQUIRE(fixture_setup(&fx, 8192), "fixture created");
     TEST_REQUIRE_GOTO(sendfile_stage_file(&fx, "0123456789", 10), "file staged", cleanup);
@@ -1317,7 +1339,7 @@ TEST(test_sendfile_writer_selection_and_multipart) {
     TEST_REQUIRE_GOTO(length > 0 && (size_t)length < sizeof(expected), "expected multipart built", cleanup_request);
     TEST_REQUIRE_GOTO(__run_body_filters(request, fx.response) == CWF_OK, "multipart body", cleanup_request);
     TEST_REQUIRE_GOTO(fixture_drain(&fx), "multipart drain", cleanup_request);
-    TEST_ASSERT(range->buf->data == NULL, "multipart file bytes need no read buffer");
+    TEST_ASSERT(range->buf->data != NULL, "small multipart uses the combined buffered path");
     TEST_ASSERT_EQUAL_SIZE(head + (size_t)length, fx.captured_size, "multipart wire length");
     TEST_ASSERT(memcmp(fx.captured + head, expected, (size_t)length) == 0, "multipart framing unchanged");
     cleanup_request:
@@ -1451,6 +1473,9 @@ TEST(test_sendfile_multipart_proc_fallback_head_and_if_range) {
     size_t expected_size;
     char* expected = sendfile_multipart_expected(&fx, source, &expected_size);
     TEST_REQUIRE_GOTO(expected != NULL, "wire oracle built", cleanup_request);
+    TEST_REQUIRE_GOTO(sendfile_probe_unsupported(&fx, 2, 9) == CWF_DATA_AGAIN,
+                      "procfs multipart source rejects sendfile", cleanup_request);
+    sendfile_range_module(&fx)->sendfile_disabled = 1;
     TEST_ASSERT_EQUAL(CWF_OK, __run_body_filters(request, fx.response), "fallback completes");
     TEST_ASSERT(fixture_drain(&fx), "fallback drain");
     TEST_ASSERT(sendfile_range_module(&fx)->sendfile_disabled, "unsupported descriptor disables sendfile");
@@ -1522,14 +1547,19 @@ TEST(test_sendfile_multipart_truncated_and_one_surviving_part) {
     TEST_ASSERT(memcmp(fx.captured + head, expected, expected_size) == 0, "one-part multipart framed correctly");
     free(expected);
     fx.response->base.reset(fx.response); fx.captured_size = 0;
+    char ctype[HTTP_MULTIPART_BUFFER_MAX / 2 + 1];
+    memset(ctype, 'x', sizeof(ctype) - 1); ctype[sizeof(ctype) - 1] = 0;
     for (int buffered = 0; buffered < 2; ++buffered) {
         TEST_REQUIRE_GOTO(sendfile_stage_file(&fx, "0123456789", 10), "next file", cleanup_request);
         TEST_REQUIRE_GOTO(sendfile_request_range(request, 0, 1), "first available part", cleanup_request);
         TEST_REQUIRE_GOTO(sendfile_append_range(request, 7, 9), "later part", cleanup_request);
+        bufo_clear(sendfile_range_module(&fx)->buf);
+        TEST_REQUIRE_GOTO(fx.response->add_header(fx.response, "Content-Type", ctype), "large framing selects sendfile", cleanup_request);
         TEST_REQUIRE_GOTO(__run_header_filters(request, fx.response) == CWF_OK, "next header", cleanup_request);
         TEST_REQUIRE_GOTO(ftruncate(fx.response->file_.fd, 8) == 0, "truncate after framing", cleanup_request);
         sendfile_range_module(&fx)->sendfile_disabled = buffered;
         TEST_ASSERT_EQUAL(CWF_ERROR, __run_body_filters(request, fx.response), "truncated multipart fails");
+        TEST_ASSERT((sendfile_range_module(&fx)->buf->data != NULL) == buffered, "both multipart transports exercised");
         fx.response->base.reset(fx.response); fx.captured_size = 0;
     }
     cleanup_request:
@@ -1603,6 +1633,149 @@ TEST(test_sendfile_multipart_budget_across_parts) {
     free(expected);
     cleanup_payload:
     free(payload);
+    cleanup_request:
+    httprequest_free(request);
+    cleanup:
+    fixture_teardown(&fx);
+}
+
+TEST(test_file_hybrid_boundary_and_keepalive) {
+    TEST_SUITE("http_write_filter: hybrid files");
+    TEST_CASE("small files join the head; the threshold boundary resets on keep-alive");
+    write_fixture_t fx;
+    const size_t limit = HTTP_FILE_BUFFER_MAX;
+    TEST_REQUIRE(fixture_setup(&fx, limit + 8192), "fixture created");
+    char* payload = malloc(limit + 1);
+    TEST_REQUIRE_GOTO(payload != NULL, "payload allocated", cleanup);
+    for (size_t i = 0; i <= limit; i++) payload[i] = (char)(i * 13);
+    const size_t sizes[] = {limit, limit + 1, 200, 0};
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        TEST_REQUIRE_GOTO(sendfile_stage_file(&fx, payload, sizes[i]), "file staged", cleanup_payload);
+        TEST_REQUIRE_GOTO(__run_header_filters(NULL, fx.response) == CWF_OK, "head prepared", cleanup_payload);
+        const size_t head = sendfile_head_size(&fx);
+        TEST_REQUIRE_GOTO(__run_body_filters(NULL, fx.response) == CWF_OK, "body sent", cleanup_payload);
+        TEST_REQUIRE_GOTO(__run_flush_filters(NULL, fx.response) == CWF_OK, "empty head flushed", cleanup_payload);
+        TEST_REQUIRE_GOTO(fixture_drain(&fx), "wire captured", cleanup_payload);
+        TEST_ASSERT_EQUAL_SIZE(head + sizes[i], fx.captured_size, "exact wire length");
+        TEST_ASSERT(memcmp(fx.captured + head, payload, sizes[i]) == 0, "exact bytes");
+        TEST_ASSERT((fx.response->body.data != NULL) == (sizes[i] > 0 && sizes[i] <= limit), "transport follows selected body size");
+        TEST_ASSERT_EQUAL_SIZE(sizes[i], fx.response->body_bytes_sent, "body bytes counted once");
+        fx.response->base.reset(fx.response);
+        fx.captured_size = 0;
+    }
+    cleanup_payload:
+    free(payload);
+    cleanup:
+    fixture_teardown(&fx);
+}
+
+TEST(test_small_range_uses_selected_length_and_one_write) {
+    TEST_SUITE("http_write_filter: hybrid files");
+    TEST_CASE("a short range of a large file is joined to the header in one socket write");
+    write_fixture_t fx;
+    TEST_REQUIRE(fixture_setup_type(&fx, 8192, SOCK_SEQPACKET), "packet fixture created");
+    const size_t size = HTTP_FILE_BUFFER_MAX + 1024;
+    char* payload = malloc(size);
+    TEST_REQUIRE_GOTO(payload != NULL, "payload allocated", cleanup);
+    for (size_t i = 0; i < size; i++) payload[i] = (char)i;
+    TEST_REQUIRE_GOTO(sendfile_stage_file(&fx, payload, size), "large file staged", cleanup_payload);
+    httprequest_t* request = httprequest_create(fx.conn);
+    TEST_REQUIRE_GOTO(request != NULL, "request created", cleanup_payload);
+    request->method = ROUTE_GET;
+    TEST_REQUIRE_GOTO(sendfile_request_range(request, 777, 976), "short range selected", cleanup_request);
+    TEST_REQUIRE_GOTO(__run_header_filters(request, fx.response) == CWF_OK, "head prepared", cleanup_request);
+    const size_t head = sendfile_head_size(&fx);
+    TEST_REQUIRE_GOTO(__run_body_filters(request, fx.response) == CWF_OK, "range sent", cleanup_request);
+    const ssize_t bytes = recv(fx.rd_fd, fx.captured, fx.captured_capacity, 0);
+    TEST_ASSERT_EQUAL_SIZE(head + 200, bytes > 0 ? (size_t)bytes : 0, "head and range share one write");
+    TEST_ASSERT(bytes > 0 && memcmp(fx.captured + head, payload + 777, 200) == 0, "correct range offset");
+    TEST_ASSERT(recv(fx.rd_fd, fx.captured, fx.captured_capacity, 0) == -1 && errno == EAGAIN, "no second write");
+    TEST_ASSERT(fx.response->body.data == NULL, "whole file was not read");
+    cleanup_request:
+    httprequest_free(request);
+    cleanup_payload:
+    free(payload);
+    cleanup:
+    fixture_teardown(&fx);
+}
+
+TEST(test_small_multipart_join_and_partial_resume) {
+    TEST_SUITE("http_write_filter: hybrid files");
+    TEST_CASE("small multipart shares one write with the head and resumes a partial joined head exactly");
+    char payload[200];
+    for (size_t i = 0; i < sizeof(payload); ++i) payload[i] = (char)(i * 17);
+    for (int partial = 0; partial < 2; ++partial) {
+        write_fixture_t fx;
+        TEST_REQUIRE(fixture_setup_type(&fx, 32768, partial ? SOCK_STREAM : SOCK_SEQPACKET), "fixture created");
+        httprequest_t* request = httprequest_create(fx.conn);
+        TEST_REQUIRE_GOTO(request != NULL, "request created", cleanup);
+        request->method = ROUTE_GET;
+        TEST_REQUIRE_GOTO(sendfile_stage_file(&fx, payload, sizeof(payload)), "small file staged", cleanup_request);
+        TEST_REQUIRE_GOTO(sendfile_request_range(request, 0, 49), "first part", cleanup_request);
+        TEST_REQUIRE_GOTO(sendfile_append_range(request, 150, 199), "second part", cleanup_request);
+        if (partial) {
+            char value[20001];
+            memset(value, 'x', sizeof(value) - 1); value[sizeof(value) - 1] = 0;
+            TEST_REQUIRE_GOTO(fixture_shrink_sndbuf(&fx), "small send buffer", cleanup_request);
+            TEST_REQUIRE_GOTO(fx.response->add_header(fx.response, "X-Large", value), "long head staged", cleanup_request);
+        }
+        TEST_REQUIRE_GOTO(__run_header_filters(request, fx.response) == CWF_OK, "head prepared", cleanup_request);
+        const size_t head = sendfile_head_size(&fx);
+        size_t expected_size;
+        char* expected = sendfile_multipart_expected(&fx, payload, &expected_size);
+        TEST_REQUIRE_GOTO(expected != NULL, "multipart oracle built", cleanup_request);
+        TEST_ASSERT_EQUAL_SIZE(expected_size, sendfile_range_module(&fx)->mp_size, "threshold includes multipart framing");
+        int r = __run_body_filters(request, fx.response);
+        TEST_ASSERT_EQUAL(partial ? CWF_EVENT_AGAIN : CWF_OK, r, "joined write outcome");
+        if (partial) {
+            int guard = 0;
+            while (r == CWF_EVENT_AGAIN && guard++ < 128) {
+                if (!fixture_drain(&fx)) { r = CWF_ERROR; break; }
+                r = __run_body_filters(request, fx.response);
+            }
+            TEST_ASSERT_EQUAL(CWF_OK, r, "partial multipart completes");
+            TEST_ASSERT(fixture_drain(&fx), "remaining bytes captured");
+        }
+        else {
+            const ssize_t n = recv(fx.rd_fd, fx.captured, fx.captured_capacity, 0);
+            fx.captured_size = n > 0 ? (size_t)n : 0;
+            char extra;
+            TEST_ASSERT(recv(fx.rd_fd, &extra, 1, 0) == -1 && errno == EAGAIN, "one packet contains the entire response");
+        }
+        TEST_ASSERT_EQUAL_SIZE(head + expected_size, fx.captured_size, "exact wire length");
+        TEST_ASSERT(fx.captured_size == head + expected_size && memcmp(fx.captured + head, expected, expected_size) == 0, "parts and boundaries sent once");
+        TEST_ASSERT_EQUAL_SIZE(expected_size, fx.response->body_bytes_sent, "multipart bytes counted once");
+        free(expected);
+        cleanup_request:
+        httprequest_free(request);
+        cleanup:
+        fixture_teardown(&fx);
+    }
+}
+
+TEST(test_multipart_threshold_includes_part_headers) {
+    TEST_SUITE("http_write_filter: hybrid files");
+    TEST_CASE("large multipart framing selects sendfile even when selected file bytes are tiny");
+    write_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx, HTTP_MULTIPART_BUFFER_MAX * 3), "fixture created");
+    httprequest_t* request = httprequest_create(fx.conn);
+    TEST_REQUIRE_GOTO(request != NULL, "request created", cleanup);
+    char* ctype = malloc(HTTP_MULTIPART_BUFFER_MAX / 2 + 1);
+    TEST_REQUIRE_GOTO(ctype != NULL, "large content type allocated", cleanup_request);
+    memset(ctype, 'x', HTTP_MULTIPART_BUFFER_MAX / 2); ctype[HTTP_MULTIPART_BUFFER_MAX / 2] = 0;
+    request->method = ROUTE_GET;
+    TEST_REQUIRE_GOTO(sendfile_stage_file(&fx, "0123456789", 10), "source staged", cleanup_ctype);
+    TEST_REQUIRE_GOTO(sendfile_request_range(request, 0, 1), "first part", cleanup_ctype);
+    TEST_REQUIRE_GOTO(sendfile_append_range(request, 8, 9), "second part", cleanup_ctype);
+    TEST_REQUIRE_GOTO(fx.response->add_header(fx.response, "Content-Type", ctype), "large part field staged", cleanup_ctype);
+    TEST_REQUIRE_GOTO(__run_header_filters(request, fx.response) == CWF_OK, "head prepared", cleanup_ctype);
+    http_module_range_t* m = sendfile_range_module(&fx);
+    TEST_ASSERT(m->mp_size > HTTP_MULTIPART_BUFFER_MAX, "framed response exceeds the threshold");
+    TEST_REQUIRE_GOTO(__run_body_filters(request, fx.response) == CWF_OK, "multipart sent", cleanup_ctype);
+    TEST_ASSERT(m->buf->data == NULL, "large framing retains the sendfile path");
+    TEST_ASSERT_EQUAL_SIZE(m->mp_size, fx.response->body_bytes_sent, "framed body fully counted");
+    cleanup_ctype:
+    free(ctype);
     cleanup_request:
     httprequest_free(request);
     cleanup:

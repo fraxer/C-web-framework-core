@@ -30,6 +30,7 @@ typedef struct {
     size_t parts_count;
     size_t part_index;
     int mp_state;
+    size_t mp_size;         /* framed response length, including boundaries */
     size_t mp_total;        /* complete-length for Content-Range lines */
     size_t data_pos;        /* position inside the current part's data */
     char* part_ctype;       /* Content-Type replayed inside each part */

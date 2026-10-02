@@ -84,6 +84,7 @@ http_module_range_t* range_module_create(void) {
     module->part_index = 0;
     module->mp_state = MP_STATE_TEXT;
     module->mp_total = 0;
+    module->mp_size = 0;
     module->data_pos = 0;
     module->part_ctype = NULL;
     module->text = NULL;
@@ -141,6 +142,7 @@ void range_module_clear(http_module_range_t* module) {
 
     module->mp_state = MP_STATE_TEXT;
     module->mp_total = 0;
+    module->mp_size = 0;
     module->data_pos = 0;
     module->mp_active = 0;
     module->sendfile_disabled = 0;
@@ -379,6 +381,7 @@ int mp_setup(httpresponse_t* response, http_module_range_t* module, size_t data_
         content_length += part_length;
     }
 
+    module->mp_size = content_length;
     response->status_code = 206;
 
     if (!response->add_content_length(response, content_length))
@@ -704,7 +707,10 @@ int range_handler_body(httprequest_t* request, httpresponse_t* response, bufo_t*
     if (request->method == ROUTE_HEAD)
         return CWF_OK;
 
-    if (!module->sendfile_disabled) {
+    const int small_body = module->mp_active
+        ? module->mp_size <= HTTP_MULTIPART_BUFFER_MAX
+        : module->range_size <= HTTP_FILE_BUFFER_MAX;
+    if (!module->sendfile_disabled && !small_body) {
         http_filter_t* writer = http_file_writer(response, cur_filter->next);
         if (writer != NULL) {
             response->cur_filter = writer;
