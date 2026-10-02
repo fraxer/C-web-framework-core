@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include "http_range_filter.h"
+#include "http_write_filter.h"
 
 #define BUF_SIZE 16384
 
@@ -39,8 +40,10 @@ static ssize_t mp_part_header_length(const http_module_range_t* module, const ht
 static int mp_stage_text(http_module_range_t* module, int lead_crlf);
 static int mp_setup(httpresponse_t* response, http_module_range_t* module, size_t data_size);
 static int mp_fill_chunk(httpresponse_t* response, http_module_range_t* module);
+static int mp_send_file(httprequest_t* request, httpresponse_t* response, http_module_range_t* module);
 static int range_handler_header(httprequest_t* request, httpresponse_t* response);
 static int range_handler_body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf);
+static int range_if_range_matches(httprequest_t* request, httpresponse_t* response);
 
 http_filter_t* http_range_filter_create(void) {
     http_filter_t* filter = malloc(sizeof * filter);
@@ -75,6 +78,7 @@ http_module_range_t* range_module_create(void) {
     module->range_start = 0;
     module->unsatisfiable = 0;
     module->mp_active = 0;
+    module->sendfile_disabled = 0;
     module->parts = NULL;
     module->parts_count = 0;
     module->part_index = 0;
@@ -139,6 +143,7 @@ void range_module_clear(http_module_range_t* module) {
     module->mp_total = 0;
     module->data_pos = 0;
     module->mp_active = 0;
+    module->sendfile_disabled = 0;
     module->unsatisfiable = 0;
     module->boundary[0] = 0;
     module->range_pos = 0;
@@ -236,14 +241,12 @@ int range_get_chunk(httpresponse_t* response, http_module_range_t* module) {
     const size_t take = remaining < buf->capacity ? remaining : buf->capacity;
 
     const ssize_t r = range_read_data(response, buf->data, module->range_start + module->range_pos, take);
-    if (r < 0)
+    if (r < 0 || (r == 0 && take > 0))
         return 0;
 
     module->range_pos += (size_t)r;
 
-    /* EOF below the promised size means the backing file was truncated after
-     * the headers were framed; end the stream instead of spinning forever. */
-    if (module->range_pos == module->range_size || (r == 0 && take > 0))
+    if (module->range_pos == module->range_size)
         buf->is_last = 1;
 
     bufo_reset_pos(buf);
@@ -381,9 +384,6 @@ int mp_setup(httpresponse_t* response, http_module_range_t* module, size_t data_
     if (!response->add_content_length(response, content_length))
         return 0;
 
-    if (!bufo_alloc(module->buf, BUF_SIZE))
-        return 0;
-
     /* Stage the opening part header so the body phase starts in text mode. */
     return mp_stage_text(module, 0);
 }
@@ -460,6 +460,91 @@ int mp_fill_chunk(httpresponse_t* response, http_module_range_t* module) {
     return 1;
 }
 
+/* Reuse the generator's state so unsupported sendfile descriptors can resume
+ * through mp_fill_chunk at the exact text/part position already transmitted. */
+static int mp_send_file(httprequest_t* request, httpresponse_t* response, http_module_range_t* module) {
+    const int head = http_write_flush(request, response);
+    if (head != CWF_OK)
+        return head;
+
+    size_t budget = 1024 * 1024;
+    while (module->mp_state != MP_STATE_DONE) {
+        if (module->mp_state == MP_STATE_TEXT) {
+            if (module->text == NULL || module->text_pos > module->text_len)
+                return CWF_ERROR;
+
+            bufo_t text = {0};
+            text.data = module->text;
+            text.size = text.capacity = module->text_len;
+            text.pos = module->text_pos;
+            text.is_proxy = 1;
+
+            const int result = http_write_file_text(response, &text);
+            module->text_pos = text.pos;
+
+            if (result != CWF_OK)
+                return result;
+
+            module->mp_state = module->part_index < module->parts_count ? MP_STATE_DATA : MP_STATE_DONE;
+            module->data_pos = 0;
+
+            continue;
+        }
+
+        if (budget == 0) {
+            response->event_again = 1;
+            return CWF_EVENT_AGAIN;
+        }
+
+        const http_range_part_t* part = &module->parts[module->part_index];
+        if (part->start > (size_t)SSIZE_MAX || module->data_pos > part->size ||
+            part->size > (size_t)SSIZE_MAX - part->start)
+            return CWF_ERROR;
+
+        off_t offset = (off_t)(part->start + module->data_pos);
+        const size_t before = (size_t)offset;
+        const size_t left = part->size - module->data_pos;
+        const size_t take = left < budget ? left : budget;
+
+        const int result = http_write_file_span(request, response, &offset, before + take);
+        const size_t sent = (size_t)offset - before;
+        module->data_pos += sent;
+        budget -= sent;
+
+        if (result != CWF_OK)
+            return result;
+
+        if (module->data_pos == part->size) {
+            module->part_index++;
+            if (!mp_stage_text(module, 1))
+                return CWF_ERROR;
+
+            module->mp_state = MP_STATE_TEXT;
+        }
+    }
+
+    return CWF_OK;
+}
+
+/* Metadata has second granularity (the generated ETag is explicitly weak),
+ * so it cannot establish a strong date validator. If-Range dates therefore
+ * fall back to the full representation. A handler's strong ETag can match. */
+static int range_if_range_matches(httprequest_t* request, httpresponse_t* response) {
+    http_header_t* condition = request->get_header(request, "If-Range");
+    if (condition == NULL) return 1;
+    const char* value = condition->value;
+    const size_t length = condition->value_length;
+    if (value == NULL || length < 2 || value[0] != '"' || value[length - 1] != '"')
+        return 0;
+    for (size_t i = 1; i + 1 < length; ++i) {
+        const unsigned char c = (unsigned char)value[i];
+        if (c < 0x21 || c == '"' || c == 0x7f) return 0;
+    }
+    http_header_t* etag = response->get_header(response, "ETag");
+    return etag != NULL && etag->value != NULL && etag->value_length == length &&
+           memcmp(value, etag->value, length) == 0;
+}
+
 int range_handler_header(httprequest_t* request, httpresponse_t* response) {
     http_filter_t* cur_filter = response->cur_filter;
     if (cur_filter == NULL || cur_filter->module == NULL)
@@ -492,6 +577,9 @@ int range_handler_header(httprequest_t* request, httpresponse_t* response) {
         return filter_next_handler_header(request, response);
 
     if (response->last_modified)
+        return filter_next_handler_header(request, response);
+
+    if (!range_if_range_matches(request, response))
         return filter_next_handler_header(request, response);
 
     size_t data_size = response->body.size;
@@ -559,12 +647,15 @@ int range_handler_header(httprequest_t* request, httpresponse_t* response) {
                                   module->range_start,
                                   module->range_start + module->range_size - 1,
                                   data_size);
-        if (size < 0 || (size_t)size >= sizeof(bytes)) return CWF_ERROR;
 
-        if (!response->add_headeru(response, "Content-Range", 13, bytes, (size_t)size)) return CWF_ERROR;
-        if (!response->add_content_length(response, module->range_size)) return CWF_ERROR;
+        if (size < 0 || (size_t)size >= sizeof(bytes))
+            return CWF_ERROR;
 
-        if (!bufo_alloc(module->buf, BUF_SIZE)) return CWF_ERROR;
+        if (!response->add_headeru(response, "Content-Range", 13, bytes, (size_t)size))
+            return CWF_ERROR;
+
+        if (!response->add_content_length(response, module->range_size))
+            return CWF_ERROR;
     }
     else {
         module->parts = parts;
@@ -612,6 +703,37 @@ int range_handler_body(httprequest_t* request, httpresponse_t* response, bufo_t*
      * headers (206, Content-Range, Content-Length) are present. */
     if (request->method == ROUTE_HEAD)
         return CWF_OK;
+
+    if (!module->sendfile_disabled) {
+        http_filter_t* writer = http_file_writer(response, cur_filter->next);
+        if (writer != NULL) {
+            response->cur_filter = writer;
+            int result = CWF_ERROR;
+            if (module->mp_active) {
+                result = mp_send_file(request, response, module);
+            }
+            else {
+                if (module->range_start > (size_t)SSIZE_MAX ||
+                    module->range_pos > module->range_size ||
+                    module->range_size > (size_t)SSIZE_MAX - module->range_start)
+                    return CWF_ERROR;
+
+                off_t offset = (off_t)(module->range_start + module->range_pos);
+                result = http_write_file_span(request, response, &offset,
+                                             module->range_start + module->range_size);
+                module->range_pos = (size_t)offset - module->range_start;
+            }
+
+            if (result != CWF_DATA_AGAIN)
+                return result;
+
+            module->sendfile_disabled = 1;
+            response->cur_filter = cur_filter;
+        }
+    }
+
+    if (!bufo_alloc(module->buf, BUF_SIZE))
+        return CWF_ERROR;
 
     int r = 0;
     bufo_t* buf = module->buf;

@@ -20,8 +20,10 @@ http_module_write_t* http_write_create(void);
 void http_write_free(void* arg);
 int http_write_header(httprequest_t* request, httpresponse_t* response);
 int http_write_body(httprequest_t* request, httpresponse_t* response, bufo_t* buf);
-/* Push out a head that no body pass claimed (HEAD, 304, 204, empty body).
- * Called once per response after the body filters — see __run_flush_filters. */
 int http_write_flush(httprequest_t* request, httpresponse_t* response);
+int http_write_file(httprequest_t* request, httpresponse_t* response, off_t* offset);
+int http_write_file_span(httprequest_t* request, httpresponse_t* response, off_t* offset, size_t end);
+http_filter_t* http_file_writer(httpresponse_t* response, http_filter_t* filter);
+int http_write_file_text(httpresponse_t* response, bufo_t* buf);
 
 #endif

@@ -1,4 +1,5 @@
 #include "http_data_filter.h"
+#include "http_write_filter.h"
 
 #include <errno.h>
 #include <unistd.h>
@@ -50,6 +51,7 @@ http_module_data_t* __create(void) {
     module->proxy_body_buf->is_proxy = 1;
     module->proxy_body_buf->capacity = BUF_SIZE;
     module->file_offset = 0;
+    module->sendfile_disabled = 0;
 
     return module;
 }
@@ -78,6 +80,7 @@ void __reset(void* arg) {
      * size == 0, so __body returned CWF_OK and dropped the body. */
     module->proxy_body_buf->capacity = BUF_SIZE;
     module->file_offset = 0;
+    module->sendfile_disabled = 0;
 }
 
 int __header(httprequest_t* request, httpresponse_t* response) {
@@ -137,6 +140,12 @@ int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf)
     http_filter_t* cur_filter = response->cur_filter;
     http_module_data_t* module = cur_filter->module;
 
+    /* RFC 9112 §6.3: these responses end at the HTTP head. Apply the rule
+     * before Range forwarding and either file or buffered body transport. */
+    if ((response->status_code >= 100 && response->status_code < 200) ||
+        response->status_code == 204 || response->status_code == 304)
+        return CWF_OK;
+
     if (response->range)
         return filter_next_handler_body(request, response, parent_buf);
 
@@ -144,11 +153,21 @@ int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf)
     if (request != NULL && request->method == ROUTE_HEAD)
         return CWF_OK;
 
-    // RFC 7232: 304 response MUST NOT contain a message body; RFC 9110
-    // §15.3.5: nor may a 204 -- the header stage gave it no Content-Length, so
-    // an HTTP/1.1 client would read a body sent anyway as the next response.
-    if (response->status_code == 304 || response->status_code == 204)
-        return CWF_OK;
+    /* Header filters have already selected encoding/framing. Only the HTTP/1
+     * terminal writer can put raw file bytes on this connection (h2c has no
+     * SSL either). Keep transformed and ranged bodies in the normal chain. */
+    if (!module->sendfile_disabled) {
+        http_filter_t* writer = http_file_writer(response, cur_filter->next);
+        if (writer != NULL) {
+            response->cur_filter = writer;
+            const int result = http_write_file(request, response, &module->file_offset);
+            if (result != CWF_DATA_AGAIN)
+                return result;
+
+            module->sendfile_disabled = 1;
+            response->cur_filter = cur_filter;
+        }
+    }
 
     int r = 0;
     int ok = 0;
@@ -234,14 +253,16 @@ bufo_t* file_next_chunk_data(httpresponse_t* response, http_module_data_t* modul
      * a second lseek(). */
     ssize_t r;
     do {
-        r = pread(response->file_.fd, response->body.data, response->body.capacity, module->file_offset);
+        const size_t remaining = response->file_.size - (size_t)module->file_offset;
+        const size_t count = remaining < response->body.capacity ? remaining : response->body.capacity;
+        r = pread(response->file_.fd, response->body.data, count, module->file_offset);
     } while (r < 0 && errno == EINTR);
 
-    /* Genuine read failure (EBADF, EIO, ...): leave **ok = 0 so __body maps
+    /* Read failure or EOF before the promised length: leave **ok = 0 so __body maps
      * it to CWF_ERROR. Returning NULL with ok = 1 (an earlier version) made
      * __body skip the "all data sent" check and pass NULL to the next
      * filter — a NULL deref / corrupted stream. */
-    if (r < 0)
+    if (r <= 0)
         return NULL;
 
     module->file_offset += r;

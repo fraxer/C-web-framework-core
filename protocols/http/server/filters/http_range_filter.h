@@ -23,6 +23,7 @@ typedef struct {
     unsigned unsatisfiable : 1;
     /* multipart/byteranges mode (the request carried several ranges) */
     unsigned mp_active : 1;
+    unsigned sendfile_disabled : 1;
 
     /* multipart/byteranges state */
     http_range_part_t* parts;

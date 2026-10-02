@@ -588,6 +588,36 @@ TEST(test_data_body_304_no_body) {
     fixture_teardown(&fx);
 }
 
+static void check_bodiless_data_status(int status, int range, int file) {
+    data_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx, 64), "fixture created");
+    TEST_REQUIRE_GOTO(body_set(fx.response, "body", 4), "memory body staged", cleanup);
+    if (file)
+        TEST_REQUIRE_GOTO(file_set(fx.response, "file", 4) >= 0, "file body staged", cleanup);
+    fx.response->status_code = status;
+    fx.response->range = range;
+    char bytes[] = "parent";
+    bufo_t parent = {.data = bytes, .size = 6, .capacity = 6, .is_proxy = 1};
+    TEST_ASSERT_EQUAL(CWF_OK, run_body(&fx, NULL, &parent), "bodiless status completes");
+    TEST_ASSERT_EQUAL(0, fx.sink.body_calls, "status guard precedes Range forwarding");
+    TEST_ASSERT_EQUAL_SIZE(0, fx.sink.size, "no downstream bytes");
+    TEST_ASSERT_EQUAL_SIZE(0, fx.response->body.pos, "memory body untouched");
+    TEST_ASSERT_EQUAL_SIZE(0, parent.pos, "Range parent untouched");
+    TEST_ASSERT(fx.module->file_offset == 0, "file progress untouched");
+    cleanup:
+    fixture_teardown(&fx);
+}
+
+TEST(test_data_body_bodiless_statuses_before_range) {
+    TEST_SUITE("http_data_filter: body");
+    TEST_CASE("all 1xx, 204 and 304 suppress memory and file bodies even with Range set");
+    const int statuses[] = {100, 101, 102, 103, 199, 204, 304};
+    for (size_t i = 0; i < sizeof(statuses) / sizeof(statuses[0]); ++i)
+        for (int range = 0; range < 2; ++range)
+            for (int file = 0; file < 2; ++file)
+                check_bodiless_data_status(statuses[i], range, file);
+}
+
 TEST(test_data_body_partial_write_resume) {
     TEST_SUITE("http_data_filter: body");
     TEST_CASE("REGRESSION: a partial downstream write resumes without losing or repeating bytes");

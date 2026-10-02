@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/sendfile.h>
 
 #include "http_write_filter.h"
 #include "log.h"
@@ -313,4 +314,71 @@ int http_write_flush(httprequest_t* request, httpresponse_t* response) {
         return CWF_OK;
 
     return __wr(response, buf);
+}
+
+int http_write_file(httprequest_t* request, httpresponse_t* response, off_t* offset) {
+    return http_write_file_span(request, response, offset, response->file_.size);
+}
+
+int http_write_file_text(httpresponse_t* response, bufo_t* buf) {
+    const size_t before = buf->pos;
+    const int result = __wr(response, buf);
+    response->body_bytes_sent += buf->pos - before;
+
+    return result;
+}
+
+http_filter_t* http_file_writer(httpresponse_t* response, http_filter_t* filter) {
+    connection_t* connection = response->connection;
+    if (response->file_.fd < 0 || connection == NULL || connection->ssl != NULL ||
+        response->content_encoding != CE_NONE || response->transfer_encoding != TE_NONE ||
+        response->connect_tunnel)
+        return NULL;
+
+    while (filter != NULL && filter->next != NULL)
+        filter = filter->next;
+
+    return filter != NULL && filter->handler_body == http_write_body ? filter : NULL;
+}
+
+int http_write_file_span(httprequest_t* request, httpresponse_t* response, off_t* offset, size_t end) {
+    if (*offset < 0 || (size_t)*offset > end || end > response->file_.size)
+        return CWF_ERROR;
+    /* The deferred head must be completely drained before any file bytes.
+     * A partial head retains its cursor in the writer's own buffer. */
+    const int head_result = http_write_flush(request, response);
+    if (head_result != CWF_OK) return head_result;
+
+    size_t remaining = end - (size_t)*offset;
+    /* Bound work per worker turn. EPOLLOUT is level-triggered, so yielding
+     * also works with a socket that is still writable. */
+    size_t budget = 1024 * 1024;
+    connection_t* connection = response->connection;
+    while (remaining > 0 && budget > 0) {
+        const size_t count = remaining < budget ? remaining : budget;
+        const ssize_t sent = sendfile(connection->fd,
+                                     response->file_.fd, offset, count);
+        if (sent > 0) {
+            remaining -= (size_t)sent;
+            budget -= (size_t)sent;
+            response->body_bytes_sent += (size_t)sent;
+            continue;
+        }
+        if (sent == 0) {
+            log_error("sendfile: file ended before the promised length\n");
+            return CWF_ERROR;
+        }
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            response->event_again = 1;
+            return CWF_EVENT_AGAIN;
+        }
+        if (errno == EINVAL || errno == ENOSYS || errno == EOPNOTSUPP)
+            return CWF_DATA_AGAIN;
+        log_error("sendfile error: %s\n", strerror(errno));
+        return CWF_ERROR;
+    }
+    if (remaining == 0) return CWF_OK;
+    response->event_again = 1;
+    return CWF_EVENT_AGAIN;
 }
