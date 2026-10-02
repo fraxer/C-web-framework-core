@@ -156,7 +156,7 @@ int __body(httprequest_t* request, httpresponse_t* response, bufo_t* parent_buf)
     /* Header filters have already selected encoding/framing. Only the HTTP/1
      * terminal writer can put raw file bytes on this connection (h2c has no
      * SSL either). Keep transformed and ranged bodies in the normal chain. */
-    if (!module->sendfile_disabled) {
+    if (!module->sendfile_disabled && (response->file_.size == 0 || response->file_.size > HTTP_FILE_BUFFER_MAX)) {
         http_filter_t* writer = http_file_writer(response, cur_filter->next);
         if (writer != NULL) {
             response->cur_filter = writer;

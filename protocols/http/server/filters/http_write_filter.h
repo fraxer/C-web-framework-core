@@ -10,6 +10,15 @@
  * write is no longer the thing the client waits on. */
 #define HTTP_WRITE_JOIN_MAX 2048
 
+/* Small file bodies use the joined memory writer; multipart includes framing.
+ * Build overrides are reserved for benchmark experiments. */
+#ifndef HTTP_FILE_BUFFER_MAX
+#define HTTP_FILE_BUFFER_MAX 2048
+#endif
+#ifndef HTTP_MULTIPART_BUFFER_MAX
+#define HTTP_MULTIPART_BUFFER_MAX 16384
+#endif
+
 typedef struct {
     http_module_t base;
     bufo_t* buf;
