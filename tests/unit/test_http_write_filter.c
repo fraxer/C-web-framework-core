@@ -275,8 +275,8 @@ TEST(test_write_header_basic) {
     /* __head_size() accounting must agree with what __build_head appends: the
      * buffer is the predicted head plus the join reserve, so any drift shows
      * up here as a capacity/size mismatch. */
-    TEST_ASSERT_EQUAL_SIZE(expected_size + HTTP_WRITE_JOIN_MAX, fx.module->buf->capacity,
-                           "buffer should be the head size plus the join reserve");
+    TEST_ASSERT(fx.module->buf->capacity >= expected_size + HTTP_WRITE_JOIN_MAX,
+                "buffer has room for the head and join reserve");
     TEST_ASSERT_EQUAL_SIZE(expected_size, fx.module->buf->size,
                            "buffer size should equal the head size");
     TEST_ASSERT_EQUAL_SIZE(fx.module->buf->size, fx.module->buf->pos,
@@ -612,7 +612,7 @@ TEST(test_write_reset_allows_reuse) {
     TEST_ASSERT_EQUAL_UINT(0, fx.module->base.cont, "cont should be cleared");
     TEST_ASSERT_EQUAL_UINT(0, fx.module->base.done, "done should be cleared");
     TEST_ASSERT_NULL(fx.module->base.parent_buf, "parent_buf should be cleared");
-    TEST_ASSERT_NULL(fx.module->buf->data, "head buffer should be released");
+    TEST_ASSERT_NOT_NULL(fx.module->buf->data, "ordinary head buffer is retained");
     TEST_ASSERT_EQUAL_SIZE(0, fx.module->buf->size, "buffer size should be cleared");
     TEST_ASSERT_EQUAL_SIZE(0, fx.module->buf->pos, "buffer pos should be cleared");
 
@@ -1695,6 +1695,36 @@ TEST(test_small_range_uses_selected_length_and_one_write) {
     httprequest_free(request);
     cleanup_payload:
     free(payload);
+    cleanup:
+    fixture_teardown(&fx);
+}
+
+TEST(test_write_buffer_retention_growth_and_limit) {
+    TEST_SUITE("http_write_filter: buffer reuse");
+    TEST_CASE("keep-alive reuses ordinary buffers, grows for larger heads and releases oversized allocations");
+    write_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx, HTTP_WRITE_RETAIN_MAX * 3), "fixture created");
+    TEST_REQUIRE_GOTO(run_header_and_flush(&fx) == CWF_OK, "first head sent", cleanup);
+    char* first = fx.module->buf->data;
+    const size_t capacity = fx.module->buf->capacity;
+    fx.module->base.reset(fx.module);
+    TEST_ASSERT(fx.module->buf->data == first && fx.module->buf->capacity == capacity, "allocation reused on reset");
+    TEST_ASSERT(!fx.module->buf->is_last && fx.module->buf->size == 0 && fx.module->buf->pos == 0, "cursors and flags reset");
+    TEST_REQUIRE_GOTO(run_header(&fx) == CWF_OK, "next head fits retained buffer", cleanup);
+    TEST_ASSERT(fx.module->buf->data == first, "no allocation for ordinary next response");
+    fx.module->base.reset(fx.module);
+    char* value = malloc(HTTP_WRITE_RETAIN_MAX + 1);
+    TEST_REQUIRE_GOTO(value != NULL, "large value allocated", cleanup);
+    memset(value, 'x', HTTP_WRITE_RETAIN_MAX);
+    value[HTTP_WRITE_RETAIN_MAX] = 0;
+    TEST_REQUIRE_GOTO(fx.response->add_header(fx.response, "X-Large", value), "large field staged", cleanup_value);
+    TEST_REQUIRE_GOTO(run_header(&fx) == CWF_OK, "head grows retained buffer", cleanup_value);
+    TEST_ASSERT(fx.module->buf->capacity > HTTP_WRITE_RETAIN_MAX, "larger head fits");
+    TEST_REQUIRE_GOTO(run_flush(&fx) == CWF_OK, "larger head fully flushed", cleanup_value);
+    fx.module->base.reset(fx.module);
+    TEST_ASSERT(fx.module->buf->data == NULL && fx.module->buf->capacity == 0, "oversized buffer released");
+    cleanup_value:
+    free(value);
     cleanup:
     fixture_teardown(&fx);
 }

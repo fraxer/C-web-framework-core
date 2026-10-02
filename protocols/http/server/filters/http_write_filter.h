@@ -9,9 +9,10 @@
  * kilobytes the copy costs more than the extra write saves, and the second
  * write is no longer the thing the client waits on. */
 #define HTTP_WRITE_JOIN_MAX 2048
+#define HTTP_WRITE_RETAIN_MAX 8192
 
-/* Small file bodies use the joined memory writer; multipart includes framing.
- * Build overrides are reserved for benchmark experiments. */
+/* Small file bodies cost less as one joined memory write than as a separate
+ * header write and sendfile. Build overrides are for benchmark experiments. */
 #ifndef HTTP_FILE_BUFFER_MAX
 #define HTTP_FILE_BUFFER_MAX 2048
 #endif
