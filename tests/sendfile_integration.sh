@@ -311,6 +311,23 @@ def functional(port, work, source, tls):
         status, _, small = get("/small.txt")
         check(status == 200 and len(small) == 1024, "small request while slow client waits")
         check(first + body(stream, {"content-length": str(len(source)-1024)}) == source, "slow client's bytes")
+        slow.sendall(request_bytes("/small.txt"))
+        status, fields = head(stream)
+        check(status == 200 and body(stream, fields) == (work / "www/small.txt").read_bytes(),
+              "keep-alive resumes after slow file response")
+    count += 1
+    # A later TCP segment must wait behind the outstanding file response.
+    with connection(port, tls) as slow, slow.makefile("rb") as stream:
+        slow.sendall(request_bytes("/large.bin"))
+        status, fields = head(stream)
+        first = exact(stream, 1024)
+        time.sleep(.15)
+        slow.sendall(request_bytes("/small.txt", close=True))
+        check(status == 200 and first + body(stream, {"content-length": str(len(source)-1024)}) == source,
+              "late pipeline file body intact")
+        status, fields = head(stream)
+        check(status == 200 and body(stream, fields) == (work / "www/small.txt").read_bytes(),
+              "late pipeline second response ordered")
     count += 1
     # TCP RST interrupts a file response; the next request must still work.
     import struct
