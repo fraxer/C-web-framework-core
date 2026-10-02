@@ -75,10 +75,10 @@ int __build_head(httpresponse_t* response, bufo_t* buf) {
         HTTP_CONTINUE_LINE_LEN - ctx->cont_sent : 0;
 
     /* Room for the head plus the first body chunk that will be joined to it
-     * (§10.1). The buffer is reallocated per response anyway, so the tail is
-     * not a permanent cost; what it buys is that the join never has to grow
-     * the buffer mid-response. */
-    if (!bufo_alloc(buf, __head_size(response) + cont_left + HTTP_WRITE_JOIN_MAX)) return 0;
+     * (§10.1). Ordinary buffers survive reset up to HTTP_WRITE_RETAIN_MAX;
+     * oversized headers release their allocation when the response ends. */
+    /* A retained keep-alive buffer may be too small for this response. */
+    if (!bufo_ensure_capacity(buf, __head_size(response) + cont_left + HTTP_WRITE_JOIN_MAX)) return 0;
 
     if (cont_left > 0) {
         if (!__append_full(buf, HTTP_CONTINUE_LINE + ctx->cont_sent, cont_left)) return 0;
@@ -157,7 +157,12 @@ void http_write_reset(void* arg) {
     module->base.done = 0;
     module->base.parent_buf = NULL;
 
-    bufo_clear(module->buf);
+    /* Keep ordinary heads, but release a client's oversized header allocation
+     * so idle keep-alive connections do not pin unbounded memory. */
+    if (module->buf->capacity <= HTTP_WRITE_RETAIN_MAX)
+        bufo_flush(module->buf);
+    else
+        bufo_clear(module->buf);
 }
 
 int __wr(httpresponse_t* response, bufo_t* buf) {
