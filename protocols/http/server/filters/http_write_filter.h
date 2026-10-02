@@ -10,6 +10,9 @@
  * write is no longer the thing the client waits on. */
 #define HTTP_WRITE_JOIN_MAX 2048
 #define HTTP_WRITE_RETAIN_MAX 8192
+#ifndef HTTP_FILE_MSG_MORE
+#define HTTP_FILE_MSG_MORE 1
+#endif
 
 /* Small file bodies cost less as one joined memory write than as a separate
  * header write and sendfile. Build overrides are for benchmark experiments. */
@@ -34,6 +37,7 @@ int http_write_flush(httprequest_t* request, httpresponse_t* response);
 int http_write_file(httprequest_t* request, httpresponse_t* response, off_t* offset);
 int http_write_file_span(httprequest_t* request, httpresponse_t* response, off_t* offset, size_t end);
 http_filter_t* http_file_writer(httpresponse_t* response, http_filter_t* filter);
-int http_write_file_text(httpresponse_t* response, bufo_t* buf);
+int http_write_file_text(httpresponse_t* response, bufo_t* buf, int more);
+int http_write_file_header(httprequest_t* request, httpresponse_t* response, int more);
 
 #endif
