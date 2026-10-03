@@ -179,7 +179,7 @@ int str_insertc(str_t* str, char ch, size_t pos) {
     if (str == NULL)
         return 0;
 
-    if (pos > str->size)
+    if (pos > str->size || str->size == SIZE_MAX)
         return 0;
 
     // Fast path: append to SSO buffer
@@ -200,7 +200,8 @@ int str_insertc(str_t* str, char ch, size_t pos) {
     char* buffer = __str_get_buffer(str);
 
     // Insert character
-    memmove(buffer + pos + 1, buffer + pos, str->size - pos);
+    if (pos < str->size)
+        memmove(buffer + pos + 1, buffer + pos, str->size - pos);
     buffer[pos] = ch;
     str->size++;
     buffer[str->size] = '\0';
@@ -213,15 +214,22 @@ int str_prependc(str_t* str, char ch) {
 }
 
 int str_appendc(str_t* str, char ch) {
-    if (str == NULL) return 0;
-    return str_insertc(str, ch, str->size);
+    if (str == NULL || str->size >= SIZE_MAX - 1) return 0;
+
+    if (str->size + 1 >= __str_get_capacity(str) && !__str_expand_buffer(str, 1))
+        return 0;
+
+    char* buffer = __str_get_buffer(str);
+    buffer[str->size++] = ch;
+    buffer[str->size] = '\0';
+    return 1;
 }
 
 int str_insert(str_t* str, const char* string, size_t size, size_t pos) {
     if (str == NULL || string == NULL)
         return 0;
 
-    if (pos > str->size)
+    if (pos > str->size || str->size == SIZE_MAX || size > SIZE_MAX - str->size - 1)
         return 0;
 
     // Fast path: append to SSO buffer
@@ -234,7 +242,7 @@ int str_insert(str_t* str, const char* string, size_t size, size_t pos) {
 
     // Check if we need to expand buffer
     size_t current_capacity = __str_get_capacity(str);
-    if (str->size + size + 1 >= current_capacity) {
+    if (str->size + size + 1 > current_capacity) {
         if (!__str_expand_buffer(str, size))
             return 0;
     }
@@ -243,7 +251,8 @@ int str_insert(str_t* str, const char* string, size_t size, size_t pos) {
     char* buffer = __str_get_buffer(str);
 
     // Insert string
-    memmove(buffer + pos + size, buffer + pos, str->size - pos);
+    if (pos < str->size && size != 0)
+        memmove(buffer + pos + size, buffer + pos, str->size - pos);
     memcpy(buffer + pos, string, size);
     str->size += size;
     buffer[str->size] = '\0';
@@ -256,8 +265,30 @@ int str_prepend(str_t* str, const char* string, size_t size) {
 }
 
 int str_append(str_t* str, const char* string, size_t size) {
-    if (str == NULL) return 0;
-    return str_insert(str, string, size, str->size);
+    if (str == NULL || string == NULL || str->size == SIZE_MAX ||
+        size > SIZE_MAX - str->size - 1) return 0;
+    if (size == 0) return 1;
+
+    char* buffer = __str_get_buffer(str);
+    size_t capacity = __str_get_capacity(str);
+    // Use integer addresses: relational comparison of unrelated pointers is UB.
+    // Keep an offset, rather than a pointer that realloc/SSO growth invalidates.
+    uintptr_t source = (uintptr_t)string, base = (uintptr_t)buffer;
+    int aliased = source >= base && source - base < capacity;
+    size_t offset = aliased ? source - base : 0;
+    if (aliased && size > capacity - offset) return 0;
+
+    if (str->size + size + 1 > capacity) {
+        if (!__str_expand_buffer(str, size)) return 0;
+        buffer = __str_get_buffer(str);
+        if (aliased) string = buffer + offset;
+    }
+
+    if (aliased) memmove(buffer + str->size, string, size);
+    else memcpy(buffer + str->size, string, size);
+    str->size += size;
+    buffer[str->size] = '\0';
+    return 1;
 }
 
 int str_appendf(str_t* str, const char* format, ...) {
@@ -393,6 +424,8 @@ char* str_copy(str_t* str) {
 }
 
 static int __str_expand_buffer(str_t* str, const size_t extra_size) {
+    if (str->size == SIZE_MAX || extra_size > SIZE_MAX - str->size - 1)
+        return 0;
     size_t required_size = str->size + extra_size + 1; // +1 for null terminator
     size_t target_size;
 
@@ -407,23 +440,12 @@ static int __str_expand_buffer(str_t* str, const size_t extra_size) {
     // Already in dynamic mode - expand
     // Growth strategy: double the capacity or use required size (whichever is larger)
 
-    // SECURITY FIX: Check for integer overflow before doubling
-    if (str->capacity > SIZE_MAX / 2) {
-        // Cannot safely double - use required_size or max safe value
-        target_size = required_size;
+    target_size = str->capacity > SIZE_MAX / 2 ? required_size : str->capacity * 2;
 
-        // Additional safety check: refuse unreasonably large allocations
-        if (target_size > SIZE_MAX - 1024) {
-            return 0;  // Request too large
-        }
-    } else {
-        target_size = str->capacity * 2;
-    }
-
-    // Ensure minimum growth to avoid many small reallocs
-    if (target_size < str->capacity + MIN_STR_GROWTH) {
+    // Minimum growth must not wrap either.
+    if (str->capacity <= SIZE_MAX - MIN_STR_GROWTH &&
+        target_size < str->capacity + MIN_STR_GROWTH)
         target_size = str->capacity + MIN_STR_GROWTH;
-    }
 
     if (target_size < required_size) {
         target_size = required_size;

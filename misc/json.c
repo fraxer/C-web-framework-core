@@ -368,8 +368,6 @@ json_token_t* __parse_string(json_parser_t* parser) {
     json_token_t* token = json_token_alloc(JSON_STRING);
     if (token == NULL) return NULL;
 
-    int result = 0;
-
     if (*parser->ptr != '"') {
         parser->error = "Expected '\"'";
         return token;
@@ -384,13 +382,19 @@ json_token_t* __parse_string(json_parser_t* parser) {
     }
 
     const char* scan = parser->ptr;
-    str_t* str = str_create_empty(128);
-    if (str == NULL) {
-        parser->error = "Out of memory";
-        return token;
-    }
+    const char* run = scan;
+    // json_token_alloc initialized this embedded string. Keep the same
+    // initial growth policy as the previous temporary-string path.
+    str_t* str = &token->value._string;
+    str->init_capacity = 128;
 
     while (1) {
+        // Ordinary ASCII and validated UTF-8 stay in one pending copy span.
+        // Bounds precede every load; no speculative read past parser->end.
+        while (scan < parser->end && (unsigned char)*scan >= 0x20 &&
+               (unsigned char)*scan < 0x80 && *scan != '"' && *scan != '\\')
+            scan++;
+
         // Проверка границ буфера ДО разыменования
         if (scan >= parser->end) {
             parser->error = "Unterminated string (unexpected end)";
@@ -415,6 +419,8 @@ json_token_t* __parse_string(json_parser_t* parser) {
         }
 
         if (*scan == '\\') {
+            if (scan != run && !str_append(str, run, (size_t)(scan - run)))
+                goto out_of_memory;
             scan++;
 
             // Проверка границ буфера ДО разыменования
@@ -434,8 +440,7 @@ json_token_t* __parse_string(json_parser_t* parser) {
                 scan++;
 
                 // Проверка границ буфера для 4 hex-символов
-                // Нужно проверить, что у нас есть минимум 4 байта: scan, scan+1, scan+2, scan+3
-                if (scan + 4 > parser->end) {
+                if ((size_t)(parser->end - scan) < 4) {
                     parser->error = "Unterminated string (incomplete \\uXXXX escape)";
                     goto failed;
                 }
@@ -447,12 +452,6 @@ json_token_t* __parse_string(json_parser_t* parser) {
 
                 uint32_t codepoint = 0;
                 for (int i = 0; i < 4; i++) {
-                    // Дополнительная проверка границ внутри цикла
-                    // if (scan >= parser->end) {
-                    //     parser->error = "Unterminated string (incomplete \\uXXXX escape)";
-                    //     goto failed;
-                    // }
-
                     if (*scan == '\0') {
                         parser->error = "Unterminated string (incomplete \\uXXXX escape)";
                         goto failed;
@@ -478,7 +477,7 @@ json_token_t* __parse_string(json_parser_t* parser) {
                     uint32_t high_surrogate = codepoint;
 
                     // Проверяем, что следом идет \u
-                    if (scan + 2 > parser->end) {
+                    if ((size_t)(parser->end - scan) < 2) {
                         parser->error = "Invalid surrogate pair (incomplete)";
                         goto failed;
                     }
@@ -491,7 +490,7 @@ json_token_t* __parse_string(json_parser_t* parser) {
                     scan += 2; // Пропускаем \u
 
                     // Проверка границ для следующих 4 hex-символов
-                    if (scan + 4 > parser->end) {
+                    if ((size_t)(parser->end - scan) < 4) {
                         parser->error = "Invalid surrogate pair (incomplete low surrogate)";
                         goto failed;
                     }
@@ -499,11 +498,6 @@ json_token_t* __parse_string(json_parser_t* parser) {
                     // Читаем low surrogate
                     uint32_t low_surrogate = 0;
                     for (int i = 0; i < 4; i++) {
-                        // if (scan >= parser->end) {
-                        //     parser->error = "Invalid surrogate pair (incomplete low surrogate)";
-                        //     goto failed;
-                        // }
-
                         if (*scan == '\0') {
                             parser->error = "Invalid surrogate pair (incomplete low surrogate)";
                             goto failed;
@@ -538,34 +532,34 @@ json_token_t* __parse_string(json_parser_t* parser) {
                     goto failed;
                 }
 
-                // Конвертация в UTF-8 с валидацией
+                // Decode into a local block, including U+0000 as string data.
+                char decoded[4];
+                size_t length;
                 if (codepoint < 0x80) {
-                    // 1-байтовая UTF-8 последовательность (ASCII)
-                    str_appendc(str, codepoint);
+                    decoded[0] = codepoint;
+                    length = 1;
                 } else if (codepoint < 0x800) {
-                    // 2-байтовая UTF-8 последовательность
-                    str_appendc(str, 0xC0 | (codepoint >> 6));
-                    str_appendc(str, 0x80 | (codepoint & 0x3F));
+                    decoded[0] = 0xC0 | (codepoint >> 6);
+                    decoded[1] = 0x80 | (codepoint & 0x3F);
+                    length = 2;
                 } else if (codepoint < 0x10000) {
-                    // 3-байтовая UTF-8 последовательность
-                    str_appendc(str, 0xE0 | (codepoint >> 12));
-                    str_appendc(str, 0x80 | ((codepoint >> 6) & 0x3F));
-                    str_appendc(str, 0x80 | (codepoint & 0x3F));
-                } else if (codepoint <= 0x10FFFF) {
-                    // 4-байтовая UTF-8 последовательность
-                    str_appendc(str, 0xF0 | (codepoint >> 18));
-                    str_appendc(str, 0x80 | ((codepoint >> 12) & 0x3F));
-                    str_appendc(str, 0x80 | ((codepoint >> 6) & 0x3F));
-                    str_appendc(str, 0x80 | (codepoint & 0x3F));
+                    decoded[0] = 0xE0 | (codepoint >> 12);
+                    decoded[1] = 0x80 | ((codepoint >> 6) & 0x3F);
+                    decoded[2] = 0x80 | (codepoint & 0x3F);
+                    length = 3;
                 } else {
-                    parser->error = "Invalid Unicode codepoint (out of range)";
-                    goto failed;
+                    decoded[0] = 0xF0 | (codepoint >> 18);
+                    decoded[1] = 0x80 | ((codepoint >> 12) & 0x3F);
+                    decoded[2] = 0x80 | ((codepoint >> 6) & 0x3F);
+                    decoded[3] = 0x80 | (codepoint & 0x3F);
+                    length = 4;
                 }
+                if (!str_append(str, decoded, length)) goto out_of_memory;
             } else {
                 // Все escape-последовательности обрабатываются через lookup table
                 char escaped = escape_table[(uint8_t)*scan];
                 if (escaped) {
-                    str_appendc(str, escaped);
+                    if (!str_appendc(str, escaped)) goto out_of_memory;
                     scan++;
                 } else {
                     // Неизвестная escape-последовательность
@@ -573,15 +567,12 @@ json_token_t* __parse_string(json_parser_t* parser) {
                     goto failed;
                 }
             }
+            run = scan;
         } else {
             // Обычный символ - валидация UTF-8 на лету
             unsigned char c = (unsigned char)*scan;
 
-            if (c < 0x80) {
-                // ASCII символ
-                str_appendc(str, c);
-                scan++;
-            } else if ((c & 0xE0) == 0xC0) {
+            if ((c & 0xE0) == 0xC0) {
                 // 2-байтовая UTF-8 последовательность (RFC 3629)
 
                 // Проверка на недопустимые байты (0xC0, 0xC1 - overlong encodings)
@@ -591,8 +582,7 @@ json_token_t* __parse_string(json_parser_t* parser) {
                 }
 
                 // Проверка границ буфера ДО разыменования
-                // Нужен доступ к scan+1, поэтому проверяем scan + 2 > end
-                if (scan + 2 > parser->end) {
+                if ((size_t)(parser->end - scan) < 2) {
                     parser->error = "Invalid UTF-8 sequence (unexpected end)";
                     goto failed;
                 }
@@ -604,14 +594,12 @@ json_token_t* __parse_string(json_parser_t* parser) {
                     goto failed;
                 }
 
-                str_appendc(str, *scan++);
-                str_appendc(str, *scan++);
+                scan += 2;
             } else if ((c & 0xF0) == 0xE0) {
                 // 3-байтовая UTF-8 последовательность (RFC 3629)
 
                 // Проверка границ буфера ДО разыменования
-                // Нужен доступ к scan+1 и scan+2, поэтому проверяем scan + 3 > end
-                if (scan + 3 > parser->end) {
+                if ((size_t)(parser->end - scan) < 3) {
                     parser->error = "Invalid UTF-8 sequence (unexpected end)";
                     goto failed;
                 }
@@ -645,9 +633,7 @@ json_token_t* __parse_string(json_parser_t* parser) {
                     goto failed;
                 }
 
-                str_appendc(str, *scan++);
-                str_appendc(str, *scan++);
-                str_appendc(str, *scan++);
+                scan += 3;
             } else if ((c & 0xF8) == 0xF0) {
                 // 4-байтовая UTF-8 последовательность (RFC 3629)
 
@@ -658,8 +644,7 @@ json_token_t* __parse_string(json_parser_t* parser) {
                 }
 
                 // Проверка границ буфера ДО разыменования
-                // Нужен доступ к scan+1, scan+2, scan+3, поэтому проверяем scan + 4 > end
-                if (scan + 4 > parser->end) {
+                if ((size_t)(parser->end - scan) < 4) {
                     parser->error = "Invalid UTF-8 sequence (unexpected end)";
                     goto failed;
                 }
@@ -698,10 +683,7 @@ json_token_t* __parse_string(json_parser_t* parser) {
                     goto failed;
                 }
 
-                str_appendc(str, *scan++);
-                str_appendc(str, *scan++);
-                str_appendc(str, *scan++);
-                str_appendc(str, *scan++);
+                scan += 4;
             } else {
                 // Неправильный UTF-8 байт (0x80-0xBF без начала последовательности,
                 // или 0xC0-0xC1, или 0xF5-0xFF)
@@ -717,20 +699,18 @@ json_token_t* __parse_string(json_parser_t* parser) {
         goto failed;
     }
 
-    // Move string data into embedded structure
-    str_move(str, &token->value._string);
-    str_free(str);  // Free the temporary structure
+    if (scan != run && !str_append(str, run, (size_t)(scan - run)))
+        goto out_of_memory;
 
     parser->ptr = scan + 1;
+    return token;
 
-    result = 1;
+    out_of_memory:
+    parser->error = "Out of memory";
 
     failed:
 
-    if (result == 0) {
-        str_free(str);
-    }
-
+    // The caller frees this token on error, including its partial string.
     return token;
 }
 

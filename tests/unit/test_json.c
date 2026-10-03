@@ -1236,3 +1236,125 @@ done:
     free(subtree);
     free(siblings);
 }
+
+
+TEST(test_json_string_runs_and_decoded_bytes) {
+    TEST_CASE("String runs preserve exact UTF-8, escapes, NUL and SSO boundaries");
+    const char* input = "\"abé雪😀\\\"cd\\\\ef\\/\\b\\f\\n\\r\\t\\u0000\\u007f\\u0080\\u07ff\\u0800\\uffff\\uD83D\\uDE00tail\"";
+    const char expected[] = "abé雪😀\"cd\\ef/\b\f\n\r\t\0\x7f\xc2\x80\xdf\xbf\xe0\xa0\x80\xef\xbf\xbf😀tail";
+    json_doc_t* doc = json_parse(input);
+    TEST_REQUIRE_NOT_NULL(doc, "Mixed string parses");
+    TEST_ASSERT_EQUAL_SIZE(sizeof expected - 1, json_string_size(json_root(doc)), "Decoded size includes NUL");
+    TEST_ASSERT(!memcmp(expected, json_string(json_root(doc)), sizeof expected - 1), "Exact decoded bytes");
+    json_free(doc);
+    const size_t lengths[] = {0, 1, 30, 31, 32, 33, 127, 128, 129, 1048576};
+    for (size_t i = 0; i < sizeof lengths / sizeof lengths[0]; i++) {
+        size_t n = lengths[i];
+        char* text = malloc(n + 16);
+        TEST_REQUIRE_NOT_NULL(text, "Input buffer allocated");
+        memcpy(text, "{\"", 2);
+        memset(text + 2, 'a', n);
+        memcpy(text + 2 + n, "\":\"value\"}", 11);
+        doc = json_parse(text);
+        TEST_ASSERT_NOT_NULL(doc, "Long and short keys parse");
+        if (doc) {
+            json_token_t* key = json_root(doc)->child;
+            TEST_ASSERT_EQUAL_SIZE(n, json_string_size(key), "Key length");
+            TEST_ASSERT(!memcmp(json_string(key), text + 2, n), "Key bytes");
+            TEST_ASSERT_STR_EQUAL("value", json_string(key->child), "Nested value");
+            json_free(doc);
+        }
+        text[0] = '"';
+        memset(text + 1, 'a', n);
+        text[n + 1] = '"';
+        text[n + 2] = 0;
+        doc = json_parse(text);
+        TEST_ASSERT_NOT_NULL(doc, "Long and short values parse");
+        if (doc) {
+            TEST_ASSERT_EQUAL_SIZE(n, json_string_size(json_root(doc)), "Value length");
+            TEST_ASSERT(!memcmp(json_string(json_root(doc)), text + 1, n), "Value bytes");
+            json_free(doc);
+        }
+        text[n + 1] = '\\';
+        text[n + 2] = 'q';
+        text[n + 3] = '"';
+        text[n + 4] = 0;
+        TEST_ASSERT(!json_accepts(text), "Bad escape at very end rejected");
+        free(text);
+    }
+    json_manager_free();
+}
+
+TEST(test_json_string_invalid_and_truncated_sequences) {
+    TEST_CASE("Reject all incomplete UTF-8/escape prefixes and malformed sequences");
+    const char* sequences[] = {"é", "雪", "😀", "\\u1234", "\\uD83D\\uDE00"};
+    char input[64];
+    for (size_t i = 0; i < sizeof sequences / sizeof sequences[0]; i++) {
+        size_t n = strlen(sequences[i]);
+        for (size_t j = 0; j < n; j++) {
+            input[0] = '"';
+            memcpy(input + 1, sequences[i], j);
+            input[j + 1] = 0;
+            TEST_ASSERT(!json_accepts(input), "Truncated prefix rejected");
+            input[j + 1] = '"';
+            input[j + 2] = 0;
+            /* An empty prefix and the complete first surrogate escape differ:
+             * the latter is still invalid without its low surrogate. */
+            if (j > 0) TEST_ASSERT(!json_accepts(input), "Quote cannot terminate incomplete sequence");
+        }
+    }
+    const char* invalid[] = {
+        "\"\\q\"", "\"\\uD800\"", "\"\\uDC00\"", "\"\\uD800\\u0041\"",
+        "\"\\uZZZZ\"", "\"\xc0\xaf\"", "\"\xc1\xbf\"", "\"\xe0\x80\xaf\"",
+        "\"\xed\xa0\x80\"", "\"\xf0\x80\x80\xaf\"", "\"\xf4\x90\x80\x80\"",
+        "\"\xf5\x80\x80\x80\"", "\"\x80\"", "\"\xff\"", "\"\xc2x\"",
+        "\"\xe2\x82x\"", "\"\xf0\x9f\x98x\"", "\"unterminated",
+    };
+    for (size_t i = 0; i < sizeof invalid / sizeof invalid[0]; i++)
+        TEST_ASSERT(!json_accepts(invalid[i]), "Malformed string rejected");
+    for (int c = 1; c < 32; c++) {
+        input[0] = '"'; input[1] = 'a'; input[2] = c; input[3] = '"'; input[4] = 0;
+        TEST_ASSERT(!json_accepts(input), "Raw control byte rejected");
+    }
+}
+
+
+#ifdef TEST_STRING_ALLOC_FAILURES
+/* The allocation hook is defined in test_str.c and only affects test copies. */
+void cwfr_test_alloc_fail_after(long successful);
+int cwfr_test_alloc_failed(void);
+TEST(test_json_string_allocation_failures) {
+    TEST_CASE("Every string allocation failure rejects the document and releases partial state");
+    char input[4096];
+    const char* prefix = "{\"short\":\"ok\",\"long\":\"";
+    size_t n = strlen(prefix);
+    memcpy(input, prefix, n);
+    const char piece[] = "ab雪\\uD83D\\uDE00\\n";
+    for (int i = 0; i < 150; i++) {
+        memcpy(input + n, piece, sizeof piece - 1);
+        n += sizeof piece - 1;
+    }
+    strcpy(input + n, "\",\"nested\":[\"last\",true,42]}");
+    int completed = 0;
+    for (long i = 0; i < 100; i++) {
+        json_manager_free();
+        cwfr_test_alloc_fail_after(i);
+        json_doc_t* doc = json_parse(input);
+        int failed = cwfr_test_alloc_failed();
+        cwfr_test_alloc_fail_after(-1);
+        if (failed) TEST_ASSERT(doc == NULL, "Failed allocation cannot yield successful truncated string");
+        else {
+            TEST_ASSERT_NOT_NULL(doc, "Parse succeeds after all allocation sites");
+            if (doc) {
+                json_token_t* long_key = json_root(doc)->child->sibling;
+                TEST_ASSERT_EQUAL_SIZE(150 * 10, json_string_size(long_key->child), "No truncation after OOM recovery");
+            }
+            completed = 1;
+        }
+        json_free(doc);
+        json_manager_free();
+        if (completed) break;
+    }
+    TEST_ASSERT(completed, "All allocation sites exercised");
+}
+#endif
