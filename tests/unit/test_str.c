@@ -1,3 +1,31 @@
+#ifdef TEST_STRING_ALLOC_FAILURES
+/* Test-local allocator shared by the str and JSON fault-injection suites. */
+#undef malloc
+#undef realloc
+#include <stdlib.h>
+
+static long remaining = -1;
+static int failed;
+void cwfr_test_alloc_fail_after(long successful) {
+    remaining = successful;
+    failed = 0;
+}
+int cwfr_test_alloc_failed(void) { return failed; }
+static int fail(void) {
+    if (remaining < 0) return 0;
+    if (remaining-- == 0) { failed = 1; return 1; }
+    return 0;
+}
+void* cwfr_test_malloc(size_t size) {
+    return fail() ? NULL : malloc(size);
+}
+void* cwfr_test_realloc(void* ptr, size_t size) {
+    return fail() ? NULL : realloc(ptr, size);
+}
+#define malloc cwfr_test_malloc
+#define realloc cwfr_test_realloc
+#endif
+
 #include "framework.h"
 #include "str.h"
 #include <string.h>
@@ -884,3 +912,89 @@ TEST(test_str_init_capacity_preserved) {
 
     str_free(str);
 }
+
+
+TEST(test_str_append_boundaries_and_alias) {
+    TEST_CASE("Append across SSO and dynamic boundaries, including embedded NUL and aliases");
+    char data[4096];
+    for (size_t i = 0; i < sizeof data; i++) data[i] = 'a' + i % 26;
+    const size_t lengths[] = {0, 30, 31, 32, 33, 63, 64, 65, 4096};
+    for (size_t i = 0; i < sizeof lengths / sizeof lengths[0]; i++) {
+        str_t s;
+        str_init(&s, 64);
+        TEST_ASSERT(str_append(&s, data, lengths[i]), "Block append succeeds");
+        TEST_ASSERT_EQUAL_SIZE(lengths[i], s.size, "Exact size");
+        TEST_ASSERT(!memcmp(str_get(&s), data, s.size), "Exact bytes");
+        TEST_ASSERT(str_appendc(&s, '\0'), "NUL byte appends as data");
+        TEST_ASSERT_EQUAL_SIZE(lengths[i] + 1, s.size, "NUL counted in size");
+        TEST_ASSERT(str_get(&s)[s.size - 1] == 0 && str_get(&s)[s.size] == 0,
+                    "Data NUL and terminator exist");
+        str_clear(&s);
+    }
+    for (size_t length = 15; length <= 65; length++) {
+        str_t s;
+        str_init(&s, 64);
+        TEST_ASSERT(str_append(&s, data, length), "Setup alias source");
+        TEST_ASSERT(str_append(&s, str_get(&s), s.size), "Self append survives growth");
+        TEST_ASSERT_EQUAL_SIZE(length * 2, s.size, "Self append size");
+        TEST_ASSERT(!memcmp(str_get(&s), data, length) &&
+                    !memcmp(str_get(&s) + length, data, length), "Self append bytes");
+        TEST_ASSERT(str_append(&s, str_get(&s) + 1, length - 1), "Interior alias appends");
+        TEST_ASSERT_EQUAL_SIZE(length * 3 - 1, s.size, "Interior alias size");
+        TEST_ASSERT(!memcmp(str_get(&s) + length * 2, data + 1, length - 1), "Interior alias bytes");
+        str_clear(&s);
+    }
+    str_t s;
+    str_init(&s, 0);
+    TEST_ASSERT(str_reserve(&s, 64), "Reserve dynamic buffer");
+    TEST_ASSERT(str_append(&s, data, 63), "Exact capacity minus terminator");
+    TEST_ASSERT_EQUAL_SIZE(64, s.capacity, "Exact fit needs no growth");
+    TEST_ASSERT(str_appendc(&s, 'y'), "Next byte grows");
+    TEST_ASSERT(s.capacity >= 65, "Room for terminator after growth");
+    TEST_ASSERT(str_insertc(&s, 'a', 0), "Insert at start");
+    TEST_ASSERT(str_insert(&s, "bc", 2, 1), "Insert in middle");
+    TEST_ASSERT(!memcmp(str_get(&s), "abc", 3), "Insert keeps order");
+    TEST_ASSERT(!str_append(&s, "x", SIZE_MAX), "Overflow rejected");
+    TEST_ASSERT_EQUAL_SIZE(67, s.size, "Overflow preserves size");
+    TEST_ASSERT(!str_insert(&s, "x", SIZE_MAX, 0), "Insert overflow rejected");
+    size_t saved_size = s.size;
+    s.size = SIZE_MAX - 1;
+    TEST_ASSERT(!str_appendc(&s, 'x'), "Character append overflow rejected");
+    TEST_ASSERT(!str_insertc(&s, 'x', 0), "Character insert overflow rejected");
+    TEST_ASSERT_EQUAL_SIZE(SIZE_MAX - 1, s.size, "Overflow preserves synthetic size");
+    s.size = saved_size;
+    str_clear(&s);
+}
+
+
+#ifdef TEST_STRING_ALLOC_FAILURES
+TEST(test_str_append_allocation_failure_atomicity) {
+    TEST_CASE("SSO and realloc failures preserve content, ownership and size");
+    char data[256];
+    memset(data, 'z', sizeof data);
+    for (int dynamic = 0; dynamic < 2; dynamic++) {
+        str_t s;
+        str_init(&s, 64);
+        size_t length = dynamic ? 63 : 31;
+        TEST_ASSERT(str_append(&s, data, length), "Source created");
+        char* buffer = str_get(&s);
+        size_t capacity = s.capacity;
+        cwfr_test_alloc_fail_after(0);
+        TEST_ASSERT(!str_appendc(&s, 'q'), "Growth failure rejected");
+        TEST_ASSERT(cwfr_test_alloc_failed(), "Allocation failed at intended site");
+        cwfr_test_alloc_fail_after(-1);
+        TEST_ASSERT(buffer == str_get(&s) && capacity == s.capacity, "Ownership unchanged");
+        TEST_ASSERT_EQUAL_SIZE(length, s.size, "Size unchanged");
+        TEST_ASSERT(!memcmp(data, str_get(&s), length) && str_get(&s)[length] == 0,
+                    "Content and terminator unchanged");
+        cwfr_test_alloc_fail_after(0);
+        TEST_ASSERT(!str_append(&s, str_get(&s), length), "Alias growth failure rejected");
+        cwfr_test_alloc_fail_after(-1);
+        TEST_ASSERT(buffer == str_get(&s) && capacity == s.capacity && length == s.size,
+                    "Failed self append preserves ownership");
+        TEST_ASSERT(!memcmp(data, str_get(&s), length), "Failed self append preserves bytes");
+        TEST_ASSERT(str_append(&s, str_get(&s), length), "Append can recover after OOM");
+        str_clear(&s);
+    }
+}
+#endif

@@ -38,9 +38,46 @@ if(INCLUDE_HTTP3 STREQUAL yes)
     set(QUIC_CLIENT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/quicclient/quicclient.c)
 endif()
 
+# Compile the str/JSON suites and allocation-instrumented copies into the
+# existing runner. Rename their public symbols so other suites continue to use
+# the shared production framework, including its separate token manager.
+list(REMOVE_ITEM UNIT_TEST_FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/unit/test_str.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/unit/test_json.c")
+set(STRING_ALLOC_RENAMES "/* Generated test-only API namespace. */\n")
+set(STRING_ALLOC_SYMBOLS "")
+foreach(header str.h json.h)
+    set(api_header "${CMAKE_CURRENT_SOURCE_DIR}/../misc/${header}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${api_header}")
+    file(READ "${api_header}" api_text)
+    string(REGEX MATCHALL "(str_|json_|memory_block_)[A-Za-z0-9_]+[ \t\r\n]*\\(" api_functions "${api_text}")
+    foreach(function ${api_functions})
+        string(REGEX REPLACE "[ \t\r\n]*\\($" "" symbol "${function}")
+        list(APPEND STRING_ALLOC_SYMBOLS "${symbol}")
+    endforeach()
+endforeach()
+list(REMOVE_DUPLICATES STRING_ALLOC_SYMBOLS)
+foreach(symbol ${STRING_ALLOC_SYMBOLS})
+    string(APPEND STRING_ALLOC_RENAMES "#define ${symbol} cwfr_test_${symbol}\n")
+endforeach()
+set(STRING_ALLOC_NAMESPACE "${CMAKE_CURRENT_BINARY_DIR}/string_alloc_symbols.h")
+file(GENERATE OUTPUT "${STRING_ALLOC_NAMESPACE}" CONTENT "${STRING_ALLOC_RENAMES}")
+
+add_library(string_alloc_tests OBJECT
+    unit/test_str.c unit/test_json.c
+    ../misc/str.c ../misc/json.c)
+target_compile_definitions(string_alloc_tests PRIVATE
+    TEST_STRING_ALLOC_FAILURES=1 malloc=cwfr_test_malloc realloc=cwfr_test_realloc)
+target_compile_options(string_alloc_tests PRIVATE
+    -include ${STRING_ALLOC_NAMESPACE})
+if(BUILD_FUZZERS STREQUAL "yes" AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(string_alloc_tests PRIVATE -fno-sanitize-coverage=trace-pc)
+endif()
+
 add_executable(
     runner
     unit/runner.c
+    $<TARGET_OBJECTS:string_alloc_tests>
     ${UNIT_TEST_FILES}
     ${QUIC_CLIENT_SOURCES}
     unit/mail_stubs.c
@@ -61,6 +98,7 @@ add_executable(
 
 target_link_libraries(runner PRIVATE
     cwfr_framework
+    m
     ${PCRE2_LIBRARIES}
     ${ZLIB_LIBRARIES}
     ${OPENSSL_LIBRARIES}
@@ -127,6 +165,7 @@ target_compile_definitions(runner PRIVATE
 add_dependencies(runner shadow_test_v1 shadow_test_v2 shadow_merged)
 
 add_test(NAME core_tests COMMAND runner)
+
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)
