@@ -243,39 +243,9 @@ int websockets_protocol_resource_payload_parse(websocketsparser_t* parser, char*
         if (!websocketsrequest_has_payload(protocol))
             return 0;
 
-        if (!websockets_create_tmpfile(request->protocol, env()->main.tmp))
+        /* Routing bytes remain outside the visible payload and its size limit. */
+        if (!websocketsrequest_payload_append(request->protocol, string + offset, remaining))
             return 0;
-
-        /* A failed lseek returns -1, which the unsigned comparison below
-         * would fold into a passing value and wave past the body-size limit. */
-        off_t payloadlength = lseek(request->protocol->payload.fd, 0, SEEK_END);
-        if (payloadlength < 0)
-            return 0;
-
-        /* Only the payload bytes count against the limit: measuring the whole
-         * chunk also billed the method and location prefix on the first chunk. */
-        if ((size_t)payloadlength + remaining > env()->main.client_max_body_size)
-            return 0;
-
-        /* A single write may legally be short (EINTR, ENOSPC, rlimit);
-         * accepting a partial write here silently truncated the message
-         * handed to the handler, so write until every byte is on disk. */
-        size_t written = 0;
-        while (written < remaining) {
-            const ssize_t r = write(request->protocol->payload.fd, &string[offset + written], remaining - written);
-
-            if (r < 0) {
-                if (errno == EINTR)
-                    continue;
-                return 0;
-            }
-            if (r == 0)
-                return 0;
-
-            written += (size_t)r;
-        }
-
-        lseek(request->protocol->payload.fd, 0, SEEK_SET);
     }
 
     return 1;

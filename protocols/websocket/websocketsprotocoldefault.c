@@ -71,40 +71,7 @@ int websockets_protocol_default_payload_parse(websocketsparser_t* parser, char* 
     if (length == 0)
         return 1;
 
-    const char* tmp_dir = env()->main.tmp;
-    if (!websockets_create_tmpfile(request->protocol, tmp_dir))
-        return 0;
-
-    /* A failed lseek returns -1, which the unsigned comparison below would
-     * fold into length - 1 and wave past the body-size limit. */
-    off_t payloadlength = lseek(request->protocol->payload.fd, 0, SEEK_END);
-    if (payloadlength < 0)
-        return 0;
-
-    if ((size_t)payloadlength + length > env()->main.client_max_body_size)
-        return 0;
-
-    /* A single write may legally be short (EINTR, ENOSPC, rlimit); accepting
-     * a partial write here silently truncated the message handed to the
-     * handler, so write until every byte of the chunk is on disk. */
-    size_t written = 0;
-    while (written < length) {
-        const ssize_t r = write(request->protocol->payload.fd, string + written, length - written);
-
-        if (r < 0) {
-            if (errno == EINTR)
-                continue;
-            return 0;
-        }
-        if (r == 0)
-            return 0;
-
-        written += (size_t)r;
-    }
-
-    lseek(request->protocol->payload.fd, 0, SEEK_SET);
-
-    return 1;
+    return websocketsrequest_payload_append(request->protocol, string, length);
 }
 
 int set_websockets_default(connection_t* connection, void* data) {
