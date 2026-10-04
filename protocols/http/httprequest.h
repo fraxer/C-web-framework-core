@@ -301,8 +301,9 @@ int httprequest_trailern_add(httprequest_t*, const char*, size_t, const char*, s
 httprequest_t* httprequest_create(connection_t*);
 void httprequest_free(void* arg);
 void httprequest_init_payload(httprequest_t* request);
-/* Open the temp file a request body is spooled into. Used by the protocol
- * parsers (h1.1 and h2) as body bytes arrive; the payload type is decided
+/* Create a legacy payload file, or materialize and transfer the incoming
+ * store to it. HTTP/2/3 and outgoing builders use this representation;
+ * HTTP/1.1 receives into the incoming store. The payload type is decided
  * lazily from Content-Type by httprequest_payload_parse(). */
 int httprequest_create_payload_file(http_payload_t* payload);
 void httprequest_payload_free(http_payload_t* payload);

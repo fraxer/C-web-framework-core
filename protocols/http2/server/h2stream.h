@@ -75,7 +75,7 @@ typedef struct h2stream {
     /* Receive side: advertised window plus the counters that auto-scale it. */
     h2_recv_window_t recv;
 
-    size_t  req_body_len;   /* DATA bytes spooled into request->payload_.file */
+    size_t  req_body_len;   /* DATA bytes stored in request->payload_.incoming */
     int64_t content_length; /* declared, or -1 when the request carried none */
     uint64_t request_progress_ms; /* last request-body progress, independent of PING */
 

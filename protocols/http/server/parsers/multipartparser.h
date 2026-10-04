@@ -43,12 +43,14 @@ typedef struct multipartparser {
     http_header_t* header;
     http_header_t* last_header;
     int payload_fd;
+    const http_payload_t* payload;
     const char* error;
     int header_count;
     char prev_ch;
 } multipartparser_t;
 
 void multipartparser_init(multipartparser_t*, int, const char*);
+void multipartparser_init_payload(multipartparser_t*, const http_payload_t*, const char*);
 multipart_res_e multipartparser_parse(multipartparser_t*, char*, size_t);
 http_payloadpart_t* multipartparser_part(multipartparser_t*);
 void multipartparser_clear(multipartparser_t*);

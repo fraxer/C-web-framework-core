@@ -107,11 +107,12 @@ int is_valid_header_value_char(unsigned char c) {
     return 0; // Все управляющие символы (0-31), включая \r и \n, запрещены!
 }
 
-void multipartparser_init(multipartparser_t* parser, int payload_fd, const char* boundary) {
+static void multipartparser_init_source(multipartparser_t* parser, int payload_fd,
+                                        size_t payload_size, const char* boundary) {
     const size_t boundary_size = strlen(boundary);
 
     parser->boundary = boundary;
-    parser->payload_size = lseek(payload_fd, 0, SEEK_END);
+    parser->payload_size = payload_size;
     parser->payload_offset = 0;
     parser->header_key_offset = 0;
     parser->header_value_offset = 0;
@@ -128,11 +129,34 @@ void multipartparser_init(multipartparser_t* parser, int payload_fd, const char*
     parser->header = NULL;
     parser->last_header = NULL;
     parser->payload_fd = payload_fd;
+    parser->payload = NULL;
     parser->error = "";
     parser->header_count = 0;
     parser->prev_ch = '\0';
+}
 
+void multipartparser_init(multipartparser_t* parser, int payload_fd, const char* boundary) {
+    off_t size = lseek(payload_fd, 0, SEEK_END);
+    multipartparser_init_source(parser, payload_fd, size < 0 ? 0 : (size_t)size, boundary);
     lseek(payload_fd, 0, SEEK_SET);
+}
+
+void multipartparser_init_payload(multipartparser_t* parser, const http_payload_t* payload,
+                                 const char* boundary) {
+    multipartparser_init_source(parser, -1, http_payload_size(payload), boundary);
+    parser->payload = payload;
+}
+
+static int multipartparser_read_header(multipartparser_t* parser, char* value,
+                                       size_t offset, size_t size) {
+    if (parser->payload == NULL)
+        return multipartparser_write_header(parser->payload_fd, value, offset, size);
+
+    if (!http_payload_read(parser->payload, offset, value, size))
+        return 0;
+
+    value[size] = 0;
+    return 1;
 }
 
 multipart_res_e multipartparser_parse(multipartparser_t* parser, char* buffer, size_t buffer_size) {
@@ -405,12 +429,14 @@ int multipartparser_create_header(multipartparser_t* parser) {
         return 0;
     }
 
-    if (key_size && !multipartparser_write_header(parser->payload_fd, header->key, key_offset, key_size)) {
+    if (key_size && !multipartparser_read_header(parser, header->key, key_offset, key_size)) {
         parser->error = "multipartparser: write_header key failed";
+        http_header_free(header);
         return 0;
     }
-    if (value_size && !multipartparser_write_header(parser->payload_fd, header->value, value_offset, value_size)) {
+    if (value_size && !multipartparser_read_header(parser, header->value, value_offset, value_size)) {
         parser->error = "multipartparser: write_header val failed";
+        http_header_free(header);
         return 0;
     }
 

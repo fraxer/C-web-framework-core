@@ -976,7 +976,7 @@ static h2_request_status_e h2_consume_trailers(h2session_t* s, h2stream_t* strea
     return status;
 }
 
-/* Spool a DATA payload into the request's temp file, mirroring the h1.1 parser
+/* Store a DATA payload using the same threshold as the h1.1 parser
  * (httprequestparser.c __parse_payload): the payload type is then derived from
  * Content-Type on demand, so get_payload/get_payload_json/multipart accessors
  * behave identically under h2. */
@@ -986,12 +986,15 @@ static int h2_body_append(h2stream_t* stream, const uint8_t* data, size_t len) {
     if (len > SIZE_MAX - stream->req_body_len) return 0;
     if (stream->req_body_len + len > env()->main.client_max_body_size) return 0;
 
-    http_payload_t* payload = &stream->request->payload_;
-    if (payload->file.fd < 0)
-        if (!httprequest_create_payload_file(payload))
+    body_store_t* incoming = &stream->request->payload_.incoming;
+    if (incoming->state == BODY_STORE_EMPTY) {
+        incoming->max_size = env()->main.client_max_body_size;
+        if (stream->content_length >= 0 &&
+            !body_store_prepare(incoming, (size_t)stream->content_length, env()->main.tmp))
             return 0;
+    }
 
-    if (!payload->file.append_content(&payload->file, (const char*)data, len))
+    if (!body_store_append(incoming, data, len, env()->main.tmp))
         return 0;
 
     stream->req_body_len += len;
