@@ -59,7 +59,12 @@ TEST(test_mysql_ddl_simple_protocol) {
         "CREATE TABLE should succeed via simple protocol");
 
     // SET and transaction-control statements likewise carry no params.
-    TEST_ASSERT(__mysql_exec("SET @cwfr_x := 1"), "SET should succeed");
+    /* @cwfr_x is a MySQL user variable, whereas dbquery's @name syntax is a
+     * framework identifier parameter. The positional API passes this SQL as-is.
+     */
+    dbresult_t* set = dbquery_params(MYSQL_DBID, "SET @cwfr_x := 1", NULL);
+    TEST_ASSERT(dbresult_ok(set), "SET should succeed");
+    dbresult_free(set);
     TEST_ASSERT(__mysql_exec("BEGIN"), "BEGIN should succeed");
     TEST_ASSERT(__mysql_exec("COMMIT"), "COMMIT should succeed");
 

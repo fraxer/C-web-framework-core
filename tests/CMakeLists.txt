@@ -502,12 +502,33 @@ endif()
 
 if(HAS_DB)
     file(GLOB DB_TEST_FILES "${CMAKE_CURRENT_SOURCE_DIR}/db/test_db_*.c")
+    list(REMOVE_ITEM DB_TEST_FILES "${CMAKE_CURRENT_SOURCE_DIR}/db/test_db_view_alloc.c")
+    set(DB_VIEW_DRIVER_OBJECTS "")
+    if(PostgreSQL_FOUND AND INCLUDE_POSTGRESQL STREQUAL "yes")
+        set(PG_VIEW_NAMESPACE "${CMAKE_CURRENT_BINARY_DIR}/pg_view_symbols.h")
+        file(GENERATE OUTPUT "${PG_VIEW_NAMESPACE}" CONTENT
+            "#define postgresql_load cwfr_test_postgresql_load\n#define postgresql_view_supported cwfr_test_postgresql_view_supported\n#define postgresql_execute_params_view cwfr_test_postgresql_execute_params_view\n#define postgresql_process_result_view cwfr_test_postgresql_process_result_view\n")
+        add_library(pg_view_alloc_tests OBJECT
+            db/test_db_view_alloc.c ../framework/database/postgresql.c
+            ../framework/database/dbresult_view.c)
+        target_include_directories(pg_view_alloc_tests PRIVATE ../framework/database)
+        target_compile_options(pg_view_alloc_tests PRIVATE
+            "SHELL:-include ${DB_VIEW_NAMESPACE}" "SHELL:-include ${PG_VIEW_NAMESPACE}")
+        target_compile_definitions(pg_view_alloc_tests PRIVATE
+            calloc=cwfr_test_view_calloc strdup=cwfr_test_view_strdup malloc=cwfr_test_pg_malloc)
+        target_link_libraries(pg_view_alloc_tests PRIVATE cwfr_framework)
+        if(BUILD_FUZZERS STREQUAL "yes" AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
+            target_compile_options(pg_view_alloc_tests PRIVATE -fno-sanitize-coverage=trace-pc)
+        endif()
+        set(DB_VIEW_DRIVER_OBJECTS $<TARGET_OBJECTS:pg_view_alloc_tests>)
+    endif()
 
     add_executable(
         db_runner
         db/runner.c
         core/testdb.c
         ${DB_TEST_FILES}
+        ${DB_VIEW_DRIVER_OBJECTS}
     )
 
     target_compile_definitions(db_runner PRIVATE
@@ -526,6 +547,9 @@ if(HAS_DB)
         Threads::Threads
         ${CMAKE_DL_LIBS}
     )
+    if(PostgreSQL_FOUND AND INCLUDE_POSTGRESQL STREQUAL "yes")
+        target_link_libraries(db_runner PRIVATE pq)
+    endif()
 
     add_test(NAME db_tests COMMAND db_runner)
 endif()

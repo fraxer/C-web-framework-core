@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <limits.h>
 
 #include "log.h"
 #include "array.h"
@@ -14,6 +15,7 @@
 #include "dbresult.h"
 #include "dbquery.h"
 #include "postgresql.h"
+#include "postgresql_view_internal.h"
 
 typedef struct {
     array_t* param_order;
@@ -891,71 +893,172 @@ dbresult_t* __execute_prepared(void* connection, const char* stmt_name, array_t*
     return __process_result(pgconnection, result);
 }
 
-dbresult_t* __execute_params(void* connection, const char* sql, array_t* params) {
-    postgresqlconnection_t* pgconnection = connection;
-
-    log_debug("DB params query: %s\n", sql);
-
-    int res = 0;
-    dbresult_t* result = dbresult_create();
-    if (result == NULL) return NULL;
-
-    const int n_params = params != NULL ? (int)array_size(params) : 0;
-    const char** param_values = NULL;
-    int* param_lengths = NULL;
-
-    if (n_params > 0) {
-        param_values = malloc(sizeof(char*) * n_params);
-        param_lengths = malloc(sizeof(int) * n_params);
-        if (param_values == NULL || param_lengths == NULL) {
-            log_error("__execute_params: memory allocation failed\n");
-            goto failed;
+/* The old and view paths share binding, conversion and the exact libpq send.
+ * Returned strings remain field-owned until PQsendQueryParams has consumed them.
+ */
+static int __send_params(postgresqlconnection_t* connection, const char* sql,
+                         array_t* params, const char** error) {
+    size_t count = params ? array_size(params) : 0;
+    if (!sql || !connection->connection || count > INT_MAX ||
+        count > SIZE_MAX / sizeof(char*) || count > SIZE_MAX / sizeof(int)) {
+        *error = "Invalid PostgreSQL query parameters";
+        return 0;
+    }
+    int ok = 0;
+    const char** values = NULL;
+    int* lengths = NULL;
+    if (count) {
+        values = malloc(sizeof(*values) * count);
+        lengths = malloc(sizeof(*lengths) * count);
+        if (!values || !lengths) {
+            *error = "Out of memory";
+            goto done;
         }
-
-        for (int i = 0; i < n_params; i++) {
+        for (size_t i = 0; i < count; i++) {
             mfield_t* field = array_get(params, i);
-            if (field == NULL) {
-                log_error("__execute_params: param %d is NULL\n", i);
-                goto failed;
+            if (!field) {
+                *error = "PostgreSQL bind parameter is NULL";
+                goto done;
             }
-
-            // NULL values are bound as SQL NULL (not interpolated into the text).
             if (field->is_null) {
-                param_values[i] = NULL;
-                param_lengths[i] = 0;
+                values[i] = NULL;
+                lengths[i] = 0;
                 continue;
             }
-
-            str_t* str = model_field_to_string(field);
-            if (str == NULL) {
-                log_error("__execute_params: model_field_to_string failed for %s\n", field->name);
-                goto failed;
+            str_t* string = model_field_to_string(field);
+            if (!string || !str_get(string) || str_size(string) > INT_MAX) {
+                *error = "PostgreSQL parameter conversion failed";
+                goto done;
             }
-
-            param_values[i] = str_get(str);
-            param_lengths[i] = (int)str_size(str);
+            values[i] = str_get(string);
+            lengths[i] = (int)str_size(string);
         }
     }
+    ok = PQsendQueryParams(connection->connection, sql, (int)count, NULL,
+                           values, lengths, NULL, 0);
+    if (!ok) *error = PQerrorMessage(connection->connection);
+ done:
+    free(values);
+    free(lengths);
+    return ok;
+}
 
-    // Text format params (paramFormats=NULL); PostgreSQL infers types from context.
-    if (!PQsendQueryParams(pgconnection->connection, sql, n_params, NULL, param_values, param_lengths, NULL, 0)) {
-        log_error("PQsendQueryParams failed: %s\n", PQerrorMessage(pgconnection->connection));
-        goto failed;
-    }
-
-    res = 1;
-
-    failed:
-
-    if (param_values != NULL) free(param_values);
-    if (param_lengths != NULL) free(param_lengths);
-
-    if (!res) {
-        result->ok = 0;
+dbresult_t* __execute_params(void* connection, const char* sql, array_t* params) {
+    postgresqlconnection_t* pgconnection = connection;
+    log_debug("DB params query: %s\n", sql);
+    dbresult_t* result = dbresult_create();
+    if (!result) return NULL;
+    const char* error = NULL;
+    if (!__send_params(pgconnection, sql, params, &error)) {
+        dbresult_set_error(result, error);
         return result;
     }
-
     return __process_result(pgconnection, result);
+}
+
+int postgresql_view_supported(const dbconnection_t* connection) {
+    return connection && connection->execute_params == __execute_params;
+}
+
+static const char* __view_col_name(const void* owner, int col) {
+    return PQfname((const PGresult*)owner, col);
+}
+
+static void __view_cell(const void* owner, int row, int col,
+                         const char** value, size_t* length) {
+    const PGresult* result = owner;
+    if (PQgetisnull(result, row, col)) {
+        *value = NULL;
+        *length = 0;
+    } else {
+        *value = PQgetvalue(result, row, col);
+        *length = (size_t)PQgetlength(result, row, col);
+    }
+}
+
+static void __view_free(void* owner) {
+    PQclear(owner);
+}
+
+static const dbresult_view_ops_t __view_ops = {
+    __view_col_name, __view_cell, __view_free
+};
+
+static int __view_protocol_ready(postgresqlconnection_t* pg, dbresult_view_t* view) {
+    if (!pg->connection) {
+        dbresult_view_set_error(view, "PostgreSQL connection unavailable");
+        dbresult_view_clear(view);
+        return 0;
+    }
+    if (PQpipelineStatus(pg->connection) != PQ_PIPELINE_OFF) {
+        dbresult_view_set_error(view, "PostgreSQL pipeline mode is not supported by result views");
+        PQfinish(pg->connection);
+        pg->connection = NULL;
+        dbresult_view_clear(view);
+        return 0;
+    }
+    return 1;
+}
+
+void postgresql_process_result_view(dbconnection_t* connection, dbresult_view_t* view) {
+    postgresqlconnection_t* pg = (postgresqlconnection_t*)connection;
+    int received = 0;
+    PGresult* result;
+    if (!__view_protocol_ready(pg, view)) return;
+    while ((result = PQgetResult(pg->connection))) {
+        received = 1;
+        ExecStatusType status = PQresultStatus(result);
+        switch (status) {
+        case PGRES_COMMAND_OK:
+        case PGRES_TUPLES_OK:
+        case PGRES_SINGLE_TUPLE:
+            if (!dbresult_view_error(view)) {
+                if (dbresult_view_append(view, result, &__view_ops,
+                                         PQntuples(result), PQnfields(result))) {
+                    result = NULL; /* The view now owns this PGresult. */
+                } else {
+                    dbresult_view_set_error(view, "Out of memory");
+                }
+            }
+            break;
+        case PGRES_FATAL_ERROR:
+        case PGRES_NONFATAL_ERROR:
+        case PGRES_EMPTY_QUERY:
+        case PGRES_BAD_RESPONSE:
+        case PGRES_PIPELINE_ABORTED:
+            dbresult_view_set_error(view, PQresultErrorMessage(result));
+            break;
+        default:
+            /* COPY requires a different protocol, and pipeline mode is outside
+             * this API. Close instead of leaving a busy connection in the pool.
+             * dbinstance will reconnect and invalidate prepared metadata.
+             */
+            dbresult_view_set_error(view, "Unsupported PostgreSQL result status");
+            PQclear(result);
+            PQfinish(pg->connection);
+            pg->connection = NULL;
+            dbresult_view_clear(view);
+            return;
+        }
+        PQclear(result);
+    }
+    if (PQstatus(pg->connection) != CONNECTION_OK)
+        dbresult_view_set_error(view, PQerrorMessage(pg->connection));
+    if (!received)
+        dbresult_view_set_error(view, "PostgreSQL returned no query result");
+    if (dbresult_view_error(view)) dbresult_view_clear(view);
+    else dbresult_view_set_ok(view);
+}
+
+void postgresql_execute_params_view(dbconnection_t* connection, const char* sql,
+                                    array_t* params, dbresult_view_t* view) {
+    if (!__view_protocol_ready((postgresqlconnection_t*)connection, view)) return;
+    const char* error = NULL;
+    if (!__send_params((postgresqlconnection_t*)connection, sql, params, &error)) {
+        dbresult_view_set_error(view, error);
+        return;
+    }
+    postgresql_process_result_view(connection, view);
 }
 
 db_t* postgresql_load(const char* database_id, const json_token_t* token_array) {

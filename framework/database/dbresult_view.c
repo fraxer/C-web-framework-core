@@ -95,7 +95,7 @@ int dbresult_view_query_next(dbresult_view_t* view) {
     return 1;
 }
 
-void dbresult_view_free(dbresult_view_t* view) {
+void dbresult_view_clear(dbresult_view_t* view) {
     if (!view) return;
     dbresult_view_query_t* query = view->first;
     while (query) {
@@ -104,6 +104,13 @@ void dbresult_view_free(dbresult_view_t* view) {
         free(query);
         query = next;
     }
+    view->first = view->last = view->current = NULL;
+    view->ok = 0;
+}
+
+void dbresult_view_free(dbresult_view_t* view) {
+    if (!view) return;
+    dbresult_view_clear(view);
     free(view->error);
     free(view);
 }

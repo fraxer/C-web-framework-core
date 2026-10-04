@@ -3,6 +3,7 @@
 
 #include "array.h"
 #include "database.h"
+#include "dbresult.h"
 #include "str.h"
 #include "model.h"
 
@@ -12,6 +13,12 @@ dbhost_t* dbhost(const char* dbid);
 dbresult_t* dbquery(const char* dbid, const char* format, array_t* params);
 dbresult_t* dbprepared(const char* dbid, const char* name, const char* sql, array_t* params);
 dbresult_t* dbquery_params(const char* dbid, const char* sql, array_t* ordered_params);
+/* PostgreSQL positional parameters, text results, no server-side PREPARE.
+ * Returns an owned read-only view; unsupported drivers return a failed view
+ * with an explicit error. Invalid SQL/id or unavailable connections also fail.
+ * NULL is reserved for failure to allocate the empty view itself.
+ */
+dbresult_view_t* dbquery_params_view(const char* dbid, const char* sql, array_t* ordered_params);
 dbresult_t* dbtable_exist(const char* dbid, const char* table);
 dbresult_t* dbtable_migration_create(const char* dbid, const char* table);
 dbresult_t* dbbegin(const char* dbid, transaction_level_e level);

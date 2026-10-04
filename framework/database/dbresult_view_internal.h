@@ -20,5 +20,7 @@ int dbresult_view_append(dbresult_view_t*, void* owner,
 void dbresult_view_set_ok(dbresult_view_t*);
 /* First error wins. Copies text before the driver clears the source. */
 void dbresult_view_set_error(dbresult_view_t*, const char*);
+/* Release partial owners while preserving the first error. */
+void dbresult_view_clear(dbresult_view_t*);
 
 #endif

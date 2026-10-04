@@ -11,6 +11,10 @@
 #include "dbquery.h"
 #include "model.h"
 #include "dbresult.h"
+#include "dbresult_view_internal.h"
+#ifdef PostgreSQL_FOUND
+#include "postgresql_view_internal.h"
+#endif
 
 /**
  * SQL parser state for tracking strings, comments, and context
@@ -324,6 +328,33 @@ dbresult_t* dbquery_params(const char* dbid, const char* sql, array_t* ordered_p
     }
 
     return connection->execute_params(connection, sql, ordered_params);
+}
+
+dbresult_view_t* dbquery_params_view(const char* dbid, const char* sql, array_t* params) {
+    dbresult_view_t* view = dbresult_view_create();
+    if (!view) return NULL;
+    if (!dbid || !sql) {
+        dbresult_view_set_error(view, "Database ID and SQL are required");
+        return view;
+    }
+    dbinstance_t* instance = dbinstance(dbid);
+    if (!instance) {
+        dbresult_view_set_error(view, "Database connection unavailable");
+        return view;
+    }
+    dbconnection_t* connection = instance->connection;
+    dbinstance_free(instance);
+#ifdef PostgreSQL_FOUND
+    if (postgresql_view_supported(connection)) {
+        postgresql_execute_params_view(connection, sql, params, view);
+        return view;
+    }
+#else
+    (void)connection;
+    (void)params;
+#endif
+    dbresult_view_set_error(view, "Read-only result views are not supported by this database driver");
+    return view;
 }
 
 dbresult_t* dbtable_exist(const char* dbid, const char* table) {
