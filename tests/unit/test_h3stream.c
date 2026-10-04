@@ -6,8 +6,11 @@
 #include "httprequest.h"
 #include "qpack.h"
 #include "quicmemory.h"
+#include "appconfig.h"
 
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 /* The per-stream receive state machine (docs/http3/05-http3.md §6.2). Frames are
  * built here with the codec's own encoder so the bytes are known-good; feeding
@@ -529,4 +532,52 @@ TEST(test_h3stream_section_ack_accounting) {
 
     qpack_decoder_free(d);
     qpack_encoder_free(enc);
+}
+
+TEST(test_h3stream_body_storage_threshold) {
+    TEST_SUITE("HTTP/3 body storage");
+    size_t old_limit = env()->main.client_max_body_size;
+    env()->main.client_max_body_size = 2 * BODY_STORE_FILE_THRESHOLD;
+    for (int known = 0; known < 2; ++known) {
+        qpack_encoder_t* enc = qpack_encoder_create(0, 0);
+        qpack_decoder_t* dec = qpack_decoder_create(0, 0);
+        h3stream_t* st = h3stream_create(NULL, 0);
+        const qpack_header_t fields[] = {QF(":method", "POST"), QF(":path", "/upload"),
+            QF(":scheme", "https"), QF(":authority", "example.com"), QF("content-length", "1048577")};
+        uint8_t hdr[256], payload[4096], wire[4105];
+        size_t n = headers_frame(enc, fields, known ? 5 : 4, hdr, sizeof(hdr));
+        TEST_ASSERT_EQUAL(H3STREAM_REQUEST_READY, feed(st, dec, hdr, n, 0), "headers");
+        memset(payload, 'x', sizeof(payload));
+        size_t sent = 0;
+        while (sent < BODY_STORE_FILE_THRESHOLD + 1) {
+            size_t count = BODY_STORE_FILE_THRESHOLD + 1 - sent;
+            if (count > sizeof(payload)) count = sizeof(payload);
+            if (sent < BODY_STORE_FILE_THRESHOLD - 1 && sent + count >= BODY_STORE_FILE_THRESHOLD - 1)
+                count = BODY_STORE_FILE_THRESHOLD - 1 - sent;
+            n = data_frame(payload, count, wire, sizeof(wire));
+            TEST_ASSERT_EQUAL(H3STREAM_BODY_CHUNK, feed(st, dec, wire, n, 0), "DATA chunk");
+            sent += count;
+            TEST_ASSERT_EQUAL(sent, st->req_body_len, "unframed bytes counted");
+            if (!known && sent == BODY_STORE_FILE_THRESHOLD - 1)
+                TEST_ASSERT_EQUAL(BODY_STORE_MEMORY, st->request->payload_.incoming.state, "below threshold");
+        }
+        TEST_ASSERT_EQUAL(BODY_STORE_FILE, st->request->payload_.incoming.state, "threshold reached across frames");
+        TEST_ASSERT_EQUAL(H3STREAM_DONE, feed(st, dec, NULL, 0, 1), "matching length completes");
+        char* copy = st->request->get_payload(st->request);
+        TEST_ASSERT_NOT_NULL(copy, "body readable");
+        if (copy) {
+            TEST_ASSERT_EQUAL('x', copy[0], "first byte");
+            TEST_ASSERT_EQUAL('x', copy[BODY_STORE_FILE_THRESHOLD], "last byte");
+        }
+        free(copy);
+        int fd = st->request->payload_.incoming.fd;
+        char* path = strdup(st->request->payload_.incoming.path);
+        h3stream_free(st);
+        TEST_ASSERT_EQUAL(-1, fcntl(fd, F_GETFD), "stream cleanup closes fd");
+        if (path) TEST_ASSERT_EQUAL(-1, access(path, F_OK), "stream cleanup removes file");
+        free(path);
+        qpack_encoder_free(enc);
+        qpack_decoder_free(dec);
+    }
+    env()->main.client_max_body_size = old_limit;
 }

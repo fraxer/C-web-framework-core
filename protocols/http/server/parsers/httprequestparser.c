@@ -459,8 +459,10 @@ int __parse_payload(httprequestparser_t* parser) {
         return __clear_and_return(parser, HTTP1PARSER_ERROR);
     }
 
+    if (parser->content_saved_length > parser->content_length)
+        return __clear_and_return(parser, HTTP1PARSER_ERROR);
+
     if (string_len + parser->content_saved_length > parser->content_length) {
-        // printf("has_data_for_next_request: %ld > %ld\n", string_len + parser->content_saved_length, parser->content_length);
         string_len = parser->content_length - parser->content_saved_length;
         has_data_for_next_request = 1;
     }
@@ -468,20 +470,20 @@ int __parse_payload(httprequestparser_t* parser) {
     if (parser->content_saved_length + string_len > env()->main.client_max_body_size)
         return __clear_and_return(parser, HTTP1PARSER_PAYLOAD_LARGE);
 
-    if (request->payload_.file.fd < 0) {
-        request->payload_.path = create_tmppath(env()->main.tmp);
-        if (request->payload_.path == NULL)
-            return __clear_and_return(parser, HTTP1PARSER_ERROR);
+    body_store_t* incoming = &request->payload_.incoming;
+    if (incoming->state == BODY_STORE_EMPTY) {
+        if (parser->content_length > env()->main.client_max_body_size)
+            return __clear_and_return(parser, HTTP1PARSER_PAYLOAD_LARGE);
 
-        request->payload_.file.fd = mkstemp(request->payload_.path);
-        if (request->payload_.file.fd == -1)
+        incoming->max_size = env()->main.client_max_body_size;
+        if (!body_store_prepare(incoming, parser->content_length, env()->main.tmp))
             return __clear_and_return(parser, HTTP1PARSER_ERROR);
     }
 
-    parser->content_saved_length += string_len;
-
-    if (!request->payload_.file.append_content(&request->payload_.file, &parser->buffer[parser->pos], string_len))
+    if (!body_store_append(incoming, &parser->buffer[parser->pos], string_len, env()->main.tmp))
         return __clear_and_return(parser, HTTP1PARSER_ERROR);
+
+    parser->content_saved_length += string_len;
 
     if (has_data_for_next_request) {
         parser->pos += string_len;

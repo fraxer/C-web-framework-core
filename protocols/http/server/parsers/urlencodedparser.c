@@ -1,4 +1,6 @@
 #include <unistd.h>
+#include <errno.h>
+#include <stdint.h>
 
 #include "urlencodedparser.h"
 
@@ -25,7 +27,13 @@ void urlencodedparser_init(urlencodedparser_t* parser, int payload_fd, size_t pa
     parser->field_count = 0;
     parser->limit_reached = 0;
     parser->payload_fd = payload_fd;
+    parser->payload = NULL;
     parser->error = NULL;
+}
+
+void urlencodedparser_init_payload(urlencodedparser_t* parser, const http_payload_t* payload) {
+    urlencodedparser_init(parser, -1, http_payload_size(payload));
+    parser->payload = payload;
 }
 
 int urlencodedparser_parse(urlencodedparser_t* parser, char* buffer, size_t buffer_size) {
@@ -184,6 +192,10 @@ static int __urlencodedparser_set_empty_value(urlencodedparser_t* parser) {
 }
 
 static int __urlencodedparser_set_field(urlencodedparser_t* parser, size_t offset, size_t size, urlencoded_value_t* result) {
+    if (size == SIZE_MAX || offset > parser->payload_size || size > parser->payload_size - offset) {
+        parser->error = "urlencoded parser: invalid field range";
+        return 0;
+    }
     char* value = malloc(size + 1);
     if (value == NULL) {
         parser->error = "urlencoded parser: failed to allocate buffer for field value";
@@ -191,15 +203,29 @@ static int __urlencodedparser_set_field(urlencodedparser_t* parser, size_t offse
     }
 
     size_t got = 0;
-    while (got < size) {
-        const ssize_t r = pread(parser->payload_fd, value + got, size - got, (off_t)(offset + got));
-        if (r < 0) {
+    if (parser->payload != NULL) {
+        if (!http_payload_read(parser->payload, offset, value, size)) {
             parser->error = "urlencoded parser: failed to read payload data";
             free(value);
             return 0;
         }
-        if (r == 0)
-            break;
+        got = size;
+    }
+    while (got < size) {
+        const ssize_t r = pread(parser->payload_fd, value + got, size - got, (off_t)(offset + got));
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+
+            parser->error = "urlencoded parser: failed to read payload data";
+            free(value);
+            return 0;
+        }
+        if (r == 0) {
+            parser->error = "urlencoded parser: truncated payload data";
+            free(value);
+            return 0;
+        }
 
         got += (size_t)r;
     }

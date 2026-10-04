@@ -8,6 +8,34 @@
 #include "arena.h"
 #include "httpcommon.h"
 
+static body_store_t payload_file_reader(const http_payload_t* payload) {
+    /* Borrow the legacy fd solely for reading; never reset this view. */
+    return (body_store_t){
+        .state = BODY_STORE_FILE,
+        .size = payload->file.size,
+        .fd = payload->file.fd
+    };
+}
+
+size_t http_payload_size(const http_payload_t* payload) {
+    return payload->incoming.state != BODY_STORE_EMPTY
+        ? payload->incoming.size : payload->file.size;
+}
+
+int http_payload_read(const http_payload_t* payload, size_t offset, void* data, size_t size) {
+    if (payload->incoming.state != BODY_STORE_EMPTY || payload->incoming.failed)
+        return body_store_read(&payload->incoming, offset, data, size);
+    body_store_t reader = payload_file_reader(payload);
+    return body_store_read(&reader, offset, data, size);
+}
+
+char* http_payload_copy(const http_payload_t* payload, size_t offset, size_t size) {
+    if (payload->incoming.state != BODY_STORE_EMPTY || payload->incoming.failed)
+        return body_store_copy(&payload->incoming, offset, size);
+    body_store_t reader = payload_file_reader(payload);
+    return body_store_copy(&reader, offset, size);
+}
+
 http_header_t* http_header_create(const char* key, size_t key_length, const char* value, size_t value_length) {
     http_header_t* header = malloc(sizeof * header);
     if (header == NULL) return NULL;

@@ -217,10 +217,8 @@ static int __fuzz_worker(void) {
 
 #if FUZZ_TARGET == FUZZ_URLENCODED || FUZZ_TARGET == FUZZ_MULTIPART
 
-/* Both body parsers scan a buffer but read the field values back out of a file
- * descriptor with pread, so the target needs a real, seekable one. memfd is
- * what tests/unit/test_multipartparser.c uses for the same reason, and at
- * fuzzing rates it matters that nothing touches a filesystem. */
+/* Legacy fd entry points use a real seekable memfd; the incoming entry points
+ * use an owned body store. Both must produce the same fields and offsets. */
 static int __fuzz_payload_fd(const uint8_t* data, size_t size) {
     const int fd = memfd_create("fuzz_payload", 0);
     if (fd < 0) return -1;
@@ -1103,15 +1101,14 @@ static uint64_t __h3r_request_digest(uint64_t h, httprequest_t* r) {
     if (r->path != NULL) h = __fuzz_fnv(h, r->path, r->path_length);
     h = __fuzz_fnv_headers(h, r->header_);
     h = __fuzz_fnv_headers(h, r->trailer_);
-    const file_t* body = &r->payload_.file;
-    if (body->fd >= 0) {
-        char chunk[4096];
-        for (off_t off = 0;;) {
-            const ssize_t n = pread(body->fd, chunk, sizeof chunk, off);
-            if (n <= 0) break;
-            h = __fuzz_fnv(h, chunk, (size_t)n);
-            off += n;
-        }
+    const size_t size = http_payload_size(&r->payload_);
+    char chunk[4096];
+    for (size_t off = 0; off < size;) {
+        size_t count = size - off;
+        if (count > sizeof(chunk)) count = sizeof(chunk);
+        if (!http_payload_read(&r->payload_, off, chunk, count)) __builtin_trap();
+        h = __fuzz_fnv(h, chunk, count);
+        off += count;
     }
     return h;
 }
@@ -5993,9 +5990,31 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     urlencodedparser_t parser;
     urlencodedparser_init(&parser, fd, size);
+    int legacy_ok = urlencodedparser_parse(&parser, buffer, size);
 
-    (void)urlencodedparser_parse(&parser, buffer, size);
-
+    http_payload_t payload = {.file = file_alloc()};
+    body_store_init(&payload.incoming, SIZE_MAX);
+    if (body_store_prepare(&payload.incoming, size, "/tmp") &&
+        body_store_append(&payload.incoming, data, size, "/tmp")) {
+        urlencodedparser_t incoming;
+        urlencodedparser_init_payload(&incoming, &payload);
+        int incoming_ok = urlencodedparser_parse(&incoming, buffer, size);
+        if (legacy_ok != incoming_ok) __builtin_trap();
+        const http_payloadfield_t* a = parser.field;
+        const http_payloadfield_t* b = incoming.field;
+        while (a && b) {
+            if (a->key_length != b->key_length || a->value_length != b->value_length ||
+                (a->key == NULL) != (b->key == NULL) ||
+                (a->value == NULL) != (b->value == NULL) ||
+                (a->key_length && memcmp(a->key, b->key, a->key_length)) ||
+                (a->value_length && memcmp(a->value, b->value, a->value_length))) __builtin_trap();
+            a = a->next;
+            b = b->next;
+        }
+        if (a || b) __builtin_trap();
+        urlencodedparser_clear(&incoming);
+    }
+    body_store_reset(&payload.incoming);
     urlencodedparser_clear(&parser);
     free(buffer);
     close(fd);
@@ -6008,11 +6027,12 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 /* Parses `data` delivered in reads of `fixed` bytes, or -- with fixed 0 and a
  * seed -- of sizes 1..64 from a small PRNG, or whole with both 0. Returns a
  * digest of the result and of every part the parser produced. */
-static uint64_t __fuzz_multipart_run(int fd, const char* boundary,
+static uint64_t __fuzz_multipart_run(int fd, const http_payload_t* payload, const char* boundary,
                                      const uint8_t* data, size_t size,
                                      size_t fixed, uint64_t seed) {
     multipartparser_t parser;
-    multipartparser_init(&parser, fd, boundary);
+    if (payload) multipartparser_init_payload(&parser, payload, boundary);
+    else multipartparser_init(&parser, fd, boundary);
 
     multipart_res_e result = MP_RES_PARTIAL;
     uint64_t rng = seed * 0x9E3779B97F4A7C15ULL + 1;
@@ -6098,10 +6118,20 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
      * Each read gets its own exact-size buffer that is freed after the call,
      * the way httprequest.c reuses one: a part that kept a pointer into an
      * earlier read shows up as a use-after-free, not as a quiet mismatch. */
-    const uint64_t whole = __fuzz_multipart_run(fd, boundary, data, size, 0, 0);
-    const uint64_t bytes = __fuzz_multipart_run(fd, boundary, data, size, 1, 0);
-    const uint64_t steps = __fuzz_multipart_run(fd, boundary, data, size, 0, blen + 1);
+    const uint64_t whole = __fuzz_multipart_run(fd, NULL, boundary, data, size, 0, 0);
+    const uint64_t bytes = __fuzz_multipart_run(fd, NULL, boundary, data, size, 1, 0);
+    const uint64_t steps = __fuzz_multipart_run(fd, NULL, boundary, data, size, 0, blen + 1);
     if (whole != bytes || whole != steps) __builtin_trap();
+    http_payload_t payload = {.file = file_alloc()};
+    body_store_init(&payload.incoming, SIZE_MAX);
+    if (body_store_prepare(&payload.incoming, size, "/tmp") &&
+        body_store_append(&payload.incoming, data, size, "/tmp")) {
+        const uint64_t memory = __fuzz_multipart_run(-1, &payload, boundary, data, size, 0, 0);
+        const uint64_t memory_steps = __fuzz_multipart_run(-1, &payload, boundary, data, size, 0, blen + 1);
+        if (whole != memory || whole != memory_steps) __builtin_trap();
+    }
+    body_store_reset(&payload.incoming);
+
 
     free(boundary);
     close(fd);
@@ -6159,7 +6189,9 @@ static uint64_t __fuzz_request_digest(uint64_t h, httprequest_t* request,
         }
 
     const file_t* body = &request->payload_.file;
-    const size_t body_size = body->fd >= 0 ? body->size : 0;
+    const body_store_t* incoming = &request->payload_.incoming;
+    const int stored = incoming->state != BODY_STORE_EMPTY;
+    const size_t body_size = stored ? incoming->size : (body->fd >= 0 ? body->size : 0);
     if (body_size != expected) __builtin_trap();
 
     h = __fuzz_fnv(h, &request->method, sizeof request->method);
@@ -6176,7 +6208,9 @@ static uint64_t __fuzz_request_digest(uint64_t h, httprequest_t* request,
     char chunk[4096];
     for (size_t off = 0; off < body_size;) {
         const size_t want = body_size - off < sizeof chunk ? body_size - off : sizeof chunk;
-        const ssize_t n = pread(body->fd, chunk, want, (off_t)off);
+        const ssize_t n = stored
+            ? (body_store_read(incoming, off, chunk, want) ? (ssize_t)want : -1)
+            : pread(body->fd, chunk, want, (off_t)off);
         if (n <= 0) __builtin_trap();
         h = __fuzz_fnv(h, chunk, (size_t)n);
         off += (size_t)n;

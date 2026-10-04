@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <sys/sendfile.h>
 #include <errno.h>
+#include <stdint.h>
 
 #include "file.h"
 #include "helpers.h"
@@ -54,6 +55,7 @@ int httprequest_set_payload_file_content(httprequest_t*, const file_content_t*);
 
 void httprequest_init_payload(httprequest_t* request) {
     request->payload_.pos = 0;
+    body_store_init(&request->payload_.incoming, SIZE_MAX);
     request->payload_.file = file_alloc();
     request->payload_.path = NULL;
     request->payload_.part = NULL;
@@ -267,9 +269,9 @@ const char* httprequest_cookie(httprequest_t* request, const char* key) {
 }
 
 void httprequest_payload_free(http_payload_t* payload) {
-    if (payload->file.fd < 0) return;
-
-    payload->file.close(&payload->file);
+    body_store_reset(&payload->incoming);
+    if (payload->file.fd >= 0)
+        payload->file.close(&payload->file);
     if (payload->path != NULL)
         unlink(payload->path);
 
@@ -308,29 +310,7 @@ char* httprequest_payloadf(httprequest_t* request, const char* field) {
 }
 
 char* httprequest_plain_get_data(httprequest_t* request) {
-    char* content = malloc(request->payload_.file.size + 1);
-    if (content == NULL) return 0;
-
-    size_t total = 0;
-    while (total < request->payload_.file.size) {
-        ssize_t r = pread(request->payload_.file.fd, content + total, request->payload_.file.size - total,
-                          (off_t)total);
-        if (r < 0) {
-            log_error("httprequest: payload read error: %s\n", strerror(errno));
-            free(content);
-            return 0;
-        }
-        if (r == 0) {
-            log_error("httprequest: payload truncated (%zu of %zu bytes)\n", total, request->payload_.file.size);
-            free(content);
-            return 0;
-        }
-        total += (size_t)r;
-    }
-
-    content[total] = 0;
-
-    return content;
+    return http_payload_copy(&request->payload_, 0, http_payload_size(&request->payload_));
 }
 
 http_payloadpart_t* httprequest_multipart_part(httprequest_t* request, const char* field) {
@@ -359,28 +339,7 @@ char* httprequest_multipart_get_data(httprequest_t* request, const char* field) 
 }
 
 char* httprequest_payload_part_read(httprequest_t* request, const http_payloadpart_t* part) {
-    char* buffer = malloc(part->size + 1);
-    if (buffer == NULL) return NULL;
-
-    size_t total = 0;
-    while (total < part->size) {
-        ssize_t r = pread(request->payload_.file.fd, buffer + total, part->size - total,
-                          (off_t)part->offset + (off_t)total);
-        if (r < 0) {
-            log_error("httprequest: payload read error: %s\n", strerror(errno));
-            free(buffer);
-            return NULL;
-        }
-        if (r == 0) {
-            log_error("httprequest: payload part truncated (%zu of %zu bytes)\n", total, part->size);
-            free(buffer);
-            return NULL;
-        }
-        total += (size_t)r;
-    }
-
-    buffer[part->size] = 0;
-    return buffer;
+    return http_payload_copy(&request->payload_, part->offset, part->size);
 }
 
 char* httprequest_urlencoded_get_data(httprequest_t* request, const char* field) {
@@ -421,6 +380,21 @@ file_content_t httprequest_payload_filef(httprequest_t* request, const char* fie
         return file_content;
     }
     
+    if (request->payload_.type == PLAIN && field == NULL) {
+        if (!httprequest_create_payload_file(&request->payload_)) {
+            file_content.ok = 0;
+            file_content.fd = -1;
+            return file_content;
+        }
+
+        file_content.ok = 1;
+        file_content.fd = request->payload_.file.fd;
+        file_content.offset = 0;
+        file_content.size = request->payload_.file.size;
+
+        return file_content;
+    }
+
     /* part/field share a union keyed by type; reading part for a non-multipart
      * payload reinterprets an http_payloadfield_t* as an http_payloadpart_t*
      * (type confusion → wild dereference). Only multipart has file parts. */
@@ -449,6 +423,11 @@ file_content_t httprequest_payload_filef(httprequest_t* request, const char* fie
     }
 
     file_content.ok = !(field != NULL && filename == NULL);
+    if (file_content.ok && !httprequest_create_payload_file(&request->payload_)) {
+        file_content.ok = 0;
+        file_content.fd = -1;
+        return file_content;
+    }
     file_content.fd = request->payload_.file.fd;
     file_content.offset = part->offset;
     file_content.size = part->size;
@@ -462,6 +441,15 @@ json_doc_t* httprequest_payload_json(httprequest_t* request) {
 }
 
 json_doc_t* httprequest_payload_jsonf(httprequest_t* request, const char* field) {
+    body_store_t* incoming = &request->payload_.incoming;
+    if (field == NULL && incoming->state == BODY_STORE_MEMORY) {
+        if (!httprequest_payload_parse(request))
+            return NULL;
+
+        if (request->payload_.type == PLAIN)
+            return json_parse(incoming->data);
+    }
+
     char* payload = httprequest_payloadf(request, field);
     if (payload == NULL) return NULL;
 
@@ -489,95 +477,57 @@ int httprequest_payload_parse_multipart(httprequest_t* request, const char* head
     formdataparser_t fdparser;
     formdataparser_init(&fdparser, "multipart/form-data");
     formdataparser_parse(&fdparser, header_value, header_value_length);
-
     const char* boundary = formdataparser_find_field(&fdparser, "boundary");
     if (boundary == NULL) {
         formdataparser_clear(&fdparser);
         return 0;
     }
 
-    multipartparser_t mparser;
-    multipartparser_init(&mparser, request->payload_.file.fd, boundary);
-
-    size_t buffer_size = 16384;
-    char* buffer = malloc(buffer_size);
-    if (buffer == NULL) {
-        formdataparser_clear(&fdparser);
-        return 0;
-    }
-
-    lseek(request->payload_.file.fd, 0, SEEK_SET);
-    multipart_res_e res = MP_RES_ERROR;
-    while (1) {
-        ssize_t r = read(request->payload_.file.fd, buffer, buffer_size);
-        if (r < 0) {
-            log_error("httprequest: multipart payload read error\n");
-            free(buffer);
-            formdataparser_clear(&fdparser);
-            multipartparser_clear(&mparser);
-            lseek(request->payload_.file.fd, 0, SEEK_SET);
-            return 0;
-        }
-
-        if (r == 0) break;
-
-        res = multipartparser_parse(&mparser, buffer, r);
-        if (res == MP_RES_ERROR) {
-            log_error("httprequest: multipart payload parse error. %s\n", mparser.error);
+    multipartparser_t parser;
+    multipartparser_init_payload(&parser, &request->payload_, boundary);
+    char buffer[16384];
+    size_t size = http_payload_size(&request->payload_);
+    multipart_res_e result = MP_RES_ERROR;
+    for (size_t offset = 0; offset < size;) {
+        size_t count = size - offset;
+        if (count > sizeof(buffer)) count = sizeof(buffer);
+        if (!http_payload_read(&request->payload_, offset, buffer, count)) {
+            result = MP_RES_ERROR;
             break;
         }
+        result = multipartparser_parse(&parser, buffer, count);
+        /* The closing boundary may end before the last read block. The
+         * remaining CRLF/epilogue is not another multipart part. */
+        if (result != MP_RES_PARTIAL) break;
+        offset += count;
     }
-
-    free(buffer);
     formdataparser_clear(&fdparser);
-
-    lseek(request->payload_.file.fd, 0, SEEK_SET);
-
-    if (res != MP_RES_DONE) {
-        log_error("httprequest: multipart payload parse error. %s\n", mparser.error);
-        multipartparser_clear(&mparser);
+    if (result != MP_RES_DONE) {
+        multipartparser_clear(&parser);
         return 0;
     }
-
     request->payload_.type = MULTIPART;
-    request->payload_.part = multipartparser_part(&mparser);
-
+    request->payload_.part = multipartparser_part(&parser);
     return 1;
 }
 
 int httprequest_payload_parse_urlencoded(httprequest_t* request) {
-    const size_t buffer_size = 16384;
-    char buffer[buffer_size];
-
-    const off_t payload_size = request->payload_.file.size;
     urlencodedparser_t parser;
-    urlencodedparser_init(&parser, request->payload_.file.fd, payload_size);
-
-    off_t offset = 0;
-    while (offset < payload_size) {
-        ssize_t r = pread(request->payload_.file.fd, buffer, buffer_size, offset);
-        if (r < 0) {
-            log_error("httprequest: urlencoded payload parse error\n");
+    urlencodedparser_init_payload(&parser, &request->payload_);
+    char buffer[16384];
+    size_t size = http_payload_size(&request->payload_);
+    for (size_t offset = 0; offset < size;) {
+        size_t count = size - offset;
+        if (count > sizeof(buffer)) count = sizeof(buffer);
+        if (!http_payload_read(&request->payload_, offset, buffer, count) ||
+            !urlencodedparser_parse(&parser, buffer, count)) {
             urlencodedparser_clear(&parser);
             return 0;
         }
-        if (r == 0) {
-            log_info("httprequest: urlencoded payload truncated (file smaller than declared)\n");
-            break;
-        }
-
-        if (!urlencodedparser_parse(&parser, buffer, r)) {
-            log_error("httprequest: urlencoded payload parse error: %s\n", parser.error);
-            urlencodedparser_clear(&parser);
-            return 0;
-        }
-
-        offset += (off_t)r;
+        offset += count;
     }
-
     request->payload_.type = URLENCODED;
     request->payload_.field = urlencodedparser_field(&parser);
-
     return 1;
 }
 
@@ -588,7 +538,9 @@ int httprequest_payload_parse_plain(httprequest_t* request) {
 }
 
 int httprequest_payload_parse(httprequest_t* request) {
-    if (request->payload_.file.fd < 0) return 0;
+    if (request->payload_.incoming.failed) return 0;
+    if (request->payload_.file.fd < 0 &&
+        request->payload_.incoming.state == BODY_STORE_EMPTY) return 0;
     if (request->payload_.type == MULTIPART && request->payload_.part != NULL) return 1;
     if (request->payload_.type == URLENCODED && request->payload_.field != NULL) return 1;
     if (request->payload_.type == PLAIN) return 1;
@@ -756,7 +708,30 @@ int httprequest_create_payload_file(http_payload_t* payload) {
      * appconfig exists. Keep payload spilling functional in that state. */
     env_t* current_env = env();
     const char* tmp = current_env != NULL && current_env->main.tmp != NULL
-                      ? current_env->main.tmp : "/tmp";
+                      ? current_env->main.tmp
+                      : "/tmp";
+    if (payload->incoming.failed)
+        return 0;
+
+    if (payload->file.fd >= 0)
+        return 1;
+
+    if (payload->incoming.state != BODY_STORE_EMPTY) {
+        if (!body_store_materialize(&payload->incoming, tmp))
+            return 0;
+
+        /* Transfer ownership to the public file representation.
+         * No fd/path is shared with the store, so reset closes it once. */
+        payload->file.fd = payload->incoming.fd;
+        payload->file.size = payload->incoming.size;
+        payload->path = payload->incoming.path;
+        payload->incoming.fd = -1;
+        payload->incoming.path = NULL;
+        body_store_reset(&payload->incoming);
+
+        return 1;
+    }
+
     payload->path = create_tmppath(tmp);
     if (payload->path == NULL)
         return 0;

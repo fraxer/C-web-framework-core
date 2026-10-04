@@ -146,7 +146,7 @@ void h3stream_qpack_unblock(h3stream_t* st) {
     h3stream_qpack_deferred_clear(st);
 }
 
-/* Spool a DATA chunk into the request's tmp-file payload, mirroring h2's
+/* Store a DATA chunk with the shared memory/file threshold, mirroring h2's
  * h2_body_append: the payload type is derived from Content-Type on demand, so
  * get_payload/get_payload_json/multipart behave identically under h3.
  *
@@ -163,12 +163,18 @@ static h3stream_status_e body_append(h3stream_t* st, const uint8_t* data, size_t
     if (cfg != NULL && st->req_body_len + len > cfg->main.client_max_body_size)
         return H3STREAM_ERR_BODY_TOO_LARGE;
 
-    http_payload_t* payload = &st->request->payload_;
-    if (payload->file.fd < 0)
-        if (!httprequest_create_payload_file(payload))
+    const char* tmp = cfg != NULL && cfg->main.tmp != NULL ? cfg->main.tmp : "/tmp";
+    body_store_t* incoming = &st->request->payload_.incoming;
+    if (incoming->state == BODY_STORE_EMPTY) {
+        incoming->max_size = cfg != NULL ? cfg->main.client_max_body_size : SIZE_MAX;
+        if (st->content_length >= 0 && (uint64_t)st->content_length > incoming->max_size)
+            return H3STREAM_ERR_BODY_TOO_LARGE;
+        if (st->content_length >= 0 &&
+            !body_store_prepare(incoming, (size_t)st->content_length, tmp))
             return H3STREAM_ERR_INTERNAL;
+    }
 
-    if (!payload->file.append_content(&payload->file, (const char*)data, len))
+    if (!body_store_append(incoming, data, len, tmp))
         return H3STREAM_ERR_INTERNAL;
 
     st->req_body_len += len;

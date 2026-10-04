@@ -1481,6 +1481,7 @@ int httpresponse_has_payload(httpresponse_t* response) {
 }
 
 void __httpresponse_payload_free(http_payload_t* payload) {
+    body_store_reset(&payload->incoming);
     /* path/boundary/part могли быть выделены и без открытого файла (например,
      * mkstemp не удался после create_tmppath) — освобождаем их всегда. */
     if (payload->file.fd > -1) {
@@ -1505,6 +1506,7 @@ void __httpresponse_payload_free(http_payload_t* payload) {
 
 void __httpresponse_init_payload(httpresponse_t* response) {
     response->payload_.pos = 0;
+    body_store_init(&response->payload_.incoming, SIZE_MAX);
     response->payload_.file = file_alloc();
     response->payload_.path = NULL;
     response->payload_.part = NULL;

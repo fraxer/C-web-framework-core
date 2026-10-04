@@ -996,3 +996,16 @@ TEST(test_real_world_search_query) {
     free_fields(head);
     close(fd);
 }
+
+TEST(test_urlencodedparser_truncated_field_fails) {
+    TEST_SUITE("URL-encoded parser - truncated field");
+    int fd = make_payload("a=1", 3);
+    TEST_REQUIRE(fd >= 0, "short actual file");
+    urlencodedparser_t parser;
+    urlencodedparser_init(&parser, fd, 5);
+    char wire[] = "a=123";
+    TEST_ASSERT(!urlencodedparser_parse(&parser, wire, 5), "short field read rejected");
+    TEST_ASSERT_NOT_NULL(parser.error, "read error recorded");
+    urlencodedparser_clear(&parser);
+    close(fd);
+}
