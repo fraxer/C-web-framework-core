@@ -20,6 +20,7 @@
 #            (skipped when MinIO is unreachable; REQUIRE_S3=1 makes that a
 #            failure)
 #   sendfile HTTP/TLS file responses, ranges, gzip, pipeline and buffered fallback
+#   bodymemory HTTP/1.1/2/3 and WebSocket body storage, interruption and resource drain
 #   ratelimit root static routes and fallback count missing files; refill and rate=0
 #   keepalive a quiet connection outlives the idle timeout, and does not
 #            without http3_keepalive_sec (both arms, ~90 s)
@@ -74,6 +75,10 @@
 #   H2WS_PYTHONPATH  where python-h2 lives, when it is not installed system-wide
 #   REQUIRE_H3SPEC fail instead of skip when h3spec is unavailable (default 0)
 #   REQUIRE_S3     fail instead of skip when MinIO is unreachable (default 0)
+#   BODY_SOAK_REQUESTS minimum mixed HTTP/WebSocket iterations (default 1000)
+#   BODY_SOAK_SECONDS minimum bodymemory soak duration (default 30)
+#   BODY_RSS_GROWTH_KB allowed post-warmup bodymemory RSS growth (default 16384)
+#   BODY_FD_LIMIT process fd cap for bodymemory failure tests (default 128)
 #   SOAK_REQUESTS requests in the soak stage (default 1000; release 10000)
 #   SOAK_RSS_GROWTH_KB allowed post-warmup RSS growth (default 16384)
 #   BENCH_BASELINE benchmark JSON produced with BENCH_RECORD
@@ -232,6 +237,18 @@ stage_sendfile() {
         record sendfile OK
     else
         record sendfile FAIL
+    fi
+}
+
+stage_bodymemory() {
+    say "bodymemory: incoming payload integration and resource drain"
+    if build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
+             -DINCLUDE_HTTP3=yes -DSANITIZE=none &&
+       "$CORE_DIR/tests/body_memory_integration.sh" "$CI_BUILD_DIR/limits" \
+             "$CI_BUILD_DIR/body-memory"; then
+        record bodymemory OK
+    else
+        record bodymemory FAIL
     fi
 }
 
@@ -713,7 +730,7 @@ JSON
     fi
 }
 
-ALL_STAGES=(noh3 h3unit config startup storage sendfile ratelimit keepalive limits soak affinity earlydata vn version2 ipv6 qlog priority benchmark asan tsan fuzz reload softreload hotreload h2ws h3spec)
+ALL_STAGES=(noh3 h3unit config startup storage sendfile bodymemory ratelimit keepalive limits soak affinity earlydata vn version2 ipv6 qlog priority benchmark asan tsan fuzz reload softreload hotreload h2ws h3spec)
 STAGES=("$@")
 if [ ${#STAGES[@]} -eq 0 ]; then
     STAGES=("${ALL_STAGES[@]}")
@@ -734,6 +751,7 @@ for stage in "${STAGES[@]}"; do
     startup) stage_startup ;;
     storage) stage_storage ;;
     sendfile) stage_sendfile ;;
+    bodymemory) stage_bodymemory ;;
     ratelimit) stage_ratelimit ;;
     keepalive) stage_keepalive ;;
     limits) stage_limits ;;
