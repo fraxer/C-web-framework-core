@@ -14,7 +14,8 @@ include_directories(
 )
 
 # --- Unit tests (no database required) ---
-file(GLOB UNIT_TEST_FILES "${CMAKE_CURRENT_SOURCE_DIR}/unit/test_*.c")
+set(UNIT_TEST_FILTER "test_*.c" CACHE STRING "Unit test source glob (default: all suites)")
+file(GLOB UNIT_TEST_FILES "${CMAKE_CURRENT_SOURCE_DIR}/unit/${UNIT_TEST_FILTER}")
 
 # QUIC / HTTP/3 / QPACK tests only exist in an h3 build: the symbols they call
 # are not linked into libcwfr_framework.so otherwise (framework_shared), so
@@ -74,10 +75,37 @@ if(BUILD_FUZZERS STREQUAL "yes" AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
     target_compile_options(string_alloc_tests PRIVATE -fno-sanitize-coverage=trace-pc)
 endif()
 
+# Fault injection only in a namespaced copy of the view, never in the shared
+# framework/libpq allocator. Keep these tests in the existing unit runner.
+list(REMOVE_ITEM UNIT_TEST_FILES "${CMAKE_CURRENT_SOURCE_DIR}/unit/test_dbresult_view.c")
+set(DB_VIEW_RENAMES "/* Generated test-only result view namespace. */\n")
+foreach(header dbresult.h dbresult_view_internal.h)
+    set(api_header "${CMAKE_CURRENT_SOURCE_DIR}/../framework/database/${header}")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${api_header}")
+    file(READ "${api_header}" api_text)
+    string(REGEX MATCHALL "dbresult_view_[A-Za-z0-9_]+[ \t\r\n]*\\(" api_functions "${api_text}")
+    foreach(function ${api_functions})
+        string(REGEX REPLACE "[ \t\r\n]*\\($" "" symbol "${function}")
+        string(APPEND DB_VIEW_RENAMES "#define ${symbol} cwfr_test_${symbol}\n")
+    endforeach()
+endforeach()
+set(DB_VIEW_NAMESPACE "${CMAKE_CURRENT_BINARY_DIR}/db_view_symbols.h")
+file(GENERATE OUTPUT "${DB_VIEW_NAMESPACE}" CONTENT "${DB_VIEW_RENAMES}")
+add_library(db_view_alloc_tests OBJECT
+    unit/test_dbresult_view.c ../framework/database/dbresult_view.c)
+target_include_directories(db_view_alloc_tests PRIVATE ../framework/database)
+target_compile_definitions(db_view_alloc_tests PRIVATE
+    TEST_DB_VIEW_ALLOC_FAILURES=1 calloc=cwfr_test_view_calloc strdup=cwfr_test_view_strdup)
+target_compile_options(db_view_alloc_tests PRIVATE -include ${DB_VIEW_NAMESPACE})
+if(BUILD_FUZZERS STREQUAL "yes" AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(db_view_alloc_tests PRIVATE -fno-sanitize-coverage=trace-pc)
+endif()
+
 add_executable(
     runner
     unit/runner.c
     $<TARGET_OBJECTS:string_alloc_tests>
+    $<TARGET_OBJECTS:db_view_alloc_tests>
     ${UNIT_TEST_FILES}
     ${QUIC_CLIENT_SOURCES}
     unit/mail_stubs.c

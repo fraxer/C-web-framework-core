@@ -113,3 +113,35 @@ TEST(test_dbresult_no_result_set) {
     TEST_ASSERT_NULL(dbresult_query_next(NULL), "query_next(NULL)");
     TEST_ASSERT_NULL(dbresult_col_name(NULL, 0), "col_name(NULL)");
 }
+
+TEST(test_dbresult_materialized_ownership) {
+    TEST_CASE("Legacy cells own mutable copies, distinguish NULL and preserve byte lengths");
+    dbresult_t* result = dbresult_create();
+    TEST_REQUIRE_NOT_NULL(result, "allocated");
+    dbresultquery_t* query = dbresult_query_create(3, 1);
+    TEST_REQUIRE_NOT_NULL(query, "table allocated");
+    result->query = result->current = query;
+    result->ok = 1;
+    char name[] = "value";
+    char bytes[] = {'a', 0, 'b'};
+    dbresult_query_field_insert(query, name, 0);
+    dbresult_query_value_insert(query, NULL, 0, 0, 0);
+    dbresult_query_value_insert(query, "", 0, 1, 0);
+    dbresult_query_value_insert(query, bytes, sizeof bytes, 2, 0);
+    name[0] = 'x';
+    bytes[0] = 'x';
+    TEST_ASSERT_STR_EQUAL("value", dbresult_col_name(result, 0), "name is independent copy");
+    db_table_cell_t* cell = dbresult_cell(result, 0, 0);
+    TEST_ASSERT(cell && !cell->value && cell->length == 0, "SQL NULL");
+    cell = dbresult_cell(result, 1, 0);
+    TEST_ASSERT(cell && cell->value && cell->length == 0, "empty differs from NULL");
+    cell = dbresult_cell(result, 2, 0);
+    TEST_REQUIRE_NOT_NULL(cell, "byte cell");
+    TEST_ASSERT(cell->value != bytes && cell->length == 3, "independent byte buffer");
+    TEST_ASSERT(!memcmp(cell->value, "a\0b", 3), "embedded NUL preserved");
+    cell->value[0] = 'z';
+    TEST_ASSERT(dbresult_cell(result, 2, 0)->value[0] == 'z', "legacy cell remains writable");
+    db_cell_free(cell);
+    TEST_ASSERT(cell->value == NULL && cell->length == 0, "independent cell cleanup remains supported");
+    dbresult_free(result);
+}

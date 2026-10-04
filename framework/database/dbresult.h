@@ -3,6 +3,30 @@
 
 #include "database.h"
 
+/* Read-only result, separate from the mutable materialized dbresult_t API.
+ * It owns each driver's result until dbresult_view_free(). Returned names and
+ * values must not be changed or freed; they survive cursor movement and later
+ * queries/connection closure. Concurrent reads after construction are allowed,
+ * but cursor changes and destruction require external synchronization.
+ */
+typedef struct dbresult_view dbresult_view_t;
+
+int dbresult_view_ok(const dbresult_view_t*);
+const char* dbresult_view_error(const dbresult_view_t*);
+int dbresult_view_rows(const dbresult_view_t*);
+int dbresult_view_cols(const dbresult_view_t*);
+const char* dbresult_view_col_name(const dbresult_view_t*, int col);
+/* Returns 1 for a valid cell, including SQL NULL (*value=NULL, *length=0).
+ * Empty strings have a non-NULL value and length 0. Invalid arguments/indices
+ * return 0 and reset any supplied outputs to NULL/0; no cursor is changed.
+ * Length is the driver's byte length, never inferred using strlen().
+ */
+int dbresult_view_cell(const dbresult_view_t*, int row, int col,
+                       const char** value, size_t* length);
+int dbresult_view_query_first(dbresult_view_t*);
+int dbresult_view_query_next(dbresult_view_t*);
+void dbresult_view_free(dbresult_view_t*);
+
 dbresult_t* dbresult_create(void);
 
 dbresultquery_t* dbresult_query_create(int, int);

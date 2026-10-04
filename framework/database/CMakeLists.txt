@@ -48,6 +48,7 @@ list(APPEND LIBS model)
 list(APPEND SOURCES database.c database.h)
 list(APPEND SOURCES dbquery.c dbquery.h)
 list(APPEND SOURCES dbresult.c dbresult.h)
+list(APPEND SOURCES dbresult_view.c dbresult_view_internal.h)
 list(APPEND SOURCES db.h)
 
 if(MySQL_FOUND AND INCLUDE_MYSQL STREQUAL yes)
