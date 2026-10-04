@@ -275,6 +275,7 @@ void httprequest_payload_free(http_payload_t* payload) {
     body_store_reset(&payload->incoming);
     if (payload->file.fd >= 0)
         payload->file.close(&payload->file);
+
     if (payload->path != NULL)
         unlink(payload->path);
 
@@ -382,7 +383,7 @@ file_content_t httprequest_payload_filef(httprequest_t* request, const char* fie
 
         return file_content;
     }
-    
+
     if (request->payload_.type == PLAIN && field == NULL) {
         if (!httprequest_create_payload_file(&request->payload_)) {
             file_content.ok = 0;

@@ -58,7 +58,6 @@ typedef enum {
 
 typedef struct http_payload {
     size_t pos;
-    /* Incoming server body. Client requests/responses retain file/path below. */
     body_store_t incoming;
     file_t file;
     char* path;
@@ -70,7 +69,6 @@ typedef struct http_payload {
     http_payload_type_e type;
 } http_payload_t;
 
-/* Range reads cover incoming stores and legacy client/file payloads alike. */
 size_t http_payload_size(const http_payload_t* payload);
 int http_payload_read(const http_payload_t* payload, size_t offset, void* data, size_t size);
 char* http_payload_copy(const http_payload_t* payload, size_t offset, size_t size);

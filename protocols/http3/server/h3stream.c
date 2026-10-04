@@ -169,6 +169,7 @@ static h3stream_status_e body_append(h3stream_t* st, const uint8_t* data, size_t
         incoming->max_size = cfg != NULL ? cfg->main.client_max_body_size : SIZE_MAX;
         if (st->content_length >= 0 && (uint64_t)st->content_length > incoming->max_size)
             return H3STREAM_ERR_BODY_TOO_LARGE;
+
         if (st->content_length >= 0 &&
             !body_store_prepare(incoming, (size_t)st->content_length, tmp))
             return H3STREAM_ERR_INTERNAL;
