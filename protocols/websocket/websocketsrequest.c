@@ -16,7 +16,10 @@ static void websocketsrequest_payload_free(websockets_payload_t*);
 static void websocketsrequest_reset(void* arg);
 
 void websockets_protocol_init_payload(websockets_protocol_t* protocol) {
-    body_store_init(&protocol->payload.incoming, SIZE_MAX);
+    const env_t* cfg = env();
+    body_store_init(&protocol->payload.incoming, SIZE_MAX,
+        cfg != NULL ? cfg->main.body_store.file_threshold : BODY_STORE_DEFAULT_FILE_THRESHOLD,
+        cfg != NULL ? cfg->main.body_store.mode : BODY_STORE_MODE_AUTO);
     protocol->payload.fd = -1;
     protocol->payload.path = NULL;
 }

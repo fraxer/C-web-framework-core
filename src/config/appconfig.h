@@ -4,6 +4,7 @@
 #include <stdbool.h>
 
 #include "array.h"
+#include "bodystore.h"
 #include "map.h"
 #include "json.h"
 #include "server.h"
@@ -42,11 +43,17 @@ typedef struct env_log {
 
 typedef struct i18n i18n_t;
 
+typedef struct env_body_store {
+    body_store_mode_t mode;
+    unsigned int file_threshold; /* bytes; auto mode spills at or above this */
+} env_body_store_t;
+
 typedef struct env_main {
     appconfig_reload_state_e reload;
     unsigned int workers;
     unsigned int threads;
     unsigned int client_max_body_size;
+    env_body_store_t body_store;
     char* tmp;
     env_gzip_str_t* gzip;
     env_log_t log;

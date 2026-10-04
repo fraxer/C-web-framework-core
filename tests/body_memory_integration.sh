@@ -19,7 +19,7 @@ with socket.socket() as s:
 PY
 )
 python3 - "$WORK_DIR" "$CORE_DIR" "$BUILD_DIR" "$PORT" <<'PY'
-import json,sys
+import json,sys,os
 work,core,build,port=sys.argv[1:]
 module=build+'/exec/handlers/tests/libbody_memory_module.so'
 routes={path:{'POST':{'file':module,'function':'body_check'}} for path in ['/body','/file','/json','/form']}
@@ -32,6 +32,11 @@ config={'main':{'workers':1,'threads':8,'reload':'hard','buffer_size':16384,'cli
  'http3':{'enabled':True,'port':int(port)},'http':{'routes':routes},
  'websockets':{'default':{'file':module,'function':'body_ws'},'routes':{'/body':{'POST':{'file':module,'function':'body_ws'}}}}}},
  'mimetypes':{'text/html':['html']}}
+body_store = {}
+if 'BODY_STORE_MODE' in os.environ: body_store['mode'] = os.environ['BODY_STORE_MODE']
+if 'BODY_FILE_THRESHOLD' in os.environ: body_store['file_threshold'] = int(os.environ['BODY_FILE_THRESHOLD'])
+if body_store: config['main']['body_store'] = body_store
+if 'BODY_STORE_CONFIG' in os.environ: config['main']['body_store'] = json.loads(os.environ['BODY_STORE_CONFIG'])
 open(work+'/config.json','w').write(json.dumps(config,indent=2)+'\n')
 PY
 server_pid=

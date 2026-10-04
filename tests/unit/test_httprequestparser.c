@@ -1,3 +1,4 @@
+#include "bodystore.h"
 #include "framework.h"
 #include "httprequestparser.h"
 #include "httpparsercommon.h"
@@ -29,7 +30,8 @@ static void init_test_appconfig(void) {
 
             // Initialize env
             test_appconfig->env.main.client_max_body_size = 10485760;  // 10MB
-            test_appconfig->env.main.tmp = "/tmp";
+            test_appconfig->env.main.body_store.file_threshold = BODY_STORE_DEFAULT_FILE_THRESHOLD;
+        test_appconfig->env.main.tmp = "/tmp";
             test_appconfig->env.main.log.enabled = false;
             test_appconfig->env.main.log.level = 0;
             test_appconfig->env.main.workers = 1;
@@ -2368,8 +2370,8 @@ TEST(test_httprequestparser_memory_json_without_tmp) {
 TEST(test_httprequestparser_body_storage_boundaries) {
     TEST_SUITE("HTTP Request Parser - body storage boundaries");
     setup_mock_domain();
-    const size_t sizes[] = {1, 200, 20480, BODY_STORE_FILE_THRESHOLD - 1,
-        BODY_STORE_FILE_THRESHOLD, BODY_STORE_FILE_THRESHOLD + 1};
+    const size_t sizes[] = {1, 200, 20480, BODY_STORE_DEFAULT_FILE_THRESHOLD - 1,
+        BODY_STORE_DEFAULT_FILE_THRESHOLD, BODY_STORE_DEFAULT_FILE_THRESHOLD + 1};
     char buffer[8192];
     for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
         connection_t* conn = create_mock_connection(buffer, sizeof(buffer));
@@ -2392,7 +2394,7 @@ TEST(test_httprequestparser_body_storage_boundaries) {
         }
         httprequest_t* request = parser->request;
         TEST_REQUIRE_NOT_NULL(request, "request retained");
-        TEST_ASSERT_EQUAL(sizes[i] < BODY_STORE_FILE_THRESHOLD ? BODY_STORE_MEMORY : BODY_STORE_FILE,
+        TEST_ASSERT_EQUAL(sizes[i] < BODY_STORE_DEFAULT_FILE_THRESHOLD ? BODY_STORE_MEMORY : BODY_STORE_FILE,
             request->payload_.incoming.state, "storage matches declared length");
         TEST_ASSERT_EQUAL(sizes[i], request->payload_.incoming.size, "received bytes counted");
         char* copy = request->get_payload(request);
@@ -2480,8 +2482,8 @@ TEST(test_httprequestparser_memory_body_errors) {
     char buffer[256];
     for (int large = 0; large < 2; ++large) {
         env()->main.tmp = "/cwfr-nonexistent-temp-directory";
-        env()->main.client_max_body_size = large ? 2 * BODY_STORE_FILE_THRESHOLD : 5;
-        int n = snprintf(buffer, sizeof(buffer), "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: %zu\r\n\r\na", large ? BODY_STORE_FILE_THRESHOLD : (size_t)6);
+        env()->main.client_max_body_size = large ? 2 * BODY_STORE_DEFAULT_FILE_THRESHOLD : 5;
+        int n = snprintf(buffer, sizeof(buffer), "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: %zu\r\n\r\na", large ? BODY_STORE_DEFAULT_FILE_THRESHOLD : (size_t)6);
         connection_t* conn = create_mock_connection(buffer, sizeof(buffer));
         httprequestparser_t* parser = httpparser_create(conn);
         httpparser_set_bytes_readed(parser, (size_t)n);
@@ -2537,7 +2539,7 @@ TEST(test_httprequestparser_aborted_body_storage) {
     char buffer[256];
     for (int large = 0; large < 2; ++large) {
         int n = snprintf(buffer, sizeof(buffer), "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: %zu\r\n\r\na",
-            large ? BODY_STORE_FILE_THRESHOLD : (size_t)12);
+            large ? BODY_STORE_DEFAULT_FILE_THRESHOLD : (size_t)12);
         connection_t* conn = create_mock_connection(buffer, sizeof(buffer));
         httprequestparser_t* parser = httpparser_create(conn);
         httpparser_set_bytes_readed(parser, (size_t)n);
@@ -2648,7 +2650,7 @@ TEST(test_httprequest_memory_form_thresholds) {
     const char* prefixes[] = {"name=", "--test\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\n"};
     const char* suffixes[] = {"&empty=", "\r\n--test--\r\n"};
     const char* types[] = {"application/x-www-form-urlencoded", "multipart/form-data; boundary=test"};
-    const size_t sizes[] = {20480, BODY_STORE_FILE_THRESHOLD - 1, BODY_STORE_FILE_THRESHOLD, BODY_STORE_FILE_THRESHOLD + 1};
+    const size_t sizes[] = {20480, BODY_STORE_DEFAULT_FILE_THRESHOLD - 1, BODY_STORE_DEFAULT_FILE_THRESHOLD, BODY_STORE_DEFAULT_FILE_THRESHOLD + 1};
     for (int kind = 0; kind < 2; ++kind) {
         for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
             char label[96];
@@ -2676,7 +2678,7 @@ TEST(test_httprequest_memory_form_thresholds) {
                 TEST_ASSERT_EQUAL('x', value[length - 1], "field last byte");
             }
             free(value);
-            TEST_ASSERT_EQUAL(sizes[i] < BODY_STORE_FILE_THRESHOLD ? BODY_STORE_MEMORY : BODY_STORE_FILE,
+            TEST_ASSERT_EQUAL(sizes[i] < BODY_STORE_DEFAULT_FILE_THRESHOLD ? BODY_STORE_MEMORY : BODY_STORE_FILE,
                 request->payload_.incoming.state, "form parsing preserves chosen storage");
             TEST_ASSERT_EQUAL(-1, request->payload_.file.fd, "no legacy materialization while reading");
             TEST_ASSERT(httprequest_create_payload_file(&request->payload_), "explicit materialization");

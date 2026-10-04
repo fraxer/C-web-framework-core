@@ -245,7 +245,9 @@ stage_bodymemory() {
     if build "$CI_BUILD_DIR/limits" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=yes \
              -DINCLUDE_HTTP3=yes -DSANITIZE=none &&
        "$CORE_DIR/tests/body_memory_integration.sh" "$CI_BUILD_DIR/limits" \
-             "$CI_BUILD_DIR/body-memory"; then
+             "$CI_BUILD_DIR/body-memory" &&
+       python3 "$CORE_DIR/tests/body_storage_policy.py" "$CI_BUILD_DIR/limits" \
+           "$CI_BUILD_DIR/body-storage-policy"; then
         record bodymemory OK
     else
         record bodymemory FAIL

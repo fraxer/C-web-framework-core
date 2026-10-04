@@ -19,7 +19,9 @@ import h2.events
 
 PORT, PID = map(int, sys.argv[1:3])
 WORK, BUILD = map(Path, sys.argv[3:5])
-THRESHOLD = 1048576
+THRESHOLD = int(os.environ.get('BODY_FILE_THRESHOLD', '1048576'))
+MODE = os.environ.get('BODY_STORE_MODE', 'auto')
+POLICY_ONLY = os.environ.get('BODY_POLICY_ONLY') == '1'
 REPEATS = int(os.environ.get('BODY_SOAK_REQUESTS', '1000'))
 SECONDS = int(os.environ.get('BODY_SOAK_SECONDS', '30'))
 assert REPEATS > 0 and SECONDS > 0
@@ -89,7 +91,7 @@ def request(path='/stats', data=None, content_type='application/octet-stream'):
 def validate(response, body, materialized=0):
     global CALLS
     obj = json.loads(response)
-    assert obj == {'size': len(body), 'state': 0 if not body else 2 if len(body) >= THRESHOLD else 1,
+    assert obj == {'size': len(body), 'state': 0 if not body else 2 if MODE == 'file' or (MODE == 'auto' and len(body) >= THRESHOLD) else 1,
                    'file': materialized, 'sha256': hashlib.sha256(body).hexdigest()}, obj
     CALLS += 1
 
@@ -296,7 +298,8 @@ def main():
         checked(b'x'*20000)
     baseline = drain('warm')
     pattern = bytes(range(256)) * 8193
-    sizes = [0, 1, 200, 20000, THRESHOLD-1, THRESHOLD, THRESHOLD+1, 2*THRESHOLD]
+    sizes = sorted({0, 1, 200, 20000, 1048575, 1048576, 1048577,
+                    *[n for n in (THRESHOLD-1, THRESHOLD, THRESHOLD+1, 2*THRESHOLD) if 0 <= n <= 2097152]})
     for size in sizes:
         checked(pattern[:size])
         if size:
@@ -349,9 +352,10 @@ def main():
     drain('h2_cancelled', baseline)
     REPORT['cases'].append('HTTP/2 known/unknown sizes, parallel streams and RST_STREAM')
 
-    output = subprocess.check_output([str(BUILD/'exec/body_memory_h3'), str(PORT), str(WORK/'tmp')], timeout=90)
+    output = subprocess.check_output([str(BUILD/'exec/body_memory_h3'), str(PORT), str(WORK/'tmp'), MODE, str(THRESHOLD), '1' if POLICY_ONLY else '0'], timeout=90)
     h3 = json.loads(output)
-    assert h3['calls'] == 7 and h3['cancelled_streams'] == 4 and h3['spilled_cancelled_streams'] == 4
+    assert h3['calls'] >= 7
+    if not POLICY_ONLY: assert h3['cancelled_streams'] == 4 and h3['spilled_cancelled_streams'] == 4
     CALLS += h3['calls']
     drain('h3_cancelled', baseline)
     REPORT['h3'] = h3
@@ -377,6 +381,18 @@ def main():
         broken.close()
     drain('ws_errors', baseline)
     REPORT['cases'].append('WebSocket default/resource masked/compressed/fragmented/control/disconnect/error')
+
+    if POLICY_ONLY:
+        REPORT.update(status='PASS', validated_handler_calls=CALLS, mode=MODE, threshold=THRESHOLD)
+        stats()
+        HTTP.close()
+        STOP.set()
+        worker.join()
+        (WORK/'results.json').write_text(json.dumps(REPORT, indent=2)+'\n')
+        print(json.dumps({k:v for k,v in REPORT.items() if k != 'samples'}, indent=2))
+        return
+
+    assert MODE == 'auto' and THRESHOLD == 1048576, 'resource suite requires default policy; use BODY_POLICY_ONLY=1 for custom policy'
 
     for size in (THRESHOLD-1, THRESHOLD+1):
         before_active = sample()

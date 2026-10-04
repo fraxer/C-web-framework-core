@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <limits.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <string.h>
@@ -9,6 +10,7 @@
 #include <syslog.h>
 
 #include "log.h"
+#include "bodystore.h"
 #include "file.h"
 #include "dotenv.h"
 #include "database.h"
@@ -474,6 +476,46 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     }
     env->main.client_max_body_size = client_max_body_size;
 
+    env->main.body_store.mode = BODY_STORE_MODE_AUTO;
+    env->main.body_store.file_threshold = BODY_STORE_DEFAULT_FILE_THRESHOLD;
+    const json_token_t* token_body_store = json_object_get(token_main, "body_store");
+    if (token_body_store != NULL) {
+        if (!json_is_object(token_body_store)) {
+            log_error_stderr("module_loader_config_load: body_store must be an object\n");
+            return 0;
+        }
+        const json_token_t* token_mode = json_object_get(token_body_store, "mode");
+        if (token_mode != NULL) {
+            if (!json_is_string(token_mode)) {
+                log_error_stderr("module_loader_config_load: body_store.mode must be auto, memory or file\n");
+                return 0;
+            }
+            const char* mode = json_string(token_mode);
+            if (json_string_size(token_mode) != strlen(mode)) {
+                log_error_stderr("module_loader_config_load: body_store.mode must be auto, memory or file\n");
+                return 0;
+            }
+            if (strcmp(mode, "auto") == 0) env->main.body_store.mode = BODY_STORE_MODE_AUTO;
+            else if (strcmp(mode, "memory") == 0) env->main.body_store.mode = BODY_STORE_MODE_MEMORY;
+            else if (strcmp(mode, "file") == 0) env->main.body_store.mode = BODY_STORE_MODE_FILE;
+            else {
+                log_error_stderr("module_loader_config_load: body_store.mode must be auto, memory or file\n");
+                return 0;
+            }
+        }
+
+        const json_token_t* token_threshold = json_object_get(token_body_store, "file_threshold");
+        if (token_threshold != NULL) {
+            ok = 0;
+            long long threshold = json_llong(token_threshold, &ok);
+            if (!ok || threshold < 0 || threshold > UINT_MAX ||
+                json_ldouble(token_threshold) != (long double)threshold) {
+                log_error_stderr("module_loader_config_load: body_store.file_threshold must be an integer between 0 and %u\n", UINT_MAX);
+                return 0;
+            }
+            env->main.body_store.file_threshold = (unsigned int)threshold;
+        }
+    }
 
     const json_token_t* token_tmp = json_object_get(token_main, "tmp");
     if (token_tmp == NULL) {

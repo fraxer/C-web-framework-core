@@ -1506,7 +1506,7 @@ void __httpresponse_payload_free(http_payload_t* payload) {
 
 void __httpresponse_init_payload(httpresponse_t* response) {
     response->payload_.pos = 0;
-    body_store_init(&response->payload_.incoming, SIZE_MAX);
+    body_store_init(&response->payload_.incoming, SIZE_MAX, BODY_STORE_DEFAULT_FILE_THRESHOLD, BODY_STORE_MODE_AUTO);
     response->payload_.file = file_alloc();
     response->payload_.path = NULL;
     response->payload_.part = NULL;

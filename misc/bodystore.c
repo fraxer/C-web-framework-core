@@ -14,9 +14,11 @@ static int body_store_fail(body_store_t* store) {
     return 0;
 }
 
-void body_store_init(body_store_t* store, size_t max_size) {
+void body_store_init(body_store_t* store, size_t max_size, size_t file_threshold, body_store_mode_t mode) {
     *store = (body_store_t){
         .max_size = max_size,
+        .file_threshold = file_threshold,
+        .mode = mode,
         .fd = -1
     };
 }
@@ -31,7 +33,7 @@ void body_store_reset(body_store_t* store) {
     free(store->path);
     free(store->data);
 
-    body_store_init(store, store->max_size);
+    body_store_init(store, store->max_size, store->file_threshold, store->mode);
 }
 
 static int write_range(int fd, size_t offset, const char* data, size_t size) {
@@ -120,8 +122,12 @@ int body_store_prepare(body_store_t* store, size_t length, const char* tmp_dir) 
     if (store->state != BODY_STORE_EMPTY || store->size != 0 || length > store->max_size || length > INT64_MAX)
         return body_store_fail(store);
 
-    if (length >= BODY_STORE_FILE_THRESHOLD)
+    if (store->mode == BODY_STORE_MODE_FILE ||
+        (store->mode == BODY_STORE_MODE_AUTO && length >= store->file_threshold))
         return body_store_materialize(store, tmp_dir);
+
+    if (length == SIZE_MAX)
+        return body_store_fail(store);
 
     return reserve(store, length + 1);
 }
@@ -139,18 +145,23 @@ int body_store_append(body_store_t* store, const void* data, size_t size, const 
         return 1;
 
     size_t total = store->size + size;
-    if (total >= BODY_STORE_FILE_THRESHOLD && !body_store_materialize(store, tmp_dir))
+    if ((store->mode == BODY_STORE_MODE_FILE ||
+        (store->mode == BODY_STORE_MODE_AUTO && total >= store->file_threshold)) &&
+        !body_store_materialize(store, tmp_dir))
         return 0;
 
     if (store->state == BODY_STORE_FILE) {
         if (!write_range(store->fd, store->size, data, size))
             return body_store_fail(store);
     } else {
-        size_t capacity = store->capacity ? store->capacity : 256;
+        if (total == SIZE_MAX)
+            return body_store_fail(store);
+
+        size_t ceiling = store->mode == BODY_STORE_MODE_AUTO ? store->file_threshold :
+            (store->max_size == SIZE_MAX ? SIZE_MAX : store->max_size + 1);
+        size_t capacity = store->capacity ? store->capacity : (ceiling < 256 ? ceiling : 256);
         while (capacity < total + 1) {
-            capacity = capacity > BODY_STORE_FILE_THRESHOLD / 2
-                ? BODY_STORE_FILE_THRESHOLD
-                : capacity * 2;
+            capacity = capacity > ceiling / 2 ? ceiling : capacity * 2;
         }
 
         if (!reserve(store, capacity))
