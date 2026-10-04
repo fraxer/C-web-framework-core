@@ -196,6 +196,7 @@ static int __urlencodedparser_set_field(urlencodedparser_t* parser, size_t offse
         parser->error = "urlencoded parser: invalid field range";
         return 0;
     }
+
     char* value = malloc(size + 1);
     if (value == NULL) {
         parser->error = "urlencoded parser: failed to allocate buffer for field value";
@@ -209,6 +210,7 @@ static int __urlencodedparser_set_field(urlencodedparser_t* parser, size_t offse
             free(value);
             return 0;
         }
+
         got = size;
     }
     while (got < size) {

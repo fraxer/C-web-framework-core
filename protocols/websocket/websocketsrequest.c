@@ -77,8 +77,11 @@ void websocketsrequest_reset(void* arg) {
 
 void websocketsrequest_payload_free(websockets_payload_t* payload) {
     body_store_reset(&payload->incoming);
-    if (payload->fd >= 0) close(payload->fd);
-    if (payload->path != NULL) unlink(payload->path);
+    if (payload->fd >= 0)
+        close(payload->fd);
+
+    if (payload->path != NULL)
+        unlink(payload->path);
 
     payload->fd = -1;
 
@@ -89,9 +92,12 @@ void websocketsrequest_payload_free(websockets_payload_t* payload) {
 int websockets_create_tmpfile(websockets_protocol_t* protocol, const char* tmp_dir) {
     if (protocol->payload.incoming.failed) return 0;
     if (protocol->payload.fd >= 0) return 1;
+
     body_store_t* incoming = &protocol->payload.incoming;
     if (incoming->state != BODY_STORE_EMPTY) {
-        if (!body_store_materialize(incoming, tmp_dir)) return 0;
+        if (!body_store_materialize(incoming, tmp_dir))
+            return 0;
+
         protocol->payload.fd = incoming->fd;
         protocol->payload.path = incoming->path;
         incoming->fd = -1;
@@ -119,10 +125,16 @@ static const body_store_t* websockets_payload_reader(websockets_protocol_t* prot
                                                      body_store_t* legacy) {
     if (protocol->payload.incoming.state != BODY_STORE_EMPTY || protocol->payload.incoming.failed)
         return &protocol->payload.incoming;
+
     off_t size = lseek(protocol->payload.fd, 0, SEEK_END);
     lseek(protocol->payload.fd, 0, SEEK_SET);
-    *legacy = (body_store_t){.state = BODY_STORE_FILE, .fd = protocol->payload.fd,
-                            .size = size >= 0 ? (size_t)size : 0, .failed = size < 0};
+    *legacy = (body_store_t){
+        .state = BODY_STORE_FILE,
+        .fd = protocol->payload.fd,
+        .size = size >= 0 ? (size_t)size : 0,
+        .failed = size < 0
+    };
+
     return legacy;
 }
 
@@ -142,16 +154,22 @@ int websocketsrequest_payload_append(websockets_protocol_t* protocol, const void
     const char* tmp = cfg != NULL && cfg->main.tmp != NULL ? cfg->main.tmp : "/tmp";
     size_t max = cfg != NULL ? cfg->main.client_max_body_size : SIZE_MAX;
     body_store_t* incoming = &protocol->payload.incoming;
-    if (incoming->failed) return 0;
+
+    if (incoming->failed)
+        return 0;
+
     if (protocol->payload.fd >= 0) {
         body_store_t legacy;
         websockets_payload_reader(protocol, &legacy);
         legacy.max_size = max;
         int ok = body_store_append(&legacy, data, size, tmp);
-        if (!ok) incoming->failed = 1;
+        if (!ok)
+            incoming->failed = 1;
+
         return ok;
     }
     incoming->max_size = max;
+
     return body_store_append(incoming, data, size, tmp);
 }
 
@@ -168,12 +186,17 @@ file_content_t websocketsrequest_payload_file(websockets_protocol_t* protocol) {
     file_content_t file_content = file_content_create(-1, filename, 0, 0);
     file_content.ok = 0;
 
-    if (protocol->payload.incoming.failed) return file_content;
+    if (protocol->payload.incoming.failed)
+        return file_content;
+
     if (protocol->payload.fd < 0) {
-        if (protocol->payload.incoming.state == BODY_STORE_EMPTY) return file_content;
+        if (protocol->payload.incoming.state == BODY_STORE_EMPTY)
+            return file_content;
+
         env_t* cfg = env();
         const char* tmp = cfg != NULL && cfg->main.tmp != NULL ? cfg->main.tmp : "/tmp";
-        if (!websockets_create_tmpfile(protocol, tmp)) return file_content;
+        if (!websockets_create_tmpfile(protocol, tmp))
+            return file_content;
     }
 
     off_t payload_size = lseek(protocol->payload.fd, 0, SEEK_END);
@@ -188,9 +211,11 @@ file_content_t websocketsrequest_payload_file(websockets_protocol_t* protocol) {
 }
 
 json_doc_t* websocketsrequest_payload_json(websockets_protocol_t* protocol) {
-    if (protocol->payload.incoming.failed) return NULL;
+    if (protocol->payload.incoming.failed)
+        return NULL;
     if (protocol->payload.incoming.state == BODY_STORE_MEMORY)
         return json_parse(protocol->payload.incoming.data);
+
     char* payload = websocketsrequest_payload(protocol);
     if (payload == NULL) return NULL;
 
