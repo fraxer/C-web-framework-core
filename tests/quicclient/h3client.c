@@ -498,7 +498,7 @@ int h3client_post_expect(quicclient_t* client, uint64_t stream_id,
                          const char* authority, const char* path,
                          const char* body, size_t body_len,
                          int timeout_ms, h3client_response_t* out) {
-    if (client == NULL || out == NULL) return 0;
+    if (client == NULL || out == NULL || (body == NULL && body_len != 0)) return 0;
 
     memset(out, 0, sizeof * out);
 
@@ -528,13 +528,20 @@ int h3client_post_expect(quicclient_t* client, uint64_t stream_id,
         }
     }
 
+    /* DATA may span many frames; the integration body tests cross 1 MiB. */
     uint8_t data[2048];
-    const size_t dlen = h3frame_write(data, sizeof data, H3_FRAME_DATA,
-                                      (const uint8_t*)body, body_len);
-    if (dlen == 0 || !quicclient_stream_write(client, stream_id, data, dlen, 1)) {
-        h3frame_parser_free(&parser);
-        return 0;
-    }
+    size_t offset = 0;
+    do {
+        size_t count = body_len - offset;
+        if (count > sizeof(data) - 16) count = sizeof(data) - 16;
+        const size_t dlen = h3frame_write(data, sizeof data, H3_FRAME_DATA,
+                                          count ? (const uint8_t*)body + offset : NULL, count);
+        offset += count;
+        if (dlen == 0 || !quicclient_stream_write(client, stream_id, data, dlen, offset == body_len)) {
+            h3frame_parser_free(&parser);
+            return 0;
+        }
+    } while (offset < body_len);
 
     int complete = 0;
     while (quic_now_us() < deadline) {

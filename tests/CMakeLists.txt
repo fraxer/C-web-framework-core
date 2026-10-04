@@ -247,6 +247,21 @@ if(INCLUDE_HTTP3 STREQUAL yes)
     )
 endif()
 
+# Fixtures for tests/body_memory_integration.sh; no database required.
+add_library(body_memory_module SHARED data/body_memory_module.c)
+target_link_libraries(body_memory_module PRIVATE cwfr_framework ${OPENSSL_LIBRARIES})
+set_target_properties(body_memory_module PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/exec/handlers/tests)
+if(INCLUDE_HTTP3 STREQUAL yes)
+    add_executable(body_memory_h3 data/body_memory_h3.c
+        quicclient/quicclient.c quicclient/h3client.c)
+    get_target_property(BODY_CLIENT_INCLUDES quicclient INCLUDE_DIRECTORIES)
+    target_include_directories(body_memory_h3 PRIVATE ${BODY_CLIENT_INCLUDES}
+        ${CMAKE_CURRENT_SOURCE_DIR}/quicclient)
+    target_link_libraries(body_memory_h3 PRIVATE cwfr_framework ${OPENSSL_LIBRARIES}
+        Threads::Threads ${CMAKE_DL_LIBS})
+endif()
+
 # --- Fuzzing (docs/http3/08-testing.md §5) ---
 #
 # Behind a flag because it changes how the *target* code is compiled: coverage
