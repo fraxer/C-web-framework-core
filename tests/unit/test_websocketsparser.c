@@ -1163,7 +1163,7 @@ static void storage_harness_init(harness_t* h, int resource) {
 static void storage_check(harness_t* h, const char* data, size_t size) {
     websockets_protocol_t* protocol = h->parser->request->protocol;
     TEST_ASSERT_EQUAL(size, websocketsrequest_payload_size(protocol), "visible body size");
-    TEST_ASSERT_EQUAL(size >= BODY_STORE_FILE_THRESHOLD ? BODY_STORE_FILE : BODY_STORE_MEMORY,
+    TEST_ASSERT_EQUAL(size >= BODY_STORE_DEFAULT_FILE_THRESHOLD ? BODY_STORE_FILE : BODY_STORE_MEMORY,
                       protocol->payload.incoming.state, "message threshold selects storage");
     TEST_ASSERT_EQUAL(-1, protocol->payload.fd, "no legacy file before explicit access");
     char* copy = websocketsrequest_payload(protocol);
@@ -1193,11 +1193,11 @@ static void storage_check(harness_t* h, const char* data, size_t size) {
 
 TEST(test_wsp_storage_fragment_threshold_and_control) {
     TEST_SUITE("WebSocket body storage: fragments and control frames");
-    const size_t sizes[] = {1, 200, 20000, BODY_STORE_FILE_THRESHOLD - 1,
-                           BODY_STORE_FILE_THRESHOLD, BODY_STORE_FILE_THRESHOLD + 1,
-                           2 * BODY_STORE_FILE_THRESHOLD};
+    const size_t sizes[] = {1, 200, 20000, BODY_STORE_DEFAULT_FILE_THRESHOLD - 1,
+                           BODY_STORE_DEFAULT_FILE_THRESHOLD, BODY_STORE_DEFAULT_FILE_THRESHOLD + 1,
+                           2 * BODY_STORE_DEFAULT_FILE_THRESHOLD};
     unsigned int saved_max = env()->main.client_max_body_size;
-    env()->main.client_max_body_size = 3 * BODY_STORE_FILE_THRESHOLD;
+    env()->main.client_max_body_size = 3 * BODY_STORE_DEFAULT_FILE_THRESHOLD;
     for (int resource = 0; resource < 2; ++resource) {
         for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
             harness_t h;
@@ -1222,15 +1222,15 @@ TEST(test_wsp_storage_fragment_threshold_and_control) {
             for (size_t sent = 0; sent < size;) {
                 size_t count = size - sent;
                 if (count > 16384) count = 16384;
-                if (sent < BODY_STORE_FILE_THRESHOLD - 1 && sent + count >= BODY_STORE_FILE_THRESHOLD - 1)
-                    count = BODY_STORE_FILE_THRESHOLD - 1 - sent;
+                if (sent < BODY_STORE_DEFAULT_FILE_THRESHOLD - 1 && sent + count >= BODY_STORE_DEFAULT_FILE_THRESHOLD - 1)
+                    count = BODY_STORE_DEFAULT_FILE_THRESHOLD - 1 - sent;
                 int final = sent + count == size;
                 size_t n = build_frame(wire, sent == 0 && !resource ? WSOPCODE_BINARY : WSOPCODE_CONTINUE,
                                        final, (unsigned char*)data + sent, count);
                 TEST_ASSERT_EQUAL(final ? WSPARSER_COMPLETE : WSPARSER_HANDLE_AND_CONTINUE,
                                   harness_feed(&h, wire, n), "fragment parsed");
                 sent += count;
-                if (sent == BODY_STORE_FILE_THRESHOLD - 1)
+                if (sent == BODY_STORE_DEFAULT_FILE_THRESHOLD - 1)
                     TEST_ASSERT_EQUAL(BODY_STORE_MEMORY, h.parser->request->protocol->payload.incoming.state, "one byte below threshold");
                 if (!final) {
                     websocketsrequest_t* request = h.parser->request;
@@ -1256,9 +1256,9 @@ TEST(test_wsp_storage_fragment_threshold_and_control) {
 TEST(test_wsp_storage_decompressed_message_threshold) {
     TEST_SUITE("WebSocket body storage: decompressed threshold");
     unsigned int saved_max = env()->main.client_max_body_size;
-    env()->main.client_max_body_size = 2 * BODY_STORE_FILE_THRESHOLD;
-    const size_t sizes[] = {20000, BODY_STORE_FILE_THRESHOLD - 1,
-                           BODY_STORE_FILE_THRESHOLD, BODY_STORE_FILE_THRESHOLD + 1};
+    env()->main.client_max_body_size = 2 * BODY_STORE_DEFAULT_FILE_THRESHOLD;
+    const size_t sizes[] = {20000, BODY_STORE_DEFAULT_FILE_THRESHOLD - 1,
+                           BODY_STORE_DEFAULT_FILE_THRESHOLD, BODY_STORE_DEFAULT_FILE_THRESHOLD + 1};
     for (int resource = 0; resource < 2; ++resource) {
         for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
             harness_t h;
@@ -1354,14 +1354,14 @@ TEST(test_wsp_storage_memory_reset_json_and_fd_append) {
 TEST(test_wsp_storage_spill_failure_and_close_cleanup) {
     TEST_SUITE("WebSocket body storage: failure and close cleanup");
     unsigned int saved_max = env()->main.client_max_body_size;
-    env()->main.client_max_body_size = 2 * BODY_STORE_FILE_THRESHOLD;
-    char* data = malloc(BODY_STORE_FILE_THRESHOLD);
+    env()->main.client_max_body_size = 2 * BODY_STORE_DEFAULT_FILE_THRESHOLD;
+    char* data = malloc(BODY_STORE_DEFAULT_FILE_THRESHOLD);
     TEST_REQUIRE_NOT_NULL(data, "threshold input");
-    memset(data, 'x', BODY_STORE_FILE_THRESHOLD);
+    memset(data, 'x', BODY_STORE_DEFAULT_FILE_THRESHOLD);
     websockets_protocol_t* protocol = websockets_protocol_default_create();
     websocketsrequest_t* request = websocketsrequest_create(NULL, protocol);
     TEST_REQUIRE_NOT_NULL(request, "spill request");
-    TEST_ASSERT(websocketsrequest_payload_append(protocol, data, BODY_STORE_FILE_THRESHOLD - 1), "memory before spill");
+    TEST_ASSERT(websocketsrequest_payload_append(protocol, data, BODY_STORE_DEFAULT_FILE_THRESHOLD - 1), "memory before spill");
     char* saved_tmp = env()->main.tmp;
     env()->main.tmp = "/nonexistent_dir_cwfr_test";
     TEST_ASSERT(!websocketsrequest_payload_append(protocol, "x", 1), "spill fails on unusable directory");
@@ -1376,7 +1376,7 @@ TEST(test_wsp_storage_spill_failure_and_close_cleanup) {
         harness_t h;
         harness_init(&h);
         unsigned char wire[16400];
-        size_t total = spill ? BODY_STORE_FILE_THRESHOLD : 100;
+        size_t total = spill ? BODY_STORE_DEFAULT_FILE_THRESHOLD : 100;
         for (size_t sent = 0; sent < total;) {
             size_t count = total - sent;
             if (count > 16384) count = 16384;

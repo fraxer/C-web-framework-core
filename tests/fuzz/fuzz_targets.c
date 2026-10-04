@@ -5992,7 +5992,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     int legacy_ok = urlencodedparser_parse(&parser, buffer, size);
 
     http_payload_t payload = {.file = file_alloc()};
-    body_store_init(&payload.incoming, SIZE_MAX);
+    body_store_init(&payload.incoming, SIZE_MAX, BODY_STORE_DEFAULT_FILE_THRESHOLD, BODY_STORE_MODE_AUTO);
     if (body_store_prepare(&payload.incoming, size, "/tmp") &&
         body_store_append(&payload.incoming, data, size, "/tmp")) {
         urlencodedparser_t incoming;
@@ -6122,7 +6122,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     const uint64_t steps = __fuzz_multipart_run(fd, NULL, boundary, data, size, 0, blen + 1);
     if (whole != bytes || whole != steps) __builtin_trap();
     http_payload_t payload = {.file = file_alloc()};
-    body_store_init(&payload.incoming, SIZE_MAX);
+    body_store_init(&payload.incoming, SIZE_MAX, BODY_STORE_DEFAULT_FILE_THRESHOLD, BODY_STORE_MODE_AUTO);
     if (body_store_prepare(&payload.incoming, size, "/tmp") &&
         body_store_append(&payload.incoming, data, size, "/tmp")) {
         const uint64_t memory = __fuzz_multipart_run(-1, &payload, boundary, data, size, 0, 0);

@@ -1,3 +1,4 @@
+#include "bodystore.h"
 #include "appconfig.h"
 
 #include <stdlib.h>
@@ -10,6 +11,7 @@ static void ensure_config(void) {
     if (test_appconfig != NULL) return;
     test_appconfig = calloc(1, sizeof *test_appconfig);
     if (test_appconfig != NULL) {
+        test_appconfig->env.main.body_store.file_threshold = BODY_STORE_DEFAULT_FILE_THRESHOLD;
         test_appconfig->env.main.tmp = "/tmp";
         test_appconfig->env.main.client_max_body_size = 1024 * 1024;
     }

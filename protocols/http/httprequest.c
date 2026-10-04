@@ -55,7 +55,10 @@ int httprequest_set_payload_file_content(httprequest_t*, const file_content_t*);
 
 void httprequest_init_payload(httprequest_t* request) {
     request->payload_.pos = 0;
-    body_store_init(&request->payload_.incoming, SIZE_MAX);
+    const env_t* cfg = env();
+    body_store_init(&request->payload_.incoming, SIZE_MAX,
+        cfg != NULL ? cfg->main.body_store.file_threshold : BODY_STORE_DEFAULT_FILE_THRESHOLD,
+        cfg != NULL ? cfg->main.body_store.mode : BODY_STORE_MODE_AUTO);
     request->payload_.file = file_alloc();
     request->payload_.path = NULL;
     request->payload_.part = NULL;

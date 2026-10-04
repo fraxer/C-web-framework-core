@@ -20,15 +20,21 @@ static int body_files(const char* path) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 3) return 2;
+    if (argc != 3 && argc != 6) return 2;
+    const char* mode = argc == 6 ? argv[3] : "auto";
+    size_t threshold = argc == 6 ? strtoul(argv[4], NULL, 10) : BODY_STORE_DEFAULT_FILE_THRESHOLD;
+    int policy_only = argc == 6 && atoi(argv[5]);
     quicclient_t* client = calloc(1, sizeof(*client));
     if (!client || !quicclient_connect(client, "127.0.0.1", atoi(argv[1]), "localhost", 0) ||
         !quicclient_run(client, 8000) || !h3client_start(client)) return 1;
-    const size_t sizes[] = {0, 1, 200, 20000, BODY_STORE_FILE_THRESHOLD-1,
-                            BODY_STORE_FILE_THRESHOLD, BODY_STORE_FILE_THRESHOLD+1};
+    const size_t sizes[] = {0, 1, 200, 20000, BODY_STORE_DEFAULT_FILE_THRESHOLD-1,
+                            BODY_STORE_DEFAULT_FILE_THRESHOLD, BODY_STORE_DEFAULT_FILE_THRESHOLD+1,
+                            threshold ? threshold-1 : 0, threshold, threshold+1};
     unsigned calls = 0;
     for (size_t i = 0; i < sizeof(sizes)/sizeof(sizes[0]); ++i) {
+        if (i >= 7 && !policy_only) break;
         size_t size = sizes[i];
+        if (size > 2097153) continue;
         char* body = malloc(size+1);
         if (!body) return 1;
         for (size_t j = 0; j < size; ++j) body[j] = (char)(j % 256);
@@ -41,12 +47,20 @@ int main(int argc, char** argv) {
             response.status != 200 || !response.body || !strstr(response.body, hex)) return 1;
         char expected[80];
         snprintf(expected, sizeof(expected), "\"size\":%zu,\"state\":%d", size,
-                 size == 0 ? BODY_STORE_EMPTY : size >= BODY_STORE_FILE_THRESHOLD ? BODY_STORE_FILE : BODY_STORE_MEMORY);
+                 size == 0 ? BODY_STORE_EMPTY : (strcmp(mode, "file") == 0 || (strcmp(mode, "auto") == 0 && size >= threshold)) ? BODY_STORE_FILE : BODY_STORE_MEMORY);
         if (!strstr(response.body, expected)) return 1;
         calls++;
         h3client_response_free(&response);
         quicclient_stream_release(client, id);
         free(body);
+    }
+    if (policy_only) {
+        quicclient_close(client,0,0);
+        for (int j = 0; j < 3; ++j) quicclient_pump(client,10);
+        quicclient_free(client);
+        free(client);
+        printf("{\"calls\":%u,\"cancelled_streams\":0,\"spilled_cancelled_streams\":0}\n", calls);
+        return 0;
     }
     const uint64_t cancel_base = 4 * calls;
     /* Several unfinished POSTs coexist, then RESET_STREAM must drain them. */

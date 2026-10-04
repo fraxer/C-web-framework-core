@@ -537,7 +537,7 @@ TEST(test_h3stream_section_ack_accounting) {
 TEST(test_h3stream_body_storage_threshold) {
     TEST_SUITE("HTTP/3 body storage");
     size_t old_limit = env()->main.client_max_body_size;
-    env()->main.client_max_body_size = 2 * BODY_STORE_FILE_THRESHOLD;
+    env()->main.client_max_body_size = 2 * BODY_STORE_DEFAULT_FILE_THRESHOLD;
     for (int known = 0; known < 2; ++known) {
         qpack_encoder_t* enc = qpack_encoder_create(0, 0);
         qpack_decoder_t* dec = qpack_decoder_create(0, 0);
@@ -549,16 +549,16 @@ TEST(test_h3stream_body_storage_threshold) {
         TEST_ASSERT_EQUAL(H3STREAM_REQUEST_READY, feed(st, dec, hdr, n, 0), "headers");
         memset(payload, 'x', sizeof(payload));
         size_t sent = 0;
-        while (sent < BODY_STORE_FILE_THRESHOLD + 1) {
-            size_t count = BODY_STORE_FILE_THRESHOLD + 1 - sent;
+        while (sent < BODY_STORE_DEFAULT_FILE_THRESHOLD + 1) {
+            size_t count = BODY_STORE_DEFAULT_FILE_THRESHOLD + 1 - sent;
             if (count > sizeof(payload)) count = sizeof(payload);
-            if (sent < BODY_STORE_FILE_THRESHOLD - 1 && sent + count >= BODY_STORE_FILE_THRESHOLD - 1)
-                count = BODY_STORE_FILE_THRESHOLD - 1 - sent;
+            if (sent < BODY_STORE_DEFAULT_FILE_THRESHOLD - 1 && sent + count >= BODY_STORE_DEFAULT_FILE_THRESHOLD - 1)
+                count = BODY_STORE_DEFAULT_FILE_THRESHOLD - 1 - sent;
             n = data_frame(payload, count, wire, sizeof(wire));
             TEST_ASSERT_EQUAL(H3STREAM_BODY_CHUNK, feed(st, dec, wire, n, 0), "DATA chunk");
             sent += count;
             TEST_ASSERT_EQUAL(sent, st->req_body_len, "unframed bytes counted");
-            if (!known && sent == BODY_STORE_FILE_THRESHOLD - 1)
+            if (!known && sent == BODY_STORE_DEFAULT_FILE_THRESHOLD - 1)
                 TEST_ASSERT_EQUAL(BODY_STORE_MEMORY, st->request->payload_.incoming.state, "below threshold");
         }
         TEST_ASSERT_EQUAL(BODY_STORE_FILE, st->request->payload_.incoming.state, "threshold reached across frames");
@@ -567,7 +567,7 @@ TEST(test_h3stream_body_storage_threshold) {
         TEST_ASSERT_NOT_NULL(copy, "body readable");
         if (copy) {
             TEST_ASSERT_EQUAL('x', copy[0], "first byte");
-            TEST_ASSERT_EQUAL('x', copy[BODY_STORE_FILE_THRESHOLD], "last byte");
+            TEST_ASSERT_EQUAL('x', copy[BODY_STORE_DEFAULT_FILE_THRESHOLD], "last byte");
         }
         free(copy);
         int fd = st->request->payload_.incoming.fd;
