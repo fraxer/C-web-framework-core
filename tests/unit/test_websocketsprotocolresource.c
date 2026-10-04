@@ -117,9 +117,9 @@ static void mask_buffer(char* data, size_t length, const unsigned char mask[4], 
 
 /* Read the payload tmpfile back without moving its offset. */
 static ssize_t payload_file_read(websockets_protocol_t* protocol, char* out, size_t out_size) {
-    if (protocol->payload.fd < 0) return -1;
-
-    return pread(protocol->payload.fd, out, out_size, 0);
+    size_t size = websocketsrequest_payload_size(protocol);
+    if (size > out_size) size = out_size;
+    return websocketsrequest_payload_read(protocol, 0, out, size) ? (ssize_t)size : -1;
 }
 
 static int query_key_count(query_t* query, const char* key) {
@@ -525,7 +525,8 @@ TEST(test_wsres_parse_limit_is_cumulative) {
     TEST_ASSERT_EQUAL(0, feed_chunk(&parser, part2, 2, 0), "chunk crossing the limit is rejected");
 
     char content[16] = {0};
-    TEST_ASSERT_EQUAL(3, (int)payload_file_read(request->protocol, content, sizeof(content)), "file keeps only the fitting bytes");
+    TEST_ASSERT_EQUAL(3, request->protocol->payload.incoming.size, "only fitting bytes stored");
+    TEST_ASSERT_EQUAL(-1, (int)payload_file_read(request->protocol, content, sizeof(content)), "failed message cannot be read");
 
     env()->main.client_max_body_size = saved_limit;
     parser_teardown(&parser);
@@ -557,7 +558,8 @@ TEST(test_wsres_parse_short_write_regression) {
     const struct rlimit small_limit = {.rlim_cur = 4, .rlim_max = saved_limit.rlim_max};
     TEST_REQUIRE(setrlimit(RLIMIT_FSIZE, &small_limit) == 0, "shrink RLIMIT_FSIZE");
 
-    const int result = feed_frame(&parser, "POST /x 123456", 1);
+    const int created = websockets_create_tmpfile(request->protocol, env()->main.tmp);
+    const int result = created ? feed_frame(&parser, "POST /x 123456", 1) : 1;
 
     setrlimit(RLIMIT_FSIZE, &saved_limit);
     sigaction(SIGXFSZ, &saved_action, NULL);
@@ -670,7 +672,7 @@ TEST(test_wsres_reset_clears_parsing_state) {
     parser_setup(&parser, request);
 
     TEST_REQUIRE(feed_frame(&parser, "POST /x?a=1 body", 1) == 1, "frame parsed");
-    TEST_REQUIRE(request->protocol->payload.fd >= 0, "payload written");
+    TEST_REQUIRE(request->protocol->payload.incoming.state == BODY_STORE_MEMORY, "payload written in memory");
 
     request->protocol->reset(request->protocol);
 
@@ -681,7 +683,7 @@ TEST(test_wsres_reset_clears_parsing_state) {
     TEST_ASSERT_NULL(proto(request)->query_, "query chain released");
     TEST_ASSERT_EQUAL_SIZE(0, proto(request)->uri_length, "uri_length reset");
     TEST_ASSERT_EQUAL_SIZE(0, proto(request)->path_length, "path_length reset");
-    TEST_ASSERT(request->protocol->payload.fd >= 0, "payload owned by request reset, not protocol reset");
+    TEST_ASSERT_EQUAL(BODY_STORE_MEMORY, request->protocol->payload.incoming.state, "payload owned by request reset, not protocol reset");
 
     parser_teardown(&parser);
     websocketsrequest_free(request);

@@ -5,8 +5,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <stdint.h>
 
 #include "helpers.h"
+#include "appconfig.h"
 #include "websocketsrequest.h"
 #include "connection_s.h"
 
@@ -14,6 +16,7 @@ static void websocketsrequest_payload_free(websockets_payload_t*);
 static void websocketsrequest_reset(void* arg);
 
 void websockets_protocol_init_payload(websockets_protocol_t* protocol) {
+    body_store_init(&protocol->payload.incoming, SIZE_MAX);
     protocol->payload.fd = -1;
     protocol->payload.path = NULL;
 }
@@ -21,9 +24,8 @@ void websockets_protocol_init_payload(websockets_protocol_t* protocol) {
 void websocketsrequest_free(void* arg) {
     websocketsrequest_t* request = (websocketsrequest_t*)arg;
 
-    /* can_reset == 0 makes reset a no-op, but on destruction the payload
-     * tmpfile must be released unconditionally: protocol->free below does
-     * not touch payload, so a skipped reset here leaks fd + path + inode. */
+    /* can_reset == 0 makes reset a no-op, but destruction must release
+     * memory and files unconditionally: protocol->free does not own them. */
     request->can_reset = 1;
     websocketsrequest_reset(request);
     request->protocol->free(request->protocol);
@@ -71,10 +73,9 @@ void websocketsrequest_reset(void* arg) {
 }
 
 void websocketsrequest_payload_free(websockets_payload_t* payload) {
-    if (payload->fd == -1) return;
-
-    close(payload->fd);
-    unlink(payload->path);
+    body_store_reset(&payload->incoming);
+    if (payload->fd >= 0) close(payload->fd);
+    if (payload->path != NULL) unlink(payload->path);
 
     payload->fd = -1;
 
@@ -83,7 +84,18 @@ void websocketsrequest_payload_free(websockets_payload_t* payload) {
 }
 
 int websockets_create_tmpfile(websockets_protocol_t* protocol, const char* tmp_dir) {
+    if (protocol->payload.incoming.failed) return 0;
     if (protocol->payload.fd >= 0) return 1;
+    body_store_t* incoming = &protocol->payload.incoming;
+    if (incoming->state != BODY_STORE_EMPTY) {
+        if (!body_store_materialize(incoming, tmp_dir)) return 0;
+        protocol->payload.fd = incoming->fd;
+        protocol->payload.path = incoming->path;
+        incoming->fd = -1;
+        incoming->path = NULL;
+        body_store_reset(incoming);
+        return 1;
+    }
 
     protocol->payload.path = create_tmppath(tmp_dir);
     if (protocol->payload.path == NULL)
@@ -99,44 +111,51 @@ int websockets_create_tmpfile(websockets_protocol_t* protocol, const char* tmp_d
     return 1;
 }
 
-char* websocketsrequest_payload(websockets_protocol_t* protocol) {
-    if (protocol->payload.fd < 0) return NULL;
-
-    /* A failed lseek returns -1; without the guard malloc(payload_size + 1)
-     * becomes malloc(0) and buffer[payload_size] writes at buffer[-1]. */
-    off_t payload_size = lseek(protocol->payload.fd, 0, SEEK_END);
-    if (payload_size < 0) return NULL;
-
+/* Borrow a custom protocol's fd only for this operation; never reset it. */
+static const body_store_t* websockets_payload_reader(websockets_protocol_t* protocol,
+                                                     body_store_t* legacy) {
+    if (protocol->payload.incoming.state != BODY_STORE_EMPTY || protocol->payload.incoming.failed)
+        return &protocol->payload.incoming;
+    off_t size = lseek(protocol->payload.fd, 0, SEEK_END);
     lseek(protocol->payload.fd, 0, SEEK_SET);
+    *legacy = (body_store_t){.state = BODY_STORE_FILE, .fd = protocol->payload.fd,
+                            .size = size >= 0 ? (size_t)size : 0, .failed = size < 0};
+    return legacy;
+}
 
-    char* buffer = malloc(payload_size + 1);
-    if (buffer == NULL) return NULL;
+size_t websocketsrequest_payload_size(websockets_protocol_t* protocol) {
+    body_store_t legacy;
+    return websockets_payload_reader(protocol, &legacy)->size;
+}
 
-    /* A single pread may legally return short (EINTR, the ~2 GiB Linux cap
-     * per call, network filesystems), so read until the measured size. */
-    size_t total = 0;
-    while (total < (size_t)payload_size) {
-        ssize_t r = pread(protocol->payload.fd, buffer + total, (size_t)payload_size - total, (off_t)total);
+int websocketsrequest_payload_read(websockets_protocol_t* protocol, size_t offset,
+                                  void* data, size_t size) {
+    body_store_t legacy;
+    return body_store_read(websockets_payload_reader(protocol, &legacy), offset, data, size);
+}
 
-        if (r < 0) {
-            if (errno == EINTR)
-                continue;
-            free(buffer);
-            return NULL;
-        }
-        /* Early EOF: the file is shorter than measured — fail instead of
-         * returning a string with an uninitialized tail. */
-        if (r == 0) {
-            free(buffer);
-            return NULL;
-        }
-
-        total += (size_t)r;
+int websocketsrequest_payload_append(websockets_protocol_t* protocol, const void* data, size_t size) {
+    env_t* cfg = env();
+    const char* tmp = cfg != NULL && cfg->main.tmp != NULL ? cfg->main.tmp : "/tmp";
+    size_t max = cfg != NULL ? cfg->main.client_max_body_size : SIZE_MAX;
+    body_store_t* incoming = &protocol->payload.incoming;
+    if (incoming->failed) return 0;
+    if (protocol->payload.fd >= 0) {
+        body_store_t legacy;
+        websockets_payload_reader(protocol, &legacy);
+        legacy.max_size = max;
+        int ok = body_store_append(&legacy, data, size, tmp);
+        if (!ok) incoming->failed = 1;
+        return ok;
     }
+    incoming->max_size = max;
+    return body_store_append(incoming, data, size, tmp);
+}
 
-    buffer[payload_size] = 0;
-
-    return buffer;
+char* websocketsrequest_payload(websockets_protocol_t* protocol) {
+    body_store_t legacy;
+    const body_store_t* reader = websockets_payload_reader(protocol, &legacy);
+    return body_store_copy(reader, 0, reader->size);
 }
 
 file_content_t websocketsrequest_payload_file(websockets_protocol_t* protocol) {
@@ -144,10 +163,14 @@ file_content_t websocketsrequest_payload_file(websockets_protocol_t* protocol) {
     /* Start from an invalid descriptor so the no-payload result never leaks
      * fd 0 (stdin) to a caller that ignores .ok. */
     file_content_t file_content = file_content_create(-1, filename, 0, 0);
+    file_content.ok = 0;
 
-    if (protocol->payload.fd == -1) {
-        file_content.ok = 0;
-        return file_content;
+    if (protocol->payload.incoming.failed) return file_content;
+    if (protocol->payload.fd < 0) {
+        if (protocol->payload.incoming.state == BODY_STORE_EMPTY) return file_content;
+        env_t* cfg = env();
+        const char* tmp = cfg != NULL && cfg->main.tmp != NULL ? cfg->main.tmp : "/tmp";
+        if (!websockets_create_tmpfile(protocol, tmp)) return file_content;
     }
 
     off_t payload_size = lseek(protocol->payload.fd, 0, SEEK_END);
@@ -162,6 +185,9 @@ file_content_t websocketsrequest_payload_file(websockets_protocol_t* protocol) {
 }
 
 json_doc_t* websocketsrequest_payload_json(websockets_protocol_t* protocol) {
+    if (protocol->payload.incoming.failed) return NULL;
+    if (protocol->payload.incoming.state == BODY_STORE_MEMORY)
+        return json_parse(protocol->payload.incoming.data);
     char* payload = websocketsrequest_payload(protocol);
     if (payload == NULL) return NULL;
 

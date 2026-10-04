@@ -1694,15 +1694,14 @@ static void __ws_seq_handle(websocketsparser_t* parser, ws_seq_result_t* r) {
     if (request == NULL) __builtin_trap();
 
     uint64_t h = 1469598103934665603ULL;
-    size_t len = 0;
-    const int fd = request->protocol->payload.fd;
+    size_t len = websocketsrequest_payload_size(request->protocol);
     char chunk[4096];
-    for (;;) {
-        const ssize_t n = fd >= 0 ? pread(fd, chunk, sizeof chunk, (off_t)len) : 0;
-        if (n < 0) __builtin_trap();
-        if (n == 0) break;
-        h = __fuzz_fnv(h, chunk, (size_t)n);
-        len += (size_t)n;
+    for (size_t offset = 0; offset < len;) {
+        size_t count = len - offset;
+        if (count > sizeof(chunk)) count = sizeof(chunk);
+        if (!websocketsrequest_payload_read(request->protocol, offset, chunk, count)) __builtin_trap();
+        h = __fuzz_fnv(h, chunk, count);
+        offset += count;
     }
     /* The payload is hashed in pieces, so the event is built from the hash and
      * the length rather than from the bytes; __ws_seq_expect does the same. */
@@ -10467,17 +10466,12 @@ static void __wsc_http_upgrade(void* arg) {
     switch_to_websockets(arg);
 }
 
-/* The message's payload, whole: the protocols spool it to a file. */
+/* Read either incoming representation without forcing file materialization. */
 static uint8_t* __wsc_payload(websocketsrequest_t* request, size_t* len) {
-    *len = 0;
-    const int fd = request->protocol->payload.fd;
-    if (fd < 0) return NULL;
-    const off_t size = lseek(fd, 0, SEEK_END);
-    if (size <= 0) return NULL;
-    uint8_t* p = malloc((size_t)size);
+    *len = websocketsrequest_payload_size(request->protocol);
+    if (*len == 0) return NULL;
+    uint8_t* p = (uint8_t*)websocketsrequest_payload(request->protocol);
     if (p == NULL) abort();
-    if (pread(fd, p, (size_t)size, 0) != size) abort();
-    *len = (size_t)size;
     return p;
 }
 

@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#include "bodystore.h"
 #include "connection_queue.h"
 #include "queryparser.h"
 
@@ -43,6 +44,8 @@ typedef struct websockets_frame {
 } websockets_frame_t;
 
 typedef struct websockets_payload {
+    body_store_t incoming;
+    /* Legacy storage for custom payload_parse callbacks and explicit fd access. */
     int fd;
     char* path;
 } websockets_payload_t;

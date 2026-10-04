@@ -20,6 +20,8 @@
 #include "websocketsrequest.h"
 #include "websocketsprotocoldefault.h"
 #include "ws_deflate.h"
+#include "websocketsprotocolresource.h"
+#include <fcntl.h>
 #include "ws_utf8.h"
 #include "bufferdata.h"
 
@@ -1146,4 +1148,257 @@ TEST(test_wsp_reset_clears_state) {
     free(out);
 
     harness_free(&h);
+}
+
+
+/* Storage regressions drive the production parser and built-in protocols. */
+static void storage_harness_init(harness_t* h, int resource) {
+    harness_init(h);
+    if (resource) {
+        websocketsparser_free(h->parser);
+        h->parser = websocketsparser_create(&h->connection, websockets_protocol_resource_create);
+    }
+}
+
+static void storage_check(harness_t* h, const char* data, size_t size) {
+    websockets_protocol_t* protocol = h->parser->request->protocol;
+    TEST_ASSERT_EQUAL(size, websocketsrequest_payload_size(protocol), "visible body size");
+    TEST_ASSERT_EQUAL(size >= BODY_STORE_FILE_THRESHOLD ? BODY_STORE_FILE : BODY_STORE_MEMORY,
+                      protocol->payload.incoming.state, "message threshold selects storage");
+    TEST_ASSERT_EQUAL(-1, protocol->payload.fd, "no legacy file before explicit access");
+    char* copy = websocketsrequest_payload(protocol);
+    TEST_ASSERT_NOT_NULL(copy, "caller-owned binary copy");
+    if (copy) {
+        TEST_ASSERT_EQUAL(0, memcmp(copy, data, size), "whole message bytes");
+        TEST_ASSERT_EQUAL(0, copy[size], "extra terminator");
+    }
+    free(copy);
+    file_content_t file = websocketsrequest_payload_file(protocol);
+    TEST_ASSERT(file.ok, "explicit file materialization");
+    TEST_ASSERT_EQUAL(size, file.size, "materialization preserves size");
+    TEST_ASSERT_EQUAL(file.fd, websocketsrequest_payload_file(protocol).fd, "fd reused");
+    copy = websocketsrequest_payload(protocol);
+    TEST_ASSERT_NOT_NULL(copy, "read after materialization");
+    if (copy) TEST_ASSERT_EQUAL(0, memcmp(copy, data, size), "materialization preserves bytes");
+    free(copy);
+    char* path = strdup(protocol->payload.path);
+    int fd = file.fd;
+    /* Destruction must release ownership even when ordinary reset is gated. */
+    h->parser->request->can_reset = 0;
+    harness_free(h);
+    TEST_ASSERT_EQUAL(-1, fcntl(fd, F_GETFD), "destruction closes fd");
+    if (path) TEST_ASSERT_EQUAL(-1, access(path, F_OK), "destruction removes path");
+    free(path);
+}
+
+TEST(test_wsp_storage_fragment_threshold_and_control) {
+    TEST_SUITE("WebSocket body storage: fragments and control frames");
+    const size_t sizes[] = {1, 200, 20000, BODY_STORE_FILE_THRESHOLD - 1,
+                           BODY_STORE_FILE_THRESHOLD, BODY_STORE_FILE_THRESHOLD + 1,
+                           2 * BODY_STORE_FILE_THRESHOLD};
+    unsigned int saved_max = env()->main.client_max_body_size;
+    env()->main.client_max_body_size = 3 * BODY_STORE_FILE_THRESHOLD;
+    for (int resource = 0; resource < 2; ++resource) {
+        for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+            harness_t h;
+            storage_harness_init(&h, resource);
+            size_t size = sizes[i];
+            char label[80];
+            snprintf(label, sizeof(label), "%s %zu bytes", resource ? "resource" : "default", size);
+            TEST_CASE(label);
+            char* data = malloc(size);
+            TEST_REQUIRE_NOT_NULL(data, "binary input");
+            for (size_t j = 0; j < size; ++j) data[j] = (char)(j % 251);
+            unsigned char wire[16400];
+            if (resource) {
+                size_t n = build_frame(wire, WSOPCODE_BINARY, 0, (const unsigned char*)"PO", 2);
+                TEST_ASSERT_EQUAL(WSPARSER_HANDLE_AND_CONTINUE, harness_feed(&h, wire, n), "partial method");
+                websocketsparser_prepare_remains(h.parser);
+                n = build_frame(wire, WSOPCODE_CONTINUE, 0, (const unsigned char*)"ST /route?x=1 ", 14);
+                TEST_ASSERT_EQUAL(WSPARSER_HANDLE_AND_CONTINUE, harness_feed(&h, wire, n), "split routing prefix");
+                websocketsparser_prepare_remains(h.parser);
+                TEST_ASSERT_EQUAL(BODY_STORE_EMPTY, h.parser->request->protocol->payload.incoming.state, "prefix is not stored");
+            }
+            for (size_t sent = 0; sent < size;) {
+                size_t count = size - sent;
+                if (count > 16384) count = 16384;
+                if (sent < BODY_STORE_FILE_THRESHOLD - 1 && sent + count >= BODY_STORE_FILE_THRESHOLD - 1)
+                    count = BODY_STORE_FILE_THRESHOLD - 1 - sent;
+                int final = sent + count == size;
+                size_t n = build_frame(wire, sent == 0 && !resource ? WSOPCODE_BINARY : WSOPCODE_CONTINUE,
+                                       final, (unsigned char*)data + sent, count);
+                TEST_ASSERT_EQUAL(final ? WSPARSER_COMPLETE : WSPARSER_HANDLE_AND_CONTINUE,
+                                  harness_feed(&h, wire, n), "fragment parsed");
+                sent += count;
+                if (sent == BODY_STORE_FILE_THRESHOLD - 1)
+                    TEST_ASSERT_EQUAL(BODY_STORE_MEMORY, h.parser->request->protocol->payload.incoming.state, "one byte below threshold");
+                if (!final) {
+                    websocketsrequest_t* request = h.parser->request;
+                    websocketsparser_prepare_remains(h.parser);
+                    n = build_frame(wire, WSOPCODE_PING, 1, (const unsigned char*)"p", 1);
+                    TEST_ASSERT_EQUAL(WSPARSER_HANDLE_AND_CONTINUE, harness_feed(&h, wire, n), "interleaved ping");
+                    TEST_ASSERT_EQUAL(sent, websocketsrequest_payload_size(request->protocol), "ping does not append body");
+                    websocketsparser_prepare_remains(h.parser);
+                    TEST_ASSERT(h.parser->request == request, "ping preserves request");
+                }
+            }
+            if (resource) {
+                websockets_protocol_resource_t* protocol = (websockets_protocol_resource_t*)h.parser->request->protocol;
+                TEST_ASSERT_STR_EQUAL("/route", protocol->path, "routing path unchanged");
+            }
+            storage_check(&h, data, size);
+            free(data);
+        }
+    }
+    env()->main.client_max_body_size = saved_max;
+}
+
+TEST(test_wsp_storage_decompressed_message_threshold) {
+    TEST_SUITE("WebSocket body storage: decompressed threshold");
+    unsigned int saved_max = env()->main.client_max_body_size;
+    env()->main.client_max_body_size = 2 * BODY_STORE_FILE_THRESHOLD;
+    const size_t sizes[] = {20000, BODY_STORE_FILE_THRESHOLD - 1,
+                           BODY_STORE_FILE_THRESHOLD, BODY_STORE_FILE_THRESHOLD + 1};
+    for (int resource = 0; resource < 2; ++resource) {
+        for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+            harness_t h;
+            storage_harness_init(&h, resource);
+            harness_enable_deflate(&h);
+            size_t size = sizes[i];
+            const char* prefix = resource ? "POST /route " : "";
+            size_t prefix_size = strlen(prefix);
+            char* text = malloc(prefix_size + size);
+            TEST_REQUIRE_NOT_NULL(text, "uncompressed input");
+            memcpy(text, prefix, prefix_size);
+            memset(text + prefix_size, 'x', size);
+            ws_deflate_t client;
+            ws_deflate_init(&client);
+            TEST_REQUIRE(ws_deflate_start(&client), "compressor");
+            unsigned char compressed[16384], wire[16400];
+            ssize_t clen = ws_deflate_compress(&client, text, prefix_size + size,
+                                             (char*)compressed, sizeof(compressed), 1);
+            TEST_REQUIRE(clen > 2 && (size_t)clen < sizeof(compressed), "small compressed wire body");
+            size_t half = (size_t)clen / 2;
+            size_t n = build_frame_masked(wire, WSOPCODE_TEXT, 0, 1, compressed, half, DEFAULT_MASK);
+            TEST_ASSERT_EQUAL(WSPARSER_HANDLE_AND_CONTINUE, harness_feed(&h, wire, n), "compressed first fragment");
+            websocketsrequest_t* request = h.parser->request;
+            size_t stored = websocketsrequest_payload_size(request->protocol);
+            websocketsparser_prepare_remains(h.parser);
+            n = build_frame(wire, WSOPCODE_PONG, 1, (const unsigned char*)"p", 1);
+            TEST_ASSERT_EQUAL(WSPARSER_HANDLE_AND_CONTINUE, harness_feed(&h, wire, n), "pong during compressed message");
+            TEST_ASSERT_EQUAL(stored, websocketsrequest_payload_size(request->protocol), "pong preserves decompressed bytes");
+            websocketsparser_prepare_remains(h.parser);
+            n = build_frame(wire, WSOPCODE_CONTINUE, 1, compressed + half, (size_t)clen - half);
+            TEST_ASSERT_EQUAL(WSPARSER_COMPLETE, harness_feed(&h, wire, n), "compressed message completed");
+            storage_check(&h, text + prefix_size, size);
+            ws_deflate_free(&client);
+            free(text);
+        }
+    }
+    env()->main.client_max_body_size = saved_max;
+}
+
+
+TEST(test_wsp_storage_memory_reset_json_and_fd_append) {
+    TEST_SUITE("WebSocket body storage: API and lifecycle");
+    harness_t h;
+    harness_init(&h);
+    unsigned char wire[128];
+    const char* text = "{\"value\":123}";
+    char* saved_tmp = env()->main.tmp;
+    env()->main.tmp = "/nonexistent_dir_cwfr_test";
+    size_t n = build_frame(wire, WSOPCODE_TEXT, 1, (const unsigned char*)text, strlen(text));
+    TEST_ASSERT_EQUAL(WSPARSER_COMPLETE, harness_feed(&h, wire, n), "small JSON needs no tmp directory");
+    websocketsrequest_t* request = h.parser->request;
+    json_doc_t* a = websocketsrequest_payload_json(request->protocol);
+    json_doc_t* b = websocketsrequest_payload_json(request->protocol);
+    TEST_ASSERT(a && b && a != b, "independent JSON documents");
+    char* copy = websocketsrequest_payload(request->protocol);
+    request->can_reset = 0;
+    request->base.reset(request);
+    TEST_ASSERT_EQUAL(BODY_STORE_MEMORY, request->protocol->payload.incoming.state, "gated reset preserves memory");
+    request->base.reset(request);
+    TEST_ASSERT_EQUAL(BODY_STORE_EMPTY, request->protocol->payload.incoming.state, "ordinary reset frees memory");
+    TEST_ASSERT_STR_EQUAL(text, copy, "caller copy survives reset");
+    if (a) TEST_ASSERT(json_is_object(json_root(a)), "JSON survives reset");
+    json_free(a);
+    json_free(b);
+    free(copy);
+    env()->main.tmp = saved_tmp;
+    harness_free(&h);
+
+    websockets_protocol_t* protocol = websockets_protocol_default_create();
+    request = websocketsrequest_create(NULL, protocol);
+    TEST_REQUIRE_NOT_NULL(request, "request for explicit file access");
+    TEST_ASSERT(websocketsrequest_payload_append(protocol, "abc", 3), "initial memory");
+    file_content_t file = websocketsrequest_payload_file(protocol);
+    TEST_ASSERT(file.ok, "file requested during message");
+    TEST_ASSERT(websocketsrequest_payload_append(protocol, "def", 3), "append after materialization");
+    copy = websocketsrequest_payload(protocol);
+    TEST_ASSERT_STR_EQUAL("abcdef", copy, "append preserves materialized message");
+    TEST_ASSERT_EQUAL(file.fd, websocketsrequest_payload_file(protocol).fd, "same fd after append");
+    free(copy);
+    request->can_reset = 0;
+    websocketsrequest_free(request);
+    TEST_ASSERT_EQUAL(-1, fcntl(file.fd, F_GETFD), "destruction closes explicit fd");
+
+    harness_init(&h);
+    n = build_frame(wire, WSOPCODE_BINARY, 1, (const unsigned char*)"", 0);
+    TEST_ASSERT_EQUAL(WSPARSER_COMPLETE, harness_feed(&h, wire, n), "empty message completes");
+    TEST_ASSERT_EQUAL(BODY_STORE_EMPTY, h.parser->request->protocol->payload.incoming.state, "empty message retains absent payload semantics");
+    TEST_ASSERT_NULL(harness_payload(&h), "empty payload accessor unchanged");
+    TEST_ASSERT(!websocketsrequest_payload_file(h.parser->request->protocol).ok, "empty payload has no file");
+    harness_free(&h);
+}
+
+TEST(test_wsp_storage_spill_failure_and_close_cleanup) {
+    TEST_SUITE("WebSocket body storage: failure and close cleanup");
+    unsigned int saved_max = env()->main.client_max_body_size;
+    env()->main.client_max_body_size = 2 * BODY_STORE_FILE_THRESHOLD;
+    char* data = malloc(BODY_STORE_FILE_THRESHOLD);
+    TEST_REQUIRE_NOT_NULL(data, "threshold input");
+    memset(data, 'x', BODY_STORE_FILE_THRESHOLD);
+    websockets_protocol_t* protocol = websockets_protocol_default_create();
+    websocketsrequest_t* request = websocketsrequest_create(NULL, protocol);
+    TEST_REQUIRE_NOT_NULL(request, "spill request");
+    TEST_ASSERT(websocketsrequest_payload_append(protocol, data, BODY_STORE_FILE_THRESHOLD - 1), "memory before spill");
+    char* saved_tmp = env()->main.tmp;
+    env()->main.tmp = "/nonexistent_dir_cwfr_test";
+    TEST_ASSERT(!websocketsrequest_payload_append(protocol, "x", 1), "spill fails on unusable directory");
+    TEST_ASSERT_NULL(websocketsrequest_payload(protocol), "failed message cannot be dispatched as partial body");
+    TEST_ASSERT(!websocketsrequest_payload_file(protocol).ok, "failed message has no file accessor");
+    TEST_ASSERT_EQUAL(-1, protocol->payload.incoming.fd, "no fd leaked on spill failure");
+    env()->main.tmp = saved_tmp;
+    request->can_reset = 0;
+    websocketsrequest_free(request);
+
+    for (int spill = 0; spill < 2; ++spill) {
+        harness_t h;
+        harness_init(&h);
+        unsigned char wire[16400];
+        size_t total = spill ? BODY_STORE_FILE_THRESHOLD : 100;
+        for (size_t sent = 0; sent < total;) {
+            size_t count = total - sent;
+            if (count > 16384) count = 16384;
+            size_t n = build_frame(wire, sent == 0 ? WSOPCODE_BINARY : WSOPCODE_CONTINUE,
+                                   0, (const unsigned char*)data, count);
+            TEST_ASSERT_EQUAL(WSPARSER_HANDLE_AND_CONTINUE, harness_feed(&h, wire, n), "unfinished message fragment");
+            sent += count;
+            websocketsparser_prepare_remains(h.parser);
+        }
+        body_store_t* store = &h.parser->request->protocol->payload.incoming;
+        TEST_ASSERT_EQUAL(spill ? BODY_STORE_FILE : BODY_STORE_MEMORY, store->state, "incomplete message storage");
+        int fd = store->fd;
+        char* path = store->path ? strdup(store->path) : NULL;
+        const unsigned char close[] = {0x03, 0xe8};
+        size_t n = build_frame(wire, WSOPCODE_CLOSE, 1, close, sizeof(close));
+        TEST_ASSERT_EQUAL(WSPARSER_HANDLE_AND_CONTINUE, harness_feed(&h, wire, n), "close interrupts fragments");
+        h.parser->request->can_reset = 0;
+        harness_free(&h);
+        if (spill) TEST_ASSERT_EQUAL(-1, fcntl(fd, F_GETFD), "connection teardown closes incoming fd");
+        if (path) TEST_ASSERT_EQUAL(-1, access(path, F_OK), "connection teardown unlinks incoming file");
+        free(path);
+    }
+    free(data);
+    env()->main.client_max_body_size = saved_max;
 }

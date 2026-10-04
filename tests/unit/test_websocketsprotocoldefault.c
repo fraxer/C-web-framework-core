@@ -71,9 +71,9 @@ static void parser_setup(websocketsparser_t* parser, websocketsrequest_t* reques
 
 /* Read the tmpfile back without moving its offset. */
 static ssize_t payload_file_read(websockets_protocol_t* protocol, char* out, size_t out_size) {
-    if (protocol->payload.fd < 0) return -1;
-
-    return pread(protocol->payload.fd, out, out_size, 0);
+    size_t size = websocketsrequest_payload_size(protocol);
+    if (size > out_size) size = out_size;
+    return websocketsrequest_payload_read(protocol, 0, out, size) ? (ssize_t)size : -1;
 }
 
 static void mask_buffer(char* data, size_t length, const unsigned char mask[4], size_t key_offset) {
@@ -114,7 +114,7 @@ TEST(test_wsdef_create_initializes_protocol) {
 
 TEST(test_wsdef_payload_parse_plain_chunk) {
     TEST_SUITE("websocketsprotocoldefault: payload_parse");
-    TEST_CASE("unmasked chunk lands in the tmpfile, offset rewound");
+    TEST_CASE("unmasked small chunk stays in memory");
 
     websocketsrequest_t* request = make_default_request();
     TEST_REQUIRE_NOT_NULL(request, "request allocation");
@@ -123,8 +123,8 @@ TEST(test_wsdef_payload_parse_plain_chunk) {
     parser_setup(&parser, request, NULL);
 
     TEST_ASSERT_EQUAL(1, websockets_protocol_default_payload_parse(&parser, "hello", 5, 0), "parse succeeds");
-    TEST_ASSERT(request->protocol->payload.fd >= 0, "tmpfile created");
-    TEST_ASSERT_EQUAL(0, lseek(request->protocol->payload.fd, 0, SEEK_CUR), "offset rewound to start");
+    TEST_ASSERT_EQUAL(BODY_STORE_MEMORY, request->protocol->payload.incoming.state, "memory selected");
+    TEST_ASSERT_EQUAL(-1, request->protocol->payload.fd, "no legacy fd");
     TEST_ASSERT_EQUAL(0, parser.payload_index, "payload_index untouched without unmasking");
 
     char content[16] = {0};
@@ -244,7 +244,7 @@ TEST(test_wsdef_payload_parse_limit_first_chunk) {
     TEST_ASSERT_EQUAL(0, websockets_protocol_default_payload_parse(&parser, "12345", 5, 0), "oversized chunk rejected");
 
     char content[8];
-    TEST_ASSERT_EQUAL(0, (int)payload_file_read(request->protocol, content, sizeof(content)), "nothing was written");
+    TEST_ASSERT_EQUAL(-1, (int)payload_file_read(request->protocol, content, sizeof(content)), "failed store cannot be read");
 
     env()->main.client_max_body_size = saved_limit;
     websocketsrequest_free(request);
@@ -267,8 +267,8 @@ TEST(test_wsdef_payload_parse_limit_is_cumulative) {
     TEST_ASSERT_EQUAL(0, websockets_protocol_default_payload_parse(&parser, "789", 3, 0), "second chunk crosses the limit");
 
     char content[16] = {0};
-    TEST_ASSERT_EQUAL(6, (int)payload_file_read(request->protocol, content, sizeof(content)), "file keeps only the first chunk");
-    TEST_ASSERT_STR_EQUAL("123456", content, "first chunk intact");
+    TEST_ASSERT_EQUAL(6, request->protocol->payload.incoming.size, "only first chunk stored");
+    TEST_ASSERT_EQUAL(-1, (int)payload_file_read(request->protocol, content, sizeof(content)), "partial failed message cannot be read");
 
     env()->main.client_max_body_size = saved_limit;
     websocketsrequest_free(request);
@@ -276,7 +276,7 @@ TEST(test_wsdef_payload_parse_limit_is_cumulative) {
 
 TEST(test_wsdef_payload_parse_tmpdir_failure) {
     TEST_SUITE("websocketsprotocoldefault: payload_parse");
-    TEST_CASE("unusable tmp directory fails the chunk cleanly");
+    TEST_CASE("small chunk does not need a usable tmp directory");
 
     websocketsrequest_t* request = make_default_request();
     TEST_REQUIRE_NOT_NULL(request, "request allocation");
@@ -287,7 +287,7 @@ TEST(test_wsdef_payload_parse_tmpdir_failure) {
     char* saved_tmp = env()->main.tmp;
     env()->main.tmp = "/nonexistent_dir_cwfr_test";
 
-    TEST_ASSERT_EQUAL(0, websockets_protocol_default_payload_parse(&parser, "data", 4, 0), "chunk fails without tmpfile");
+    TEST_ASSERT_EQUAL(1, websockets_protocol_default_payload_parse(&parser, "data", 4, 0), "small chunk succeeds without tmpfile");
     TEST_ASSERT_EQUAL(-1, request->protocol->payload.fd, "fd stays at the -1 sentinel");
 
     env()->main.tmp = saved_tmp;
@@ -319,7 +319,8 @@ TEST(test_wsdef_payload_parse_short_write_regression) {
     const struct rlimit small_limit = {.rlim_cur = 4, .rlim_max = saved_limit.rlim_max};
     TEST_REQUIRE(setrlimit(RLIMIT_FSIZE, &small_limit) == 0, "shrink RLIMIT_FSIZE");
 
-    const int result = websockets_protocol_default_payload_parse(&parser, "123456", 6, 0);
+    const int created = websockets_create_tmpfile(request->protocol, env()->main.tmp);
+    const int result = created ? websockets_protocol_default_payload_parse(&parser, "123456", 6, 0) : 1;
 
     setrlimit(RLIMIT_FSIZE, &saved_limit);
     sigaction(SIGXFSZ, &saved_action, NULL);
@@ -377,7 +378,8 @@ TEST(test_wsdef_reset_leaves_payload_to_request) {
     /* The default protocol has no per-message state of its own, so its reset
      * must not touch the payload - websocketsrequest_reset releases it. */
     request->protocol->reset(request->protocol);
-    TEST_ASSERT(request->protocol->payload.fd >= 0, "payload survives protocol reset");
+    TEST_ASSERT_EQUAL(BODY_STORE_MEMORY, request->protocol->payload.incoming.state, "payload survives protocol reset");
+    TEST_REQUIRE(websocketsrequest_payload_file(request->protocol).ok, "explicit file access");
 
     char* path = strdup(request->protocol->payload.path);
     TEST_REQUIRE_NOT_NULL(path, "path copy");

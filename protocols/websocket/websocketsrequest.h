@@ -18,12 +18,14 @@ struct websocketsparser;
  * Can be extended for custom protocol implementations (e.g., JSON-RPC, binary protocols).
  */
 typedef struct websockets_protocol {
-    /** Temporary file storage for payload data (fd + path) */
+    /** Owned memory/file storage for incoming payload data */
     websockets_payload_t payload;
 
     /**
      * Parse incoming payload chunk (called during frame reception).
-     * Typically decodes XOR mask and writes to temp file.
+     * Decodes XOR masking before appending visible bytes to owned storage.
+     * Custom callbacks may use websocketsrequest_payload_append, or retain
+     * the legacy fd/path after websockets_create_tmpfile.
      * @param parser Parser with current frame state
      * @param data Raw masked data chunk
      * @param size Chunk size in bytes
@@ -117,14 +119,18 @@ websocketsrequest_t* websocketsrequest_create(connection_t* connection, websocke
 void websocketsrequest_free(void* arg);
 
 /**
- * Read payload as string from protocol's temp file.
+ * Read payload as a caller-owned string from memory or file storage.
  * @param protocol Protocol with payload data
  * @return Allocated null-terminated string (caller must free), or NULL on error
  */
 char* websocketsrequest_payload(websockets_protocol_t* protocol);
+/* Internal binary range access and accumulation after unmasking/decompression. */
+size_t websocketsrequest_payload_size(websockets_protocol_t* protocol);
+int websocketsrequest_payload_read(websockets_protocol_t* protocol, size_t offset, void* data, size_t size);
+int websocketsrequest_payload_append(websockets_protocol_t* protocol, const void* data, size_t size);
 
 /**
- * Get payload as file content descriptor.
+ * Materialize payload as a file content descriptor owned by the request.
  * @param protocol Protocol with payload data
  * @return file_content_t with fd, size, offset. Check .ok for validity
  */
@@ -138,7 +144,7 @@ file_content_t websocketsrequest_payload_file(websockets_protocol_t* protocol);
 json_doc_t* websocketsrequest_payload_json(websockets_protocol_t* protocol);
 
 /**
- * Initialize protocol payload fields (fd=-1, path=NULL).
+ * Initialize incoming storage and legacy fields (fd=-1, path=NULL).
  * @param protocol Protocol to initialize
  */
 void websockets_protocol_init_payload(websockets_protocol_t* protocol);
