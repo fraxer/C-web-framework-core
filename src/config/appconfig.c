@@ -285,7 +285,7 @@ void __appconfig_env_init(env_t* env) {
     env->main.reload = APPCONFIG_RELOAD_SOFT;
     env->main.client_max_body_size = 0;
     env->main.body_store.file_threshold = BODY_STORE_DEFAULT_FILE_THRESHOLD;
-    env->main.body_store.mode = BODY_STORE_MODE_AUTO;
+    env->main.body_store.mode = BODY_STORE_MODE_FILE;
     env->main.gzip = NULL;
     env->main.threads = 0;
     env->main.workers = 0;
@@ -313,7 +313,7 @@ void __appconfig_env_free(env_t* env) {
 
     env->main.client_max_body_size = 0;
     env->main.body_store.file_threshold = BODY_STORE_DEFAULT_FILE_THRESHOLD;
-    env->main.body_store.mode = BODY_STORE_MODE_AUTO;
+    env->main.body_store.mode = BODY_STORE_MODE_FILE;
     env->main.threads = 0;
     env->main.workers = 0;
 

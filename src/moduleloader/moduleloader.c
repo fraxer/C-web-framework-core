@@ -476,7 +476,7 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     }
     env->main.client_max_body_size = client_max_body_size;
 
-    env->main.body_store.mode = BODY_STORE_MODE_AUTO;
+    env->main.body_store.mode = BODY_STORE_MODE_FILE;
     env->main.body_store.file_threshold = BODY_STORE_DEFAULT_FILE_THRESHOLD;
     const json_token_t* token_body_store = json_object_get(token_main, "body_store");
     if (token_body_store != NULL) {

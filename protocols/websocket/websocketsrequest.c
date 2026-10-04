@@ -19,7 +19,7 @@ void websockets_protocol_init_payload(websockets_protocol_t* protocol) {
     const env_t* cfg = env();
     body_store_init(&protocol->payload.incoming, SIZE_MAX,
         cfg != NULL ? cfg->main.body_store.file_threshold : BODY_STORE_DEFAULT_FILE_THRESHOLD,
-        cfg != NULL ? cfg->main.body_store.mode : BODY_STORE_MODE_AUTO);
+        cfg != NULL ? cfg->main.body_store.mode : BODY_STORE_MODE_FILE);
     protocol->payload.fd = -1;
     protocol->payload.path = NULL;
 }
