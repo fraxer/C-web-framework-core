@@ -1520,6 +1520,51 @@ TEST(test_wsh_sent_ping_waits_for_pong) {
     timeout_set_clock(NULL);
 }
 
+TEST(test_wsh_send_idle_ignores_handler_blocked_output) {
+    TEST_SUITE("websocket heartbeat");
+    TEST_CASE("a Ping queued behind an unfinished handler does not run the send clock");
+    wsh_harness_t h;
+    TEST_REQUIRE(wsh_harness_init(&h), "harness initialized");
+    heartbeat_test_ms = 100000;
+    timeout_set_clock(heartbeat_clock);
+    timeout_policy_defaults(&h.server.timeouts);
+    TEST_ASSERT(wsh_attach_parser(&h, websockets_protocol_default_create), "parser attached");
+    websocketsparser_t* p = h.ctx.parser;
+    connection_out_slot_t* blocked = calloc(1, sizeof *blocked);
+    if (p && blocked) {
+        p->timeout_policy.ws_ping_interval_ms = 10;
+        p->timeout_policy.ws_send_idle_timeout_ms = 100;
+        p->timeout_policy.ws_pong_timeout_ms = 3000;
+        p->timeout_policy.ws_application_idle_timeout_ms = 0;
+        /* The reserved, still empty slot of a handler that has not returned. */
+        cqueue_lock(h.ctx.write_queue);
+        cqueue_append(h.ctx.write_queue, blocked);
+        cqueue_unlock(h.ctx.write_queue);
+        heartbeat_test_ms += 10;
+        websockets_server_tick(h.conn);
+        TEST_ASSERT(p->ping_queued && wsh_staged(&h) == NULL && wsh_pending(&h) == 2,
+                    "Ping waits behind the handler's slot");
+        heartbeat_test_ms += 1000;
+        TEST_ASSERT(websockets_guard_read(h.conn), "connection survives a long handler");
+        TEST_ASSERT(!(p->timeout_reported & timeout_event_bit("send_idle")), "no send_idle while output is blocked");
+
+        /* The handler finishes without a reply: the Ping is now writable, and
+         * an unwritable socket would be the peer's doing. */
+        cqueue_lock(h.ctx.write_queue);
+        cqueue_pop(h.ctx.write_queue);
+        cqueue_unlock(h.ctx.write_queue);
+        free(blocked);
+        blocked = NULL;
+        TEST_ASSERT(websockets_guard_read(h.conn), "send clock starts once the head is ready");
+        heartbeat_test_ms += 100;
+        TEST_ASSERT(!websockets_guard_read(h.conn), "stalled writable output still hits send_idle");
+        TEST_ASSERT(p->timeout_reported & timeout_event_bit("send_idle"), "send_idle reported");
+    } else TEST_ASSERT(0, "parser and slot allocated");
+    free(blocked);
+    wsh_harness_free(&h);
+    timeout_set_clock(NULL);
+}
+
 TEST(test_wsh_timeout_read_and_tick_close) {
     TEST_SUITE("websocket heartbeat");
     for (int read_path = 0; read_path < 2; read_path++) {

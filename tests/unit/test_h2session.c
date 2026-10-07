@@ -3,6 +3,7 @@
 #include "connection_s.h"
 #include "domain.h"
 #include "h2ws.h"
+#include "multiplexing.h"
 
 #include <sys/socket.h>
 #include <time.h>
@@ -367,6 +368,51 @@ TEST(test_h2session_header_receive_timing) {
     h2_session_free(s);
 }
 
+static int trailers_control_mod(connection_t* c, int flags) { (void)c; (void)flags; return 1; }
+
+TEST(test_h2session_trailers_after_body_deadline) {
+    TEST_SUITE("h2session");
+    TEST_CASE("trailers completing after the body deadline do not dispatch the request");
+    server_t server = {0};
+    timeout_policy_defaults(&server.timeouts);
+    server.timeouts.request_body_idle_timeout_ms = 10;
+    char host[] = "localhost";
+    domain_t domain = { .is_literal = 1, .template = host, .ascii_template = host, .ascii_length = 9 };
+    server.domain = &domain;
+    server.port = 8080;
+    server.ip = ipaddr_from_v4(0x0100007f);
+    cqueue_item_t item = { .data = &server };
+    connection_t listening = { .port = 8080, .ip = server.ip };
+    /* Lets a wrongly dispatched request be answered instead of crashing. */
+    mpxapi_t api = { .control_mod = trailers_control_mod };
+    listener_t listener = { .servers = { .item = &item, .last_item = &item, .size = 1 },
+                            .connection = &listening, .api = &api };
+    connection_server_ctx_t ctx = { .server = &server, .listener = &listener };
+    connection_t c = { .fd = -1, .ctx = &ctx, .port = 8080, .ip = server.ip };
+    h2session_t* s = h2_test_session_create(&c);
+    TEST_REQUIRE(s != NULL, "session allocated");
+    timeout_test_ms = 100000;
+    timeout_set_clock(timeout_test_clock);
+    s->abort_epoch_ms = s->ctrl_epoch_ms = timeout_test_ms;
+    /* POST, scheme http, path /, literal authority localhost; body follows. */
+    const uint8_t block[] = {0x83,0x86,0x84,0x01,9,'l','o','c','a','l','h','o','s','t'};
+    TEST_ASSERT(feed_frame(s, H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, 1, block, sizeof block),
+                "request headers accepted");
+    h2stream_t* stream = h2stream_find(s, 1);
+    TEST_REQUIRE(stream && stream->headers_done && stream->state == H2_STREAM_OPEN, "body pending");
+    stream->timeout_policy.request_body_idle_timeout_ms = 10;
+    /* No timer tick runs between expiry and the trailers' arrival. */
+    timeout_test_ms += 11;
+    const size_t out_before = s->out_len;
+    TEST_ASSERT(feed_frame(s, H2_FRAME_HEADERS, H2_FLAG_END_HEADERS | H2_FLAG_END_STREAM, 1, NULL, 0),
+                "late trailers handled as a stream error");
+    TEST_ASSERT(h2stream_find(s, 1) == NULL, "expired request is not dispatched");
+    TEST_ASSERT(s->out_len - out_before == 13 && s->out[out_before + 3] == H2_FRAME_RST_STREAM &&
+                s->out[out_before + 12] == 8, "RST_STREAM(CANCEL) is queued");
+    timeout_set_clock(NULL);
+    h2_session_free(s);
+}
+
 TEST(test_h2session_websocket_partial_data_deadlines) {
     TEST_SUITE("h2 websocket partial data");
     server_t server = {0};
@@ -413,6 +459,55 @@ TEST(test_h2session_websocket_partial_data_deadlines) {
         TEST_ASSERT(h2stream_find(s, 1) == NULL, "steady trickle cannot outrun message total");
         TEST_ASSERT(h2_session_feed(s, wire + 13, n - 13), "rest of the frame discarded at the boundary");
     }
+    timeout_set_clock(NULL);
+    h2_session_free(s);
+}
+
+TEST(test_h2session_websocket_send_idle_ignores_handler_blocked_output) {
+    TEST_SUITE("h2 websocket send timeout");
+    TEST_CASE("a Ping queued behind an unfinished handler does not run the send clock");
+    server_t server = {0};
+    timeout_policy_defaults(&server.timeouts);
+    server.timeouts.ws_ping_interval_ms = 10;
+    server.timeouts.ws_send_idle_timeout_ms = 100;
+    server.timeouts.ws_pong_timeout_ms = 3000;
+    server.timeouts.ws_application_idle_timeout_ms = 0;
+    connection_server_ctx_t ctx = { .server = &server };
+    connection_t c = { .fd = -1, .ctx = &ctx };
+    h2session_t* s = h2_test_session_create(&c);
+    TEST_REQUIRE(s != NULL, "session allocated");
+    timeout_test_ms = 100000;
+    timeout_set_clock(timeout_test_clock);
+    h2stream_t* stream = h2stream_create(s, 1);
+    if (stream) stream->ws = h2_ws_tunnel_create(&c, stream, 0, NULL);
+    connection_out_slot_t* blocked = calloc(1, sizeof *blocked);
+    if (stream && stream->ws && blocked) {
+        h2_ws_tunnel_t* tunnel = stream->ws;
+        websocketsparser_t* p = tunnel->parser;
+        p->timeout_policy = server.timeouts;
+        p->heartbeat_ms = timeout_test_ms;
+        /* The reserved, still empty slot of a handler that has not returned. */
+        cqueue_lock(tunnel->out);
+        cqueue_append(tunnel->out, blocked);
+        cqueue_unlock(tunnel->out);
+        timeout_test_ms += 10;
+        TEST_ASSERT(h2_ws_tunnel_tick(tunnel, timeout_test_ms) && p->ping_queued, "Ping queued");
+        TEST_ASSERT(!h2_ws_tunnel_has_output(tunnel), "Ping waits behind the handler's slot");
+        timeout_test_ms += 1000;
+        TEST_ASSERT(h2_ws_tunnel_tick(tunnel, timeout_test_ms), "tunnel survives a long handler");
+        TEST_ASSERT(!(p->timeout_reported & timeout_event_bit("send_idle")), "no send_idle while output is blocked");
+
+        /* The handler finishes without a reply: the Ping is now writable. */
+        cqueue_lock(tunnel->out);
+        cqueue_pop(tunnel->out);
+        cqueue_unlock(tunnel->out);
+        free(blocked);
+        blocked = NULL;
+        TEST_ASSERT(h2_ws_tunnel_tick(tunnel, timeout_test_ms), "send clock starts once the head is ready");
+        timeout_test_ms += 100;
+        TEST_ASSERT(!h2_ws_tunnel_tick(tunnel, timeout_test_ms), "stalled writable output still hits send_idle");
+    } else TEST_ASSERT(0, "tunnel and slot allocated");
+    free(blocked);
     timeout_set_clock(NULL);
     h2_session_free(s);
 }

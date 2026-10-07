@@ -56,23 +56,24 @@ static int __out_publish_new(websocketsresponse_t* response, cqueue_t* out_queue
 static void __out_finish_current(connection_t* connection);
 static int __fanout_allowed(connection_t* connection, const websocketsrequest_t* request);
 
+/* Output the write path could make progress on: the response in flight, or a
+ * filled queue head. A filled slot behind an empty head waits on a handler,
+ * not on the peer, and must not run the send clock. */
 static int __pending_output(connection_server_ctx_t* ctx) {
     if (ctx->response) return 1;
     if (!ctx->write_queue) return 0;
-    int pending = 0;
     cqueue_lock(ctx->write_queue);
-    for (cqueue_item_t* item = cqueue_first(ctx->write_queue); item; item = item->next) {
-        const connection_out_slot_t* slot = item->data;
-        if (slot && slot->response) { pending = 1; break; }
-    }
+    cqueue_item_t* first = cqueue_first(ctx->write_queue);
+    const connection_out_slot_t* slot = first != NULL ? first->data : NULL;
+    const int ready = slot != NULL && slot->response != NULL;
     cqueue_unlock(ctx->write_queue);
-    return pending;
+    return ready;
 }
 
 static int __timeout_check(connection_t* connection, uint64_t now) {
     connection_server_ctx_t* ctx = connection->ctx;
     websocketsparser_t* p = ctx->parser;
-    const char* reason = websocketsparser_timeout(p, now, __pending_output(ctx) || p->ping_queued);
+    const char* reason = websocketsparser_timeout(p, now, __pending_output(ctx));
     timeout_report(&p->timeout_reported, "websocket", reason, connection->fd, 0);
     if (reason) {
         if (p->close_started_ms || p->frame_started_ms || !strcmp(reason, "send_idle")) {
