@@ -1,6 +1,7 @@
 #include "h2ws.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 #include "broadcast.h"
 #include "connection_s.h"
@@ -216,6 +217,7 @@ h2_data_status_e h2_ws_tunnel_write(h2session_t* s, h2stream_t* stream) {
 
         const h2_data_status_e st = h2_data_write(&tunnel->writer, s, stream, &view, 1);
 
+        if (view.pos > response->body.pos) tunnel->parser->send_progress_ms = timeout_now_ms();
         response->body.pos = view.pos;
 
         if (st != H2_DATA_DRAINED) return st;
@@ -223,6 +225,9 @@ h2_data_status_e h2_ws_tunnel_write(h2session_t* s, h2stream_t* stream) {
         if (response->frame_code == WEBSOCKETS_CLOSE)
             tunnel->close_sent = 1;
 
+        if (response->frame_code == 0x89 && tunnel->parser->ping_queued)
+            websocketsparser_ping_sent(tunnel->parser);
+        timeout_event_clear(&tunnel->parser->timeout_reported, "send_idle");
         response->base.free(response);
         tunnel->writing = NULL;
 
@@ -249,6 +254,7 @@ static int h2_ws_message_seen(h2_ws_tunnel_t* tunnel, connection_t* connection) 
 
     switch (parser->frame.opcode) {
     case WSOPCODE_CLOSE: {
+        parser->close_started_ms = timeout_now_ms();
         /* Echo the close and stop: END_STREAM rides the reply out, and this
          * stream is finished (the full lifecycle is step 7). */
         websocketsresponse_t* response = websocketsresponse_create(connection);
@@ -269,6 +275,7 @@ static int h2_ws_message_seen(h2_ws_tunnel_t* tunnel, connection_t* connection) 
         break;
     }
     case WSOPCODE_PONG:
+        websocketsparser_pong(parser, bufferdata_get(&parser->buf), bufferdata_writed(&parser->buf));
         break; /* answer to our own ping; nothing is owed */
 
     default:
@@ -296,7 +303,7 @@ static int h2_ws_message_seen(h2_ws_tunnel_t* tunnel, connection_t* connection) 
         if (tunnel->stream != NULL)
             atomic_store_explicit(&tunnel->stream->handler_pending, 1, memory_order_release);
 
-        if (parser->request->protocol->get_resource(connection, parser->request)) {
+        if (websocketsparser_dispatch_resource(parser)) {
             /* Dispatched: the queue item owns the request now. The parser drops
              * its pointer on reset without freeing, so nothing is done here. */
             return 1;
@@ -320,11 +327,41 @@ static int h2_ws_message_seen(h2_ws_tunnel_t* tunnel, connection_t* connection) 
     return ok;
 }
 
+static int h2_ws_pending_output(h2_ws_tunnel_t* tunnel) {
+    if (tunnel->writing) return 1;
+    int pending = 0;
+    cqueue_lock(tunnel->out);
+    for (cqueue_item_t* item = cqueue_first(tunnel->out); item; item = item->next) {
+        const connection_out_slot_t* slot = item->data;
+        if (slot && slot->response) { pending = 1; break; }
+    }
+    cqueue_unlock(tunnel->out);
+    return pending;
+}
+
+static int h2_ws_check_timeout(h2_ws_tunnel_t* tunnel, uint64_t now) {
+    websocketsparser_t* p = tunnel->parser;
+    const char* reason = websocketsparser_timeout(p, now, h2_ws_pending_output(tunnel) || p->ping_queued);
+    timeout_report(&p->timeout_reported, "h2_ws", reason, p->timeout_policy.enforce, tunnel->connection->fd, tunnel->stream->id);
+    if (reason && p->timeout_policy.enforce) {
+        if (p->close_started_ms || p->frame_started_ms || !strcmp(reason, "send_idle")) return 0;
+        p->close_started_ms = now;
+        websocketsresponse_t* response = websocketsresponse_create(tunnel->connection);
+        if (!response) return 0;
+        const char status[] = { 3, (char)0xf0 }; /* 1008: policy timeout */
+        websocketsresponse_close(response, status, sizeof status);
+        return h2_ws_queue_now(tunnel, response);
+    }
+    return 1;
+}
+
 int h2_ws_tunnel_feed(h2_ws_tunnel_t* tunnel, connection_t* connection,
                       uint8_t* data, size_t len) {
     websocketsparser_t* parser = tunnel->parser;
 
     if (len == 0) return 1;
+    if (!h2_ws_check_timeout(tunnel, timeout_now_ms())) return 0;
+    if (parser->close_started_ms) return 1;
 
     /* Point the parser at this DATA payload and treat it as one read. The
      * buffer belongs to the HTTP/2 frame parser and is reused by the next
@@ -346,11 +383,13 @@ int h2_ws_tunnel_feed(h2_ws_tunnel_t* tunnel, connection_t* connection,
 
         case WSPARSER_HANDLE_AND_CONTINUE:
             if (!h2_ws_message_seen(tunnel, connection)) return 0;
+            websocketsparser_message_done(parser);
             websocketsparser_prepare_remains(parser);
             break;
 
         case WSPARSER_COMPLETE:
             if (!h2_ws_message_seen(tunnel, connection)) return 0;
+            websocketsparser_message_done(parser);
             websocketsparser_reset(parser);
             return 1;
 
@@ -367,4 +406,19 @@ int h2_ws_tunnel_feed(h2_ws_tunnel_t* tunnel, connection_t* connection,
             return 0;
         }
     }
+}
+
+int h2_ws_tunnel_tick(h2_ws_tunnel_t* tunnel, uint64_t now) {
+    websocketsparser_t* p = tunnel->parser;
+    if (!h2_ws_check_timeout(tunnel, now)) return 0;
+    if (!p->close_started_ms && !p->ping_queued && !p->ping_sent_ms && timeout_expired(now, p->heartbeat_ms, p->timeout_policy.ws_ping_interval_ms)) {
+        websocketsresponse_t* response = websocketsresponse_create(tunnel->connection);
+        if (!response) return 0;
+        p->ping_sequence++;
+        p->ping_queued = 1;
+        p->send_progress_ms = now;
+        websocketsresponse_ping(response, (const char*)&p->ping_sequence, sizeof p->ping_sequence);
+        return h2_ws_queue_now(tunnel, response);
+    }
+    return 1;
 }

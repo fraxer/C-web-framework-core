@@ -9,6 +9,7 @@
 #include "websocketscommon.h"
 #include "ws_deflate.h"
 #include "ws_utf8.h"
+#include "timeouts.h"
 
 enum websocketsparser_status {
     WSPARSER_ERROR = 0,
@@ -48,6 +49,19 @@ typedef enum websockets_payload_stage {
 
 typedef struct websocketsparser {
     requestparser_t base;
+    timeout_policy_t timeout_policy;
+    uint64_t message_started_ms;
+    uint64_t message_progress_ms;
+    uint64_t frame_started_ms;
+    uint64_t frame_progress_ms;
+    uint64_t application_progress_ms;
+    uint64_t heartbeat_ms;
+    uint64_t ping_sent_ms;
+    uint64_t send_progress_ms;
+    uint64_t close_started_ms;
+    uint64_t ping_sequence;
+    unsigned timeout_reported;
+    int ping_queued;
     websockets_request_stage_e stage;
     websockets_frame_t frame;
     bufferdata_t buf;
@@ -89,6 +103,7 @@ typedef struct websocketsparser {
     /** Streaming UTF-8 validator for TEXT messages (RFC 6455 §8.1). */
     ws_utf8_validator_t utf8_validator;
 } websocketsparser_t;
+_Static_assert(offsetof(websocketsparser_t, base) == 0, "parser interface must stay first");
 
 websocketsparser_t* websocketsparser_create(connection_t* connection, websockets_protocol_t*(*protocol_create)(void));
 void websocketsparser_init(websocketsparser_t* parser);
@@ -97,5 +112,11 @@ void websocketsparser_free(void* arg);
 void websocketsparser_set_bytes_readed(websocketsparser_t*, size_t);
 int websocketsparser_run(websocketsparser_t*);
 void websocketsparser_prepare_remains(websocketsparser_t*);
+/* Owner thread only. Pong must match the outstanding heartbeat payload. */
+int websocketsparser_dispatch_resource(websocketsparser_t* parser);
+void websocketsparser_ping_sent(websocketsparser_t* parser);
+void websocketsparser_pong(websocketsparser_t* parser, const char* payload, size_t length);
+void websocketsparser_message_done(websocketsparser_t* parser);
+const char* websocketsparser_timeout(websocketsparser_t* parser, uint64_t now, int sending);
 
 #endif

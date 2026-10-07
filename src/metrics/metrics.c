@@ -3,6 +3,7 @@
 #include <time.h>
 
 #include "metrics.h"
+#include "timeouts.h"
 
 atomic_int __metrics_on = 0;
 
@@ -558,6 +559,7 @@ json_doc_t* metrics_snapshot_json(void) {
     const unsigned long long depth_sum = __load(&__m.queue_depth_sum);
 
     json_token_t* root = json_root(doc);
+    json_object_set(root, "timeouts", timeout_metrics_json());
     json_object_set(root, "enabled", json_create_bool(metrics_enabled()));
     json_object_set(root, "window_ms", json_create_number((long double)window_ns / 1000000.0L));
 
@@ -706,6 +708,7 @@ json_doc_t* metrics_snapshot_json(void) {
 }
 
 void metrics_reset(void) {
+    timeout_metrics_reset();
     for (int s = 0; s < LOCK_SITE__COUNT; s++) {
         lock_site_metrics_t* pair[2] = { &__m.lock_site[s], &__m.lock_blocker[s] };
 

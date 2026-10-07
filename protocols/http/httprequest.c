@@ -92,6 +92,12 @@ httprequest_t* httprequest_create(connection_t* connection) {
     request->method = ROUTE_NONE;
     request->asterisk_form = 0;
     request->keepalive = 0;
+    request->started_ms = request->headers_done_ms = request->received_ms = request->queued_ms = 0;
+    atomic_init(&request->handler_started_ms, 0);
+    atomic_init(&request->handler_done_ms, 0);
+    request->slow_reported = request->timing_finished = 0;
+    timeout_policy_defaults(&request->timing_policy);
+    request->timing_policy_ready = 0;
     request->version = HTTP1_VER_NONE;
     request->transfer_encoding = TE_NONE;
     request->content_encoding = CE_NONE;
@@ -138,9 +144,15 @@ httprequest_t* httprequest_create(connection_t* connection) {
 }
 
 void httprequest_reset(httprequest_t* request) {
+    request->started_ms = request->headers_done_ms = request->received_ms = request->queued_ms = 0;
+    atomic_store(&request->handler_started_ms, 0);
+    atomic_store(&request->handler_done_ms, 0);
+    request->slow_reported = request->timing_finished = 0;
     request->method = ROUTE_NONE;
     request->asterisk_form = 0;
     request->keepalive = 0;
+    timeout_policy_defaults(&request->timing_policy);
+    request->timing_policy_ready = 0;
     request->version = HTTP1_VER_NONE;
     /* Set by httprequest_create and, until the object started being recycled,
      * never anywhere else — so a reused request carried the framing of the
@@ -1085,4 +1097,54 @@ int httprequest_set_payload_file_content(httprequest_t* request, const file_cont
     failed:
 
     return result;
+}
+
+void httprequest_slow_tick(httprequest_t* r, const timeout_policy_t* p, const char* protocol, uint64_t now) {
+    if (!r || !p || r->slow_reported || !timeout_expired(now, r->started_ms, p->slow_request_threshold_ms))
+        return;
+
+    r->slow_reported = 1;
+
+    const uint64_t started = atomic_load_explicit(&r->handler_started_ms, memory_order_acquire);
+    const uint64_t done = atomic_load_explicit(&r->handler_done_ms, memory_order_acquire);
+    const char* phase = !r->headers_done_ms
+        ? "headers"
+        : !r->received_ms
+            ? "body"
+            : r->queued_ms && !started
+                ? "queue"
+                : started && !done
+                    ? "handler"
+                    : "send";
+
+    timeout_record(protocol, "slow", 0);
+
+    log_info("slow_request protocol=%s phase=%s age_ms=%llu\n", protocol, phase, (unsigned long long)(now - r->started_ms));
+}
+
+void httprequest_timing_finish(httprequest_t* r) {
+    if (!r || !r->started_ms || r->timing_finished)
+        return;
+
+    r->timing_finished = 1;
+
+    uint64_t hs = atomic_load_explicit(&r->handler_started_ms, memory_order_acquire);
+    uint64_t hd = atomic_load_explicit(&r->handler_done_ms, memory_order_acquire);
+    uint64_t headers = r->headers_done_ms >= r->started_ms ? r->headers_done_ms - r->started_ms : 0;
+    uint64_t body = r->received_ms >= r->headers_done_ms && r->headers_done_ms ? r->received_ms - r->headers_done_ms : 0;
+    uint64_t queue = hs >= r->queued_ms && r->queued_ms ? hs - r->queued_ms : 0;
+    uint64_t handler = hd >= hs && hs ? hd - hs : 0;
+    uint64_t send_start = hd ? hd : r->received_ms ? r->received_ms : r->headers_done_ms ? r->headers_done_ms : r->started_ms;
+    uint64_t now = timeout_now_ms();
+    uint64_t send = now >= send_start ? now - send_start : 0;
+    uint64_t total = now >= r->started_ms ? now - r->started_ms : 0;
+    const uint64_t durations[] = { headers, body, queue, handler, send, total };
+    for (unsigned i = 0; i < 6; i++)
+        timeout_duration_record(i, durations[i]);
+
+    const timeout_policy_t* p = &r->timing_policy;
+    if (p && total >= p->slow_request_threshold_ms)
+        log_info("slow_request_complete headers_ms=%llu body_ms=%llu queue_ms=%llu handler_ms=%llu send_ms=%llu total_ms=%llu\n",
+            (unsigned long long)headers, (unsigned long long)body, (unsigned long long)queue,
+            (unsigned long long)handler, (unsigned long long)send, (unsigned long long)total);
 }

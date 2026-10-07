@@ -151,6 +151,7 @@ route_t* route_init_route() {
     route->handler[ROUTE_HEAD] = NULL;
 
     for (int i = 0; i < 7; i++) {
+        timeout_policy_defaults(&route->timeouts[i]);
         route->static_file[i] = NULL;
         route->cache_control[i] = NULL;
         route->storage_name[i] = NULL;
@@ -510,7 +511,7 @@ void route_parser_free(route_parser_t* parser) {
     }
 }
 
-static int route_method_index(const char* method) {
+int route_method_index(const char* method) {
     if (strcmp(method, "GET") == 0) return ROUTE_GET;
     if (strcmp(method, "POST") == 0) return ROUTE_POST;
     if (strcmp(method, "PUT") == 0) return ROUTE_PUT;
@@ -521,7 +522,7 @@ static int route_method_index(const char* method) {
     return ROUTE_NONE;
 }
 
-static int route_ws_method_index(const char* method) {
+int route_ws_method_index(const char* method) {
     if (strcmp(method, "GET") == 0) return ROUTE_GET;
     if (strcmp(method, "POST") == 0) return ROUTE_POST;
     if (strcmp(method, "DELETE") == 0) return ROUTE_DELETE;
@@ -718,4 +719,23 @@ int route_match(const route_t* route, const char* path, size_t length,
     pcre2_match_data_free(match_data);
 
     return rc > 0;
+}
+
+int route_find_http(route_t* routes, const char* path, size_t length, int method, route_t** selected) {
+    *selected = NULL;
+    if (!path || method < 0 || method >= 7) return 0;
+    for (route_t* route = routes; route; route = route->next) {
+        if (!route->handler[method] && !route->static_file[method]) continue;
+        int vector[ROUTE_VECTOR_MAX];
+        int matched = route_match(route, path, length, vector, route_vector_size(route));
+        if (matched < 0) return -1;
+        if (matched) { *selected = route; return 1; }
+    }
+    return 0;
+}
+
+void route_timeout_policy(route_t* routes, const char* path, size_t length, int method, timeout_policy_t* policy) {
+    route_t* selected;
+    if (route_find_http(routes, path, length, method, &selected) == 1)
+        timeout_policy_merge(policy, &selected->timeouts[method]);
 }

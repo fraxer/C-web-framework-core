@@ -79,9 +79,9 @@ typedef struct h3app {
      * otherwise finished only by its response (__app_done), and the transport
      * keeps a stream until the application is finished with it: without this
      * the stream, and the stream credit it holds, stayed until the connection
-     * closed. Set only while st->response is NULL, i.e. before dispatch and
-     * before any inline answer, which is what makes "nothing will come"
-     * true. */
+     * closed. Receive-side abandonment happens before dispatch. A send timeout
+     * can also abandon an answered stream; its request/response remain owned
+     * by the stream until teardown. */
     int            abandoned;
 
     /* A PRIORITY_UPDATE has been applied to this stream. RFC 9218 §7: the frame
@@ -287,6 +287,8 @@ int h3conn_write(h3conn_t* c, quicconn_t* qc);
  * it, and nothing else would ask for one: quicconn_want_write is edge-driven,
  * and the edge -- the handler finishing -- has already passed. */
 int h3conn_has_pending(const h3conn_t* c, const quicconn_t* qc);
+/* Caller holds the QUIC connection lock. Cancels only expired request streams. */
+void h3conn_timeout_tick(h3conn_t* c, quicconn_t* qc);
 
 /* ---- Graceful shutdown (docs/http3/07-integration.md §5) ---- */
 

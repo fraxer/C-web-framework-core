@@ -81,6 +81,11 @@ void websockets_protocol_resource_free(void* arg) {
 }
 
 int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t* request) {
+    return websocketsrequest_get_resource_with_policy(connection, request, NULL);
+}
+
+int websocketsrequest_get_resource_with_policy(connection_t* connection, websocketsrequest_t* request,
+                                               timeout_policy_t* policy) {
     websockets_protocol_resource_t* protocol = (websockets_protocol_resource_t*)request->protocol;
 
     /* The method and the location are finished on the byte that ends them,
@@ -120,6 +125,10 @@ int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t
          * chain and then continue to the next route, polluting the params the
          * dispatched route sees. */
         if (route->handler[protocol->method] == NULL) continue;
+        if (policy) {
+            *policy = ctx->server->timeouts;
+            timeout_policy_merge(policy, &route->timeouts[protocol->method]);
+        }
 
         query_t* last_query = websocketsrequest_last_query_item(protocol);
 

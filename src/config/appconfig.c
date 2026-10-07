@@ -281,6 +281,7 @@ int appconfig_wait_workers(void) {
 
 void __appconfig_env_init(env_t* env) {
     if (env == NULL) return;
+    timeout_policy_defaults(&env->main.timeouts);
 
     env->main.reload = APPCONFIG_RELOAD_SOFT;
     env->main.client_max_body_size = 0;

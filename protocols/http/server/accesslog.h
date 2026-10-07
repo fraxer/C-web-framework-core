@@ -37,7 +37,9 @@
  * anything reading the journal.
  */
 
-/* Arm the log for this response and start its clock. Called once, where the
+/* Arm the log for this response and initialize its clock. HTTP dispatch
+ * replaces that clock with the first request-byte time, including reception.
+ * Called once, where the
  * response object is taken for a request, with the vhost that request resolved
  * to; a vhost with the log switched off leaves the response unarmed and nothing
  * downstream does any work for it. */

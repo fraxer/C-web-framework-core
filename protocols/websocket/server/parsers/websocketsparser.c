@@ -3,6 +3,7 @@
 
 #include "appconfig.h"
 #include "websocketsparser.h"
+#include "websocketsprotocolresource.h"
 #include "connection_s.h"
 
 int websocketsparser_parse_first_byte(websocketsparser_t*);
@@ -37,6 +38,13 @@ static int websocketsparser_text_finish_ok(websocketsparser_t* parser) {
     return ws_utf8_validator_finish(&parser->utf8_validator);
 }
 
+/* Receive deadlines (Pong, message, application) are stamped on the
+ * connection's receive clock, the one websocketsparser_timeout checks them on;
+ * see connection_recv_now. Heartbeat, send and Close stay on wall time. */
+static uint64_t __recv_now(const websocketsparser_t* parser) {
+    return connection_recv_stamp(parser->connection != NULL ? parser->connection->ctx : NULL, timeout_now_ms());
+}
+
 websocketsparser_t* websocketsparser_create(connection_t* connection, websockets_protocol_t*(*protocol_create)(void)) {
     websocketsparser_t* parser = malloc(sizeof * parser);
     if (parser == NULL) return NULL;
@@ -47,11 +55,25 @@ websocketsparser_t* websocketsparser_create(connection_t* connection, websockets
     parser->connection = connection;
     parser->protocol_create = protocol_create;
     parser->buffer = connection->buffer;
+    /* init ran before there was a connection to read the clock of. */
+    parser->application_progress_ms = __recv_now(parser);
+    connection_server_ctx_t* ctx = connection->ctx;
+    if (ctx != NULL && ctx->server != NULL) parser->timeout_policy = ctx->server->timeouts;
 
     return parser;
 }
 
 void websocketsparser_init(websocketsparser_t* parser) {
+    timeout_policy_defaults(&parser->timeout_policy);
+    parser->connection = NULL;
+    parser->message_started_ms = parser->message_progress_ms = 0;
+    parser->frame_started_ms = parser->frame_progress_ms = 0;
+    parser->heartbeat_ms = timeout_now_ms();
+    parser->application_progress_ms = __recv_now(parser);
+    parser->ping_sent_ms = parser->send_progress_ms = parser->close_started_ms = 0;
+    parser->ping_sequence = 0;
+    parser->ping_queued = 0;
+    parser->timeout_reported = 0;
     parser->base.free = websocketsparser_free;
     parser->stage = WSPARSER_STAGE_FIRST_BYTE;
     parser->bytes_readed = 0;
@@ -149,6 +171,13 @@ int __frame_end(websocketsparser_t* parser) {
 }
 
 int websocketsparser_run(websocketsparser_t* parser) {
+    if (parser->bytes_readed > parser->pos_start) {
+        const uint64_t stamp = __recv_now(parser);
+        if (!parser->frame_started_ms) parser->frame_started_ms = stamp;
+        parser->frame_progress_ms = stamp;
+        if (parser->frame.opcode < WSOPCODE_CLOSE && parser->stage != WSPARSER_STAGE_FIRST_BYTE)
+            parser->message_progress_ms = stamp;
+    }
     if (parser->stage == WSPARSER_STAGE_PAYLOAD)
         return websocketsparser_parse_payload(parser);
 
@@ -168,6 +197,13 @@ int websocketsparser_run(websocketsparser_t* parser) {
             bufferdata_complete(&parser->buf);
             if (!websocketsparser_parse_first_byte(parser))
                 return __clear_and_return(parser, WSPARSER_BAD_REQUEST);
+
+            const uint64_t stamp = __recv_now(parser);
+            parser->frame_started_ms = parser->frame_progress_ms = stamp;
+            if (parser->frame.opcode < WSOPCODE_CLOSE) {
+                if (!parser->message_started_ms) parser->message_started_ms = stamp;
+                parser->message_progress_ms = stamp;
+            }
 
             bufferdata_reset(&parser->buf);
 
@@ -651,4 +687,65 @@ void websockets_frame_init(websockets_frame_t* frame) {
     frame->mask[2] = 0;
     frame->mask[3] = 0;
     frame->payload_length = 0;
+}
+
+int websocketsparser_dispatch_resource(websocketsparser_t* p) {
+    if (p->request->protocol->get_resource == websocketsrequest_get_resource)
+        return websocketsrequest_get_resource_with_policy(p->connection, p->request, &p->timeout_policy);
+    return p->request->protocol->get_resource(p->connection, p->request);
+}
+
+void websocketsparser_ping_sent(websocketsparser_t* p) {
+    if (!p->ping_queued) return;
+    p->ping_queued = 0;
+    p->ping_sent_ms = __recv_now(p);
+}
+
+void websocketsparser_pong(websocketsparser_t* p, const char* payload, size_t length) {
+    if (p->timeout_policy.enforce && timeout_expired(__recv_now(p), p->ping_sent_ms,
+        p->timeout_policy.ws_pong_timeout_ms)) return;
+    if (p->ping_sent_ms && length == sizeof p->ping_sequence && payload &&
+        memcmp(payload, &p->ping_sequence, length) == 0) {
+        p->ping_sent_ms = 0;
+        p->ping_queued = 0;
+        p->heartbeat_ms = timeout_now_ms();
+        timeout_event_clear(&p->timeout_reported, "pong");
+    }
+}
+
+void websocketsparser_message_done(websocketsparser_t* p) {
+    p->frame_started_ms = p->frame_progress_ms = 0;
+    if (p->frame.opcode < WSOPCODE_CLOSE && p->frame.fin) {
+        p->message_started_ms = p->message_progress_ms = 0;
+        p->application_progress_ms = __recv_now(p);
+        timeout_event_clear(&p->timeout_reported, "message_idle");
+        timeout_event_clear(&p->timeout_reported, "message_total");
+        timeout_event_clear(&p->timeout_reported, "application_idle");
+    }
+}
+
+const char* websocketsparser_timeout(websocketsparser_t* p, uint64_t now, int sending) {
+    const timeout_policy_t* policy = &p->timeout_policy;
+    /* Inbound deadlines (Pong, message, application) run on the receive
+     * clock they were stamped on: a parked connection -- a handler or queued
+     * output in flight -- is not reading, and the client's silence is then the
+     * server's doing. Close and send-idle stay on wall time; they measure this
+     * side's own progress. A parser without a connection gets raw time. */
+    connection_server_ctx_t* ctx = p->connection != NULL ? p->connection->ctx : NULL;
+    const uint64_t recv_now = ctx != NULL ? connection_recv_now(ctx, now) : now;
+    if (p->close_started_ms)
+        return timeout_expired(now, p->close_started_ms, policy->ws_close_timeout_ms) ? "close" : NULL;
+    if (timeout_expired(recv_now, p->ping_sent_ms, policy->ws_pong_timeout_ms)) return "pong";
+    if (timeout_expired(recv_now, p->message_progress_ms, policy->ws_message_idle_timeout_ms) ||
+        timeout_expired(recv_now, p->frame_progress_ms, policy->ws_message_idle_timeout_ms)) return "message_idle";
+    if (timeout_expired(recv_now, p->message_started_ms, policy->ws_message_total_timeout_ms)) return "message_total";
+    if (timeout_expired(recv_now, p->application_progress_ms, policy->ws_application_idle_timeout_ms)) return "application_idle";
+    if (sending) {
+        if (!p->send_progress_ms) p->send_progress_ms = now;
+        if (timeout_expired(now, p->send_progress_ms, policy->ws_send_idle_timeout_ms)) return "send_idle";
+    } else {
+        p->send_progress_ms = 0;
+        timeout_event_clear(&p->timeout_reported, "send_idle");
+    }
+    return NULL;
 }

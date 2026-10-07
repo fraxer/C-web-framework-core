@@ -56,6 +56,60 @@ static int __out_publish_new(websocketsresponse_t* response, cqueue_t* out_queue
 static void __out_finish_current(connection_t* connection);
 static int __fanout_allowed(connection_t* connection, const websocketsrequest_t* request);
 
+static int __pending_output(connection_server_ctx_t* ctx) {
+    if (ctx->response) return 1;
+    if (!ctx->write_queue) return 0;
+    int pending = 0;
+    cqueue_lock(ctx->write_queue);
+    for (cqueue_item_t* item = cqueue_first(ctx->write_queue); item; item = item->next) {
+        const connection_out_slot_t* slot = item->data;
+        if (slot && slot->response) { pending = 1; break; }
+    }
+    cqueue_unlock(ctx->write_queue);
+    return pending;
+}
+
+static int __timeout_check(connection_t* connection, uint64_t now) {
+    connection_server_ctx_t* ctx = connection->ctx;
+    websocketsparser_t* p = ctx->parser;
+    const char* reason = websocketsparser_timeout(p, now, __pending_output(ctx) || p->ping_queued);
+    timeout_report(&p->timeout_reported, "websocket", reason, p->timeout_policy.enforce, connection->fd, 0);
+    if (reason && p->timeout_policy.enforce) {
+        if (p->close_started_ms || p->frame_started_ms || !strcmp(reason, "send_idle")) {
+            return 0;
+        }
+        p->close_started_ms = now;
+        if (!__post_close_default(connection, 1008, "Session timeout")) return 0;
+        connection->keepalive = 0;
+        connection_after_read(connection);
+    }
+    return 1;
+}
+
+void websockets_server_tick(connection_t* connection) {
+    if (!connection_s_trylock(connection)) return;
+    connection_server_ctx_t* ctx = connection->ctx;
+    websocketsparser_t* p = ctx->parser;
+    if (p == NULL) { connection_s_unlock(connection); return; }
+    const uint64_t now = timeout_now_ms();
+    if (!__timeout_check(connection, now)) {
+        connection_close_locked(connection);
+        return;
+    }
+    if (!p->close_started_ms && !p->ping_queued && !p->ping_sent_ms &&
+               timeout_expired(now, p->heartbeat_ms, p->timeout_policy.ws_ping_interval_ms)) {
+        websocketsresponse_t* response = websocketsresponse_create(connection);
+        if (response == NULL) { connection_close_locked(connection); return; }
+        p->ping_sequence++;
+        p->ping_queued = 1;
+        p->send_progress_ms = now;
+        websocketsresponse_ping(response, (const char*)&p->ping_sequence, sizeof p->ping_sequence);
+        if (!__post_response(response)) { connection_close_locked(connection); return; }
+        connection_after_read(connection);
+    }
+    connection_s_unlock(connection);
+}
+
 /* --------------------------------------------------------------------------
  * Output ordering (docs/concurrency/00 §4.4, phase C)
  *
@@ -312,6 +366,12 @@ int websockets_guard_write(connection_t* connection) {
 int __read(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
     websocketsparser_t* parser = ctx->parser;
+    connection_s_lock(connection, LOCK_SITE_WS_READ);
+    const int alive = __timeout_check(connection, timeout_now_ms());
+    const int closing = parser->close_started_ms != 0;
+    connection_s_unlock(connection);
+    if (!alive) return 0;
+    if (closing) return 1;
 
     while (1) {
         ssize_t bytes_readed = 0;
@@ -349,6 +409,7 @@ int __read(connection_t* connection) {
                 {
                     if (!__handle_locked(connection, parser))
                         return 0;
+                    websocketsparser_message_done(parser);
 
                     websocketsparser_prepare_remains(parser);
                     break;
@@ -357,6 +418,7 @@ int __read(connection_t* connection) {
                 {
                     if (!__handle_locked(connection, parser))
                         return 0;
+                    websocketsparser_message_done(parser);
 
                     websocketsparser_reset(parser);
 
@@ -404,6 +466,8 @@ static int __write_staged(connection_t* connection, websocketsresponse_t* respon
             return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? -1 : 0;
 
         response->body.pos += writed;
+        if (writed > 0 && ((connection_server_ctx_t*)connection->ctx)->parser)
+            ((websocketsparser_t*)((connection_server_ctx_t*)connection->ctx)->parser)->send_progress_ms = timeout_now_ms();
 
         /* A short write leaves the tail of the frame unsent: finishing here
          * (falling through to connection_after_write) would truncate it. */
@@ -435,6 +499,8 @@ static int __write_staged(connection_t* connection, websocketsresponse_t* respon
             return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? -1 : 0;
 
         response->file_.pos += writed;
+        if (writed > 0 && ((connection_server_ctx_t*)connection->ctx)->parser)
+            ((websocketsparser_t*)((connection_server_ctx_t*)connection->ctx)->parser)->send_progress_ms = timeout_now_ms();
 
         if (response->file_.pos < response->file_.size) return -1;
     }
@@ -463,7 +529,11 @@ int __write(connection_t* connection) {
         if (r < 0) return 1; /* stays staged for the next EPOLLOUT */
 
         close_sent = ((websocketsresponse_t*)ctx->response)->frame_code == 0x88;
+        websocketsparser_t* heartbeat = ctx->parser;
+        if (((websocketsresponse_t*)ctx->response)->frame_code == 0x89 && heartbeat && heartbeat->ping_queued)
+            websocketsparser_ping_sent(heartbeat);
 
+        if (heartbeat) timeout_event_clear(&heartbeat->timeout_reported, "send_idle");
         __out_finish_current(connection);
 
         /* A CLOSE frame just left; anything behind it is moot. keepalive
@@ -478,8 +548,7 @@ int __write(connection_t* connection) {
      * a reply whose handler is still running. Ending the connection now would
      * drop both; the handler that fills the head asks for EPOLLOUT again. */
     if (connection->keepalive == 0 && !close_sent) {
-        connection_server_ctx_t* conn_ctx = connection->ctx;
-        return conn_ctx->listener->api->control_mod(connection, MPXONESHOT);
+        return connection_control_mod(connection, MPXONESHOT);
     }
 
     return connection_after_write(connection);
@@ -492,6 +561,7 @@ int __handle(websocketsparser_t* parser) {
     switch (parser->frame.opcode) {
     case WSOPCODE_CLOSE:
     {
+        parser->close_started_ms = timeout_now_ms();
         websocketsresponse_t* response = websocketsresponse_create(connection);
         if (response == NULL) return 0;
         websocketsresponse_close(response, bufferdata_get(&parser->buf), bufferdata_writed(&parser->buf));
@@ -506,6 +576,7 @@ int __handle(websocketsparser_t* parser) {
         return __post_response(response);
     }
     case WSOPCODE_PONG:
+        websocketsparser_pong(parser, bufferdata_get(&parser->buf), bufferdata_writed(&parser->buf));
         return 1;
     default:
         break;
@@ -515,7 +586,7 @@ int __handle(websocketsparser_t* parser) {
     if (!parser->frame.fin)
         return 1;
 
-    if (parser->request->protocol->get_resource(connection, parser->request))
+    if (websocketsparser_dispatch_resource(parser))
         return 1;
 
     /* Not dispatched (no matching route or the queue rejected it): ownership

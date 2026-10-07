@@ -47,6 +47,11 @@ typedef struct h2session {
      * is overwritten on every recv, so h2 accumulates frame bytes here). */
     uint8_t* read_buf;
     size_t   read_len;
+    uint64_t frame_started_ms; /* first byte, including an unclassified frame header */
+    uint64_t header_started_ms; /* one absolute HEADERS/CONTINUATION block */
+    unsigned header_slow_reported;
+    int data_discard; /* timed-out DATA: drain payload before the next frame */
+    unsigned header_timeout_reported;
     size_t   read_cap;
 
     h2frame_parser_t frame;
@@ -79,7 +84,6 @@ typedef struct h2session {
     int      cont_end_stream;
     int      cont_active;
     uint32_t cont_reject_error; /* decode a refused block before resetting it */
-    uint64_t cont_started_ms;
     /* Frames in the block being accumulated, HEADERS included. The byte limit
      * above bounds memory but not work: an empty CONTINUATION adds nothing to
      * cont_len and can be repeated forever (docs/http2/08, phase A.3). */

@@ -52,8 +52,41 @@ typedef struct {
     connection_ctx_t base;
 
     listener_t* listener;
+    uint64_t accepted_ms;
+    uint64_t idle_started_ms;
+    uint64_t send_progress_ms;
+    uint64_t h2_write_bytes;
+    uint64_t timeout_close_started_ms;
+    /* The receive clock (connection_recv_now). h1 and WebSocket park deaf
+     * while a handler or a response write is in flight, and a client cannot be
+     * blamed for silence the server itself chose not to read -- so their
+     * header/body/message deadlines are stamped and checked on a clock that
+     * stands still while the connection is disarmed for reading.
+     *
+     * One word, so a reader on any thread never sees half a transition. While
+     * armed it holds the total time spent disarmed so far (receive time =
+     * now - value); while disarmed, CONNECTION_RECV_PAUSED plus the receive
+     * time at which reading stopped. Written only by connection_control_mod,
+     * under arm_locked. */
+    atomic_uint_least64_t recv_clock;
+    /* Serializes connection_control_mod. The broadcast path re-arms a foreign
+     * connection without connection_s_lock, so two epoll_ctl calls on one fd
+     * can race; holding this across the call and the recv_clock transition it
+     * implies keeps the clock in the order the kernel saw the masks. Innermost:
+     * nothing else is ever acquired while it is held. */
+    atomic_bool arm_locked;
+    unsigned timeout_reported;
+    unsigned timeout_closing;
     void* parser;
     server_t* server;
+    /* Value copy of ctx->server->timeouts, refreshed at every ctx->server
+     * assignment (accept, local create, Host reroute, SNI, QUIC) -- all on
+     * the owning worker's threads, while its generation is alive. The
+     * per-request receive reset runs on handler threads too, and one of those
+     * can be the last reference dropping an old generation's connection after
+     * that generation's config -- and with it every server_t -- was freed, so
+     * it must read this copy and never dereference ctx->server. */
+    timeout_policy_t receive_policy;
     void* request;
     void* response;
     /* One finished HTTP/1.1 response object, reset and kept for the next request
@@ -201,6 +234,30 @@ typedef struct {
     void (*transport_free)(void*);
 } connection_server_ctx_t;
 
+#define CONNECTION_RECV_PAUSED (UINT64_C(1) << 63)
+
+/* Wall time with the spans this connection spent disarmed for reading removed;
+ * while disarmed it holds still at the moment reads stopped. A receive deadline
+ * measures only the time the client could actually have been read -- provided
+ * its start was stamped on this same clock (connection_recv_stamp). Comparing a
+ * wall-time stamp against it would extend the deadline by every pause in the
+ * connection's history, not just the ones since the stamp. A ctx that never
+ * went through connection_control_mod (unit tests, client contexts) reads raw
+ * time: the word stays zero. */
+static inline uint64_t connection_recv_now(const connection_server_ctx_t* ctx, uint64_t now) {
+    const uint64_t clock = atomic_load_explicit(&ctx->recv_clock, memory_order_relaxed);
+    if (clock & CONNECTION_RECV_PAUSED)
+        return clock & ~CONNECTION_RECV_PAUSED;
+    return now > clock ? now - clock : 0;
+}
+
+/* The start of a receive deadline: connection_recv_now, or raw time without a
+ * ctx. Never 0, which every deadline field reads as "not started". */
+static inline uint64_t connection_recv_stamp(const connection_server_ctx_t* ctx, uint64_t now) {
+    const uint64_t stamp = ctx != NULL ? connection_recv_now(ctx, now) : now;
+    return stamp != 0 ? stamp : 1;
+}
+
 /* The interim status line, shared by the parser that sends it and the write
  * filter that flushes whatever is left of it. */
 #define HTTP_CONTINUE_LINE "HTTP/1.1 100 Continue\r\n\r\n"
@@ -240,6 +297,10 @@ void connection_s_inc(connection_t*);
 connection_dec_result_e connection_s_dec(connection_t*);
 
 int connection_close_locked(connection_t*);
+/* listener->api->control_mod plus the receive clock: every TCP re-arm and park
+ * goes through here, so losing and regaining read interest (MPXIN) is where the
+ * clock stops and resumes. Call this, never api->control_mod directly. */
+int connection_control_mod(connection_t*, int events);
 int connection_after_write(connection_t*);
 /* Serialized dispatch (HTTP/1.1, WebSocket): at most one queue entry per
  * connection, so at most one handler runs at a time. */

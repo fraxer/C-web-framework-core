@@ -78,6 +78,7 @@ typedef struct h2_ws_tunnel {
 h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, h2stream_t* stream,
                                     int resource_protocol, const ws_deflate_config_t* deflate);
 void h2_ws_tunnel_free(h2_ws_tunnel_t* tunnel);
+int h2_ws_tunnel_tick(h2_ws_tunnel_t* tunnel, uint64_t now);
 
 /* Hand one DATA payload to the parser. `data` must be writable: WebSocket
  * payloads are masked, and the parser unmasks in place — exactly as it does

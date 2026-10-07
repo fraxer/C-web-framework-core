@@ -12,6 +12,7 @@
 #include "domain.h"
 #include "openssl.h"
 #include "ratelimiter.h"
+#include "timeouts.h"
 
 struct middleware_item;
 
@@ -96,6 +97,7 @@ struct broadcast;
 struct appconfig;
 
 typedef struct server {
+    timeout_policy_t timeouts;
     unsigned short int port;
     size_t root_length;
     /* The address this vhost is bound to, either family (misc/ipaddr.h). Also

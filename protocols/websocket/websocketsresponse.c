@@ -377,30 +377,26 @@ void websocketsresponse_default(websocketsresponse_t* response, const char* text
     websocketsresponse_text(response, text);
 }
 
-void websocketsresponse_pong(websocketsresponse_t* response, const char* data, size_t length) {
+static void __control_frame(websocketsresponse_t* response, unsigned char opcode,
+                            const char* data, size_t length) {
     websocketsresponse_reset(response);
-
     if (data == NULL) length = 0;
-    if (length > 125) length = 125; /* RFC 6455 5.5: control frame payload limit */
-
-    response->frame_code = 0x8A;
-
+    if (length > 125) length = 125;
+    response->frame_code = opcode;
     response->body.size = websocketsresponse_data_size(length);
-
     websocketsresponse_prepare(response, data, length);
 }
 
+void websocketsresponse_pong(websocketsresponse_t* response, const char* data, size_t length) {
+    __control_frame(response, 0x8A, data, length);
+}
+
+void websocketsresponse_ping(websocketsresponse_t* response, const char* data, size_t length) {
+    __control_frame(response, 0x89, data, length);
+}
+
 void websocketsresponse_close(websocketsresponse_t* response, const char* data, size_t length) {
-    websocketsresponse_reset(response);
-
-    if (data == NULL) length = 0;
-    if (length > 125) length = 125; /* RFC 6455 5.5: control frame payload limit */
-
-    response->frame_code = 0x88;
-
-    response->body.size = websocketsresponse_data_size(length);
-
-    websocketsresponse_prepare(response, data, length);
+    __control_frame(response, 0x88, data, length);
 }
 
 /**

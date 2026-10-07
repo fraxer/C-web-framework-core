@@ -252,6 +252,12 @@ add_library(body_memory_module SHARED data/body_memory_module.c)
 target_link_libraries(body_memory_module PRIVATE cwfr_framework ${OPENSSL_LIBRARIES})
 set_target_properties(body_memory_module PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/exec/handlers/tests)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME timeouts_integration
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/timeouts_integration.py
+            $<TARGET_FILE:cwfr> $<TARGET_FILE:body_memory_module>)
+    set_tests_properties(timeouts_integration PROPERTIES TIMEOUT 30)
+endif()
 if(INCLUDE_HTTP3 STREQUAL yes)
     add_executable(body_memory_h3 data/body_memory_h3.c
         quicclient/quicclient.c quicclient/h3client.c)

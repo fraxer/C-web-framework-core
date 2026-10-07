@@ -413,12 +413,17 @@ static void __stage(accesslog_t* log, char* record, size_t length) {
 }
 
 void http_access_log(httprequest_t* request, httpresponse_t* response) {
+    httprequest_timing_finish(request);
     /* Nothing is formatted, and no clock is read, before this test. */
     if (response == NULL || !response->access_log) return;
 
     /* Once per response. The h1.1 write path can be re-entered after an EAGAIN,
      * and a retried flush must not produce a second record. */
     response->access_log = 0;
+    if (request && request->started_ms) {
+        response->access_started.tv_sec = request->started_ms / 1000;
+        response->access_started.tv_nsec = (request->started_ms % 1000) * 1000000;
+    }
 
     char data[ACCESS_LOG_BUF];
     accesslog_buf_t buf = { .data = data, .capacity = sizeof(data), .pos = 0 };

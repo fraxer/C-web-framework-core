@@ -6,7 +6,9 @@
 #include "multiplexingserver.h"
 #include "server.h"
 #include "httpserverhandlers.h"
+#include "httprequestparser.h"
 #include "h2session.h"
+#include "websocketsserverhandlers.h"
 
 #ifdef CWFR_HTTP3
 #include "quicendpoint.h"
@@ -394,8 +396,13 @@ static void __mpx_on_tick(mpxapi_t* api) {
             connection_server_ctx_t* ctx = connection->ctx;
             if (ctx->is_http2)
                 h2_server_tick(connection, shutdown_now);
+            else if (connection->read == websockets_guard_read &&
+                     (!shutdown_now || !appconfig_terminating()))
+                websockets_server_tick(connection);
             else if (shutdown_now && connection->close == connection_close)
                 __mpx_http1_shutdown_tick(connection);
+            else if (connection->close == connection_close)
+                http_server_tick(connection);
         }
 
         connection = next;
@@ -428,10 +435,19 @@ static void __mpx_http1_shutdown_tick(connection_t* connection) {
 
     connection->keepalive = 0;
 
-    const int idle = ctx->request == NULL && ctx->response == NULL &&
+    /* A request still being received belongs to the parser, before dispatch
+     * puts it into ctx->request. Soft reload must let that upload finish. */
+    const int receiving = connection->read == http_server_guard_read && ctx->parser &&
+        ((httprequestparser_t*)ctx->parser)->header_started_ms != 0;
+    const int idle = !receiving && ctx->request == NULL && ctx->response == NULL &&
         !atomic_load_explicit(&ctx->need_write, memory_order_acquire);
     if (idle)
         connection_close_locked(connection);
+    else if (connection->read == http_server_guard_read) {
+        /* Keep the lock until the deadline sweep takes over: handler completion
+         * cannot retire the connection between the drain and timeout checks. */
+        http_server_tick_locked(connection);
+    }
     else
         connection_s_unlock(connection);
 }

@@ -1485,3 +1485,109 @@ TEST(test_wsh_resource_empty_final_frame_regression) {
     teardown:
     wsh_harness_free(&h);
 }
+
+static uint64_t heartbeat_test_ms;
+static uint64_t heartbeat_clock(void) { return heartbeat_test_ms; }
+
+TEST(test_wsh_sent_ping_waits_for_pong) {
+    TEST_SUITE("websocket heartbeat");
+    wsh_harness_t h;
+    TEST_REQUIRE(wsh_harness_init(&h), "harness initialized");
+    heartbeat_test_ms = 100000;
+    timeout_set_clock(heartbeat_clock);
+    timeout_policy_defaults(&h.server.timeouts);
+    TEST_ASSERT(wsh_attach_parser(&h, websockets_protocol_default_create), "parser attached");
+    websocketsparser_t* p = h.ctx.parser;
+    if (p) {
+        p->timeout_policy.ws_ping_interval_ms = 10;
+        p->timeout_policy.ws_send_idle_timeout_ms = 100;
+        p->timeout_policy.ws_pong_timeout_ms = 3000;
+        heartbeat_test_ms += 10;
+        websockets_server_tick(h.conn);
+        TEST_ASSERT(websockets_guard_write(h.conn), "Ping written");
+        unsigned char wire[32];
+        ssize_t n = recv(h.peer_fd, wire, sizeof wire, 0);
+        TEST_ASSERT(n == 10 && wire[0] == 0x89, "single Ping on wire");
+        heartbeat_test_ms += 100;
+        TEST_ASSERT(websocketsparser_timeout(p, heartbeat_test_ms, h.ctx.response != NULL || p->ping_queued) == NULL,
+                    "sent Ping does not activate send watchdog");
+        websockets_server_tick(h.conn);
+        TEST_ASSERT(wsh_pending(&h) == 0 && wsh_staged(&h) == NULL, "no new probe while Pong pending");
+        websocketsparser_pong(p, (char*)&p->ping_sequence, sizeof p->ping_sequence);
+        TEST_ASSERT(!p->ping_sent_ms, "matching Pong confirms probe");
+    }
+    wsh_harness_free(&h);
+    timeout_set_clock(NULL);
+}
+
+TEST(test_wsh_timeout_read_and_tick_close) {
+    TEST_SUITE("websocket heartbeat");
+    for (int read_path = 0; read_path < 2; read_path++) {
+        wsh_harness_t h;
+        TEST_REQUIRE(wsh_harness_init(&h), "harness initialized");
+        heartbeat_test_ms = 100000;
+        timeout_set_clock(heartbeat_clock);
+        timeout_policy_defaults(&h.server.timeouts);
+        TEST_ASSERT(wsh_attach_parser(&h, websockets_protocol_default_create), "parser attached");
+        websocketsparser_t* p = h.ctx.parser;
+        if (p) {
+            p->timeout_policy.enforce = 1;
+            p->timeout_policy.ws_pong_timeout_ms = 10;
+            p->ping_sent_ms = heartbeat_test_ms;
+            heartbeat_test_ms += 10;
+            if (read_path)
+                TEST_ASSERT(websockets_guard_read(h.conn), "read path initiates graceful timeout Close");
+            else
+                websockets_server_tick(h.conn);
+            TEST_ASSERT(wsh_staged(&h) != NULL, "Close staged at deadline");
+            (void)websockets_guard_write(h.conn);
+            unsigned char wire[128];
+            ssize_t n = recv(h.peer_fd, wire, sizeof wire, 0);
+            TEST_ASSERT(n >= 4 && wire[0] == 0x88 && wire[2] == 3 && wire[3] == 0xf0,
+                        "read and tick both send Close 1008");
+        }
+        wsh_harness_free(&h);
+        timeout_set_clock(NULL);
+    }
+}
+
+TEST(test_wsh_resource_policy_inherits_per_message) {
+    TEST_SUITE("websocket resource timeouts");
+    wsh_harness_t h;
+    TEST_REQUIRE(wsh_harness_init(&h), "harness initialized");
+    route_t* first = route_create("/first");
+    route_t* second = route_create("/second");
+    heartbeat_test_ms = 100000;
+    timeout_set_clock(heartbeat_clock);
+    timeout_policy_defaults(&h.server.timeouts);
+    TEST_ASSERT(first && second && wsh_attach_parser(&h, websockets_protocol_resource_create), "routes and parser created");
+    websocketsparser_t* p = h.ctx.parser;
+    if (first && second && p) {
+        first->next = second;
+        h.server.websockets.route = first;
+        TEST_ASSERT(route_set_websockets_handler(first, "GET", wsh_reply_handle, NULL), "first handler installed");
+        TEST_ASSERT(route_set_websockets_handler(second, "GET", wsh_reply_handle, NULL), "second handler installed");
+        first->timeouts[ROUTE_GET].explicit_fields = TIMEOUT_EXPLICIT(ws_pong_timeout_ms);
+        first->timeouts[ROUTE_GET].ws_pong_timeout_ms = 100;
+        second->timeouts[ROUTE_GET].explicit_fields = TIMEOUT_EXPLICIT(ws_message_idle_timeout_ms);
+        second->timeouts[ROUTE_GET].ws_message_idle_timeout_ms = 20;
+        p->ping_sent_ms = heartbeat_test_ms;
+        unsigned char wire[64];
+        const char* messages[] = {"GET /first", "GET /second", "GET /missing"};
+        for (int i = 0; i < 3; i++) {
+            size_t n = wsh_build_frame(wire, 1, 1, (const unsigned char*)messages[i], strlen(messages[i]));
+            TEST_ASSERT(send(h.peer_fd, wire, n, 0) == (ssize_t)n && websockets_guard_read(h.conn), "resource message received");
+            if (i == 0)
+                TEST_ASSERT(p->timeout_policy.ws_pong_timeout_ms == 100, "first route policy applied at full message");
+            else
+                TEST_ASSERT(p->timeout_policy.ws_pong_timeout_ms == h.server.timeouts.ws_pong_timeout_ms &&
+                            p->timeout_policy.ws_message_idle_timeout_ms == 20, "second route inherits afresh; unmatched keeps current policy");
+            TEST_ASSERT(p->ping_sent_ms == heartbeat_test_ms, "route changes preserve the outstanding Pong clock");
+        }
+    }
+    h.server.websockets.route = NULL;
+    if (first && first->next == second) routes_free(first);
+    else { routes_free(first); routes_free(second); }
+    wsh_harness_free(&h);
+    timeout_set_clock(NULL);
+}

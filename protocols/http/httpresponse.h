@@ -302,7 +302,7 @@ typedef struct httpresponse {
     /* Access log (server/accesslog.h). `body_bytes_sent` is what the terminal
      * write stage of the protocol actually put on the wire -- compressed and
      * ranged bytes, not the size of the resource -- and `access_started` is when
-     * this response was taken for its request, both meaningless unless
+     * the first request bytes arrived (including request reception), both meaningless unless
      * `access_log` was set at that moment. */
     struct timespec access_started;
     size_t body_bytes_sent;
