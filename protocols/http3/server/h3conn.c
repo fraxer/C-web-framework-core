@@ -613,9 +613,9 @@ static h3conn_result_t __read_request(h3conn_t* c, quicconn_t* qc, quicstream_t*
         h3stream_t* st = app->req;
         const char* reason = timeout_request_reason(timeout_now_ms(), st->header_started_ms,
             st->body_started_ms, st->body_progress_ms, &st->timeout_policy);
-        timeout_report(&st->timeout_reported, "h3", reason, st->timeout_policy.enforce,
+        timeout_report(&st->timeout_reported, "h3", reason,
                        c->connection ? c->connection->fd : -1, qs->id);
-        if (reason && st->timeout_policy.enforce) {
+        if (reason) {
             h3conn_timeout_tick(c, qc);
             return __reset(H3_REQUEST_CANCELLED);
         }
@@ -1404,26 +1404,23 @@ void h3conn_timeout_tick(h3conn_t* c, quicconn_t* qc) {
                 st->response_sent_offset = qs->send.sent_off;
             }
             if (timeout_expired(now, st->response_progress_ms, p->response_send_idle_timeout_ms)) {
-                timeout_report(&st->timeout_reported, "h3", "send_idle", p->enforce,
+                timeout_report(&st->timeout_reported, "h3", "send_idle",
                                c->connection ? c->connection->fd : -1, qs->id);
-                if (p->enforce) {
-                    app->abandoned = app->drained = 1;
-                    st->response_done = 1;
-                    atomic_store_explicit(&st->response_ready, 0, memory_order_release);
-                    quicstream_reset(qs, H3_REQUEST_CANCELLED);
-                    quicstream_stop_sending(qs, H3_REQUEST_CANCELLED);
-                    atomic_store_explicit(&qc->want_write, 1, memory_order_release);
-                    continue;
-                }
+                app->abandoned = app->drained = 1;
+                st->response_done = 1;
+                atomic_store_explicit(&st->response_ready, 0, memory_order_release);
+                quicstream_reset(qs, H3_REQUEST_CANCELLED);
+                quicstream_stop_sending(qs, H3_REQUEST_CANCELLED);
+                atomic_store_explicit(&qc->want_write, 1, memory_order_release);
+                continue;
             }
         } else st->response_progress_ms = 0;
         if (app->drained) continue;
         const char* reason = timeout_request_reason(now, st->header_started_ms,
             st->body_started_ms, st->body_progress_ms, p);
         if (!reason) continue;
-        timeout_report(&st->timeout_reported, "h3", reason, p->enforce,
+        timeout_report(&st->timeout_reported, "h3", reason,
                        c->connection ? c->connection->fd : -1, qs->id);
-        if (!p->enforce) continue;
         if (app->qpack_blocked_counted && c->qpack_blocked_streams) c->qpack_blocked_streams--;
         app->qpack_blocked_counted = 0;
         st->qpack_blocked = 0;

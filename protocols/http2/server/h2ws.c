@@ -342,8 +342,8 @@ static int h2_ws_pending_output(h2_ws_tunnel_t* tunnel) {
 static int h2_ws_check_timeout(h2_ws_tunnel_t* tunnel, uint64_t now) {
     websocketsparser_t* p = tunnel->parser;
     const char* reason = websocketsparser_timeout(p, now, h2_ws_pending_output(tunnel) || p->ping_queued);
-    timeout_report(&p->timeout_reported, "h2_ws", reason, p->timeout_policy.enforce, tunnel->connection->fd, tunnel->stream->id);
-    if (reason && p->timeout_policy.enforce) {
+    timeout_report(&p->timeout_reported, "h2_ws", reason, tunnel->connection->fd, tunnel->stream->id);
+    if (reason) {
         if (p->close_started_ms || p->frame_started_ms || !strcmp(reason, "send_idle")) return 0;
         p->close_started_ms = now;
         websocketsresponse_t* response = websocketsresponse_create(tunnel->connection);

@@ -28,13 +28,13 @@ TEST(test_timeout_configuration) {
     TEST_SUITE("timeouts");
     timeout_policy_t p;
     timeout_policy_defaults(&p);
-    TEST_ASSERT(p.request_header_timeout_ms == 60000 && !p.enforce, "defaults observe and 60s headers");
-    json_doc_t* d = json_parse("{\"request_timeout_mode\":\"enforce\",\"request_header_timeout_ms\":200,\"ws_ping_interval_ms\":0}");
+    TEST_ASSERT(p.request_header_timeout_ms == 60000, "defaults to 60s headers");
+    json_doc_t* d = json_parse("{\"request_header_timeout_ms\":200,\"ws_ping_interval_ms\":0}");
     TEST_REQUIRE(d != NULL, "JSON parsed");
     TEST_ASSERT(timeout_policy_load(&p, json_root(d), "main.timeouts"), "valid policy loads");
     json_free(d);
-    TEST_ASSERT(p.enforce && p.request_header_timeout_ms == 200 && p.request_body_idle_timeout_ms == 60000, "partial policy inherits");
-    const char* invalid[] = { "null", "[]", "{\"foo\":1}", "{\"request_header_timeout_ms\":-1}", "{\"request_header_timeout_ms\":1.5}", "{\"request_header_timeout_ms\":\"10\"}", "{\"request_header_timeout_ms\":86400001}", "{\"request_header_timeout_ms\":0}", "{\"ws_close_timeout_ms\":0}", "{\"request_timeout_mode\":\"unknown\"}" };
+    TEST_ASSERT(p.request_header_timeout_ms == 200 && p.request_body_idle_timeout_ms == 60000, "partial policy inherits");
+    const char* invalid[] = { "null", "[]", "{\"foo\":1}", "{\"request_header_timeout_ms\":-1}", "{\"request_header_timeout_ms\":1.5}", "{\"request_header_timeout_ms\":\"10\"}", "{\"request_header_timeout_ms\":86400001}", "{\"request_header_timeout_ms\":0}", "{\"ws_close_timeout_ms\":0}", "{\"request_body_idle_timeout_ms\":0}", "{\"ws_ping_interval_ms\":1000,\"ws_pong_timeout_ms\":0}", "{\"request_timeout_mode\":\"enforce\"}" };
     for (unsigned i = 0; i < sizeof invalid / sizeof invalid[0]; i++) {
         timeout_policy_t before = p;
         d = json_parse(invalid[i]);
@@ -47,7 +47,7 @@ TEST(test_timeout_configuration) {
     d = json_parse("{\"request_body_total_timeout_ms\":1234}");
     TEST_ASSERT(timeout_policy_load_route(&patch, json_root(d), "route.timeouts", 0), "body route override accepted");
     timeout_policy_merge(&p, &patch);
-    TEST_ASSERT(p.request_body_total_timeout_ms == 1234 && p.request_header_timeout_ms == 200 && p.enforce, "merge selects only explicit fields");
+    TEST_ASSERT(p.request_body_total_timeout_ms == 1234 && p.request_header_timeout_ms == 200, "merge selects only explicit fields");
     json_free(d);
     d = json_parse("{\"request_header_timeout_ms\":1234}");
     TEST_ASSERT(!timeout_policy_load_route(&patch, json_root(d), "route.timeouts", 0), "route cannot change header deadline");
@@ -58,13 +58,12 @@ TEST(test_timeout_configuration) {
 
 TEST(test_timeout_http1_receive) {
     TEST_SUITE("timeouts");
-    for (int body = 0; body < 2; body++) for (int enforce = 0; enforce < 2; enforce++) {
+    for (int body = 0; body < 2; body++) {
         int fd[2];
         TEST_REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fd) == 0, "socket pair");
         server_t server = {0};
         timeout_policy_defaults(&server.timeouts);
         server.timeouts.request_header_timeout_ms = server.timeouts.request_body_idle_timeout_ms = 10;
-        server.timeouts.enforce = enforce;
         char name[] = "localhost";
         domain_t domain = { .is_literal = 1, .template = name, .ascii_template = name, .ascii_length = 9 };
         server.domain = &domain;
@@ -91,16 +90,12 @@ TEST(test_timeout_http1_receive) {
         TEST_ASSERT(ctx->response == NULL, "not expired before deadline");
         test_time++;
         http_server_tick(c);
-        if (enforce) {
-            TEST_ASSERT(ctx->response != NULL && ctx->timeout_closing, "408 staged at deadline");
-            http_server_guard_write(c);
-            char wire[4096] = {0};
-            ssize_t n = recv(fd[1], wire, sizeof wire - 1, 0);
-            TEST_ASSERT(n > 0 && strstr(wire, "408") && strstr(wire, "Connection: close"), "408 and close on wire");
-        } else {
-            TEST_ASSERT(!ctx->response && !ctx->timeout_closing, "observe keeps receiving");
-            TEST_ASSERT(((httprequestparser_t*)ctx->parser)->timeout_reported & timeout_event_bit(body ? "body_idle" : "headers", 0), "observe records expiry");
-        }
+        TEST_ASSERT(ctx->response != NULL && ctx->timeout_closing, "408 staged at deadline");
+        TEST_ASSERT(((httprequestparser_t*)ctx->parser)->timeout_reported & timeout_event_bit(body ? "body_idle" : "headers"), "expiry recorded");
+        http_server_guard_write(c);
+        char wire[4096] = {0};
+        ssize_t n = recv(fd[1], wire, sizeof wire - 1, 0);
+        TEST_ASSERT(n > 0 && strstr(wire, "408") && strstr(wire, "Connection: close"), "408 and close on wire");
         connection_free(c);
         close(fd[0]); close(fd[1]);
         timeout_set_clock(NULL);
@@ -144,12 +139,11 @@ TEST(test_timeout_websocket_watchdog) {
 
 TEST(test_timeout_http1_pipeline_cycle) {
     TEST_SUITE("timeouts");
-    for (int enforce = 0; enforce < 2; enforce++) {
+    {
         server_t server = {0};
         timeout_policy_defaults(&server.timeouts);
         server.timeouts.request_header_timeout_ms = 100;
         server.timeouts.request_body_idle_timeout_ms = 3000;
-        server.timeouts.enforce = enforce;
         connection_server_ctx_t ctx = { .server = &server };
         ctx.receive_policy = server.timeouts;
         char buffer[] = "GET / HTTP/1.0\r\n\r\nGET /next HTTP/1.0\r\n";
@@ -209,16 +203,21 @@ TEST(test_timeout_http1_effective_slow_policy) {
     timeout_set_clock(NULL);
 }
 
-TEST(test_timeout_events_reason_mode_and_episode) {
+TEST(test_timeout_events_reason_and_episode) {
     TEST_SUITE("timeouts");
     unsigned reported = 0;
-    TEST_ASSERT(timeout_report(&reported, "http1", "headers", 0, -1, 0), "first observation recorded");
-    TEST_ASSERT(!timeout_report(&reported, "http1", "headers", 0, -1, 0), "repeated tick suppressed");
-    TEST_ASSERT(timeout_report(&reported, "http1", "headers", 1, -1, 0), "observe cannot suppress enforce");
-    TEST_ASSERT(timeout_report(&reported, "http1", "body_idle", 0, -1, 0), "different reason recorded");
+    timeout_metrics_reset();
+    TEST_ASSERT(timeout_report(&reported, "http1", "headers", -1, 0), "first expiry recorded");
+    TEST_ASSERT(!timeout_report(&reported, "http1", "headers", -1, 0), "repeated tick suppressed");
+    TEST_ASSERT(timeout_report(&reported, "http1", "body_idle", -1, 0), "different reason recorded");
     timeout_event_clear(&reported, "headers");
-    TEST_ASSERT(timeout_report(&reported, "http1", "headers", 0, -1, 0), "new header episode recorded");
-    TEST_ASSERT(!timeout_report(&reported, "http1", "body_idle", 0, -1, 0), "other active episode retains deduplication");
+    TEST_ASSERT(timeout_report(&reported, "http1", "headers", -1, 0), "new header episode recorded");
+    TEST_ASSERT(!timeout_report(&reported, "http1", "body_idle", -1, 0), "other active episode retains deduplication");
+    json_token_t* m = timeout_metrics_json();
+    TEST_ASSERT(json_llong(json_object_get(json_object_get(m, "http1"), "headers"), NULL) == 2 &&
+                json_llong(json_object_get(json_object_get(m, "http1"), "body_idle"), NULL) == 1,
+                "metrics count one per recorded episode");
+    json_token_free_tree(m);
 }
 
 TEST(test_timeout_http1_send_reuse) {
@@ -241,32 +240,45 @@ TEST(test_timeout_http1_send_reuse) {
         ctx->receive_policy = server.timeouts;
         TEST_ASSERT(set_http(c), "HTTP parser installed");
         timeout_metrics_reset();
+        /* The send event is deduplicated per exchange: a keepalive reset opens
+         * the next one. */
         for (int episode = 0; episode < 2; episode++) {
-            httprequest_t* r = httprequest_create(c);
-            httpresponse_t* response = httpresponse_create(c);
-            TEST_ASSERT(r && response, "exchange objects created");
-            if (!r || !response) {
-                if (r) httprequest_free(r);
-                if (response) response->base.free(response);
-                break;
-            }
+            TEST_ASSERT(timeout_report(&ctx->timeout_reported, "http1", "send_idle", c->fd, 0), "send event recorded once per exchange");
+            TEST_ASSERT(!timeout_report(&ctx->timeout_reported, "http1", "send_idle", c->fd, 0), "repeated within the exchange");
+            ctx->base.reset(ctx);
+        }
+        httprequest_t* r = httprequest_create(c);
+        httpresponse_t* response = httpresponse_create(c);
+        TEST_ASSERT(r && response, "exchange objects created");
+        if (r && response) {
             r->timing_policy = server.timeouts;
             ctx->request = r;
             ctx->response = response;
             atomic_store(&ctx->need_write, 1);
             ctx->send_progress_ms = test_time;
-            test_time += 10;
+            /* Held past the close, so the asserts below read live memory. */
+            connection_s_inc(c);
+            test_time += 9;
             http_server_tick(c);
+            TEST_ASSERT(!atomic_load(&ctx->detached), "response still within its send budget");
+            test_time++;
             http_server_tick(c);
+            TEST_ASSERT(atomic_load(&ctx->detached), "stalled response closes the connection at the deadline");
             json_token_t* m = timeout_metrics_json();
-            TEST_ASSERT(json_llong(json_object_get(json_object_get(json_object_get(m, "http1"), "send_idle"), "observe"), NULL) == episode + 1,
-                        "one send event per keepalive exchange");
+            TEST_ASSERT(json_llong(json_object_get(json_object_get(m, "http1"), "send_idle"), NULL) == 3, "send idle recorded");
             json_token_free_tree(m);
-            ctx->base.reset(ctx);
+            connection_s_dec(c);
+            c = NULL; /* closed its fd and freed with the last reference */
+        } else {
+            if (r) httprequest_free(r);
+            if (response) response->base.free(response);
         }
-        connection_free(c);
+        if (c) {
+            connection_free(c);
+            close(fd[0]);
+        }
     }
-    close(fd[0]); close(fd[1]);
+    close(fd[1]);
     timeout_set_clock(NULL);
 }
 
@@ -320,13 +332,12 @@ TEST(test_timeout_recv_clock) {
  * reading its responses. */
 TEST(test_timeout_http1_pause_not_banked) {
     TEST_SUITE("timeouts");
-    for (int pause_during = 0; pause_during < 2; pause_during++) for (int enforce = 0; enforce < 2; enforce++) {
+    for (int pause_during = 0; pause_during < 2; pause_during++) {
         int fd[2];
         TEST_REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fd) == 0, "socket pair");
         server_t server = {0};
         timeout_policy_defaults(&server.timeouts);
         server.timeouts.request_header_timeout_ms = 10;
-        server.timeouts.enforce = enforce;
         char name[] = "localhost";
         domain_t domain = { .is_literal = 1, .template = name, .ascii_template = name, .ascii_length = 9 };
         server.domain = &domain;
@@ -364,7 +375,7 @@ TEST(test_timeout_http1_pause_not_banked) {
             test_time += 5000;
             http_server_tick(c);
             TEST_ASSERT(!ctx->response && !ctx->timeout_closing &&
-                        !(((httprequestparser_t*)ctx->parser)->timeout_reported & timeout_event_bit("headers", 0)),
+                        !(((httprequestparser_t*)ctx->parser)->timeout_reported & timeout_event_bit("headers")),
                         "not expired while the server is not reading");
             connection_control_mod(c, MPXIN | MPXRDHUP);
             test_time += 5;
@@ -372,14 +383,11 @@ TEST(test_timeout_http1_pause_not_banked) {
             test_time += 9;
         }
         http_server_tick(c);
-        TEST_ASSERT(ctx->response == NULL && !(((httprequestparser_t*)ctx->parser)->timeout_reported & timeout_event_bit("headers", 0)),
+        TEST_ASSERT(ctx->response == NULL && !(((httprequestparser_t*)ctx->parser)->timeout_reported & timeout_event_bit("headers")),
                     "not expired before the budget of receive time");
         test_time++;
         http_server_tick(c);
-        if (enforce)
-            TEST_ASSERT(ctx->response != NULL && ctx->timeout_closing, "408 staged at the plain budget");
-        else
-            TEST_ASSERT(((httprequestparser_t*)ctx->parser)->timeout_reported & timeout_event_bit("headers", 0), "observe records expiry at the plain budget");
+        TEST_ASSERT(ctx->response != NULL && ctx->timeout_closing, "408 staged at the plain budget");
         connection_free(c);
         close(fd[0]); close(fd[1]);
         timeout_set_clock(NULL);

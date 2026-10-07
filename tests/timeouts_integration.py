@@ -25,7 +25,7 @@ def main():
                 "workers": 1, "threads": 2, "reload": "soft",
                 "buffer_size": 16384, "client_max_body_size": 1048576,
                 "tmp": tmp, "gzip": [], "log": {"enabled": True, "level": "info"},
-                "timeouts": {"request_timeout_mode": "enforce", "request_header_timeout_ms": 100,
+                "timeouts": {"request_header_timeout_ms": 100,
                              "request_body_idle_timeout_ms": 100,
                              "ws_ping_interval_ms": 100, "ws_pong_timeout_ms": 300,
                              "ws_close_timeout_ms": 100, "ws_send_idle_timeout_ms": 50},
@@ -84,6 +84,11 @@ def main():
         candidate = copy.deepcopy(config)
         candidate["servers"]["s1"]["timeouts"] = {"request_body_idle_timeout_ms": 0}
         rejected(candidate, "servers.s1.timeouts")
+        # There is one mode: every timeout terminates. The former switch is
+        # an unknown key, not a silently ignored one.
+        candidate = copy.deepcopy(config)
+        candidate["main"]["timeouts"]["request_timeout_mode"] = "observe"
+        rejected(candidate, "main.timeouts.request_timeout_mode")
         candidate = copy.deepcopy(config)
         candidate["servers"]["s1"]["http"]["routes"]["/ws"]["GET"]["timeouts"] = {
             "request_header_timeout_ms": 10}
@@ -249,8 +254,9 @@ def main():
                     response = receive(upload, eof=True)
                     assert b"HTTP/1.1 408" in response, response
 
-                # Valid reload switches policy. Observation records expiry but accepts completion.
-                config["main"]["timeouts"]["request_timeout_mode"] = "observe"
+                # Valid reload switches policy: a longer header budget accepts
+                # the same slow request the 100ms one rejected.
+                config["main"]["timeouts"]["request_header_timeout_ms"] = 1500
                 save(config)
                 proc.send_signal(signal.SIGUSR1)
                 deadline = time.monotonic() + 5
@@ -265,10 +271,10 @@ def main():
                                 break
                     except OSError:
                         pass
-                    assert time.monotonic() < deadline, "observe reload did not take effect"
+                    assert time.monotonic() < deadline, "longer header budget reload did not take effect"
 
-                # Back to enforce for the parked-connection regressions below.
-                config["main"]["timeouts"]["request_timeout_mode"] = "enforce"
+                # Back to 100ms for the parked-connection regressions below.
+                config["main"]["timeouts"]["request_header_timeout_ms"] = 100
                 save(config)
                 proc.send_signal(signal.SIGUSR1)
                 deadline = time.monotonic() + 5
@@ -280,12 +286,12 @@ def main():
                                 break
                     except OSError:
                         pass
-                    assert time.monotonic() < deadline, "enforce reload did not take effect"
+                    assert time.monotonic() < deadline, "short header budget reload did not take effect"
 
                 # A pipelined request parked behind a running handler must not be
                 # timed out on the server's own stall: while the handler runs the
                 # connection is not read, so the second request's header budget
-                # must not accrue (regression: enforce closed the connection and
+                # must not accrue (regression: the timeout closed the connection and
                 # lost the first response already being computed).
                 with connect() as sock:
                     sock.sendall(b"GET /slow?ms=800 HTTP/1.1\r\nHost: localhost\r\n\r\n"
@@ -344,7 +350,7 @@ def main():
                     raise AssertionError(
                         f"handler completion crashed on the freed listener, rc={proc.returncode}:\n"
                         + log.read())
-                print("timeouts: config/listener validation, pipeline, route overrides, Ping/Pong/Close, active upload/WebSocket soft reload, observe, parked pipeline, unbanked pause and hard-reload handler lifetime passed")
+                print("timeouts: config/listener validation, pipeline, route overrides, Ping/Pong/Close, active upload/WebSocket soft reload, policy reload, parked pipeline, unbanked pause and hard-reload handler lifetime passed")
             finally:
                 proc.terminate()
                 try:

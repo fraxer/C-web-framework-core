@@ -702,7 +702,7 @@ void websocketsparser_ping_sent(websocketsparser_t* p) {
 }
 
 void websocketsparser_pong(websocketsparser_t* p, const char* payload, size_t length) {
-    if (p->timeout_policy.enforce && timeout_expired(__recv_now(p), p->ping_sent_ms,
+    if (timeout_expired(__recv_now(p), p->ping_sent_ms,
         p->timeout_policy.ws_pong_timeout_ms)) return;
     if (p->ping_sent_ms && length == sizeof p->ping_sequence && payload &&
         memcmp(payload, &p->ping_sequence, length) == 0) {

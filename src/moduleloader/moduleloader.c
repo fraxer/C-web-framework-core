@@ -1429,9 +1429,8 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             if (other->port == server->port && ipaddr_equal(&other->ip, &server->ip) &&
                 (other->timeouts.request_header_timeout_ms != server->timeouts.request_header_timeout_ms ||
                  other->timeouts.tls_handshake_timeout_ms != server->timeouts.tls_handshake_timeout_ms ||
-                 ((other->timeouts.explicit_fields ^ server->timeouts.explicit_fields) & TIMEOUT_EXPLICIT(request_header_timeout_ms)) ||
-                 other->timeouts.enforce != server->timeouts.enforce)) {
-                log_error_stderr("servers.%s.timeouts: vhosts sharing a listener must agree on header/TLS budgets and timeout mode\n", json_it_key(&it_servers));
+                 ((other->timeouts.explicit_fields ^ server->timeouts.explicit_fields) & TIMEOUT_EXPLICIT(request_header_timeout_ms)))) {
+                log_error_stderr("servers.%s.timeouts: vhosts sharing a listener must agree on header/TLS budgets\n", json_it_key(&it_servers));
                 goto failed;
             }
         }

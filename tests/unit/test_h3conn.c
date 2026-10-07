@@ -430,7 +430,6 @@ TEST(test_h3conn_timeout_stream_isolation) {
     h3stream_t* st = h3conn_request_of(stalled);
     TEST_ASSERT(st && st->headers_done, "request body phase entered");
     if (st) {
-        st->timeout_policy.enforce = 1;
         st->timeout_policy.request_body_idle_timeout_ms = 10;
     }
     h3_timeout_ms += 5;
@@ -438,7 +437,6 @@ TEST(test_h3conn_timeout_stream_isolation) {
     h3conn_stream_read(c, NULL, active);
     h3stream_t* live = h3conn_request_of(active);
     if (live) {
-        live->timeout_policy.enforce = 1;
         live->timeout_policy.request_body_idle_timeout_ms = 10;
     }
     quicconn_t qc = {0};

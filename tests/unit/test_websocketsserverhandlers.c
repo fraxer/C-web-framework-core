@@ -1531,7 +1531,6 @@ TEST(test_wsh_timeout_read_and_tick_close) {
         TEST_ASSERT(wsh_attach_parser(&h, websockets_protocol_default_create), "parser attached");
         websocketsparser_t* p = h.ctx.parser;
         if (p) {
-            p->timeout_policy.enforce = 1;
             p->timeout_policy.ws_pong_timeout_ms = 10;
             p->ping_sent_ms = heartbeat_test_ms;
             heartbeat_test_ms += 10;
