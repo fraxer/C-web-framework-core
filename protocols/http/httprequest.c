@@ -1117,8 +1117,6 @@ void httprequest_slow_tick(httprequest_t* r, const timeout_policy_t* p, const ch
                     ? "handler"
                     : "send";
 
-    timeout_record(protocol, "slow");
-
     log_info("slow_request protocol=%s phase=%s age_ms=%llu\n", protocol, phase, (unsigned long long)(now - r->started_ms));
 }
 
@@ -1138,10 +1136,6 @@ void httprequest_timing_finish(httprequest_t* r) {
     uint64_t now = timeout_now_ms();
     uint64_t send = now >= send_start ? now - send_start : 0;
     uint64_t total = now >= r->started_ms ? now - r->started_ms : 0;
-    const uint64_t durations[] = { headers, body, queue, handler, send, total };
-    for (unsigned i = 0; i < 6; i++)
-        timeout_duration_record(i, durations[i]);
-
     const timeout_policy_t* p = &r->timing_policy;
     if (p && total >= p->slow_request_threshold_ms)
         log_info("slow_request_complete headers_ms=%llu body_ms=%llu queue_ms=%llu handler_ms=%llu send_ms=%llu total_ms=%llu\n",

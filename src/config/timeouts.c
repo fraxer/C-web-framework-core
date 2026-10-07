@@ -3,15 +3,9 @@
 #include <stddef.h>
 #include <string.h>
 #include <time.h>
-#include <stdatomic.h>
 
-static const char* const protocols[] = { "http1", "h2", "h3", "websocket", "h2_ws" };
-static const char* const reasons[] = { "headers", "body_idle", "body_total", "tls_handshake", "idle", "send_idle", "pong", "message_idle", "message_total", "application_idle", "close", "handshake", "slow" };
-static const char* const stages[] = { "headers", "body", "queue", "handler", "send", "total" };
+static const char* const reasons[] = { "headers", "body_idle", "body_total", "tls_handshake", "idle", "send_idle", "pong", "message_idle", "message_total", "application_idle", "close", "handshake" };
 #define REASON_COUNT (sizeof reasons / sizeof reasons[0])
-static atomic_uint_fast64_t counts[5][REASON_COUNT];
-static atomic_uint_fast64_t duration_count[6], duration_sum[6], duration_hist[6][8];
-static const uint64_t duration_bounds[] = { 1, 10, 100, 1000, 10000, 60000, 600000 };
 
 unsigned timeout_event_bit(const char* reason) {
     for (unsigned r = 0; r < REASON_COUNT; r++)
@@ -29,62 +23,11 @@ int timeout_report(unsigned* reported, const char* protocol, const char* reason,
     const unsigned bit = timeout_event_bit(reason);
     if (*reported & bit) return 0;
     *reported |= bit;
-    timeout_record(protocol, reason);
     const int websocket = !strcmp(protocol, "websocket") || !strcmp(protocol, "h2_ws");
     log_info("%s protocol=%s reason=%s fd=%d stream=%llu\n",
         websocket ? "websocket_timeout" : "request_timeout", protocol, reason,
         fd, (unsigned long long)stream_id);
     return 1;
-}
-
-void timeout_record(const char* protocol, const char* reason) {
-    size_t p, r;
-    for (p = 0; p < 5; p++) if (!strcmp(protocols[p], protocol)) break;
-    for (r = 0; r < REASON_COUNT; r++) if (!strcmp(reasons[r], reason)) break;
-    if (p < 5 && r < REASON_COUNT) atomic_fetch_add_explicit(&counts[p][r], 1, memory_order_relaxed);
-}
-
-void timeout_duration_record(unsigned stage, uint64_t ms) {
-    if (stage >= 6) return;
-    unsigned bucket = 0;
-    while (bucket < 7 && ms > duration_bounds[bucket]) bucket++;
-    atomic_fetch_add_explicit(&duration_count[stage], 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&duration_sum[stage], ms, memory_order_relaxed);
-    atomic_fetch_add_explicit(&duration_hist[stage][bucket], 1, memory_order_relaxed);
-}
-
-void timeout_metrics_reset(void) {
-    for (unsigned p = 0; p < 5; p++) for (unsigned r = 0; r < REASON_COUNT; r++) atomic_store(&counts[p][r], 0);
-    for (unsigned s = 0; s < 6; s++) {
-        atomic_store(&duration_count[s], 0); atomic_store(&duration_sum[s], 0);
-        for (unsigned b = 0; b < 8; b++) atomic_store(&duration_hist[s][b], 0);
-    }
-}
-
-json_token_t* timeout_metrics_json(void) {
-    json_token_t* root = json_create_object();
-    if (!root) return NULL;
-    for (unsigned p = 0; p < 5; p++) {
-        json_token_t* events = json_create_object();
-        for (unsigned r = 0; r < REASON_COUNT; r++)
-            json_object_set(events, reasons[r], json_create_number(atomic_load(&counts[p][r])));
-        json_object_set(root, protocols[p], events);
-    }
-    json_token_t* durations = json_create_object();
-    json_token_t* bounds = json_create_array();
-    for (unsigned b = 0; b < 7; b++) json_array_append(bounds, json_create_number(duration_bounds[b]));
-    json_object_set(durations, "bucket_upper_bounds_ms", bounds);
-    for (unsigned s = 0; s < 6; s++) {
-        json_token_t* item = json_create_object();
-        json_token_t* hist = json_create_array();
-        for (unsigned b = 0; b < 8; b++) json_array_append(hist, json_create_number(atomic_load(&duration_hist[s][b])));
-        json_object_set(item, "samples", json_create_number(atomic_load(&duration_count[s])));
-        json_object_set(item, "sum_ms", json_create_number(atomic_load(&duration_sum[s])));
-        json_object_set(item, "hist", hist);
-        json_object_set(durations, stages[s], item);
-    }
-    json_object_set(root, "durations_ms", durations);
-    return root;
 }
 
 typedef struct { const char* name; size_t offset; uint32_t value; } timeout_field_t;
@@ -96,7 +39,6 @@ static const timeout_field_t fields[] = {
 
 void timeout_policy_defaults(timeout_policy_t* p) {
     memset(p, 0, sizeof(*p));
-    p->legacy_h2_timeout_ms = 120000;
     for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++)
         *(uint32_t*)((char*)p + fields[i].offset) = fields[i].value;
 }
