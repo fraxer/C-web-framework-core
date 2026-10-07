@@ -273,6 +273,48 @@ TEST(test_timeout_http1_send_reuse) {
     timeout_set_clock(NULL);
 }
 
+/* An idle connection -- no request byte yet, fresh or between keep-alive
+ * requests -- closes without a 408: a pooled client may be sending its next
+ * request right then and would take the 408 for the answer to it. */
+TEST(test_timeout_http1_idle_closes_silently) {
+    TEST_SUITE("timeouts");
+    for (int keepalive = 0; keepalive < 2; keepalive++) {
+        int fd[2];
+        TEST_REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fd) == 0, "socket pair");
+        server_t server = {0};
+        timeout_policy_defaults(&server.timeouts);
+        server.timeouts.request_header_timeout_ms = 10;
+        server.timeouts.keepalive_timeout_ms = 20;
+        mpxapi_t api = { .control_mod = arm, .control_del = detach };
+        listener_t listener = { .api = &api };
+        char buffer[4096];
+        test_time = 100000;
+        timeout_set_clock(clock_ms);
+        connection_t* c = connection_s_alloc(&listener, fd[0], &server.ip, 8080, &server.ip, 40000, buffer, sizeof buffer);
+        if (!c) { timeout_set_clock(NULL); close(fd[0]); close(fd[1]); TEST_ASSERT(0, "connection allocated"); continue; }
+        connection_server_ctx_t* ctx = c->ctx;
+        ctx->server = &server;
+        ctx->receive_policy = server.timeouts;
+        TEST_ASSERT(set_http(c), "HTTP parser installed");
+        /* The first request clears accepted_ms; from then on the keep-alive budget applies. */
+        if (keepalive) ctx->accepted_ms = 0;
+        const uint32_t budget = keepalive ? server.timeouts.keepalive_timeout_ms : server.timeouts.request_header_timeout_ms;
+        connection_s_inc(c); /* held past the close, so the asserts read live memory */
+        http_server_tick(c);
+        test_time += budget - 1;
+        http_server_tick(c);
+        TEST_ASSERT(!atomic_load(&ctx->detached), "idle connection kept within its budget");
+        test_time++;
+        http_server_tick(c);
+        TEST_ASSERT(atomic_load(&ctx->detached) && ctx->response == NULL, "closed at the deadline without staging a response");
+        char wire[64];
+        TEST_ASSERT(recv(fd[1], wire, sizeof wire, 0) == 0, keepalive ? "keep-alive peer sees a bare EOF, no 408" : "fresh peer sees a bare EOF, no 408");
+        connection_s_dec(c); /* the last reference: frees it; its fd is already closed */
+        close(fd[1]);
+        timeout_set_clock(NULL);
+    }
+}
+
 TEST(test_timeout_recv_clock) {
     TEST_SUITE("timeouts");
     int fd[2];

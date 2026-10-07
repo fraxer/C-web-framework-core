@@ -130,6 +130,13 @@ def main():
                         sock.sendall(request)
                         response = receive(sock, eof=True)
                         assert b"HTTP/1.1 408" in response, response
+                # Without a single request byte there is nothing to answer: the
+                # connection closes silently, as nginx does, and a pooled client
+                # never takes a 408 for the reply to a request it was sending.
+                with connect() as sock:
+                    started = time.monotonic()
+                    response = receive(sock, eof=True)
+                    assert response == b"" and time.monotonic() - started < 2, response
                 assert b"ready" in get(), "timeout stopped other connections"
 
                 # Two complete requests and a partial third share one read.
