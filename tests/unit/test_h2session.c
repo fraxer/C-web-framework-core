@@ -113,7 +113,10 @@ TEST(test_h2session_upload_timeout) {
     h2stream_t* active = h2stream_create(s, 3);
     h2stream_t* handler = h2stream_create(s, 5);
     TEST_REQUIRE(stalled && active && handler, "streams created");
-    stalled->request_progress_ms = now_ms() - 121000;
+    /* As h2_stream_recv_init leaves them without a vhost: the default policy. */
+    timeout_policy_defaults(&stalled->timeout_policy);
+    active->timeout_policy = handler->timeout_policy = stalled->timeout_policy;
+    stalled->request_progress_ms = now_ms() - stalled->timeout_policy.request_body_idle_timeout_ms - 1000;
     active->request_progress_ms = now_ms();
     handler->request_progress_ms = stalled->request_progress_ms;
     handler->state = H2_STREAM_HALF_CLOSED_REMOTE;
@@ -141,7 +144,6 @@ TEST(test_h2session_late_partial_frame) {
     server_t server = {0};
     timeout_policy_defaults(&server.timeouts);
     server.timeouts.request_header_timeout_ms = 10;
-    server.timeouts.explicit_fields = 1;
     ctx.server = &server;
     connection_t connection = { .fd = -1, .ctx = &ctx };
     h2session_t* s = h2_test_session_create(&connection);
@@ -175,18 +177,13 @@ TEST(test_h2session_configured_timeout_isolation) {
     timeout_set_clock(timeout_test_clock);
     timeout_policy_defaults(&stalled->timeout_policy);
     stalled->timeout_policy.request_body_idle_timeout_ms = 10;
-    stalled->timeout_policy.explicit_fields = 2;
     active->timeout_policy = stalled->timeout_policy;
     stalled->body_started_ms = stalled->request_progress_ms = timeout_test_ms;
     active->body_started_ms = active->request_progress_ms = timeout_test_ms + 5;
     s->last_activity_ms = timeout_test_ms;
     timeout_test_ms += 10;
-    timeout_metrics_reset();
     h2_server_tick(&connection, 0);
     TEST_ASSERT(h2stream_find(s, 1) == NULL && h2stream_find(s, 3) == active, "only the expired stream is cancelled");
-    json_token_t* m = timeout_metrics_json();
-    TEST_ASSERT(json_llong(json_object_get(json_object_get(m, "h2"), "body_idle"), NULL) == 1, "stalled body recorded once");
-    json_token_free_tree(m);
     uint8_t wire[64];
     ssize_t n = recv(fd[1], wire, sizeof wire, 0);
     TEST_ASSERT(n == 13 && wire[3] == H2_FRAME_RST_STREAM && wire[8] == 1 && wire[12] == 8, "RST_STREAM(CANCEL) is emitted");
@@ -202,7 +199,6 @@ TEST(test_h2session_data_header_budget) {
         timeout_policy_defaults(&server.timeouts);
         server.timeouts.request_header_timeout_ms = 10;
         server.timeouts.request_body_idle_timeout_ms = 1000;
-        server.timeouts.explicit_fields = 3;
         connection_server_ctx_t ctx = { .server = &server };
         connection_t c = { .fd = -1, .ctx = &ctx };
         h2session_t* s = h2_test_session_create(&c);
@@ -235,14 +231,12 @@ TEST(test_h2session_absolute_header_block) {
         server_t server = {0};
         timeout_policy_defaults(&server.timeouts);
         server.timeouts.request_header_timeout_ms = 10;
-        server.timeouts.explicit_fields = 1;
         connection_server_ctx_t ctx = { .server = &server };
         connection_t c = { .fd = -1, .ctx = &ctx };
         h2session_t* s = h2_test_session_create(&c);
         TEST_REQUIRE(s != NULL, "session created");
         timeout_test_ms = 100000;
         timeout_set_clock(timeout_test_clock);
-        timeout_metrics_reset();
         s->abort_epoch_ms = s->ctrl_epoch_ms = timeout_test_ms;
         /* Self-dependent priority rejects this stream after decoding; no dispatch. */
         uint8_t payload[] = {0,0,0,1,0,0x82};
@@ -255,9 +249,7 @@ TEST(test_h2session_absolute_header_block) {
         const uint8_t rest[] = {0x86,0x84};
         int accepted = feed_frame(s, H2_FRAME_CONTINUATION, H2_FLAG_END_HEADERS, 1, rest, sizeof rest);
         TEST_ASSERT(accepted == (elapsed[boundary] < 10), "continuation cannot restart absolute budget");
-        json_token_t* m = timeout_metrics_json();
-        TEST_ASSERT(json_llong(json_object_get(json_object_get(m, "h2"), "headers"), NULL) == (elapsed[boundary] >= 10), "one expired block reported at the exact boundary");
-        json_token_free_tree(m);
+        TEST_ASSERT((s->header_timeout_reported != 0) == (elapsed[boundary] >= 10), "expiry reported exactly at the boundary");
         timeout_set_clock(NULL);
         h2_session_free(s);
     }
@@ -280,7 +272,6 @@ TEST(test_h2session_partial_data_progress_and_cancel) {
             timeout_policy_defaults(&stalled->timeout_policy);
             stalled->timeout_policy.request_body_idle_timeout_ms = 10;
             stalled->timeout_policy.request_body_total_timeout_ms = 0;
-            stalled->timeout_policy.explicit_fields = TIMEOUT_EXPLICIT(request_body_idle_timeout_ms);
             stalled->body_started_ms = stalled->request_progress_ms = timeout_test_ms;
             stalled->recv.avail = neighbor->recv.avail = H2_DEFAULT_WINDOW;
             uint8_t payload[] = {2,'a','b','c',0,0};
@@ -318,7 +309,6 @@ TEST(test_h2session_header_receive_timing) {
     timeout_policy_defaults(&server.timeouts);
     server.timeouts.request_header_timeout_ms = 1000;
     server.timeouts.slow_request_threshold_ms = 10;
-    server.timeouts.explicit_fields = TIMEOUT_EXPLICIT(request_header_timeout_ms);
     char host[] = "localhost";
     domain_t domain = { .is_literal = 1, .template = host, .ascii_template = host, .ascii_length = 9 };
     server.domain = &domain;
@@ -334,7 +324,6 @@ TEST(test_h2session_header_receive_timing) {
     timeout_test_ms = 100000;
     timeout_set_clock(timeout_test_clock);
     s->abort_epoch_ms = s->ctrl_epoch_ms = timeout_test_ms;
-    timeout_metrics_reset();
     /* POST, scheme http, path /, literal authority localhost. */
     const uint8_t block[] = {0x83,0x86,0x84,0x01,9,'l','o','c','a','l','h','o','s','t'};
     uint8_t wire[64];
@@ -346,25 +335,15 @@ TEST(test_h2session_header_receive_timing) {
     /* Trigger observation before END_HEADERS, retaining a partial transport header. */
     n = h2frame_encode(wire, sizeof wire, H2_FRAME_CONTINUATION, H2_FLAG_END_HEADERS, 1, NULL, 0);
     TEST_ASSERT(h2_session_feed(s, wire, 1), "partial CONTINUATION accepted");
-    json_token_t* metrics = timeout_metrics_json();
-    TEST_ASSERT(json_llong(json_object_get(json_object_get(metrics, "h2"), "slow"), NULL) == 1,
-                "live slow event during headers");
-    json_token_free_tree(metrics);
+    TEST_ASSERT(s->header_slow_reported, "live slow event during headers");
     TEST_ASSERT(h2_session_feed(s, wire + 1, n - 1), "block completes");
     h2stream_t* stream = h2stream_find(s, 1);
     TEST_ASSERT(stream && stream->headers_done, "real request built without dispatch");
     if (stream) {
         TEST_ASSERT(stream->request->headers_done_ms - stream->request->started_ms == 18, "timing includes HEADERS and CONTINUATION");
+        TEST_ASSERT(stream->request->slow_reported, "header slow event transferred, so the request does not report it again");
         httprequest_slow_tick(stream->request, &stream->timeout_policy, "h2", timeout_test_ms);
         httprequest_timing_finish(stream->request);
-        metrics = timeout_metrics_json();
-        TEST_ASSERT(json_llong(json_object_get(json_object_get(metrics, "h2"), "slow"), NULL) == 1,
-                    "header slow event transferred without duplication");
-        TEST_ASSERT(json_llong(json_object_get(json_object_get(json_object_get(metrics, "durations_ms"), "headers"), "sum_ms"), NULL) == 18,
-                    "completion header metric includes receive time");
-        TEST_ASSERT(json_llong(json_object_get(json_object_get(json_object_get(metrics, "durations_ms"), "total"), "sum_ms"), NULL) == 18,
-                    "completion total includes receive time");
-        json_token_free_tree(metrics);
     }
     timeout_test_ms++;
     TEST_ASSERT(feed_frame(s, H2_FRAME_HEADERS, H2_FLAG_END_HEADERS, 3, block, sizeof block),

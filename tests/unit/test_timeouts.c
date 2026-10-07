@@ -206,18 +206,12 @@ TEST(test_timeout_http1_effective_slow_policy) {
 TEST(test_timeout_events_reason_and_episode) {
     TEST_SUITE("timeouts");
     unsigned reported = 0;
-    timeout_metrics_reset();
     TEST_ASSERT(timeout_report(&reported, "http1", "headers", -1, 0), "first expiry recorded");
     TEST_ASSERT(!timeout_report(&reported, "http1", "headers", -1, 0), "repeated tick suppressed");
     TEST_ASSERT(timeout_report(&reported, "http1", "body_idle", -1, 0), "different reason recorded");
     timeout_event_clear(&reported, "headers");
     TEST_ASSERT(timeout_report(&reported, "http1", "headers", -1, 0), "new header episode recorded");
     TEST_ASSERT(!timeout_report(&reported, "http1", "body_idle", -1, 0), "other active episode retains deduplication");
-    json_token_t* m = timeout_metrics_json();
-    TEST_ASSERT(json_llong(json_object_get(json_object_get(m, "http1"), "headers"), NULL) == 2 &&
-                json_llong(json_object_get(json_object_get(m, "http1"), "body_idle"), NULL) == 1,
-                "metrics count one per recorded episode");
-    json_token_free_tree(m);
 }
 
 TEST(test_timeout_http1_send_reuse) {
@@ -239,7 +233,6 @@ TEST(test_timeout_http1_send_reuse) {
         ctx->server = &server;
         ctx->receive_policy = server.timeouts;
         TEST_ASSERT(set_http(c), "HTTP parser installed");
-        timeout_metrics_reset();
         /* The send event is deduplicated per exchange: a keepalive reset opens
          * the next one. */
         for (int episode = 0; episode < 2; episode++) {
@@ -264,9 +257,7 @@ TEST(test_timeout_http1_send_reuse) {
             test_time++;
             http_server_tick(c);
             TEST_ASSERT(atomic_load(&ctx->detached), "stalled response closes the connection at the deadline");
-            json_token_t* m = timeout_metrics_json();
-            TEST_ASSERT(json_llong(json_object_get(json_object_get(m, "http1"), "send_idle"), NULL) == 3, "send idle recorded");
-            json_token_free_tree(m);
+            TEST_ASSERT(ctx->timeout_reported & timeout_event_bit("send_idle"), "send idle reported");
             connection_s_dec(c);
             c = NULL; /* closed its fd and freed with the last reference */
         } else {

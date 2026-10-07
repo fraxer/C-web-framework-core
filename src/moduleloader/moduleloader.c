@@ -724,13 +724,13 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     }
 
 
-    long long legacy_timeout = 120;
-    int legacy_status = env_config_get_llong_checked(env, "http2_request_timeout_sec", &legacy_timeout);
-    if (legacy_status < 0 || legacy_timeout < 0 || legacy_timeout > 86400) {
-        log_error_stderr("main.env.http2_request_timeout_sec must be an integer in 0..86400 seconds\n");
+    /* Superseded by main.timeouts. Refused rather than ignored: main.env keeps
+     * any key, and a config that still sets this one would otherwise have its
+     * HTTP/2 budgets change without a word. */
+    if (env_config_get_llong_checked(env, "http2_request_timeout_sec", NULL) != 0) {
+        log_error_stderr("main.env.http2_request_timeout_sec was removed: use main.timeouts.request_header_timeout_ms and request_body_idle_timeout_ms\n");
         goto failed;
     }
-    env->main.timeouts.legacy_h2_timeout_ms = (uint32_t)legacy_timeout * 1000;
 
 
     if (!__module_loader_servers_load(config, json_object_get(root, "servers")))
@@ -1428,8 +1428,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
         for (server_t* other = first_server; other && other != server; other = other->next) {
             if (other->port == server->port && ipaddr_equal(&other->ip, &server->ip) &&
                 (other->timeouts.request_header_timeout_ms != server->timeouts.request_header_timeout_ms ||
-                 other->timeouts.tls_handshake_timeout_ms != server->timeouts.tls_handshake_timeout_ms ||
-                 ((other->timeouts.explicit_fields ^ server->timeouts.explicit_fields) & TIMEOUT_EXPLICIT(request_header_timeout_ms)))) {
+                 other->timeouts.tls_handshake_timeout_ms != server->timeouts.tls_handshake_timeout_ms)) {
                 log_error_stderr("servers.%s.timeouts: vhosts sharing a listener must agree on header/TLS budgets\n", json_it_key(&it_servers));
                 goto failed;
             }

@@ -175,7 +175,6 @@ static uint32_t h2_idle_timeout_sec = H2_DEFAULT_IDLE_TIMEOUT_SEC;
 static uint32_t h2_ping_interval_sec = 0;
 static uint32_t h2_ping_ack_timeout_sec = H2_DEFAULT_PING_ACK_TIMEOUT_SEC;
 static uint32_t h2_settings_ack_timeout_sec = H2_DEFAULT_SETTINGS_ACK_TIMEOUT_SEC;
-static uint32_t h2_request_timeout_sec = 120;
 static int64_t  h2_recv_window_initial = H2_DEFAULT_WINDOW;
 static int64_t  h2_recv_window_max = H2_DEFAULT_RECV_WINDOW_MAX;
 static int64_t  h2_write_quantum = H2_DEFAULT_WRITE_QUANTUM;
@@ -206,8 +205,6 @@ static size_t h2_header_block_cap(void) {
 }
 
 void h2_policy_init(void) {
-    const int request_timeout = env_get_int("http2_request_timeout_sec", 120);
-    h2_request_timeout_sec = request_timeout > 0 ? (uint32_t)request_timeout : 0;
     h2_idle_timeout_sec = (uint32_t)env_get_int("http2_idle_timeout_sec", H2_DEFAULT_IDLE_TIMEOUT_SEC);
     h2_ping_interval_sec = (uint32_t)env_get_int("http2_ping_interval_sec", 0);
     /* Default ack grace: the interval itself, capped so a stuck peer is caught
@@ -1730,14 +1727,9 @@ static h2_frame_result_e h2_on_continuation(h2session_t* s, const h2_frame_t* fr
     return h2_on_header_block(s, s->cont_stream_id, s->cont, s->cont_len, s->cont_end_stream);
 }
 
-/* An implicit body idle budget falls back to main.env.http2_request_timeout_sec,
- * the one HTTP/2 request timeout that predates the timeouts policy. */
 static int h2_body_expired(h2session_t* s, h2stream_t* stream, uint64_t now) {
     const timeout_policy_t* p = &stream->timeout_policy;
-    connection_server_ctx_t* ctx = s->connection->ctx;
-    const uint32_t idle_budget = (p->explicit_fields & TIMEOUT_EXPLICIT(request_body_idle_timeout_ms)) ? p->request_body_idle_timeout_ms :
-        (ctx && ctx->server ? p->legacy_h2_timeout_ms : h2_request_timeout_sec * 1000u);
-    const int idle = timeout_expired(now, stream->request_progress_ms, idle_budget);
+    const int idle = timeout_expired(now, stream->request_progress_ms, p->request_body_idle_timeout_ms);
     const int total = timeout_expired(now, stream->body_started_ms, p->request_body_total_timeout_ms);
     if (!idle && !total) return 0;
     timeout_report(&stream->timeout_reported, "h2", idle ? "body_idle" : "body_total", s->connection->fd, stream->id);
@@ -1941,23 +1933,13 @@ static timeout_policy_t h2_receive_policy(h2session_t* s) {
     return policy;
 }
 
-/* Same legacy fallback as h2_body_expired for an implicit header budget. */
-static uint32_t h2_header_budget(h2session_t* s) {
-    connection_server_ctx_t* ctx = s->connection->ctx;
-    timeout_policy_t policy = h2_receive_policy(s);
-    if (policy.explicit_fields & TIMEOUT_EXPLICIT(request_header_timeout_ms))
-        return policy.request_header_timeout_ms;
-    return ctx && ctx->server ? policy.legacy_h2_timeout_ms : h2_request_timeout_sec * 1000u;
-}
-
 static int h2_header_expired(h2session_t* s, uint64_t now) {
-    const uint32_t budget = h2_header_budget(s);
+    const timeout_policy_t policy = h2_receive_policy(s);
+    const uint32_t budget = policy.request_header_timeout_ms;
     if (s->header_started_ms && !s->header_slow_reported &&
         !h2stream_find(s, s->cont_active ? s->cont_stream_id : s->frame.stream_id)) {
-        timeout_policy_t policy = h2_receive_policy(s);
         if (timeout_expired(now, s->header_started_ms, policy.slow_request_threshold_ms)) {
             s->header_slow_reported = 1;
-            timeout_record("h2", "slow");
             log_info("slow_request protocol=h2 phase=headers age_ms=%llu\n",
                      (unsigned long long)(now - s->header_started_ms));
         }

@@ -94,14 +94,18 @@ def main():
             "request_header_timeout_ms": 10}
         rejected(candidate, "timeouts")
 
-        # Equal numeric listener budgets with different explicit presence have
-        # different H2 fallback semantics and must remain incompatible.
+        # The header budget applies before Host/SNI picks a vhost, so vhosts
+        # sharing a listener must agree on it.
         candidate = copy.deepcopy(config)
-        candidate["main"]["timeouts"].pop("request_header_timeout_ms")
         candidate["servers"]["s2"] = copy.deepcopy(candidate["servers"]["s1"])
         candidate["servers"]["s2"]["domains"] = ["other.localhost"]
         candidate["servers"]["s2"]["timeouts"] = {"request_header_timeout_ms": 60000}
         rejected(candidate, "vhosts sharing a listener")
+        # The pre-policy HTTP/2 timeout is gone; a config that still sets it is
+        # refused instead of silently changing its HTTP/2 budgets.
+        candidate = copy.deepcopy(config)
+        candidate["main"]["env"] = {"http2_request_timeout_sec": 120}
+        rejected(candidate, "main.env.http2_request_timeout_sec")
 
         save(config)
         with (work / "server.log").open("w+") as log:
