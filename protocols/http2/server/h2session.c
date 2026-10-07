@@ -1967,6 +1967,11 @@ static size_t h2_data_progress(const h2frame_parser_t* f) {
     return received < useful ? received : useful;
 }
 
+/* The first useful DATA byte, past the pad-length byte when there is one. */
+static const uint8_t* h2_data_useful(const h2frame_parser_t* f) {
+    return f->flags & H2_FLAG_PADDED ? f->payload + 1 : f->payload;
+}
+
 static int h2_check_partial_body(h2session_t* s, uint64_t now) {
     if (s->frame.stage != H2FRAME_STAGE_PAYLOAD || s->frame.type != H2_FRAME_DATA || s->data_discard)
         return 1;
@@ -2021,8 +2026,17 @@ static int h2_process_buffer(h2session_t* s) {
             s->header_started_ms = s->frame_started_ms;
         if (classified && s->frame.type == H2_FRAME_DATA && !s->data_discard) {
             h2stream_t* stream = h2stream_find(s, s->frame.stream_id);
-            if (stream && !stream->ws && !stream->rejected && h2_data_progress(&s->frame) > before)
-                stream->request_progress_ms = now;
+            const size_t progress = h2_data_progress(&s->frame);
+            if (stream && !stream->rejected && progress > before) {
+                if (!stream->ws) stream->request_progress_ms = now;
+                /* A complete frame goes to the tunnel itself in a moment. */
+                else if (st == H2PARSE_CONTINUE && stream->state == H2_STREAM_OPEN &&
+                         !h2_ws_tunnel_receiving(stream->ws, h2_data_useful(&s->frame), progress, now)) {
+                    s->data_discard = 1;
+                    if (h2_stream_error(s, stream->id, H2_ERR_CANCEL) != H2_FRAME_OK)
+                        return h2_fail(s, s->error_code);
+                }
+            }
         }
         if ((!classified || s->header_started_ms) &&
             h2_header_expired(s, now))

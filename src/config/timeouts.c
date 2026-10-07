@@ -47,7 +47,9 @@ void timeout_policy_defaults(timeout_policy_t* p) {
     *p = timeout_policy_default;
 }
 
-int timeout_policy_load(timeout_policy_t* p, const json_token_t* object, const char* path) {
+/* `validate` is off for a route override: it is a patch over a server policy
+ * that is not known here, so the cross-field rules wait for the merge. */
+static int __policy_load(timeout_policy_t* p, const json_token_t* object, const char* path, int validate) {
     if (object == NULL) return 1;
     if (!json_is_object(object)) {
         log_error_stderr("%s must be an object\n", path);
@@ -74,9 +76,13 @@ int timeout_policy_load(timeout_policy_t* p, const json_token_t* object, const c
         *(uint32_t*)((char*)&candidate + fields[i].offset) = (uint32_t)value;
         candidate.explicit_fields |= UINT64_C(1) << i;
     }
-    if (!timeout_policy_validate(&candidate, path)) return 0;
+    if (validate && !timeout_policy_validate(&candidate, path)) return 0;
     *p = candidate;
     return 1;
+}
+
+int timeout_policy_load(timeout_policy_t* p, const json_token_t* object, const char* path) {
+    return __policy_load(p, object, path, 1);
 }
 
 /* Every timeout terminates what it bounds, so the two that stop a slowloris
@@ -119,7 +125,7 @@ int timeout_policy_load_route(timeout_policy_t* p, const json_token_t* object, c
             return 0;
         }
     }
-    return timeout_policy_load(p, object, path);
+    return __policy_load(p, object, path, 0);
 }
 
 int timeout_expired(uint64_t now, uint64_t start, uint32_t budget) {

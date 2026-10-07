@@ -91,6 +91,13 @@ int h2_ws_tunnel_tick(h2_ws_tunnel_t* tunnel, uint64_t now);
 int h2_ws_tunnel_feed(h2_ws_tunnel_t* tunnel, connection_t* connection,
                       uint8_t* data, size_t len);
 
+/* The useful bytes received so far of a DATA frame still on its way in. They
+ * reach the parser only with the whole frame, but the WebSocket frame and
+ * message deadlines run from their arrival -- otherwise one DATA frame trickled
+ * a byte at a time holds every message timer off. Returns 0 when a deadline has
+ * already passed and the stream has to die. */
+int h2_ws_tunnel_receiving(h2_ws_tunnel_t* tunnel, const uint8_t* data, size_t len, uint64_t now);
+
 /* Is anything waiting to go out on this tunnel? Read by the write scheduler to
  * decide whether the stream deserves a turn and whether to arm EPOLLOUT. */
 int h2_ws_tunnel_has_output(const h2_ws_tunnel_t* tunnel);

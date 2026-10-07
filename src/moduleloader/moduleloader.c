@@ -1433,12 +1433,20 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
                 goto failed;
             }
         }
+        /* Route overrides were only range-checked when loaded; whether they
+         * make sense depends on the server policy they patch, known only now. */
+        static const char* const method_names[7] = { "GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD" };
         for (int ws = 0; ws < 2; ws++) {
             for (route_t* route = ws ? server->websockets.route : server->http.route; route; route = route->next) {
                 for (int method = 0; method < 7; method++) {
+                    if (!route->timeouts[method].explicit_fields) continue;
                     timeout_policy_t effective = server->timeouts;
                     timeout_policy_merge(&effective, &route->timeouts[method]);
-                    if (!timeout_policy_validate(&effective, timeout_path)) goto failed;
+                    char route_path[512];
+                    snprintf(route_path, sizeof route_path, "servers.%s.%s.routes.%s.%s.timeouts",
+                             (const char*)json_it_key(&it_servers), ws ? "websockets" : "http",
+                             route->path, method_names[method]);
+                    if (!timeout_policy_validate(&effective, route_path)) goto failed;
                 }
             }
         }

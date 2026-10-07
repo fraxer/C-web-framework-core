@@ -111,6 +111,10 @@ void websocketsparser_reset(websocketsparser_t*);
 void websocketsparser_free(void* arg);
 void websocketsparser_set_bytes_readed(websocketsparser_t*, size_t);
 int websocketsparser_run(websocketsparser_t*);
+/* Bytes of the next read are arriving but cannot be parsed yet (HTTP/2 holds a
+ * DATA payload until the whole frame is in). Starts and refreshes the frame and
+ * message timers exactly as run() would on them; consumes nothing. */
+void websocketsparser_receiving(websocketsparser_t* parser, const uint8_t* data, size_t len);
 void websocketsparser_prepare_remains(websocketsparser_t*);
 /* Owner thread only. Pong must match the outstanding heartbeat payload. */
 int websocketsparser_dispatch_resource(websocketsparser_t* parser);

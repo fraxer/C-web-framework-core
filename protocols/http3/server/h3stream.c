@@ -47,6 +47,17 @@ h3stream_t* h3stream_create(connection_t* connection, size_t max_field_section_s
         return NULL;
     }
 
+    /* malloc, not calloc: a stale stamp from a recycled block would either
+     * expire a fresh request on the next tick or move its deadline. The
+     * caller narrows the policy to the server's once it knows the server. */
+    timeout_policy_defaults(&st->timeout_policy);
+    st->header_started_ms = 0;
+    st->body_started_ms = 0;
+    st->body_progress_ms = 0;
+    st->response_progress_ms = 0;
+    st->response_sent_offset = 0;
+    st->timeout_reported = 0;
+
     st->response = NULL;
     atomic_init(&st->response_ready, 0);
     st->response_done = 0;

@@ -408,6 +408,13 @@ int h2_ws_tunnel_feed(h2_ws_tunnel_t* tunnel, connection_t* connection,
     }
 }
 
+int h2_ws_tunnel_receiving(h2_ws_tunnel_t* tunnel, const uint8_t* data, size_t len, uint64_t now) {
+    /* Late bytes must not rescue a deadline that passed between ticks. */
+    if (!h2_ws_check_timeout(tunnel, now)) return 0;
+    if (!tunnel->parser->close_started_ms) websocketsparser_receiving(tunnel->parser, data, len);
+    return 1;
+}
+
 int h2_ws_tunnel_tick(h2_ws_tunnel_t* tunnel, uint64_t now) {
     websocketsparser_t* p = tunnel->parser;
     if (!h2_ws_check_timeout(tunnel, now)) return 0;
