@@ -21,6 +21,17 @@ typedef enum httprequestparser_stage {
 
 typedef struct httprequestparser {
     requestparser_t base;
+    /* Receive deadlines, stamped on the connection's receive clock
+     * (connection_recv_stamp) -- the clock __receive_timeout checks them on.
+     * Not wall time: request timing reads started_wall_ms instead. */
+    uint64_t header_started_ms;
+    uint64_t body_started_ms;
+    uint64_t body_progress_ms;
+    /* Wall time of the request's first byte, for the access log and the slow
+     * request threshold (request->started_ms). */
+    uint64_t started_wall_ms;
+    unsigned timeout_reported;
+    timeout_policy_t timeout_policy;
     char* buffer;
     bufferdata_t buf;
     size_t bytes_readed;
@@ -43,6 +54,7 @@ typedef struct httprequestparser {
      * clears it. */
     int expect_continue;
 } httprequestparser_t;
+_Static_assert(offsetof(httprequestparser_t, base) == 0, "parser interface must stay first");
 
 httprequestparser_t* httpparser_create(connection_t* connection);
 void httpparser_init(httprequestparser_t* parser, connection_t* connection);

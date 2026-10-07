@@ -120,6 +120,7 @@ connection_t* connection_s_create_local(server_t* server) {
 
     connection_server_ctx_t* ctx = connection->ctx;
     ctx->server = server;
+    ctx->receive_policy = server->timeouts;
 
     connection->close = NULL;
     connection->read = NULL;
@@ -264,13 +265,63 @@ connection_dec_result_e connection_s_dec(connection_t* connection) {
     return CONNECTION_DEC_RESULT_DECREMENT;
 }
 
+/* Stop or resume the receive clock (connection_server_ctx_t::recv_clock) on a
+ * change of read interest. Caller holds arm_locked, so the read and the store
+ * cannot interleave with another transition. */
+static void __recv_clock_transition(connection_server_ctx_t* ctx, uint32_t before, uint32_t after) {
+    const int was_readable = (before & MPXIN) != 0;
+    const int readable = (after & MPXIN) != 0;
+    if (was_readable == readable) return;
+
+    const uint64_t now = timeout_now_ms();
+    const uint64_t clock = atomic_load_explicit(&ctx->recv_clock, memory_order_relaxed);
+    const int paused = (clock & CONNECTION_RECV_PAUSED) != 0;
+
+    if (readable && paused) {
+        /* Resume: the total disarmed time is whatever makes the clock pick up
+         * where it stopped. */
+        const uint64_t frozen = clock & ~CONNECTION_RECV_PAUSED;
+        atomic_store_explicit(&ctx->recv_clock, now > frozen ? now - frozen : 0, memory_order_relaxed);
+    }
+    else if (!readable && !paused) {
+        const uint64_t frozen = now > clock ? now - clock : 0;
+        atomic_store_explicit(&ctx->recv_clock, frozen | CONNECTION_RECV_PAUSED, memory_order_relaxed);
+    }
+}
+
+int connection_control_mod(connection_t* connection, int events) {
+    connection_server_ctx_t* ctx = connection->ctx;
+
+    /* Held across the epoll_ctl, not just the bookkeeping: what the clock has
+     * to follow is the order in which the kernel saw the masks. Contention is
+     * a worker and a broadcast producer on one connection -- rare and short,
+     * but the holder may be in a syscall, so yield rather than spin. */
+    _Bool expected = 0;
+    while (!atomic_compare_exchange_weak_explicit(&ctx->arm_locked, &expected, 1,
+                                                  memory_order_acquire, memory_order_relaxed)) {
+        expected = 0;
+        sched_yield();
+    }
+
+    /* epoll_events is the mask the multiplexer actually installed -- unchanged
+     * on failure, untouched for QUIC -- so the transition follows the outcome
+     * rather than the request. */
+    const uint32_t before = atomic_load_explicit(&ctx->epoll_events, memory_order_acquire);
+    const int result = ctx->listener->api->control_mod(connection, events);
+    const uint32_t after = atomic_load_explicit(&ctx->epoll_events, memory_order_acquire);
+    __recv_clock_transition(ctx, before, after);
+
+    atomic_store_explicit(&ctx->arm_locked, 0, memory_order_release);
+    return result;
+}
+
 int connection_after_write(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
     const int inline_write = ctx->inline_write && ctx->switch_to_protocol.fn == NULL;
 
     if (connection->keepalive == 0) {
         atomic_store(&ctx->destroyed, 1);
-        return ctx->listener->api->control_mod(connection, MPXOUT | MPXIN | MPXHUP);
+        return connection_control_mod(connection, MPXOUT | MPXIN | MPXHUP);
     }
 
     connection_reset(connection);
@@ -295,7 +346,7 @@ int connection_after_write(connection_t* connection) {
 
     if (!handlers_empty || !broadcast_empty) {
         connection_queue_guard_append(connection);
-        return ctx->listener->api->control_mod(connection, MPXONESHOT);
+        return connection_control_mod(connection, MPXONESHOT);
     }
 
     int expected = 2;
@@ -312,7 +363,7 @@ int connection_after_write(connection_t* connection) {
         expected = 1;
         if (atomic_compare_exchange_strong(&ctx->broadcast_ref_count, &expected, 2)) {
             connection_queue_guard_append(connection);
-            return ctx->listener->api->control_mod(connection, MPXONESHOT);
+            return connection_control_mod(connection, MPXONESHOT);
         }
 
         /* Lost the race: the producer that put the message there parked the
@@ -327,7 +378,7 @@ int connection_after_write(connection_t* connection) {
     if (inline_write && atomic_load_explicit(&ctx->epoll_events, memory_order_acquire) == (MPXIN | MPXRDHUP))
         return 1;
 
-    return ctx->listener->api->control_mod(connection, MPXIN | MPXRDHUP);
+    return connection_control_mod(connection, MPXIN | MPXRDHUP);
 }
 
 /* The event set a parked connection keeps, by protocol (docs/concurrency/01,
@@ -368,7 +419,7 @@ static int __park(connection_t* connection) {
     if (!atomic_compare_exchange_strong(&ctx->broadcast_ref_count, &expected, 2))
         return 1; /* somebody else parked it already */
 
-    if (!ctx->listener->api->control_mod(connection, __park_events(ctx))) {
+    if (!connection_control_mod(connection, __park_events(ctx))) {
         atomic_store(&ctx->broadcast_ref_count, 1);
         return 0;
     }
@@ -390,7 +441,7 @@ int connection_park_rearm(connection_t* connection) {
      * fd is already closed and whose number may belong to somebody else. */
     if (atomic_load(&ctx->detached)) return 1;
 
-    return ctx->listener->api->control_mod(connection, __park_events(ctx));
+    return connection_control_mod(connection, __park_events(ctx));
 }
 
 /* Serialized dispatch: park, and queue the connection only if it is not queued
@@ -406,7 +457,7 @@ int connection_queue_append(connection_queue_item_t* item) {
         return 1;
     }
 
-    if (!ctx->listener->api->control_mod(item->connection, MPXONESHOT)) {
+    if (!connection_control_mod(item->connection, MPXONESHOT)) {
         atomic_store(&ctx->broadcast_ref_count, 1);
         return 0;
     }
@@ -436,7 +487,7 @@ int connection_queue_append_parallel(connection_queue_item_t* item) {
 int connection_queue_append_broadcast(connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
 
-    if (!ctx->listener->api->control_mod(connection, MPXONESHOT)) {
+    if (!connection_control_mod(connection, MPXONESHOT)) {
         atomic_store(&ctx->broadcast_ref_count, 1);
         return 0;
     }
@@ -457,7 +508,7 @@ int connection_after_read(connection_t* connection) {
     if (atomic_load(&ctx->detached))
         return 1;
 
-    const int result = ctx->listener->api->control_mod(connection, MPXOUT | MPXRDHUP);
+    const int result = connection_control_mod(connection, MPXOUT | MPXRDHUP);
     if (result) ctx->inline_write = 0;
     return result;
 }
@@ -544,6 +595,15 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
     atomic_store(&ctx->lock_site, LOCK_SITE_OTHER);
     atomic_store(&ctx->handlers_inflight, 0);
     ctx->listener = listener;
+    ctx->accepted_ms = timeout_now_ms();
+    ctx->idle_started_ms = 0;
+    ctx->send_progress_ms = 0;
+    ctx->h2_write_bytes = 0;
+    ctx->timeout_close_started_ms = 0;
+    atomic_init(&ctx->recv_clock, 0);
+    atomic_init(&ctx->arm_locked, 0);
+    ctx->timeout_reported = 0;
+    ctx->timeout_closing = 0;
     ctx->parser = NULL;
     ctx->server = NULL;
     ctx->request = NULL;
@@ -566,6 +626,10 @@ connection_server_ctx_t* __ctx_create(listener_t* listener) {
         if (item)
             ctx->server = item->data;
     }
+    if (ctx->server != NULL)
+        ctx->receive_policy = ctx->server->timeouts;
+    else
+        timeout_policy_defaults(&ctx->receive_policy);
 
     if (ctx->queue == NULL || ctx->broadcast_queue == NULL || ctx->write_queue == NULL) {
         cqueue_free(ctx->queue);
@@ -588,6 +652,8 @@ void __ctx_reset(void* arg) {
      * (docs/http2/10, T.2). */
     ctx->cont_pending = 0;
     ctx->cont_sent = 0;
+    ctx->send_progress_ms = 0;
+    ctx->timeout_reported = 0;
 
     /* When a protocol switch is pending (h2c Upgrade — see connection_after_write),
      * the switch callback adopts the request: the upgraded HTTP/1.1 request

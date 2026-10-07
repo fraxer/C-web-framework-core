@@ -7,14 +7,27 @@
 #include "queryparser.h"
 #include "json.h"
 #include "request.h"
+#include <stdatomic.h>
 
 typedef struct httprequest_head {
     size_t size;
     char* data;
 } httprequest_head_t;
 
+struct timeout_policy;
+
 typedef struct httprequest {
     request_t base;
+    uint64_t started_ms;
+    timeout_policy_t timing_policy;
+    int timing_policy_ready;
+    uint64_t headers_done_ms;
+    uint64_t received_ms;
+    uint64_t queued_ms;
+    atomic_uint_fast64_t handler_started_ms;
+    atomic_uint_fast64_t handler_done_ms;
+    unsigned slow_reported;
+    unsigned timing_finished;
 
     const char* uri;
     const char* path;
@@ -291,6 +304,10 @@ typedef struct httprequest {
     size_t uri_length;
     size_t path_length;
 } httprequest_t;
+void httprequest_slow_tick(httprequest_t* request, const struct timeout_policy* policy,
+                          const char* protocol, uint64_t now);
+void httprequest_timing_finish(httprequest_t* request);
+_Static_assert(offsetof(httprequest_t, base) == 0, "request interface must stay first");
 
 /* Append a trailing field to a request (RFC 9113 §8.1). Used by the HTTP/2
  * parser when the trailer block arrives, before the request is dispatched;

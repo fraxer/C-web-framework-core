@@ -49,9 +49,11 @@ static void __reset(void* arg);
 
 /* Worker thread only — see the invariant on connection_data_write(). */
 static ssize_t __raw_write(connection_t* connection, const char* data, size_t size) {
-    return connection->ssl ?
+    ssize_t written = connection->ssl ?
         openssl_write(connection->ssl, data, size) :
         send(connection->fd, data, size, MSG_NOSIGNAL);
+    if (written > 0 && connection->ctx) ((connection_server_ctx_t*)connection->ctx)->h2_write_bytes += (uint64_t)written;
+    return written;
 }
 
 /* Map a failed write to a filter status. */

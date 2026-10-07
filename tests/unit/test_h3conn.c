@@ -411,3 +411,45 @@ TEST(test_h3conn_refusal_stops_the_upload) {
     stream_free(qs);
     h3conn_free(c);
 }
+
+static uint64_t h3_timeout_ms;
+static uint64_t h3_timeout_clock(void) { return h3_timeout_ms; }
+
+TEST(test_h3conn_timeout_stream_isolation) {
+    TEST_SUITE("h3conn");
+    h3conn_t* c = h3conn_create(NULL, 65536, 0);
+    quicstream_t* stalled = request_stream(0);
+    quicstream_t* active = request_stream(1);
+    TEST_REQUIRE(c && stalled && active, "driver and streams allocated");
+    h3_timeout_ms = 100000;
+    timeout_set_clock(h3_timeout_clock);
+    uint8_t req[256];
+    size_t n = get_request(req, sizeof req);
+    deliver(stalled, 0, req, n, 0);
+    TEST_ASSERT(h3conn_stream_read(c, NULL, stalled).status == H3CONN_REQUEST_HEADERS, "headers received, waiting for FIN");
+    h3stream_t* st = h3conn_request_of(stalled);
+    TEST_ASSERT(st && st->headers_done, "request body phase entered");
+    if (st) {
+        st->timeout_policy.enforce = 1;
+        st->timeout_policy.request_body_idle_timeout_ms = 10;
+    }
+    h3_timeout_ms += 5;
+    deliver(active, 0, req, n, 0);
+    h3conn_stream_read(c, NULL, active);
+    h3stream_t* live = h3conn_request_of(active);
+    if (live) {
+        live->timeout_policy.enforce = 1;
+        live->timeout_policy.request_body_idle_timeout_ms = 10;
+    }
+    quicconn_t qc = {0};
+    qc.streams = stalled;
+    stalled->next = active;
+    h3_timeout_ms += 5;
+    h3conn_timeout_tick(c, &qc);
+    TEST_ASSERT(stalled->send_reset_pending && stalled->send_stop_sending_pending, "expired stream reset in both directions");
+    TEST_ASSERT(h3conn_request_of(stalled) == NULL && stalled->app_done(stalled->app), "partial request resources released immediately");
+    TEST_ASSERT(h3conn_request_of(active) == live && !active->send_reset_pending, "active sibling survives");
+    stalled->next = NULL;
+    timeout_set_clock(NULL);
+    stream_free(stalled); stream_free(active); h3conn_free(c);
+}

@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "timeouts.h"
 
 #include "h3error.h"
 #include "h3frame.h"
@@ -105,6 +106,13 @@ uint64_t h3stream_status_error(h3stream_status_e st);
 struct httpresponse;
 
 typedef struct h3stream {
+    timeout_policy_t timeout_policy;
+    uint64_t header_started_ms;
+    uint64_t body_started_ms;
+    uint64_t body_progress_ms;
+    uint64_t response_progress_ms;
+    uint64_t response_sent_offset;
+    unsigned timeout_reported;
     h3frame_parser_t parser;
     httprequest_t*   request;
     /* Set when the request is dispatched, so the write filter can find its way

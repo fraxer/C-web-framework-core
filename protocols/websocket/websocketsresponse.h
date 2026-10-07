@@ -119,6 +119,7 @@ void websocketsresponse_default(websocketsresponse_t* response, const char* text
  * @param length Payload length
  */
 void websocketsresponse_pong(websocketsresponse_t* response, const char* data, size_t length);
+void websocketsresponse_ping(websocketsresponse_t* response, const char* data, size_t length);
 
 /**
  * Send CLOSE control frame to initiate connection close.
