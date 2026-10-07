@@ -100,6 +100,9 @@ static int h2_ws_queue_now(h2_ws_tunnel_t* tunnel, websocketsresponse_t* respons
 
     slot->response = &response->base;
 
+    if (h2_ws_tunnel_has_output(tunnel))
+        websocketsparser_send_ready(tunnel->parser, timeout_now_ms());
+
     return 1;
 }
 
@@ -133,6 +136,10 @@ static int h2_ws_wake(connection_t* connection, void* owner, int handler_done) {
     h2_ws_tunnel_t* tunnel = owner;
 
     int released = 0;
+
+    /* Before a release below: `tunnel` is gone after it. */
+    if (tunnel != NULL && h2_ws_tunnel_has_output(tunnel))
+        websocketsparser_send_ready(tunnel->parser, timeout_now_ms());
 
     if (handler_done && tunnel != NULL) {
         const int left = atomic_fetch_sub(&tunnel->inflight, 1) - 1;
@@ -192,7 +199,10 @@ h2_data_status_e h2_ws_tunnel_write(h2session_t* s, h2stream_t* stream) {
             if (ready) cqueue_pop(tunnel->out);
             cqueue_unlock(tunnel->out);
 
-            if (!ready) return H2_DATA_DRAINED;
+            if (!ready) {
+                websocketsparser_send_drained(tunnel->parser);
+                return H2_DATA_DRAINED;
+            }
 
             tunnel->writing = (websocketsresponse_t*)slot->response;
             free(slot);
@@ -414,7 +424,6 @@ int h2_ws_tunnel_tick(h2_ws_tunnel_t* tunnel, uint64_t now) {
         if (!response) return 0;
         p->ping_sequence++;
         p->ping_queued = 1;
-        p->send_progress_ms = now;
         websocketsresponse_ping(response, (const char*)&p->ping_sequence, sizeof p->ping_sequence);
         return h2_ws_queue_now(tunnel, response);
     }

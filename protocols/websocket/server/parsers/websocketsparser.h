@@ -122,5 +122,7 @@ void websocketsparser_ping_sent(websocketsparser_t* parser);
 void websocketsparser_pong(websocketsparser_t* parser, const char* payload, size_t length);
 void websocketsparser_message_done(websocketsparser_t* parser);
 const char* websocketsparser_timeout(websocketsparser_t* parser, uint64_t now, int sending);
+void websocketsparser_send_ready(websocketsparser_t* parser, uint64_t now);
+void websocketsparser_send_drained(websocketsparser_t* parser);
 
 #endif

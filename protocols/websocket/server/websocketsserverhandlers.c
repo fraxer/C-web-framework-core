@@ -70,6 +70,12 @@ static int __pending_output(connection_server_ctx_t* ctx) {
     return ready;
 }
 
+/* Output just became writable: start the send clock (see
+ * websocketsparser_send_ready). Caller holds connection_s_lock. */
+static void __send_ready(connection_server_ctx_t* ctx) {
+    if (ctx->parser != NULL) websocketsparser_send_ready(ctx->parser, timeout_now_ms());
+}
+
 static int __timeout_check(connection_t* connection, uint64_t now) {
     connection_server_ctx_t* ctx = connection->ctx;
     websocketsparser_t* p = ctx->parser;
@@ -103,7 +109,6 @@ void websockets_server_tick(connection_t* connection) {
         if (response == NULL) { connection_close_locked(connection); return; }
         p->ping_sequence++;
         p->ping_queued = 1;
-        p->send_progress_ms = now;
         websocketsresponse_ping(response, (const char*)&p->ping_sequence, sizeof p->ping_sequence);
         if (!__post_response(response)) { connection_close_locked(connection); return; }
         connection_after_read(connection);
@@ -271,6 +276,7 @@ int __out_publish(connection_t* connection, connection_out_slot_t* slot, websock
      * parks the connection -- nothing armed -- so the promote below finds the
      * stage busy and the arm has to come from here, or neither goes out. */
     if (__out_promote(connection) || ctx->response != NULL) {
+        __send_ready(ctx);
         atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
         r = connection_after_read(connection);
     }
@@ -311,6 +317,7 @@ static int __out_publish_new(websocketsresponse_t* response, cqueue_t* out_queue
     if (out_queue != NULL)
         r = out_wake != NULL ? out_wake(connection, out_owner, handler_done) : 1;
     else if (__out_promote(connection) || ctx->response != NULL) {   /* see __out_publish */
+        __send_ready(ctx);
         atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
         r = connection_after_read(connection);
     }
@@ -545,6 +552,10 @@ int __write(connection_t* connection) {
             break;
     }
 
+    /* Nothing writable is left: whatever comes next starts its own clock. */
+    if (ctx->parser != NULL && !__pending_output(ctx))
+        websocketsparser_send_drained(ctx->parser);
+
     /* The connection is closing, but our CLOSE has not left: it waits behind
      * a reply whose handler is still running. Ending the connection now would
      * drop both; the handler that fills the head asks for EPOLLOUT again. */
@@ -754,6 +765,13 @@ void __queue_data_request_free(void* arg) {
  * frame carrying the status code and stop reading the (now desynced) stream.
  * Replying with a text frame kept the connection parsing garbage. */
 int __post_close_default(connection_t* connection, unsigned short status_code, const char* reason) {
+    /* Every Close this side starts runs the close clock -- a protocol error's
+     * as much as a timeout's. It may sit behind a handler that never returns,
+     * where the send clock does not look, and nothing else would end it. */
+    websocketsparser_t* parser = ((connection_server_ctx_t*)connection->ctx)->parser;
+    if (parser != NULL && !parser->close_started_ms)
+        parser->close_started_ms = timeout_now_ms();
+
     websocketsresponse_t* response = websocketsresponse_create(connection);
     if (response == NULL) return 0;
 
@@ -800,6 +818,7 @@ int __post_response(websocketsresponse_t* response) {
     if (!__out_promote(connection))
         return 1; /* queued behind a handler that has not replied yet */
 
+    __send_ready(ctx);
     atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
 
     return connection_after_read(connection);

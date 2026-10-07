@@ -756,11 +756,23 @@ const char* websocketsparser_timeout(websocketsparser_t* p, uint64_t now, int se
     if (timeout_expired(recv_now, p->message_started_ms, policy->ws_message_total_timeout_ms)) return "message_total";
     if (timeout_expired(recv_now, p->application_progress_ms, policy->ws_application_idle_timeout_ms)) return "application_idle";
     if (sending) {
-        if (!p->send_progress_ms) p->send_progress_ms = now;
+        websocketsparser_send_ready(p, now);
         if (timeout_expired(now, p->send_progress_ms, policy->ws_send_idle_timeout_ms)) return "send_idle";
-    } else {
-        p->send_progress_ms = 0;
-        timeout_event_clear(&p->timeout_reported, "send_idle");
-    }
+    } else websocketsparser_send_drained(p);
     return NULL;
+}
+
+/* The send clock runs only while writable output waits on the peer. It has to
+ * stop the moment that output drains, not when a watchdog next happens to look:
+ * a stamp left over from the previous reply put a reply queued later straight
+ * past its deadline. Starting it is idempotent -- a frame already waiting keeps
+ * its own clock. The watchdog still starts it lazily for output that became
+ * writable without a publish (a handler that finished with no reply). */
+void websocketsparser_send_ready(websocketsparser_t* p, uint64_t now) {
+    if (!p->send_progress_ms) p->send_progress_ms = now;
+}
+
+void websocketsparser_send_drained(websocketsparser_t* p) {
+    p->send_progress_ms = 0;
+    timeout_event_clear(&p->timeout_reported, "send_idle");
 }
