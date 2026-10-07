@@ -1117,7 +1117,7 @@ void httprequest_slow_tick(httprequest_t* r, const timeout_policy_t* p, const ch
                     ? "handler"
                     : "send";
 
-    timeout_record(protocol, "slow", 0);
+    timeout_record(protocol, "slow");
 
     log_info("slow_request protocol=%s phase=%s age_ms=%llu\n", protocol, phase, (unsigned long long)(now - r->started_ms));
 }

@@ -1730,18 +1730,17 @@ static h2_frame_result_e h2_on_continuation(h2session_t* s, const h2_frame_t* fr
     return h2_on_header_block(s, s->cont_stream_id, s->cont, s->cont_len, s->cont_end_stream);
 }
 
-static int h2_body_expired(h2session_t* s, h2stream_t* stream, uint64_t now, int* enforce) {
+/* An implicit body idle budget falls back to main.env.http2_request_timeout_sec,
+ * the one HTTP/2 request timeout that predates the timeouts policy. */
+static int h2_body_expired(h2session_t* s, h2stream_t* stream, uint64_t now) {
     const timeout_policy_t* p = &stream->timeout_policy;
     connection_server_ctx_t* ctx = s->connection->ctx;
     const uint32_t idle_budget = (p->explicit_fields & TIMEOUT_EXPLICIT(request_body_idle_timeout_ms)) ? p->request_body_idle_timeout_ms :
         (ctx && ctx->server ? p->legacy_h2_timeout_ms : h2_request_timeout_sec * 1000u);
-    const int idle_enforce = (p->explicit_fields & TIMEOUT_EXPLICIT(request_body_idle_timeout_ms)) ? p->enforce : 1;
     const int idle = timeout_expired(now, stream->request_progress_ms, idle_budget);
     const int total = timeout_expired(now, stream->body_started_ms, p->request_body_total_timeout_ms);
     if (!idle && !total) return 0;
-    *enforce = (idle && idle_enforce) || (total && p->enforce);
-    const char* reason = total && (!idle || (!idle_enforce && p->enforce)) ? "body_total" : "body_idle";
-    timeout_report(&stream->timeout_reported, "h2", reason, *enforce, s->connection->fd, stream->id);
+    timeout_report(&stream->timeout_reported, "h2", idle ? "body_idle" : "body_total", s->connection->fd, stream->id);
     return 1;
 }
 
@@ -1780,8 +1779,7 @@ static h2_frame_result_e h2_on_data(h2session_t* s, const h2_frame_t* frame) {
     if (state != H2_STREAM_OPEN || stream == NULL)
         return h2_stream_error(s, frame->stream_id, H2_ERR_STREAM_CLOSED);
 
-    int body_enforce;
-    if (!stream->ws && h2_body_expired(s, stream, h2_now_ms(), &body_enforce) && body_enforce)
+    if (!stream->ws && h2_body_expired(s, stream, h2_now_ms()))
         return h2_stream_error(s, frame->stream_id, H2_ERR_CANCEL);
 
     const uint8_t* data = frame->payload;
@@ -1943,24 +1941,23 @@ static timeout_policy_t h2_receive_policy(h2session_t* s) {
     return policy;
 }
 
-static void h2_header_policy(h2session_t* s, uint32_t* budget, int* enforce) {
+/* Same legacy fallback as h2_body_expired for an implicit header budget. */
+static uint32_t h2_header_budget(h2session_t* s) {
     connection_server_ctx_t* ctx = s->connection->ctx;
     timeout_policy_t policy = h2_receive_policy(s);
-    const int explicit = (policy.explicit_fields & TIMEOUT_EXPLICIT(request_header_timeout_ms)) != 0;
-    *budget = explicit ? policy.request_header_timeout_ms :
-        (ctx && ctx->server ? policy.legacy_h2_timeout_ms : h2_request_timeout_sec * 1000u);
-    *enforce = explicit ? policy.enforce : 1;
+    if (policy.explicit_fields & TIMEOUT_EXPLICIT(request_header_timeout_ms))
+        return policy.request_header_timeout_ms;
+    return ctx && ctx->server ? policy.legacy_h2_timeout_ms : h2_request_timeout_sec * 1000u;
 }
 
-static int h2_header_expired(h2session_t* s, uint64_t now, int* enforce) {
-    uint32_t budget;
-    h2_header_policy(s, &budget, enforce);
+static int h2_header_expired(h2session_t* s, uint64_t now) {
+    const uint32_t budget = h2_header_budget(s);
     if (s->header_started_ms && !s->header_slow_reported &&
         !h2stream_find(s, s->cont_active ? s->cont_stream_id : s->frame.stream_id)) {
         timeout_policy_t policy = h2_receive_policy(s);
         if (timeout_expired(now, s->header_started_ms, policy.slow_request_threshold_ms)) {
             s->header_slow_reported = 1;
-            timeout_record("h2", "slow", 0);
+            timeout_record("h2", "slow");
             log_info("slow_request protocol=h2 phase=headers age_ms=%llu\n",
                      (unsigned long long)(now - s->header_started_ms));
         }
@@ -1970,7 +1967,7 @@ static int h2_header_expired(h2session_t* s, uint64_t now, int* enforce) {
     const uint64_t start = s->header_started_ms ? s->header_started_ms :
         s->frame.stage != H2FRAME_STAGE_PAYLOAD ? s->frame_started_ms : 0;
     if (!timeout_expired(now, start, budget)) return 0;
-    timeout_report(&s->header_timeout_reported, "h2", "headers", *enforce, s->connection->fd, 0);
+    timeout_report(&s->header_timeout_reported, "h2", "headers", s->connection->fd, 0);
     return 1;
 }
 
@@ -1987,9 +1984,8 @@ static int h2_check_partial_body(h2session_t* s, uint64_t now) {
     if (s->frame.stage != H2FRAME_STAGE_PAYLOAD || s->frame.type != H2_FRAME_DATA || s->data_discard)
         return 1;
     h2stream_t* stream = h2stream_find(s, s->frame.stream_id);
-    int enforce;
     if (stream && !stream->ws && !stream->rejected && stream->state == H2_STREAM_OPEN &&
-        h2_body_expired(s, stream, now, &enforce) && enforce) {
+        h2_body_expired(s, stream, now)) {
         s->data_discard = 1;
         return h2_stream_error(s, stream->id, H2_ERR_CANCEL) == H2_FRAME_OK;
     }
@@ -2002,10 +1998,9 @@ static int h2_process_buffer(h2session_t* s) {
     int result = 1;
 
     while (p < end) {
-        int enforce;
         /* Late bytes must not finish an already expired partial frame/block
          * between timer ticks. */
-        if (h2_header_expired(s, timeout_now_ms(), &enforce) && enforce)
+        if (h2_header_expired(s, timeout_now_ms()))
             return h2_fail(s, H2_ERR_ENHANCE_YOUR_CALM);
         if (!s->frame_started_ms) s->frame_started_ms = timeout_now_ms();
         if (!h2_check_partial_body(s, timeout_now_ms())) return h2_fail(s, s->error_code);
@@ -2031,7 +2026,7 @@ static int h2_process_buffer(h2session_t* s) {
                 stream->request_progress_ms = timeout_now_ms();
         }
         if ((!classified || s->header_started_ms) &&
-            h2_header_expired(s, timeout_now_ms(), &enforce) && enforce)
+            h2_header_expired(s, timeout_now_ms()))
             return h2_fail(s, H2_ERR_ENHANCE_YOUR_CALM);
 
         if (st == H2PARSE_CONTINUE) {
@@ -2843,14 +2838,11 @@ void h2_server_tick(connection_t* connection, int shutdown_now) {
      * keep a stalled upload alive forever. Bound incomplete field blocks by a
      * deadline and body reads by their own inactivity clock. Tunnels and queued
      * handlers have separate lifetimes and are not upload timeouts. */
-    int header_enforce;
-    if (h2_header_expired(s, now, &header_enforce)) {
-        if (header_enforce) {
-            h2_queue_goaway(s, H2_ERR_ENHANCE_YOUR_CALM);
-            (void)h2_flush_out(s);
-            connection_close_locked(connection);
-            return;
-        }
+    if (h2_header_expired(s, now)) {
+        h2_queue_goaway(s, H2_ERR_ENHANCE_YOUR_CALM);
+        (void)h2_flush_out(s);
+        connection_close_locked(connection);
+        return;
     }
     int expired = 0;
     for (h2stream_t* stream = s->streams; stream != NULL;) {
@@ -2860,22 +2852,7 @@ void h2_server_tick(connection_t* connection, int shutdown_now) {
         if (!stream->ws && stream->response && atomic_load_explicit(&stream->response_ready, memory_order_acquire)) {
             if (!stream->response_progress_ms) stream->response_progress_ms = now;
             if (timeout_expired(now, stream->response_progress_ms, p->response_send_idle_timeout_ms)) {
-                timeout_report(&stream->timeout_reported, "h2", "send_idle", p->enforce, connection->fd, stream->id);
-                if (p->enforce) {
-                    if (h2_stream_error(s, stream->id, H2_ERR_CANCEL) != H2_FRAME_OK) {
-                        connection_close_locked(connection);
-                        return;
-                    }
-                    expired = 1;
-                    stream = next;
-                    continue;
-                }
-            }
-        }
-        if (stream->ws && stream->response != NULL &&
-            timeout_expired(now, stream->body_started_ms, p->ws_handshake_timeout_ms)) {
-            timeout_report(&stream->timeout_reported, "h2_ws", "handshake", p->enforce, connection->fd, stream->id);
-            if (p->enforce) {
+                timeout_report(&stream->timeout_reported, "h2", "send_idle", connection->fd, stream->id);
                 if (h2_stream_error(s, stream->id, H2_ERR_CANCEL) != H2_FRAME_OK) {
                     connection_close_locked(connection);
                     return;
@@ -2884,6 +2861,17 @@ void h2_server_tick(connection_t* connection, int shutdown_now) {
                 stream = next;
                 continue;
             }
+        }
+        if (stream->ws && stream->response != NULL &&
+            timeout_expired(now, stream->body_started_ms, p->ws_handshake_timeout_ms)) {
+            timeout_report(&stream->timeout_reported, "h2_ws", "handshake", connection->fd, stream->id);
+            if (h2_stream_error(s, stream->id, H2_ERR_CANCEL) != H2_FRAME_OK) {
+                connection_close_locked(connection);
+                return;
+            }
+            expired = 1;
+            stream = next;
+            continue;
         }
         if (stream->ws != NULL && stream->response == NULL && !h2_ws_tunnel_tick(stream->ws, now)) {
             if (h2_stream_error(s, stream->id, H2_ERR_CANCEL) != H2_FRAME_OK) {
@@ -2894,20 +2882,17 @@ void h2_server_tick(connection_t* connection, int shutdown_now) {
             stream = next;
             continue;
         }
-        int body_enforce;
         if (stream->state == H2_STREAM_OPEN && !stream->rejected && stream->ws == NULL &&
-            h2_body_expired(s, stream, now, &body_enforce)) {
-            if (body_enforce) {
-                if (s->frame.stage == H2FRAME_STAGE_PAYLOAD && s->frame.type == H2_FRAME_DATA &&
-                    s->frame.stream_id == stream->id) s->data_discard = 1;
-                if (s->cont_active && s->cont_stream_id == stream->id)
-                    s->cont_reject_error = H2_ERR_STREAM_CLOSED;
-                if (h2_stream_error(s, stream->id, H2_ERR_CANCEL) != H2_FRAME_OK) {
-                    connection_close_locked(connection);
-                    return;
-                }
-                expired = 1;
+            h2_body_expired(s, stream, now)) {
+            if (s->frame.stage == H2FRAME_STAGE_PAYLOAD && s->frame.type == H2_FRAME_DATA &&
+                s->frame.stream_id == stream->id) s->data_discard = 1;
+            if (s->cont_active && s->cont_stream_id == stream->id)
+                s->cont_reject_error = H2_ERR_STREAM_CLOSED;
+            if (h2_stream_error(s, stream->id, H2_ERR_CANCEL) != H2_FRAME_OK) {
+                connection_close_locked(connection);
+                return;
             }
+            expired = 1;
         }
         stream = next;
     }

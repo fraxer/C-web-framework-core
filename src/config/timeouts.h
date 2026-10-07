@@ -34,7 +34,6 @@ typedef struct timeout_policy {
 #undef TIMEOUT_MEMBER
     uint64_t explicit_fields;
     uint32_t legacy_h2_timeout_ms;
-    int enforce;
 } timeout_policy_t;
 
 void timeout_policy_defaults(timeout_policy_t* policy);
@@ -51,11 +50,13 @@ void timeout_set_clock(uint64_t (*clock_ms)(void));
 int timeout_expired(uint64_t now, uint64_t start, uint32_t budget);
 const char* timeout_request_reason(uint64_t now, uint64_t headers, uint64_t body,
                                    uint64_t progress, const timeout_policy_t* policy);
-unsigned timeout_event_bit(const char* reason, int enforce);
+unsigned timeout_event_bit(const char* reason);
 void timeout_event_clear(unsigned* reported, const char* reason);
+/* Log and count an expiry once per episode (the bit in *reported). Every
+ * timeout terminates what it bounds; the caller does that, this only records. */
 int timeout_report(unsigned* reported, const char* protocol, const char* reason,
-                   int enforce, int fd, uint64_t stream_id);
-void timeout_record(const char* protocol, const char* reason, int enforce);
+                   int fd, uint64_t stream_id);
+void timeout_record(const char* protocol, const char* reason);
 void timeout_duration_record(unsigned stage, uint64_t duration_ms);
 json_token_t* timeout_metrics_json(void);
 void timeout_metrics_reset(void);

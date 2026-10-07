@@ -73,8 +73,8 @@ static int __timeout_check(connection_t* connection, uint64_t now) {
     connection_server_ctx_t* ctx = connection->ctx;
     websocketsparser_t* p = ctx->parser;
     const char* reason = websocketsparser_timeout(p, now, __pending_output(ctx) || p->ping_queued);
-    timeout_report(&p->timeout_reported, "websocket", reason, p->timeout_policy.enforce, connection->fd, 0);
-    if (reason && p->timeout_policy.enforce) {
+    timeout_report(&p->timeout_reported, "websocket", reason, connection->fd, 0);
+    if (reason) {
         if (p->close_started_ms || p->frame_started_ms || !strcmp(reason, "send_idle")) {
             return 0;
         }

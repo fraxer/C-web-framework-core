@@ -142,7 +142,6 @@ TEST(test_h2session_late_partial_frame) {
     timeout_policy_defaults(&server.timeouts);
     server.timeouts.request_header_timeout_ms = 10;
     server.timeouts.explicit_fields = 1;
-    server.timeouts.enforce = 1;
     ctx.server = &server;
     connection_t connection = { .fd = -1, .ctx = &ctx };
     h2session_t* s = h2_test_session_create(&connection);
@@ -182,12 +181,12 @@ TEST(test_h2session_configured_timeout_isolation) {
     active->body_started_ms = active->request_progress_ms = timeout_test_ms + 5;
     s->last_activity_ms = timeout_test_ms;
     timeout_test_ms += 10;
+    timeout_metrics_reset();
     h2_server_tick(&connection, 0);
-    TEST_ASSERT(h2stream_find(s, 1) == stalled, "observe does not cancel expired stream");
-    TEST_ASSERT(stalled->timeout_reported & timeout_event_bit("body_idle", 0), "observe records stalled body");
-    stalled->timeout_policy.enforce = active->timeout_policy.enforce = 1;
-    h2_server_tick(&connection, 0);
-    TEST_ASSERT(h2stream_find(s, 1) == NULL && h2stream_find(s, 3) == active, "enforce cancels only expired stream");
+    TEST_ASSERT(h2stream_find(s, 1) == NULL && h2stream_find(s, 3) == active, "only the expired stream is cancelled");
+    json_token_t* m = timeout_metrics_json();
+    TEST_ASSERT(json_llong(json_object_get(json_object_get(m, "h2"), "body_idle"), NULL) == 1, "stalled body recorded once");
+    json_token_free_tree(m);
     uint8_t wire[64];
     ssize_t n = recv(fd[1], wire, sizeof wire, 0);
     TEST_ASSERT(n == 13 && wire[3] == H2_FRAME_RST_STREAM && wire[8] == 1 && wire[12] == 8, "RST_STREAM(CANCEL) is emitted");
@@ -198,13 +197,12 @@ TEST(test_h2session_configured_timeout_isolation) {
 
 TEST(test_h2session_data_header_budget) {
     TEST_SUITE("h2session");
-    for (int enforce = 0; enforce < 2; enforce++) {
+    {
         server_t server = {0};
         timeout_policy_defaults(&server.timeouts);
         server.timeouts.request_header_timeout_ms = 10;
         server.timeouts.request_body_idle_timeout_ms = 1000;
         server.timeouts.explicit_fields = 3;
-        server.timeouts.enforce = enforce;
         connection_server_ctx_t ctx = { .server = &server };
         connection_t c = { .fd = -1, .ctx = &ctx };
         h2session_t* s = h2_test_session_create(&c);
@@ -233,12 +231,11 @@ TEST(test_h2session_data_header_budget) {
 TEST(test_h2session_absolute_header_block) {
     TEST_SUITE("h2session");
     const unsigned elapsed[] = {9, 10, 18};
-    for (unsigned boundary = 0; boundary < 3; boundary++) for (int enforce = 0; enforce < 2; enforce++) {
+    for (unsigned boundary = 0; boundary < 3; boundary++) {
         server_t server = {0};
         timeout_policy_defaults(&server.timeouts);
         server.timeouts.request_header_timeout_ms = 10;
         server.timeouts.explicit_fields = 1;
-        server.timeouts.enforce = enforce;
         connection_server_ctx_t ctx = { .server = &server };
         connection_t c = { .fd = -1, .ctx = &ctx };
         h2session_t* s = h2_test_session_create(&c);
@@ -257,12 +254,10 @@ TEST(test_h2session_absolute_header_block) {
         timeout_test_ms = 100000 + elapsed[boundary];
         const uint8_t rest[] = {0x86,0x84};
         int accepted = feed_frame(s, H2_FRAME_CONTINUATION, H2_FLAG_END_HEADERS, 1, rest, sizeof rest);
-        TEST_ASSERT(accepted == (!enforce || elapsed[boundary] < 10), "continuation cannot restart absolute budget");
-        if (!enforce) {
-            json_token_t* m = timeout_metrics_json();
-            TEST_ASSERT(json_llong(json_object_get(json_object_get(json_object_get(m, "h2"), "headers"), "observe"), NULL) == (elapsed[boundary] >= 10), "observe reports one expired block at the exact boundary");
-            json_token_free_tree(m);
-        }
+        TEST_ASSERT(accepted == (elapsed[boundary] < 10), "continuation cannot restart absolute budget");
+        json_token_t* m = timeout_metrics_json();
+        TEST_ASSERT(json_llong(json_object_get(json_object_get(m, "h2"), "headers"), NULL) == (elapsed[boundary] >= 10), "one expired block reported at the exact boundary");
+        json_token_free_tree(m);
         timeout_set_clock(NULL);
         h2_session_free(s);
     }
@@ -270,7 +265,7 @@ TEST(test_h2session_absolute_header_block) {
 
 TEST(test_h2session_partial_data_progress_and_cancel) {
     TEST_SUITE("h2session");
-    for (int padded = 0; padded < 2; padded++) for (int enforce = 0; enforce < 2; enforce++) {
+    for (int padded = 0; padded < 2; padded++) {
         connection_server_ctx_t ctx = {0};
         connection_t c = { .fd = -1, .ctx = &ctx };
         h2session_t* s = h2_test_session_create(&c);
@@ -286,7 +281,6 @@ TEST(test_h2session_partial_data_progress_and_cancel) {
             stalled->timeout_policy.request_body_idle_timeout_ms = 10;
             stalled->timeout_policy.request_body_total_timeout_ms = 0;
             stalled->timeout_policy.explicit_fields = TIMEOUT_EXPLICIT(request_body_idle_timeout_ms);
-            stalled->timeout_policy.enforce = enforce;
             stalled->body_started_ms = stalled->request_progress_ms = timeout_test_ms;
             stalled->recv.avail = neighbor->recv.avail = H2_DEFAULT_WINDOW;
             uint8_t payload[] = {2,'a','b','c',0,0};
@@ -303,11 +297,11 @@ TEST(test_h2session_partial_data_progress_and_cancel) {
                 TEST_ASSERT(h2_session_feed(s, wire + 13, 1), "padding read before expiry");
                 timeout_test_ms += 1;
                 TEST_ASSERT(h2_session_feed(s, wire + 14, n - 14), "expired DATA drained to frame boundary");
-                TEST_ASSERT((h2stream_find(s, 1) == NULL) == enforce, "padding cannot extend body idle");
+                TEST_ASSERT(h2stream_find(s, 1) == NULL, "padding cannot extend body idle");
             } else {
                 timeout_test_ms += 10;
                 TEST_ASSERT(h2_session_feed(s, wire + 13, n - 13), "late body fragment drained");
-                TEST_ASSERT((h2stream_find(s, 1) == NULL) == enforce, "late payload cannot revive expired body");
+                TEST_ASSERT(h2stream_find(s, 1) == NULL, "late payload cannot revive expired body");
             }
             const uint8_t data[] = {'z'};
             TEST_ASSERT(feed_frame(s, H2_FRAME_DATA, 0, 3, data, sizeof data), "neighbor frame accepted after draining");
@@ -353,7 +347,7 @@ TEST(test_h2session_header_receive_timing) {
     n = h2frame_encode(wire, sizeof wire, H2_FRAME_CONTINUATION, H2_FLAG_END_HEADERS, 1, NULL, 0);
     TEST_ASSERT(h2_session_feed(s, wire, 1), "partial CONTINUATION accepted");
     json_token_t* metrics = timeout_metrics_json();
-    TEST_ASSERT(json_llong(json_object_get(json_object_get(json_object_get(metrics, "h2"), "slow"), "observe"), NULL) == 1,
+    TEST_ASSERT(json_llong(json_object_get(json_object_get(metrics, "h2"), "slow"), NULL) == 1,
                 "live slow event during headers");
     json_token_free_tree(metrics);
     TEST_ASSERT(h2_session_feed(s, wire + 1, n - 1), "block completes");
@@ -364,7 +358,7 @@ TEST(test_h2session_header_receive_timing) {
         httprequest_slow_tick(stream->request, &stream->timeout_policy, "h2", timeout_test_ms);
         httprequest_timing_finish(stream->request);
         metrics = timeout_metrics_json();
-        TEST_ASSERT(json_llong(json_object_get(json_object_get(json_object_get(metrics, "h2"), "slow"), "observe"), NULL) == 1,
+        TEST_ASSERT(json_llong(json_object_get(json_object_get(metrics, "h2"), "slow"), NULL) == 1,
                     "header slow event transferred without duplication");
         TEST_ASSERT(json_llong(json_object_get(json_object_get(json_object_get(metrics, "durations_ms"), "headers"), "sum_ms"), NULL) == 18,
                     "completion header metric includes receive time");
@@ -436,10 +430,9 @@ TEST(test_h2session_websocket_heartbeat_lifecycle) {
                 TEST_ASSERT(!websocketsparser_timeout(p, timeout_test_ms, h2_ws_tunnel_has_output(t) || p->ping_queued),
                             "sent Ping waits for Pong budget");
                 TEST_ASSERT(h2_ws_tunnel_tick(t, timeout_test_ms) && !h2_ws_tunnel_has_output(t), "no duplicate Ping");
-                p->timeout_policy.enforce = 1;
                 timeout_test_ms += 2900;
                 websocketsparser_pong(p, (char*)&p->ping_sequence, sizeof p->ping_sequence);
-                TEST_ASSERT(p->ping_sent_ms != 0, "Pong at deadline cannot revive enforce probe");
+                TEST_ASSERT(p->ping_sent_ms != 0, "Pong at deadline cannot revive the probe");
                 TEST_ASSERT(h2_ws_tunnel_tick(t, timeout_test_ms), "timeout queues Close");
                 stream->write_credit = H2_DEFAULT_WINDOW;
                 TEST_ASSERT(h2_ws_tunnel_write(s, stream) == H2_DATA_DRAINED, "Close written");

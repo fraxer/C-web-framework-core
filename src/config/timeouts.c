@@ -6,41 +6,42 @@
 #include <stdatomic.h>
 
 static const char* const protocols[] = { "http1", "h2", "h3", "websocket", "h2_ws" };
-static const char* const reasons[] = { "headers", "body_idle", "body_total", "body", "tls_handshake", "idle", "send_idle", "pong", "message_idle", "message_total", "application_idle", "close", "handshake", "slow" };
+static const char* const reasons[] = { "headers", "body_idle", "body_total", "tls_handshake", "idle", "send_idle", "pong", "message_idle", "message_total", "application_idle", "close", "handshake", "slow" };
 static const char* const stages[] = { "headers", "body", "queue", "handler", "send", "total" };
-static atomic_uint_fast64_t counts[5][14][2];
+#define REASON_COUNT (sizeof reasons / sizeof reasons[0])
+static atomic_uint_fast64_t counts[5][REASON_COUNT];
 static atomic_uint_fast64_t duration_count[6], duration_sum[6], duration_hist[6][8];
 static const uint64_t duration_bounds[] = { 1, 10, 100, 1000, 10000, 60000, 600000 };
 
-unsigned timeout_event_bit(const char* reason, int enforce) {
-    for (unsigned r = 0; r < sizeof reasons / sizeof reasons[0]; r++)
-        if (!strcmp(reasons[r], reason)) return 1u << (r * 2 + !!enforce);
+unsigned timeout_event_bit(const char* reason) {
+    for (unsigned r = 0; r < REASON_COUNT; r++)
+        if (!strcmp(reasons[r], reason)) return 1u << r;
     return 0;
 }
 
 void timeout_event_clear(unsigned* reported, const char* reason) {
-    *reported &= ~(timeout_event_bit(reason, 0) | timeout_event_bit(reason, 1));
+    *reported &= ~timeout_event_bit(reason);
 }
 
 int timeout_report(unsigned* reported, const char* protocol, const char* reason,
-                   int enforce, int fd, uint64_t stream_id) {
+                   int fd, uint64_t stream_id) {
     if (!reason) return 0;
-    const unsigned bit = timeout_event_bit(reason, enforce);
+    const unsigned bit = timeout_event_bit(reason);
     if (*reported & bit) return 0;
     *reported |= bit;
-    timeout_record(protocol, reason, enforce);
+    timeout_record(protocol, reason);
     const int websocket = !strcmp(protocol, "websocket") || !strcmp(protocol, "h2_ws");
-    log_info("%s protocol=%s reason=%s mode=%s fd=%d stream=%llu\n",
+    log_info("%s protocol=%s reason=%s fd=%d stream=%llu\n",
         websocket ? "websocket_timeout" : "request_timeout", protocol, reason,
-        enforce ? "enforce" : "observe", fd, (unsigned long long)stream_id);
+        fd, (unsigned long long)stream_id);
     return 1;
 }
 
-void timeout_record(const char* protocol, const char* reason, int enforce) {
+void timeout_record(const char* protocol, const char* reason) {
     size_t p, r;
     for (p = 0; p < 5; p++) if (!strcmp(protocols[p], protocol)) break;
-    for (r = 0; r < 14; r++) if (!strcmp(reasons[r], reason)) break;
-    if (p < 5 && r < 14) atomic_fetch_add_explicit(&counts[p][r][!!enforce], 1, memory_order_relaxed);
+    for (r = 0; r < REASON_COUNT; r++) if (!strcmp(reasons[r], reason)) break;
+    if (p < 5 && r < REASON_COUNT) atomic_fetch_add_explicit(&counts[p][r], 1, memory_order_relaxed);
 }
 
 void timeout_duration_record(unsigned stage, uint64_t ms) {
@@ -53,7 +54,7 @@ void timeout_duration_record(unsigned stage, uint64_t ms) {
 }
 
 void timeout_metrics_reset(void) {
-    for (unsigned p = 0; p < 5; p++) for (unsigned r = 0; r < 14; r++) for (unsigned m = 0; m < 2; m++) atomic_store(&counts[p][r][m], 0);
+    for (unsigned p = 0; p < 5; p++) for (unsigned r = 0; r < REASON_COUNT; r++) atomic_store(&counts[p][r], 0);
     for (unsigned s = 0; s < 6; s++) {
         atomic_store(&duration_count[s], 0); atomic_store(&duration_sum[s], 0);
         for (unsigned b = 0; b < 8; b++) atomic_store(&duration_hist[s][b], 0);
@@ -65,12 +66,8 @@ json_token_t* timeout_metrics_json(void) {
     if (!root) return NULL;
     for (unsigned p = 0; p < 5; p++) {
         json_token_t* events = json_create_object();
-        for (unsigned r = 0; r < 14; r++) {
-            json_token_t* modes = json_create_object();
-            json_object_set(modes, "observe", json_create_number(atomic_load(&counts[p][r][0])));
-            json_object_set(modes, "enforce", json_create_number(atomic_load(&counts[p][r][1])));
-            json_object_set(events, reasons[r], modes);
-        }
+        for (unsigned r = 0; r < REASON_COUNT; r++)
+            json_object_set(events, reasons[r], json_create_number(atomic_load(&counts[p][r])));
         json_object_set(root, protocols[p], events);
     }
     json_token_t* durations = json_create_object();
@@ -114,15 +111,6 @@ int timeout_policy_load(timeout_policy_t* p, const json_token_t* object, const c
     for (json_it_t it = json_init_it(object); !json_end_it(&it); json_next_it(&it)) {
         const char* name = json_it_key(&it);
         const json_token_t* token = json_it_value(&it);
-        if (strcmp(name, "request_timeout_mode") == 0) {
-            const char* mode = json_is_string(token) ? json_string(token) : NULL;
-            if (mode == NULL || (strcmp(mode, "observe") && strcmp(mode, "enforce"))) {
-                log_error_stderr("%s.%s must be observe or enforce\n", path, name);
-                return 0;
-            }
-            candidate.enforce = strcmp(mode, "enforce") == 0;
-            continue;
-        }
         size_t i;
         for (i = 0; i < sizeof fields / sizeof fields[0]; i++)
             if (strcmp(name, fields[i].name) == 0) break;
@@ -145,11 +133,12 @@ int timeout_policy_load(timeout_policy_t* p, const json_token_t* object, const c
     return 1;
 }
 
+/* Every timeout terminates what it bounds, so the two that stop a slowloris
+ * cannot be switched off, and a server Ping needs a deadline for its Pong. */
 int timeout_policy_validate(const timeout_policy_t* p, const char* path) {
-    if (p->enforce && (!p->request_header_timeout_ms ||
-        !p->request_body_idle_timeout_ms ||
-        (p->ws_ping_interval_ms && !p->ws_pong_timeout_ms))) {
-        log_error_stderr("%s: enforce requires positive header/body idle and Pong timeout when Ping is enabled\n", path);
+    if (!p->request_header_timeout_ms || !p->request_body_idle_timeout_ms ||
+        (p->ws_ping_interval_ms && !p->ws_pong_timeout_ms)) {
+        log_error_stderr("%s: header and body idle timeouts must be positive, and so must the Pong timeout when Ping is enabled\n", path);
         return 0;
     }
     return 1;

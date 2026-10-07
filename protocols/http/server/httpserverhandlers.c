@@ -267,12 +267,12 @@ void http_server_tick_locked(connection_t* connection) {
             }
         } else if (!ctx->cont_pending) ctx->send_progress_ms = 0;
     }
-    timeout_report(reported, "http1", reason, policy ? policy->enforce : 0, connection->fd, 0);
+    timeout_report(reported, "http1", reason, connection->fd, 0);
     if (ctx->timeout_closing && timeout_expired(now, ctx->timeout_close_started_ms, 5000)) {
         connection_close_locked(connection);
         return;
     }
-    if (reason && policy && policy->enforce && !ctx->timeout_closing) {
+    if (reason && !ctx->timeout_closing) {
         /* Never insert an error ahead of an in-flight pipeline response. */
         if (!strcmp(reason, "send_idle") || connection->read != http_server_guard_read || ctx->request || ctx->response ||
             !cqueue_empty(ctx->queue) || !__post_parse_refusal(connection, 408)) {
@@ -543,9 +543,8 @@ int __read(connection_t* connection) {
         {
             if (ctx->timeout_closing) return 1;
             const char* timeout_reason = __receive_timeout(parser, timeout_now_ms());
-            timeout_report(&parser->timeout_reported, "http1", timeout_reason,
-                           parser->timeout_policy.enforce, connection->fd, 0);
-            if (timeout_reason && parser->timeout_policy.enforce) {
+            timeout_report(&parser->timeout_reported, "http1", timeout_reason, connection->fd, 0);
+            if (timeout_reason) {
                 if (ctx->request || ctx->response || !cqueue_empty(ctx->queue)) return 0;
                 ctx->timeout_closing = 1;
                 ctx->timeout_close_started_ms = timeout_now_ms();
