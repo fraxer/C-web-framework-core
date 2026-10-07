@@ -273,8 +273,13 @@ void http_server_tick_locked(connection_t* connection) {
         return;
     }
     if (reason && !ctx->timeout_closing) {
-        /* Never insert an error ahead of an in-flight pipeline response. */
-        if (!strcmp(reason, "send_idle") || connection->read != http_server_guard_read || ctx->request || ctx->response ||
+        /* Never insert an error ahead of an in-flight pipeline response. An
+         * idle connection -- no request byte yet, fresh or between keep-alive
+         * requests -- closes silently, as nginx does: a pooled client may be
+         * sending its next request at this very moment and would read a 408
+         * as the answer to it. */
+        if (!strcmp(reason, "send_idle") || !strcmp(reason, "idle") ||
+            connection->read != http_server_guard_read || ctx->request || ctx->response ||
             !cqueue_empty(ctx->queue) || !__post_parse_refusal(connection, 408)) {
             connection_close_locked(connection);
             return;
