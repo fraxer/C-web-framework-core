@@ -30,17 +30,21 @@ int timeout_report(unsigned* reported, const char* protocol, const char* reason,
     return 1;
 }
 
-typedef struct { const char* name; size_t offset; uint32_t value; } timeout_field_t;
+typedef struct { const char* name; size_t offset; } timeout_field_t;
 static const timeout_field_t fields[] = {
-#define TIMEOUT_ENTRY(name, value) { #name, offsetof(timeout_policy_t, name), value },
+#define TIMEOUT_ENTRY(name, value) { #name, offsetof(timeout_policy_t, name) },
     TIMEOUT_FIELDS(TIMEOUT_ENTRY)
 #undef TIMEOUT_ENTRY
 };
 
+const timeout_policy_t timeout_policy_default = {
+#define TIMEOUT_DEFAULT(name, value) .name = value,
+    TIMEOUT_FIELDS(TIMEOUT_DEFAULT)
+#undef TIMEOUT_DEFAULT
+};
+
 void timeout_policy_defaults(timeout_policy_t* p) {
-    memset(p, 0, sizeof(*p));
-    for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++)
-        *(uint32_t*)((char*)p + fields[i].offset) = fields[i].value;
+    *p = timeout_policy_default;
 }
 
 int timeout_policy_load(timeout_policy_t* p, const json_token_t* object, const char* path) {

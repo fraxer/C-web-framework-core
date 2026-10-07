@@ -590,9 +590,12 @@ static void h2_stream_recv_init(h2session_t* s, h2stream_t* stream) {
     stream->request->started_ms = s->header_started_ms ? s->header_started_ms : stream->recv.epoch_ms;
     stream->request->slow_reported = s->header_slow_reported;
     stream->request->headers_done_ms = stream->recv.epoch_ms;
-    timeout_policy_defaults(&stream->timeout_policy);
     connection_server_ctx_t* tctx = s->connection->ctx;
-    if (tctx && tctx->server) stream->timeout_policy = tctx->server->timeouts;
+    if (tctx && tctx->server)
+        stream->timeout_policy = tctx->server->timeouts;
+    else
+        timeout_policy_defaults(&stream->timeout_policy);
+
     /* SETTINGS_INITIAL_WINDOW_SIZE is all the peer credits a new stream with;
      * anything this connection has already learned above that is only ours to
      * count once the WINDOW_UPDATE below has been queued. */
@@ -1920,25 +1923,27 @@ static h2_frame_result_e h2_handle_frame(h2session_t* s, const h2_frame_t* frame
  *  Read path
  * ======================================================================= */
 
-/* Parse and handle whole frames sitting in the session buffer. Returns 1 to
- * keep going, 0 to close. Unlike Phase 3 this does not stop at the first
- * dispatched request — several streams may be accepted from one read. */
-static timeout_policy_t h2_receive_policy(h2session_t* s) {
+/* The policy for frames not yet tied to a stream's own: the listener's first
+ * vhost (vhosts sharing a listener agree on the header budget), else the
+ * connection's, else the defaults. Borrowed, not copied -- this runs at least
+ * twice per frame. Worker thread only, where the generation is alive. */
+static const timeout_policy_t* h2_receive_policy(h2session_t* s) {
     connection_server_ctx_t* ctx = s->connection->ctx;
-    timeout_policy_t policy;
-    timeout_policy_defaults(&policy);
-    if (ctx && ctx->server) policy = ctx->server->timeouts;
     if (ctx && ctx->listener && !cqueue_empty(&ctx->listener->servers))
-        policy = ((server_t*)cqueue_first(&ctx->listener->servers)->data)->timeouts;
-    return policy;
+        return &((server_t*)cqueue_first(&ctx->listener->servers)->data)->timeouts;
+
+    if (ctx && ctx->server)
+        return &ctx->server->timeouts;
+
+    return &timeout_policy_default;
 }
 
 static int h2_header_expired(h2session_t* s, uint64_t now) {
-    const timeout_policy_t policy = h2_receive_policy(s);
-    const uint32_t budget = policy.request_header_timeout_ms;
+    const timeout_policy_t* policy = h2_receive_policy(s);
+    const uint32_t budget = policy->request_header_timeout_ms;
     if (s->header_started_ms && !s->header_slow_reported &&
         !h2stream_find(s, s->cont_active ? s->cont_stream_id : s->frame.stream_id)) {
-        if (timeout_expired(now, s->header_started_ms, policy.slow_request_threshold_ms)) {
+        if (timeout_expired(now, s->header_started_ms, policy->slow_request_threshold_ms)) {
             s->header_slow_reported = 1;
             log_info("slow_request protocol=h2 phase=headers age_ms=%llu\n",
                      (unsigned long long)(now - s->header_started_ms));
@@ -1974,18 +1979,30 @@ static int h2_check_partial_body(h2session_t* s, uint64_t now) {
     return 1;
 }
 
+/* Parse and handle whole frames sitting in the session buffer. Returns 1 to
+ * keep going, 0 to close. Unlike Phase 3 this does not stop at the first
+ * dispatched request — several streams may be accepted from one read. */
 static int h2_process_buffer(h2session_t* s) {
     const uint8_t* p = s->read_buf;
     const uint8_t* end = s->read_buf + s->read_len;
     int result = 1;
+    /* One clock read for the whole buffer: every byte in it arrived with the
+     * same read, so that is the arrival time of each frame it holds. Reading
+     * the clock per check cost several vDSO calls per frame, all of them
+     * inside the connection lock that the handler threads wait on. */
+    const uint64_t now = timeout_now_ms();
 
     while (p < end) {
         /* Late bytes must not finish an already expired partial frame/block
          * between timer ticks. */
-        if (h2_header_expired(s, timeout_now_ms()))
+        if (h2_header_expired(s, now))
             return h2_fail(s, H2_ERR_ENHANCE_YOUR_CALM);
-        if (!s->frame_started_ms) s->frame_started_ms = timeout_now_ms();
-        if (!h2_check_partial_body(s, timeout_now_ms())) return h2_fail(s, s->error_code);
+        if (!s->frame_started_ms)
+            s->frame_started_ms = now;
+
+        if (!h2_check_partial_body(s, now))
+            return h2_fail(s, s->error_code);
+
         const size_t before = s->frame.stage == H2FRAME_STAGE_PAYLOAD && s->frame.type == H2_FRAME_DATA ?
                               h2_data_progress(&s->frame) : 0;
         /* Stop at classification, so a late payload cannot refresh its timer
@@ -2005,10 +2022,10 @@ static int h2_process_buffer(h2session_t* s) {
         if (classified && s->frame.type == H2_FRAME_DATA && !s->data_discard) {
             h2stream_t* stream = h2stream_find(s, s->frame.stream_id);
             if (stream && !stream->ws && !stream->rejected && h2_data_progress(&s->frame) > before)
-                stream->request_progress_ms = timeout_now_ms();
+                stream->request_progress_ms = now;
         }
         if ((!classified || s->header_started_ms) &&
-            h2_header_expired(s, timeout_now_ms()))
+            h2_header_expired(s, now))
             return h2_fail(s, H2_ERR_ENHANCE_YOUR_CALM);
 
         if (st == H2PARSE_CONTINUE) {

@@ -35,6 +35,9 @@ typedef struct timeout_policy {
     uint64_t explicit_fields;
 } timeout_policy_t;
 
+/* The built-in defaults, fixed at compile time from TIMEOUT_FIELDS: borrow
+ * this where a policy is only read, copy it with timeout_policy_defaults. */
+extern const timeout_policy_t timeout_policy_default;
 void timeout_policy_defaults(timeout_policy_t* policy);
 /* Merge a partial object into an inherited policy; errors include JSON path. */
 int timeout_policy_load(timeout_policy_t* policy, const json_token_t* object,
