@@ -52,6 +52,24 @@ TEST(test_timeout_configuration) {
     d = json_parse("{\"request_header_timeout_ms\":1234}");
     TEST_ASSERT(!timeout_policy_load_route(&patch, json_root(d), "route.timeouts", 0), "route cannot change header deadline");
     json_free(d);
+    /* A route patch is judged on the policy it lands on, not on the defaults:
+     * no Pong deadline is fine once the server has switched Ping off. */
+    timeout_policy_t server, ws_patch;
+    timeout_policy_defaults(&server);
+    server.ws_ping_interval_ms = 0;
+    timeout_policy_defaults(&ws_patch);
+    d = json_parse("{\"ws_pong_timeout_ms\":0}");
+    TEST_ASSERT(timeout_policy_load_route(&ws_patch, json_root(d), "route.timeouts", 1), "Pong override loads without the server policy");
+    json_free(d);
+    timeout_policy_t effective = server;
+    timeout_policy_merge(&effective, &ws_patch);
+    TEST_ASSERT(timeout_policy_validate(&effective, "route.timeouts"), "inherited Ping 0 with route Pong 0 is valid");
+    effective = timeout_policy_default;
+    timeout_policy_merge(&effective, &ws_patch);
+    TEST_ASSERT(!timeout_policy_validate(&effective, "route.timeouts"), "route Pong 0 under an enabled Ping is still rejected");
+    d = json_parse("{\"ws_pong_timeout_ms\":-1}");
+    TEST_ASSERT(!timeout_policy_load_route(&ws_patch, json_root(d), "route.timeouts", 1), "route values are still range-checked");
+    json_free(d);
     TEST_ASSERT(!timeout_expired(109, 100, 10) && timeout_expired(110, 100, 10), "exact deadline boundary");
     TEST_ASSERT(!timeout_expired(1000, 100, 0) && !timeout_expired(99, 100, 1), "disabled budgets and backward clock are safe");
 }

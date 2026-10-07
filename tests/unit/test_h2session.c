@@ -367,6 +367,56 @@ TEST(test_h2session_header_receive_timing) {
     h2_session_free(s);
 }
 
+TEST(test_h2session_websocket_partial_data_deadlines) {
+    TEST_SUITE("h2 websocket partial data");
+    server_t server = {0};
+    timeout_policy_defaults(&server.timeouts);
+    server.timeouts.ws_ping_interval_ms = 0; /* no heartbeat to catch the stall instead */
+    server.timeouts.ws_message_idle_timeout_ms = 10;
+    server.timeouts.ws_message_total_timeout_ms = 20;
+    connection_server_ctx_t ctx = { .server = &server };
+    connection_t c = { .fd = -1, .ctx = &ctx };
+    h2session_t* s = h2_test_session_create(&c);
+    TEST_REQUIRE(s != NULL, "session allocated");
+    timeout_test_ms = 100000;
+    timeout_set_clock(timeout_test_clock);
+    s->abort_epoch_ms = s->ctrl_epoch_ms = timeout_test_ms;
+    h2stream_t* stream = h2stream_create(s, 1);
+    if (stream) {
+        s->last_stream_id = 1;
+        stream->recv.avail = H2_DEFAULT_WINDOW;
+        stream->ws = h2_ws_tunnel_create(&c, stream, 0, NULL);
+    }
+    TEST_ASSERT(stream && stream->ws, "tunnel created");
+    if (stream && stream->ws) {
+        websocketsparser_t* p = stream->ws->parser;
+        /* One masked text frame, "hello", carried by one DATA frame that the
+         * client trickles in: the tunnel parser sees none of it until the end. */
+        uint8_t payload[] = {0x81,0x85,0,0,0,0,'h','e','l','l','o'};
+        uint8_t wire[32];
+        const size_t n = h2frame_encode(wire, sizeof wire, H2_FRAME_DATA, 0, 1, payload, sizeof payload);
+        const uint64_t start = timeout_test_ms;
+        TEST_ASSERT(h2_session_feed(s, wire, 10), "DATA header and the first WebSocket byte");
+        TEST_ASSERT(p->message_started_ms == start && p->message_progress_ms == start,
+                    "message timers start before the DATA frame completes");
+        timeout_test_ms += 9;
+        TEST_ASSERT(h2_session_feed(s, wire + 10, 1), "progress before the idle deadline");
+        TEST_ASSERT(p->message_progress_ms == timeout_test_ms && p->message_started_ms == start,
+                    "progress refreshes the idle timer, not the total one");
+        const char* idle = websocketsparser_timeout(p, timeout_test_ms + 10, 0);
+        TEST_ASSERT(idle && !strcmp(idle, "message_idle"), "a stalled DATA frame hits message idle");
+        timeout_test_ms += 9;
+        TEST_ASSERT(h2_session_feed(s, wire + 11, 1), "still within both budgets");
+        TEST_ASSERT(h2stream_find(s, 1) == stream, "stream alive");
+        timeout_test_ms += 2;
+        TEST_ASSERT(h2_session_feed(s, wire + 12, 1), "late byte drained, connection kept");
+        TEST_ASSERT(h2stream_find(s, 1) == NULL, "steady trickle cannot outrun message total");
+        TEST_ASSERT(h2_session_feed(s, wire + 13, n - 13), "rest of the frame discarded at the boundary");
+    }
+    timeout_set_clock(NULL);
+    h2_session_free(s);
+}
+
 TEST(test_h2session_websocket_heartbeat_lifecycle) {
     TEST_SUITE("h2 websocket heartbeat");
     int fd[2];

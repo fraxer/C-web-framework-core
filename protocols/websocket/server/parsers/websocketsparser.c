@@ -170,6 +170,21 @@ int __frame_end(websocketsparser_t* parser) {
     return WSPARSER_HANDLE_AND_CONTINUE;
 }
 
+void websocketsparser_receiving(websocketsparser_t* parser, const uint8_t* data, size_t len) {
+    if (len == 0) return;
+    const uint64_t stamp = __recv_now(parser);
+    if (!parser->frame_started_ms) parser->frame_started_ms = stamp;
+    parser->frame_progress_ms = stamp;
+    /* Between frames the first byte names the opcode run() will see; inside
+     * one, the opcode is already parsed. Control frames never touch the
+     * message timers. */
+    const int opcode = parser->stage == WSPARSER_STAGE_FIRST_BYTE ? (data[0] & 0x0F) : parser->frame.opcode;
+    if (opcode < WSOPCODE_CLOSE) {
+        if (!parser->message_started_ms) parser->message_started_ms = stamp;
+        parser->message_progress_ms = stamp;
+    }
+}
+
 int websocketsparser_run(websocketsparser_t* parser) {
     if (parser->bytes_readed > parser->pos_start) {
         const uint64_t stamp = __recv_now(parser);
