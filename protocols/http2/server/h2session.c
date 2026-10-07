@@ -1486,6 +1486,15 @@ static h2_frame_result_e h2_reject_stream(h2session_t* s, h2stream_t* stream,
     return H2_FRAME_OK;
 }
 
+static int h2_body_expired(h2session_t* s, h2stream_t* stream, uint64_t now) {
+    const timeout_policy_t* p = &stream->timeout_policy;
+    const int idle = timeout_expired(now, stream->request_progress_ms, p->request_body_idle_timeout_ms);
+    const int total = timeout_expired(now, stream->body_started_ms, p->request_body_total_timeout_ms);
+    if (!idle && !total) return 0;
+    timeout_report(&stream->timeout_reported, "h2", idle ? "body_idle" : "body_total", s->connection->fd, stream->id);
+    return 1;
+}
+
 static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
                                             const uint8_t* block, size_t len,
                                             int end_stream) {
@@ -1514,6 +1523,12 @@ static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
             stream->state = H2_STREAM_HALF_CLOSED_REMOTE;
             return H2_FRAME_OK;
         }
+
+        /* Trailers end the body, so they are held to its deadlines like DATA:
+         * a block completing after expiry, before the timer tick notices,
+         * must not dispatch the request. */
+        if (!stream->ws && h2_body_expired(s, stream, h2_now_ms()))
+            return h2_stream_error(s, stream_id, H2_ERR_CANCEL);
 
         return h2_dispatch(s, stream);
     }
@@ -1728,15 +1743,6 @@ static h2_frame_result_e h2_on_continuation(h2session_t* s, const h2_frame_t* fr
                                            s->cont_reject_error);
 
     return h2_on_header_block(s, s->cont_stream_id, s->cont, s->cont_len, s->cont_end_stream);
-}
-
-static int h2_body_expired(h2session_t* s, h2stream_t* stream, uint64_t now) {
-    const timeout_policy_t* p = &stream->timeout_policy;
-    const int idle = timeout_expired(now, stream->request_progress_ms, p->request_body_idle_timeout_ms);
-    const int total = timeout_expired(now, stream->body_started_ms, p->request_body_total_timeout_ms);
-    if (!idle && !total) return 0;
-    timeout_report(&stream->timeout_reported, "h2", idle ? "body_idle" : "body_total", s->connection->fd, stream->id);
-    return 1;
 }
 
 static h2_frame_result_e h2_on_data(h2session_t* s, const h2_frame_t* frame) {

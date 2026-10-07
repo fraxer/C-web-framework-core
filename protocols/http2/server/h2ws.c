@@ -327,21 +327,12 @@ static int h2_ws_message_seen(h2_ws_tunnel_t* tunnel, connection_t* connection) 
     return ok;
 }
 
-static int h2_ws_pending_output(h2_ws_tunnel_t* tunnel) {
-    if (tunnel->writing) return 1;
-    int pending = 0;
-    cqueue_lock(tunnel->out);
-    for (cqueue_item_t* item = cqueue_first(tunnel->out); item; item = item->next) {
-        const connection_out_slot_t* slot = item->data;
-        if (slot && slot->response) { pending = 1; break; }
-    }
-    cqueue_unlock(tunnel->out);
-    return pending;
-}
-
 static int h2_ws_check_timeout(h2_ws_tunnel_t* tunnel, uint64_t now) {
     websocketsparser_t* p = tunnel->parser;
-    const char* reason = websocketsparser_timeout(p, now, h2_ws_pending_output(tunnel) || p->ping_queued);
+    /* Only writable output runs the send clock. A Ping or reply queued behind
+     * a handler that has not returned is waiting on the application, not on
+     * the peer, so ping_queued alone does not count either. */
+    const char* reason = websocketsparser_timeout(p, now, h2_ws_tunnel_has_output(tunnel));
     timeout_report(&p->timeout_reported, "h2_ws", reason, tunnel->connection->fd, tunnel->stream->id);
     if (reason) {
         if (p->close_started_ms || p->frame_started_ms || !strcmp(reason, "send_idle")) return 0;
