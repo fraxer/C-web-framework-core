@@ -471,6 +471,9 @@ static int mp_send_file(httprequest_t* request, httpresponse_t* response, http_m
         return head;
 
     size_t budget = 1024 * 1024;
+    /* Declared outside the loop: a per-iteration address-taken local gets an
+     * ASan scope marker that -fanalyzer misreads as an uninitialized use. */
+    off_t offset = 0;
     while (module->mp_state != MP_STATE_DONE) {
         if (module->mp_state == MP_STATE_TEXT) {
             if (module->text == NULL || module->text_pos > module->text_len)
@@ -504,7 +507,7 @@ static int mp_send_file(httprequest_t* request, httpresponse_t* response, http_m
             part->size > (size_t)SSIZE_MAX - part->start)
             return CWF_ERROR;
 
-        off_t offset = (off_t)(part->start + module->data_pos);
+        offset = (off_t)(part->start + module->data_pos);
         const size_t before = (size_t)offset;
         const size_t left = part->size - module->data_pos;
         const size_t take = left < budget ? left : budget;

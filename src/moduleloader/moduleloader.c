@@ -1592,8 +1592,7 @@ int __module_loader_validate_storage_routes(appconfig_t* config) {
             for (int method = 0; method < 7; method++) {
                 if (route->storage_name[method] == NULL) continue;
 
-                storage_type_e type = STORAGE_TYPE_FS;
-                if (!storage_type_in(config->storages, route->storage_name[method], &type)) {
+                if (!storage_type_in(config->storages, route->storage_name[method], NULL)) {
                     log_error_stderr("__module_loader_validate_storage_routes: storage %s not found for route %s\n",
                                      route->storage_name[method], route->path);
                     return 0;
