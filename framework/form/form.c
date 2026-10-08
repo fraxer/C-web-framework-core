@@ -436,7 +436,7 @@ static int field_default(const form_field_spec_t* spec, form_value_t* value) {
     }
 }
 
-static int spec_valid(const form_schema_t* schema, const form_field_spec_t* spec) {
+static int spec_valid(const form_field_spec_t* spec) {
     const form_field_common_t* common = field_common(spec);
 
     if (common == NULL || common->name == NULL ||
@@ -523,7 +523,7 @@ form_t* form_create(const form_schema_t* schema, const form_input_t inputs[]) {
 
     for (size_t i = 0; i < schema->fields_count; i++) {
         const form_field_spec_t* spec = &schema->fields[i];
-        if (!spec_valid(schema, spec))
+        if (!spec_valid(spec))
             goto invalid_schema;
 
         const form_field_common_t* common = field_common(spec);
@@ -725,7 +725,8 @@ static void field_validate(form_t* form, size_t index) {
     form_field_t* field = &form->fields[index];
     form_input_t cleaned = field->input;
 
-    if (cleaned.kind != FORM_INPUT_TEXT && cleaned.kind != FORM_INPUT_OBJECT && cleaned.kind != FORM_INPUT_TEXT_LIST) {
+    if (common == NULL ||
+        (cleaned.kind != FORM_INPUT_TEXT && cleaned.kind != FORM_INPUT_OBJECT && cleaned.kind != FORM_INPUT_TEXT_LIST)) {
         field->error = FORM_INVALID;
         return;
     }
@@ -960,6 +961,9 @@ const char* form_error_message(const form_t* form, size_t index) {
 
     const form_field_spec_t* spec = &form->schema->fields[index];
     const form_field_common_t* common = field_common(spec);
+    if (common == NULL)
+        return NULL;
+
     switch (field->error) {
     case FORM_REQUIRED: return common->required_message;
     case FORM_MIN_LENGTH:
@@ -1005,7 +1009,8 @@ const char* form_field_name(const form_t* form, size_t index) {
     if (form == NULL || index >= form->schema->fields_count)
         return NULL;
 
-    return field_common(&form->schema->fields[index])->name;
+    const form_field_common_t* common = field_common(&form->schema->fields[index]);
+    return common != NULL ? common->name : NULL;
 }
 
 size_t form_fields_count(const form_t* form) {

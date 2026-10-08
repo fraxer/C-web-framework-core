@@ -20,12 +20,16 @@
 
 /* A client-initiated bidirectional stream: id 0, 4, 8, ... */
 static quicstream_t* request_stream(uint64_t index) {
-    return quicstream_create(index << 2, STREAM_WINDOW, STREAM_WINDOW, STREAM_WINDOW);
+    quicstream_t* qs = quicstream_create(index << 2, STREAM_WINDOW, STREAM_WINDOW, STREAM_WINDOW);
+    if (qs == NULL) abort();
+    return qs;
 }
 
 /* A client-initiated unidirectional stream: id 2, 6, 10, ... */
 static quicstream_t* uni_stream(uint64_t index) {
-    return quicstream_create((index << 2) | 0x02, STREAM_WINDOW, STREAM_WINDOW, 0);
+    quicstream_t* qs = quicstream_create((index << 2) | 0x02, STREAM_WINDOW, STREAM_WINDOW, 0);
+    if (qs == NULL) abort();
+    return qs;
 }
 
 static void deliver(quicstream_t* qs, uint64_t offset, const uint8_t* data, size_t len, int fin) {
@@ -198,7 +202,8 @@ TEST(test_h3conn_request_errors) {
     quicstream_on_reset(qs, H3_REQUEST_CANCELLED, n);
     r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_REQUEST_RESET, "cancelled");
-    TEST_ASSERT(h3conn_request_of(qs)->response == NULL && qs->send.len == 0,
+    const h3stream_t* cancelled = h3conn_request_of(qs);
+    TEST_ASSERT(cancelled != NULL && cancelled->response == NULL && qs->send.len == 0,
                 "no response -- they asked for none");
     /* But our half is ended (RFC 9114 §4.1.1: cancel by terminating every
      * direction still open). Left open, with nothing ever to send on it, the

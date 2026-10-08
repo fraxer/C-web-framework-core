@@ -128,6 +128,7 @@ TEST(test_db_query_value_roundtrip) {
 
     /* 64 KiB of quotes. */
     char* big = malloc(65537);
+    TEST_REQUIRE_NOT_NULL(big, "64 KiB buffer");
     memset(big, '\'', 65536);
     big[65536] = '\0';
     dbresult_t* r = __query1("SELECT :v AS v", mparam_text(v, big));

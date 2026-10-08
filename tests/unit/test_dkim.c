@@ -551,12 +551,11 @@ TEST(test_dkim_signature_field_signed_as_sent) {
 
     /* What a verifier hashes for this field: the field as sent with the value
      * of b= removed, canonicalized. The signer's copy is the last header. */
-    char* sent = strdup(sign);
-    TEST_REQUIRE_NOT_NULL(sent, "copy");
-    char* b = strstr(sent, " b=");
-    if (b == NULL) b = strstr(sent, "\tb=");
+    const char* b = strstr(sign, " b=");
+    if (b == NULL) b = strstr(sign, "\tb=");
     TEST_REQUIRE_NOT_NULL(b, "b= tag present");
-    b[3] = '\0';
+    char* sent = strndup(sign, (size_t)(b - sign) + 3);
+    TEST_REQUIRE_NOT_NULL(sent, "copy");
     char* canonical = dkim_test_relaxed_value(sent);
 
     mail_header_t* signed_field = dkim->last_header;

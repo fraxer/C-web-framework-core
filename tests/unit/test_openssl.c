@@ -492,9 +492,9 @@ TEST(test_openssl_write_retry_from_moved_buffer) {
     unsigned char* moved = malloc(65536);
     unsigned char* received = malloc(65536);
 
-    TEST_REQUIRE_NOT_NULL(openssl, "make_openssl should not return NULL");
-    TEST_REQUIRE(sent != NULL && moved != NULL && received != NULL, "buffers");
-    TEST_REQUIRE(openssl_init(openssl) == 1, "server context should initialize");
+    TEST_REQUIRE_NOT_NULL_GOTO(openssl, "make_openssl should not return NULL", cleanup);
+    TEST_REQUIRE_GOTO(sent != NULL && moved != NULL && received != NULL, "buffers", cleanup);
+    TEST_REQUIRE_GOTO(openssl_init(openssl) == 1, "server context should initialize", cleanup);
 
     tls_pair_t pair;
     TEST_REQUIRE_GOTO(tls_pair_setup(&pair, openssl->ctx), "tls pair should be created", done);
@@ -534,6 +534,9 @@ TEST(test_openssl_write_retry_from_moved_buffer) {
     done:
 
     tls_pair_free(&pair);
+
+    cleanup:
+
     openssl_free(openssl);
     free(sent);
     free(moved);

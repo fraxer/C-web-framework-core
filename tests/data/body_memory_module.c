@@ -26,7 +26,7 @@ void body_check(httpctx_t* ctx) {
     atomic_fetch_add(&calls, 1);
     httprequest_t* req = ctx->request;
     size_t size = http_payload_size(&req->payload_);
-    int state = req->payload_.incoming.state;
+    body_store_state_t state = req->payload_.incoming.state;
     char* copy = http_payload_copy(&req->payload_, 0, size);
     if (size && !copy) { ctx->response->send_default(ctx->response, 500); return; }
     if (strcmp(req->path, "/json") == 0) {

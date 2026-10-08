@@ -366,7 +366,7 @@ TEST(test_mailmessage_set_subject_large_value) {
     big[size] = '\0';
 
     mail_message_t* m = mail_message_create();
-    TEST_REQUIRE_NOT_NULL(m, "mail_message_create should succeed");
+    TEST_REQUIRE_NOT_NULL_GOTO(m, "mail_message_create should succeed", cleanup);
 
     TEST_ASSERT_EQUAL(1, mail_message_set_subject(m, big), "set_subject survives");
     TEST_ASSERT_EQUAL(1, mail_message_set_from(m, "a@b.ru", big), "set_from survives");
@@ -374,6 +374,8 @@ TEST(test_mailmessage_set_subject_large_value) {
                 "the subject is encoded");
 
     mail_message_free(m);
+
+cleanup:
     free(big);
 }
 

@@ -28,6 +28,7 @@ TEST(test_aes256gcm_roundtrip) {
     }
 
     char* long_value = malloc(100001);
+    TEST_REQUIRE_NOT_NULL(long_value, "100 000 bytes buffer");
     memset(long_value, 'x', 100000);
     long_value[100000] = '\0';
     char* sealed = aes256gcm_encrypt(long_value, __key);
@@ -52,6 +53,7 @@ TEST(test_aes256gcm_tamper) {
     const size_t n = strlen(sealed);
     for (size_t i = 0; i < n; i++) {
         char* copy = strdup(sealed);
+        TEST_REQUIRE_NOT_NULL_GOTO(copy, "copy", cleanup);
         copy[i] = copy[i] == 'A' ? 'B' : 'A';
         char* opened = aes256gcm_decrypt(copy, __key);
         /* A change in the unused bits of the last character can leave the
@@ -72,6 +74,8 @@ TEST(test_aes256gcm_tamper) {
 
     TEST_ASSERT_NULL(aes256gcm_decrypt("", __key), "empty");
     TEST_ASSERT_NULL(aes256gcm_decrypt("!!!!", __key), "not base64");
+
+cleanup:
     free(sealed);
 }
 
