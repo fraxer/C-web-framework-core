@@ -148,6 +148,25 @@ static int host_is(const httprequest_t* r, const char* want) {
     return h != NULL && h->value_length == strlen(want) && memcmp(h->value, want, h->value_length) == 0;
 }
 
+TEST(test_h3stream_timeout_state_initialized) {
+    TEST_SUITE("h3stream");
+
+    /* h3stream_create mallocs; a stale stamp or report bit would cancel a
+     * fresh request or move its deadline (ASan's malloc fill makes any field
+     * left out fail here every time). */
+    TEST_CASE("a fresh stream starts with clear timeout stamps and the default policy");
+    h3stream_t* st = h3stream_create(NULL, 0);
+    TEST_REQUIRE(st != NULL, "stream created");
+    TEST_ASSERT(!st->header_started_ms && !st->body_started_ms && !st->body_progress_ms, "receive stamps clear");
+    TEST_ASSERT(!st->response_progress_ms && !st->response_sent_offset, "send progress clear");
+    TEST_ASSERT(!st->timeout_reported, "nothing reported yet");
+    TEST_ASSERT(st->timeout_policy.request_header_timeout_ms == timeout_policy_default.request_header_timeout_ms &&
+                st->timeout_policy.request_body_idle_timeout_ms == timeout_policy_default.request_body_idle_timeout_ms &&
+                st->timeout_policy.response_send_idle_timeout_ms == timeout_policy_default.response_send_idle_timeout_ms &&
+                !st->timeout_policy.explicit_fields, "default policy");
+    h3stream_free(st);
+}
+
 TEST(test_h3stream_request) {
     TEST_SUITE("h3stream");
 

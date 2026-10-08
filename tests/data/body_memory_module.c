@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <openssl/sha.h>
 #include "http.h"
 #include "wscontext.h"
@@ -25,7 +26,7 @@ void body_check(httpctx_t* ctx) {
     atomic_fetch_add(&calls, 1);
     httprequest_t* req = ctx->request;
     size_t size = http_payload_size(&req->payload_);
-    int state = req->payload_.incoming.state;
+    body_store_state_t state = req->payload_.incoming.state;
     char* copy = http_payload_copy(&req->payload_, 0, size);
     if (size && !copy) { ctx->response->send_default(ctx->response, 500); return; }
     if (strcmp(req->path, "/json") == 0) {
@@ -62,6 +63,16 @@ void body_check(httpctx_t* ctx) {
     ctx->response->send_data(ctx->response, out);
 }
 void body_upgrade(httpctx_t* ctx) { switch_to_websockets(ctx); }
+/* A deliberately slow handler: models an I/O-bound handler (the timeout and
+ * reload scenarios need server-side work that outlives a tick or a reload). */
+void body_delay(httpctx_t* ctx) {
+    int ok = 0;
+    long ms = query_param_int(ctx->request->query_, "ms", &ok);
+    if (!ok || ms < 0) ms = 500;
+    if (ms > 10000) ms = 10000;
+    if (ms) usleep((useconds_t)ms * 1000);
+    ctx->response->send_data(ctx->response, "{\"delay\":1}");
+}
 void body_ws(wsctx_t* ctx) {
     atomic_fetch_add(&calls, 1);
     websockets_protocol_t* protocol = ctx->request->protocol;

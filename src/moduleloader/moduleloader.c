@@ -401,6 +401,11 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
         return 0;
     }
 
+    timeout_policy_defaults(&env->main.timeouts);
+    if (!timeout_policy_load(&env->main.timeouts,
+                            json_object_get(token_main, "timeouts"), "main.timeouts"))
+        return 0;
+
 
     const json_token_t* token_reload = json_object_get(token_main, "reload");
     if (token_reload == NULL) {
@@ -719,6 +724,15 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     }
 
 
+    /* Superseded by main.timeouts. Refused rather than ignored: main.env keeps
+     * any key, and a config that still sets this one would otherwise have its
+     * HTTP/2 budgets change without a word. */
+    if (env_config_get_llong_checked(env, "http2_request_timeout_sec", NULL) != 0) {
+        log_error_stderr("main.env.http2_request_timeout_sec was removed: use main.timeouts.request_header_timeout_ms and request_body_idle_timeout_ms\n");
+        goto failed;
+    }
+
+
     if (!__module_loader_servers_load(config, json_object_get(root, "servers")))
         goto failed;
     if (!__module_loader_databases_load(config, json_object_get(root, "databases")))
@@ -735,6 +749,7 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
         goto failed;
     if (!__module_loader_taskmanager_init(config, json_object_get(root, "task_manager")))
         goto failed;
+
     if (!__module_loader_translations_load(config, json_object_get(root, "translations")))
         goto failed;
 
@@ -1102,6 +1117,12 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             goto failed;
         }
 
+        server->timeouts = config->env.main.timeouts;
+        char timeout_path[256];
+        snprintf(timeout_path, sizeof timeout_path, "servers.%s.timeouts", (const char*)json_it_key(&it_servers));
+        if (!timeout_policy_load(&server->timeouts, json_object_get(token_server, "timeouts"), timeout_path))
+            goto failed;
+
         const json_token_t* token_domains = json_object_get(token_server, "domains");
         if (token_domains != NULL) {
             finded_fields[DOMAINS] = 1;
@@ -1404,6 +1425,32 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
         if (finded_fields[WEBSOCKETS] == 0)
             server->websockets.default_handler = (void(*)(void*))websockets_default_handler;
 
+        for (server_t* other = first_server; other && other != server; other = other->next) {
+            if (other->port == server->port && ipaddr_equal(&other->ip, &server->ip) &&
+                (other->timeouts.request_header_timeout_ms != server->timeouts.request_header_timeout_ms ||
+                 other->timeouts.tls_handshake_timeout_ms != server->timeouts.tls_handshake_timeout_ms)) {
+                log_error_stderr("servers.%s.timeouts: vhosts sharing a listener must agree on header/TLS budgets\n", json_it_key(&it_servers));
+                goto failed;
+            }
+        }
+        /* Route overrides were only range-checked when loaded; whether they
+         * make sense depends on the server policy they patch, known only now. */
+        static const char* const method_names[7] = { "GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD" };
+        for (int ws = 0; ws < 2; ws++) {
+            for (route_t* route = ws ? server->websockets.route : server->http.route; route; route = route->next) {
+                for (int method = 0; method < 7; method++) {
+                    if (!route->timeouts[method].explicit_fields) continue;
+                    timeout_policy_t effective = server->timeouts;
+                    timeout_policy_merge(&effective, &route->timeouts[method]);
+                    char route_path[512];
+                    snprintf(route_path, sizeof route_path, "servers.%s.%s.routes.%s.%s.timeouts",
+                             (const char*)json_it_key(&it_servers), ws ? "websockets" : "http",
+                             route->path, method_names[method]);
+                    if (!timeout_policy_validate(&effective, route_path)) goto failed;
+                }
+            }
+        }
+
         if (!__module_loader_check_unique_domainport(first_server)) {
             log_error_stderr("__module_loader_servers_load: domains with ports must be unique\n");
             goto failed;
@@ -1545,8 +1592,7 @@ int __module_loader_validate_storage_routes(appconfig_t* config) {
             for (int method = 0; method < 7; method++) {
                 if (route->storage_name[method] == NULL) continue;
 
-                storage_type_e type = STORAGE_TYPE_FS;
-                if (!storage_type_in(config->storages, route->storage_name[method], &type)) {
+                if (!storage_type_in(config->storages, route->storage_name[method], NULL)) {
                     log_error_stderr("__module_loader_validate_storage_routes: storage %s not found for route %s\n",
                                      route->storage_name[method], route->path);
                     return 0;
@@ -1940,6 +1986,13 @@ int __module_loader_set_http_route(routeloader_lib_t** first_lib, routeloader_li
             log_error_stderr("__module_loader_set_http_route: http.route item.value must be object with at least 1 element\n");
             return 0;
         }
+
+        const int timeout_method = route_method_index(method);
+        char timeout_path[512];
+        snprintf(timeout_path, sizeof timeout_path, "http.routes.%s.%s.timeouts", route->path, method);
+        if (timeout_method == ROUTE_NONE ||
+            !timeout_policy_load_route(&route->timeouts[timeout_method], json_object_get(token_item, "timeouts"), timeout_path, 0))
+            return 0;
 
         const json_token_t* token_ratelimit = json_object_get(token_item, "ratelimit");
         ratelimiter_t* ratelimiter = NULL;
@@ -2437,6 +2490,13 @@ int __module_loader_set_websockets_route(routeloader_lib_t** first_lib, routeloa
             log_error_stderr("__module_loader_set_websockets_route: websockets.route item.value must be object with at least 2 elements\n");
             return 0;
         }
+
+        const int timeout_method = route_ws_method_index(method);
+        char timeout_path[512];
+        snprintf(timeout_path, sizeof timeout_path, "websockets.routes.%s.%s.timeouts", route->path, method);
+        if (timeout_method == ROUTE_NONE ||
+            !timeout_policy_load_route(&route->timeouts[timeout_method], json_object_get(token_object, "timeouts"), timeout_path, 1))
+            return 0;
 
         const json_token_t* token_file = json_object_get(token_object, "file");
         if (!json_is_string(token_file)) {

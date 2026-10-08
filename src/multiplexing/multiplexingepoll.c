@@ -63,9 +63,11 @@ void* mpx_epoll_init() {
         return NULL;
     }
 
-    /* Failure to arm the timer is non-fatal: the worker simply has no idle/PING
-     * sweep. Everything else (event dispatch, connection lifecycle) still works. */
-    (void)__mpx_timer_create(api);
+    /* Deadlines are mandatory: never silently start without their sweep. */
+    if (!__mpx_timer_create(api)) {
+        api->base.free(api);
+        return NULL;
+    }
 
     return api;
 }

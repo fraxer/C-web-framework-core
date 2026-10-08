@@ -78,6 +78,7 @@ typedef struct h2_ws_tunnel {
 h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, h2stream_t* stream,
                                     int resource_protocol, const ws_deflate_config_t* deflate);
 void h2_ws_tunnel_free(h2_ws_tunnel_t* tunnel);
+int h2_ws_tunnel_tick(h2_ws_tunnel_t* tunnel, uint64_t now);
 
 /* Hand one DATA payload to the parser. `data` must be writable: WebSocket
  * payloads are masked, and the parser unmasks in place — exactly as it does
@@ -89,6 +90,13 @@ void h2_ws_tunnel_free(h2_ws_tunnel_t* tunnel);
  * payload is simply the next read. */
 int h2_ws_tunnel_feed(h2_ws_tunnel_t* tunnel, connection_t* connection,
                       uint8_t* data, size_t len);
+
+/* The useful bytes received so far of a DATA frame still on its way in. They
+ * reach the parser only with the whole frame, but the WebSocket frame and
+ * message deadlines run from their arrival -- otherwise one DATA frame trickled
+ * a byte at a time holds every message timer off. Returns 0 when a deadline has
+ * already passed and the stream has to die. */
+int h2_ws_tunnel_receiving(h2_ws_tunnel_t* tunnel, const uint8_t* data, size_t len, uint64_t now);
 
 /* Is anything waiting to go out on this tunnel? Read by the write scheduler to
  * decide whether the stream deserves a turn and whether to arm EPOLLOUT. */

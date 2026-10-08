@@ -8,6 +8,10 @@
 
 int set_tls(connection_t* connection);
 int set_http(connection_t* connection);
+/* Worker-owned tick. Owns the connection lock and may free the connection. */
+void http_server_tick(connection_t* connection);
+/* Caller holds the connection lock; tick releases it or closes the connection. */
+void http_server_tick_locked(connection_t* connection);
 int http_server_guard_read(connection_t* connection);
 int http_server_guard_write(connection_t* connection);
 void http_server_init_sni_callbacks(server_t* servers);
@@ -17,6 +21,11 @@ void http_server_init_sni_callbacks(server_t* servers);
  * hands it here; the handler fills httpresponse_t and the protocol's write guard
  * serializes it. */
 int http_server_dispatch(connection_t* connection, httprequest_t* request);
+
+/* Resolve the effective timeout policy once, without retaining routing state
+ * in the request. Used when initial headers complete and by internal dispatch. */
+void http_server_request_policy(connection_t* connection, httprequest_t* request,
+                                const timeout_policy_t* inherited);
 
 /* Drive the response filter chain. Shared with the HTTP/2 write guard, which
  * runs the same stages — only the terminal one differs (frames instead of a

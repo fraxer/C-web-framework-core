@@ -3,6 +3,7 @@
 
 #include <stdatomic.h>
 #include <stdint.h>
+#include "timeouts.h"
 
 #include "httprequest.h"
 #include "httpresponse.h"
@@ -78,6 +79,10 @@ typedef struct h2stream {
     size_t  req_body_len;   /* DATA bytes stored in request->payload_.incoming */
     int64_t content_length; /* declared, or -1 when the request carried none */
     uint64_t request_progress_ms; /* last request-body progress, independent of PING */
+    uint64_t body_started_ms;
+    uint64_t response_progress_ms;
+    timeout_policy_t timeout_policy;
+    unsigned timeout_reported;
 
     /* Scheduling: bytes this stream may still put on the wire during the current
      * write turn. Refilled per turn by the write path, spent by the write filter,

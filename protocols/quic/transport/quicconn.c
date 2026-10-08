@@ -4265,6 +4265,7 @@ quicconn_t* quicconn_accept(struct quicendpoint* endpoint,
     ctx->transport_data = conn;
     ctx->transport_free = __quicconn_transport_free;
     ctx->server = server;
+    ctx->receive_policy = server->timeouts;
 
     return conn;
 }

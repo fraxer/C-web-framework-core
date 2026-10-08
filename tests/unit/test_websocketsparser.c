@@ -1360,7 +1360,7 @@ TEST(test_wsp_storage_spill_failure_and_close_cleanup) {
     memset(data, 'x', BODY_STORE_DEFAULT_FILE_THRESHOLD);
     websockets_protocol_t* protocol = websockets_protocol_default_create();
     websocketsrequest_t* request = websocketsrequest_create(NULL, protocol);
-    TEST_REQUIRE_NOT_NULL(request, "spill request");
+    TEST_REQUIRE_NOT_NULL_GOTO(request, "spill request", cleanup);
     TEST_ASSERT(websocketsrequest_payload_append(protocol, data, BODY_STORE_DEFAULT_FILE_THRESHOLD - 1), "memory before spill");
     char* saved_tmp = env()->main.tmp;
     env()->main.tmp = "/nonexistent_dir_cwfr_test";
@@ -1399,6 +1399,8 @@ TEST(test_wsp_storage_spill_failure_and_close_cleanup) {
         if (path) TEST_ASSERT_EQUAL(-1, access(path, F_OK), "connection teardown unlinks incoming file");
         free(path);
     }
+
+cleanup:
     free(data);
     env()->main.client_max_body_size = saved_max;
 }

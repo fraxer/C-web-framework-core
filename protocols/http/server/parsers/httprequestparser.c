@@ -17,6 +17,7 @@
 #include "queryparser.h"
 #include "idn_utils.h"
 #include "connection_s.h"
+#include "httpserverhandlers.h"
 
 #define MAX_HEADER_KEY_SIZE 256
 #define MAX_HEADER_VALUE_SIZE 8192
@@ -45,6 +46,30 @@ static int __header_is_host(http_header_t* header);
 static int __header_is_content_length(http_header_t* header);
 static int __header_is_transfer_encoding(http_header_t* header);
 
+/* Reset the per-request receive state for the request about to arrive. Runs on
+ * handler threads too (prepare_continue, the free path), which may outlive the
+ * worker that owns the listener and even the connection's whole generation: a
+ * hard reload frees listeners while in-flight connections still hold
+ * references, and a cross-generation handler thread can drop the last one
+ * after its config -- every server_t with it -- is gone. So this reads only
+ * the ctx's policy copy, never ctx->listener or ctx->server. */
+static void __reset_receive(httprequestparser_t* parser) {
+    parser->header_started_ms = 0;
+    parser->body_started_ms = 0;
+    parser->body_progress_ms = 0;
+    parser->started_wall_ms = 0;
+    parser->timeout_reported = 0;
+    connection_server_ctx_t* timeout_ctx = parser->connection->ctx;
+    if (timeout_ctx != NULL)
+        parser->timeout_policy = timeout_ctx->receive_policy;
+    else
+        timeout_policy_defaults(&parser->timeout_policy);
+}
+
+static uint64_t __recv_stamp(const httprequestparser_t* parser, uint64_t now) {
+    return connection_recv_stamp(parser->connection != NULL ? parser->connection->ctx : NULL, now);
+}
+
 httprequestparser_t* httpparser_create(connection_t* connection) {
     httprequestparser_t* parser = malloc(sizeof * parser);
     if (parser == NULL) return NULL;
@@ -58,6 +83,8 @@ void httpparser_init(httprequestparser_t* parser, connection_t* connection) {
     parser->base.free = httpparser_free;
     parser->stage = HTTP1REQUESTPARSER_METHOD;
     parser->host_found = connection->ssl != NULL;
+    parser->connection = connection;
+    __reset_receive(parser);
     parser->host_header_seen = 0;
     parser->content_length_found = 0;
     parser->transfer_encoding_found = 0;
@@ -161,6 +188,11 @@ int httpparser_run(httprequestparser_t* parser) {
         return HTTP1PARSER_ERROR;
     }
 
+    if (parser->header_started_ms == 0 && parser->bytes_readed > parser->pos_start) {
+        const uint64_t now = timeout_now_ms();
+        parser->started_wall_ms = now;
+        parser->header_started_ms = __recv_stamp(parser, now);
+    }
     if (parser->stage == HTTP1REQUESTPARSER_PAYLOAD)
         return __parse_payload(parser);
 
@@ -177,6 +209,7 @@ int httpparser_run(httprequestparser_t* parser) {
 
             if (parser->request == NULL) {
                 parser->request = __take_request(parser->connection);
+                if (parser->request != NULL) parser->request->started_ms = parser->started_wall_ms;
                 if (parser->request == NULL)
                     return __clear_and_return(parser, HTTP1PARSER_OUT_OF_MEMORY);
 
@@ -364,6 +397,18 @@ int httpparser_run(httprequestparser_t* parser) {
         case HTTP1REQUESTPARSER_NEWLINE3:
             if (ch == '\n') {
                 parser->stage = HTTP1REQUESTPARSER_PAYLOAD;
+                const uint64_t now = timeout_now_ms();
+                parser->request->headers_done_ms = now;
+                parser->body_started_ms = parser->body_progress_ms = __recv_stamp(parser, now);
+                connection_server_ctx_t* timeout_ctx = parser->connection->ctx;
+                if (timeout_ctx != NULL && timeout_ctx->server != NULL) {
+                    uint32_t header_budget = parser->timeout_policy.request_header_timeout_ms;
+                    parser->timeout_policy = timeout_ctx->receive_policy;
+                    parser->timeout_policy.request_header_timeout_ms = header_budget;
+                }
+
+                http_server_request_policy(parser->connection, parser->request, &parser->timeout_policy);
+                parser->timeout_policy = parser->request->timing_policy;
 
                 // RFC 7230: Host header is mandatory for HTTP/1.1
                 if (parser->request->version == HTTP1_VER_1_1 && !parser->host_header_seen) {
@@ -417,6 +462,7 @@ void httpparser_set_bytes_readed(httprequestparser_t* parser, size_t readed) {
 }
 
 void httpparser_prepare_continue(httprequestparser_t* parser) {
+    __reset_receive(parser);
     bufferdata_clear(&parser->buf);
 
     parser->stage = HTTP1REQUESTPARSER_METHOD;
@@ -484,6 +530,7 @@ int __parse_payload(httprequestparser_t* parser) {
         return __clear_and_return(parser, HTTP1PARSER_ERROR);
 
     parser->content_saved_length += string_len;
+    if (string_len != 0) parser->body_progress_ms = __recv_stamp(parser, timeout_now_ms());
 
     if (has_data_for_next_request) {
         parser->pos += string_len;
@@ -735,6 +782,7 @@ int httpparser_select_server(connection_t* connection, const char* host, size_t 
         if (ipaddr_equal(&server->ip, &connection->ip) && server->port == connection->port &&
             __server_matches_host(server, ascii_domain, ascii_length)) {
             ctx->server = server;
+            ctx->receive_policy = server->timeouts;
             free(ascii_domain);
             return HTTP1PARSER_CONTINUE;
         }

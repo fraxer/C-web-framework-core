@@ -49,6 +49,7 @@ typedef struct env_body_store {
 } env_body_store_t;
 
 typedef struct env_main {
+    timeout_policy_t timeouts;
     appconfig_reload_state_e reload;
     unsigned int workers;
     unsigned int threads;

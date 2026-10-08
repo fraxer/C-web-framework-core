@@ -20,12 +20,16 @@
 
 /* A client-initiated bidirectional stream: id 0, 4, 8, ... */
 static quicstream_t* request_stream(uint64_t index) {
-    return quicstream_create(index << 2, STREAM_WINDOW, STREAM_WINDOW, STREAM_WINDOW);
+    quicstream_t* qs = quicstream_create(index << 2, STREAM_WINDOW, STREAM_WINDOW, STREAM_WINDOW);
+    if (qs == NULL) abort();
+    return qs;
 }
 
 /* A client-initiated unidirectional stream: id 2, 6, 10, ... */
 static quicstream_t* uni_stream(uint64_t index) {
-    return quicstream_create((index << 2) | 0x02, STREAM_WINDOW, STREAM_WINDOW, 0);
+    quicstream_t* qs = quicstream_create((index << 2) | 0x02, STREAM_WINDOW, STREAM_WINDOW, 0);
+    if (qs == NULL) abort();
+    return qs;
 }
 
 static void deliver(quicstream_t* qs, uint64_t offset, const uint8_t* data, size_t len, int fin) {
@@ -198,7 +202,8 @@ TEST(test_h3conn_request_errors) {
     quicstream_on_reset(qs, H3_REQUEST_CANCELLED, n);
     r = h3conn_stream_read(c, NULL, qs);
     TEST_ASSERT(r.status == H3CONN_REQUEST_RESET, "cancelled");
-    TEST_ASSERT(h3conn_request_of(qs)->response == NULL && qs->send.len == 0,
+    const h3stream_t* cancelled = h3conn_request_of(qs);
+    TEST_ASSERT(cancelled != NULL && cancelled->response == NULL && qs->send.len == 0,
                 "no response -- they asked for none");
     /* But our half is ended (RFC 9114 §4.1.1: cancel by terminating every
      * direction still open). Left open, with nothing ever to send on it, the
@@ -410,4 +415,44 @@ TEST(test_h3conn_refusal_stops_the_upload) {
 
     stream_free(qs);
     h3conn_free(c);
+}
+
+static uint64_t h3_timeout_ms;
+static uint64_t h3_timeout_clock(void) { return h3_timeout_ms; }
+
+TEST(test_h3conn_timeout_stream_isolation) {
+    TEST_SUITE("h3conn");
+    h3conn_t* c = h3conn_create(NULL, 65536, 0);
+    quicstream_t* stalled = request_stream(0);
+    quicstream_t* active = request_stream(1);
+    TEST_REQUIRE(c && stalled && active, "driver and streams allocated");
+    h3_timeout_ms = 100000;
+    timeout_set_clock(h3_timeout_clock);
+    uint8_t req[256];
+    size_t n = get_request(req, sizeof req);
+    deliver(stalled, 0, req, n, 0);
+    TEST_ASSERT(h3conn_stream_read(c, NULL, stalled).status == H3CONN_REQUEST_HEADERS, "headers received, waiting for FIN");
+    h3stream_t* st = h3conn_request_of(stalled);
+    TEST_ASSERT(st && st->headers_done, "request body phase entered");
+    if (st) {
+        st->timeout_policy.request_body_idle_timeout_ms = 10;
+    }
+    h3_timeout_ms += 5;
+    deliver(active, 0, req, n, 0);
+    h3conn_stream_read(c, NULL, active);
+    h3stream_t* live = h3conn_request_of(active);
+    if (live) {
+        live->timeout_policy.request_body_idle_timeout_ms = 10;
+    }
+    quicconn_t qc = {0};
+    qc.streams = stalled;
+    stalled->next = active;
+    h3_timeout_ms += 5;
+    h3conn_timeout_tick(c, &qc);
+    TEST_ASSERT(stalled->send_reset_pending && stalled->send_stop_sending_pending, "expired stream reset in both directions");
+    TEST_ASSERT(h3conn_request_of(stalled) == NULL && stalled->app_done(stalled->app), "partial request resources released immediately");
+    TEST_ASSERT(h3conn_request_of(active) == live && !active->send_reset_pending, "active sibling survives");
+    stalled->next = NULL;
+    timeout_set_clock(NULL);
+    stream_free(stalled); stream_free(active); h3conn_free(c);
 }

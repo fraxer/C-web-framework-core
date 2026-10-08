@@ -7,6 +7,7 @@
 #include "response.h"
 #include "ratelimiter.h"
 #include "strtemplate.h"
+#include "timeouts.h"
 
 typedef enum route_methods {
     ROUTE_NONE = -1,
@@ -33,6 +34,7 @@ typedef struct route_param {
 } route_param_t;
 
 typedef struct route {
+    timeout_policy_t timeouts[7]; /* partial overrides, explicit_fields selects members */
     int is_primitive;
     int params_count;
     /* Capture groups of the compiled location, the params' included. */
@@ -60,6 +62,10 @@ typedef struct route {
 } route_t;
 
 route_t* route_create(const char*);
+int route_method_index(const char* method);
+int route_ws_method_index(const char* method);
+int route_find_http(route_t* routes, const char* path, size_t length, int method, route_t** selected);
+void route_timeout_policy(route_t* routes, const char* path, size_t length, int method, timeout_policy_t* policy);
 int route_set_http_handler(route_t*, const char*, void(*)(void*), ratelimiter_t* ratelimiter);
 int route_set_http_static(route_t*, const char* method, const char* static_file, const char* storage_name, ratelimiter_t* ratelimiter);
 int route_set_http_cache_control(route_t*, const char* method, const char* cache_control);

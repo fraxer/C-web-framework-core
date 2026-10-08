@@ -38,6 +38,7 @@ static form_input_t text_input(const char* text) {
 
 static form_input_t list_input(const char* const* strings, size_t count) {
     char** items = count ? calloc(count, sizeof *items) : NULL;
+    if (count && items == NULL) abort();
     for (size_t i = 0; i < count; i++) items[i] = strdup(strings[i]);
     return (form_input_t){ .kind = FORM_INPUT_TEXT_LIST,
                            .data.text_list = { items, count } };
@@ -492,7 +493,7 @@ static void expect_filepath(const form_field_spec_t* field, const char* text,
     TEST_REQUIRE_NOT_NULL(form, label);
     TEST_ASSERT(form_is_valid(form), label);
     const form_value_t* value = form_cleaned_data(form, 0);
-    TEST_ASSERT(value != NULL && value->data.text != NULL &&
+    TEST_ASSERT(value != NULL && value->data.text != NULL && text != NULL &&
                 strcmp(value->data.text, text) == 0, label);
     form_free(form);
 }

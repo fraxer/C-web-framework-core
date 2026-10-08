@@ -2651,6 +2651,8 @@ TEST(test_httprequest_memory_form_thresholds) {
     const char* suffixes[] = {"&empty=", "\r\n--test--\r\n"};
     const char* types[] = {"application/x-www-form-urlencoded", "multipart/form-data; boundary=test"};
     const size_t sizes[] = {20480, BODY_STORE_DEFAULT_FILE_THRESHOLD - 1, BODY_STORE_DEFAULT_FILE_THRESHOLD, BODY_STORE_DEFAULT_FILE_THRESHOLD + 1};
+    char* body = NULL;
+    httprequest_t* request = NULL;
     for (int kind = 0; kind < 2; ++kind) {
         for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
             char label[96];
@@ -2658,18 +2660,19 @@ TEST(test_httprequest_memory_form_thresholds) {
             TEST_CASE(label);
             size_t prefix = strlen(prefixes[kind]), suffix = strlen(suffixes[kind]);
             size_t length = sizes[i] - prefix - suffix;
-            char* body = malloc(sizes[i]);
-            TEST_REQUIRE_NOT_NULL(body, "form fixture");
+            body = malloc(sizes[i]);
+            TEST_REQUIRE_NOT_NULL_GOTO(body, "form fixture", cleanup);
             memcpy(body, prefixes[kind], prefix);
             memset(body + prefix, 'x', length);
             memcpy(body + prefix + length, suffixes[kind], suffix);
-            httprequest_t* request = httprequest_create(NULL);
-            TEST_REQUIRE_NOT_NULL(request, "request");
+            request = httprequest_create(NULL);
+            TEST_REQUIRE_NOT_NULL_GOTO(request, "request", cleanup);
             request->method = ROUTE_POST;
             request->add_header(request, "Content-Type", types[kind]);
             TEST_ASSERT(body_store_prepare(&request->payload_.incoming, sizes[i], "/tmp"), "reserve form");
             TEST_ASSERT(body_store_append(&request->payload_.incoming, body, sizes[i], "/tmp"), "store form");
             free(body);
+            body = NULL;
             char* value = request->get_payloadf(request, "name");
             TEST_ASSERT_NOT_NULL(value, "field spans parser blocks");
             if (value) {
@@ -2687,6 +2690,11 @@ TEST(test_httprequest_memory_form_thresholds) {
             if (value) TEST_ASSERT_EQUAL(length, strlen(value), "field length preserved");
             free(value);
             httprequest_free(request);
+            request = NULL;
         }
     }
+
+cleanup:
+    free(body);
+    if (request != NULL) httprequest_free(request);
 }

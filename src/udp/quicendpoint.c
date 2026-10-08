@@ -2701,6 +2701,9 @@ static void __endpoint_tick(quicendpoint_t* ep, int shutdown_now) {
             }
         }
 
+        connection_server_ctx_t* timeout_ctx = conn->conn.ctx;
+        if (conn->state == QUICCONN_ACTIVE && timeout_ctx && timeout_ctx->parser)
+            h3conn_timeout_tick(timeout_ctx->parser, conn);
         int alive = quicconn_tick(conn, now);
         if (alive && atomic_load_explicit(&conn->want_write, memory_order_acquire)) alive = quicconn_send(conn, now);
 

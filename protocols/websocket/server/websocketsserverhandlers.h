@@ -10,6 +10,7 @@ typedef void*(*queue_data_create)(connection_t* connection, void* component, rat
 
 int websockets_guard_read(connection_t* connection);
 int websockets_guard_write(connection_t* connection);
+void websockets_server_tick(connection_t* connection);
 
 /* Hand a finished response to the connection's output order and, if it is now
  * at the head, ask the event loop for a write turn. Takes connection_s_lock, so

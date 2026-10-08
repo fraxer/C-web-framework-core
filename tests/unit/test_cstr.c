@@ -7,6 +7,7 @@
 /* Helper: cstr_* edit in place, so every test works on its own copy. */
 static char* dup_str(const char* value) {
     char* copy = malloc(strlen(value) + 1);
+    if (copy == NULL) abort();
     strcpy(copy, value);
     return copy;
 }

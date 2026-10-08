@@ -210,6 +210,8 @@ static int __wr_flags(httpresponse_t* response, bufo_t* buf, int flags) {
         }
 
         bufo_move_front_pos(buf, writed);
+        connection_server_ctx_t* timeout_ctx = ((connection_t*)response->connection)->ctx;
+        if (timeout_ctx) timeout_ctx->send_progress_ms = timeout_now_ms();
     }
 
     return CWF_OK;
@@ -374,6 +376,7 @@ int http_write_file_span(httprequest_t* request, httpresponse_t* response, off_t
         const ssize_t sent = sendfile(connection->fd,
                                      response->file_.fd, offset, count);
         if (sent > 0) {
+            if (connection->ctx) ((connection_server_ctx_t*)connection->ctx)->send_progress_ms = timeout_now_ms();
             remaining -= (size_t)sent;
             budget -= (size_t)sent;
             response->body_bytes_sent += (size_t)sent;

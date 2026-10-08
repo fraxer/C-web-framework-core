@@ -1,0 +1,140 @@
+#include "timeouts.h"
+#include "log.h"
+#include <stddef.h>
+#include <string.h>
+#include <time.h>
+
+static const char* const reasons[] = { "headers", "body_idle", "body_total", "tls_handshake", "idle", "send_idle", "pong", "message_idle", "message_total", "application_idle", "close", "handshake" };
+#define REASON_COUNT (sizeof reasons / sizeof reasons[0])
+
+unsigned timeout_event_bit(const char* reason) {
+    for (unsigned r = 0; r < REASON_COUNT; r++)
+        if (!strcmp(reasons[r], reason)) return 1u << r;
+    return 0;
+}
+
+void timeout_event_clear(unsigned* reported, const char* reason) {
+    *reported &= ~timeout_event_bit(reason);
+}
+
+int timeout_report(unsigned* reported, const char* protocol, const char* reason,
+                   int fd, uint64_t stream_id) {
+    if (!reason) return 0;
+    const unsigned bit = timeout_event_bit(reason);
+    if (*reported & bit) return 0;
+    *reported |= bit;
+    const int websocket = !strcmp(protocol, "websocket") || !strcmp(protocol, "h2_ws");
+    log_info("%s protocol=%s reason=%s fd=%d stream=%llu\n",
+        websocket ? "websocket_timeout" : "request_timeout", protocol, reason,
+        fd, (unsigned long long)stream_id);
+    return 1;
+}
+
+typedef struct { const char* name; size_t offset; } timeout_field_t;
+static const timeout_field_t fields[] = {
+#define TIMEOUT_ENTRY(name, value) { #name, offsetof(timeout_policy_t, name) },
+    TIMEOUT_FIELDS(TIMEOUT_ENTRY)
+#undef TIMEOUT_ENTRY
+};
+
+const timeout_policy_t timeout_policy_default = {
+#define TIMEOUT_DEFAULT(name, value) .name = value,
+    TIMEOUT_FIELDS(TIMEOUT_DEFAULT)
+#undef TIMEOUT_DEFAULT
+};
+
+void timeout_policy_defaults(timeout_policy_t* p) {
+    *p = timeout_policy_default;
+}
+
+/* `validate` is off for a route override: it is a patch over a server policy
+ * that is not known here, so the cross-field rules wait for the merge. */
+static int __policy_load(timeout_policy_t* p, const json_token_t* object, const char* path, int validate) {
+    if (object == NULL) return 1;
+    if (!json_is_object(object)) {
+        log_error_stderr("%s must be an object\n", path);
+        return 0;
+    }
+    timeout_policy_t candidate = *p;
+    for (json_it_t it = json_init_it(object); !json_end_it(&it); json_next_it(&it)) {
+        const char* name = json_it_key(&it);
+        const json_token_t* token = json_it_value(&it);
+        size_t i;
+        for (i = 0; i < sizeof fields / sizeof fields[0]; i++)
+            if (strcmp(name, fields[i].name) == 0) break;
+        if (i == sizeof fields / sizeof fields[0]) {
+            log_error_stderr("%s.%s is an unknown timeout\n", path, name);
+            return 0;
+        }
+        long double value = json_is_number(token) ? json_ldouble(token) : -1;
+        if (!(value >= 0 && value <= 86400000) || value != (uint32_t)value ||
+            (value == 0 && (!strcmp(name, "slow_request_threshold_ms") ||
+                            !strcmp(name, "ws_close_timeout_ms")))) {
+            log_error_stderr("%s.%s must be an integer in 0..86400000 ms (slow threshold and close timeout must be positive)\n", path, name);
+            return 0;
+        }
+        *(uint32_t*)((char*)&candidate + fields[i].offset) = (uint32_t)value;
+        candidate.explicit_fields |= UINT64_C(1) << i;
+    }
+    if (validate && !timeout_policy_validate(&candidate, path)) return 0;
+    *p = candidate;
+    return 1;
+}
+
+int timeout_policy_load(timeout_policy_t* p, const json_token_t* object, const char* path) {
+    return __policy_load(p, object, path, 1);
+}
+
+/* Every timeout terminates what it bounds, so the two that stop a slowloris
+ * cannot be switched off, and a server Ping needs a deadline for its Pong. */
+int timeout_policy_validate(const timeout_policy_t* p, const char* path) {
+    if (!p->request_header_timeout_ms || !p->request_body_idle_timeout_ms ||
+        (p->ws_ping_interval_ms && !p->ws_pong_timeout_ms)) {
+        log_error_stderr("%s: header and body idle timeouts must be positive, and so must the Pong timeout when Ping is enabled\n", path);
+        return 0;
+    }
+    return 1;
+}
+
+static uint64_t (*test_clock)(void);
+void timeout_set_clock(uint64_t (*clock_ms)(void)) { test_clock = clock_ms; }
+uint64_t timeout_now_ms(void) {
+    if (test_clock) return test_clock();
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+void timeout_policy_merge(timeout_policy_t* p, const timeout_policy_t* overrides) {
+    for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++)
+        if (overrides->explicit_fields & (UINT64_C(1) << i))
+            *(uint32_t*)((char*)p + fields[i].offset) = *(const uint32_t*)((const char*)overrides + fields[i].offset);
+    p->explicit_fields |= overrides->explicit_fields;
+}
+
+int timeout_policy_load_route(timeout_policy_t* p, const json_token_t* object, const char* path, int ws) {
+    if (!object) return 1;
+    if (!json_is_object(object)) return timeout_policy_load(p, object, path);
+    for (json_it_t it = json_init_it(object); !json_end_it(&it); json_next_it(&it)) {
+        const char* name = json_it_key(&it);
+        int allowed = ws ? (!strncmp(name, "ws_", 3) && strcmp(name, "ws_handshake_timeout_ms")) :
+            (!strcmp(name, "request_body_idle_timeout_ms") || !strcmp(name, "request_body_total_timeout_ms") ||
+             !strcmp(name, "slow_request_threshold_ms"));
+        if (!allowed) {
+            log_error_stderr("%s.%s cannot be overridden on this route\n", path, name);
+            return 0;
+        }
+    }
+    return __policy_load(p, object, path, 0);
+}
+
+int timeout_expired(uint64_t now, uint64_t start, uint32_t budget) {
+    return budget != 0 && start != 0 && now >= start && now - start >= budget;
+}
+
+const char* timeout_request_reason(uint64_t now, uint64_t headers, uint64_t body,
+                                   uint64_t progress, const timeout_policy_t* p) {
+    if (!body) return timeout_expired(now, headers, p->request_header_timeout_ms) ? "headers" : NULL;
+    if (timeout_expired(now, progress, p->request_body_idle_timeout_ms)) return "body_idle";
+    return timeout_expired(now, body, p->request_body_total_timeout_ms) ? "body_total" : NULL;
+}

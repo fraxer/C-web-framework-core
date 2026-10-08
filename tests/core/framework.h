@@ -205,9 +205,10 @@ static inline void register_test_suite(test_suite_fn suite) {
     stats.total++; \
     const char* __str_expected = (expected); \
     const char* __str_actual = (actual); \
-    /* Null-safe: a NULL actual (e.g. a failed canonicalization) must be a \
-     * clean FAIL, never strcmp/printf UB — matches gtest EXPECT_STREQ. */ \
-    if (__str_actual != NULL && strcmp(__str_expected, __str_actual) == 0) { \
+    /* Null-safe: a NULL on either side (e.g. a failed canonicalization) must \
+     * be a clean FAIL, never strcmp/printf UB. */ \
+    if (__str_expected != NULL && __str_actual != NULL && \
+        strcmp(__str_expected, __str_actual) == 0) { \
         stats.passed++; \
     } else { \
         PRINT_TEST_CONTEXT(); \
