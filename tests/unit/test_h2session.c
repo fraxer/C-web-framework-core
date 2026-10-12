@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "framework.h"
 #include "h2session.h"
 #include "connection_s.h"
@@ -5,6 +6,9 @@
 #include "h2ws.h"
 #include "multiplexing.h"
 
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdint.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -619,5 +623,150 @@ TEST(test_h2session_websocket_heartbeat_lifecycle) {
         timeout_set_clock(NULL);
         h2_session_free(s);
     }
+    close(fd[0]); close(fd[1]);
+}
+
+static int rearm_calls;
+static int rearm_events;
+static int stub_control_mod(connection_t* connection, int events) {
+    (void)connection;
+    rearm_calls++;
+    rearm_events = events;
+    return 1;
+}
+
+TEST(test_h2session_shutdown_tick_rearms_tunnel_heartbeat) {
+    TEST_SUITE("h2 websocket heartbeat");
+    TEST_CASE("a Ping queued by a soft-reload tick gets an EPOLLOUT turn");
+    int fd[2];
+    TEST_REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fd) == 0, "socket pair");
+    server_t server = {0};
+    timeout_policy_defaults(&server.timeouts);
+    server.timeouts.ws_ping_interval_ms = 10;
+    server.timeouts.ws_send_idle_timeout_ms = 100;
+    server.timeouts.ws_pong_timeout_ms = 3000;
+    server.timeouts.ws_application_idle_timeout_ms = 0;
+    mpxapi_t api = { .control_mod = stub_control_mod };
+    listener_t listener = { .api = &api };
+    connection_server_ctx_t ctx = { .server = &server, .listener = &listener };
+    connection_t c = { .fd = fd[0], .ctx = &ctx };
+    h2session_t* s = h2_test_session_create(&c);
+    TEST_REQUIRE(s != NULL, "session allocated");
+    ctx.parser = s;
+    timeout_test_ms = 100000;
+    timeout_set_clock(timeout_test_clock);
+    h2stream_t* stream = h2stream_create(s, 1);
+    if (stream) {
+        s->last_stream_id = 1;
+        stream->ws = h2_ws_tunnel_create(&c, stream, 0, NULL);
+    }
+    TEST_ASSERT(stream && stream->ws, "tunnel created");
+    if (stream && stream->ws) {
+        stream->ws->parser->heartbeat_ms = timeout_test_ms;
+        timeout_test_ms += 10;
+        rearm_calls = rearm_events = 0;
+        h2_server_tick(&c, 1);
+        TEST_ASSERT(s->goaway_sent && h2stream_find(s, 1) == stream, "GOAWAY sent, tunnel kept draining");
+        TEST_ASSERT(stream->ws->parser->ping_queued && h2_ws_tunnel_has_output(stream->ws), "heartbeat Ping queued");
+        TEST_ASSERT(rearm_calls == 1 && (rearm_events & MPXOUT), "shutdown tick re-arms for the queued Ping");
+    }
+    timeout_set_clock(NULL);
+    h2_session_free(s);
+    close(fd[0]); close(fd[1]);
+}
+
+/* Short writes on demand: the coalesced DATA path only joins frames of up to
+ * 2 KB, and no socket buffer splits a write that small, so the test hands out
+ * the socket budget itself. Only the one fd is limited; all else passes through. */
+static int send_limit_fd = -1;
+static size_t send_budget;
+ssize_t send(int fd, const void* buf, size_t len, int flags) {
+    static ssize_t (*real_send)(int, const void*, size_t, int);
+    if (real_send == NULL)
+        *(void**)(&real_send) = dlsym(RTLD_NEXT, "send");
+
+    if (fd == send_limit_fd) {
+        if (send_budget == 0) {
+            errno = EAGAIN;
+            return -1;
+        }
+        if (len > send_budget) len = send_budget;
+        const ssize_t n = real_send(fd, buf, len, flags);
+        if (n > 0) send_budget -= (size_t)n;
+        return n;
+    }
+
+    return real_send(fd, buf, len, flags);
+}
+
+TEST(test_h2session_websocket_send_progress_counts_socket_bytes) {
+    TEST_SUITE("h2 websocket send timeout");
+    TEST_CASE("partial writes inside one coalesced DATA frame refresh the send clock");
+    int fd[2];
+    TEST_REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fd) == 0, "socket pair");
+    server_t server = {0};
+    timeout_policy_defaults(&server.timeouts);
+    server.timeouts.ws_ping_interval_ms = 0;
+    server.timeouts.ws_send_idle_timeout_ms = 100;
+    server.timeouts.ws_application_idle_timeout_ms = 0;
+    connection_server_ctx_t ctx = { .server = &server };
+    connection_t c = { .fd = fd[0], .ctx = &ctx };
+    h2session_t* s = h2_test_session_create(&c);
+    TEST_REQUIRE(s != NULL, "session allocated");
+    timeout_test_ms = 100000;
+    timeout_set_clock(timeout_test_clock);
+    s->send_window = H2_DEFAULT_WINDOW;
+    h2stream_t* stream = h2stream_create(s, 1);
+    if (stream) {
+        stream->write_credit = H2_DEFAULT_WINDOW;
+        stream->ws = h2_ws_tunnel_create(&c, stream, 0, NULL);
+    }
+    /* One unmasked binary frame small enough to travel joined with its DATA
+     * header, so the body position only moves once the whole frame is out. */
+    enum { PAYLOAD = 1000 };
+    char* body = calloc(1, PAYLOAD + 4);
+    websocketsresponse_t* response = stream && stream->ws ? websocketsresponse_create(&c) : NULL;
+    connection_out_slot_t* slot = calloc(1, sizeof *slot);
+    if (stream && stream->ws && body && response && slot) {
+        websocketsparser_t* p = stream->ws->parser;
+        body[0] = (char)0x82; body[1] = 126;
+        body[2] = (char)(PAYLOAD >> 8); body[3] = (char)(PAYLOAD & 0xff);
+        websocketsresponse_set_body(response, body, PAYLOAD + 4);
+        body = NULL;
+        slot->response = &response->base;
+        cqueue_lock(stream->ws->out);
+        cqueue_append(stream->ws->out, slot);
+        cqueue_unlock(stream->ws->out);
+        slot = NULL;
+        response = NULL;
+        websocketsparser_send_ready(p, timeout_test_ms);
+        const uint64_t start = timeout_test_ms;
+
+        send_limit_fd = fd[0];
+        send_budget = 300;
+        TEST_ASSERT(h2_ws_tunnel_write(s, stream) == H2_DATA_SOCKET, "socket fills mid-frame");
+        TEST_ASSERT(p->send_progress_ms == start, "first partial write counts as progress");
+
+        timeout_test_ms += 90;
+        send_budget = 300;
+        TEST_ASSERT(h2_ws_tunnel_write(s, stream) == H2_DATA_SOCKET, "still inside the same DATA frame");
+        TEST_ASSERT(stream->ws->writing != NULL && stream->ws->writing->body.pos == 0,
+                    "frame position has not moved yet");
+        TEST_ASSERT(p->send_progress_ms == timeout_test_ms, "socket bytes refresh the send clock");
+        timeout_test_ms += 10;
+        TEST_ASSERT(h2_ws_tunnel_tick(stream->ws, timeout_test_ms), "moving peer does not hit send_idle");
+
+        send_budget = SIZE_MAX;
+        TEST_ASSERT(h2_ws_tunnel_write(s, stream) == H2_DATA_DRAINED, "rest of the frame drains");
+        send_limit_fd = -1;
+        char wire[2048];
+        TEST_ASSERT(recv(fd[1], wire, sizeof wire, 0) == 9 + PAYLOAD + 4, "one whole DATA frame on the wire");
+    } else TEST_ASSERT(0, "tunnel and frame allocated");
+    send_limit_fd = -1;
+    if (response) response->base.free(response);
+    free(slot);
+    free(body);
+    timeout_set_clock(NULL);
+    h2_session_free(s);
     close(fd[0]); close(fd[1]);
 }

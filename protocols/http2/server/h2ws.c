@@ -225,9 +225,16 @@ h2_data_status_e h2_ws_tunnel_write(h2session_t* s, h2stream_t* stream) {
          * stream would shut the tunnel the client is still using. */
         view.is_last = (response->frame_code == WEBSOCKETS_CLOSE) ? 1 : 0;
 
+        /* Progress is bytes the socket took, not view.pos: a coalesced DATA
+         * frame only advances the body once the whole frame has drained, so a
+         * slow but moving peer would otherwise look stalled. Same counter
+         * h2_write_stream uses for responses. */
+        connection_server_ctx_t* ctx = s->connection->ctx;
+        const uint64_t before = ctx ? ctx->h2_write_bytes : 0;
+
         const h2_data_status_e st = h2_data_write(&tunnel->writer, s, stream, &view, 1);
 
-        if (view.pos > response->body.pos)
+        if (ctx && ctx->h2_write_bytes != before)
             tunnel->parser->send_progress_ms = timeout_now_ms();
 
         response->body.pos = view.pos;

@@ -2987,6 +2987,15 @@ void h2_server_tick(connection_t* connection, int shutdown_now) {
             return;
         }
 
+        /* The stream loop above may have queued output — a tunnel heartbeat
+         * Ping — and the streams still draining need it on the wire. Without
+         * the EPOLLOUT turn an otherwise idle WebSocket never sends it and is
+         * reaped by send_idle instead. */
+        if (ctx->listener && !h2_drain_and_rearm(s, connection)) {
+            connection_close_locked(connection);
+            return;
+        }
+
         connection_s_unlock(connection);
         return;
     }
