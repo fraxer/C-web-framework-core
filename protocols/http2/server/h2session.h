@@ -47,8 +47,15 @@ typedef struct h2session {
      * is overwritten on every recv, so h2 accumulates frame bytes here). */
     uint8_t* read_buf;
     size_t   read_len;
+    /* Receive deadlines, stamped on the connection's receive clock
+     * (connection_recv_stamp): writes disarm reads for the whole connection,
+     * and a client cannot be blamed for bytes the server chose not to read. */
     uint64_t frame_started_ms; /* first byte, including an unclassified frame header */
     uint64_t header_started_ms; /* one absolute HEADERS/CONTINUATION block */
+    /* The same two moments in wall time, for request->started_ms and the slow
+     * request threshold. */
+    uint64_t frame_started_wall_ms;
+    uint64_t header_started_wall_ms;
     unsigned header_slow_reported;
     int data_discard; /* timed-out DATA: drain payload before the next frame */
     unsigned header_timeout_reported;

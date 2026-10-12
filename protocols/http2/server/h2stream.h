@@ -78,6 +78,9 @@ typedef struct h2stream {
 
     size_t  req_body_len;   /* DATA bytes stored in request->payload_.incoming */
     int64_t content_length; /* declared, or -1 when the request carried none */
+    /* Request-body deadlines, on the connection's receive clock
+     * (connection_recv_stamp). A tunnel has no body: there body_started_ms is
+     * the wall time its handshake deadline runs from. */
     uint64_t request_progress_ms; /* last request-body progress, independent of PING */
     uint64_t body_started_ms;
     uint64_t response_progress_ms;
