@@ -390,16 +390,25 @@ int websockets_guard_write(connection_t* connection) {
     return r;
 }
 
-int __read(connection_t* connection) {
-    connection_server_ctx_t* ctx = connection->ctx;
-    websocketsparser_t* parser = ctx->parser;
+/* Returns 0 to drop the connection, -1 to stop reading (a Close is under way),
+ * 1 to read on. */
+static int __read_deadline(connection_t* connection) {
+    websocketsparser_t* parser = ((connection_server_ctx_t*)connection->ctx)->parser;
     connection_s_lock(connection, LOCK_SITE_WS_READ);
     const int alive = __timeout_check(connection, timeout_now_ms());
     const int closing = parser->close_started_ms != 0;
     connection_s_unlock(connection);
 
     if (!alive) return 0;
-    if (closing) return 1;
+
+    return closing ? -1 : 1;
+}
+
+int __read(connection_t* connection) {
+    connection_server_ctx_t* ctx = connection->ctx;
+    websocketsparser_t* parser = ctx->parser;
+    int deadline = __read_deadline(connection);
+    if (deadline <= 0) return deadline < 0;
 
     while (1) {
         ssize_t bytes_readed = 0;
@@ -418,6 +427,14 @@ int __read(connection_t* connection) {
         case 0:
             return 0;
         default:
+            /* Every read, not just the first: a peer that keeps the socket
+             * busy holds this loop, and the worker's sweep with it. Check
+             * before run() stamps the new bytes as progress, so a message past
+             * its deadline never reaches dispatch -- whose message_done()
+             * would then wipe the timers and hide it from the next sweep. */
+            deadline = __read_deadline(connection);
+            if (deadline <= 0) return deadline < 0;
+
             websocketsparser_set_bytes_readed(parser, bytes_readed);
             parser->pos_start = 0;
             parser->pos = 0;
