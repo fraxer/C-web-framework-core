@@ -682,28 +682,25 @@ int route_vector_size(const route_t* route) {
     return route == NULL ? 0 : (route->captures + 1) * 2;
 }
 
-int route_match(const route_t* route, const char* path, size_t length,
-                int* vector, int vector_size) {
-    if (route == NULL || path == NULL || vector == NULL || vector_size < 2) return -1;
+int route_match(const route_t* route, const char* path, size_t length, int* vector, int vector_size) {
+    if (route == NULL || path == NULL || vector == NULL || vector_size < 2)
+        return -1;
 
-    for (int i = 0; i < vector_size; i++) vector[i] = -1;
+    for (int i = 0; i < vector_size; i++)
+        vector[i] = -1;
 
-    /* A primitive location is answered by the comparison alone, whichever way
-     * it goes. Its pattern is the same string anchored at both ends
-     * (route_parse_location clears `is_primitive` for anything PCRE reads as
-     * more than itself), so running it after a miss asks the same question a
-     * second time and pays a pcre2_match for the answer it already has. With a
-     * handful of routes on the server that was the top line of the profile --
-     * 5.4% of the worker, all of it in libpcre. */
     if (route->is_primitive) {
-        if (!route_compare_primitive(route, path, length)) return 0;
+        if (!route_compare_primitive(route, path, length))
+            return 0;
+
         vector[0] = 0;
         vector[1] = (int)length;
         return 1;
     }
 
     pcre2_match_data* match_data = pcre2_match_data_create_from_pattern(route->location, NULL);
-    if (match_data == NULL) return -1;
+    if (match_data == NULL)
+        return -1;
 
     const int rc = pcre2_match(route->location, (PCRE2_SPTR)path, length, 0, 0, match_data, NULL);
     if (rc > 0) {
@@ -711,7 +708,9 @@ int route_match(const route_t* route, const char* path, size_t length,
         const uint32_t pairs = pcre2_get_ovector_count(match_data);
 
         for (uint32_t i = 0; i < pairs && (int)(i * 2 + 1) < vector_size; i++) {
-            if (ovector[i * 2] == PCRE2_UNSET) continue;
+            if (ovector[i * 2] == PCRE2_UNSET)
+                continue;
+
             vector[i * 2] = (int)ovector[i * 2];
             vector[i * 2 + 1] = (int)ovector[i * 2 + 1];
         }
@@ -723,13 +722,23 @@ int route_match(const route_t* route, const char* path, size_t length,
 
 int route_find_http(route_t* routes, const char* path, size_t length, int method, route_t** selected) {
     *selected = NULL;
-    if (!path || method < 0 || method >= 7) return 0;
+
+    if (!path || method < 0 || method >= 7)
+        return 0;
+
     for (route_t* route = routes; route; route = route->next) {
-        if (!route->handler[method] && !route->static_file[method]) continue;
+        if (!route->handler[method] && !route->static_file[method])
+            continue;
+
         int vector[ROUTE_VECTOR_MAX];
         int matched = route_match(route, path, length, vector, route_vector_size(route));
-        if (matched < 0) return -1;
-        if (matched) { *selected = route; return 1; }
+        if (matched < 0)
+            return -1;
+
+        if (matched) {
+            *selected = route;
+            return 1;
+        }
     }
     return 0;
 }

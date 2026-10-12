@@ -205,20 +205,18 @@ typedef enum {
 
 static void __apply_route_cache_control(httpresponse_t* response, route_t* route, int method);
 
-/* Called under the connection lock, including before consuming new input.
- * The receive deadlines are stamped and checked on connection_recv_now: while
- * the connection is parked (a handler queued, a response draining) the server
- * is not reading, and the next pipelined request's headers must not be timed
- * out against the server's own stall. */
 static const char* __receive_timeout(httprequestparser_t* p, uint64_t now) {
-    return timeout_request_reason(
-        p->connection != NULL && p->connection->ctx != NULL ?
-            connection_recv_now(p->connection->ctx, now) : now,
-        p->header_started_ms, p->body_started_ms, p->body_progress_ms, &p->timeout_policy);
+    uint64_t t = p->connection != NULL && p->connection->ctx != NULL
+        ? connection_recv_now(p->connection->ctx, now)
+        : now;
+
+    return timeout_request_reason(t, p->header_started_ms, p->body_started_ms, p->body_progress_ms, &p->timeout_policy);
 }
 
 void http_server_tick(connection_t* connection) {
-    if (!connection_s_trylock(connection)) return;
+    if (!connection_s_trylock(connection))
+        return;
+
     http_server_tick_locked(connection);
 }
 
@@ -228,25 +226,40 @@ void http_server_tick_locked(connection_t* connection) {
     const timeout_policy_t* policy = ctx->server != NULL ? &ctx->server->timeouts : NULL;
     const char* reason = NULL;
     unsigned* reported = &ctx->timeout_reported;
+
     if (connection->read == __tls_read) {
-        if (policy && timeout_expired(now, ctx->accepted_ms, policy->tls_handshake_timeout_ms)) reason = "tls_handshake";
+        if (policy && timeout_expired(now, ctx->accepted_ms, policy->tls_handshake_timeout_ms))
+            reason = "tls_handshake";
     } else if (connection->read == http_server_guard_read && ctx->parser != NULL) {
         httprequestparser_t* p = ctx->parser;
         policy = &p->timeout_policy;
-        if (ctx->cont_pending) __send_continue(connection);
+        if (ctx->cont_pending)
+            __send_continue(connection);
+
         reason = __receive_timeout(p, now);
         if (ctx->cont_pending) {
-            reason = timeout_expired(now, ctx->send_progress_ms, policy->response_send_idle_timeout_ms) ? "send_idle" : NULL;
+            reason = timeout_expired(now, ctx->send_progress_ms, policy->response_send_idle_timeout_ms)
+                ? "send_idle"
+                : NULL;
         }
+
         reported = &p->timeout_reported;
         if (!p->header_started_ms && !ctx->request && !ctx->response && cqueue_empty(ctx->queue)) {
-            if (!ctx->idle_started_ms) ctx->idle_started_ms = now;
-            uint32_t budget = ctx->accepted_ms ? policy->request_header_timeout_ms : policy->keepalive_timeout_ms;
-            if (timeout_expired(now, ctx->accepted_ms ? ctx->accepted_ms : ctx->idle_started_ms, budget)) reason = "idle";
+            if (!ctx->idle_started_ms)
+                ctx->idle_started_ms = now;
+
+            uint32_t budget = ctx->accepted_ms
+                ? policy->request_header_timeout_ms
+                : policy->keepalive_timeout_ms;
+
+            if (timeout_expired(now, ctx->accepted_ms ? ctx->accepted_ms : ctx->idle_started_ms, budget))
+                reason = "idle";
         }
+
         httprequest_slow_tick(p->request, policy, "http1", now);
         if (ctx->request)
             httprequest_slow_tick(ctx->request, &((httprequest_t*)ctx->request)->timing_policy, "http1", now);
+
         if (ctx->request && ((httprequest_t*)ctx->request)->headers_done_ms) {
             httprequest_t* r = ctx->request;
             const http_header_t* upgrade = r->get_headern(r, "Upgrade", 7);
@@ -257,21 +270,31 @@ void http_server_tick_locked(connection_t* connection) {
                 reported = &ctx->timeout_reported;
             }
         }
+
         if (ctx->response && atomic_load_explicit(&ctx->need_write, memory_order_acquire)) {
-            if (!ctx->send_progress_ms) ctx->send_progress_ms = now;
-            const timeout_policy_t* send_policy = ctx->request ? &((httprequest_t*)ctx->request)->timing_policy : policy;
+            if (!ctx->send_progress_ms)
+                ctx->send_progress_ms = now;
+
+            const timeout_policy_t* send_policy = ctx->request
+                ? &((httprequest_t*)ctx->request)->timing_policy
+                : policy;
+
             if (timeout_expired(now, ctx->send_progress_ms, send_policy->response_send_idle_timeout_ms)) {
                 policy = send_policy;
                 reason = "send_idle";
                 reported = &ctx->timeout_reported;
             }
-        } else if (!ctx->cont_pending) ctx->send_progress_ms = 0;
+        } else if (!ctx->cont_pending) {
+            ctx->send_progress_ms = 0;
+        }
     }
+
     timeout_report(reported, "http1", reason, connection->fd, 0);
     if (ctx->timeout_closing && timeout_expired(now, ctx->timeout_close_started_ms, 5000)) {
         connection_close_locked(connection);
         return;
     }
+
     if (reason && !ctx->timeout_closing) {
         /* Never insert an error ahead of an in-flight pipeline response. An
          * idle connection -- no request byte yet, fresh or between keep-alive
@@ -284,12 +307,14 @@ void http_server_tick_locked(connection_t* connection) {
             connection_close_locked(connection);
             return;
         }
+
         ctx->timeout_closing = 1;
         ctx->timeout_close_started_ms = now;
         ctx->send_progress_ms = now;
         atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
         connection_after_read(connection);
     }
+
     connection_s_unlock(connection);
 }
 
@@ -317,7 +342,8 @@ int set_http(connection_t* connection) {
     connection->write = http_server_guard_write;
 
     connection_server_ctx_t* ctx = connection->ctx;
-    if (ctx->accepted_ms) ctx->accepted_ms = timeout_now_ms();
+    if (ctx->accepted_ms)
+        ctx->accepted_ms = timeout_now_ms();
 
     if (ctx->parser != NULL) {
         requestparser_t* parser = ctx->parser;
@@ -546,11 +572,15 @@ int __read(connection_t* connection) {
             return 0;
         default:
         {
-            if (ctx->timeout_closing) return 1;
+            if (ctx->timeout_closing)
+                return 1;
+
             const char* timeout_reason = __receive_timeout(parser, timeout_now_ms());
             timeout_report(&parser->timeout_reported, "http1", timeout_reason, connection->fd, 0);
             if (timeout_reason) {
-                if (ctx->request || ctx->response || !cqueue_empty(ctx->queue)) return 0;
+                if (ctx->request || ctx->response || !cqueue_empty(ctx->queue))
+                    return 0;
+
                 ctx->timeout_closing = 1;
                 ctx->timeout_close_started_ms = timeout_now_ms();
                 return __post_parse_refusal(connection, 408);
@@ -817,7 +847,9 @@ int __handler_finished(connection_t* connection, httprequest_t* request, httpres
  * Wrapping the branch keeps every caller out of the business of knowing which
  * path locks. */
 static void __publish_response(connection_t* connection, httprequest_t* request, httpresponse_t* response) {
-    if (request) atomic_store_explicit(&request->handler_done_ms, timeout_now_ms(), memory_order_release);
+    if (request)
+        atomic_store_explicit(&request->handler_done_ms, timeout_now_ms(), memory_order_release);
+
     if (__is_multiplexed(connection)) {
         __handler_finished(connection, request, response);
         return;
@@ -828,14 +860,16 @@ static void __publish_response(connection_t* connection, httprequest_t* request,
     connection_s_unlock(connection);
 }
 
-void http_server_request_policy(connection_t* connection, httprequest_t* request,
-                                const timeout_policy_t* inherited) {
-    if (request->timing_policy_ready) return;
+void http_server_request_policy(connection_t* connection, httprequest_t* request, const timeout_policy_t* inherited) {
+    if (request->timing_policy_ready)
+        return;
+
     connection_server_ctx_t* ctx = connection ? connection->ctx : NULL;
     request->timing_policy = *inherited;
     if (ctx && ctx->server)
         route_timeout_policy(ctx->server->http.route, request->path, request->path_length,
                              request->method, &request->timing_policy);
+
     request->timing_policy_ready = 1;
 }
 
@@ -844,10 +878,13 @@ int http_server_dispatch(connection_t* connection, httprequest_t* request) {
 }
 
 int __handle(connection_t* connection, httprequest_t* request, deferred_handler handler) {
-    if (request && !request->received_ms) request->received_ms = timeout_now_ms();
+    if (request && !request->received_ms)
+        request->received_ms = timeout_now_ms();
+
     connection_server_ctx_t* conn_ctx = connection->ctx;
     if (request && !request->timing_policy_ready && conn_ctx->server)
         http_server_request_policy(connection, request, &conn_ctx->server->timeouts);
+
     httpresponse_t* response = __create_response(connection);
     if (response == NULL) return 0;
     /* h1.1: whether the connection survives this answer is its request's to
@@ -1029,9 +1066,10 @@ int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
     connection_t* connection = request->connection;
     connection_server_ctx_t* ctx = connection->ctx;
 
-    route_t* route;
-    if (route_find_http(ctx->server->http.route, request->path, request->path_length,
-                        request->method, &route) != 1) return 0;
+    route_t* route = NULL;
+    if (route_find_http(ctx->server->http.route, request->path, request->path_length, request->method, &route) != 1)
+        return 0;
+
     ratelimiter_t* ratelimiter = __ratelimiter_find(&ctx->server->http, route);
     int queued = 0;
 
@@ -1040,8 +1078,8 @@ int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
      * groups to expand. */
     const int vector_size = route_vector_size(route);
     int vector[ROUTE_VECTOR_MAX];
-    if (!route->is_primitive && route_match(route, request->path, request->path_length,
-                                           vector, vector_size) != 1) return 0;
+    if (!route->is_primitive && route_match(route, request->path, request->path_length, vector, vector_size) != 1)
+        return 0;
 
     for (route_param_t* param = route->param; param; param = param->next) {
         const int start = vector[param->group * 2];
@@ -1059,8 +1097,7 @@ int __handler_added_to_queue(httprequest_t* request, httpresponse_t* response) {
         httpparser_append_query(request, query);
     }
 
-    switch (__route_dispatch(connection, request, response, route,
-                             route->is_primitive ? NULL : vector, ratelimiter, &queued)) {
+    switch (__route_dispatch(connection, request, response, route, route->is_primitive ? NULL : vector, ratelimiter, &queued)) {
     case ROUTE_DISPATCH_ERROR: return 0;
     case ROUTE_DISPATCH_DONE: return queued;
     case ROUTE_DISPATCH_SKIP: return 0;
@@ -1195,7 +1232,6 @@ void* __queue_data_request_create(connection_t* connection, httprequest_t* reque
 
     data->base.free = __queue_data_request_free;
     data->request = request;
-    if (request) request->queued_ms = timeout_now_ms();
     data->connection = connection;
     data->response = response;
     data->ratelimiter = ratelimiter;
@@ -1206,6 +1242,9 @@ void* __queue_data_request_create(connection_t* connection, httprequest_t* reque
     data->storage_path = NULL;
     data->cache_control = NULL;
     data->storage_type = STORAGE_TYPE_FS;
+
+    if (request)
+        request->queued_ms = timeout_now_ms();
 
     return data;
 }
@@ -1216,7 +1255,6 @@ void* __queue_data_response_create(connection_t* connection, httprequest_t* requ
 
     data->base.free = __queue_data_response_free;
     data->request = request;
-    if (request) request->queued_ms = timeout_now_ms();
     data->connection = connection;
     data->response = response;
     data->ratelimiter = ratelimiter;
@@ -1227,6 +1265,9 @@ void* __queue_data_response_create(connection_t* connection, httprequest_t* requ
     data->storage_path = NULL;
     data->cache_control = NULL;
     data->storage_type = STORAGE_TYPE_FS;
+
+    if (request)
+        request->queued_ms = timeout_now_ms();
 
     return data;
 }
@@ -1246,7 +1287,6 @@ void* __queue_data_storage_create(connection_t* connection, httprequest_t* reque
 
     data->base.free = __queue_data_storage_free;
     data->request = request;
-    if (request) request->queued_ms = timeout_now_ms();
     data->connection = connection;
     data->response = response;
     data->ratelimiter = ratelimiter;
@@ -1256,6 +1296,9 @@ void* __queue_data_storage_create(connection_t* connection, httprequest_t* reque
     data->storage_path = NULL;
     data->cache_control = NULL;
     data->storage_type = STORAGE_TYPE_FS;
+
+    if (request)
+        request->queued_ms = timeout_now_ms();
 
     return data;
 }
@@ -1340,7 +1383,9 @@ void __queue_request_handler(void* arg) {
     }
 
     connection_queue_http_data_t* data = (connection_queue_http_data_t*)item->data;
-    if (data->request) atomic_store_explicit(&data->request->handler_started_ms, timeout_now_ms(), memory_order_release);
+    if (data->request)
+        atomic_store_explicit(&data->request->handler_started_ms, timeout_now_ms(), memory_order_release);
+
     if (item->connection == NULL) {
         log_error("__queue_request_handler: item->connection is NULL\n");
         return;
@@ -1420,7 +1465,9 @@ void __queue_storage_handler(void* arg) {
     }
 
     connection_queue_http_data_t* data = (connection_queue_http_data_t*)item->data;
-    if (data->request) atomic_store_explicit(&data->request->handler_started_ms, timeout_now_ms(), memory_order_release);
+    if (data->request)
+        atomic_store_explicit(&data->request->handler_started_ms, timeout_now_ms(), memory_order_release);
+
     connection_server_ctx_t* conn_ctx = item->connection->ctx;
     if (conn_ctx == NULL) {
         log_error("__queue_storage_handler: conn_ctx is NULL\n");
@@ -1486,7 +1533,9 @@ void __queue_response_handler(void* arg) {
     }
 
     connection_queue_http_data_t* data = (connection_queue_http_data_t*)item->data;
-    if (data->request) atomic_store_explicit(&data->request->handler_started_ms, timeout_now_ms(), memory_order_release);
+    if (data->request)
+        atomic_store_explicit(&data->request->handler_started_ms, timeout_now_ms(), memory_order_release);
+
     connection_server_ctx_t* conn_ctx = item->connection->ctx;
     if (conn_ctx == NULL) {
         log_error("__queue_response_handler: conn_ctx is NULL\n");

@@ -59,15 +59,34 @@ static void __reset_receive(httprequestparser_t* parser) {
     parser->body_progress_ms = 0;
     parser->started_wall_ms = 0;
     parser->timeout_reported = 0;
-    connection_server_ctx_t* timeout_ctx = parser->connection->ctx;
-    if (timeout_ctx != NULL)
-        parser->timeout_policy = timeout_ctx->receive_policy;
+
+    connection_server_ctx_t* ctx = parser->connection->ctx;
+    if (ctx != NULL)
+        parser->timeout_policy = ctx->receive_policy;
     else
         timeout_policy_defaults(&parser->timeout_policy);
 }
 
 static uint64_t __recv_stamp(const httprequestparser_t* parser, uint64_t now) {
     return connection_recv_stamp(parser->connection != NULL ? parser->connection->ctx : NULL, now);
+}
+
+/* Headers are fully read: stamp the body timers and switch the parser to the
+ * request's own timeout policy, keeping the header budget already in effect. */
+static void __start_body_timeout(httprequestparser_t* parser) {
+    const uint64_t now = timeout_now_ms();
+    parser->request->headers_done_ms = now;
+    parser->body_started_ms = parser->body_progress_ms = __recv_stamp(parser, now);
+
+    connection_server_ctx_t* ctx = parser->connection->ctx;
+    if (ctx != NULL && ctx->server != NULL) {
+        uint32_t header_budget = parser->timeout_policy.request_header_timeout_ms;
+        parser->timeout_policy = ctx->receive_policy;
+        parser->timeout_policy.request_header_timeout_ms = header_budget;
+    }
+
+    http_server_request_policy(parser->connection, parser->request, &parser->timeout_policy);
+    parser->timeout_policy = parser->request->timing_policy;
 }
 
 httprequestparser_t* httpparser_create(connection_t* connection) {
@@ -83,8 +102,6 @@ void httpparser_init(httprequestparser_t* parser, connection_t* connection) {
     parser->base.free = httpparser_free;
     parser->stage = HTTP1REQUESTPARSER_METHOD;
     parser->host_found = connection->ssl != NULL;
-    parser->connection = connection;
-    __reset_receive(parser);
     parser->host_header_seen = 0;
     parser->content_length_found = 0;
     parser->transfer_encoding_found = 0;
@@ -100,6 +117,7 @@ void httpparser_init(httprequestparser_t* parser, connection_t* connection) {
     parser->request = NULL;
 
     bufferdata_init(&parser->buf);
+    __reset_receive(parser);
 }
 
 void httpparser_free(void* parser) {
@@ -193,6 +211,7 @@ int httpparser_run(httprequestparser_t* parser) {
         parser->started_wall_ms = now;
         parser->header_started_ms = __recv_stamp(parser, now);
     }
+
     if (parser->stage == HTTP1REQUESTPARSER_PAYLOAD)
         return __parse_payload(parser);
 
@@ -209,9 +228,10 @@ int httpparser_run(httprequestparser_t* parser) {
 
             if (parser->request == NULL) {
                 parser->request = __take_request(parser->connection);
-                if (parser->request != NULL) parser->request->started_ms = parser->started_wall_ms;
                 if (parser->request == NULL)
                     return __clear_and_return(parser, HTTP1PARSER_OUT_OF_MEMORY);
+
+                parser->request->started_ms = parser->started_wall_ms;
 
                 const size_t remaining = parser->bytes_readed - parser->pos;
                 const size_t log_size = remaining < 500 ? remaining : 500;
@@ -397,18 +417,7 @@ int httpparser_run(httprequestparser_t* parser) {
         case HTTP1REQUESTPARSER_NEWLINE3:
             if (ch == '\n') {
                 parser->stage = HTTP1REQUESTPARSER_PAYLOAD;
-                const uint64_t now = timeout_now_ms();
-                parser->request->headers_done_ms = now;
-                parser->body_started_ms = parser->body_progress_ms = __recv_stamp(parser, now);
-                connection_server_ctx_t* timeout_ctx = parser->connection->ctx;
-                if (timeout_ctx != NULL && timeout_ctx->server != NULL) {
-                    uint32_t header_budget = parser->timeout_policy.request_header_timeout_ms;
-                    parser->timeout_policy = timeout_ctx->receive_policy;
-                    parser->timeout_policy.request_header_timeout_ms = header_budget;
-                }
-
-                http_server_request_policy(parser->connection, parser->request, &parser->timeout_policy);
-                parser->timeout_policy = parser->request->timing_policy;
+                __start_body_timeout(parser);
 
                 // RFC 7230: Host header is mandatory for HTTP/1.1
                 if (parser->request->version == HTTP1_VER_1_1 && !parser->host_header_seen) {
@@ -530,7 +539,8 @@ int __parse_payload(httprequestparser_t* parser) {
         return __clear_and_return(parser, HTTP1PARSER_ERROR);
 
     parser->content_saved_length += string_len;
-    if (string_len != 0) parser->body_progress_ms = __recv_stamp(parser, timeout_now_ms());
+    if (string_len != 0)
+        parser->body_progress_ms = __recv_stamp(parser, timeout_now_ms());
 
     if (has_data_for_next_request) {
         parser->pos += string_len;

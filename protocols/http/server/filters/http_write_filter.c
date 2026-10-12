@@ -210,8 +210,9 @@ static int __wr_flags(httpresponse_t* response, bufo_t* buf, int flags) {
         }
 
         bufo_move_front_pos(buf, writed);
-        connection_server_ctx_t* timeout_ctx = ((connection_t*)response->connection)->ctx;
-        if (timeout_ctx) timeout_ctx->send_progress_ms = timeout_now_ms();
+        connection_server_ctx_t* conn_ctx = ((connection_t*)response->connection)->ctx;
+        if (conn_ctx)
+            conn_ctx->send_progress_ms = timeout_now_ms();
     }
 
     return CWF_OK;

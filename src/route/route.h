@@ -34,7 +34,6 @@ typedef struct route_param {
 } route_param_t;
 
 typedef struct route {
-    timeout_policy_t timeouts[7]; /* partial overrides, explicit_fields selects members */
     int is_primitive;
     int params_count;
     /* Capture groups of the compiled location, the params' included. */
@@ -58,6 +57,7 @@ typedef struct route {
      * указатель на storage_t: резолв по имени смотрит в активную конфигурацию
      * в момент запроса и потому переживает reload. */
     char* storage_name[7];
+    timeout_policy_t timeouts[7]; /* partial overrides, explicit_fields selects members */
     ratelimiter_t* ratelimiter;
 } route_t;
 

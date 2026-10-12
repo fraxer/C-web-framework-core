@@ -62,6 +62,7 @@ static int __fanout_allowed(connection_t* connection, const websocketsrequest_t*
 static int __pending_output(connection_server_ctx_t* ctx) {
     if (ctx->response) return 1;
     if (!ctx->write_queue) return 0;
+
     cqueue_lock(ctx->write_queue);
     cqueue_item_t* first = cqueue_first(ctx->write_queue);
     const connection_out_slot_t* slot = first != NULL ? first->data : NULL;
@@ -73,7 +74,8 @@ static int __pending_output(connection_server_ctx_t* ctx) {
 /* Output just became writable: start the send clock (see
  * websocketsparser_send_ready). Caller holds connection_s_lock. */
 static void __send_ready(connection_server_ctx_t* ctx) {
-    if (ctx->parser != NULL) websocketsparser_send_ready(ctx->parser, timeout_now_ms());
+    if (ctx->parser != NULL)
+        websocketsparser_send_ready(ctx->parser, timeout_now_ms());
 }
 
 static int __timeout_check(connection_t* connection, uint64_t now) {
@@ -82,35 +84,52 @@ static int __timeout_check(connection_t* connection, uint64_t now) {
     const char* reason = websocketsparser_timeout(p, now, __pending_output(ctx));
     timeout_report(&p->timeout_reported, "websocket", reason, connection->fd, 0);
     if (reason) {
-        if (p->close_started_ms || p->frame_started_ms || !strcmp(reason, "send_idle")) {
+        if (p->close_started_ms || p->frame_started_ms || !strcmp(reason, "send_idle"))
             return 0;
-        }
+
         p->close_started_ms = now;
-        if (!__post_close_default(connection, 1008, "Session timeout")) return 0;
+        if (!__post_close_default(connection, 1008, "Session timeout"))
+            return 0;
+
         connection->keepalive = 0;
         connection_after_read(connection);
     }
+
     return 1;
 }
 
 void websockets_server_tick(connection_t* connection) {
     if (!connection_s_trylock(connection)) return;
+
     connection_server_ctx_t* ctx = connection->ctx;
     websocketsparser_t* p = ctx->parser;
-    if (p == NULL) { connection_s_unlock(connection); return; }
+    if (p == NULL) {
+        connection_s_unlock(connection);
+        return;
+    }
+
     const uint64_t now = timeout_now_ms();
     if (!__timeout_check(connection, now)) {
         connection_close_locked(connection);
         return;
     }
+
     if (!p->close_started_ms && !p->ping_queued && !p->ping_sent_ms &&
                timeout_expired(now, p->heartbeat_ms, p->timeout_policy.ws_ping_interval_ms)) {
         websocketsresponse_t* response = websocketsresponse_create(connection);
-        if (response == NULL) { connection_close_locked(connection); return; }
+        if (response == NULL) {
+            connection_close_locked(connection);
+            return;
+        }
+
         p->ping_sequence++;
         p->ping_queued = 1;
         websocketsresponse_ping(response, (const char*)&p->ping_sequence, sizeof p->ping_sequence);
-        if (!__post_response(response)) { connection_close_locked(connection); return; }
+        if (!__post_response(response)) {
+            connection_close_locked(connection);
+            return;
+        }
+
         connection_after_read(connection);
     }
     connection_s_unlock(connection);
@@ -378,6 +397,7 @@ int __read(connection_t* connection) {
     const int alive = __timeout_check(connection, timeout_now_ms());
     const int closing = parser->close_started_ms != 0;
     connection_s_unlock(connection);
+
     if (!alive) return 0;
     if (closing) return 1;
 
@@ -541,7 +561,9 @@ int __write(connection_t* connection) {
         if (((websocketsresponse_t*)ctx->response)->frame_code == 0x89 && heartbeat && heartbeat->ping_queued)
             websocketsparser_ping_sent(heartbeat);
 
-        if (heartbeat) timeout_event_clear(&heartbeat->timeout_reported, "send_idle");
+        if (heartbeat)
+            timeout_event_clear(&heartbeat->timeout_reported, "send_idle");
+
         __out_finish_current(connection);
 
         /* A CLOSE frame just left; anything behind it is moot. keepalive

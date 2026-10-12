@@ -396,8 +396,7 @@ static void __mpx_on_tick(mpxapi_t* api) {
             connection_server_ctx_t* ctx = connection->ctx;
             if (ctx->is_http2)
                 h2_server_tick(connection, shutdown_now);
-            else if (connection->read == websockets_guard_read &&
-                     (!shutdown_now || !appconfig_terminating()))
+            else if (connection->read == websockets_guard_read && (!shutdown_now || !appconfig_terminating()))
                 websockets_server_tick(connection);
             else if (shutdown_now && connection->close == connection_close)
                 __mpx_http1_shutdown_tick(connection);
@@ -441,6 +440,7 @@ static void __mpx_http1_shutdown_tick(connection_t* connection) {
         ((httprequestparser_t*)ctx->parser)->header_started_ms != 0;
     const int idle = !receiving && ctx->request == NULL && ctx->response == NULL &&
         !atomic_load_explicit(&ctx->need_write, memory_order_acquire);
+
     if (idle)
         connection_close_locked(connection);
     else if (connection->read == http_server_guard_read) {

@@ -235,7 +235,8 @@ static h3app_t* __app_of(h3conn_t* c, quicstream_t* qs) {
         app->req->request->started_ms = app->req->header_started_ms;
         timeout_policy_defaults(&app->req->timeout_policy);
         connection_server_ctx_t* ctx = c->connection ? c->connection->ctx : NULL;
-        if (ctx && ctx->server) app->req->timeout_policy = ctx->server->timeouts;
+        if (ctx && ctx->server)
+            app->req->timeout_policy = ctx->server->timeouts;
     }
 
     qs->app = app;
@@ -687,6 +688,7 @@ static h3conn_result_t __read_request(h3conn_t* c, quicconn_t* qc, quicstream_t*
                 connection_server_ctx_t* timeout_ctx = c->connection ? c->connection->ctx : NULL;
                 if (timeout_ctx && timeout_ctx->server)
                     app->req->timeout_policy = timeout_ctx->server->timeouts;
+
                 http_server_request_policy(c->connection, app->req->request, &app->req->timeout_policy);
                 app->req->timeout_policy = app->req->request->timing_policy;
 
@@ -1388,13 +1390,18 @@ h3conn_result_t h3conn_stream_read(h3conn_t* c, quicconn_t* qc, quicstream_t* qs
 
 void h3conn_timeout_tick(h3conn_t* c, quicconn_t* qc) {
     if (!c || !qc) return;
+
     const uint64_t now = timeout_now_ms();
     for (quicstream_t* qs = qc->streams; qs; qs = qs->next) {
         h3app_t* app = qs->app;
-        if (!app || !app->is_request || !app->req) continue;
+        if (!app || !app->is_request || !app->req)
+            continue;
+
         h3stream_t* st = app->req;
         const timeout_policy_t* p = &st->timeout_policy;
-        if (!app->abandoned && !st->response_done) httprequest_slow_tick(st->request, p, "h3", now);
+        if (!app->abandoned && !st->response_done)
+            httprequest_slow_tick(st->request, p, "h3", now);
+
         const int sending = !app->abandoned && st->response &&
             (atomic_load_explicit(&st->response_ready, memory_order_acquire) || st->response_done) &&
             (!st->response_done || qs->send.sent_off < qs->send.write_off || (qs->send.fin && !qs->send.fin_sent));
@@ -1404,8 +1411,7 @@ void h3conn_timeout_tick(h3conn_t* c, quicconn_t* qc) {
                 st->response_sent_offset = qs->send.sent_off;
             }
             if (timeout_expired(now, st->response_progress_ms, p->response_send_idle_timeout_ms)) {
-                timeout_report(&st->timeout_reported, "h3", "send_idle",
-                               c->connection ? c->connection->fd : -1, qs->id);
+                timeout_report(&st->timeout_reported, "h3", "send_idle", c->connection ? c->connection->fd : -1, qs->id);
                 app->abandoned = app->drained = 1;
                 st->response_done = 1;
                 atomic_store_explicit(&st->response_ready, 0, memory_order_release);
@@ -1414,14 +1420,23 @@ void h3conn_timeout_tick(h3conn_t* c, quicconn_t* qc) {
                 atomic_store_explicit(&qc->want_write, 1, memory_order_release);
                 continue;
             }
-        } else st->response_progress_ms = 0;
-        if (app->drained) continue;
+        }
+        else {
+            st->response_progress_ms = 0;
+        }
+
+        if (app->drained)
+            continue;
+
         const char* reason = timeout_request_reason(now, st->header_started_ms,
             st->body_started_ms, st->body_progress_ms, p);
-        if (!reason) continue;
-        timeout_report(&st->timeout_reported, "h3", reason,
-                       c->connection ? c->connection->fd : -1, qs->id);
-        if (app->qpack_blocked_counted && c->qpack_blocked_streams) c->qpack_blocked_streams--;
+        if (!reason)
+            continue;
+
+        timeout_report(&st->timeout_reported, "h3", reason, c->connection ? c->connection->fd : -1, qs->id);
+        if (app->qpack_blocked_counted && c->qpack_blocked_streams)
+            c->qpack_blocked_streams--;
+
         app->qpack_blocked_counted = 0;
         st->qpack_blocked = 0;
         (void)qpack_decoder_cancel_stream(c->session->qdec, qs->id);
@@ -1431,6 +1446,7 @@ void h3conn_timeout_tick(h3conn_t* c, quicconn_t* qc) {
             h3stream_free(st);
             app->req = NULL;
         }
+
         atomic_store_explicit(&qc->want_write, 1, memory_order_release);
     }
 }

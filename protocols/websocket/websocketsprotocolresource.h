@@ -90,8 +90,7 @@ typedef struct websockets_protocol_resource {
 websockets_protocol_t* websockets_protocol_resource_create(void);
 int websocketsrequest_get_resource(connection_t* connection, websocketsrequest_t* request);
 /* Policy is updated synchronously before the request leaves for its handler. */
-int websocketsrequest_get_resource_with_policy(connection_t* connection, websocketsrequest_t* request,
-                                               timeout_policy_t* policy);
+int websocketsrequest_get_resource_with_policy(connection_t* connection, websocketsrequest_t* request, timeout_policy_t* policy);
 
 /**
  * Configure connection to use resource WebSocket protocol.
