@@ -162,6 +162,58 @@ TEST(test_h2session_late_partial_frame) {
     h2_session_free(s);
 }
 
+/* Response writes disarm reads for the whole connection; the time spent so
+ * must not count against a partial header block or a stalled upload. */
+TEST(test_h2session_receive_deadlines_pause_with_reads) {
+    TEST_SUITE("h2session");
+    int fd[2];
+    TEST_REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fd) == 0, "local socket pair");
+    server_t server = {0};
+    timeout_policy_defaults(&server.timeouts);
+    server.timeouts.request_header_timeout_ms = 10;
+    connection_server_ctx_t ctx = { .server = &server };
+    connection_t connection = { .fd = fd[0], .ctx = &ctx };
+    h2session_t* s = h2_test_session_create(&connection);
+    TEST_REQUIRE(s != NULL, "session allocated");
+    ctx.parser = s; ctx.is_http2 = 1;
+    timeout_test_ms = 100000;
+    timeout_set_clock(timeout_test_clock);
+    s->abort_epoch_ms = s->ctrl_epoch_ms = s->last_activity_ms = timeout_test_ms;
+
+    h2stream_t* upload = h2stream_create(s, 1);
+    TEST_REQUIRE(upload != NULL, "stream allocated");
+    s->last_stream_id = 1;
+    timeout_policy_defaults(&upload->timeout_policy);
+    upload->timeout_policy.request_body_idle_timeout_ms = 10;
+    upload->body_started_ms = upload->request_progress_ms = connection_recv_stamp(&ctx, timeout_test_ms);
+
+    uint8_t wire[32];
+    uint8_t payload[8] = {0};
+    const size_t n = h2frame_encode(wire, sizeof wire, H2_FRAME_PING, 0, 0, payload, sizeof payload);
+    TEST_ASSERT(n == 17 && h2_session_feed(s, wire, 4), "partial frame starts the header deadline");
+
+    /* Parked for a response write, as connection_control_mod records it. */
+    const uint64_t frozen = connection_recv_now(&ctx, timeout_test_ms);
+    atomic_store(&ctx.recv_clock, frozen | CONNECTION_RECV_PAUSED);
+    timeout_test_ms += 1000;
+    h2_server_tick(&connection, 0);
+    TEST_ASSERT(h2stream_find(s, 1) == upload && !upload->timeout_reported, "paused reads do not expire the upload");
+    TEST_ASSERT(!s->header_timeout_reported, "paused reads do not expire the header block");
+
+    atomic_store(&ctx.recv_clock, timeout_test_ms - frozen);
+    timeout_test_ms += 5;
+    TEST_ASSERT(h2_session_feed(s, wire + 4, n - 4), "frame completes on receive time");
+    TEST_ASSERT(!s->header_timeout_reported, "no header expiry");
+
+    timeout_test_ms += 5;
+    h2_server_tick(&connection, 0);
+    TEST_ASSERT(h2stream_find(s, 1) == NULL, "receive time past the budget expires the upload");
+
+    timeout_set_clock(NULL);
+    h2_session_free(s);
+    close(fd[0]); close(fd[1]);
+}
+
 TEST(test_h2session_configured_timeout_isolation) {
     TEST_SUITE("h2session");
     int fd[2];

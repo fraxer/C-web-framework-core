@@ -100,7 +100,7 @@ def main():
         candidate["servers"]["s2"] = copy.deepcopy(candidate["servers"]["s1"])
         candidate["servers"]["s2"]["domains"] = ["other.localhost"]
         candidate["servers"]["s2"]["timeouts"] = {"request_header_timeout_ms": 60000}
-        rejected(candidate, "vhosts sharing a listener")
+        rejected(candidate, "virtual hosts sharing a listener")
         # The pre-policy HTTP/2 timeout is gone; a config that still sets it is
         # refused instead of silently changing its HTTP/2 budgets.
         candidate = copy.deepcopy(config)

@@ -276,6 +276,13 @@ static uint64_t h2_now_ms(void) {
     return timeout_now_ms();
 }
 
+/* The start of a receive deadline for wall time `now`: response writes disarm
+ * reads for the whole connection, so header and body deadlines run on the
+ * receive clock and stand still meanwhile. */
+static uint64_t h2_recv_stamp(const h2session_t* s, uint64_t now) {
+    return connection_recv_stamp(s->connection->ctx, now);
+}
+
 typedef enum {
     H2_FRAME_ERROR = 0,      /* connection error — GOAWAY(s->error_code) and close */
     H2_FRAME_OK,             /* keep processing frames */
@@ -586,8 +593,8 @@ static int h2_recv_debit(h2_recv_window_t* w, uint32_t len) {
  * only the initial value, so the difference has to go out as a WINDOW_UPDATE). */
 static void h2_stream_recv_init(h2session_t* s, h2stream_t* stream) {
     stream->recv.epoch_ms = h2_now_ms();
-    stream->request_progress_ms = stream->recv.epoch_ms;
-    stream->request->started_ms = s->header_started_ms ? s->header_started_ms : stream->recv.epoch_ms;
+    stream->request_progress_ms = h2_recv_stamp(s, stream->recv.epoch_ms);
+    stream->request->started_ms = s->header_started_wall_ms ? s->header_started_wall_ms : stream->recv.epoch_ms;
     stream->request->slow_reported = s->header_slow_reported;
     stream->request->headers_done_ms = stream->recv.epoch_ms;
     connection_server_ctx_t* tctx = s->connection->ctx;
@@ -1486,8 +1493,10 @@ static h2_frame_result_e h2_reject_stream(h2session_t* s, h2stream_t* stream,
     return H2_FRAME_OK;
 }
 
+/* `now` is wall time; the deadlines are checked on the receive clock. */
 static int h2_body_expired(h2session_t* s, h2stream_t* stream, uint64_t now) {
     const timeout_policy_t* p = &stream->timeout_policy;
+    now = h2_recv_stamp(s, now);
     const int idle = timeout_expired(now, stream->request_progress_ms, p->request_body_idle_timeout_ms);
     const int total = timeout_expired(now, stream->body_started_ms, p->request_body_total_timeout_ms);
     if (!idle && !total)
@@ -1577,8 +1586,8 @@ static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
         return h2_request_failed(s, stream, status);
 
     stream->headers_done = 1;
-    stream->body_started_ms = h2_now_ms();
-    stream->request->headers_done_ms = stream->body_started_ms;
+    stream->request->headers_done_ms = h2_now_ms();
+    stream->body_started_ms = h2_recv_stamp(s, stream->request->headers_done_ms);
     stream->request_progress_ms = stream->body_started_ms;
     connection_server_ctx_t* tctx = s->connection->ctx;
     if (tctx && tctx->server)
@@ -1831,7 +1840,7 @@ static h2_frame_result_e h2_on_data(h2session_t* s, const h2_frame_t* frame) {
     if (!h2_body_append(stream, data, data_len))
         return h2_stream_error(s, stream->id, H2_ERR_INTERNAL_ERROR);
 
-    if (data_len != 0) stream->request_progress_ms = h2_now_ms();
+    if (data_len != 0) stream->request_progress_ms = h2_recv_stamp(s, h2_now_ms());
 
     if (!(frame->flags & H2_FLAG_END_STREAM)) return H2_FRAME_OK;
 
@@ -1948,22 +1957,24 @@ static const timeout_policy_t* h2_receive_policy(h2session_t* s) {
     return &timeout_policy_default;
 }
 
+/* `now` is wall time: the slow request threshold is measured on it, the
+ * header deadline on the receive clock. */
 static int h2_header_expired(h2session_t* s, uint64_t now) {
     const timeout_policy_t* policy = h2_receive_policy(s);
     const uint32_t budget = policy->request_header_timeout_ms;
-    if (s->header_started_ms && !s->header_slow_reported &&
+    if (s->header_started_wall_ms && !s->header_slow_reported &&
         !h2stream_find(s, s->cont_active ? s->cont_stream_id : s->frame.stream_id)) {
-        if (timeout_expired(now, s->header_started_ms, policy->slow_request_threshold_ms)) {
+        if (timeout_expired(now, s->header_started_wall_ms, policy->slow_request_threshold_ms)) {
             s->header_slow_reported = 1;
             log_info("slow_request protocol=h2 phase=headers age_ms=%llu\n",
-                     (unsigned long long)(now - s->header_started_ms));
+                     (unsigned long long)(now - s->header_started_wall_ms));
         }
     }
     /* Before frame classification, retain the existing connection receive
      * protection. Known DATA/control payloads never get an HTTP header budget. */
     const uint64_t start = s->header_started_ms ? s->header_started_ms :
         s->frame.stage != H2FRAME_STAGE_PAYLOAD ? s->frame_started_ms : 0;
-    if (!timeout_expired(now, start, budget))
+    if (!timeout_expired(h2_recv_stamp(s, now), start, budget))
         return 0;
 
     timeout_report(&s->header_timeout_reported, "h2", "headers", s->connection->fd, 0);
@@ -2014,6 +2025,7 @@ static int h2_process_buffer(h2session_t* s) {
      * the clock per check cost several vDSO calls per frame, all of them
      * inside the connection lock that the handler threads wait on. */
     const uint64_t now = timeout_now_ms();
+    const uint64_t recv_now = h2_recv_stamp(s, now);
 
     while (p < end) {
         /* Late bytes must not finish an already expired partial frame/block
@@ -2021,8 +2033,10 @@ static int h2_process_buffer(h2session_t* s) {
         if (h2_header_expired(s, now))
             return h2_fail(s, H2_ERR_ENHANCE_YOUR_CALM);
 
-        if (!s->frame_started_ms)
-            s->frame_started_ms = now;
+        if (!s->frame_started_ms) {
+            s->frame_started_ms = recv_now;
+            s->frame_started_wall_ms = now;
+        }
 
         if (!h2_check_partial_body(s, now))
             return h2_fail(s, s->error_code);
@@ -2043,15 +2057,17 @@ static int h2_process_buffer(h2session_t* s) {
         }
         const h2parse_status_e st = h2frame_parser_feed(&s->frame, &p, feed_end);
         const int classified = s->frame.stage == H2FRAME_STAGE_PAYLOAD || st == H2PARSE_FRAME_READY;
-        if (classified && s->frame.type == H2_FRAME_HEADERS && !s->header_started_ms)
+        if (classified && s->frame.type == H2_FRAME_HEADERS && !s->header_started_ms) {
             s->header_started_ms = s->frame_started_ms;
+            s->header_started_wall_ms = s->frame_started_wall_ms;
+        }
 
         if (classified && s->frame.type == H2_FRAME_DATA && !s->data_discard) {
             h2stream_t* stream = h2stream_find(s, s->frame.stream_id);
             const size_t progress = h2_data_progress(&s->frame);
             if (stream && !stream->rejected && progress > before) {
                 if (!stream->ws) {
-                    stream->request_progress_ms = now;
+                    stream->request_progress_ms = recv_now;
                 }
                 /* A complete frame goes to the tunnel itself in a moment. */
                 else if (st == H2PARSE_CONTINUE && stream->state == H2_STREAM_OPEN &&
@@ -2089,9 +2105,11 @@ static int h2_process_buffer(h2session_t* s) {
         h2frame_parser_get(&s->frame, &frame);
         const h2_frame_result_e r = h2_handle_frame(s, &frame);
         s->frame_started_ms = 0;
+        s->frame_started_wall_ms = 0;
         s->data_discard = 0;
         if (!s->cont_active) {
             s->header_started_ms = 0;
+            s->header_started_wall_ms = 0;
             s->header_slow_reported = 0;
             s->header_timeout_reported = 0;
         }
