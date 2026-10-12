@@ -227,7 +227,9 @@ h2_data_status_e h2_ws_tunnel_write(h2session_t* s, h2stream_t* stream) {
 
         const h2_data_status_e st = h2_data_write(&tunnel->writer, s, stream, &view, 1);
 
-        if (view.pos > response->body.pos) tunnel->parser->send_progress_ms = timeout_now_ms();
+        if (view.pos > response->body.pos)
+            tunnel->parser->send_progress_ms = timeout_now_ms();
+
         response->body.pos = view.pos;
 
         if (st != H2_DATA_DRAINED) return st;
@@ -237,6 +239,7 @@ h2_data_status_e h2_ws_tunnel_write(h2session_t* s, h2stream_t* stream) {
 
         if (response->frame_code == 0x89 && tunnel->parser->ping_queued)
             websocketsparser_ping_sent(tunnel->parser);
+
         timeout_event_clear(&tunnel->parser->timeout_reported, "send_idle");
         response->base.free(response);
         tunnel->writing = NULL;
@@ -345,10 +348,14 @@ static int h2_ws_check_timeout(h2_ws_tunnel_t* tunnel, uint64_t now) {
     const char* reason = websocketsparser_timeout(p, now, h2_ws_tunnel_has_output(tunnel));
     timeout_report(&p->timeout_reported, "h2_ws", reason, tunnel->connection->fd, tunnel->stream->id);
     if (reason) {
-        if (p->close_started_ms || p->frame_started_ms || !strcmp(reason, "send_idle")) return 0;
+        if (p->close_started_ms || p->frame_started_ms || !strcmp(reason, "send_idle"))
+            return 0;
+
         p->close_started_ms = now;
         websocketsresponse_t* response = websocketsresponse_create(tunnel->connection);
-        if (!response) return 0;
+        if (!response)
+            return 0;
+
         const char status[] = { 3, (char)0xf0 }; /* 1008: policy timeout */
         websocketsresponse_close(response, status, sizeof status);
         return h2_ws_queue_now(tunnel, response);
@@ -411,21 +418,30 @@ int h2_ws_tunnel_feed(h2_ws_tunnel_t* tunnel, connection_t* connection,
 
 int h2_ws_tunnel_receiving(h2_ws_tunnel_t* tunnel, const uint8_t* data, size_t len, uint64_t now) {
     /* Late bytes must not rescue a deadline that passed between ticks. */
-    if (!h2_ws_check_timeout(tunnel, now)) return 0;
-    if (!tunnel->parser->close_started_ms) websocketsparser_receiving(tunnel->parser, data, len);
+    if (!h2_ws_check_timeout(tunnel, now))
+        return 0;
+
+    if (!tunnel->parser->close_started_ms)
+        websocketsparser_receiving(tunnel->parser, data, len);
+
     return 1;
 }
 
 int h2_ws_tunnel_tick(h2_ws_tunnel_t* tunnel, uint64_t now) {
     websocketsparser_t* p = tunnel->parser;
-    if (!h2_ws_check_timeout(tunnel, now)) return 0;
+    if (!h2_ws_check_timeout(tunnel, now))
+        return 0;
+
     if (!p->close_started_ms && !p->ping_queued && !p->ping_sent_ms && timeout_expired(now, p->heartbeat_ms, p->timeout_policy.ws_ping_interval_ms)) {
         websocketsresponse_t* response = websocketsresponse_create(tunnel->connection);
-        if (!response) return 0;
+        if (!response)
+            return 0;
+
         p->ping_sequence++;
         p->ping_queued = 1;
         websocketsresponse_ping(response, (const char*)&p->ping_sequence, sizeof p->ping_sequence);
         return h2_ws_queue_now(tunnel, response);
     }
+
     return 1;
 }

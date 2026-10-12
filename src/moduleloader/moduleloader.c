@@ -402,10 +402,8 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
     }
 
     timeout_policy_defaults(&env->main.timeouts);
-    if (!timeout_policy_load(&env->main.timeouts,
-                            json_object_get(token_main, "timeouts"), "main.timeouts"))
+    if (!timeout_policy_load(&env->main.timeouts, json_object_get(token_main, "timeouts"), "main.timeouts"))
         return 0;
-
 
     const json_token_t* token_reload = json_object_get(token_main, "reload");
     if (token_reload == NULL) {
@@ -749,7 +747,6 @@ int module_loader_config_load(appconfig_t* config, json_doc_t* document) {
         goto failed;
     if (!__module_loader_taskmanager_init(config, json_object_get(root, "task_manager")))
         goto failed;
-
     if (!__module_loader_translations_load(config, json_object_get(root, "translations")))
         goto failed;
 
@@ -1429,7 +1426,7 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
             if (other->port == server->port && ipaddr_equal(&other->ip, &server->ip) &&
                 (other->timeouts.request_header_timeout_ms != server->timeouts.request_header_timeout_ms ||
                  other->timeouts.tls_handshake_timeout_ms != server->timeouts.tls_handshake_timeout_ms)) {
-                log_error_stderr("servers.%s.timeouts: vhosts sharing a listener must agree on header/TLS budgets\n", json_it_key(&it_servers));
+                log_error_stderr("servers.%s.timeouts: virtual hosts sharing a listener must agree on header/TLS budgets\n", json_it_key(&it_servers));
                 goto failed;
             }
         }
@@ -1439,14 +1436,17 @@ int __module_loader_servers_load(appconfig_t* config, const json_token_t* token_
         for (int ws = 0; ws < 2; ws++) {
             for (route_t* route = ws ? server->websockets.route : server->http.route; route; route = route->next) {
                 for (int method = 0; method < 7; method++) {
-                    if (!route->timeouts[method].explicit_fields) continue;
+                    if (!route->timeouts[method].explicit_fields)
+                        continue;
+
                     timeout_policy_t effective = server->timeouts;
                     timeout_policy_merge(&effective, &route->timeouts[method]);
                     char route_path[512];
                     snprintf(route_path, sizeof route_path, "servers.%s.%s.routes.%s.%s.timeouts",
                              (const char*)json_it_key(&it_servers), ws ? "websockets" : "http",
                              route->path, method_names[method]);
-                    if (!timeout_policy_validate(&effective, route_path)) goto failed;
+                    if (!timeout_policy_validate(&effective, route_path))
+                        goto failed;
                 }
             }
         }

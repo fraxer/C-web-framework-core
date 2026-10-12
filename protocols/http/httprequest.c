@@ -92,10 +92,14 @@ httprequest_t* httprequest_create(connection_t* connection) {
     request->method = ROUTE_NONE;
     request->asterisk_form = 0;
     request->keepalive = 0;
-    request->started_ms = request->headers_done_ms = request->received_ms = request->queued_ms = 0;
+    request->started_ms = 0;
+    request->headers_done_ms = 0;
+    request->received_ms = 0;
+    request->queued_ms = 0;
     atomic_init(&request->handler_started_ms, 0);
     atomic_init(&request->handler_done_ms, 0);
-    request->slow_reported = request->timing_finished = 0;
+    request->slow_reported = 0;
+    request->timing_finished = 0;
     timeout_policy_defaults(&request->timing_policy);
     request->timing_policy_ready = 0;
     request->version = HTTP1_VER_NONE;
@@ -144,10 +148,14 @@ httprequest_t* httprequest_create(connection_t* connection) {
 }
 
 void httprequest_reset(httprequest_t* request) {
-    request->started_ms = request->headers_done_ms = request->received_ms = request->queued_ms = 0;
+    request->started_ms = 0;
+    request->headers_done_ms = 0;
+    request->received_ms = 0;
+    request->queued_ms = 0;
     atomic_store(&request->handler_started_ms, 0);
     atomic_store(&request->handler_done_ms, 0);
-    request->slow_reported = request->timing_finished = 0;
+    request->slow_reported = 0;
+    request->timing_finished = 0;
     request->method = ROUTE_NONE;
     request->asterisk_form = 0;
     request->keepalive = 0;
@@ -1107,15 +1115,12 @@ void httprequest_slow_tick(httprequest_t* r, const timeout_policy_t* p, const ch
 
     const uint64_t started = atomic_load_explicit(&r->handler_started_ms, memory_order_acquire);
     const uint64_t done = atomic_load_explicit(&r->handler_done_ms, memory_order_acquire);
-    const char* phase = !r->headers_done_ms
-        ? "headers"
-        : !r->received_ms
-            ? "body"
-            : r->queued_ms && !started
-                ? "queue"
-                : started && !done
-                    ? "handler"
-                    : "send";
+    const char* phase = "send";
+
+    if (!r->headers_done_ms) phase = "headers";
+    else if (!r->received_ms) phase = "body";
+    else if (r->queued_ms && !started) phase = "queue";
+    else if (started && !done) phase = "handler";
 
     log_info("slow_request protocol=%s phase=%s age_ms=%llu\n", protocol, phase, (unsigned long long)(now - r->started_ms));
 }

@@ -297,8 +297,7 @@ int connection_control_mod(connection_t* connection, int events) {
      * a worker and a broadcast producer on one connection -- rare and short,
      * but the holder may be in a syscall, so yield rather than spin. */
     _Bool expected = 0;
-    while (!atomic_compare_exchange_weak_explicit(&ctx->arm_locked, &expected, 1,
-                                                  memory_order_acquire, memory_order_relaxed)) {
+    while (!atomic_compare_exchange_weak_explicit(&ctx->arm_locked, &expected, 1, memory_order_acquire, memory_order_relaxed)) {
         expected = 0;
         sched_yield();
     }

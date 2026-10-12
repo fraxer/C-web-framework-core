@@ -35,7 +35,10 @@ static ssize_t __raw_write(connection_t* connection, const char* data, size_t si
     ssize_t written = connection->ssl ?
         openssl_write(connection->ssl, data, size) :
         send(connection->fd, data, size, MSG_NOSIGNAL);
-    if (written > 0 && connection->ctx) ((connection_server_ctx_t*)connection->ctx)->h2_write_bytes += (uint64_t)written;
+
+    if (written > 0 && connection->ctx)
+        ((connection_server_ctx_t*)connection->ctx)->h2_write_bytes += (uint64_t)written;
+
     return written;
 }
 

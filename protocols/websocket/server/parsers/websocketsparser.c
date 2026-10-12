@@ -58,7 +58,8 @@ websocketsparser_t* websocketsparser_create(connection_t* connection, websockets
     /* init ran before there was a connection to read the clock of. */
     parser->application_progress_ms = __recv_now(parser);
     connection_server_ctx_t* ctx = connection->ctx;
-    if (ctx != NULL && ctx->server != NULL) parser->timeout_policy = ctx->server->timeouts;
+    if (ctx != NULL && ctx->server != NULL)
+        parser->timeout_policy = ctx->server->timeouts;
 
     return parser;
 }
@@ -66,11 +67,15 @@ websocketsparser_t* websocketsparser_create(connection_t* connection, websockets
 void websocketsparser_init(websocketsparser_t* parser) {
     timeout_policy_defaults(&parser->timeout_policy);
     parser->connection = NULL;
-    parser->message_started_ms = parser->message_progress_ms = 0;
-    parser->frame_started_ms = parser->frame_progress_ms = 0;
+    parser->message_started_ms = 0;
+    parser->message_progress_ms = 0;
+    parser->frame_started_ms = 0;
+    parser->frame_progress_ms = 0;
     parser->heartbeat_ms = timeout_now_ms();
     parser->application_progress_ms = __recv_now(parser);
-    parser->ping_sent_ms = parser->send_progress_ms = parser->close_started_ms = 0;
+    parser->ping_sent_ms = 0;
+    parser->send_progress_ms = 0;
+    parser->close_started_ms = 0;
     parser->ping_sequence = 0;
     parser->ping_queued = 0;
     parser->timeout_reported = 0;
@@ -173,14 +178,18 @@ int __frame_end(websocketsparser_t* parser) {
 void websocketsparser_receiving(websocketsparser_t* parser, const uint8_t* data, size_t len) {
     if (len == 0) return;
     const uint64_t stamp = __recv_now(parser);
-    if (!parser->frame_started_ms) parser->frame_started_ms = stamp;
+    if (!parser->frame_started_ms)
+        parser->frame_started_ms = stamp;
+
     parser->frame_progress_ms = stamp;
     /* Between frames the first byte names the opcode run() will see; inside
      * one, the opcode is already parsed. Control frames never touch the
      * message timers. */
     const int opcode = parser->stage == WSPARSER_STAGE_FIRST_BYTE ? (data[0] & 0x0F) : parser->frame.opcode;
     if (opcode < WSOPCODE_CLOSE) {
-        if (!parser->message_started_ms) parser->message_started_ms = stamp;
+        if (!parser->message_started_ms)
+            parser->message_started_ms = stamp;
+
         parser->message_progress_ms = stamp;
     }
 }
@@ -188,7 +197,9 @@ void websocketsparser_receiving(websocketsparser_t* parser, const uint8_t* data,
 int websocketsparser_run(websocketsparser_t* parser) {
     if (parser->bytes_readed > parser->pos_start) {
         const uint64_t stamp = __recv_now(parser);
-        if (!parser->frame_started_ms) parser->frame_started_ms = stamp;
+        if (!parser->frame_started_ms)
+            parser->frame_started_ms = stamp;
+
         parser->frame_progress_ms = stamp;
         if (parser->frame.opcode < WSOPCODE_CLOSE && parser->stage != WSPARSER_STAGE_FIRST_BYTE)
             parser->message_progress_ms = stamp;
@@ -216,7 +227,9 @@ int websocketsparser_run(websocketsparser_t* parser) {
             const uint64_t stamp = __recv_now(parser);
             parser->frame_started_ms = parser->frame_progress_ms = stamp;
             if (parser->frame.opcode < WSOPCODE_CLOSE) {
-                if (!parser->message_started_ms) parser->message_started_ms = stamp;
+                if (!parser->message_started_ms)
+                    parser->message_started_ms = stamp;
+
                 parser->message_progress_ms = stamp;
             }
 
@@ -707,18 +720,21 @@ void websockets_frame_init(websockets_frame_t* frame) {
 int websocketsparser_dispatch_resource(websocketsparser_t* p) {
     if (p->request->protocol->get_resource == websocketsrequest_get_resource)
         return websocketsrequest_get_resource_with_policy(p->connection, p->request, &p->timeout_policy);
+
     return p->request->protocol->get_resource(p->connection, p->request);
 }
 
 void websocketsparser_ping_sent(websocketsparser_t* p) {
     if (!p->ping_queued) return;
+
     p->ping_queued = 0;
     p->ping_sent_ms = __recv_now(p);
 }
 
 void websocketsparser_pong(websocketsparser_t* p, const char* payload, size_t length) {
-    if (timeout_expired(__recv_now(p), p->ping_sent_ms,
-        p->timeout_policy.ws_pong_timeout_ms)) return;
+    if (timeout_expired(__recv_now(p), p->ping_sent_ms, p->timeout_policy.ws_pong_timeout_ms))
+        return;
+
     if (p->ping_sent_ms && length == sizeof p->ping_sequence && payload &&
         memcmp(payload, &p->ping_sequence, length) == 0) {
         p->ping_sent_ms = 0;
@@ -750,6 +766,7 @@ const char* websocketsparser_timeout(websocketsparser_t* p, uint64_t now, int se
     const uint64_t recv_now = ctx != NULL ? connection_recv_now(ctx, now) : now;
     if (p->close_started_ms)
         return timeout_expired(now, p->close_started_ms, policy->ws_close_timeout_ms) ? "close" : NULL;
+
     if (timeout_expired(recv_now, p->ping_sent_ms, policy->ws_pong_timeout_ms)) return "pong";
     if (timeout_expired(recv_now, p->message_progress_ms, policy->ws_message_idle_timeout_ms) ||
         timeout_expired(recv_now, p->frame_progress_ms, policy->ws_message_idle_timeout_ms)) return "message_idle";
@@ -758,7 +775,9 @@ const char* websocketsparser_timeout(websocketsparser_t* p, uint64_t now, int se
     if (sending) {
         websocketsparser_send_ready(p, now);
         if (timeout_expired(now, p->send_progress_ms, policy->ws_send_idle_timeout_ms)) return "send_idle";
-    } else websocketsparser_send_drained(p);
+    }
+    else websocketsparser_send_drained(p);
+
     return NULL;
 }
 
@@ -769,7 +788,8 @@ const char* websocketsparser_timeout(websocketsparser_t* p, uint64_t now, int se
  * its own clock. The watchdog still starts it lazily for output that became
  * writable without a publish (a handler that finished with no reply). */
 void websocketsparser_send_ready(websocketsparser_t* p, uint64_t now) {
-    if (!p->send_progress_ms) p->send_progress_ms = now;
+    if (!p->send_progress_ms)
+        p->send_progress_ms = now;
 }
 
 void websocketsparser_send_drained(websocketsparser_t* p) {

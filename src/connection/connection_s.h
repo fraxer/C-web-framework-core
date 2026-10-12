@@ -248,6 +248,7 @@ static inline uint64_t connection_recv_now(const connection_server_ctx_t* ctx, u
     const uint64_t clock = atomic_load_explicit(&ctx->recv_clock, memory_order_relaxed);
     if (clock & CONNECTION_RECV_PAUSED)
         return clock & ~CONNECTION_RECV_PAUSED;
+
     return now > clock ? now - clock : 0;
 }
 

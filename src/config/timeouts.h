@@ -26,6 +26,7 @@ enum timeout_field_index {
     TIMEOUT_FIELDS(TIMEOUT_INDEX)
 #undef TIMEOUT_INDEX
 };
+
 #define TIMEOUT_EXPLICIT(name) (UINT64_C(1) << TIMEOUT_INDEX_##name)
 
 typedef struct timeout_policy {
