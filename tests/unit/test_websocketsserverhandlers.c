@@ -1738,3 +1738,40 @@ TEST(test_wsh_resource_policy_inherits_per_message) {
     wsh_harness_free(&h);
     timeout_set_clock(NULL);
 }
+
+static uint64_t stepping_clock(void) { return heartbeat_test_ms += 4; }
+
+TEST(test_wsh_message_total_checked_on_every_read_regression) {
+    TEST_SUITE("websocket heartbeat");
+    /* REGRESSION: __read checked deadlines only on entry. A frame that kept
+     * arriving looped through goto read_data unchecked, reached its handler
+     * past ws_message_total_timeout_ms, and message_done() then cleared the
+     * timers, so no later sweep saw the violation either. */
+    TEST_CASE("a message that outlives its total budget mid-read is not dispatched");
+
+    wsh_harness_t h;
+    /* 4-byte reads: the frame takes many trips through goto read_data, and the
+     * clock moves 4 ms on every look. */
+    TEST_REQUIRE(wsh_harness_init_sized(&h, 4), "harness init");
+    heartbeat_test_ms = 100000;
+    timeout_set_clock(stepping_clock);
+    timeout_policy_defaults(&h.server.timeouts);
+    TEST_REQUIRE_GOTO(wsh_attach_parser(&h, websockets_protocol_default_create), "parser attach", teardown);
+    h.server.websockets.default_handler = wsh_reply_handle;
+
+    websocketsparser_t* p = h.ctx.parser;
+    wsh_quiet_policy(p);
+    p->timeout_policy.ws_message_total_timeout_ms = 10;
+
+    unsigned char frame[64];
+    const char payload[] = "a message slower than its budget";
+    size_t n = wsh_build_frame(frame, 0x01, 1, (const unsigned char*)payload, sizeof payload - 1);
+    TEST_REQUIRE_GOTO(send(h.peer_fd, frame, n, 0) == (ssize_t)n, "frame sent", teardown);
+    TEST_ASSERT_EQUAL(0, websockets_guard_read(h.conn), "mid-frame expiry drops the connection");
+    TEST_ASSERT(cqueue_pop(h.ctx.queue) == NULL, "the expired message never reaches dispatch");
+    TEST_ASSERT(p->timeout_reported & timeout_event_bit("message_total"), "message_total reported");
+
+    teardown:
+    wsh_harness_free(&h);
+    timeout_set_clock(NULL);
+}
