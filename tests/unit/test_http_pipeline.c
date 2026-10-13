@@ -33,6 +33,7 @@
 #include "httpresponse.h"
 #include "multiplexing.h"
 #include "server.h"
+#include "timeouts.h"
 
 #include <fcntl.h>
 #include <errno.h>
@@ -577,4 +578,174 @@ TEST(test_pipeline_refusal_waits_for_worker) {
     TEST_ASSERT(strcmp(r.order, "404 400") == 0, "the first request's answer, then the refusal");
     TEST_ASSERT(r.last_close, "the refusal says Connection: close");
     TEST_ASSERT(r.destroyed, "and the connection is closed after it");
+}
+
+/* The watchdog tests below run on a test clock and on a server with real
+ * budgets; every other test here keeps hpl_server's zeroed (disabled) ones. */
+static uint64_t hpl_time;
+static uint64_t hpl_clock(void) { return hpl_time; }
+
+static void hpl_timeouts_begin(timeout_policy_t* saved) {
+    *saved = hpl_server.timeouts;
+    timeout_policy_defaults(&hpl_server.timeouts);
+    hpl_server.timeouts.response_send_idle_timeout_ms = 10;
+    hpl_server.timeouts.ws_handshake_timeout_ms = 10;
+    hpl_time = 100000;
+    timeout_set_clock(hpl_clock);
+}
+
+/* A watchdog close leaves the connection in the worker queue, where a worker
+ * would drop it; take it out here, or the next test pops it instead of its own. */
+static void hpl_drain_queue(void) {
+    for (int i = 0; i < 16; i++) {
+        connection_t* queued = __connection_queue_pop();
+        if (queued != NULL) connection_s_dec(queued);
+    }
+}
+
+static void hpl_timeouts_end(const timeout_policy_t* saved) {
+    timeout_set_clock(NULL);
+    hpl_server.timeouts = *saved;
+}
+
+/* Plays epoll and the workers, like hpl_loop, but stops as soon as a worker
+ * has published its answer -- before the write path gets to it. */
+static int hpl_until_worker_published(hpl_t* h) {
+    for (int step = 0; h->alive && step < 2000; step++) {
+        if (atomic_load(&h->ctx->destroyed)) return 0;
+
+        connection_t* queued = __connection_queue_pop();
+        if (queued != NULL) {
+            connection_server_ctx_t* qctx = queued->ctx;
+            cqueue_lock(qctx->queue);
+            connection_queue_item_t* item = cqueue_pop(qctx->queue);
+            cqueue_unlock(qctx->queue);
+            if (item != NULL) { item->run(item); item->free(item); }
+            connection_s_dec(queued);
+            if (item != NULL) return 1;
+            continue;
+        }
+
+        const int armed = atomic_load(&hpl_armed);
+        if ((armed & MPXOUT) || atomic_load(&h->ctx->need_write)) {
+            if (armed & MPXONESHOT) atomic_store(&hpl_armed, 0);
+            h->alive = http_server_guard_write(h->connection);
+        }
+        else if (armed & MPXIN) {
+            if (armed & MPXONESHOT) atomic_store(&hpl_armed, 0);
+            h->alive = http_server_guard_read(h->connection);
+        }
+        else return 0;
+
+        hpl_drain_wire(h);
+    }
+    return 0;
+}
+
+TEST(test_pipeline_queued_answer_send_idle) {
+    TEST_SUITE("http1 pipelining");
+    TEST_CASE("an answer a worker publishes is watched by the send-idle timeout");
+
+    static const char input[] = "GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                                "GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    timeout_policy_t saved;
+    hpl_timeouts_begin(&saved);
+    hpl_t h;
+    hpl_result_t r;
+    int published = 0, announced = 0, kept = 0, closed = 0, reported = 0;
+
+    const int opened = hpl_open(&h, 0);
+    if (opened) {
+        hpl_send(&h, input, sizeof input - 1);
+        published = hpl_until_worker_published(&h);
+        announced = h.ctx->response != NULL && atomic_load(&h.ctx->need_write);
+
+        /* The client stops reading: nothing is written from here on. */
+        connection_s_inc(h.connection); /* the close drops one */
+        http_server_tick(h.connection);
+        hpl_time += 9;
+        http_server_tick(h.connection);
+        kept = !atomic_load(&h.ctx->detached);
+        hpl_time++;
+        http_server_tick(h.connection);
+        closed = atomic_load(&h.ctx->detached);
+        reported = (h.ctx->timeout_reported & timeout_event_bit("send_idle")) != 0;
+        hpl_drain_queue();
+    }
+    hpl_close(&h, &r);
+    hpl_timeouts_end(&saved);
+
+    TEST_REQUIRE(opened && published, "a worker published an answer");
+    TEST_ASSERT(announced, "the published answer announces itself as pending output");
+    TEST_ASSERT(kept, "kept within its send budget");
+    TEST_ASSERT(closed, "a stalled client loses the connection at the deadline");
+    TEST_ASSERT(reported, "send idle reported");
+}
+
+static const char hpl_upgrade_behind[] =
+    "GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    "GET /ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
+TEST(test_pipeline_queued_upgrade_handshake_watchdog) {
+    TEST_SUITE("http1 pipelining");
+    TEST_CASE("an upgrade still in the handler queue is held to its handshake deadline");
+
+    timeout_policy_t saved;
+    hpl_timeouts_begin(&saved);
+    hpl_t h;
+    hpl_result_t r;
+    int queued = 0, kept = 0, closed = 0, reported = 0;
+
+    const int opened = hpl_open(&h, 0);
+    if (opened) {
+        hpl_send(&h, hpl_upgrade_behind, sizeof hpl_upgrade_behind - 1);
+        h.alive = http_server_guard_read(h.connection);
+        cqueue_lock(h.ctx->queue);
+        queued = !cqueue_empty(h.ctx->queue);
+        cqueue_unlock(h.ctx->queue);
+
+        connection_s_inc(h.connection); /* the close drops one */
+        hpl_time += 9;
+        http_server_tick(h.connection);
+        kept = !atomic_load(&h.ctx->detached);
+        hpl_time++;
+        http_server_tick(h.connection);
+        closed = atomic_load(&h.ctx->detached);
+        reported = (h.ctx->timeout_reported & timeout_event_bit("handshake")) != 0;
+        hpl_drain_queue();
+    }
+    hpl_close(&h, &r);
+    hpl_timeouts_end(&saved);
+
+    TEST_REQUIRE(opened && h.alive && queued, "the upgrade waits in the handler queue");
+    TEST_ASSERT(kept, "kept within its handshake budget");
+    TEST_ASSERT(closed, "closed at the handshake deadline");
+    TEST_ASSERT(reported, "handshake timeout reported");
+}
+
+TEST(test_pipeline_queued_upgrade_rechecked_on_publish) {
+    TEST_SUITE("http1 pipelining");
+    TEST_CASE("an upgrade that outlived its deadline in the queue is not answered");
+
+    timeout_policy_t saved;
+    hpl_timeouts_begin(&saved);
+    hpl_t h;
+    hpl_result_t r;
+
+    const int opened = hpl_open(&h, 0);
+    if (opened) {
+        hpl_send(&h, hpl_upgrade_behind, sizeof hpl_upgrade_behind - 1);
+        h.alive = http_server_guard_read(h.connection);
+        /* Every handler thread was busy, and the watchdog did not get a turn. */
+        hpl_time += 10;
+        hpl_loop(&h, NULL);
+    }
+    hpl_close(&h, &r);
+    hpl_timeouts_end(&saved);
+
+    TEST_REQUIRE(opened, "harness must start");
+    TEST_ASSERT_EQUAL_SIZE(1, r.responses, "only the request ahead of the upgrade is answered");
+    TEST_ASSERT(strcmp(r.order, "404") == 0, "and that answer is the first request's");
+    TEST_ASSERT(r.destroyed, "the connection is closed instead of answering the upgrade");
 }

@@ -213,6 +213,36 @@ static const char* __receive_timeout(httprequestparser_t* p, uint64_t now) {
     return timeout_request_reason(t, p->header_started_ms, p->body_started_ms, p->body_progress_ms, &p->timeout_policy);
 }
 
+/* The handshake budget runs from the upgrade's headers, not from when a handler
+ * thread got to it: an upgrade that waited out its deadline in the queue must not
+ * be switched afterwards. */
+static int __ws_handshake_expired(httprequest_t* r, uint64_t now) {
+    if (r == NULL || !r->headers_done_ms)
+        return 0;
+
+    const http_header_t* upgrade = r->get_headern(r, "Upgrade", 7);
+    return upgrade && upgrade->value_length == 9 && !strncasecmp(upgrade->value, "websocket", 9) &&
+        timeout_expired(now, r->headers_done_ms, r->timing_policy.ws_handshake_timeout_ms);
+}
+
+/* ctx->request is bound only when a handler starts, so an upgrade still waiting
+ * in ctx->queue is invisible to the check above. Queued items have not run, and
+ * a worker takes one off only under the queue lock, so their requests are
+ * stable while it is held. */
+static int __queued_ws_handshake_expired(connection_server_ctx_t* ctx, uint64_t now) {
+    int expired = 0;
+
+    cqueue_lock(ctx->queue);
+    for (cqueue_item_t* it = cqueue_first(ctx->queue); it != NULL && !expired; it = it->next) {
+        connection_queue_item_t* item = it->data;
+        connection_queue_http_data_t* data = item != NULL ? (connection_queue_http_data_t*)item->data : NULL;
+        expired = data != NULL && __ws_handshake_expired(data->request, now);
+    }
+    cqueue_unlock(ctx->queue);
+
+    return expired;
+}
+
 void http_server_tick(connection_t* connection) {
     if (!connection_s_trylock(connection))
         return;
@@ -260,15 +290,13 @@ void http_server_tick_locked(connection_t* connection) {
         if (ctx->request)
             httprequest_slow_tick(ctx->request, &((httprequest_t*)ctx->request)->timing_policy, "http1", now);
 
-        if (ctx->request && ((httprequest_t*)ctx->request)->headers_done_ms) {
-            httprequest_t* r = ctx->request;
-            const http_header_t* upgrade = r->get_headern(r, "Upgrade", 7);
-            if (upgrade && upgrade->value_length == 9 && !strncasecmp(upgrade->value, "websocket", 9) &&
-                timeout_expired(now, r->headers_done_ms, r->timing_policy.ws_handshake_timeout_ms)) {
-                policy = &r->timing_policy;
-                reason = "handshake";
-                reported = &ctx->timeout_reported;
-            }
+        if (__ws_handshake_expired(ctx->request, now)) {
+            policy = &((httprequest_t*)ctx->request)->timing_policy;
+            reason = "handshake";
+            reported = &ctx->timeout_reported;
+        } else if (__queued_ws_handshake_expired(ctx, now)) {
+            reason = "handshake";
+            reported = &ctx->timeout_reported;
         }
 
         if (ctx->response && atomic_load_explicit(&ctx->need_write, memory_order_acquire)) {
@@ -831,6 +859,11 @@ int __handler_finished(connection_t* connection, httprequest_t* request, httpres
 
     (void)request;
 
+    /* The send-idle watchdog only watches a response that announces itself,
+     * as the inline path (__post_response) does. Without it a queued answer
+     * to a client that stopped reading held the connection forever. */
+    atomic_store_explicit(&ctx->need_write, 1, memory_order_release);
+
     return connection_after_read(connection);
 }
 
@@ -856,6 +889,17 @@ static void __publish_response(connection_t* connection, httprequest_t* request,
     }
 
     connection_s_lock(connection, __publish_site(connection));
+
+    /* The watchdog may not have ticked between the handler's start and here,
+     * and a 101 that goes out now would switch the connection anyway. Close
+     * it instead, as the watchdog would have: the event loop sees destroyed
+     * on the OUT event that __handler_finished arms. */
+    if (__ws_handshake_expired(request, timeout_now_ms())) {
+        connection_server_ctx_t* ctx = connection->ctx;
+        timeout_report(&ctx->timeout_reported, "http1", "handshake", connection->fd, 0);
+        atomic_store(&ctx->destroyed, 1);
+    }
+
     __handler_finished(connection, request, response);
     connection_s_unlock(connection);
 }
@@ -1418,6 +1462,13 @@ void __queue_request_handler(void* arg) {
         conn_ctx->request = data->request;
         conn_ctx->response = data->response;
         connection_s_unlock(item->connection);
+    }
+
+    /* An upgrade that outlived its handshake budget in the queue is closed on
+     * publish; running the user's handler for it first would be wasted work. */
+    if (!__is_multiplexed(item->connection) && __ws_handshake_expired(data->request, timeout_now_ms())) {
+        __publish_response(item->connection, data->request, data->response);
+        return;
     }
 
     if (!ratelimiter_allow(data->ratelimiter, &item->connection->remote_ip, 1)) {
