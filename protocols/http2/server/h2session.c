@@ -2196,11 +2196,20 @@ int h2_session_feed(h2session_t* s, const uint8_t* data, size_t len) {
     return h2_process_buffer(s);
 }
 
+static void h2_publish_drain(h2session_t* s);
+
 /* Flush pending outbound frames and re-arm epoll for the next event: EPOLLOUT if
  * there is still data to send or a stream waiting on the write path, otherwise
- * EPOLLIN. The shared tail of the read loop and the h2c bootstrap. */
+ * EPOLLIN. The shared tail of the read loop, the timer and the h2c bootstrap. */
 static int h2_drain_and_rearm(h2session_t* s, connection_t* connection) {
     connection_server_ctx_t* ctx = connection->ctx;
+
+    /* A handler may have pushed its response and armed EPOLLOUT before this
+     * caller took the lock. h2_has_writable cannot see a response still in the
+     * publish queue, so without the drain the re-arm below would replace that
+     * EPOLLOUT with a read and strand the response. Callers hold the lock, as
+     * h2_write does when it drains. */
+    h2_publish_drain(s);
 
     if (h2_flush_out(s) == 0) return 0;
 
@@ -2893,6 +2902,10 @@ void h2_server_tick(connection_t* connection, int shutdown_now) {
     connection_server_ctx_t* ctx = connection->ctx;
     h2session_t* s = ctx->parser;
     const uint64_t now = h2_now_ms();
+
+    /* Responses handlers finished since the last write turn: on their streams
+     * before the walk below, so their send-idle clock starts now. */
+    h2_publish_drain(s);
 
     /* Connection activity is not request progress: another stream or PING can
      * keep a stalled upload alive forever. Bound incomplete field blocks by a

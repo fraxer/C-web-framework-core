@@ -675,6 +675,60 @@ TEST(test_h2session_shutdown_tick_rearms_tunnel_heartbeat) {
     close(fd[0]); close(fd[1]);
 }
 
+/* A handler publishes by pushing onto the session's queue and arming EPOLLOUT;
+ * only the write callback used to drain that queue. A tick that ran first saw
+ * no ready stream and re-armed the parked connection for reading only. */
+TEST(test_h2session_tick_keeps_published_response) {
+    TEST_SUITE("h2session");
+    TEST_CASE("a tick between publish and write keeps the response writable");
+    for (int shutdown_now = 0; shutdown_now < 2; shutdown_now++) {
+        int fd[2];
+        TEST_REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fd) == 0, "socket pair");
+        server_t server = {0};
+        timeout_policy_defaults(&server.timeouts);
+        mpxapi_t api = { .control_mod = stub_control_mod };
+        listener_t listener = { .api = &api };
+        connection_server_ctx_t ctx = { .server = &server, .listener = &listener };
+        connection_t c = { .fd = fd[0], .ctx = &ctx };
+        h2session_t* s = h2_test_session_create(&c);
+        TEST_REQUIRE(s != NULL, "session allocated");
+        ctx.parser = s;
+        ctx.is_http2 = 1;
+        /* Parked when the handler was dispatched (connection_queue_append_parallel). */
+        atomic_store(&ctx.broadcast_ref_count, 2);
+        timeout_test_ms = 100000;
+        timeout_set_clock(timeout_test_clock);
+        s->last_activity_ms = timeout_test_ms;
+
+        h2stream_t* stream = h2stream_create(s, 1);
+        httpresponse_t* response = httpresponse_create_h2(&c);
+        TEST_REQUIRE(stream && response, "stream and response allocated");
+        s->last_stream_id = 1;
+        stream->state = H2_STREAM_HALF_CLOSED_REMOTE;
+        timeout_policy_defaults(&stream->timeout_policy);
+        stream->response = response;
+        atomic_store(&stream->handler_pending, 1);
+
+        rearm_calls = rearm_events = 0;
+        TEST_ASSERT(h2_server_response_ready(&c, response), "handler publishes");
+        TEST_ASSERT(rearm_calls == 1 && (rearm_events & MPXOUT), "publish arms EPOLLOUT");
+
+        h2_server_tick(&c, shutdown_now);
+        cqueue_lock(s->publish_queue);
+        const int queued = !cqueue_empty(s->publish_queue);
+        cqueue_unlock(s->publish_queue);
+        TEST_ASSERT(!queued && atomic_load(&stream->response_ready), shutdown_now
+                    ? "shutdown tick puts the response on its stream" : "tick puts the response on its stream");
+        TEST_ASSERT((rearm_events & MPXOUT) && atomic_load(&ctx.need_write), shutdown_now
+                    ? "shutdown tick keeps write interest" : "tick keeps write interest");
+        TEST_ASSERT(stream->response_progress_ms == timeout_test_ms, "send-idle clock started");
+
+        timeout_set_clock(NULL);
+        h2_session_free(s);
+        close(fd[0]); close(fd[1]);
+    }
+}
+
 /* Short writes on demand: the coalesced DATA path only joins frames of up to
  * 2 KB, and no socket buffer splits a write that small, so the test hands out
  * the socket budget itself. Only the one fd is limited; all else passes through. */
