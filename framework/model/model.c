@@ -5,13 +5,13 @@
 #include <stdarg.h>
 #include <time.h>
 #include <locale.h>
-#include <pthread.h>
 
 #include "db.h"
 #include "log.h"
 #include "array.h"
 #include "appconfig.h"
 #include "model.h"
+#include "numlocale.h"
 
 static void __model_value_clear(mvalue_t* value, mtype_e type);
 static void __model_value_free(mvalue_t* value, mtype_e type);
@@ -87,19 +87,10 @@ static dbconnection_t* __model_acquire_conn(const char* dbid) {
    would emit a comma and corrupt both SQL and JSON. We format in a private
    "C" locale via uselocale(), which is thread-local and so safe under the
    framework's worker threads. */
-static locale_t __c_locale = (locale_t)0;
-static pthread_once_t __c_locale_once = PTHREAD_ONCE_INIT;
-
-static void __c_locale_init(void) {
-    __c_locale = newlocale(LC_NUMERIC_MASK, "C", (locale_t)0);
-}
-
 static ssize_t __snprintf_c(char* buf, size_t n, const char* fmt, ...) {
-    pthread_once(&__c_locale_once, __c_locale_init);
-
     locale_t old = (locale_t)0;
-    if (__c_locale != (locale_t)0)
-        old = uselocale(__c_locale);
+    if (numeric_locale() != (locale_t)0)
+        old = uselocale(numeric_locale());
 
     va_list args;
     va_start(args, fmt);
