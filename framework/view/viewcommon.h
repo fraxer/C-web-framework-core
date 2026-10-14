@@ -3,9 +3,11 @@
 
 #include <stdatomic.h>
 
+#include "arena.h"
 #include "json.h"
 #include "bufferdata.h"
 #include "viewexpr.h"
+#include "viewmodifier.h"
 
 #define VIEWPARSER_VARIABLE_ITEM_NAME_SIZE 80
 
@@ -47,6 +49,7 @@ typedef struct view_loop {
     char element_name[VIEWPARSER_VARIABLE_ITEM_NAME_SIZE];
     char key_name[VIEWPARSER_VARIABLE_ITEM_NAME_SIZE];
     const char* key_value;  // object loops: the current key, borrowed from the document
+    size_t key_length;      // its bytes, NUL bytes included
     long long key_index;
     int key_is_index;
 
@@ -70,6 +73,8 @@ typedef struct view_copy_tags {
     view_loop_copy_t* copy;
     view_loop_copy_t* last_copy;
     bufferdata_t buf;
+    arena_t arena;          // strings made by modifiers, reset after every tag
+    view_escape_e escape;   // how {{ }} values reach buf
 } view_copy_tags_t;
 
 typedef struct view {
@@ -77,6 +82,11 @@ typedef struct view {
     view_tag_t* root_tag;
     struct view* next;
 } view_t;
+
+// Bytes a render's modifier arena may keep between tags for reuse.
+#define VIEW_ARENA_RETAIN (1024 * 1024)
+
+void view_arena_reset(arena_t* arena);
 
 void view_tag_free(view_tag_t* tag);
 void view_tag_condition_free(view_tag_t* tag);
