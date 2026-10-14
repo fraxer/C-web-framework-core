@@ -22,6 +22,15 @@ function(cwfr_add_subdirs)
 	endforeach()
 endfunction()
 
+# Make pointer <-> integer conversions an error, as gcc >= 14 and clang do by
+# default. Older gcc only warns, and an API change such as the escape mode
+# render()/send_view() gained before the storage name would then build and
+# crash at run time: render(doc, "views", "/x.tpl") passes a string as the
+# enum and the path as the storage.
+function(cwfr_strict_conversions TARGET)
+	target_compile_options(${TARGET} PRIVATE -Werror=int-conversion)
+endfunction()
+
 # Build a STATIC library from *.c/*.h in the current directory.
 #
 #   cwfr_add_lib(<name>
@@ -42,6 +51,7 @@ function(cwfr_add_lib NAME)
 		set(ARG_INCLUDE_DIRS ".")
 	endif()
 	target_include_directories(${NAME} PUBLIC ${ARG_INCLUDE_DIRS})
+	cwfr_strict_conversions(${NAME})
 
 	if(ARG_LINK_LIBS)
 		target_link_libraries(${NAME} ${ARG_LINK_LIBS})
