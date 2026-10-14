@@ -9695,7 +9695,8 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
  * the document is built from whatever a request brought, so what matters most
  * is that a value is only ever data.
  *
- * The first byte picks the mode:
+ * The first byte picks the mode: bit 0 the input mode below, bit 1 the
+ * escape mode of render() -- VIEW_RAW when set, VIEW_ESCAPE otherwise.
  *   raw -- any bytes as the template, against a document of strings, numbers,
  *     booleans, arrays and an object from the input. Parsing twice gives the
  *     same tree; rendering from a fresh store and again from the cache gives
@@ -9707,7 +9708,8 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
  *     null propagates through arithmetic, strings compare with strcmp, a
  *     number prints as an integer, truthiness as viewexpr_value_istrue says.
  *     Values carry "{{", "{%", "}}" and any other byte but NUL, and must come
- *     out as themselves.
+ *     out as themselves under VIEW_RAW and HTML-escaped (& < > " ') under
+ *     VIEW_ESCAPE.
  *
  * The templates live in a directory made once; a fresh viewstore per input
  * keeps the cache from carrying one input's tree into the next. */
@@ -9884,10 +9886,22 @@ static int __vw_true(vw_val_t v) {
     }
 }
 
-static void __vw_render_val(vw_text_t* out, vw_val_t v) {
+static void __vw_render_val(vw_text_t* out, vw_val_t v, int escape) {
     char buf[32];
     switch (v.type) {
-    case VW_STR: __vw_puts(out, v.s); break;
+    case VW_STR:
+        if (!escape) { __vw_puts(out, v.s); break; }
+        for (const char* p = v.s; *p != 0; p++) {
+            switch (*p) {
+            case '&': __vw_puts(out, "&amp;"); break;
+            case '<': __vw_puts(out, "&lt;"); break;
+            case '>': __vw_puts(out, "&gt;"); break;
+            case '"': __vw_puts(out, "&quot;"); break;
+            case '\'': __vw_puts(out, "&#39;"); break;
+            default: __vw_put(out, p, 1); break;
+            }
+        }
+        break;
     case VW_NUM: snprintf(buf, sizeof buf, "%lld", v.n); __vw_puts(out, buf); break;
     case VW_BOOL: __vw_puts(out, v.b ? "true" : "false"); break;
     default: break;
@@ -9911,6 +9925,7 @@ typedef struct {
     int depth;
     int budget;          /* tags left, so templates stay small */
     vw_text_t tpl;
+    int escape;          /* render() runs with VIEW_ESCAPE: the oracle escapes values */
 } vw_gen_t;
 
 /* Precedence, lowest first: || && == != < <= > >= + - * / % unary. */
@@ -10150,7 +10165,7 @@ static void __vw_item(vw_gen_t* g, vw_text_t* out, int live) {
         __vw_put(&g->tpl, e.text.p, e.text.len);
         __vw_puts(&g->tpl, __vw_space(g->in));
         __vw_puts(&g->tpl, "}}");
-        if (live) __vw_render_val(out, e.v);
+        if (live) __vw_render_val(out, e.v, g->escape);
         __vw_expr_free(&e);
         break;
     }
@@ -10253,12 +10268,12 @@ static view_tag_t* __vw_parse(const char* name, int* ok) {
     return root;
 }
 
-static char* __vw_render(json_doc_t* doc, const char* name) {
+static char* __vw_render(json_doc_t* doc, const char* name, view_escape_e escape) {
     viewstore_t* store = viewstore_create();
     if (store == NULL) abort();
     appconfig()->viewstore = store;
-    char* first = render(doc, VW_STORAGE, "/%s", name);
-    char* cached = render(doc, VW_STORAGE, "/%s", name);
+    char* first = render(doc, escape, VW_STORAGE, "/%s", name);
+    char* cached = render(doc, escape, VW_STORAGE, "/%s", name);
     if ((first == NULL) != (cached == NULL) || (first && strcmp(first, cached) != 0)) __builtin_trap();
     free(cached);
     appconfig()->viewstore = NULL;
@@ -10270,6 +10285,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     if (size < 2) return 0;
     if (!__vw_init()) abort();
     const uint8_t mode = data[0];
+    const view_escape_e escape = (mode & 2) ? VIEW_RAW : VIEW_ESCAPE;
     const size_t split = data[1];
     data += 2; size -= 2;
 
@@ -10288,8 +10304,8 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         if (t1) t1->free(t1);
         if (t2) t2->free(t2);
 
-        char* a = __vw_render(doc.doc, "t.html");
-        char* b = __vw_render(doc.doc, "t.html");
+        char* a = __vw_render(doc.doc, "t.html", escape);
+        char* b = __vw_render(doc.doc, "t.html", escape);
         if ((a == NULL) != (b == NULL) || (a && strcmp(a, b) != 0)) __builtin_trap();
         if ((a != NULL) != ok1) __builtin_trap();     /* refused exactly when the parser refuses */
         free(a);
@@ -10302,7 +10318,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     vw_in_t in = { data, size };
     vw_doc_t doc;
     __vw_doc_build(&doc, &in);
-    vw_gen_t g = { &in, &doc, { { { 0 } } }, 0, 24, { 0 } };
+    vw_gen_t g = { &in, &doc, { { { 0 } } }, 0, 24, { 0 }, escape == VIEW_ESCAPE };
     vw_text_t want = { 0 };
     __vw_puts(&want, "");
     __vw_puts(&g.tpl, "");
@@ -10310,7 +10326,7 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     for (int i = 0; i < items; i++) __vw_item(&g, &want, 1);
     __vw_write("g.html", g.tpl.p, g.tpl.len);
 
-    char* got = __vw_render(doc.doc, "g.html");
+    char* got = __vw_render(doc.doc, "g.html", escape);
     if (getenv("FUZZ_TRACE") != NULL)
         fprintf(stderr, "template [%s]\nwant [%s]\ngot  [%s]\n", g.tpl.p, want.p, got ? got : "(null)");
     if (got == NULL || strcmp(got, want.p) != 0) __builtin_trap();
