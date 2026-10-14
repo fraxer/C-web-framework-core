@@ -9,6 +9,7 @@
 #include "arena.h"
 #include "array.h"
 #include "json.h"
+#include "viewmodifier.h"
 #include "response.h"
 #include "http_filter.h"
 
@@ -91,11 +92,12 @@ typedef struct httpresponse {
      * Render and send HTML template (view).
      * @param response - pointer to httpresponse
      * @param document - JSON document with template data (can be NULL)
+     * @param escape - VIEW_ESCAPE to HTML-escape {{ }} values, VIEW_RAW for non-HTML output
      * @param storage_name - template storage name
      * @param path_format - template path format (supports printf formatting)
      * @param ... - arguments for path formatting
      */
-    void(*send_view)(struct httpresponse* response, json_doc_t* document, const char* storage_name, const char* path_format, ...);
+    void(*send_view)(struct httpresponse* response, json_doc_t* document, view_escape_e escape, const char* storage_name, const char* path_format, ...);
 
     /*
      * Send default HTTP response with status code.

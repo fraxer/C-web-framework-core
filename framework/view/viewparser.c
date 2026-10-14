@@ -14,7 +14,7 @@ static int __viewparser_parse_content(viewparser_t* parser);
 static int __viewparser_variable_create(viewparser_t* parser);
 static void __viewparser_expr_begin(viewparser_t* parser);
 static int __viewparser_expr_collect(viewparser_t* parser, char ch, char close_first);
-static int __viewparser_expr_complete(viewparser_t* parser, int forbid_expression);
+static int __viewparser_expr_complete(viewparser_t* parser, int forbid_expression, int output);
 static void __viewparser_variable_rtrim(viewparser_t* parser);
 static void __viewparser_tag_append_child_or_sibling(view_tag_t* parent, view_tag_t* child);
 static void __viewparser_tag_set_parent_text_params(view_tag_t* tag, view_tag_t* parent);
@@ -296,7 +296,7 @@ int __viewparser_parse_content(viewparser_t* parser) {
                 context->stage = VIEWPARSER_TEXT;
                 context->symbol = VIEWPARSER_FIGFIGCLOSE;
 
-                if (!__viewparser_expr_complete(parser, 0))
+                if (!__viewparser_expr_complete(parser, 0, 1))
                     return 0;
 
                 parser->current_tag = parser->current_tag->parent;
@@ -411,7 +411,7 @@ int __viewparser_parse_content(viewparser_t* parser) {
 
                 // else takes no expression, if/elseif require one
                 view_condition_item_t* tag_cond_item = (view_condition_item_t*)parser->current_tag;
-                if (!__viewparser_expr_complete(parser, tag_cond_item->always_true))
+                if (!__viewparser_expr_complete(parser, tag_cond_item->always_true, 0))
                     return 0;
             }
 
@@ -481,7 +481,7 @@ int __viewparser_parse_content(viewparser_t* parser) {
                 context->stage = VIEWPARSER_TEXT;
                 context->symbol = VIEWPARSER_FIGFIGCLOSE;
 
-                if (!__viewparser_expr_complete(parser, 0)) {
+                if (!__viewparser_expr_complete(parser, 0, 0)) {
                     log_error("__viewparser_parse_content: invalid loop collection expression\n");
                     return 0;
                 }
@@ -618,9 +618,10 @@ int __viewparser_expr_collect(viewparser_t* parser, char ch, char close_first) {
  * @param parser The view parser.
  * @param forbid_expression Non-zero for tags that take no expression (else):
  *                          any non-space content is an error.
+ * @param output Non-zero for a {{ }} tag: raw/nl2br may end the expression.
  * @return 1 on success, 0 otherwise.
  */
-int __viewparser_expr_complete(viewparser_t* parser, int forbid_expression) {
+int __viewparser_expr_complete(viewparser_t* parser, int forbid_expression, int output) {
     __viewparser_variable_rtrim(parser);
 
     bufferdata_complete(&parser->variable_buffer);
@@ -641,7 +642,9 @@ int __viewparser_expr_complete(viewparser_t* parser, int forbid_expression) {
         return 1;
     }
 
-    viewexpr_node_t* expr = viewexpr_parse(expression, expression_size);
+    viewexpr_node_t* expr = output
+        ? viewexpr_parse_output(expression, expression_size)
+        : viewexpr_parse(expression, expression_size);
     bufferdata_reset(&parser->variable_buffer);
 
     if (expr == NULL) {

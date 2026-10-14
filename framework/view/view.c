@@ -9,10 +9,10 @@
 #include "viewstore.h"
 #include "view.h"
 
-static char* __view_render(json_doc_t* document, const char* storage_name, const char* path);
-static char* __view_make_content(view_t* view, json_doc_t* document);
+static char* __view_render(json_doc_t* document, view_escape_e escape, const char* storage_name, const char* path);
+static char* __view_make_content(view_t* view, json_doc_t* document, view_escape_e escape);
 static viewexpr_value_t __view_eval_tag(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag);
-static void __view_write_value(view_copy_tags_t* copy_tags, const viewexpr_value_t* value);
+static void __view_write_value(view_copy_tags_t* copy_tags, const viewexpr_node_t* expr, const viewexpr_value_t* value);
 static void __view_build_content_recursive(view_t* view, json_doc_t* document, view_copy_tags_t* copy_tags, view_tag_t* tag);
 static void __view_copy_loop_tags_init(view_copy_tags_t* copy_tags);
 static void __view_copy_loop_tags_free(view_copy_tags_t* copy_tags);
@@ -20,15 +20,33 @@ static view_loop_t* __view_copy_loop_tag_add(view_copy_tags_t* copy_tags, view_t
 static view_loop_t* __view_copy_loop_tag_get(view_copy_tags_t* copy_tags, view_tag_t* tag);
 
 /**
+ * Reclaims what modifiers allocated for one tag. arena_reset() keeps every
+ * block for reuse, and a request larger than all spare blocks takes a new
+ * one, so results that grow from tag to tag (truncate(n) with increasing n)
+ * would keep the sum of their sizes until the render ends. Past
+ * VIEW_ARENA_RETAIN the blocks go back to the allocator instead.
+ *
+ * @param arena The render's modifier arena.
+ * @return void
+ */
+void view_arena_reset(arena_t* arena) {
+    arena_reset(arena);
+
+    if (arena->total_bytes > VIEW_ARENA_RETAIN)
+        arena_free(arena); // leaves it empty and ready, as arena_init() does
+}
+
+/**
  * Render a view using a JSON document and a storage.
  *
  * @param document The JSON document to use.
+ * @param escape VIEW_ESCAPE to HTML-escape {{ }} values, VIEW_RAW to write them as is.
  * @param storage_name The name of the storage to use.
  * @param path_format The format of the path.
  * @param ... The arguments to format the path.
  * @return The rendered content of the view.
  */
-char* render(json_doc_t* document, const char* storage_name, const char* path_format, ...) {
+char* render(json_doc_t* document, view_escape_e escape, const char* storage_name, const char* path_format, ...) {
     char path[PATH_MAX];
 
     va_list args;
@@ -39,18 +57,19 @@ char* render(json_doc_t* document, const char* storage_name, const char* path_fo
     if (written < 0 || written >= (int)sizeof(path))
         return NULL;
 
-    return __view_render(document, storage_name, path);
+    return __view_render(document, escape, storage_name, path);
 }
 
 /**
  * Render a view.
  *
  * @param document The JSON document to render.
+ * @param escape How {{ }} values are written.
  * @param storage_name The name of the storage to use.
  * @param path The path of the view.
  * @return The rendered content of the view, or NULL if an error occurred.
  */
-char* __view_render(json_doc_t* document, const char* storage_name, const char* path) {
+char* __view_render(json_doc_t* document, view_escape_e escape, const char* storage_name, const char* path) {
     viewstore_t* viewstore = appconfig()->viewstore;
     if (viewstore == NULL) return NULL;
 
@@ -88,7 +107,7 @@ char* __view_render(json_doc_t* document, const char* storage_name, const char* 
         }
     }
 
-    return __view_make_content(view, document);
+    return __view_make_content(view, document, escape);
 }
 
 /**
@@ -96,11 +115,13 @@ char* __view_render(json_doc_t* document, const char* storage_name, const char* 
  *
  * @param view The view to render.
  * @param document The JSON document to render.
+ * @param escape How {{ }} values are written.
  * @return The rendered content of the view, or NULL if an error occurred.
  */
-char* __view_make_content(view_t* view, json_doc_t* document) {
+char* __view_make_content(view_t* view, json_doc_t* document, view_escape_e escape) {
     view_copy_tags_t copy_tags;
     __view_copy_loop_tags_init(&copy_tags);
+    copy_tags.escape = escape;
 
     view_tag_t* child = view->root_tag->child;
     if (child == NULL) {
@@ -138,7 +159,7 @@ typedef struct view_scope_data {
  */
 static viewexpr_value_t __view_scope_resolve(const viewexpr_scope_t* scope, const char* name) {
     const view_scope_data_t* data = scope->data;
-    viewexpr_value_t value = { VIEWEXPR_NULL, 0, 0, NULL, NULL };
+    viewexpr_value_t value = { VIEWEXPR_NULL, 0, 0, NULL, NULL, 0 };
 
     view_loop_t* tag_parent = __view_copy_loop_tag_get(data->copy_tags, data->tag->data_parent);
     while (tag_parent != NULL) {
@@ -150,6 +171,7 @@ static viewexpr_value_t __view_scope_resolve(const viewexpr_scope_t* scope, cons
             else {
                 value.type = VIEWEXPR_STRING;
                 value.string = tag_parent->key_value;
+                value.length = tag_parent->key_length;
             }
 
             return value;
@@ -178,29 +200,38 @@ static viewexpr_value_t __view_scope_resolve(const viewexpr_scope_t* scope, cons
  */
 viewexpr_value_t __view_eval_tag(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag) {
     view_scope_data_t data = { copy_tags, document, tag };
-    const viewexpr_scope_t scope = { __view_scope_resolve, &data };
+    const viewexpr_scope_t scope = { __view_scope_resolve, &data, &copy_tags->arena };
 
     return viewexpr_eval(tag->expr, &scope);
 }
 
 /**
- * Writes an expression value to the output buffer: strings as is, numbers
- * and booleans in their canonical text form, null and containers as nothing.
+ * Writes the value of a {{ }} tag to the output buffer: strings HTML-escaped
+ * in VIEW_ESCAPE mode unless the tag ends in raw (NUL bytes as U+FFFD), numbers and booleans in
+ * their canonical text form, null and containers as nothing. A tag ending in
+ * a safe modifier (nl2br) is written by that modifier.
  *
- * @param copy_tags The copy tags structure with the output buffer.
+ * @param copy_tags The copy tags structure with the output buffer and mode.
+ * @param expr The tag expression.
  * @param value The value to write.
  * @return void
  */
-void __view_write_value(view_copy_tags_t* copy_tags, const viewexpr_value_t* value) {
+void __view_write_value(view_copy_tags_t* copy_tags, const viewexpr_node_t* expr, const viewexpr_value_t* value) {
+    const viewmodifier_t* root = expr != NULL && expr->type == VIEWEXPR_NODE_MODIFIER ? expr->modifier : NULL;
+
+    if (root != NULL && root->kind == VIEWMOD_SAFE) {
+        root->output(&copy_tags->buf, value, copy_tags->escape);
+        return;
+    }
+
     switch (value->type)
     {
     case VIEWEXPR_STRING:
     {
-        const char* string = value->string;
-        if (string == NULL) return;
+        if (value->string == NULL) return;
 
-        for (size_t i = 0; string[i] != 0; i++)
-            bufferdata_push(&copy_tags->buf, string[i]);
+        const int raw = root != NULL && root->kind == VIEWMOD_RAW;
+        viewmodifier_write_text(&copy_tags->buf, value->string, value->length, raw ? VIEW_RAW : copy_tags->escape);
 
         break;
     }
@@ -251,7 +282,10 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
                 bufferdata_push(&copy_tags->buf, content[i]);
 
             const viewexpr_value_t value = __view_eval_tag(copy_tags, document, child);
-            __view_write_value(copy_tags, &value);
+            __view_write_value(copy_tags, child->expr, &value);
+
+            // the value is in the buffer now: what modifiers allocated is no longer needed
+            view_arena_reset(&copy_tags->arena);
 
             if (child->next == NULL) {
                 size = bufferdata_writed(&parent->result_content);
@@ -285,6 +319,7 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
             if (!istrue) {
                 const viewexpr_value_t value = __view_eval_tag(copy_tags, document, child);
                 istrue = viewexpr_value_istrue(&value);
+                view_arena_reset(&copy_tags->arena);
             }
 
             if (!istrue) {
@@ -341,6 +376,10 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
 
             const viewexpr_value_t loop_value = __view_eval_tag(copy_tags, document, child);
             const json_token_t* token = loop_value.type == VIEWEXPR_TOKEN ? loop_value.token : NULL;
+
+            // a collection is always a document token (modifiers never make
+            // containers): what its expression allocated is no longer needed
+            view_arena_reset(&copy_tags->arena);
             if (token != NULL) {
                 if (token->type == JSON_OBJECT || token->type == JSON_ARRAY) {
                     for (json_it_t it = json_init_it(token); !json_end_it(&it); it = json_next_it(&it)) {
@@ -350,12 +389,14 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
                         if (token->type == JSON_OBJECT) {
                             const char* key = json_it_key(&it);
                             tag_for->key_value = key != NULL ? key : "";
+                            tag_for->key_length = key != NULL ? json_string_size(it.key) : 0;
                             tag_for->key_is_index = 0;
                             tag_for->key_index = 0;
                         }
                         else {
                             const int key_index = *(int*)json_it_key(&it);
                             tag_for->key_value = NULL;
+                            tag_for->key_length = 0;
                             tag_for->key_is_index = 1;
                             tag_for->key_index = key_index;
                         }
@@ -437,6 +478,8 @@ void __view_copy_loop_tags_init(view_copy_tags_t* copy_tags) {
     if (copy_tags == NULL) return;
 
     bufferdata_init(&copy_tags->buf);
+    arena_init(&copy_tags->arena);
+    copy_tags->escape = VIEW_ESCAPE;
     copy_tags->copy = NULL;
     copy_tags->last_copy = NULL;
 }
@@ -458,6 +501,7 @@ void __view_copy_loop_tags_free(view_copy_tags_t* copy_tags) {
     }
 
     bufferdata_clear(&copy_tags->buf);
+    arena_free(&copy_tags->arena);
 }
 
 /**

@@ -79,7 +79,7 @@ typedef enum {
 
 static httpresponse_t* __httpresponse_create(connection_t* connection, http_chain_e chain);
 
-void __httpresponse_view(httpresponse_t* response, json_doc_t* document, const char* storage_name, const char* path_format, ...);
+void __httpresponse_view(httpresponse_t* response, json_doc_t* document, view_escape_e escape, const char* storage_name, const char* path_format, ...);
 
 void httpresponse_free(void* arg) {
     httpresponse_t* response = arg;
@@ -102,7 +102,7 @@ int __httpresponse_init_parser(httpresponse_t* response) {
     return 1;
 }
 
-void __httpresponse_view(httpresponse_t* response, json_doc_t* document, const char* storage_name, const char* path_format, ...)
+void __httpresponse_view(httpresponse_t* response, json_doc_t* document, view_escape_e escape, const char* storage_name, const char* path_format, ...)
 {
     char path[PATH_MAX];
 
@@ -111,7 +111,8 @@ void __httpresponse_view(httpresponse_t* response, json_doc_t* document, const c
     vsnprintf(path, sizeof(path), path_format, args);
     va_end(args);
 
-    char* data = render(document, storage_name, path);
+    // the path is already formatted: pass it as an argument, not as a format
+    char* data = render(document, escape, storage_name, "%s", path);
     if (data == NULL) {
         response->send_data(response, "Render view error");
         return;
