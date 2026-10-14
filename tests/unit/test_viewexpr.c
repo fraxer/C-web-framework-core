@@ -1,7 +1,11 @@
 #include "framework.h"
 #include "viewexpr.h"
+#include "viewmodifier.h"
+#include "arena.h"
 
+#include <locale.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 // ============================================================================
@@ -10,7 +14,7 @@
 
 static viewexpr_value_t vx_scope_resolve(const viewexpr_scope_t* scope, const char* name) {
     json_doc_t* doc = scope->data;
-    viewexpr_value_t value = { VIEWEXPR_NULL, 0, 0, NULL, NULL };
+    viewexpr_value_t value = { VIEWEXPR_NULL, 0, 0, NULL, NULL, 0 };
 
     const json_token_t* root = doc != NULL ? json_root(doc) : NULL;
     if (root == NULL || root->type != JSON_OBJECT) return value;
@@ -24,7 +28,7 @@ static int vx_truth(const char* expression, json_doc_t* doc) {
     viewexpr_node_t* node = viewexpr_parse(expression, strlen(expression));
     if (node == NULL) return -1;
 
-    const viewexpr_scope_t scope = { vx_scope_resolve, doc };
+    const viewexpr_scope_t scope = { vx_scope_resolve, doc, NULL };
     const viewexpr_value_t value = viewexpr_eval(node, &scope);
 
     // the value may borrow a string owned by the AST — consume it first
@@ -41,7 +45,7 @@ static long double vx_number(const char* expression, json_doc_t* doc) {
     viewexpr_node_t* node = viewexpr_parse(expression, strlen(expression));
     if (node == NULL) return NAN;
 
-    const viewexpr_scope_t scope = { vx_scope_resolve, doc };
+    const viewexpr_scope_t scope = { vx_scope_resolve, doc, NULL };
     const viewexpr_value_t value = viewexpr_eval(node, &scope);
     const long double number = value.type == VIEWEXPR_NUMBER ? value.number : NAN;
 
@@ -281,4 +285,256 @@ TEST(test_viewexpr_number_format) {
                            "Infinity should not format");
     TEST_ASSERT_EQUAL_SIZE(0, viewexpr_number_format(1.0L, NULL, 0),
                            "NULL buffer should not format");
+}
+
+TEST(test_viewexpr_numbers_ignore_locale) {
+    TEST_CASE("Number literals and printing do not follow the current locale");
+
+    locale_t comma = newlocale(LC_ALL_MASK, "ru_RU.utf8", (locale_t)0);
+    if (comma == (locale_t)0) {
+        printf("  (skipped: ru_RU.utf8 is not installed)\n");
+        return;
+    }
+    const locale_t previous = uselocale(comma);
+
+    const long double product = vx_number("1.25 * 2", NULL);
+    char buffer[64];
+    viewexpr_number_format(0.5L, buffer, sizeof(buffer));
+
+    uselocale(previous);
+    freelocale(comma);
+
+    TEST_ASSERT(product == 2.5L, "1.25 reads as one and a quarter");
+    TEST_ASSERT_STR_EQUAL("0.5", buffer, "A fraction prints with a decimal point");
+}
+
+// ============================================================================
+// Modifiers
+// ============================================================================
+
+static char vx_result[1024];
+
+/* Parses `expression` as a {{ }} tag (viewexpr_parse_output), evaluates it
+ * against `doc` with an arena and returns the result as text: strings as is,
+ * numbers via viewexpr_number_format, bools "true"/"false", containers
+ * "<token>", null "<null>", "<parse-error>" when the parse fails. */
+static const char* vx_text(const char* expression, json_doc_t* doc) {
+    viewexpr_node_t* node = viewexpr_parse_output(expression, strlen(expression));
+    if (node == NULL) {
+        snprintf(vx_result, sizeof(vx_result), "<parse-error>");
+        return vx_result;
+    }
+
+    arena_t arena;
+    arena_init(&arena);
+
+    const viewexpr_scope_t scope = { vx_scope_resolve, doc, &arena };
+    const viewexpr_value_t value = viewexpr_eval(node, &scope);
+
+    switch (value.type)
+    {
+    case VIEWEXPR_STRING:
+    {
+        // NUL bytes inside the value show as the two characters "\0"
+        size_t out = 0;
+        for (size_t i = 0; i < value.length && out + 3 < sizeof(vx_result); i++) {
+            if (value.string[i] == 0) {
+                vx_result[out++] = '\\';
+                vx_result[out++] = '0';
+            }
+            else
+                vx_result[out++] = value.string[i];
+        }
+        vx_result[out] = 0;
+        break;
+    }
+    case VIEWEXPR_NUMBER:
+        viewexpr_number_format(value.number, vx_result, sizeof(vx_result));
+        break;
+    case VIEWEXPR_BOOL:
+        snprintf(vx_result, sizeof(vx_result), "%s", value.boolean ? "true" : "false");
+        break;
+    case VIEWEXPR_TOKEN:
+        snprintf(vx_result, sizeof(vx_result), "<token>");
+        break;
+    default:
+        snprintf(vx_result, sizeof(vx_result), "<null>");
+        break;
+    }
+
+    arena_free(&arena);
+    viewexpr_node_free(node);
+
+    return vx_result;
+}
+
+TEST(test_viewexpr_modifier_binding) {
+    TEST_CASE("Modifier binds to the nearest operand");
+
+    json_doc_t* doc = json_parse("{\"price\":2,\"qty\":1.256,\"a\":\"\",\"b\":\"x\",\"count\":null,\"x\":-3,"
+                                 "\"login\":\"bob\",\"name\":null,\"items\":{\"k\":\"v\"},\"key\":\"K\"}");
+    TEST_REQUIRE_NOT_NULL(doc, "Document should be parsed");
+
+    TEST_ASSERT_STR_EQUAL("2.52", vx_text("price * qty | round(2)", doc), "Modifier applies to qty only");
+    TEST_ASSERT_STR_EQUAL("2.51", vx_text("(price * qty) | round(2)", doc), "Parentheses apply it to the product");
+    TEST_ASSERT_STR_EQUAL("true", vx_text("a || b | upper", doc), "Modifier binds tighter than ||");
+    TEST_ASSERT_STR_EQUAL("1", vx_text("count | default(0) + 1", doc), "Modifier binds tighter than +");
+    TEST_ASSERT_STR_EQUAL("-3", vx_text("-x | abs", doc), "Unary minus applies after the modifier");
+    TEST_ASSERT_STR_EQUAL("BOB", vx_text("name | default(login | upper)", doc), "Modifier inside an argument");
+    TEST_ASSERT_STR_EQUAL("v", vx_text("items[key | lower]", doc), "Modifier inside an index");
+    TEST_ASSERT_STR_EQUAL("X", vx_text("b | upper()", doc), "Empty parentheses");
+    TEST_ASSERT_STR_EQUAL("X", vx_text("b|upper", doc), "No spaces around |");
+    TEST_ASSERT_STR_EQUAL("X", vx_text("b |upper( )", doc), "Space inside parentheses");
+    TEST_ASSERT_STR_EQUAL("X", vx_text("b\n| upper", doc), "Line break before |");
+    TEST_ASSERT_STR_EQUAL("|", vx_text("b | replace('x', '|')", doc), "| inside a string literal is text");
+    TEST_ASSERT_STR_EQUAL("true", vx_text("b || b", doc), "|| is still logical or");
+
+    json_free(doc);
+}
+
+TEST(test_viewexpr_modifier_parse_errors) {
+    TEST_CASE("Modifier parse errors");
+
+    json_doc_t* doc = json_parse("{\"a\":\"\",\"b\":\"x\"}");
+    TEST_REQUIRE_NOT_NULL(doc, "Document should be parsed");
+
+    const char* invalid[] = {
+        "b | nope", "b | upper(1)", "b | truncate", "b | truncate(1, 2, 3)",
+        "b |", "b | | upper", "b | upper(", "b | (upper)", "| b",
+        "b | raw || a", "b | nl2br | upper", "b | default(a | raw)", "b | raw | raw",
+        "b | upper(,)", "b | truncate(1,)", "!b | raw"
+    };
+
+    for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); i++)
+        TEST_ASSERT_STR_EQUAL("<parse-error>", vx_text(invalid[i], doc), invalid[i]);
+
+    TEST_ASSERT_STR_EQUAL("X", vx_text("b | upper | raw", doc), "raw last at the root is allowed");
+    TEST_ASSERT_STR_EQUAL("x", vx_text("b | nl2br", doc), "nl2br at the root is allowed");
+    TEST_ASSERT_STR_EQUAL("x", vx_text("(b | raw)", doc), "Parentheses add no node: raw is still the root");
+
+    json_free(doc);
+}
+
+TEST(test_viewexpr_modifier_raw_forbidden_in_parse) {
+    TEST_CASE("raw and nl2br are refused outside {{ }}");
+
+    TEST_ASSERT_NULL(viewexpr_parse("b | raw", 7), "raw is refused by viewexpr_parse");
+    TEST_ASSERT_NULL(viewexpr_parse("b | nl2br", 9), "nl2br is refused by viewexpr_parse");
+
+    viewexpr_node_t* node = viewexpr_parse("b | upper", 9);
+    TEST_ASSERT_NOT_NULL(node, "Value modifiers are allowed by viewexpr_parse");
+    viewexpr_node_free(node);
+}
+
+TEST(test_viewexpr_modifier_root_kind) {
+    TEST_CASE("Modifier node structure");
+
+    const char* expression = "b | upper | raw";
+    viewexpr_node_t* root = viewexpr_parse_output(expression, strlen(expression));
+    TEST_REQUIRE_NOT_NULL(root, "Expression should parse");
+
+    TEST_ASSERT(root->type == VIEWEXPR_NODE_MODIFIER, "Root is a modifier node");
+    TEST_ASSERT(root->modifier != NULL && root->modifier->kind == VIEWMOD_RAW, "Root modifier is raw");
+    TEST_ASSERT(root->left != NULL && root->left->modifier == viewmodifier_find("upper", 5), "Operand is the upper node");
+
+    viewexpr_node_free(root);
+}
+
+TEST(test_viewexpr_modifier_without_scope) {
+    TEST_CASE("Modifiers evaluated without a scope");
+
+    viewexpr_node_t* upper = viewexpr_parse_output("'a' | upper", 11);
+    TEST_REQUIRE_NOT_NULL(upper, "Expression should parse");
+    const viewexpr_value_t upper_value = viewexpr_eval(upper, NULL);
+    TEST_ASSERT(upper_value.type == VIEWEXPR_NULL, "A new string needs an arena");
+    viewexpr_node_free(upper);
+
+    viewexpr_node_t* fallback = viewexpr_parse_output("null | default(1)", 17);
+    TEST_REQUIRE_NOT_NULL(fallback, "Expression should parse");
+    const viewexpr_value_t fallback_value = viewexpr_eval(fallback, NULL);
+    TEST_ASSERT(fallback_value.type == VIEWEXPR_NUMBER && fallback_value.number == 1, "default needs no arena");
+    viewexpr_node_free(fallback);
+}
+
+/* "a" followed by `count` copies of `link`. Free the result. */
+static char* vx_chain(const char* link, size_t count) {
+    const size_t link_size = strlen(link);
+    char* text = malloc(1 + link_size * count + 1);
+    if (text == NULL) return NULL;
+
+    char* p = text;
+    *p++ = 'a';
+    for (size_t i = 0; i < count; i++) {
+        memcpy(p, link, link_size);
+        p += link_size;
+    }
+    *p = 0;
+
+    return text;
+}
+
+TEST(test_viewexpr_long_chains_are_refused) {
+    TEST_CASE("Expressions with too many nodes are a parse error, not a stack overflow");
+
+    const char* links[] = { " | lower", " + a", " || a" };
+    for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); i++) {
+        char* chain = vx_chain(links[i], 20000);
+        TEST_REQUIRE_NOT_NULL(chain, "Allocation should succeed");
+
+        viewexpr_node_t* node = viewexpr_parse_output(chain, strlen(chain));
+        TEST_ASSERT_NULL(node, links[i]);
+        viewexpr_node_free(node);
+        free(chain);
+    }
+
+    char* fits = vx_chain(" | lower", 300);
+    TEST_REQUIRE_NOT_NULL(fits, "Allocation should succeed");
+    viewexpr_node_t* node = viewexpr_parse_output(fits, strlen(fits));
+    TEST_ASSERT_NOT_NULL(node, "300 links still parse");
+    viewexpr_node_free(node);
+    free(fits);
+}
+
+TEST(test_viewexpr_path_after_group_and_modifier) {
+    TEST_CASE("Field and index access after parentheses and after a modifier");
+
+    json_doc_t* doc = json_parse("{\"users\":[{\"name\":\"Ann\"},{\"name\":\"Bob\"}],\"obj\":{\"k\":[\"x\",\"y\"]},\"s\":\"str\"}");
+    TEST_REQUIRE_NOT_NULL(doc, "Document should be parsed");
+
+    TEST_ASSERT_STR_EQUAL("Ann", vx_text("(users | first).name", doc), "Field of a grouped modifier result");
+    TEST_ASSERT_STR_EQUAL("Ann", vx_text("users | first.name", doc), "Field right after a modifier");
+    TEST_ASSERT_STR_EQUAL("Bob", vx_text("users | last().name", doc), "Field after a modifier call");
+    TEST_ASSERT_STR_EQUAL("Bob", vx_text("(users | last)['name']", doc), "String index after parentheses");
+    TEST_ASSERT_STR_EQUAL("Bob", vx_text("(users)[1].name", doc), "Number index after parentheses");
+    TEST_ASSERT_STR_EQUAL("y", vx_text("(obj).k[1]", doc), "Several segments after parentheses");
+    TEST_ASSERT_STR_EQUAL("x", vx_text("obj | default(1).k[0]", doc), "Path after a modifier with arguments");
+    TEST_ASSERT_STR_EQUAL("ANN", vx_text("(users | first).name | upper", doc), "Modifier after the path");
+    TEST_ASSERT_STR_EQUAL("<null>", vx_text("(s).x", doc), "Field of a string is null");
+    TEST_ASSERT_STR_EQUAL("<null>", vx_text("('a')[0]", doc), "Index of a literal is null");
+    TEST_ASSERT_STR_EQUAL("<null>", vx_text("(users | first).missing", doc), "Missing field is null");
+
+    TEST_ASSERT_STR_EQUAL("<parse-error>", vx_text("(users | first).", doc), "Field name expected after '.'");
+    TEST_ASSERT_STR_EQUAL("<parse-error>", vx_text("(users)[", doc), "Unclosed index");
+    TEST_ASSERT_STR_EQUAL("<parse-error>", vx_text("s | raw.x", doc), "raw under a path is not the root");
+    TEST_ASSERT_STR_EQUAL("<parse-error>", vx_text("(s | raw).x", doc), "raw in parentheses under a path is not the root");
+
+    json_free(doc);
+}
+
+TEST(test_viewexpr_strings_with_nul) {
+    TEST_CASE("Comparisons, truthiness and lookups use the string length");
+
+    json_doc_t* doc = json_parse("{\"s\":\"a\\u0000b\",\"t\":\"a\",\"z\":\"\\u0000\",\"k\":{\"a\\u0000b\":\"nul\",\"a\":\"plain\"}}");
+    TEST_REQUIRE_NOT_NULL(doc, "Document should be parsed");
+
+    TEST_ASSERT_STR_EQUAL("a\\0b", vx_text("s", doc), "The whole value is kept");
+    TEST_ASSERT_STR_EQUAL("false", vx_text("s == t", doc), "a\\0b is not a");
+    TEST_ASSERT_STR_EQUAL("true", vx_text("s != t", doc), "a\\0b differs from a");
+    TEST_ASSERT_STR_EQUAL("true", vx_text("s > t", doc), "The longer string with the same prefix is greater");
+    TEST_ASSERT_STR_EQUAL("true", vx_text("z && true", doc), "A NUL string is truthy");
+    TEST_ASSERT_STR_EQUAL("nul", vx_text("k[s]", doc), "Key lookup by a string with NUL");
+    TEST_ASSERT_STR_EQUAL("plain", vx_text("k[t]", doc), "Key lookup without NUL");
+    TEST_ASSERT_STR_EQUAL("3", vx_text("s | length", doc), "length of the whole value");
+
+    json_free(doc);
 }
