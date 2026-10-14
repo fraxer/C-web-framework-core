@@ -6,6 +6,8 @@
 #include "json.h"
 
 #define VIEWEXPR_MAX_DEPTH 32
+#define VIEWEXPR_MAX_ARGS 3
+#define VIEWEXPR_MAX_NODES 1024 // operands and modifiers in one expression
 
 typedef enum viewexpr_valuetype {
     VIEWEXPR_NULL = 0,
@@ -19,15 +21,21 @@ typedef struct viewexpr_value {
     viewexpr_valuetype_e type;
     int boolean;
     long double number;
-    const char* string;         // borrowed: json document, AST literal or loop key
-    const json_token_t* token;  // JSON_OBJECT or JSON_ARRAY
+    const char* string;         // borrowed: json document, AST literal or loop key;
+                                // NUL-terminated, may also contain NUL bytes
+    const json_token_t* token;  // VIEWEXPR_TOKEN: JSON_OBJECT or JSON_ARRAY; VIEWEXPR_STRING
+                                // taken from a document: its JSON_STRING token, which keeps
+                                // the length of a string with NUL bytes (NULL otherwise)
+    size_t length;              // VIEWEXPR_STRING: bytes in string, NUL bytes included
 } viewexpr_value_t;
 
 typedef enum viewexpr_nodetype {
     VIEWEXPR_NODE_LITERAL = 0,
     VIEWEXPR_NODE_VARIABLE,
     VIEWEXPR_NODE_UNARY,
-    VIEWEXPR_NODE_BINARY
+    VIEWEXPR_NODE_BINARY,
+    VIEWEXPR_NODE_MODIFIER,
+    VIEWEXPR_NODE_PATH      // .field / [index] segments applied to the value of left
 } viewexpr_nodetype_e;
 
 typedef enum viewexpr_op {
@@ -55,22 +63,31 @@ typedef struct viewexpr_segment {
     struct viewexpr_segment* next;
 } viewexpr_segment_t;
 
+struct viewmodifier;
+
 typedef struct viewexpr_node {
     viewexpr_nodetype_e type;
     viewexpr_op_e op;           // unary and binary nodes
     viewexpr_value_t literal;   // literal nodes; literal.string is owned by the node
-    viewexpr_segment_t* path;   // variable nodes
+    viewexpr_segment_t* path;   // variable and path nodes
     struct viewexpr_node* left; // unary operand and binary left operand
     struct viewexpr_node* right;
+    const struct viewmodifier* modifier;            // modifier nodes; the operand is left
+    struct viewexpr_node* args[VIEWEXPR_MAX_ARGS];  // modifier arguments
+    size_t argc;
 } viewexpr_node_t;
+
+struct arena;
 
 // Resolves the leading identifier of a variable path to a value.
 typedef struct viewexpr_scope {
     viewexpr_value_t (*resolve)(const struct viewexpr_scope* scope, const char* name);
     void* data;
+    struct arena* arena; // strings made by modifiers; NULL: such modifiers give null
 } viewexpr_scope_t;
 
 viewexpr_node_t* viewexpr_parse(const char* expression, size_t length);
+viewexpr_node_t* viewexpr_parse_output(const char* expression, size_t length);
 void viewexpr_node_free(viewexpr_node_t* node);
 
 viewexpr_value_t viewexpr_eval(const viewexpr_node_t* node, const viewexpr_scope_t* scope);
