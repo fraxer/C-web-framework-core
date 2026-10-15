@@ -410,6 +410,55 @@ cleanup:
     vp_env_free(fs);
 }
 
+TEST(test_viewparser_completes_long_content) {
+    TEST_CASE("Text longer than the static buffer is flushed to the dynamic one after parsing");
+
+    // the cached tree is rendered by many threads: bufferdata_get on it must
+    // not flush (realloc) a buffer, so nothing may stay in static_buffer
+    const size_t part = BUFFERDATA_SIZE + 100;
+    const size_t total = part * 3 + 64;
+    char* tpl = malloc(total);
+    TEST_REQUIRE_NOT_NULL(tpl, "Template buffer should be allocated");
+
+    size_t pos = 0;
+    memset(tpl + pos, 'a', part); pos += part;
+    pos += (size_t)sprintf(tpl + pos, "{%% if x %%}");
+    memset(tpl + pos, 'b', part); pos += part;
+    pos += (size_t)sprintf(tpl + pos, "{%% endif %%}");
+    memset(tpl + pos, 'c', part); pos += part;
+    tpl[pos] = 0;
+
+    storagefs_t* fs = vp_env_init();
+    TEST_REQUIRE_NOT_NULL_GOTO(fs, "Environment should be initialized", cleanup_tpl);
+    TEST_REQUIRE_GOTO(vp_write_template("vp_long.html", tpl),
+                      "Template should be written", cleanup);
+
+    viewparser_t* parser = viewparser_init(VP_TEST_STORAGE, "/vp_long.html");
+    TEST_REQUIRE_NOT_NULL_GOTO(parser, "Parser should be created", cleanup);
+
+    TEST_REQUIRE_GOTO(viewparser_run(parser), "Parse should succeed", cleanup_parser);
+
+    view_tag_t* root = parser->root_tag;
+    TEST_ASSERT_EQUAL(BUFFERDATA_DYNAMIC, root->result_content.type, "Root content should be dynamic");
+    TEST_ASSERT_EQUAL_SIZE(0, root->result_content.offset_sbuffer, "Root static buffer should be flushed");
+    TEST_ASSERT_EQUAL_SIZE(part * 2, bufferdata_writed(&root->result_content), "Root should hold both outer parts");
+
+    view_tag_t* cond = root->child;
+    TEST_REQUIRE_NOT_NULL_GOTO(cond, "Condition tag should be created", cleanup_parser);
+    view_tag_t* branch = cond->child;
+    TEST_REQUIRE_NOT_NULL_GOTO(branch, "If branch should be created", cleanup_parser);
+    TEST_ASSERT_EQUAL(BUFFERDATA_DYNAMIC, branch->result_content.type, "Branch content should be dynamic");
+    TEST_ASSERT_EQUAL_SIZE(0, branch->result_content.offset_sbuffer, "Branch static buffer should be flushed");
+    TEST_ASSERT_EQUAL_SIZE(part, bufferdata_writed(&branch->result_content), "Branch should hold its part");
+
+cleanup_parser:
+    viewparser_free(parser);
+cleanup:
+    vp_env_free(fs);
+cleanup_tpl:
+    free(tpl);
+}
+
 TEST(test_viewparser_free_null) {
     TEST_CASE("viewparser_free(NULL) is a no-op");
 

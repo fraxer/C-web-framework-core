@@ -9,6 +9,12 @@
 #include "viewstore.h"
 #include "view.h"
 
+typedef struct view_scope_data {
+    view_copy_tags_t* copy_tags;
+    json_doc_t* document;
+    view_tag_t* tag;
+} view_scope_data_t;
+
 static char* __view_render(json_doc_t* document, view_escape_e escape, const char* storage_name, const char* path);
 static char* __view_make_content(view_t* view, json_doc_t* document, view_escape_e escape);
 static viewexpr_value_t __view_eval_tag(view_copy_tags_t* copy_tags, json_doc_t* document, view_tag_t* tag);
@@ -119,20 +125,15 @@ char* __view_render(json_doc_t* document, view_escape_e escape, const char* stor
  * @return The rendered content of the view, or NULL if an error occurred.
  */
 char* __view_make_content(view_t* view, json_doc_t* document, view_escape_e escape) {
+    view_tag_t* child = view->root_tag->child;
+    if (child == NULL)
+        return bufferdata_copy(&view->root_tag->result_content);
+
     view_copy_tags_t copy_tags;
     __view_copy_loop_tags_init(&copy_tags);
     copy_tags.escape = escape;
 
-    view_tag_t* child = view->root_tag->child;
-    if (child == NULL) {
-        const size_t size = bufferdata_writed(&view->root_tag->result_content);
-        const char* content = bufferdata_get(&view->root_tag->result_content);
-
-        for (size_t i = 0; i < size; i++)
-            bufferdata_push(&copy_tags.buf, content[i]);
-    }
-    else
-        __view_build_content_recursive(view, document, &copy_tags, child);
+    __view_build_content_recursive(view, document, &copy_tags, child);
 
     bufferdata_complete(&copy_tags.buf);
 
@@ -142,12 +143,6 @@ char* __view_make_content(view_t* view, json_doc_t* document, view_escape_e esca
 
     return data;
 }
-
-typedef struct view_scope_data {
-    view_copy_tags_t* copy_tags;
-    json_doc_t* document;
-    view_tag_t* tag;
-} view_scope_data_t;
 
 /**
  * Resolves the leading identifier of an expression variable: loop key and
