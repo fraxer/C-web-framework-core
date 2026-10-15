@@ -4,7 +4,7 @@
 #include <stddef.h>
 
 #include "arena.h"
-#include "bufferdata.h"
+#include "str.h"
 #include "viewexpr.h"
 
 #define VIEWMODIFIER_MAX_ARGS VIEWEXPR_MAX_ARGS
@@ -33,13 +33,13 @@ typedef struct viewmodifier {
                               const viewexpr_value_t* args, size_t argc);
 
     // VIEWMOD_SAFE: writes the input to the output in the given mode. NULL otherwise.
-    void (*output)(bufferdata_t* buf, const viewexpr_value_t* input, view_escape_e escape);
+    void (*output)(str_t* buf, const viewexpr_value_t* input, view_escape_e escape);
 } viewmodifier_t;
 
 const viewmodifier_t* viewmodifier_find(const char* name, size_t length);
 
 // Writes `length` bytes of text: & < > " ' as HTML entities in VIEW_ESCAPE
 // mode, NUL bytes as U+FFFD in both modes.
-void viewmodifier_write_text(bufferdata_t* buf, const char* text, size_t length, view_escape_e escape);
+void viewmodifier_write_text(str_t* buf, const char* text, size_t length, view_escape_e escape);
 
 #endif

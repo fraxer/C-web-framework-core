@@ -378,17 +378,16 @@ static const char* vm_output(const char* name, const viewexpr_value_t* input, vi
         return vm_result;
     }
 
-    bufferdata_t buf;
-    bufferdata_init(&buf);
+    str_t buf;
+    str_init(&buf, 0);
     modifier->output(&buf, input, mode);
-    bufferdata_complete(&buf);
 
-    const size_t size = bufferdata_writed(&buf);
+    const size_t size = str_size(&buf);
     const size_t copy = size < sizeof(vm_result) - 1 ? size : sizeof(vm_result) - 1;
-    memcpy(vm_result, bufferdata_get(&buf), copy);
+    memcpy(vm_result, str_get(&buf), copy);
     vm_result[copy] = 0;
 
-    bufferdata_clear(&buf);
+    str_clear(&buf);
 
     return vm_result;
 }

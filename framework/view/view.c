@@ -26,6 +26,23 @@ static view_loop_t* __view_copy_loop_tag_add(view_copy_tags_t* copy_tags, view_t
 static view_loop_t* __view_copy_loop_tag_get(view_copy_tags_t* copy_tags, view_tag_t* tag);
 
 /**
+ * Appends content[from, to) to the output, the range clamped to `size`.
+ *
+ * @param buf The output buffer.
+ * @param content The text the range is taken from.
+ * @param size The length of content.
+ * @param from The first byte of the range.
+ * @param to The byte after the last one.
+ * @return void
+ */
+static void __view_write_range(str_t* buf, const char* content, size_t size, size_t from, size_t to) {
+    if (to > size) to = size;
+    if (from >= to) return;
+
+    str_append(buf, content + from, to - from);
+}
+
+/**
  * Reclaims what modifiers allocated for one tag. arena_reset() keeps every
  * block for reuse, and a request larger than all spare blocks takes a new
  * one, so results that grow from tag to tag (truncate(n) with increasing n)
@@ -135,9 +152,7 @@ char* __view_make_content(view_t* view, json_doc_t* document, view_escape_e esca
 
     __view_build_content_recursive(view, document, &copy_tags, child);
 
-    bufferdata_complete(&copy_tags.buf);
-
-    char* data = bufferdata_copy(&copy_tags.buf);
+    char* data = str_copy(&copy_tags.buf);
 
     __view_copy_loop_tags_free(&copy_tags);
 
@@ -235,8 +250,7 @@ void __view_write_value(view_copy_tags_t* copy_tags, const viewexpr_node_t* expr
         char buffer[64];
         const size_t size = viewexpr_number_format(value->number, buffer, sizeof(buffer));
 
-        for (size_t i = 0; i < size; i++)
-            bufferdata_push(&copy_tags->buf, buffer[i]);
+        str_append(&copy_tags->buf, buffer, size);
 
         break;
     }
@@ -244,8 +258,7 @@ void __view_write_value(view_copy_tags_t* copy_tags, const viewexpr_node_t* expr
     {
         const char* string = value->boolean ? "true" : "false";
 
-        for (size_t i = 0; string[i] != 0; i++)
-            bufferdata_push(&copy_tags->buf, string[i]);
+        str_append(&copy_tags->buf, string, strlen(string));
 
         break;
     }
@@ -273,8 +286,7 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
 
             size_t size = bufferdata_writed(&parent->result_content);
             const char* content = bufferdata_get(&parent->result_content);
-            for (size_t i = child->parent_text_offset; i < child->parent_text_offset + child->parent_text_size && i < size; i++)
-                bufferdata_push(&copy_tags->buf, content[i]);
+            __view_write_range(&copy_tags->buf, content, size, child->parent_text_offset, child->parent_text_offset + child->parent_text_size);
 
             const viewexpr_value_t value = __view_eval_tag(copy_tags, document, child);
             __view_write_value(copy_tags, child->expr, &value);
@@ -285,8 +297,7 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
             if (child->next == NULL) {
                 size = bufferdata_writed(&parent->result_content);
                 content = bufferdata_get(&parent->result_content);
-                for (size_t i = child->parent_text_offset + child->parent_text_size; i < size; i++)
-                    bufferdata_push(&copy_tags->buf, content[i]);
+                __view_write_range(&copy_tags->buf, content, size, child->parent_text_offset + child->parent_text_size, size);
 
                 if (child == tag) return;
             }
@@ -326,8 +337,7 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
 
             size_t size = bufferdata_writed(&parent->parent->result_content);
             const char* content = bufferdata_get(&parent->parent->result_content);
-            for (size_t i = parent->parent_text_offset; i < parent->parent_text_offset + parent->parent_text_size && i < size; i++)
-                bufferdata_push(&copy_tags->buf, content[i]);
+            __view_write_range(&copy_tags->buf, content, size, parent->parent_text_offset, parent->parent_text_offset + parent->parent_text_size);
 
             if (istrue) {
                 if (child->child != NULL) {
@@ -336,16 +346,14 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
                 else {
                     const size_t size = bufferdata_writed(&child->result_content);
                     const char* content = bufferdata_get(&child->result_content);
-                    for (size_t i = 0; i < size; i++)
-                        bufferdata_push(&copy_tags->buf, content[i]);
+                    str_append(&copy_tags->buf, content, size);
                 }
             }
 
             if (parent->next == NULL) {
                 size = bufferdata_writed(&parent->parent->result_content);
                 content = bufferdata_get(&parent->parent->result_content);
-                for (size_t i = parent->parent_text_offset + parent->parent_text_size; i < size; i++)
-                    bufferdata_push(&copy_tags->buf, content[i]);
+                __view_write_range(&copy_tags->buf, content, size, parent->parent_text_offset + parent->parent_text_size, size);
             }
 
             if (istrue) return;
@@ -366,8 +374,7 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
             view_tag_t* parent = child->parent;
             size_t size = bufferdata_writed(&parent->result_content);
             const char* content = bufferdata_get(&parent->result_content);
-            for (size_t i = child->parent_text_offset; i < child->parent_text_offset + child->parent_text_size && i < size; i++)
-                bufferdata_push(&copy_tags->buf, content[i]);
+            __view_write_range(&copy_tags->buf, content, size, child->parent_text_offset, child->parent_text_offset + child->parent_text_size);
 
             const viewexpr_value_t loop_value = __view_eval_tag(copy_tags, document, child);
             const json_token_t* token = loop_value.type == VIEWEXPR_TOKEN ? loop_value.token : NULL;
@@ -404,8 +411,7 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
                         else {
                             const size_t size = bufferdata_writed(&child->result_content);
                             const char* content = bufferdata_get(&child->result_content);
-                            for (size_t i = 0; i < size; i++)
-                                bufferdata_push(&copy_tags->buf, content[i]);
+                            str_append(&copy_tags->buf, content, size);
                         }
                     }
                 }
@@ -414,8 +420,7 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
             if (child->next == NULL) {
                 size = bufferdata_writed(&parent->result_content);
                 content = bufferdata_get(&parent->result_content);
-                for (size_t i = child->parent_text_offset + child->parent_text_size; i < size; i++)
-                    bufferdata_push(&copy_tags->buf, content[i]);
+                __view_write_range(&copy_tags->buf, content, size, child->parent_text_offset + child->parent_text_size, size);
             }
 
             child = child->next;
@@ -429,8 +434,7 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
             if (parent != NULL) {
                 const size_t size = bufferdata_writed(&parent->result_content);
                 const char* content = bufferdata_get(&parent->result_content);
-                for (size_t i = child->parent_text_offset; i < child->parent_text_offset + child->parent_text_size && i < size; i++)
-                    bufferdata_push(&copy_tags->buf, content[i]);
+                __view_write_range(&copy_tags->buf, content, size, child->parent_text_offset, child->parent_text_offset + child->parent_text_size);
             }
 
             if (child->child != NULL) {
@@ -439,15 +443,13 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
             else {
                 const size_t size = bufferdata_writed(&child->result_content);
                 const char* content = bufferdata_get(&child->result_content);
-                for (size_t i = 0; i < size; i++)
-                    bufferdata_push(&copy_tags->buf, content[i]);
+                str_append(&copy_tags->buf, content, size);
             }
 
             if (child->next == NULL && parent != NULL) {
                 const size_t size = bufferdata_writed(&parent->result_content);
                 const char* content = bufferdata_get(&parent->result_content);
-                for (size_t i = child->parent_text_offset + child->parent_text_size; i < size; i++)
-                    bufferdata_push(&copy_tags->buf, content[i]);
+                __view_write_range(&copy_tags->buf, content, size, child->parent_text_offset + child->parent_text_size, size);
             }
 
             child = child->next;
@@ -472,7 +474,7 @@ void __view_build_content_recursive(view_t* view, json_doc_t* document, view_cop
 void __view_copy_loop_tags_init(view_copy_tags_t* copy_tags) {
     if (copy_tags == NULL) return;
 
-    bufferdata_init(&copy_tags->buf);
+    str_init(&copy_tags->buf, VIEW_OUTPUT_INIT_CAPACITY);
     arena_init(&copy_tags->arena);
     copy_tags->escape = VIEW_ESCAPE;
     copy_tags->copy = NULL;
@@ -495,7 +497,7 @@ void __view_copy_loop_tags_free(view_copy_tags_t* copy_tags) {
         copy = next;
     }
 
-    bufferdata_clear(&copy_tags->buf);
+    str_clear(&copy_tags->buf);
     arena_free(&copy_tags->arena);
 }
 
