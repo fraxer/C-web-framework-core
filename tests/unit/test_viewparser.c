@@ -85,8 +85,7 @@ static int vp_parse(const char* name, const char* content) {
 }
 
 static const char* vp_tag_content(view_tag_t* tag) {
-    bufferdata_complete(&tag->result_content);
-    return bufferdata_get(&tag->result_content);
+    return str_get(&tag->result_content);
 }
 
 // ============================================================================
@@ -410,12 +409,17 @@ cleanup:
     vp_env_free(fs);
 }
 
-TEST(test_viewparser_completes_long_content) {
-    TEST_CASE("Text longer than the static buffer is flushed to the dynamic one after parsing");
+static int vp_all_bytes(const char* text, size_t size, char ch) {
+    for (size_t i = 0; i < size; i++)
+        if (text[i] != ch) return 0;
 
-    // the cached tree is rendered by many threads: bufferdata_get on it must
-    // not flush (realloc) a buffer, so nothing may stay in static_buffer
-    const size_t part = BUFFERDATA_SIZE + 100;
+    return 1;
+}
+
+TEST(test_viewparser_keeps_long_content) {
+    TEST_CASE("Text of several kilobytes around a tag is kept whole");
+
+    const size_t part = 4096 + 100;
     const size_t total = part * 3 + 64;
     char* tpl = malloc(total);
     TEST_REQUIRE_NOT_NULL(tpl, "Template buffer should be allocated");
@@ -439,17 +443,16 @@ TEST(test_viewparser_completes_long_content) {
     TEST_REQUIRE_GOTO(viewparser_run(parser), "Parse should succeed", cleanup_parser);
 
     view_tag_t* root = parser->root_tag;
-    TEST_ASSERT_EQUAL(BUFFERDATA_DYNAMIC, root->result_content.type, "Root content should be dynamic");
-    TEST_ASSERT_EQUAL_SIZE(0, root->result_content.offset_sbuffer, "Root static buffer should be flushed");
-    TEST_ASSERT_EQUAL_SIZE(part * 2, bufferdata_writed(&root->result_content), "Root should hold both outer parts");
+    TEST_REQUIRE_GOTO(str_size(&root->result_content) == part * 2, "Root should hold both outer parts", cleanup_parser);
+    TEST_ASSERT(vp_all_bytes(str_get(&root->result_content), part, 'a'), "Root should start with the first part");
+    TEST_ASSERT(vp_all_bytes(str_get(&root->result_content) + part, part, 'c'), "Root should end with the last part");
 
     view_tag_t* cond = root->child;
     TEST_REQUIRE_NOT_NULL_GOTO(cond, "Condition tag should be created", cleanup_parser);
     view_tag_t* branch = cond->child;
     TEST_REQUIRE_NOT_NULL_GOTO(branch, "If branch should be created", cleanup_parser);
-    TEST_ASSERT_EQUAL(BUFFERDATA_DYNAMIC, branch->result_content.type, "Branch content should be dynamic");
-    TEST_ASSERT_EQUAL_SIZE(0, branch->result_content.offset_sbuffer, "Branch static buffer should be flushed");
-    TEST_ASSERT_EQUAL_SIZE(part, bufferdata_writed(&branch->result_content), "Branch should hold its part");
+    TEST_REQUIRE_GOTO(str_size(&branch->result_content) == part, "Branch should hold its part", cleanup_parser);
+    TEST_ASSERT(vp_all_bytes(str_get(&branch->result_content), part, 'b'), "Branch should hold the middle part");
 
 cleanup_parser:
     viewparser_free(parser);

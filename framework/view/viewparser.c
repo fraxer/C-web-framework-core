@@ -11,7 +11,6 @@ static viewparser_context_t* __viewparser_context_create();
 static void __viewparser_context_free(viewparser_context_t* context);
 static int __viewparser_readfile(viewparser_context_t* context, const char* storage_name,const char* path);
 static int __viewparser_parse_content(viewparser_t* parser);
-static int __viewparser_tags_complete(view_tag_t* tag);
 static int __viewparser_variable_create(viewparser_t* parser);
 static void __viewparser_expr_begin(viewparser_t* parser);
 static int __viewparser_expr_collect(viewparser_t* parser, char ch, char close_first);
@@ -69,7 +68,7 @@ viewparser_t* viewparser_init(const char* restrict storage_name, const char* res
     parser->expr_quote = 0;
     parser->expr_escape = 0;
 
-    bufferdata_init(&parser->variable_buffer);
+    str_init(&parser->variable_buffer, 0);
 
     return parser;
 }
@@ -106,41 +105,6 @@ int viewparser_run(viewparser_t* parser) {
     if (!__viewparser_parse_content(parser))
         return 0;
 
-    // the parsed tree is cached and rendered by many threads at once:
-    // bufferdata_get must not have to flush a buffer during rendering
-    if (!__viewparser_tags_complete(parser->root_tag)) {
-        log_error("viewparser_run: out of memory completing view %s", parser->path);
-        return 0;
-    }
-
-    return 1;
-}
-
-/**
- * Flushes the static part of every tag's result_content into its dynamic
- * buffer, so later bufferdata_get calls on the tree only read it.
- * Walks the tree iteratively to stay off the stack on deep templates.
- *
- * @param tag The root of the tag tree.
- * @return Non-zero on success; zero if an allocation failed.
- */
-int __viewparser_tags_complete(view_tag_t* tag) {
-    while (tag != NULL) {
-        if (!bufferdata_complete(&tag->result_content))
-            return 0;
-
-        if (tag->child != NULL) {
-            tag = tag->child;
-            continue;
-        }
-
-        while (tag != NULL && tag->next == NULL)
-            tag = tag->parent;
-
-        if (tag != NULL)
-            tag = tag->next;
-    }
-
     return 1;
 }
 
@@ -168,7 +132,7 @@ view_tag_t* viewparser_move_root_tag(viewparser_t* parser) {
 void viewparser_free(viewparser_t* parser) {
     if (parser == NULL) return;
 
-    bufferdata_clear(&parser->variable_buffer);
+    str_clear(&parser->variable_buffer);
 
     __viewparser_context_free(parser->context);
 
@@ -268,7 +232,7 @@ int __viewparser_parse_content(viewparser_t* parser) {
             {
                 if (context->symbol == VIEWPARSER_FIGFIGOPEN) {
                     context->stage = VIEWPARSER_VARIABLE;
-                    bufferdata_pop_back(&parser->current_tag->result_content);
+                    str_pop(&parser->current_tag->result_content);
 
                     if (!__viewparser_variable_create(parser))
                         return 0;
@@ -280,18 +244,18 @@ int __viewparser_parse_content(viewparser_t* parser) {
 
                 context->symbol = VIEWPARSER_FIGFIGOPEN;
 
-                bufferdata_push(&parser->current_tag->result_content, ch);
+                str_appendc(&parser->current_tag->result_content, ch);
                 break;
             }
             case '*':
             {
                 if (context->symbol != VIEWPARSER_FIGFIGOPEN) {
-                    bufferdata_push(&parser->current_tag->result_content, ch);
+                    str_appendc(&parser->current_tag->result_content, ch);
                     break;
                 }
 
                 context->stage = VIEWPARSER_INCLUDE;
-                bufferdata_pop_back(&parser->current_tag->result_content);
+                str_pop(&parser->current_tag->result_content);
 
                 if (!__viewparser_include_create(parser))
                     return 0;
@@ -303,20 +267,20 @@ int __viewparser_parse_content(viewparser_t* parser) {
             case '%':
             {
                 if (context->symbol != VIEWPARSER_FIGFIGOPEN) {
-                    bufferdata_push(&parser->current_tag->result_content, ch);
+                    str_appendc(&parser->current_tag->result_content, ch);
                     break;
                 }
 
                 context->stage = VIEWPARSER_BRANCH;
                 context->symbol = VIEWPARSER_FIGPERCENTOPEN;
 
-                bufferdata_pop_back(&parser->current_tag->result_content);
+                str_pop(&parser->current_tag->result_content);
 
                 break;
             }
             default:
                 context->symbol = VIEWPARSER_DEFAULT;
-                bufferdata_push(&parser->current_tag->result_content, ch);
+                str_appendc(&parser->current_tag->result_content, ch);
                 break;
             }
 
@@ -426,7 +390,7 @@ int __viewparser_parse_content(viewparser_t* parser) {
                 if (context->symbol == VIEWPARSER_FIGPERCENTCLOSE)
                     return 0;
 
-                bufferdata_push(&parser->variable_buffer, ch);
+                str_appendc(&parser->variable_buffer, ch);
                 parser->current_context->symbol = VIEWPARSER_DEFAULT;
 
                 break;
@@ -610,7 +574,7 @@ int __viewparser_expr_collect(viewparser_t* parser, char ch, char close_first) {
     viewparser_context_t* const context = parser->current_context;
 
     if (parser->expr_quote != 0) {
-        bufferdata_push(&parser->variable_buffer, ch);
+        str_appendc(&parser->variable_buffer, ch);
 
         if (ch == parser->expr_quote && !parser->expr_escape)
             parser->expr_quote = 0;
@@ -625,7 +589,7 @@ int __viewparser_expr_collect(viewparser_t* parser, char ch, char close_first) {
             return 1;
 
         // close_first was part of the expression, keep it and reprocess ch
-        bufferdata_push(&parser->variable_buffer, close_first);
+        str_appendc(&parser->variable_buffer, close_first);
         context->symbol = VIEWPARSER_DEFAULT;
 
         return __viewparser_expr_collect(parser, ch, close_first);
@@ -641,7 +605,7 @@ int __viewparser_expr_collect(viewparser_t* parser, char ch, char close_first) {
         parser->expr_escape = 0;
     }
 
-    bufferdata_push(&parser->variable_buffer, ch);
+    str_appendc(&parser->variable_buffer, ch);
     context->symbol = VIEWPARSER_DEFAULT;
 
     return 0;
@@ -660,28 +624,27 @@ int __viewparser_expr_collect(viewparser_t* parser, char ch, char close_first) {
 int __viewparser_expr_complete(viewparser_t* parser, int forbid_expression, int output) {
     __viewparser_variable_rtrim(parser);
 
-    bufferdata_complete(&parser->variable_buffer);
-    const size_t expression_size = bufferdata_writed(&parser->variable_buffer);
-    const char* expression = bufferdata_get(&parser->variable_buffer);
+    const size_t expression_size = str_size(&parser->variable_buffer);
+    const char* expression = str_get(&parser->variable_buffer);
 
     if (forbid_expression) {
         for (size_t i = 0; i < expression_size; i++) {
             const char ch = expression[i];
             if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r') {
                 log_error("__viewparser_expr_complete: tag takes no expression\n");
-                bufferdata_reset(&parser->variable_buffer);
+                str_reset(&parser->variable_buffer);
                 return 0;
             }
         }
 
-        bufferdata_reset(&parser->variable_buffer);
+        str_reset(&parser->variable_buffer);
         return 1;
     }
 
     viewexpr_node_t* expr = output
         ? viewexpr_parse_output(expression, expression_size)
         : viewexpr_parse(expression, expression_size);
-    bufferdata_reset(&parser->variable_buffer);
+    str_reset(&parser->variable_buffer);
 
     if (expr == NULL) {
         log_error("__viewparser_expr_complete: invalid expression\n");
@@ -700,8 +663,8 @@ int __viewparser_expr_complete(viewparser_t* parser, int forbid_expression, int 
  * @return void
  */
 void __viewparser_variable_rtrim(viewparser_t* parser) {
-    while (bufferdata_back(&parser->variable_buffer) == ' ')
-        bufferdata_pop_back(&parser->variable_buffer);
+    while (str_last(&parser->variable_buffer) == ' ')
+        str_pop(&parser->variable_buffer);
 }
 
 /**
@@ -735,11 +698,11 @@ void __viewparser_tag_set_parent_text_params(view_tag_t* tag, view_tag_t* parent
 
     if (parent->last_child != NULL) {
         tag->parent_text_offset = parent->last_child->parent_text_offset + parent->last_child->parent_text_size;
-        tag->parent_text_size = bufferdata_writed(&parent->result_content) - tag->parent_text_offset;
+        tag->parent_text_size = str_size(&parent->result_content) - tag->parent_text_offset;
     }
     else {
         tag->parent_text_offset = 0;
-        tag->parent_text_size = bufferdata_writed(&parent->result_content);
+        tag->parent_text_size = str_size(&parent->result_content);
     }
 }
 
@@ -772,7 +735,7 @@ void __viewparser_tag_init(view_tag_t* tag, viewparser_tagtype_e type, view_tag_
     tag->type = type;
     tag->parent_text_offset = 0;
     tag->parent_text_size = 0;
-    bufferdata_init(&tag->result_content);
+    str_init(&tag->result_content, 0);
     tag->data_parent = data_parent;
     tag->parent = parent;
     tag->child = NULL;
@@ -850,7 +813,7 @@ int __viewparser_include_write_body(viewparser_t* parser, char ch) {
         if (parser->current_context->symbol == VIEWPARSER_FIGASTOPEN)
             break;
 
-        bufferdata_push(&parser->variable_buffer, ch);
+        str_appendc(&parser->variable_buffer, ch);
 
         parser->current_context->symbol = VIEWPARSER_VARIABLE_SPACE;
 
@@ -874,7 +837,7 @@ int __viewparser_include_write_body(viewparser_t* parser, char ch) {
                 tag->control_key_index++;
         }
         else {
-            bufferdata_push(&parser->variable_buffer, ch);
+            str_appendc(&parser->variable_buffer, ch);
         }
 
         parser->current_context->symbol = VIEWPARSER_DEFAULT;
@@ -895,8 +858,7 @@ int __viewparser_include_write_body(viewparser_t* parser, char ch) {
 int __viewparser_include_load_content(viewparser_t* parser) {
     __viewparser_variable_rtrim(parser);
 
-    bufferdata_complete(&parser->variable_buffer);
-    const size_t path_size = bufferdata_writed(&parser->variable_buffer);
+    const size_t path_size = str_size(&parser->variable_buffer);
     if (path_size >= 4096) {
         log_error("__viewparser_include_load_content: path size exceeds 4096 bytes");
         return 0;
@@ -924,13 +886,13 @@ int __viewparser_include_load_content(viewparser_t* parser) {
     parser->current_context->last_child = context;
     parser->current_context = context;
 
-    const char* path = bufferdata_get(&parser->variable_buffer);
+    const char* path = str_get(&parser->variable_buffer);
     if (!__viewparser_readfile(parser->current_context, parser->storage_name, path)) {
         log_error("__viewparser_include_load_content: view file not found %s", path);
         return 0;
     }
 
-    bufferdata_reset(&parser->variable_buffer);
+    str_reset(&parser->variable_buffer);
 
     return 1;
 }
@@ -944,9 +906,8 @@ int __viewparser_include_load_content(viewparser_t* parser) {
 int __viewparser_branch_write_body(viewparser_t* parser) {
     __viewparser_variable_rtrim(parser);
 
-    bufferdata_complete(&parser->variable_buffer);
-    const size_t tag_name_size = bufferdata_writed(&parser->variable_buffer);
-    const char* tag_name = bufferdata_get(&parser->variable_buffer);
+    const size_t tag_name_size = str_size(&parser->variable_buffer);
+    const char* tag_name = str_get(&parser->variable_buffer);
 
     // empty buffer: the closing "%}" right after endif/endfor already
     // processed the word in the space handler, nothing left to do
@@ -1012,7 +973,7 @@ int __viewparser_branch_write_body(viewparser_t* parser) {
         return 0;
     }
 
-    bufferdata_reset(&parser->variable_buffer);
+    str_reset(&parser->variable_buffer);
 
     return 1;
 }
@@ -1175,9 +1136,8 @@ int __viewparser_loop_write_item(viewparser_t* parser, char ch) {
         if (ch == ' ' && context->symbol == VIEWPARSER_VARIABLE_SPACE)
             break;
 
-        bufferdata_complete(&parser->variable_buffer);
-        const size_t tag_name_size = bufferdata_writed(&parser->variable_buffer);
-        const char* tag_name = bufferdata_get(&parser->variable_buffer);
+        const size_t tag_name_size = str_size(&parser->variable_buffer);
+        const char* tag_name = str_get(&parser->variable_buffer);
 
         if (tag_name_size == 0) {
             log_error("__viewparser_loop_write_item: item name is empty\n");
@@ -1196,7 +1156,7 @@ int __viewparser_loop_write_item(viewparser_t* parser, char ch) {
 
         strcpy(tag_for->element_name, tag_name);
 
-        bufferdata_reset(&parser->variable_buffer);
+        str_reset(&parser->variable_buffer);
 
         if (ch == ',') {
             context->symbol = VIEWPARSER_VARIABLE_SPACE;
@@ -1211,7 +1171,7 @@ int __viewparser_loop_write_item(viewparser_t* parser, char ch) {
     }
     default:
         context->symbol = VIEWPARSER_DEFAULT;
-        bufferdata_push(&parser->variable_buffer, ch);
+        str_appendc(&parser->variable_buffer, ch);
         break;
     }
 
@@ -1236,9 +1196,8 @@ int __viewparser_loop_write_index(viewparser_t* parser, char ch) {
         if (context->symbol == VIEWPARSER_VARIABLE_SPACE)
             break;
 
-        bufferdata_complete(&parser->variable_buffer);
-        const size_t tag_name_size = bufferdata_writed(&parser->variable_buffer);
-        const char* tag_name = bufferdata_get(&parser->variable_buffer);
+        const size_t tag_name_size = str_size(&parser->variable_buffer);
+        const char* tag_name = str_get(&parser->variable_buffer);
 
         if (tag_name_size > VIEWPARSER_VARIABLE_ITEM_NAME_SIZE - 1) {
             log_error("__viewparser_loop_write_index: tag_name_size > VIEWPARSER_VARIABLE_ITEM_NAME_SIZE - 1\n");
@@ -1257,7 +1216,7 @@ int __viewparser_loop_write_index(viewparser_t* parser, char ch) {
 
         strcpy(tag_for->key_name, tag_name);
 
-        bufferdata_reset(&parser->variable_buffer);
+        str_reset(&parser->variable_buffer);
 
         context->symbol = VIEWPARSER_VARIABLE_SPACE;
         context->stage = VIEWPARSER_LOOP_IN;
@@ -1266,7 +1225,7 @@ int __viewparser_loop_write_index(viewparser_t* parser, char ch) {
     }
     default:
         context->symbol = VIEWPARSER_DEFAULT;
-        bufferdata_push(&parser->variable_buffer, ch);
+        str_appendc(&parser->variable_buffer, ch);
         break;
     }
 
@@ -1291,9 +1250,8 @@ int __viewparser_loop_write_in(viewparser_t* parser, char ch) {
         if (context->symbol == VIEWPARSER_VARIABLE_SPACE)
             break;
 
-        bufferdata_complete(&parser->variable_buffer);
-        const size_t tag_name_size = bufferdata_writed(&parser->variable_buffer);
-        const char* tag_name = bufferdata_get(&parser->variable_buffer);
+        const size_t tag_name_size = str_size(&parser->variable_buffer);
+        const char* tag_name = str_get(&parser->variable_buffer);
 
         if (tag_name_size > 2) {
             log_error("__viewparser_loop_write_in: tag_name_size > 2\n");
@@ -1305,7 +1263,7 @@ int __viewparser_loop_write_in(viewparser_t* parser, char ch) {
             return 0;
         }
 
-        bufferdata_reset(&parser->variable_buffer);
+        str_reset(&parser->variable_buffer);
 
         context->symbol = VIEWPARSER_VARIABLE_SPACE;
         context->stage = VIEWPARSER_LOOP_VAR;
@@ -1316,7 +1274,7 @@ int __viewparser_loop_write_in(viewparser_t* parser, char ch) {
     }
     default:
         context->symbol = VIEWPARSER_DEFAULT;
-        bufferdata_push(&parser->variable_buffer, ch);
+        str_appendc(&parser->variable_buffer, ch);
         break;
     }
 

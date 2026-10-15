@@ -75,6 +75,7 @@ static viewexpr_node_t* __viewexpr_parse_primary(viewexpr_parser_t* parser, int 
 static viewexpr_node_t* __viewexpr_parse_variable(viewexpr_parser_t* parser, int depth);
 static int __viewexpr_parse_segments(viewexpr_parser_t* parser, viewexpr_segment_t** head, viewexpr_segment_t** last, int depth);
 static viewexpr_value_t __viewexpr_eval_node(const viewexpr_node_t* node, const viewexpr_scope_t* scope);
+static size_t __viewexpr_number_format(long double value, char* buffer, size_t buffer_size);
 
 static int __viewexpr_isspace(char ch) {
     return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
@@ -1342,8 +1343,6 @@ viewexpr_value_t __viewexpr_eval_node(const viewexpr_node_t* node, const viewexp
 viewexpr_value_t viewexpr_eval(const viewexpr_node_t* node, const viewexpr_scope_t* scope) {
     return __viewexpr_eval_node(node, scope);
 }
-
-static size_t __viewexpr_number_format(long double value, char* buffer, size_t buffer_size);
 
 /**
  * Formats a number the way templates should show it: integral values without

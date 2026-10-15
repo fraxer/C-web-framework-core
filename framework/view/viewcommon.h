@@ -5,7 +5,6 @@
 
 #include "arena.h"
 #include "json.h"
-#include "bufferdata.h"
 #include "str.h"
 #include "viewexpr.h"
 #include "viewmodifier.h"
@@ -26,7 +25,7 @@ typedef struct view_tag {
     int type; // var, cond, loop, inc
     size_t parent_text_offset;
     size_t parent_text_size;
-    bufferdata_t result_content;
+    str_t result_content;
     struct view_tag* data_parent;
     struct view_tag* parent;
     struct view_tag* child;
