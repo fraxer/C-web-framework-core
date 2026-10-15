@@ -797,9 +797,8 @@ static viewexpr_value_t __viewmodifier_join(arena_t* arena, const viewexpr_value
     return __viewmodifier_string(result, size);
 }
 
-static void __viewmodifier_write(bufferdata_t* buf, const char* text, size_t size) {
-    for (size_t i = 0; i < size; i++)
-        bufferdata_push(buf, text[i]);
+static void __viewmodifier_write(str_t* buf, const char* text, size_t size) {
+    str_append(buf, text, size);
 }
 
 /**
@@ -814,7 +813,7 @@ static void __viewmodifier_write(bufferdata_t* buf, const char* text, size_t siz
  * @param escape The escape mode.
  * @return void
  */
-void viewmodifier_write_text(bufferdata_t* buf, const char* text, size_t length, view_escape_e escape) {
+void viewmodifier_write_text(str_t* buf, const char* text, size_t length, view_escape_e escape) {
     if (text == NULL) return;
 
     for (size_t i = 0; i < length; i++) {
@@ -837,7 +836,7 @@ void viewmodifier_write_text(bufferdata_t* buf, const char* text, size_t length,
             }
         }
 
-        bufferdata_push(buf, ch);
+        str_appendc(buf, ch);
     }
 }
 
@@ -1067,7 +1066,7 @@ static viewexpr_value_t __viewmodifier_json(arena_t* arena, const viewexpr_value
  * or CR) into "<br>\n". VIEW_RAW: writes the text as is. NUL bytes become
  * U+FFFD in both modes, as in viewmodifier_write_text().
  */
-static void __viewmodifier_nl2br(bufferdata_t* buf, const viewexpr_value_t* input, view_escape_e escape) {
+static void __viewmodifier_nl2br(str_t* buf, const viewexpr_value_t* input, view_escape_e escape) {
     char buffer[VIEWMODIFIER_NUMBER_BUFFER_SIZE];
     size_t length = 0;
     const char* text = __viewmodifier_text(input, buffer, &length);

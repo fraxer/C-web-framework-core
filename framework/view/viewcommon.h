@@ -6,6 +6,7 @@
 #include "arena.h"
 #include "json.h"
 #include "bufferdata.h"
+#include "str.h"
 #include "viewexpr.h"
 #include "viewmodifier.h"
 
@@ -72,7 +73,7 @@ typedef struct view_loop_copy {
 typedef struct view_copy_tags {
     view_loop_copy_t* copy;
     view_loop_copy_t* last_copy;
-    bufferdata_t buf;
+    str_t buf;              // the render output
     arena_t arena;          // strings made by modifiers, reset after every tag
     view_escape_e escape;   // how {{ }} values reach buf
 } view_copy_tags_t;
@@ -82,6 +83,9 @@ typedef struct view {
     view_tag_t* root_tag;
     struct view* next;
 } view_t;
+
+// First dynamic allocation of a render's output; str_t doubles it from there.
+#define VIEW_OUTPUT_INIT_CAPACITY 4096
 
 // Bytes a render's modifier arena may keep between tags for reuse.
 #define VIEW_ARENA_RETAIN (1024 * 1024)
