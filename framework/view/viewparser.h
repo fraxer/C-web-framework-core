@@ -47,7 +47,7 @@ typedef struct viewparser_context {
 typedef struct {
     const char* storage_name;
     const char* path;
-    bufferdata_t variable_buffer;
+    str_t variable_buffer;
     int level;
     char expr_quote;  // active string literal quote inside an expression tag, 0 if none
     char expr_escape; // previous expression char was an unconsumed backslash

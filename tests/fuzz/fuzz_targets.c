@@ -10248,11 +10248,11 @@ static int __vw_same_tree(const view_tag_t* a, const view_tag_t* b) {
         if (a == NULL || b == NULL) return 0;
         if (a->type != b->type || a->parent_text_offset != b->parent_text_offset ||
             a->parent_text_size != b->parent_text_size) return 0;
-        const size_t an = bufferdata_writed((bufferdata_t*)&a->result_content);
-        const size_t bn = bufferdata_writed((bufferdata_t*)&b->result_content);
+        const size_t an = str_size(&a->result_content);
+        const size_t bn = str_size(&b->result_content);
         if (an != bn) return 0;
-        if (an && memcmp(bufferdata_get((bufferdata_t*)&a->result_content),
-                         bufferdata_get((bufferdata_t*)&b->result_content), an) != 0) return 0;
+        if (an && memcmp(str_get((str_t*)&a->result_content),
+                         str_get((str_t*)&b->result_content), an) != 0) return 0;
         if ((a->expr == NULL) != (b->expr == NULL)) return 0;
         if (!__vw_same_tree(a->child, b->child)) return 0;
     }

@@ -18,7 +18,7 @@ static view_tag_t* create_test_tag(void) {
     view_tag_t* tag = calloc(1, sizeof(view_tag_t));
     if (tag == NULL) return NULL;
 
-    bufferdata_init(&tag->result_content);
+    str_init(&tag->result_content, 0);
     tag->free = test_tag_free;
 
     return tag;

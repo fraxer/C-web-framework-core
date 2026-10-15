@@ -72,7 +72,7 @@ void __view_tag_free(view_tag_t* tag) {
     tag->type = VIEW_TAGTYPE_VAR;
     tag->parent_text_offset = 0;
     tag->parent_text_size = 0;
-    bufferdata_clear(&tag->result_content);
+    str_clear(&tag->result_content);
     tag->data_parent = NULL;
     tag->parent = NULL;
     tag->last_child = NULL;
