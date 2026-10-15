@@ -15,6 +15,7 @@ literally, so `ON`, `1` and `true` all leave the suite out.
 | `h3_runner` | the QUIC / HTTP/3 / QPACK subset | `-DINCLUDE_HTTP3=yes` |
 | `db_runner` | `db/test_db_*.c` — real SQL against a real server | a reachable database |
 | `quicclient` | a QUIC/HTTP3 client tool, for the shell suites below | `-DINCLUDE_HTTP3=yes` |
+| `view_bench` | template engine throughput, 1 vs N threads (`-t`, default 4); not a test, not in CTest | a Release build for meaningful numbers |
 | `fuzz_*` | the protocol parsers under a fuzzer; run by `fuzz/run.sh` | `-DBUILD_FUZZERS=yes` (clang or gcc) |
 
 `h2_runner` and `h3_runner` are narrower builds of files `runner` already
@@ -47,6 +48,7 @@ tests/
 │   ├── runner.c              # DB test runner
 │   ├── test_db_*.c           # test files, picked up by a glob
 │   └── test_config.json      # DB connection config
+├── bench/                    # view_bench.c: template engine benchmark
 ├── quicclient/               # QUIC/HTTP3 client used by the h3 shell suites
 ├── fuzz/                     # fuzz targets, driver and corpus
 ├── data/                     # fixtures: certificates, shadow-copy modules

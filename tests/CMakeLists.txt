@@ -177,6 +177,12 @@ if(Python3_Interpreter_FOUND)
     set_tests_properties(startup_lifetime PROPERTIES TIMEOUT 120)
 endif()
 
+# Template engine throughput (tests/bench/view_bench.c). A tool, not a test: its
+# numbers only mean something in a Release build, so it is not added to CTest.
+add_executable(view_bench bench/view_bench.c)
+target_link_libraries(view_bench PRIVATE cwfr_framework
+    ${OPENSSL_LIBRARIES} Threads::Threads ${CMAKE_DL_LIBS})
+
 # HTTP/2 regressions can run independently of database and HTTP client suites.
 set(H2_UNIT_TEST_FILES ${UNIT_TEST_FILES})
 list(FILTER H2_UNIT_TEST_FILES INCLUDE REGEX "/test_(h2|hpack|httpfields)")

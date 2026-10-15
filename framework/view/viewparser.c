@@ -11,6 +11,7 @@ static viewparser_context_t* __viewparser_context_create();
 static void __viewparser_context_free(viewparser_context_t* context);
 static int __viewparser_readfile(viewparser_context_t* context, const char* storage_name,const char* path);
 static int __viewparser_parse_content(viewparser_t* parser);
+static int __viewparser_tags_complete(view_tag_t* tag);
 static int __viewparser_variable_create(viewparser_t* parser);
 static void __viewparser_expr_begin(viewparser_t* parser);
 static int __viewparser_expr_collect(viewparser_t* parser, char ch, char close_first);
@@ -104,6 +105,41 @@ int viewparser_run(viewparser_t* parser) {
 
     if (!__viewparser_parse_content(parser))
         return 0;
+
+    // the parsed tree is cached and rendered by many threads at once:
+    // bufferdata_get must not have to flush a buffer during rendering
+    if (!__viewparser_tags_complete(parser->root_tag)) {
+        log_error("viewparser_run: out of memory completing view %s", parser->path);
+        return 0;
+    }
+
+    return 1;
+}
+
+/**
+ * Flushes the static part of every tag's result_content into its dynamic
+ * buffer, so later bufferdata_get calls on the tree only read it.
+ * Walks the tree iteratively to stay off the stack on deep templates.
+ *
+ * @param tag The root of the tag tree.
+ * @return Non-zero on success; zero if an allocation failed.
+ */
+int __viewparser_tags_complete(view_tag_t* tag) {
+    while (tag != NULL) {
+        if (!bufferdata_complete(&tag->result_content))
+            return 0;
+
+        if (tag->child != NULL) {
+            tag = tag->child;
+            continue;
+        }
+
+        while (tag != NULL && tag->next == NULL)
+            tag = tag->parent;
+
+        if (tag != NULL)
+            tag = tag->next;
+    }
 
     return 1;
 }
