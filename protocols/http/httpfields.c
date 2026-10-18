@@ -388,6 +388,8 @@ http_fields_status_e httpfields_to_request(httprequest_t* request,
             status = HTTP_FIELDS_EXTENDED_CONNECT;
             goto done;
         }
+        /* The tunnel's upgrade handler authenticates it like any request. */
+        apply_cookies(request);
         status = HTTP_FIELDS_WEBSOCKET;
         goto done;
     }

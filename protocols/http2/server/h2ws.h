@@ -78,6 +78,10 @@ typedef struct h2_ws_tunnel {
 h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, h2stream_t* stream,
                                     int resource_protocol, const ws_deflate_config_t* deflate);
 void h2_ws_tunnel_free(h2_ws_tunnel_t* tunnel);
+/* Takes over one reference to the session a handler attached when it accepted
+ * the tunnel (switch_to_websockets_session); every message request parsed from
+ * now on carries it, as on an HTTP/1.1 session upgrade. */
+void h2_ws_tunnel_adopt_session(h2_ws_tunnel_t* tunnel, ws_session_t* session);
 int h2_ws_tunnel_tick(h2_ws_tunnel_t* tunnel, uint64_t now);
 
 /* Hand one DATA payload to the parser. `data` must be writable: WebSocket

@@ -175,6 +175,8 @@ static httpresponse_t* __httpresponse_create(connection_t* connection, http_chai
     response->vary_encoding = 0;
     response->gzip_precompressed = 0;
     response->connect_tunnel = 0;
+    response->ws_accept = 0;
+    response->ws_session = NULL;
     response->access_log = 0;
     response->access_started.tv_sec = 0;
     response->access_started.tv_nsec = 0;
@@ -245,6 +247,9 @@ void __httpresponse_reset(httpresponse_t* response) {
     response->vary_encoding = 0;
     response->gzip_precompressed = 0;
     response->connect_tunnel = 0;
+    response->ws_accept = 0;
+    ws_session_unref(response->ws_session);
+    response->ws_session = NULL;
     response->access_log = 0;
     response->access_started.tv_sec = 0;
     response->access_started.tv_nsec = 0;

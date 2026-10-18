@@ -59,7 +59,36 @@ static void handshake_free(void* data) {
     free(handshake);
 }
 
+/* RFC 8441: on HTTP/2 the opening handshake is the extended CONNECT itself --
+ * no Upgrade, Connection or Sec-WebSocket-Key, and the answer is 200 (h2 has no
+ * 101). Nothing is switched on the connection, which keeps speaking h2: the
+ * session rides on the response, and the stream turns into a tunnel when the
+ * answer is published (h2session.c). Session tunnels take no permessage-deflate,
+ * like session upgrades on HTTP/1.1. */
+static int accept_tunnel(httpctx_t* ctx, ws_session_t* session) {
+    const http_header_t* ws_version  = ctx->request->get_headern(ctx->request, "Sec-WebSocket-Version", 21);
+    const http_header_t* ws_protocol = ctx->request->get_headern(ctx->request, "Sec-WebSocket-Protocol", 22);
+
+    if (ws_version == NULL || ws_version->value_length != 2 || memcmp(ws_version->value, "13", 2) != 0) {
+        __refuse(ctx, 426);
+        ctx->response->add_headern(ctx->response, "Sec-WebSocket-Version", 21, "13", 2);
+        return 0;
+    }
+
+    if (ws_protocol != NULL && strcmp(ws_protocol->value, "resource") == 0)
+        ctx->response->add_headern(ctx->response, "Sec-WebSocket-Protocol", 22, ws_protocol->value, ws_protocol->value_length);
+
+    ctx->response->status_code = 200;
+    ctx->response->connect_tunnel = 1;
+    ctx->response->ws_accept = 1;
+    ctx->response->ws_session = ws_session_ref(session);
+    return 1;
+}
+
 static int switch_session(httpctx_t* ctx, ws_session_t* session) {
+    if (ctx->request->ws_tunnel)
+        return accept_tunnel(ctx, session);
+
     const http_header_t* connection  = ctx->request->get_headern(ctx->request, "Connection", 10);
     const http_header_t* upgrade     = ctx->request->get_headern(ctx->request, "Upgrade", 7);
     const http_header_t* ws_version  = ctx->request->get_headern(ctx->request, "Sec-WebSocket-Version", 21);

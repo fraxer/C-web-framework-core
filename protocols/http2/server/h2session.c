@@ -37,6 +37,7 @@ _Static_assert(sizeof(hpack_header_t) == sizeof(httpfields_field_t),
 #include "h2ws.h"
 #include "h2stream.h"
 #include "httpserverhandlers.h"
+#include "route.h"
 #include "log.h"
 #include "metrics.h"
 #include "multiplexing.h"
@@ -1471,6 +1472,89 @@ static h2_frame_result_e h2_open_tunnel(h2session_t* s, h2stream_t* stream, int 
     return H2_FRAME_OK;
 }
 
+/* An extended CONNECT whose :path has an HTTP route (a GET handler) on a vhost
+ * that serves WebSockets is the application's to accept: it authenticates the
+ * request like an HTTP/1.1 upgrade and attaches its session. Without one the
+ * tunnel opens directly, as it always did (docs/http2/09). */
+static int h2_tunnel_has_handler(h2session_t* s, h2stream_t* stream) {
+    connection_server_ctx_t* ctx = s->connection->ctx;
+    if (ctx == NULL || ctx->server == NULL || !ctx->server->websockets.configured)
+        return 0;
+
+    route_t* route = NULL;
+    httprequest_t* request = stream->request;
+    return route_find_http(ctx->server->http.route, request->path, request->path_length, ROUTE_GET, &route) == 1 &&
+           route != NULL && route->handler[ROUTE_GET] != NULL;
+}
+
+/* Hand the extended CONNECT to its route as a GET marked ws_tunnel. The stream
+ * stays open towards us; until the handler answers it counts as `rejected`, so
+ * DATA sent early is credited and dropped, trailers never touch the request the
+ * handler is reading, and no body deadline runs. h2_publish_one settles it. */
+static h2_frame_result_e h2_dispatch_tunnel(h2session_t* s, h2stream_t* stream, int end_stream) {
+    httprequest_t* request = stream->request;
+    request->method = ROUTE_GET;
+    request->ws_tunnel = 1;
+
+    stream->tunnel_pending = 1;
+    stream->rejected = 1;
+    stream->headers_done = 1;
+    request->headers_done_ms = h2_now_ms();
+    stream->body_started_ms = h2_recv_stamp(s, request->headers_done_ms);
+    stream->request_progress_ms = stream->body_started_ms;
+    connection_server_ctx_t* ctx = s->connection->ctx;
+    if (ctx && ctx->server)
+        stream->timeout_policy = ctx->server->timeouts;
+    http_server_request_policy(s->connection, request, &stream->timeout_policy);
+    stream->timeout_policy = request->timing_policy;
+    if (end_stream) stream->state = H2_STREAM_HALF_CLOSED_REMOTE;
+
+    atomic_store_explicit(&stream->handler_pending, 1, memory_order_release);
+    if (!http_server_dispatch(s->connection, request)) {
+        atomic_store_explicit(&stream->handler_pending, 0, memory_order_release);
+        return h2_conn_error(s, H2_ERR_INTERNAL_ERROR);
+    }
+    return H2_FRAME_OK;
+}
+
+/* The handler's answer to a pending extended CONNECT. A 200 it accepted with
+ * switch_to_websockets_session() makes the stream a tunnel carrying the
+ * handler's session; anything else goes out as an ordinary answer and the
+ * stream stays `rejected` for whatever the peer still sends. */
+static void h2_settle_tunnel(h2session_t* s, h2stream_t* stream, httpresponse_t* response) {
+    stream->tunnel_pending = 0;
+    stream->rejected = 1;
+    if (!response->ws_accept || response->status_code != 200)
+        return;
+
+    const http_header_t* subprotocol =
+        stream->request->get_headern(stream->request, "Sec-WebSocket-Protocol", 22);
+    const int resource = subprotocol != NULL && subprotocol->value != NULL &&
+        strcmp(subprotocol->value, "resource") == 0;
+
+    stream->ws = h2_ws_tunnel_create(s->connection, stream, resource, NULL);
+    if (stream->ws == NULL) {
+        log_error("h2: no memory for an accepted WebSocket tunnel (fd %d)\n", s->connection->fd);
+        httpresponse_default(response, 500);
+        response->connect_tunnel = 0;
+        response->ws_accept = 0;
+        ws_session_unref(response->ws_session);
+        response->ws_session = NULL;
+        return;
+    }
+
+    h2_ws_tunnel_adopt_session(stream->ws, response->ws_session);
+    response->ws_session = NULL;
+    stream->rejected = 0;
+    stream->body_started_ms = h2_now_ms();
+    stream->timeout_policy = stream->ws->parser->timeout_policy;
+    stream->request->timing_policy = stream->timeout_policy;
+    stream->request->timing_policy_ready = 1;
+
+    log_info("h2: WebSocket tunnel accepted by its handler on stream %u (fd %d)\n",
+             stream->id, s->connection->fd);
+}
+
 static h2_frame_result_e h2_reject_stream(h2session_t* s, h2stream_t* stream,
                                           int status_code, int end_stream) {
     httpresponse_t* response = httpresponse_create_h2(s->connection);
@@ -1581,7 +1665,8 @@ static h2_frame_result_e h2_on_header_block(h2session_t* s, uint32_t stream_id,
     if (status == H2_REQUEST_EXTENDED_CONNECT)
         return h2_reject_stream(s, stream, 501, end_stream);
     if (status == H2_REQUEST_WEBSOCKET)
-        return h2_open_tunnel(s, stream, end_stream);
+        return h2_tunnel_has_handler(s, stream) ? h2_dispatch_tunnel(s, stream, end_stream)
+                                                : h2_open_tunnel(s, stream, end_stream);
     if (status != H2_REQUEST_OK)
         return h2_request_failed(s, stream, status);
 
@@ -2444,6 +2529,9 @@ static void h2_publish_one(h2session_t* s, httpresponse_t* response) {
         h2_session_drop_stream(s, stream);
         return;
     }
+
+    if (stream->tunnel_pending)
+        h2_settle_tunnel(s, stream, response);
 
     /* Release-store so the write path, which loads this with acquire, cannot
      * observe the flag before the response body and headers the handler wrote. */

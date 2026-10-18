@@ -222,3 +222,49 @@ TEST(test_ws_switch_session_transferred_to_transport) {
         TEST_ASSERT_EQUAL(1, session_destroyed, "transport releases payload exactly once");
     }
 }
+
+/* RFC 8441: an extended CONNECT routed to the handler that calls
+ * switch_to_websockets_session. There is no Upgrade/Key handshake on h2; the
+ * answer is 200 and the session travels on the response until the stream
+ * becomes a tunnel. */
+TEST(test_ws_switch_h2_tunnel_accepted_with_200) {
+    TEST_SUITE("websocketsswitch: h2 tunnel");
+    ws_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx), "fixture");
+    fx.ctx.request->ws_tunnel = 1;
+    TEST_REQUIRE(add_handshake(&fx, NULL, NULL, "13", NULL), "version");
+    fx.ctx.request->add_header(fx.ctx.request, "Sec-WebSocket-Protocol", "resource");
+    fx.ctx.request->add_header(fx.ctx.request, "Sec-WebSocket-Extensions", "permessage-deflate");
+    session_destroyed = 0;
+    ws_session_t* session = ws_session_create(&session_destroyed, ws_test_session_destroy);
+    TEST_REQUIRE_NOT_NULL(session, "session");
+    TEST_ASSERT(switch_to_websockets_session(&fx.ctx, session), "tunnel accepted");
+    httpresponse_t* response = fx.ctx.response;
+    TEST_ASSERT_EQUAL(200, response->status_code, "200, not 101");
+    TEST_ASSERT(response->connect_tunnel && response->ws_accept, "marked as an accepted tunnel");
+    TEST_ASSERT(header_is(response, "Sec-WebSocket-Protocol", "resource"), "subprotocol echoed");
+    TEST_ASSERT_NULL(response->get_header(response, "Upgrade"), "no Upgrade on h2");
+    TEST_ASSERT_NULL(response->get_header(response, "Sec-WebSocket-Accept"), "no accept key on h2");
+    TEST_ASSERT_NULL(response->get_header(response, "Sec-WebSocket-Extensions"), "no deflate for a session tunnel");
+    TEST_ASSERT(fx.server_ctx.switch_to_protocol.fn == NULL, "the h2 connection is not switched");
+    TEST_ASSERT(ws_session_data(response->ws_session) == &session_destroyed, "response carries the session");
+    TEST_ASSERT_EQUAL(0, session_destroyed, "response holds a reference");
+    fixture_teardown(&fx);
+    TEST_ASSERT_EQUAL(1, session_destroyed, "freeing the response releases it");
+}
+
+TEST(test_ws_switch_h2_tunnel_bad_version_refused) {
+    TEST_SUITE("websocketsswitch: h2 tunnel");
+    ws_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx), "fixture");
+    fx.ctx.request->ws_tunnel = 1;
+    TEST_REQUIRE(add_handshake(&fx, NULL, NULL, "8", NULL), "version");
+    session_destroyed = 0;
+    ws_session_t* session = ws_session_create(&session_destroyed, ws_test_session_destroy);
+    TEST_REQUIRE_NOT_NULL(session, "session");
+    TEST_ASSERT(!switch_to_websockets_session(&fx.ctx, session), "refused");
+    TEST_ASSERT_EQUAL(426, fx.ctx.response->status_code, "426 with the version we speak");
+    TEST_ASSERT(!fx.ctx.response->ws_accept && fx.ctx.response->ws_session == NULL, "nothing accepted");
+    TEST_ASSERT_EQUAL(1, session_destroyed, "session released");
+    fixture_teardown(&fx);
+}

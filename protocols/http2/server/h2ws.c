@@ -52,6 +52,11 @@ h2_ws_tunnel_t* h2_ws_tunnel_create(connection_t* connection, h2stream_t* stream
     return tunnel;
 }
 
+void h2_ws_tunnel_adopt_session(h2_ws_tunnel_t* tunnel, ws_session_t* session) {
+    ws_session_unref(tunnel->parser->session);
+    tunnel->parser->session = session;
+}
+
 void h2_ws_tunnel_free(h2_ws_tunnel_t* tunnel) {
     if (tunnel == NULL) return;
 

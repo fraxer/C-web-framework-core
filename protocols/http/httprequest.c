@@ -91,6 +91,7 @@ httprequest_t* httprequest_create(connection_t* connection) {
 
     request->method = ROUTE_NONE;
     request->asterisk_form = 0;
+    request->ws_tunnel = 0;
     request->keepalive = 0;
     request->started_ms = 0;
     request->headers_done_ms = 0;
@@ -158,6 +159,7 @@ void httprequest_reset(httprequest_t* request) {
     request->timing_finished = 0;
     request->method = ROUTE_NONE;
     request->asterisk_form = 0;
+    request->ws_tunnel = 0;
     request->keepalive = 0;
     timeout_policy_defaults(&request->timing_policy);
     request->timing_policy_ready = 0;

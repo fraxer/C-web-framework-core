@@ -289,6 +289,11 @@ typedef struct httprequest {
      * server rather than any resource — so it is answered before routing, and
      * `path` carries the literal "*" that no route will ever match. */
     int asterisk_form;
+    /* h2 only: an RFC 8441 extended CONNECT handed to the HTTP route of its
+     * :path (routed as GET). The handler accepts it with
+     * switch_to_websockets_session(), which then answers 200 instead of 101
+     * and leaves the session on the response for the stream to pick up. */
+    int ws_tunnel;
     /* h1.1 only: whether this request leaves the connection open -- the
      * version's default, then what its Connection field says (RFC 9112 §9.3).
      * The parser's verdict, kept on the request it belongs to: the connection

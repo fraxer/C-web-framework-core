@@ -228,3 +228,26 @@ TEST(test_httpfields_violations) {
     TEST_ASSERT(!httpfields_is_forbidden_header("content-type", 12), "content-type allowed");
     TEST_ASSERT(!httpfields_is_forbidden_header("cookie", 6), "cookie allowed");
 }
+
+/* RFC 8441 / RFC 9220: an extended CONNECT is handed to the application's
+ * upgrade handler, which authenticates it by its cookies — they are derived
+ * exactly as for any other request, split crumbs included (RFC 9113 §8.2.3). */
+TEST(test_httpfields_websocket_connect_has_cookies) {
+    TEST_SUITE("httpfields");
+    TEST_CASE("cookies of an extended CONNECT are parsed");
+    const httpfields_field_t connect[] = {
+        F(":method", "CONNECT"), F(":protocol", "websocket"), F(":scheme", "https"),
+        F(":path", "/ws"), F(":authority", "example.com"),
+        F("cookie", "access=tok"), F("cookie", "refresh=r"),
+    };
+    for (int p = 0; p < 2; p++) {
+        httprequest_t* r = NULL;
+        const http_fields_proto_e proto = p == 0 ? HTTP_FIELDS_H2 : HTTP_FIELDS_H3;
+        TEST_ASSERT(build(connect, sizeof connect / sizeof connect[0], proto, &r) == HTTP_FIELDS_WEBSOCKET, "websocket");
+        const char* access = r->get_cookie(r, "access");
+        const char* refresh = r->get_cookie(r, "refresh");
+        TEST_ASSERT(access != NULL && strcmp(access, "tok") == 0, "access cookie");
+        TEST_ASSERT(refresh != NULL && strcmp(refresh, "r") == 0, "refresh cookie from a second crumb");
+        httprequest_free(r);
+    }
+}

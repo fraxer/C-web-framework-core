@@ -12,6 +12,7 @@
 #include "viewmodifier.h"
 #include "response.h"
 #include "http_filter.h"
+#include "ws_session.h"
 
 typedef enum {
     FILE_OK = 0,
@@ -364,6 +365,11 @@ typedef struct httpresponse {
      * length stops reading the tunnel at it. Set for the RFC 8441 WebSocket
      * tunnel (docs/http2/09); zero on every ordinary response. */
     unsigned connect_tunnel : 1;
+    /* A handler accepted the RFC 8441 tunnel this response answers; ws_session
+     * (may be NULL) is the reference the tunnel takes over. Released with the
+     * response if the stream never becomes a tunnel. */
+    unsigned ws_accept : 1;
+    ws_session_t* ws_session;
     /* This response is to produce an access-log record. Armed once, where the
      * response is taken for a request and the vhost's configuration is at hand,
      * and cleared by the record itself so a retried write cannot repeat it. */

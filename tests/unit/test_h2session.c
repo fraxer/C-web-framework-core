@@ -4,6 +4,8 @@
 #include "connection_s.h"
 #include "domain.h"
 #include "h2ws.h"
+#include "ws_session.h"
+#include "websocketsprotocolresource.h"
 #include "multiplexing.h"
 
 #include <dlfcn.h>
@@ -823,4 +825,77 @@ TEST(test_h2session_websocket_send_progress_counts_socket_bytes) {
     timeout_set_clock(NULL);
     h2_session_free(s);
     close(fd[0]); close(fd[1]);
+}
+
+/* RFC 8441 routed through an HTTP handler: the extended CONNECT waits on the
+ * handler with tunnel_pending set, and the published answer decides — a 200
+ * that accepted the tunnel turns the stream into one carrying the handler's
+ * session, anything else is an ordinary refusal. */
+static int tunnel_session_destroyed;
+static void tunnel_session_destroy(void* data) { (*(int*)data)++; }
+
+TEST(test_h2session_handler_accepts_or_refuses_tunnel) {
+    TEST_SUITE("h2session: handler-accepted tunnel");
+    for (int accept = 0; accept < 2; accept++) {
+        int fd[2];
+        TEST_REQUIRE(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, fd) == 0, "socket pair");
+        server_t server = {0};
+        timeout_policy_defaults(&server.timeouts);
+        mpxapi_t api = { .control_mod = stub_control_mod };
+        listener_t listener = { .api = &api };
+        connection_server_ctx_t ctx = { .server = &server, .listener = &listener };
+        connection_t c = { .fd = fd[0], .ctx = &ctx };
+        h2session_t* s = h2_test_session_create(&c);
+        TEST_REQUIRE(s != NULL, "session allocated");
+        ctx.parser = s;
+        ctx.is_http2 = 1;
+        atomic_store(&ctx.broadcast_ref_count, 2);
+        timeout_test_ms = 100000;
+        timeout_set_clock(timeout_test_clock);
+        s->last_activity_ms = timeout_test_ms;
+
+        h2stream_t* stream = h2stream_create(s, 1);
+        httpresponse_t* response = httpresponse_create_h2(&c);
+        TEST_REQUIRE(stream && response && stream->request, "stream and response allocated");
+        s->last_stream_id = 1;
+        stream->state = H2_STREAM_OPEN;
+        stream->recv.avail = H2_DEFAULT_WINDOW;
+        timeout_policy_defaults(&stream->timeout_policy);
+        stream->request->add_header(stream->request, "Sec-WebSocket-Protocol", "resource");
+        stream->tunnel_pending = 1;
+        stream->response = response;
+        atomic_store(&stream->handler_pending, 1);
+
+        tunnel_session_destroyed = 0;
+        ws_session_t* session = ws_session_create(&tunnel_session_destroyed, tunnel_session_destroy);
+        TEST_REQUIRE(session != NULL, "session");
+        if (accept) {
+            response->status_code = 200;
+            response->connect_tunnel = 1;
+            response->ws_accept = 1;
+            response->ws_session = session;
+        } else {
+            response->status_code = 401;
+            ws_session_unref(session);
+        }
+
+        TEST_ASSERT(h2_server_response_ready(&c, response), "handler publishes");
+        h2_server_tick(&c, 0);
+        TEST_ASSERT(!stream->tunnel_pending, "the handler's answer settled the tunnel");
+        if (accept) {
+            TEST_ASSERT(stream->ws != NULL && !stream->rejected, "accepted: the stream is a tunnel");
+            TEST_ASSERT(stream->ws && ws_session_data(stream->ws->parser->session) == &tunnel_session_destroyed,
+                        "the tunnel's requests get the handler's session");
+            TEST_ASSERT(stream->ws && stream->ws->parser->protocol_create == websockets_protocol_resource_create,
+                        "resource subprotocol kept");
+            TEST_ASSERT(stream->state == H2_STREAM_OPEN, "the stream stays open both ways");
+        } else {
+            TEST_ASSERT(stream->ws == NULL && stream->rejected, "refused: an ordinary answer, the rest is dropped");
+        }
+
+        timeout_set_clock(NULL);
+        h2_session_free(s);
+        TEST_ASSERT_EQUAL(1, tunnel_session_destroyed, "the session is released exactly once");
+        close(fd[0]); close(fd[1]);
+    }
 }

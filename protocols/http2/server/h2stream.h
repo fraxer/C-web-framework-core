@@ -121,6 +121,10 @@ typedef struct h2stream {
      * body is of no further interest, but the peer may already be sending it, so
      * DATA keeps being credited and discarded instead of dispatched. */
     unsigned rejected        : 1;
+    /* An extended CONNECT is with its route's handler: the stream stays open
+     * and its DATA is dropped until the published answer either turns it into
+     * a tunnel (200 + ws_accept) or refuses it (docs/http2/09). */
+    unsigned tunnel_pending  : 1;
     unsigned end_stream_sent : 1; /* the response already carried END_STREAM */
     unsigned window_blocked  : 1; /* body stalled waiting on a WINDOW_UPDATE */
     unsigned yielded         : 1; /* quantum spent; more body still to send */
