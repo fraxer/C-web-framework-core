@@ -1775,3 +1775,40 @@ TEST(test_wsh_message_total_checked_on_every_read_regression) {
     wsh_harness_free(&h);
     timeout_set_clock(NULL);
 }
+
+static void wsh_join_batch(void* arg) {
+    wsctx_t* ctx = arg;
+    const unsigned char update[] = {1, 0, 255};
+    const ws_frame_t frames[] = {{1, update, sizeof update}, {0, "SYNC_DONE", 9}};
+    TEST_ASSERT(websocketsresponse_frames(ctx->response, frames, 2), "join batch prepared");
+}
+
+TEST(test_wsh_join_batch_precedes_broadcast_during_handler) {
+    TEST_SUITE("websocketsserverhandlers: output order");
+    wsh_harness_t h;
+    TEST_REQUIRE(wsh_harness_init(&h), "harness");
+    TEST_REQUIRE_GOTO(wsh_attach_parser(&h, websockets_protocol_default_create), "parser", teardown);
+    h.server.websockets.default_handler = wsh_join_batch;
+    unsigned char frame[32];
+    size_t n = wsh_build_frame(frame, 0x01, 1, (const unsigned char*)"join", 4);
+    TEST_REQUIRE_GOTO(send(h.peer_fd, frame, n, 0) == (ssize_t)n, "join sent", teardown);
+    TEST_ASSERT(websockets_guard_read(h.conn), "join dispatched");
+    websocketsresponse_t* live = websocketsresponse_create(h.conn);
+    TEST_REQUIRE_NOT_NULL_GOTO(live, "live response", teardown);
+    live->send_text(live, "LIVE");
+    TEST_ASSERT(websockets_response_post(live), "broadcast queued during join");
+    TEST_ASSERT(websockets_guard_write(h.conn), "pending join blocks broadcast");
+    unsigned char wire[64];
+    TEST_ASSERT_EQUAL_SIZE(0, wsh_drain(h.peer_fd, wire, sizeof wire, 0), "no premature live update");
+    connection_queue_item_t* item = cqueue_pop(h.ctx.queue);
+    TEST_REQUIRE_NOT_NULL_GOTO(item, "join worker", teardown);
+    item->run(item);
+    item->free(item);
+    TEST_ASSERT(websockets_guard_write(h.conn), "write ordered batch and live");
+    const unsigned char expected[] = {0x82,3,1,0,255,0x81,9,'S','Y','N','C','_','D','O','N','E',0x81,4,'L','I','V','E'};
+    n = wsh_drain(h.peer_fd, wire, sizeof wire, 0);
+    TEST_ASSERT_EQUAL_SIZE(sizeof expected, n, "all three frames");
+    TEST_ASSERT(n == sizeof expected && memcmp(wire, expected, sizeof expected) == 0, "snapshot, sync done, then live");
+    teardown:
+    wsh_harness_free(&h);
+}

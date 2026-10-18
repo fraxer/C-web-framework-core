@@ -87,6 +87,7 @@ void websocketsparser_init(websocketsparser_t* parser) {
     parser->payload_index = 0;
     parser->payload_saved_length = 0;
     parser->message_fragmented = 0;
+    parser->session = NULL;
     parser->request = NULL;
     bufo_init(&parser->compressed_buf);
     parser->compressed_buffered = 0;
@@ -104,6 +105,7 @@ void websocketsparser_free(void* arg) {
     __clear(parser);
     ws_deflate_free(&parser->ws_deflate);
     bufo_clear(&parser->compressed_buf);
+    ws_session_unref(parser->session);
     free(parser);
 }
 
@@ -439,6 +441,8 @@ int websocketsparser_parse_first_byte(websocketsparser_t* parser) {
             parser->request = websocketsrequest_create(parser->connection, protocol);
             if (parser->request == NULL)
                 protocol->free(protocol);
+            else
+                parser->request->session = ws_session_ref(parser->session);
         }
         if (parser->request == NULL)
             return 0;

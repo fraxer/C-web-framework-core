@@ -105,6 +105,8 @@ int set_websockets_default(connection_t* connection, void* data) {
 
     /* Initialize deflate if negotiated during handshake */
     ws_handshake_data_t* handshake_data = data;
+    if (handshake_data != NULL)
+        parser->session = ws_session_ref(handshake_data->session);
     if (handshake_data != NULL && handshake_data->deflate_enabled) {
         parser->ws_deflate.config = handshake_data->deflate_config;
         if (ws_deflate_start(&parser->ws_deflate)) {

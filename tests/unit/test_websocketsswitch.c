@@ -166,3 +166,59 @@ TEST(test_ws_switch_unsupported_version_is_426) {
         fixture_teardown(&fx);
     }
 }
+
+static int session_destroyed;
+static void ws_test_session_destroy(void* data) { (*(int*)data)++; }
+
+TEST(test_ws_switch_session_is_released_on_refusal) {
+    TEST_SUITE("websocketsswitch: session");
+    ws_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx), "fixture");
+    session_destroyed = 0;
+    ws_session_t* session = ws_session_create(&session_destroyed, ws_test_session_destroy);
+    TEST_REQUIRE_NOT_NULL(session, "session");
+    TEST_ASSERT(!switch_to_websockets_session(&fx.ctx, session), "bad handshake refused");
+    TEST_ASSERT_EQUAL(1, session_destroyed, "consumed even on failure");
+    fixture_teardown(&fx);
+}
+
+TEST(test_ws_switch_session_declines_compression) {
+    TEST_SUITE("websocketsswitch: session");
+    ws_fixture_t fx;
+    TEST_REQUIRE(fixture_setup(&fx), "fixture");
+    TEST_REQUIRE(add_handshake(&fx, "websocket", "Upgrade", "13", SAMPLE_KEY), "headers");
+    fx.ctx.request->add_header(fx.ctx.request, "Sec-WebSocket-Extensions", "permessage-deflate");
+    session_destroyed = 0;
+    ws_session_t* session = ws_session_create(&session_destroyed, ws_test_session_destroy);
+    TEST_REQUIRE_NOT_NULL(session, "session");
+    TEST_ASSERT(switch_to_websockets_session(&fx.ctx, session), "valid handshake");
+    TEST_ASSERT_NULL(fx.ctx.response->get_header(fx.ctx.response, "Sec-WebSocket-Extensions"), "ordered session does not negotiate deflate");
+    TEST_ASSERT_EQUAL(0, session_destroyed, "handshake owns session");
+    fixture_teardown(&fx);
+    TEST_ASSERT_EQUAL(1, session_destroyed, "abandoned upgrade releases session");
+}
+
+#include "websocketsparser.h"
+
+TEST(test_ws_switch_session_transferred_to_transport) {
+    TEST_SUITE("websocketsswitch: session");
+    for (int resource = 0; resource < 2; resource++) {
+        ws_fixture_t fx;
+        TEST_REQUIRE(fixture_setup(&fx), "fixture");
+        TEST_REQUIRE(add_handshake(&fx, "websocket", "Upgrade", "13", SAMPLE_KEY), "headers");
+        if (resource)
+            fx.ctx.request->add_header(fx.ctx.request, "Sec-WebSocket-Protocol", "resource");
+        session_destroyed = 0;
+        ws_session_t* session = ws_session_create(&session_destroyed, ws_test_session_destroy);
+        TEST_REQUIRE_NOT_NULL(session, "session");
+        TEST_REQUIRE(switch_to_websockets_session(&fx.ctx, session), "upgrade accepted");
+        TEST_REQUIRE(fx.server_ctx.switch_to_protocol.fn(&fx.connection,
+                     fx.server_ctx.switch_to_protocol.data), "transport switched");
+        websocketsparser_t* parser = fx.server_ctx.parser;
+        TEST_ASSERT(ws_session_data(parser->session) == &session_destroyed, "transport owns payload");
+        fixture_teardown(&fx);
+        TEST_ASSERT_EQUAL(0, session_destroyed, "handshake release leaves transport reference");
+        parser->base.free(parser);
+        TEST_ASSERT_EQUAL(1, session_destroyed, "transport releases payload exactly once");
+    }
+}

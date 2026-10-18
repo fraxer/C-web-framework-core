@@ -53,7 +53,13 @@ static void __refuse(httpctx_t* ctx, int status_code) {
  * 426 with the one it does. The key used to be strcpy'd into a 128-byte stack
  * buffer, so a client sending a key longer than 91 bytes overflowed it; it is
  * checked for its one legal shape now, and only that is ever copied. */
-void switch_to_websockets(httpctx_t* ctx) {
+static void handshake_free(void* data) {
+    ws_handshake_data_t* handshake = data;
+    if (handshake != NULL) ws_session_unref(handshake->session);
+    free(handshake);
+}
+
+static int switch_session(httpctx_t* ctx, ws_session_t* session) {
     const http_header_t* connection  = ctx->request->get_headern(ctx->request, "Connection", 10);
     const http_header_t* upgrade     = ctx->request->get_headern(ctx->request, "Upgrade", 7);
     const http_header_t* ws_version  = ctx->request->get_headern(ctx->request, "Sec-WebSocket-Version", 21);
@@ -63,13 +69,13 @@ void switch_to_websockets(httpctx_t* ctx) {
 
     if (!__has_token(upgrade, "websocket") || !__has_token(connection, "upgrade") || !__key_valid(ws_key)) {
         __refuse(ctx, 400);
-        return;
+        return 0;
     }
 
     if (ws_version == NULL || ws_version->value_length != 2 || memcmp(ws_version->value, "13", 2) != 0) {
         __refuse(ctx, 426);
         ctx->response->add_headern(ctx->response, "Sec-WebSocket-Version", 21, "13", 2);
-        return;
+        return 0;
     }
 
     static const char magic_string[] = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -87,9 +93,10 @@ void switch_to_websockets(httpctx_t* ctx) {
     ws_handshake_data_t* handshake_data = malloc(sizeof * handshake_data);
     if (handshake_data == NULL) {
         __refuse(ctx, 500);
-        return;
+        return 0;
     }
     handshake_data->deflate_enabled = 0;
+    handshake_data->session = ws_session_ref(session);
 
     ctx->response->add_headern(ctx->response, "Upgrade", 7, "websocket", 9);
     ctx->response->add_headern(ctx->response, "Connection", 10, "Upgrade", 7);
@@ -100,7 +107,7 @@ void switch_to_websockets(httpctx_t* ctx) {
 
     conn_ctx->switch_to_protocol.fn = set_websockets_default;
     conn_ctx->switch_to_protocol.data = handshake_data;
-    conn_ctx->switch_to_protocol.data_free = free;
+    conn_ctx->switch_to_protocol.data_free = handshake_free;
 
     if (ws_protocol != NULL && strcmp(ws_protocol->value, "resource") == 0) {
         ctx->response->add_headern(ctx->response, "Sec-WebSocket-Protocol", 22, ws_protocol->value, ws_protocol->value_length);
@@ -108,7 +115,7 @@ void switch_to_websockets(httpctx_t* ctx) {
     }
 
     /* Negotiate permessage-deflate extension */
-    if (ws_extensions != NULL) {
+    if (ws_extensions != NULL && session == NULL) {
         ws_deflate_config_t deflate_config;
         if (ws_deflate_parse_header(ws_extensions->value, &deflate_config)) {
             handshake_data->deflate_config = deflate_config;
@@ -123,4 +130,16 @@ void switch_to_websockets(httpctx_t* ctx) {
 
     ctx->response->status_code = 101;
     server_connection->keepalive = 1;
+    return 1;
+}
+
+
+int switch_to_websockets_session(httpctx_t* ctx, ws_session_t* session) {
+    int ok = switch_session(ctx, session);
+    ws_session_unref(session);
+    return ok;
+}
+
+void switch_to_websockets(httpctx_t* ctx) {
+    (void)switch_to_websockets_session(ctx, NULL);
 }

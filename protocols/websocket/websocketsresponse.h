@@ -8,6 +8,12 @@
 
 struct wsctx;
 
+typedef struct {
+    int binary;
+    const void* data;
+    size_t size;
+} ws_frame_t;
+
 /**
  * WebSocket response for sending data frames to client.
  * Supports text, binary, file transmission, and control frames (pong, close).
@@ -149,5 +155,9 @@ char* websocketsresponse_detach_body(websocketsresponse_t* response, size_t* siz
  * @param size     Byte length of data
  */
 void websocketsresponse_set_body(websocketsresponse_t* response, char* data, size_t size);
+
+/* Replaces the response with an ordered, uncompressed frame batch.
+ * Copies all data; on failure the old response is unchanged. */
+int websocketsresponse_frames(websocketsresponse_t*, const ws_frame_t*, size_t count);
 
 #endif

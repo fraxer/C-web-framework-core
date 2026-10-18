@@ -8,6 +8,7 @@
 #include "json.h"
 #include "request.h"
 #include "file.h"
+#include "ws_session.h"
 
 struct websocketsrequest;
 struct websocketsparser;
@@ -60,6 +61,9 @@ typedef struct websockets_protocol {
 typedef struct websocketsrequest {
     /** Base request interface (reset/free callbacks) */
     request_t base;
+
+    /* Retained for the whole request; message reset does not release it. */
+    ws_session_t* session;
 
     /** Frame type: TEXT, BINARY, PING, PONG, CLOSE, CONTINUE, or NONE */
     websockets_datatype_e type;

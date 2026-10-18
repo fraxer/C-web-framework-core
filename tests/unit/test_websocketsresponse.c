@@ -1266,3 +1266,27 @@ TEST(test_wsresp_compression_then_plain_send) {
     ws_deflate_free(&deflate);
     free_response(response, conn);
 }
+
+TEST(test_wsresponse_batch_preserves_binary_and_frame_order) {
+    TEST_SUITE("websocketsresponse: batch");
+    TEST_CASE("snapshot and journal precede SYNC_DONE without losing NUL bytes");
+    connection_t* conn;
+    websocketsresponse_t* response = make_response(&conn);
+    TEST_REQUIRE_NOT_NULL(response, "response");
+    const unsigned char snapshot[] = {1, 0, 255};
+    const unsigned char update[] = {1, 0};
+    const ws_frame_t frames[] = {
+        {1, snapshot, sizeof snapshot},
+        {1, update, sizeof update},
+        {0, "SYNC_DONE", 9}
+    };
+    const unsigned char wire[] = {0x82,3,1,0,255, 0x82,2,1,0, 0x81,9,'S','Y','N','C','_','D','O','N','E'};
+    TEST_ASSERT(websocketsresponse_frames(response, frames, 3), "batch prepared");
+    TEST_ASSERT_EQUAL(sizeof wire, response->body.size, "three complete frames");
+    TEST_ASSERT(memcmp(response->body.data, wire, sizeof wire) == 0, "wire format and order");
+    ws_frame_t invalid = {1, NULL, 1};
+    TEST_ASSERT(!websocketsresponse_frames(response, &invalid, 1), "invalid batch refused");
+    TEST_ASSERT_EQUAL(sizeof wire, response->body.size, "failure leaves old response");
+    TEST_ASSERT(memcmp(response->body.data, wire, sizeof wire) == 0, "old response preserved");
+    free_response(response, conn);
+}

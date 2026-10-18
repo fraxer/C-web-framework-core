@@ -471,3 +471,31 @@ static int __compress_and_send(websocketsresponse_t* response, unsigned char opc
 
     return 1;
 }
+
+/* Build separately so validation/allocation failure cannot leave half a batch. */
+int websocketsresponse_frames(websocketsresponse_t* response, const ws_frame_t* frames, size_t count) {
+    if (response == NULL || frames == NULL || count == 0) return 0;
+    size_t total = 0;
+    for (size_t i = 0; i < count; i++) {
+        size_t n = frames[i].size;
+        size_t header = n <= 125 ? 2 : n <= 65535 ? 4 : 10;
+        if ((frames[i].data == NULL && n != 0) || n > SIZE_MAX - header ||
+            total > SIZE_MAX - n - header) return 0;
+        total += n + header;
+    }
+    char* bytes = malloc(total);
+    if (bytes == NULL) return 0;
+    size_t pos = 0;
+    for (size_t i = 0; i < count; i++) {
+        bytes[pos++] = frames[i].binary ? 0x82 : 0x81;
+        websocketsresponse_set_payload_length(bytes, &pos, frames[i].size);
+        if (frames[i].size != 0) memcpy(bytes + pos, frames[i].data, frames[i].size);
+        pos += frames[i].size;
+    }
+    websocketsresponse_reset(response);
+    response->frame_code = frames[0].binary ? 0x82 : 0x81;
+    response->body.data = bytes;
+    response->body.size = total;
+    response->body.pos = 0;
+    return 1;
+}

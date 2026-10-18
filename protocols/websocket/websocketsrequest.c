@@ -33,6 +33,7 @@ void websocketsrequest_free(void* arg) {
     websocketsrequest_reset(request);
     request->protocol->free(request->protocol);
 
+    ws_session_unref(request->session);
     free(request);
 }
 
@@ -42,6 +43,7 @@ websocketsrequest_t* websocketsrequest_create(connection_t* connection, websocke
     websocketsrequest_t* request = malloc(sizeof * request);
     if (request == NULL) return NULL;
 
+    request->session = NULL;
     request->type = WEBSOCKETS_NONE;
     request->can_reset = 1;
     request->fragmented = 0;

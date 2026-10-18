@@ -79,6 +79,7 @@ typedef struct websocketsparser {
 
     char* buffer;
     websocketsrequest_t* request;
+    ws_session_t* session; /* Transport-owned, shared with dispatched requests. */
     connection_t* connection;
 
     websockets_protocol_t*(*protocol_create)(void);
