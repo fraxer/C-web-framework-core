@@ -27,6 +27,7 @@
 
 #define _GNU_SOURCE
 #include <locale.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -523,4 +524,71 @@ TEST(test_i18n_nget_missing_msgid_passthrough) {
                 "untranslated n=1 should give the raw singular");
     TEST_ASSERT(i18n_nget(i18n_inst, singular, plural, 5, "ru") == plural,
                 "untranslated n=5 should give the raw plural");
+}
+
+// Lookup owns only its temporary locale, including the fallback lookup.
+TEST(test_i18n_restores_callers_locale) {
+    TEST_CASE("lookups preserve global and caller-owned thread locales");
+
+    i18n_t* inst = i18n_create(NULL, "i18n_scope_test", "en");
+    TEST_REQUIRE_NOT_NULL(inst, "i18n_create should succeed");
+    locale_t owned = newlocale(LC_ALL_MASK, "C.UTF-8", (locale_t)0);
+    if (owned == (locale_t)0) {
+        i18n_free(inst);
+        TEST_REQUIRE(0, "C.UTF-8 locale should be available");
+    }
+    locale_t original = uselocale((locale_t)0);
+    const locale_t locales[] = {LC_GLOBAL_LOCALE, owned};
+    const char* langs[] = {"en", "ru", "xx", "", NULL};
+
+    for (size_t i = 0; i < sizeof(locales) / sizeof(locales[0]); i++) {
+        uselocale(locales[i]);
+        for (size_t j = 0; j < sizeof(langs) / sizeof(langs[0]); j++) {
+            TEST_ASSERT_STR_EQUAL("missing", i18n_get(inst, "missing", langs[j]),
+                                  "untranslated message should pass through");
+            TEST_ASSERT(uselocale((locale_t)0) == locales[i],
+                        "i18n_get must restore the caller's locale");
+            TEST_ASSERT_STR_EQUAL("many", i18n_nget(inst, "one", "many", 2, langs[j]),
+                                  "untranslated plural should pass through");
+            TEST_ASSERT(uselocale((locale_t)0) == locales[i],
+                        "i18n_nget must restore the caller's locale");
+        }
+    }
+
+    uselocale(original);
+    freelocale(owned);
+    i18n_free(inst);
+}
+
+static void* i18n_worker(void* arg) {
+    i18n_t* inst = arg;
+    for (int i = 0; i < 32; i++) {
+        const char* lang = i % 2 ? "ru" : "xx";
+        if (strcmp(i18n_get(inst, "missing", lang), "missing") != 0 ||
+            strcmp(i18n_nget(inst, "one", "many", 2, lang), "many") != 0)
+            return arg;
+    }
+    return NULL;
+}
+
+// LSan must see no newlocale allocations left behind after these threads exit.
+// No locale/catalog prerequisite: an unknown lang exercises the C.UTF-8 fallback.
+TEST(test_i18n_worker_exit_releases_locales) {
+    TEST_CASE("short-lived worker threads release all lookup locales");
+
+    i18n_t* inst = i18n_create(NULL, "i18n_worker_test", "xx");
+    TEST_REQUIRE_NOT_NULL(inst, "i18n_create should succeed");
+    pthread_t workers[8];
+    size_t started = 0;
+    for (; started < sizeof(workers) / sizeof(workers[0]); started++) {
+        int rc = pthread_create(&workers[started], NULL, i18n_worker, inst);
+        TEST_ASSERT_EQUAL(0, rc, "worker should start");
+        if (rc != 0) break;
+    }
+    for (size_t i = 0; i < started; i++) {
+        void* result = inst;
+        TEST_ASSERT_EQUAL(0, pthread_join(workers[i], &result), "worker should join");
+        TEST_ASSERT_NULL(result, "concurrent lookups should return expected messages");
+    }
+    i18n_free(inst);
 }

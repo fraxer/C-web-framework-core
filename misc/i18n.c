@@ -7,9 +7,6 @@
 
 #include "i18n.h"
 
-// Thread-local locale for each thread
-static _Thread_local locale_t thread_locale = (locale_t)0;
-
 // Locale mapping entry
 typedef struct {
     const char* lang;
@@ -53,16 +50,12 @@ static const char* get_country_code(const char* lang) {
     return entry ? entry->country : NULL;
 }
 
-static void set_thread_locale(const char* lang) {
-    if (lang == NULL || *lang == '\0') return;
+// The caller owns this locale and must restore its previous locale before
+// freeing it. Keeping it in TLS would leak the last locale at thread exit.
+static locale_t set_thread_locale(const char* lang) {
+    if (lang == NULL || *lang == '\0') return (locale_t)0;
 
-    // Free previous locale if exists; detach it first — freeing the locale
-    // currently installed by uselocale() is undefined behavior
-    if (thread_locale != (locale_t)0) {
-        uselocale(LC_GLOBAL_LOCALE);
-        freelocale(thread_locale);
-        thread_locale = (locale_t)0;
-    }
+    locale_t thread_locale = (locale_t)0;
 
     const char* locale_name = get_locale_name(lang);
     if (locale_name != NULL)
@@ -82,8 +75,19 @@ static void set_thread_locale(const char* lang) {
     if (thread_locale == (locale_t)0)
         thread_locale = newlocale(LC_MESSAGES_MASK, "C.UTF-8", (locale_t)0);
 
-    if (thread_locale != (locale_t)0)
-        uselocale(thread_locale);
+    if (thread_locale != (locale_t)0 && uselocale(thread_locale) == (locale_t)0) {
+        freelocale(thread_locale);
+        return (locale_t)0;
+    }
+
+    return thread_locale;
+}
+
+static void restore_thread_locale(locale_t previous, locale_t current) {
+    if (current == (locale_t)0) return;
+
+    uselocale(previous);
+    freelocale(current);
 }
 
 i18n_t* i18n_create(const char* locale_dir, const char* domain, const char* default_lang) {
@@ -126,21 +130,22 @@ i18n_t* i18n_create(const char* locale_dir, const char* domain, const char* defa
 const char* i18n_get(i18n_t* i18n, const char* msgid, const char* lang) {
     if (i18n == NULL || msgid == NULL) return msgid;
 
-    // An empty lang must resolve to the default language: set_thread_locale("")
-    // is a no-op, so passing it through would silently reuse whatever locale the
-    // previous call on this thread installed.
+    // An empty lang must resolve to the default language.
     const char* effective_lang = (lang != NULL && *lang != '\0') ? lang : i18n->default_lang;
 
-    set_thread_locale(effective_lang);
+    locale_t previous = uselocale((locale_t)0);
+    locale_t current = set_thread_locale(effective_lang);
 
     const char* result = dgettext(i18n->domain, msgid);
 
     // if translation not found (returns msgid) and lang != default, try default
     if (result == msgid && strcasecmp(effective_lang, i18n->default_lang) != 0) {
-        set_thread_locale(i18n->default_lang);
+        restore_thread_locale(previous, current);
+        current = set_thread_locale(i18n->default_lang);
         result = dgettext(i18n->domain, msgid);
     }
 
+    restore_thread_locale(previous, current);
     return result;
 }
 
@@ -150,20 +155,23 @@ const char* i18n_nget(i18n_t* i18n, const char* singular, const char* plural,
         return n == 1 ? singular : plural;
     }
 
-    // see i18n_get: empty lang must not reuse the previous thread locale
+    // See i18n_get: an empty lang uses the default language.
     const char* effective_lang = (lang != NULL && *lang != '\0') ? lang : i18n->default_lang;
 
-    set_thread_locale(effective_lang);
+    locale_t previous = uselocale((locale_t)0);
+    locale_t current = set_thread_locale(effective_lang);
 
     const char* result = dngettext(i18n->domain, singular, plural, n);
 
     // if not translated, try default language
     if ((result == singular || result == plural) &&
         strcasecmp(effective_lang, i18n->default_lang) != 0) {
-        set_thread_locale(i18n->default_lang);
+        restore_thread_locale(previous, current);
+        current = set_thread_locale(i18n->default_lang);
         result = dngettext(i18n->domain, singular, plural, n);
     }
 
+    restore_thread_locale(previous, current);
     return result;
 }
 

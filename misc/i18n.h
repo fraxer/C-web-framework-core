@@ -10,6 +10,7 @@
  *
  * Uses standard gettext for translations.
  * File structure: locale_dir/<lang>/LC_MESSAGES/<domain>.mo
+ * Lookups restore the calling thread's locale and release temporary locales.
  */
 
 typedef struct i18n {
