@@ -166,6 +166,14 @@ add_dependencies(runner shadow_test_v1 shadow_test_v2 shadow_merged)
 
 add_test(NAME core_tests COMMAND runner)
 
+# Connection lifetime regressions also run independently of protocol suites.
+add_executable(connection_runner
+    unit/runner.c unit/test_connection.c unit/test_multiplexingepoll.c
+    unit/h3_config_stubs.c unit/mail_stubs.c)
+target_link_libraries(connection_runner PRIVATE cwfr_framework
+    ${OPENSSL_LIBRARIES} Threads::Threads ${CMAKE_DL_LIBS})
+add_test(NAME connection_unit_tests COMMAND connection_runner)
+
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_Interpreter_FOUND)

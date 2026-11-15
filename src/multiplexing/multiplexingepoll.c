@@ -268,6 +268,12 @@ void __mpx_epoll_process_events(appconfig_t* appconfig, void* arg) {
         connection_t* connection = ev->data.ptr;
         connection_server_ctx_t* ctx = connection->ctx;
 
+        /* A preceding timer event may already have closed this connection and
+         * dropped its base reference. Only the batch pin remains ours to drop;
+         * closing again would consume it before the decrement at next. */
+        if (atomic_load(&ctx->detached))
+            goto next;
+
         if (atomic_load(&ctx->destroyed) || (ev->events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) || config_shutdown)
             goto close;
 
